@@ -9,7 +9,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 
 | ADR | Decision | Status |
 |---|---|---|
-| [0001](0001-pure-deterministic-library.md) | `fleetring` is a pure, deterministic placement library | Accepted |
+| [0001](0001-pure-deterministic-library.md) | `fleetring` is a pure, deterministic placement library | Accepted (point 7 amended by 0011) |
 | [0002](0002-stable-hasher-xxh3.md) | Stable hashing behind a `StableHasher` trait, with XXH3-64 as the default | Accepted |
 | [0003](0003-integer-only-arithmetic.md) | Placement arithmetic uses integers only | Accepted |
 | [0004](0004-placement-strategies.md) | Weighted rendezvous by default, vnode ring as an option, no jump hash | Accepted |
@@ -19,6 +19,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0008](0008-placement-spec-vectors-fingerprints.md) | Versioned placement spec, golden vectors, and ring fingerprints | Accepted |
 | [0009](0009-toolchain-lints-ci.md) | Toolchain, lint, dependency, and CI policy | Accepted |
 | [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred) |
+| [0011](0011-generic-placement-core.md) | `fleetring` is general-purpose placement infrastructure; the product stays SQLite-focused | Accepted |
 
 ## Template
 

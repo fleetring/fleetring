@@ -1,6 +1,6 @@
 [package]
 name = "fleetring"
-description = "Consistent-hashing placement and routing for fleets of SQLite, libSQL, and Turso databases: one database per agent, tenant, or device."
+description = "Deterministic, cross-language placement with zone-aware replicas: weighted rendezvous or vnode consistent hashing, bounded loads, and migration planning."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ homepage.workspace = true
 authors.workspace = true
 documentation = "https://docs.rs/fleetring"
 readme = "README.md"
-keywords = ["sqlite", "libsql", "turso", "consistent-hashing", "distributed"]
-categories = ["database", "algorithms", "network-programming"]
+keywords = ["consistent-hashing", "rendezvous-hashing", "placement", "sharding", "distributed"]
+categories = ["algorithms", "data-structures", "network-programming"]
 
 [features]
 default = ["std"]

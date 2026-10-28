@@ -1,11 +1,47 @@
-//! Consistent-hashing placement for fleets of SQLite, libSQL, and Turso databases.
+//! Deterministic, cross-language placement with zone-aware replicas.
 //!
-//! FleetRing decides where each database lives in a fleet of nodes you own: one database per
-//! agent, tenant, or device. This crate is the placement core. It is a pure, deterministic
-//! library: the same ring and key produce the same placement on every platform, Rust release,
-//! and crate release.
+//! Every distributed system has to answer the same question: given a key, which nodes hold it,
+//! in what order, and what moves when the fleet changes? `fleetring` answers it for any kind of
+//! key: databases, tenants, chat rooms, actors, cache shards, game sessions, or LLM
+//! conversations pinned to the GPU that holds their KV cache.
 //!
-//! The design is recorded in the [architecture decision records].
+//! - **The same answer everywhere.** Placement is bit-identical across platforms, Rust
+//!   releases, and languages. Integer-only arithmetic, a stable hash, and a versioned placement
+//!   spec with golden vectors make it so.
+//! - **Weighted and topology-aware.** Weighted rendezvous hashing (the default) honors weights
+//!   exactly; a weighted vnode ring suits very large fleets. Either way, replicas spread across
+//!   zones first, then hosts.
+//! - **Minimal churn.** Adding, removing, or reweighting one node changes at most one replica of
+//!   any key, and filtering out a down node gives exactly the replicas of a ring without it.
+//! - **Small and fast.** No I/O, no async runtime, no unsafe code. Replica lookups take
+//!   microseconds and never allocate.
+//!
+//! `fleetring` is the placement core of [FleetRing](https://fleetring.dev), which runs fleets
+//! of SQLite databases on machines you own, and it is equally at home anywhere else. The design
+//! is recorded in the [architecture decision records].
+//!
+//! # Examples
+//!
+//! Place chat rooms on three nodes in three zones, then fail over when one node goes down:
+//!
+//! ```
+//! use fleetring::{Node, Ring};
+//!
+//! let ring = Ring::builder()
+//!     .node(Node::new("node-a".parse()?).with_zone("eu-west-1a".parse()?))
+//!     .node(Node::new("node-b".parse()?).with_zone("eu-west-1b".parse()?))
+//!     .node(Node::new("node-c".parse()?).with_zone("eu-west-1c".parse()?))
+//!     .build()?;
+//!
+//! let home = ring.replicas("room:general");
+//! assert_eq!(home.len(), 3);
+//!
+//! // Every router that sees the primary as down picks the same fallback.
+//! let down = home.primary().id();
+//! let failover = ring.replicas_where("room:general", |node| node.id() != down).ok_or("all down")?;
+//! assert_eq!(failover.primary(), home.followers().next().ok_or("no follower")?);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 //!
 //! [architecture decision records]: https://github.com/fleetring/fleetring/tree/main/docs/adr
 

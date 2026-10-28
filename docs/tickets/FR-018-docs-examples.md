@@ -27,6 +27,7 @@ A new user can place a database within five minutes and knows exactly what is gu
   - How to choose a strategy.
   - A table of feature flags.
 - **Item docs:** every public item has docs and an example that uses `?` (no `unwrap` in docs). Each has `# Errors` and `# Panics` sections where relevant.
+- **Positioning (ADR-0011):** present the crate as general-purpose placement. Docs say "key", not "database", and the examples span domains: a database fleet, key-value sharding, and chat-room failover.
 - **`examples/`**
   - `locate.rs`
   - `failover.rs` (liveness predicate)

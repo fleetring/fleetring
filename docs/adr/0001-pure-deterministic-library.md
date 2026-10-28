@@ -1,6 +1,6 @@
 # ADR-0001: `fleetring` is a pure, deterministic placement library
 
-- **Status:** Accepted (2026-10-27)
+- **Status:** Accepted (2026-10-27); point 7 amended by [ADR-0011](0011-generic-placement-core.md)
 - **Date:** 2026-10-27
 - **Related:** ADR-0006, ADR-0007, ADR-0008; tickets FR-007, FR-009, FR-012
 
@@ -26,6 +26,7 @@ Durable Objects guarantee one live instance per name. Hashing alone can't give t
 5. **Membership vs. liveness.** Membership (which nodes exist, plus their weights, zones, and hosts) determines placement, so changing it moves data. Liveness never changes placement. A sleeping laptop stays a member, and callers skip it at lookup time with a predicate. To drain a node, build a target ring without it; the daemon then migrates from the current ring to the target.
 6. **Rings are immutable.** A `Ring` is an immutable value and is `Send + Sync`. A membership change builds a new ring with `ring.to_builder()…build()`. Each ring carries an opaque `Epoch`, assigned by the control plane, that tells peers which ring is newer. Epochs don't affect placement.
 7. **One database, one key.** Keys are database names, treated as opaque bytes. Each key is placed independently. There is no slot or partition layer (ADR-0007 explains why).
+   *Amended by ADR-0011:* keys identify any placeable unit (a database, room, tenant, actor, or shard) and are still opaque bytes. In FleetRing they are database names.
 8. **The API is library-grade.** The public API follows the Rust API Guidelines: private by default, `#[non_exhaustive]` on enums that may grow, typed errors, no panics on caller input, and docs on every public item.
 
 ## Alternatives considered

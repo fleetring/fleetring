@@ -18,6 +18,10 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Live migration when nodes join or leave, with zero lost writes
 - CLI: `fleetring up`, `node add/remove`, `db create/locate/move`, `status`
 
+## The placement crate
+
+The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-purpose: *deterministic, cross-language placement with zone-aware replicas*. FleetRing uses it to place SQLite databases, but it works for anything keyed: key-value shards, chat rooms, actors, queue partitions, and inference sessions.
+
 ## Use cases
 
 - **AI agent memory:** a database per agent, placed next to its compute
