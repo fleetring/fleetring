@@ -1,6 +1,6 @@
 # ADR-0019: Nodes talk gRPC over tonic
 
-- **Status:** Proposed (2026-10-28)
+- **Status:** Accepted (2026-10-28)
 - **Date:** 2026-10-28
 - **Related:** ADR-0013, ADR-0015, ADR-0016, ADR-0017, ADR-0020
 

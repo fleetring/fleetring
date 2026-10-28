@@ -1,6 +1,6 @@
 # ADR-0016: Replication through engine adapters, starting with SQLite WAL shipping
 
-- **Status:** Proposed (2026-10-28)
+- **Status:** Accepted (2026-10-28)
 - **Date:** 2026-10-28
 - **Related:** ADR-0006, ADR-0010, ADR-0013, ADR-0015, ADR-0018, ADR-0021
 

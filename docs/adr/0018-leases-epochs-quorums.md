@@ -1,6 +1,6 @@
 # ADR-0018: Leases, epochs, and quorums: one writer per database, no acknowledged write lost
 
-- **Status:** Proposed (2026-10-28)
+- **Status:** Accepted (2026-10-28)
 - **Date:** 2026-10-28
 - **Related:** ADR-0006, ADR-0016, ADR-0017, ADR-0020, ADR-0021
 

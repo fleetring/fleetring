@@ -1,6 +1,6 @@
 # ADR-0021: Migrations that change a database's engine
 
-- **Status:** Proposed (2026-10-28). Planned now; built after live migration (MVP step 3).
+- **Status:** Accepted (2026-10-28). Planned now; built after live migration (MVP step 3).
 - **Date:** 2026-10-28
 - **Related:** ADR-0012, ADR-0016, ADR-0017, ADR-0018
 
