@@ -12,7 +12,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 
 ## Planned features
 
-- Consistent hashing with virtual nodes and bounded loads (jump and rendezvous strategies)
+- Consistent hashing with bounded loads: weighted rendezvous (default) or a virtual-node ring
 - Placement API: `key → database → node`, with zone-aware replicas
 - Router that works with existing libSQL and Turso clients
 - Live migration when nodes join or leave, with zero lost writes

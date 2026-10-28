@@ -1,0 +1,42 @@
+# Architecture decision records
+
+Decisions that shape the `fleetring` crate. Each record covers one decision: its context, what was decided, the alternatives considered, and the consequences.
+
+- **Numbering:** files are named `NNNN-short-title.md`. Numbers are never reused.
+- **Status:** `Proposed` → `Accepted` → `Deprecated` or `Superseded by ADR-NNNN`.
+- **Changing a decision:** write a new ADR that supersedes the old one, then update the old record's status line. Don't rewrite an accepted decision. Fixing typos and links is fine.
+- **Placement-affecting decisions** also need a new placement spec version (ADR-0008).
+
+| ADR | Decision | Status |
+|---|---|---|
+| [0001](0001-pure-deterministic-library.md) | `fleetring` is a pure, deterministic placement library | Accepted |
+| [0002](0002-stable-hasher-xxh3.md) | Stable hashing behind a `StableHasher` trait, with XXH3-64 as the default | Accepted |
+| [0003](0003-integer-only-arithmetic.md) | Placement arithmetic uses integers only | Accepted |
+| [0004](0004-placement-strategies.md) | Weighted rendezvous by default, vnode ring as an option, no jump hash | Accepted |
+| [0005](0005-identity.md) | Identity: node IDs, keys, labels, and weights | Accepted |
+| [0006](0006-replica-sets-topology-liveness.md) | Replica sets, topology-aware selection, and liveness filtering | Accepted |
+| [0007](0007-bounded-loads-policy.md) | Bounded loads as a deterministic policy applied at assignment time | Accepted |
+| [0008](0008-placement-spec-vectors-fingerprints.md) | Versioned placement spec, golden vectors, and ring fingerprints | Accepted |
+| [0009](0009-toolchain-lints-ci.md) | Toolchain, lint, dependency, and CI policy | Accepted |
+
+## Template
+
+```markdown
+# ADR-NNNN: <the decision, as a short sentence>
+
+- **Status:** Proposed
+- **Date:** YYYY-MM-DD
+- **Related:** ADR-…; tickets FR-…
+
+## Context
+The forces at play: constraints, facts, and goals.
+
+## Decision
+What we will do, stated so that someone can check it.
+
+## Alternatives considered
+Each serious option and why it lost.
+
+## Consequences
+What gets easier, what gets harder, and what follow-up work this creates.
+```
