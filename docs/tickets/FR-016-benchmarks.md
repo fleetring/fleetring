@@ -1,7 +1,7 @@
 ---
 id: FR-016
 title: Benchmarks and performance budget
-status: todo
+status: done
 priority: P1
 size: S
 milestone: M4 Hardening and release
@@ -40,6 +40,16 @@ Measure the hot paths, set budgets, and keep to them. Making rendezvous the defa
 
 ## Acceptance criteria
 
-- [ ] `cargo bench -p fleetring` runs every bench.
-- [ ] `docs/perf.md` is filled in with measured numbers.
-- [ ] Every budget is met, or ADR-0003/0004 is amended with the decision taken instead.
+- [x] `cargo bench -p fleetring` runs every bench.
+- [x] `docs/perf.md` is filled in with measured numbers.
+- [x] Every budget is met, or ADR-0003/0004 is amended with the decision taken instead.
+
+## Progress
+
+- 2026-10-27: `benches/lookup.rs` (divan) covers `replicas` (R = 3), `primary`, `preference`, and `build` for rendezvous with uniform and mixed weights and for vnodes, at N ∈ {3, 10, 100, 1000}. Results are in `docs/perf.md`, and every lookup and build budget is met:
+  - rendezvous at N = 100: 1.55 µs, against a 2 µs budget;
+  - rendezvous at N = 1000: 10.3 µs, against 20 µs;
+  - vnodes at N = 1000: 0.42 µs, against 1 µs;
+  - a vnode build at 1000 × 256: 19 ms, against 100 ms.
+- Still open: benches for `diff` and bounded loads, after FR-011 and FR-012 merge. The divan bench for `neg_log2_q32` was replaced by FR-005's in-crate micro-benchmark, because the function is private.
+- 2026-10-28: Added `diff` and bounded-load benches. Every budget is met, including `diff` at 350k keys/s at N = 100. `docs/perf.md` holds the full table.

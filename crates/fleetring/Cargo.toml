@@ -29,6 +29,7 @@ thiserror.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
 
@@ -38,6 +39,10 @@ dhat.workspace = true
 
 [[test]]
 name = "alloc_free"
+harness = false
+
+[[bench]]
+name = "lookup"
 harness = false
 
 [lints]
