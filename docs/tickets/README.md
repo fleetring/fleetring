@@ -62,7 +62,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-019](FR-019-release-0-1-0.md) | Release `fleetring` 0.1.0 and freeze placement spec v1 | P1 | S | FR-014, FR-016, FR-018 | done |
 | [FR-020](FR-020-cells.md) | Cells: nested placement with directories and per-cell rings | P1 | L | FR-012, FR-013 | done |
 | [FR-021](FR-021-cells-spec.md) | `CellsSpec`: serializable cells layers | P2 | M | FR-013, FR-020 | done |
-| [FR-022](FR-022-daemon-skeleton.md) | Workspace crates and the `fleetringd` skeleton | P0 | M | — | todo |
+| [FR-022](FR-022-daemon-skeleton.md) | Workspace crates and the `fleetringd` skeleton | P0 | M | — | done |
 | [FR-023](FR-023-grpc-transport.md) | gRPC protocol crate and node transport | P0 | M | FR-022 | todo |
 | [FR-024](FR-024-simulation-harness.md) | Simulation harness with turmoil | P0 | M | FR-022, FR-023 | todo |
 | [FR-025](FR-025-wal-format.md) | WAL format library | P0 | M | FR-022 | todo |
@@ -150,7 +150,7 @@ For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-
 **Engines and durability.** These must fit behind the engine adapter without changing anything above it (ADR-0016):
 
 - **libSQL and Turso adapters** as frame sources, capturing commits inside the engine.
-- **Turso MVCC adapter**, for concurrent writers within one database.
+- **Turso MVCC adapter**, for concurrent writers within one database. MVCC lifts SQLite's one-write-transaction-at-a-time limit inside a node; it doesn't change FleetRing's one writer *node* per database, which leases and epochs keep (ADR-0013, point 5; ADR-0018).
 - **Postgres adapter**, self-replicating through streaming replication. `fleetringd` only places, leases, and fences.
 - **Durability sinks:** S3 snapshots and log archiving for point-in-time restore, as a trait separate from replicas (MVP step 5).
 - **Engine-changing migrations**, such as SQLite to Postgres behind an `upgrade` command (ADR-0021), after live migration (MVP step 3).

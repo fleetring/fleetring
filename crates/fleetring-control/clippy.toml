@@ -1,0 +1,9 @@
+# Placement must be bit-identical across processes, platforms, and releases (ADR-0002).
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is unspecified; use BTreeMap or a sorted Vec (ADR-0002)" },
+    { path = "std::collections::HashSet", reason = "iteration order is unspecified; use BTreeSet or a sorted Vec (ADR-0002)" },
+    { path = "std::hash::DefaultHasher", reason = "its algorithm may change between Rust releases; use StableHasher (ADR-0002)" },
+    { path = "std::hash::RandomState", reason = "it is seeded randomly per process; use StableHasher (ADR-0002)" },
+]
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

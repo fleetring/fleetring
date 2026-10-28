@@ -1,0 +1,17 @@
+[package]
+name = "fleetring-control"
+description = "The FleetRing control plane's deterministic state machine: membership, leases, and epochs."
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+fleetring = { path = "../fleetring" }
+
+[lints]
+workspace = true
