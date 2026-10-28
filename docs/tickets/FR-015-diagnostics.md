@@ -1,7 +1,7 @@
 ---
 id: FR-015
 title: Ring diagnostics and expected load shares
-status: todo
+status: done
 priority: P2
 size: S
 milestone: M3 Change and interop
@@ -30,6 +30,13 @@ Surface topology and balance problems, such as the small-zone skew trade-off in 
 
 ## Acceptance criteria
 
-- [ ] With the 10/10/2 zone fixture and R = 3, `ZoneReplicaSkew` is reported for the 2-node zone, and its shares match sampling within 1 percentage point.
-- [ ] Healthy fixtures, such as three equal zones with R = 3, report no warnings.
-- [ ] Output order is deterministic: sorted by severity, then kind, then subject.
+- [x] With the 10/10/2 zone fixture and R = 3, `ZoneReplicaSkew` is reported for the 2-node zone, and its shares match sampling within 1 percentage point.
+- [x] Healthy fixtures, such as three equal zones with R = 3, report no warnings.
+- [x] Output order is deterministic: sorted by severity, then kind, then subject.
+
+## Progress
+
+- 2026-10-27: Done.
+  - **`Ring::diagnostics()`** reports only the deepest topology shortfall: nodes, then hosts, then zones. It also reports zone skew (replica share above 1.5× the weight share and at least 2 percentage points over it) and low vnode token counts. Results are sorted by severity, with a stable order within each severity.
+  - **`Ring::expected_shares()`** gives exact primary shares (weight ratios, or token arcs from `TokenTable::ownership`) and sampled replica shares. All values are integer basis points, so the library stays float-free.
+- The 10/10/2 zone fixture is flagged, and an independent corpus count agrees within 1 percentage point.

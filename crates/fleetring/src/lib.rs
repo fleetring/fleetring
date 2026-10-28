@@ -14,6 +14,7 @@
 #![deny(clippy::float_arithmetic)]
 
 mod bounded;
+mod diagnostics;
 mod diff;
 mod epoch;
 mod hasher;
@@ -34,6 +35,7 @@ pub mod test_util;
 mod vnodes;
 
 pub use bounded::{BoundedLoads, BoundedPlacement, Headroom, LoadView, LoadViewError};
+pub use diagnostics::{Diagnostic, NodeShare, Severity};
 pub use diff::{Change, Diff, MovementSummary};
 pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
@@ -53,6 +55,7 @@ const _: () = {
     assert_send_sync::<BoundedPlacement<'static>>();
     assert_send_sync::<BuildRingError>();
     assert_send_sync::<Change<'static, Vec<u8>>>();
+    assert_send_sync::<Diagnostic>();
     assert_send_sync::<Diff<'static, Xxh3, std::vec::IntoIter<Vec<u8>>>>();
     assert_send_sync::<Epoch>();
     assert_send_sync::<Fingerprint>();
@@ -64,6 +67,7 @@ const _: () = {
     assert_send_sync::<MovementSummary>();
     assert_send_sync::<Node>();
     assert_send_sync::<NodeId>();
+    assert_send_sync::<NodeShare>();
     assert_send_sync::<NodeSpec>();
     assert_send_sync::<ParseFingerprintError>();
     assert_send_sync::<ParseLabelError>();
@@ -74,6 +78,7 @@ const _: () = {
     assert_send_sync::<Ring<Xxh3>>();
     assert_send_sync::<RingBuilder>();
     assert_send_sync::<RingSpec>();
+    assert_send_sync::<Severity>();
     assert_send_sync::<Strategy>();
     assert_send_sync::<StrategySpec>();
     assert_send_sync::<VnodeParams>();

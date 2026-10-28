@@ -3,6 +3,7 @@
 
 mod bounded;
 mod common;
+mod diagnostics;
 mod diff;
 mod hasher;
 mod labels;

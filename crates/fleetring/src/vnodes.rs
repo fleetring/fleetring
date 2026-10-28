@@ -73,13 +73,6 @@ impl TokenTable {
     /// Returns each node's arc of the circle: the total length of the arcs ending at its
     /// tokens. A key goes to the first token at or after its hash, so a node's share of primaries
     /// is exactly its arc over 2⁶⁴. The arcs of `nodes` nodes sum to 2⁶⁴.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "diagnostics (FR-015) is the first caller outside tests"
-        )
-    )]
     pub(crate) fn ownership(&self, nodes: usize) -> Vec<u128> {
         let mut owned = vec![0u128; nodes];
         let (Some(&first), Some(&last)) = (self.tokens.first(), self.tokens.last()) else {
