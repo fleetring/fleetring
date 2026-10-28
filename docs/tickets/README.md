@@ -67,7 +67,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-024](FR-024-simulation-harness.md) | Simulation harness with turmoil | P0 | M | FR-022, FR-023 | todo |
 | [FR-025](FR-025-wal-format.md) | WAL format library | P0 | M | FR-022 | todo |
 | [FR-026](FR-026-database-actor.md) | Engine adapter and per-database actor | P0 | L | FR-022, FR-025 | todo |
-| [FR-027](FR-027-control-state-machine.md) | Control state machine | P0 | M | FR-022 | todo |
+| [FR-027](FR-027-control-state-machine.md) | Control state machine | P0 | M | FR-022 | done |
 | [FR-028](FR-028-control-node.md) | Control node service and client | P0 | M | FR-023, FR-027 | todo |
 | [FR-029](FR-029-membership.md) | Membership, heartbeats, and ring publication | P0 | M | FR-028 | todo |
 | [FR-030](FR-030-replication-stream.md) | Replication stream and follower mirroring | P0 | L | FR-023, FR-026, FR-029 | todo |
