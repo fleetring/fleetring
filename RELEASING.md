@@ -52,7 +52,7 @@ Turn on semver checking against the published baseline by adding this job to `.g
     name: semver-checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
