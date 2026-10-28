@@ -11,7 +11,13 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-fleetring = { path = "../fleetring" }
+fleetring = { path = "../fleetring", features = ["serde"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

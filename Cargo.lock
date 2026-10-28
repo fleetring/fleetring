@@ -360,6 +360,10 @@ name = "fleetring-control"
 version = "0.0.0"
 dependencies = [
  "fleetring",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
