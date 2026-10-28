@@ -1,7 +1,7 @@
 ---
 id: FR-007
 title: Ring and RingBuilder with validation and canonical membership
-status: todo
+status: done
 priority: P0
 size: M
 milestone: M2 Placement core
@@ -42,12 +42,20 @@ Build the core immutable `Ring<H = Xxh3>` and a builder that validates every inp
 
 ## Acceptance criteria
 
-- [ ] Building from any permutation of the same nodes produces the same internal order and node hashes (proptest).
-- [ ] Every `BuildRingError` variant can be reached from a test, and its `Display` names the offending value.
-- [ ] `ring.to_builder().build()` reproduces an equal ring.
-- [ ] `build()` never panics, whatever the input (proptest with arbitrary nodes).
-- [ ] The rustdoc example builds a three-node ring with zones and shows how to handle errors with `?`.
+- [x] Building from any permutation of the same nodes produces the same internal order and node hashes (proptest).
+- [x] Every `BuildRingError` variant can be reached from a test, and its `Display` names the offending value.
+- [x] `ring.to_builder().build()` reproduces an equal ring.
+- [x] `build()` never panics, whatever the input (proptest with arbitrary nodes).
+- [x] The rustdoc example builds a three-node ring with zones and shows how to handle errors with `?`.
 
 ## Notes
 
 - `len()` is deliberately missing. "Length" is ambiguous for a ring (nodes or tokens?), so `node_count()` is explicit.
+
+## Progress
+
+- 2026-10-27: Done. A subagent built it in an isolated copy, and I merged and re-verified it.
+- Deviations:
+  - **`TooManyNodes`:** added for more than `u32::MAX` nodes, so `build()` never panics.
+  - **Shared `Member` type:** per-node placement data lives in `crate::select::Member`, and strategies and selection read it through `Ring::members()`. The per-index accessors are now `#[cfg(test)]` helpers.
+  - **Dropped scope:** no membership digest. `LoadView` borrows its ring, so there's nothing to check against, and FR-013 computes the fingerprint.

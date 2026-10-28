@@ -4,3 +4,4 @@
 mod common;
 mod hasher;
 mod labels;
+mod ring;

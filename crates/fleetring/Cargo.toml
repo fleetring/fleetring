@@ -21,6 +21,7 @@ std = []
 test-util = []
 
 [dependencies]
+thiserror.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
