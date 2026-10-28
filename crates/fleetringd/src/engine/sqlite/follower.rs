@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::{
     Checkpoint, DATABASE_FILE, checkpoint, encode_position, keep_wal_on_close, remove_if_present,
-    shm_path, storage, wal_path,
+    shm_path, storage, wal_path, write_marker,
 };
 use crate::engine::{CheckpointMarker, EngineError, FrameBatch, FrameFollower, Position};
 
@@ -68,7 +68,10 @@ impl FrameFollower for SqliteFollower {
         if let Some(header) = decoded.header()
             && self.mirror.header() != Some(header)
         {
-            if self.mirror.header().is_some() {
+            if let Some(end) = self.mirror.position() {
+                // The primary checkpointed at `end`; recorded first, as the primary does, so the
+                // copy keeps vouching for it if it is promoted.
+                write_marker(&self.database, end).map_err(storage)?;
                 // The old generation's frames are gone once the new one starts.
                 self.checkpoint_database(Checkpoint::Truncate)?;
             }

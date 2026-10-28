@@ -3,5 +3,6 @@
 mod both;
 mod common;
 mod memory;
+mod pinned;
 mod registry;
 mod sqlite;

@@ -3,14 +3,20 @@
 //! WAL details stay in this module and in `fleetring-wal`. Above it, positions are the 20-byte
 //! encoding of [`fleetring_wal::Position`] and payloads are [`fleetring_wal::Batch`] payloads,
 //! both opaque.
+//!
+//! Each checkpoint first records the position it covers in `data.db-checkpoint`, durably, so
+//! that after a restart the adapter still knows which earlier-generation position the current
+//! generation continues from, and refuses every other one (FR-032).
 
 mod follower;
+mod pins;
 
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fleetring_wal::{Batch, ReadError, ReadFileError, read_committed_file};
 use rusqlite::config::DbConfig;
@@ -19,14 +25,21 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, ToSql};
 
 pub use follower::SqliteFollower;
 
+use self::pins::Pins;
 use crate::engine::{
     CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError,
     EngineKind, Executed, FrameBatch, FrameFollower, FrameSource, FrameSourceEngine, OpenMode,
-    Position, Rows, Snapshot, Statement, Transaction, Value,
+    PinnedSnapshot, Position, Rows, Snapshot, SnapshotFile, Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
 const DATABASE_FILE: &str = "data.db";
+
+/// The WAL file inside a database's location.
+const WAL_FILE: &str = "data.db-wal";
+
+/// The file inside a database's location that records where the last checkpoint ended.
+const CHECKPOINT_FILE: &str = "data.db-checkpoint";
 
 /// The smallest and largest page sizes SQLite supports.
 const PAGE_SIZES: std::ops::RangeInclusive<u32> = 512..=65536;
@@ -36,6 +49,10 @@ const PAGE_SIZES: std::ops::RangeInclusive<u32> = 512..=65536;
 /// Each database lives in its own directory as `data.db` and `data.db-wal`. The adapter keeps
 /// one write connection and one read connection open for as long as the database is open, so
 /// nothing else can checkpoint or restart the WAL.
+///
+/// Clones share the snapshots pinned through any of them, so a database reopened through a clone
+/// still refuses to checkpoint under a snapshot that a follower is reading. Engines compare by
+/// page size alone.
 ///
 /// # Examples
 ///
@@ -51,10 +68,19 @@ const PAGE_SIZES: std::ops::RangeInclusive<u32> = 512..=65536;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SqliteEngine {
     page_size: u32,
+    pins: Arc<Pins>,
 }
+
+impl PartialEq for SqliteEngine {
+    fn eq(&self, other: &Self) -> bool {
+        self.page_size == other.page_size
+    }
+}
+
+impl Eq for SqliteEngine {}
 
 impl SqliteEngine {
     /// An engine that creates databases with `page_size`-byte pages.
@@ -66,7 +92,10 @@ impl SqliteEngine {
         if !page_size.is_power_of_two() || !PAGE_SIZES.contains(&page_size) {
             return Err(InvalidPageSizeError { page_size });
         }
-        Ok(Self { page_size })
+        Ok(Self {
+            page_size,
+            pins: Arc::default(),
+        })
     }
 
     /// The page size new databases get.
@@ -102,7 +131,12 @@ impl DatabaseEngine for SqliteEngine {
             (OpenMode::Create, false) => fs::create_dir_all(location).map_err(storage)?,
             (OpenMode::Existing, true) => {}
         }
-        Ok(Box::new(SqliteDatabase::open(path, mode, self.page_size)?))
+        Ok(Box::new(SqliteDatabase::open(
+            path,
+            mode,
+            self.page_size,
+            Arc::clone(&self.pins),
+        )?))
     }
 }
 
@@ -118,10 +152,20 @@ struct SqliteDatabase {
     path: PathBuf,
     writer: Connection,
     reader: Connection,
+    /// The engine's pinned snapshots, which hold off checkpoints.
+    pins: Arc<Pins>,
+    /// Where the last checkpoint ended: the only earlier-generation position the current
+    /// generation is known to continue from.
+    checkpointed: Option<fleetring_wal::Position>,
 }
 
 impl SqliteDatabase {
-    fn open(path: PathBuf, mode: OpenMode, page_size: u32) -> Result<Self, EngineError> {
+    fn open(
+        path: PathBuf,
+        mode: OpenMode,
+        page_size: u32,
+        pins: Arc<Pins>,
+    ) -> Result<Self, EngineError> {
         let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         if mode == OpenMode::Create {
             flags |= OpenFlags::SQLITE_OPEN_CREATE;
@@ -159,10 +203,13 @@ impl SqliteDatabase {
         reader
             .execute_batch("PRAGMA query_only = 1; PRAGMA wal_autocheckpoint = 0;")
             .map_err(storage)?;
+        let checkpointed = read_marker(&path)?;
         Ok(Self {
             path,
             writer,
             reader,
+            pins,
+            checkpointed,
         })
     }
 
@@ -189,8 +236,28 @@ impl SqliteDatabase {
         }
     }
 
+    /// Reads every commit after `after`. A batch that starts a new generation continues only
+    /// from the end of the last checkpoint: any other earlier-generation position is refused,
+    /// because the frames between it and that end are gone.
     fn read_wal(&self, after: Option<&Position>) -> Result<Option<Batch>, EngineError> {
         let decoded = after.map(decode_position).transpose()?;
+        let batch = self.read_wal_unchecked(after, decoded)?;
+        if let (Some(position), Some(batch)) = (after, &batch)
+            && batch.header().is_some()
+            && decoded != self.checkpointed
+        {
+            return Err(EngineError::InvalidPosition {
+                position: position.clone(),
+            });
+        }
+        Ok(batch)
+    }
+
+    fn read_wal_unchecked(
+        &self,
+        after: Option<&Position>,
+        decoded: Option<fleetring_wal::Position>,
+    ) -> Result<Option<Batch>, EngineError> {
         read_committed_file(self.wal_path(), decoded).map_err(|error| match (error, after) {
             (
                 ReadFileError::Read(
@@ -268,6 +335,10 @@ impl Database for SqliteDatabase {
             }
             None => remove_if_present(&target_wal).map_err(storage)?,
         }
+        let marker = checkpoint_path(&self.path);
+        if marker.try_exists().map_err(storage)? {
+            copy_prefix(&marker, &checkpoint_path(&target), None).map_err(storage)?;
+        }
         sync_dir(destination).map_err(storage)?;
         Ok(Snapshot {
             position: position.map(encode_position),
@@ -307,11 +378,48 @@ impl FrameSource for SqliteDatabase {
     }
 
     fn checkpoint(&mut self) -> Result<CheckpointMarker, EngineError> {
+        // A snapshot being read must see the database file and the WAL as they were pinned.
+        if self.pins.is_pinned(&self.path) {
+            return Err(EngineError::CheckpointBlocked);
+        }
         let position = self.position()?.ok_or(EngineError::CheckpointBlocked)?;
+        // Recorded first, so a restart never forgets where the next generation continues from.
+        let end = decode_position(&position)?;
+        write_marker(&self.path, end).map_err(storage)?;
+        self.checkpointed = Some(end);
         // RESTART, not TRUNCATE: the WAL keeps a header, so its checkpoint sequence survives a
         // close and reopen, and the next generation still orders after this one.
         checkpoint(&self.writer, Checkpoint::Restart)?;
         Ok(CheckpointMarker { position })
+    }
+
+    fn pin_snapshot(&mut self) -> Result<PinnedSnapshot, EngineError> {
+        // Writes and checkpoints run only on this database's thread, so the committed prefix read
+        // here is complete. The pin then holds off checkpoints, the only thing that rewrites the
+        // database file, until the snapshot is dropped.
+        let batch = self.read_wal(None)?;
+        let header = batch.as_ref().and_then(|batch| batch.header().copied());
+        let pin = self.pins.pin(&self.path, header);
+        let mut files = Vec::with_capacity(3);
+        if let Some(marker) = open_if_present(&checkpoint_path(&self.path)).map_err(storage)? {
+            let len = marker.metadata().map_err(storage)?.len();
+            files.push(SnapshotFile::new(CHECKPOINT_FILE, marker, len));
+        }
+        let database = File::open(&self.path).map_err(storage)?;
+        let len = database.metadata().map_err(storage)?.len();
+        files.push(SnapshotFile::new(DATABASE_FILE, database, len));
+        let position = batch.map(|batch| batch.end());
+        if let Some(position) = position {
+            // The WAL comes last: the pin confirms its header is unchanged once it has been read,
+            // which shows no new generation overwrote the prefix meanwhile.
+            let wal = File::open(self.wal_path()).map_err(storage)?;
+            files.push(SnapshotFile::new(WAL_FILE, wal, position.offset()));
+        }
+        Ok(PinnedSnapshot::new(
+            position.map(encode_position),
+            files,
+            pin,
+        ))
     }
 }
 
@@ -426,6 +534,49 @@ fn wal_path(database: &Path) -> PathBuf {
     let mut path = OsString::from(database.as_os_str());
     path.push("-wal");
     PathBuf::from(path)
+}
+
+fn checkpoint_path(database: &Path) -> PathBuf {
+    let mut path = OsString::from(database.as_os_str());
+    path.push("-checkpoint");
+    PathBuf::from(path)
+}
+
+/// Reads where the last checkpoint of the database at `database` ended, if one is recorded.
+fn read_marker(database: &Path) -> Result<Option<fleetring_wal::Position>, EngineError> {
+    let bytes = match fs::read(checkpoint_path(database)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(storage(error)),
+    };
+    fleetring_wal::Position::from_bytes(&bytes)
+        .map(Some)
+        .map_err(storage)
+}
+
+/// Records durably that the last checkpoint of the database at `database` ended at `end`.
+fn write_marker(database: &Path, end: fleetring_wal::Position) -> io::Result<()> {
+    let target = checkpoint_path(database);
+    let mut staged = OsString::from(target.as_os_str());
+    staged.push(".tmp");
+    let staged = PathBuf::from(staged);
+    let mut file = File::create(&staged)?;
+    file.write_all(&end.to_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&staged, &target)?;
+    match database.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => sync_dir(dir),
+        _ => sync_dir(Path::new(".")),
+    }
+}
+
+fn open_if_present(path: &Path) -> io::Result<Option<File>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn shm_path(database: &Path) -> PathBuf {

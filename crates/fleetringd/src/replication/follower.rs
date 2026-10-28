@@ -2,9 +2,9 @@
 //! `Snapshot` RPC a new follower fetches its first copy through.
 
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fleetring::NodeId;
@@ -19,16 +19,13 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::epochs::{EpochError, sync_dir};
+use super::epochs::EpochError;
 use super::primary::held;
-use super::{Inner, PRIMARY_METADATA_KEY, archive};
+use super::{Inner, PRIMARY_METADATA_KEY, snapshot};
 use crate::engine::{
-    CheckpointMarker, EngineCapability, EngineError, Execution, FrameBatch, Payload, Position,
+    CheckpointMarker, EngineCapability, EngineError, Execution, FrameBatch, FrameFollower, Payload,
+    Position,
 };
-use crate::transport::replication_client;
-
-/// The largest snapshot chunk the `Snapshot` RPC sends.
-const CHUNK_BYTES: usize = 1024 * 1024;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -59,8 +56,10 @@ pub(super) struct FollowerSlot {
     /// Counts the streams that have opened; only the latest may apply.
     sessions: watch::Sender<u64>,
     /// Held by the stream applying batches, so that a newer stream waits for an older one.
-    applying: tokio::sync::Mutex<()>,
+    pub(super) applying: tokio::sync::Mutex<()>,
     positions: Mutex<Positions>,
+    /// How many snapshots have replaced the copy since this node started.
+    snapshots: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -71,7 +70,7 @@ struct Positions {
 
 impl FollowerSlot {
     /// Starts a new session, which ends every older one.
-    fn begin(&self) -> u64 {
+    pub(super) fn begin(&self) -> u64 {
         let mut session = 0;
         self.sessions.send_modify(|current| {
             *current += 1;
@@ -106,6 +105,20 @@ impl FollowerSlot {
             .lock()
             .expect("follower lock poisoned")
             .checkpointed = Some(position);
+    }
+
+    /// Records that a snapshot at `position` replaced the copy.
+    pub(super) fn seeded(&self, position: Option<Position>) {
+        *self.positions.lock().expect("follower lock poisoned") = Positions {
+            position,
+            checkpointed: None,
+        };
+        self.snapshots.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many snapshots have replaced the copy since this node started.
+    pub(super) fn snapshots(&self) -> u64 {
+        self.snapshots.load(Ordering::Relaxed)
     }
 }
 
@@ -182,77 +195,10 @@ impl Replication for ReplicationService {
         &self,
         request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
-        let request = request.into_inner();
-        let name: DatabaseName = request
-            .database
-            .parse()
-            .map_err(|error| Status::invalid_argument(format!("invalid database name: {error}")))?;
-        let inner = &self.inner;
-        let primary = inner.primary(&name).ok_or_else(|| {
-            Status::failed_precondition(format!("{name} has no primary on this node"))
-        })?;
-        let epoch = primary.role().epoch.get();
-        if request.epoch != epoch {
-            return Err(Status::failed_precondition(format!(
-                "{name} is at epoch {epoch} here, not {}",
-                request.epoch
-            )));
-        }
-        let staging = inner.staging("outgoing");
-        let handle = inner
-            .registry()
-            .open(&name)
+        snapshot::serve(&self.inner, request.into_inner())
             .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let snapshot = handle.snapshot(&staging).await;
-        let packed = {
-            let staging = staging.clone();
-            blocking(inner.execution, move || archive::pack(&staging)).await
-        };
-        let removal = {
-            let staging = staging.clone();
-            blocking(inner.execution, move || fs::remove_dir_all(&staging)).await
-        };
-        if let Ok(Err(error)) = removal {
-            tracing::warn!(dir = %staging.display(), %error, "can't remove a snapshot's staging directory");
-        }
-        let snapshot = snapshot.map_err(|error| Status::internal(error.to_string()))?;
-        let archive = packed?.map_err(|error| Status::internal(error.to_string()))?;
-        let position = snapshot
-            .position
-            .map(Position::into_bytes)
-            .unwrap_or_default();
-        Ok(Response::new(Box::pin(tokio_stream::iter(
-            chunks(archive, position).into_iter().map(Ok),
-        ))))
+            .map(Response::new)
     }
-}
-
-/// Splits `archive` into chunks; the last carries the snapshot's position.
-fn chunks(archive: Vec<u8>, position: Vec<u8>) -> Vec<SnapshotChunk> {
-    let mut chunks: Vec<SnapshotChunk> = archive
-        .chunks(CHUNK_BYTES)
-        .scan(0_u64, |offset, data| {
-            let chunk = SnapshotChunk {
-                offset: *offset,
-                data: data.to_vec(),
-                position: None,
-                checksum: None,
-            };
-            *offset += u64::try_from(data.len()).unwrap_or(u64::MAX);
-            Some(chunk)
-        })
-        .collect();
-    match chunks.last_mut() {
-        Some(last) => last.position = Some(position),
-        None => chunks.push(SnapshotChunk {
-            offset: 0,
-            data: Vec::new(),
-            position: Some(position),
-            checksum: None,
-        }),
-    }
-    chunks
 }
 
 /// One open `Replicate` stream on the follower.
@@ -364,6 +310,17 @@ impl Follow {
                     self.slot
                         .set_checkpointed(checkpointed.map_err(engine_status)?);
                 }
+                Message::Reseed(reseed) => {
+                    admit(inner, &self.name, reseed.epoch).await?;
+                    // The copy is replaced underneath the open follower, so close it first.
+                    drop(follower);
+                    let (reopened, at) = self.reseed(&location).await?;
+                    follower = reopened;
+                    position = at;
+                    if !send_ack(acks, position.as_ref()).await {
+                        return Ok(());
+                    }
+                }
                 Message::Open(_) => {
                     return Err(Status::invalid_argument("a replication stream opens once"));
                 }
@@ -380,64 +337,61 @@ impl Follow {
                 self.name
             ))
         })?;
-        let address = inner
-            .addresses
-            .address(primary)
-            .ok_or_else(|| Status::unavailable(format!("no address for {primary}")))?;
-        let channel = inner
-            .peers
-            .channel_to(&address)
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let mut chunks = replication_client(channel)
-            .snapshot(SnapshotRequest {
-                database: self.name.to_string(),
-                epoch: self.epoch,
-            })
-            .await?
-            .into_inner();
-        let mut archive = Vec::new();
-        let mut complete = false;
-        while let Some(chunk) = chunks.message().await? {
-            if chunk.offset != u64::try_from(archive.len()).unwrap_or(u64::MAX) {
-                return Err(Status::data_loss("snapshot chunks arrived out of order"));
-            }
-            archive.extend_from_slice(&chunk.data);
-            if chunk.position.is_some() {
-                complete = true;
-                break;
-            }
-        }
-        if !complete {
-            return Err(Status::data_loss("the snapshot ended early"));
-        }
-        let staging = inner.staging("incoming");
-        let location = location.to_owned();
-        blocking(inner.execution, move || {
-            install(&archive, &staging, &location)
-        })
-        .await?
-        .map_err(|error| Status::internal(format!("can't install the initial copy: {error}")))?;
+        let position = snapshot::fetch(inner, &self.name, self.epoch, primary, location).await?;
+        self.slot.seeded(position);
         tracing::info!(database = %self.name, from = %primary, "installed the initial copy");
         Ok(())
     }
-}
 
-/// Unpacks `archive` into `staging`, then renames it to `location`, durably.
-fn install(archive: &[u8], staging: &Path, location: &Path) -> std::io::Result<()> {
-    if let Some(root) = staging.parent() {
-        fs::create_dir_all(root)?;
+    /// Replaces the copy at `location` with a snapshot from the stream's primary, because the
+    /// primary's log no longer holds what it needs, and reopens it.
+    async fn reseed(
+        &self,
+        location: &Path,
+    ) -> Result<(Box<dyn FrameFollower>, Option<Position>), Status> {
+        let inner = &self.inner;
+        let primary = self.primary.as_ref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "the stream names no primary to re-seed {} from",
+                self.name
+            ))
+        })?;
+        let fetched = tokio::time::timeout(
+            inner.settings.open_timeout,
+            snapshot::fetch(inner, &self.name, self.epoch, primary, location),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("re-seeding from a snapshot timed out"))??;
+        let follower = {
+            let engine = Arc::clone(&inner.engine);
+            let location = location.to_owned();
+            blocking(inner.execution, move || match engine.capability() {
+                EngineCapability::FrameSource(frames) => frames.open_follower(&location),
+                _ => Err(EngineError::NotFound),
+            })
+            .await?
+            .map_err(engine_status)?
+        };
+        let position = follower.position();
+        if position != fetched {
+            return Err(Status::data_loss(format!(
+                "the snapshot was at {}, but the copy opened at {}",
+                fetched.unwrap_or_default(),
+                position.clone().unwrap_or_default()
+            )));
+        }
+        self.slot.seeded(position.clone());
+        tracing::info!(database = %self.name, from = %primary, ?position, "re-seeded the copy from a snapshot");
+        Ok((follower, position))
     }
-    archive::unpack(archive, staging)?;
-    let parent: PathBuf = location
-        .parent()
-        .map_or_else(PathBuf::new, Path::to_path_buf);
-    fs::create_dir_all(&parent)?;
-    fs::rename(staging, location)?;
-    sync_dir(&parent)
 }
 
 /// Admits `epoch` for `database`, recording it durably if it is new.
-async fn admit(inner: &Arc<Inner>, database: &DatabaseName, epoch: u64) -> Result<(), Status> {
+pub(super) async fn admit(
+    inner: &Arc<Inner>,
+    database: &DatabaseName,
+    epoch: u64,
+) -> Result<(), Status> {
     if inner.epochs.highest(database) == Some(epoch) {
         return Ok(());
     }
@@ -463,7 +417,7 @@ async fn send_ack(acks: &Acks, position: Option<&Position>) -> bool {
 }
 
 /// Runs `call` where blocking calls run: on a blocking thread, or inline under simulation.
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     execution: Execution,
     call: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Status> {

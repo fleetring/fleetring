@@ -8,7 +8,7 @@ use std::time::Duration;
 use fleetring::NodeId;
 use fleetring_control::{DatabaseName, Timestamp};
 use fleetring_proto::v1::replicate_message::Message;
-use fleetring_proto::v1::{self as proto, ReplicateMessage, ReplicateOpen};
+use fleetring_proto::v1::{self as proto, ReplicateAck, ReplicateMessage, ReplicateOpen};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
@@ -19,7 +19,8 @@ use super::{
     FollowerProgress, Inner, PRIMARY_METADATA_KEY, PrimaryRole, PrimaryStatus, Quorum, failed,
     refused,
 };
-use crate::engine::{CheckpointMarker, FrameBatch, Position};
+use crate::DatabaseError;
+use crate::engine::{CheckpointMarker, EngineError, FrameBatch, Position};
 use crate::sink::{Acknowledged, Acknowledgement, ReplicationError};
 use crate::transport::replication_client;
 
@@ -608,8 +609,8 @@ pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
 /// Why a stream ended.
 #[derive(Debug)]
 enum StreamEnd {
-    /// The follower can only catch up from a snapshot.
-    NeedsSnapshot,
+    /// The follower re-seeded its copy from a snapshot; the next stream continues from there.
+    Reseeded,
     /// The stream failed; it is reopened after a pause.
     Failed(String),
 }
@@ -617,7 +618,7 @@ enum StreamEnd {
 impl fmt::Display for StreamEnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NeedsSnapshot => f.write_str("the follower needs a snapshot"),
+            Self::Reseeded => f.write_str("the follower re-seeded from a snapshot"),
             Self::Failed(reason) => f.write_str(reason),
         }
     }
@@ -633,9 +634,9 @@ async fn follow(inner: Arc<Inner>, primary: Arc<Primary>, node: NodeId) {
         let ended = stream(&inner, &primary, &node).await;
         primary.disconnected(&node);
         let pause = match ended {
-            StreamEnd::NeedsSnapshot => {
-                tracing::warn!(database = %primary.name, follower = %node, "follower is behind the last checkpoint and needs a snapshot");
-                inner.settings.lag_limit
+            StreamEnd::Reseeded => {
+                tracing::debug!(database = %primary.name, follower = %node, "follower re-seeded; reopening");
+                inner.settings.retry_interval
             }
             StreamEnd::Failed(reason) => {
                 tracing::debug!(database = %primary.name, follower = %node, %reason, "replication stream ended; reopening");
@@ -697,14 +698,25 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
             let batch = match primary.plan(sent.as_ref()) {
                 Plan::Wait => break,
                 Plan::NeedsSnapshot => {
-                    primary.needs_snapshot(node);
-                    return StreamEnd::NeedsSnapshot;
+                    return reseed(inner, primary, node, &outgoing, &mut acks, in_flight.len())
+                        .await;
                 }
                 Plan::Send(batch) => batch,
                 Plan::Read { after, checkpoints } => {
                     match read_since(inner, primary, after, checkpoints).await {
                         Ok(Some(batch)) => batch,
                         Ok(None) => break,
+                        Err(error) if log_moved_past(primary, sent.as_ref(), &error) => {
+                            return reseed(
+                                inner,
+                                primary,
+                                node,
+                                &outgoing,
+                                &mut acks,
+                                in_flight.len(),
+                            )
+                            .await;
+                        }
                         Err(error) => return stream_failed(error),
                     }
                 }
@@ -781,20 +793,67 @@ async fn read_since(
     primary: &Primary,
     after: Option<Position>,
     checkpoints: u64,
-) -> Result<Option<FrameBatch>, String> {
-    let handle = inner
-        .registry()
-        .open(&primary.name)
-        .await
-        .map_err(|error| error.to_string())?;
-    let batch = handle
-        .committed_since(after)
-        .await
-        .map_err(|error| error.to_string())?;
+) -> Result<Option<FrameBatch>, DatabaseError> {
+    let handle = inner.registry().open(&primary.name).await?;
+    let batch = handle.committed_since(after).await?;
     if primary.checkpoints() != checkpoints {
         return Ok(None);
     }
     Ok(batch)
+}
+
+/// Whether reading the log for a follower at `sent` failed because the log no longer continues
+/// from there, as after a checkpoint the primary restarted since, so that only a snapshot can
+/// catch it up. A follower at or past the primary's end isn't behind, and is left to retry.
+fn log_moved_past(primary: &Primary, sent: Option<&Position>, error: &DatabaseError) -> bool {
+    matches!(
+        error.engine_error(),
+        Some(EngineError::InvalidPosition { .. })
+    ) && sent < primary.committed().as_ref()
+}
+
+/// Has `node` replace its copy with a snapshot, because the log no longer holds what it needs,
+/// and waits until it acknowledges the snapshot's position. Acknowledgements of the `in_flight`
+/// batches sent before arrive first.
+async fn reseed(
+    inner: &Inner,
+    primary: &Primary,
+    node: &NodeId,
+    outgoing: &mpsc::Sender<ReplicateMessage>,
+    acks: &mut tonic::Streaming<ReplicateAck>,
+    in_flight: usize,
+) -> StreamEnd {
+    primary.needs_snapshot(node);
+    tracing::info!(database = %primary.name, follower = %node, "follower is behind the last checkpoint; re-seeding it from a snapshot");
+    let request = message(Message::Reseed(proto::Reseed {
+        epoch: primary.role.epoch.get(),
+    }));
+    if outgoing.send(request).await.is_err() {
+        return stream_failed("stream closed");
+    }
+    let reseeded = time::timeout(inner.settings.open_timeout, async {
+        let mut skip = in_flight;
+        loop {
+            match acks.message().await {
+                Ok(Some(ack)) if skip > 0 => {
+                    skip -= 1;
+                    primary.acknowledged(node, held(ack.position), inner.settings.retained_bytes);
+                }
+                Ok(Some(ack)) => return Ok(held(ack.position)),
+                Ok(None) => return Err(stream_failed("the follower closed the stream")),
+                Err(status) => return Err(stream_failed(status)),
+            }
+        }
+    })
+    .await;
+    match reseeded {
+        Ok(Ok(position)) => {
+            primary.acknowledged(node, position, inner.settings.retained_bytes);
+            StreamEnd::Reseeded
+        }
+        Ok(Err(ended)) => ended,
+        Err(_) => stream_failed("the follower didn't re-seed in time"),
+    }
 }
 
 fn message(message: Message) -> ReplicateMessage {

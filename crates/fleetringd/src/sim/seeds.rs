@@ -18,6 +18,11 @@ pub const SEED_VAR: &str = "FLEETRING_SIM_SEED";
 /// The seeds every CI build runs, unless [`SEED_VAR`] picks one.
 pub const FIXED: [u64; 4] = [1, 24, 29, 2_026];
 
+/// The seeds every CI build runs for the heaviest scenarios (replication under faults), unless
+/// [`SEED_VAR`] picks one. Fewer seeds keep the fixed-seed CI run within its time budget; the
+/// nightly sweep covers many more.
+pub const FIXED_HEAVY: [u64; 2] = [1, 2_026];
+
 /// Returns the seeds to run: the one in [`SEED_VAR`] if it is set, otherwise `fixed`.
 ///
 /// # Panics

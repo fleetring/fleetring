@@ -1,5 +1,6 @@
 //! FR-030 on the harness: writes replicate to a write quorum through partitions and follower
-//! restarts, and every follower converges once the network heals.
+//! restarts, and every follower converges once the network heals. FR-032: a follower restarted
+//! after the primary checkpointed past it catches up through a snapshot.
 //!
 //! A client creates one database with three replicas through the data plane, then writes to it
 //! through the `Database` service, as the command line does. The daemons replicate it themselves.
@@ -22,8 +23,8 @@ fn database() -> Result<DatabaseName, Box<dyn Error>> {
     Ok("db-0".parse()?)
 }
 
-fn cluster(seed: u64) -> Result<Cluster, Box<dyn Error>> {
-    let settings = ReplicationSettings {
+fn settings() -> ReplicationSettings {
+    ReplicationSettings {
         stall_timeout: Duration::from_millis(400),
         ack_timeout: Duration::from_secs(2),
         open_timeout: Duration::from_secs(5),
@@ -31,7 +32,14 @@ fn cluster(seed: u64) -> Result<Cluster, Box<dyn Error>> {
         // Small, so the run crosses several checkpoints and log generations.
         checkpoint_threshold: 8 * 1024,
         ..ReplicationSettings::new()
-    };
+    }
+}
+
+fn cluster(seed: u64) -> Result<Cluster, Box<dyn Error>> {
+    cluster_with(seed, settings())
+}
+
+fn cluster_with(seed: u64, settings: ReplicationSettings) -> Result<Cluster, Box<dyn Error>> {
     Ok(Cluster::builder(seed)
         .control(CONTROL)
         .data(DATA[0])
@@ -124,7 +132,7 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
 
 #[test]
 fn acknowledged_writes_survive_partitions_and_follower_restarts() {
-    seeds::run(BINARY, &seeds::FIXED, |seed| -> TestResult {
+    seeds::run(BINARY, &seeds::FIXED_HEAVY, |seed| -> TestResult {
         let first = writes_through_faults(seed)?;
         let history = first.history();
         let written = history
@@ -159,6 +167,99 @@ fn acknowledged_writes_survive_partitions_and_follower_restarts() {
             "no write was acknowledged as under-replicated"
         );
         let second = writes_through_faults(seed)?;
+        first.trace().compare(second.trace(), Replay::supported())?;
+        Ok(())
+    });
+}
+
+/// Crashes a follower, writes on until the primary has checkpointed past it, and restarts it: the
+/// primary finds it behind the last checkpoint and has it re-seed from a snapshot, after which it
+/// catches up and converges.
+fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
+    let settings = ReplicationSettings {
+        // Short, so the crashed follower soon stops holding checkpoints back, and too few
+        // retained batches to catch it up from memory.
+        lag_limit: Duration::from_millis(500),
+        retained_bytes: 4 * 1024,
+        ..settings()
+    };
+    let mut cluster = cluster_with(seed, settings)?;
+    cluster.await_ring(Duration::from_secs(5))?;
+    cluster.client("writer", CreateAndWrite::new(1, 3, WRITES));
+    cluster.run_until(Duration::from_secs(10), "database created", |cluster| {
+        primary(cluster).is_some()
+    })?;
+    let primary = primary(&cluster).ok_or("no primary")?;
+    let lagging = DATA
+        .into_iter()
+        .find(|node| *node != primary.as_str())
+        .ok_or("a follower")?;
+    cluster.run_for(Duration::from_secs(1))?;
+
+    let database = database()?;
+    let checkpointed = |cluster: &Cluster| {
+        cluster
+            .replication(&primary)
+            .and_then(|replication| replication.primary_status(&database))
+            .and_then(|status| status.checkpointed)
+    };
+    let before = checkpointed(&cluster);
+    cluster.crash(lagging)?;
+    // Twice over: the lag limit passes, then the next checkpoint leaves the follower behind.
+    cluster.run_until(
+        Duration::from_secs(30),
+        "a checkpoint past the crashed follower",
+        |cluster| {
+            cluster
+                .replication(&primary)
+                .and_then(|replication| replication.primary_status(&database))
+                .is_some_and(|status| {
+                    status.checkpointed.is_some()
+                        && status.checkpointed != before
+                        && status.followers.iter().any(|follower| {
+                            follower.node.as_str() == lagging && !follower.connected
+                        })
+                })
+        },
+    )?;
+    let past = checkpointed(&cluster);
+    cluster.run_until(Duration::from_secs(30), "a second checkpoint", |cluster| {
+        checkpointed(cluster) != past
+    })?;
+    cluster.check_writes()?;
+    cluster.restart(lagging)?;
+
+    cluster.await_workloads(Duration::from_secs(120))?;
+    cluster.await_ring(Duration::from_secs(5))?;
+    cluster.await_replicas_converged(Duration::from_secs(30))?;
+    let reseeded = cluster
+        .replication(lagging)
+        .and_then(|replication| replication.follower_status(&database))
+        .ok_or("the restarted node follows the database")?;
+    assert!(
+        reseeded.snapshots >= 1,
+        "{lagging} caught up through a snapshot: {reseeded:?}"
+    );
+    let status = cluster
+        .replication(&primary)
+        .and_then(|replication| replication.primary_status(&database))
+        .ok_or("the primary isn't serving the database")?;
+    assert!(
+        status
+            .followers
+            .iter()
+            .all(|follower| !follower.needs_snapshot),
+        "{status:?}"
+    );
+    cluster.check()?;
+    Ok(cluster.finish()?)
+}
+
+#[test]
+fn a_follower_restarted_past_a_checkpoint_catches_up_through_a_snapshot() {
+    seeds::run(BINARY, &seeds::FIXED_HEAVY, |seed| -> TestResult {
+        let first = restart_past_a_checkpoint(seed)?;
+        let second = restart_past_a_checkpoint(seed)?;
         first.trace().compare(second.trace(), Replay::supported())?;
         Ok(())
     });
