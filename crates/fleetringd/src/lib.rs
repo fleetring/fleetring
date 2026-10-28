@@ -10,6 +10,7 @@
 mod config;
 mod daemon;
 mod data_dir;
+pub mod transport;
 
 pub use config::{Config, ConfigError, NodeConfig, Role};
 pub use daemon::{Daemon, StartError};

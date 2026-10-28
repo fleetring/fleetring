@@ -1,0 +1,237 @@
+// The wire contract between FleetRing nodes (ADR-0019). Fields evolve compatibly under protobuf's
+// rules; a breaking change gets a new package version and a new major protocol version.
+//
+// Log positions and batch payloads are opaque bytes that only engine adapters interpret
+// (ADR-0016). Positions compare lexicographically in log order.
+syntax = "proto3";
+
+package fleetring.v1;
+
+// The protocol version a peer speaks. Peers exchange it at Join; a node refuses another major.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// A node's identity and placement attributes.
+message Node {
+  string id = 1;
+  optional string zone = 2;
+  optional string host = 3;
+  uint32 weight = 4;
+}
+
+// The storage engine behind a database (ADR-0021).
+enum Engine {
+  ENGINE_UNSPECIFIED = 0;
+  ENGINE_SQLITE = 1;
+}
+
+// A database's role on the node that reports it.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_PRIMARY = 1;
+  ROLE_FOLLOWER = 2;
+}
+
+// ---- Control ----------------------------------------------------------------------------------
+
+service Control {
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc Locate(LocateRequest) returns (LocateResponse);
+  rpc AcquireLease(AcquireLeaseRequest) returns (LeaseResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (LeaseResponse);
+}
+
+message JoinRequest {
+  ProtocolVersion protocol = 1;
+  Node node = 2;
+}
+
+message JoinResponse {
+  ProtocolVersion protocol = 1;
+  uint64 membership_epoch = 2;
+}
+
+message DatabaseStatus {
+  string database = 1;
+  Role role = 2;
+  uint64 epoch = 3;
+  bytes position = 4;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  repeated DatabaseStatus databases = 2;
+}
+
+message HeartbeatResponse {
+  uint64 membership_epoch = 1;
+}
+
+message WatchMembershipRequest {
+  uint64 after_epoch = 1;
+}
+
+message Member {
+  Node node = 1;
+  bool live = 2;
+}
+
+message MembershipUpdate {
+  uint64 membership_epoch = 1;
+  repeated Member members = 2;
+}
+
+message CreateDatabaseRequest {
+  string database = 1;
+  uint32 replication_factor = 2;
+  Engine engine = 3;
+}
+
+message CreateDatabaseResponse {
+  Placement placement = 1;
+}
+
+message LocateRequest {
+  string database = 1;
+}
+
+message LocateResponse {
+  Placement placement = 1;
+}
+
+message Placement {
+  string database = 1;
+  Engine engine = 2;
+  uint64 epoch = 3;
+  optional string primary = 4;
+  repeated string followers = 5;
+}
+
+message AcquireLeaseRequest {
+  string database = 1;
+  string node_id = 2;
+}
+
+message RenewLeaseRequest {
+  string database = 1;
+  string node_id = 2;
+  uint64 epoch = 3;
+}
+
+message LeaseResponse {
+  string database = 1;
+  uint64 epoch = 2;
+  uint64 expires_at_ms = 3;
+}
+
+// ---- Replication ------------------------------------------------------------------------------
+
+service Replication {
+  // The primary opens one stream per follower and sends batches; the follower acknowledges.
+  rpc Replicate(stream ReplicateMessage) returns (stream ReplicateAck);
+  // A promotion fences a replica at a new epoch and learns its position (ADR-0018).
+  rpc Fence(FenceRequest) returns (FenceResponse);
+  rpc Snapshot(SnapshotRequest) returns (stream SnapshotChunk);
+}
+
+message ReplicateMessage {
+  oneof message {
+    ReplicateOpen open = 1;
+    Batch batch = 2;
+    CheckpointMarker checkpoint = 3;
+  }
+}
+
+message ReplicateOpen {
+  string database = 1;
+  uint64 epoch = 2;
+}
+
+// One or more committed transactions, as the engine encodes them.
+message Batch {
+  uint64 epoch = 1;
+  bytes start = 2;
+  bytes end = 3;
+  bytes payload = 4;
+}
+
+message CheckpointMarker {
+  uint64 epoch = 1;
+  bytes position = 2;
+}
+
+message ReplicateAck {
+  bytes position = 1;
+}
+
+message FenceRequest {
+  string database = 1;
+  uint64 epoch = 2;
+}
+
+message FenceResponse {
+  uint64 epoch = 1;
+  bytes position = 2;
+}
+
+message SnapshotRequest {
+  string database = 1;
+  uint64 epoch = 2;
+}
+
+message SnapshotChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+  // Set on the last chunk: the position the snapshot corresponds to, and a checksum of the file.
+  optional bytes position = 3;
+  optional bytes checksum = 4;
+}
+
+// ---- Database (v0.1 only; the router replaces it) ---------------------------------------------
+
+service Database {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+message Value {
+  oneof value {
+    bool null = 1;
+    sint64 integer = 2;
+    double real = 3;
+    string text = 4;
+    bytes blob = 5;
+  }
+}
+
+message ExecuteRequest {
+  string database = 1;
+  string sql = 2;
+  repeated Value params = 3;
+}
+
+message ExecuteResponse {
+  uint64 rows_affected = 1;
+  uint32 acknowledged_by = 2;
+  bool under_replicated = 3;
+}
+
+message QueryRequest {
+  string database = 1;
+  string sql = 2;
+  repeated Value params = 3;
+}
+
+message Row {
+  repeated Value values = 1;
+}
+
+message QueryResponse {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+}
