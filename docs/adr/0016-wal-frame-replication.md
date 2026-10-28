@@ -18,7 +18,7 @@ Engines replicate in different ways. In WAL mode, SQLite writes each transaction
    - **Frame source:** the engine hands `fleetringd` each committed transaction as a batch, and `fleetringd` ships it to followers and has their engines apply it. Plain SQLite (by reading the WAL) and later libSQL or Turso (by capturing commits inside the engine) take this shape.
    - **Self-replicating:** the engine replicates itself, as Postgres streaming replication or Turso's own sync does. `fleetringd` still places the database, holds its lease, and fences, and asks the engine for each replica's position, but it never touches the payload.
 2. **Positions and payloads are engine-defined.** Everything above the adapter, meaning ADR-0018's quorums and fencing, the control state, the protocol, and migration, sees only:
-   - a **log position**: opaque bytes from the engine, totally ordered by the adapter's compare function, like a Postgres LSN;
+   - a **log position**: opaque bytes from the engine, encoded so that comparing the bytes lexicographically gives log order, as a fixed-width big-endian Postgres LSN does. Control state and failover compare positions without knowing the engine;
    - a **batch payload**: opaque bytes that the engine produces and applies.
 
    SQLite's WAL generations, offsets, and salts stay inside the SQLite adapter.
