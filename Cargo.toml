@@ -1,15 +1,10 @@
-[package]
-name = "fleetring"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+[workspace.package]
 version = "0.0.1"
 edition = "2021"
-description = "Consistent-hashing placement and routing for fleets of SQLite, libSQL, and Turso databases: one database per agent, tenant, or device."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fleetring/fleetring"
 homepage = "https://fleetring.dev"
-documentation = "https://docs.rs/fleetring"
-readme = "README.md"
-keywords = ["sqlite", "libsql", "turso", "consistent-hashing", "distributed"]
-categories = ["database", "algorithms", "network-programming"]
-authors = ["Sam Ruberti"]
-
-[dependencies]
+[workspace.dependencies]
