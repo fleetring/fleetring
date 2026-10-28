@@ -1,6 +1,6 @@
 # ADR-0015: `fleetringd` architecture and crate layout
 
-- **Status:** Proposed (2026-10-28)
+- **Status:** Accepted (2026-10-28)
 - **Date:** 2026-10-28
 - **Related:** ADR-0001, ADR-0009, ADR-0011, ADR-0013, ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0020
 

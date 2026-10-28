@@ -1,6 +1,6 @@
 # ADR-0013: Async boundaries: synchronous placement, async I/O, engine-owned concurrency
 
-- **Status:** Proposed (2026-10-28). The `fleetring` part restates ADR-0001; the rest applies when `fleetringd`, the router, and the client start.
+- **Status:** Accepted (2026-10-28)
 - **Date:** 2026-10-28
 - **Related:** ADR-0001, ADR-0006, ADR-0010, ADR-0011
 

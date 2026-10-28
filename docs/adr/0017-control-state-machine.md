@@ -1,6 +1,6 @@
 # ADR-0017: A control plane built as a deterministic state machine: one node now, Raft later
 
-- **Status:** Proposed (2026-10-28)
+- **Status:** Accepted (2026-10-28)
 - **Date:** 2026-10-28
 - **Related:** ADR-0001, ADR-0013, ADR-0015, ADR-0018, ADR-0019
 

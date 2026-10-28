@@ -21,15 +21,15 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred) |
 | [0011](0011-generic-placement-core.md) | `fleetring` is general-purpose placement infrastructure; the product stays SQLite-focused | Accepted |
 | [0012](0012-cells-nested-placement.md) | Cells: nested placement by composing rings (directory or ring picks the cell, the cell's ring picks nodes) | Accepted |
-| [0013](0013-async-boundaries.md) | Async boundaries: synchronous placement, async I/O, engine-owned concurrency | Proposed |
+| [0013](0013-async-boundaries.md) | Async boundaries: synchronous placement, async I/O, engine-owned concurrency | Accepted |
 | [0014](0014-os-test-matrix.md) | Run the full feature and profile matrix on Linux only | Accepted |
-| [0015](0015-fleetringd-architecture.md) | `fleetringd` architecture and crate layout | Proposed |
-| [0016](0016-wal-frame-replication.md) | Replication through engine adapters, starting with SQLite WAL shipping | Proposed |
-| [0017](0017-control-state-machine.md) | A control plane built as a deterministic state machine: one node now, Raft later | Proposed |
-| [0018](0018-leases-epochs-quorums.md) | Leases, epochs, and quorums: one writer per database, no acknowledged write lost | Proposed |
-| [0019](0019-grpc-transport.md) | Nodes talk gRPC over tonic | Proposed |
-| [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Proposed |
-| [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Proposed |
+| [0015](0015-fleetringd-architecture.md) | `fleetringd` architecture and crate layout | Accepted |
+| [0016](0016-wal-frame-replication.md) | Replication through engine adapters, starting with SQLite WAL shipping | Accepted |
+| [0017](0017-control-state-machine.md) | A control plane built as a deterministic state machine: one node now, Raft later | Accepted |
+| [0018](0018-leases-epochs-quorums.md) | Leases, epochs, and quorums: one writer per database, no acknowledged write lost | Accepted |
+| [0019](0019-grpc-transport.md) | Nodes talk gRPC over tonic | Accepted |
+| [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Accepted |
+| [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Accepted |
 
 ## Template
 
