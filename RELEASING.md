@@ -6,7 +6,7 @@ This is the checklist for publishing the `fleetring` crate (FR-019). A release f
 
 - [ ] Every P0 and P1 ticket in `docs/tickets/README.md` is `done`.
 - [ ] CI is green on `main`, including the cross-target jobs (i686, s390x, wasm32-wasip1) and `spec-reference`.
-- [ ] The `Fuzz` workflow has passed recently. While the repository is private it runs only on demand, so start it from the Actions tab.
+- [ ] The nightly `Fuzz` workflow has passed recently.
 - [ ] `docs/perf.md` reflects current numbers (`cargo bench -p fleetring --bench lookup`).
 
 ## 2. Freeze the placement spec (first release of a spec version only)
