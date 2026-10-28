@@ -24,11 +24,12 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0013](0013-async-boundaries.md) | Async boundaries: synchronous placement, async I/O, engine-owned concurrency | Proposed |
 | [0014](0014-os-test-matrix.md) | Run the full feature and profile matrix on Linux only | Accepted |
 | [0015](0015-fleetringd-architecture.md) | `fleetringd` architecture and crate layout | Proposed |
-| [0016](0016-wal-frame-replication.md) | Replicate each database by shipping its SQLite WAL frames | Proposed |
+| [0016](0016-wal-frame-replication.md) | Replication through engine adapters, starting with SQLite WAL shipping | Proposed |
 | [0017](0017-control-state-machine.md) | A control plane built as a deterministic state machine: one node now, Raft later | Proposed |
 | [0018](0018-leases-epochs-quorums.md) | Leases, epochs, and quorums: one writer per database, no acknowledged write lost | Proposed |
 | [0019](0019-grpc-transport.md) | Nodes talk gRPC over tonic | Proposed |
 | [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Proposed |
+| [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Proposed |
 
 ## Template
 

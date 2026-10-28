@@ -19,7 +19,7 @@ Route every change to control state through one pure, deterministic function, so
 
 - **`fleetring-control`:** `Command`, `State`, `Outcome`, and `apply(&mut State, Command) -> Outcome`, with no I/O, clock, or randomness. Each command carries its control-node timestamp.
 - **Commands:** join, leave, heartbeat (with reported log positions), create a database, acquire a lease, renew a lease, start a promotion, and complete a promotion. Migration commands arrive with MVP step 3.
-- **State:** members with their placement attributes and liveness, the membership epoch, databases with their replication factor, and each database's lease (holder, epoch, and expiry).
+- **State:** members with their placement attributes and liveness, the membership epoch, databases with their replication factor and engine (`sqlite` in v0.1; the field exists for later engines and engine changes, ADR-0021), and each database's lease (holder, epoch, and expiry).
 - **ADR-0018 rules:** epochs only increase, a new epoch is issued only after the current lease has expired plus a margin, and a promotion completes only with a promotion quorum.
 - **Snapshots:** serialize and restore `State` exactly.
 - **Ring:** build the `fleetring::Ring` for the current membership. State never stores computed placement.

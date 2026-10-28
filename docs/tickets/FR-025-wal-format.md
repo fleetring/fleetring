@@ -13,7 +13,7 @@ adrs: [ADR-0016, ADR-0018]
 
 ## Goal
 
-Read, validate, and mirror SQLite WAL files exactly, in a pure synchronous crate (ADR-0016).
+Read, validate, and mirror SQLite WAL files exactly, in a pure synchronous crate (ADR-0016). This is the SQLite adapter's internals: its types encode into the engine-defined position and payload, and never appear above the adapter.
 
 ## Scope
 
