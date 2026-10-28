@@ -346,9 +346,9 @@ impl<'ring, K> Change<'ring, K> {
 
     /// Returns whether the preferred primary differs between the two rings.
     ///
-    /// A primary change means a leadership handoff: a single-leader system such as `fleetringd`
-    /// moves the key's lease from the old primary to the new one. The new primary may already hold a replica, in which case
-    /// no data moves for it.
+    /// A primary change means a leadership handoff: a single-leader system moves the key's lease
+    /// from the old primary to the new one. The new primary may already hold a replica, in which
+    /// case no data moves for it.
     #[must_use]
     pub fn primary_changed(&self) -> bool {
         self.from.primary().id() != self.to.primary().id()

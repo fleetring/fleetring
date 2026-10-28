@@ -10,11 +10,32 @@ use crate::{Node, NodeId};
 
 /// The nodes a key is placed on, best first: the preferred primary, then its followers.
 ///
-/// A replica set is never empty. Its first node is the *preferred* primary; `fleetringd`'s
-/// lease confirms it or fails over to a follower. When the ring has fewer eligible nodes than
-/// the replication factor, the set is shorter and [`is_under_replicated`] returns true.
+/// A replica set is never empty. Its first node is the *preferred* primary: a single-leader
+/// system confirms it with a lease or an election of its own, or fails over to a follower. When
+/// the ring has fewer eligible nodes than the replication factor, the set is shorter and
+/// [`is_under_replicated`] returns true.
 ///
-/// Equality compares the node IDs in order and ignores the replication factor.
+/// Equality compares the node IDs in order and ignores the replication factor. The set displays
+/// as its IDs in order, such as `[node-1, node-2]`.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring::{Node, Ring};
+///
+/// let ring = Ring::builder()
+///     .node(Node::new("node-1".parse()?).with_zone("eu-west-1a".parse()?))
+///     .node(Node::new("node-2".parse()?).with_zone("eu-west-1b".parse()?))
+///     .build()?;
+/// let replicas = ring.replicas("tenant:acme");
+/// // Two nodes can't hold the default three replicas.
+/// assert_eq!(replicas.len(), 2);
+/// assert!(replicas.is_under_replicated());
+/// let follower = replicas.followers().next().ok_or("no follower")?;
+/// assert_ne!(replicas.primary().zone(), follower.zone());
+/// println!("writes go to {}; replicas: {replicas}", replicas.primary().id());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 ///
 /// [`is_under_replicated`]: Self::is_under_replicated
 #[derive(Clone)]

@@ -12,8 +12,9 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 
 ## Planned features
 
-- Consistent hashing with bounded loads: weighted rendezvous (default) or a virtual-node ring
+- Consistent hashing: weighted rendezvous (default) or a virtual-node ring, with identical placement on every platform
 - Placement API: `key → database → node`, with zone-aware replicas
+- Bounded loads, applied when a database is created or moved: it skips nodes that would end up more than a set headroom above their share of bytes or traffic
 - Router that works with existing libSQL and Turso clients
 - Live migration when nodes join or leave, with zero lost writes
 - CLI: `fleetring up`, `node add/remove`, `db create/locate/move`, `status`
@@ -35,6 +36,12 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 - [ ] Live migration
 - [ ] Demo: 10k agents with live rebalancing
 - [ ] Backups and point-in-time restore
+
+## Design docs
+
+- [`docs/adr/`](docs/adr/): architecture decision records, one per decision, explaining why the placement crate works the way it does.
+- [`docs/spec/`](docs/spec/): the placement spec. [Version 1](docs/spec/placement-v1.md) defines placement precisely enough that every implementation, in any language, puts each key on the same nodes. It stays a draft until `fleetring` 0.1.0 freezes it.
+- [`docs/tickets/`](docs/tickets/): the work plan for the placement crate, with each ticket's scope, status, and acceptance criteria.
 
 ## License
 

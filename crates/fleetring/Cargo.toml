@@ -45,6 +45,11 @@ harness = false
 name = "lookup"
 harness = false
 
+# Serializes a ring spec to JSON, so it needs serde support.
+[[example]]
+name = "spec_roundtrip"
+required-features = ["serde"]
+
 [lints]
 workspace = true
 

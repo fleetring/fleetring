@@ -266,10 +266,11 @@ impl<'ring, H> LoadView<'ring, H> {
     ///
     /// The capacity is `⌈(100 + ε) · (total + r · item_load) · w / (100 · W)⌉`: the node's fair
     /// share of the total once all `r` replicas are placed, plus the headroom ε percent. Here
-    /// `total` is [`total_load`](Self::total_load), `r` is the ring's replication factor, `w` is
-    /// the node's weight, and `W` is the ring's total weight. The node has room for the key
-    /// if its load plus `item_load` is at most this. The arithmetic is exact and can't overflow
-    /// for any loads, weights, or headroom.
+    /// `total` is [`total_load`](Self::total_load), `r` is the number of replicas a placement
+    /// creates (the ring's replication factor, or its node count if that is smaller), `w` is the
+    /// node's weight, and `W` is the ring's total weight. The node has room for the key if its
+    /// load plus `item_load` is at most this. The arithmetic is exact and can't overflow for any
+    /// loads, weights, or headroom.
     ///
     /// # Examples
     ///
@@ -463,8 +464,9 @@ impl<'ring> BoundedPlacement<'ring> {
     /// Returns whether the replicas equal the key's home replica set: the same nodes, in the
     /// same order.
     ///
-    /// Clients compute home placement themselves, so when this returns false, the daemon must
-    /// record an override for the key (ADR-0001). A saturated placement can still be home.
+    /// Clients compute home placement themselves, so when this returns false, whatever records
+    /// placements must record an override for the key, and clients that look for it at home must
+    /// be redirected (ADR-0001). A saturated placement can still be home.
     #[must_use]
     pub fn is_home(&self) -> bool {
         self.home

@@ -428,7 +428,7 @@ impl<H: StableHasher> RingBuilder<H> {
     /// - there are no nodes ([`BuildRingError::NoNodes`]);
     /// - there are more than `u32::MAX` nodes ([`BuildRingError::TooManyNodes`]);
     /// - two nodes share an ID ([`BuildRingError::DuplicateNode`]);
-    /// - a host label appears in more than one zone ([`BuildRingError::HostInMultipleZones`]).
+    /// - a host label appears in more than one zone ([`BuildRingError::HostInMultipleZones`]);
     /// - a [`Strategy::Vnodes`] ring would need more than 2²² tokens
     ///   ([`BuildRingError::TooManyTokens`]).
     ///

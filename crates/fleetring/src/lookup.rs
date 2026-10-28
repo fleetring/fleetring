@@ -127,6 +127,21 @@ impl<H: StableHasher> Ring<H> {
     ///
     /// The first R nodes are [`replicas`](Self::replicas). Later nodes are where traffic or
     /// data goes when earlier ones are unavailable. Unlike `replicas`, this allocates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring::{Node, Ring};
+    ///
+    /// let ring = Ring::builder()
+    ///     .nodes(["a", "b", "c", "d"].map(|id| Node::new(id.parse().expect("valid id"))))
+    ///     .build()?;
+    /// assert_eq!(ring.preference("room:42").len(), 4);
+    /// // The replica set is the list's first R nodes.
+    /// let replicas = ring.replicas("room:42");
+    /// assert!(ring.preference("room:42").take(3).eq(&replicas));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn preference(&self, key: impl AsRef<[u8]>) -> Preference<'_> {
         self.preference_where(key, |_| true)
@@ -136,6 +151,22 @@ impl<H: StableHasher> Ring<H> {
     ///
     /// Filtering happens before zone and host spreading, exactly as in
     /// [`replicas_where`](Self::replicas_where). `eligible` is called once per node.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring::{Node, Ring};
+    ///
+    /// let ring = Ring::builder()
+    ///     .nodes(["a", "b", "c", "d"].map(|id| Node::new(id.parse().expect("valid id"))))
+    ///     .build()?;
+    /// let all: Vec<&Node> = ring.preference("room:42").collect();
+    /// let down = all[0].id();
+    /// let live: Vec<&Node> = ring.preference_where("room:42", |node| node.id() != down).collect();
+    /// // Without zones or hosts to spread over, filtering only skips the rejected nodes.
+    /// assert_eq!(live, all[1..]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn preference_where<F>(&self, key: impl AsRef<[u8]>, mut eligible: F) -> Preference<'_>
     where
         F: FnMut(&Node) -> bool,

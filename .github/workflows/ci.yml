@@ -62,6 +62,14 @@ jobs:
         run: cargo test --workspace --no-default-features --no-fail-fast
       - name: all features, release
         run: cargo test --workspace --all-features --release --no-fail-fast
+      # Runs every example, so a new one can't be left out. `cargo test` already builds them
+      # on every OS, so running them on one is enough.
+      - name: examples
+        if: runner.os == 'Linux'
+        run: |
+          for example in crates/fleetring/examples/*.rs; do
+            cargo run -p fleetring --all-features --example "$(basename "$example" .rs)"
+          done
 
   statistics:
     name: statistical suite (release)
