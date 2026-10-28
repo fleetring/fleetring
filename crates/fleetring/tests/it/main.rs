@@ -3,6 +3,7 @@
 
 mod bounded;
 mod cells;
+mod cells_spec;
 mod common;
 mod diagnostics;
 mod diff;

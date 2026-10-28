@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Cells specs.** `CellsSpec` describes a cells layer portably, as `RingSpec` does a ring. `Cells::to_spec` writes one, and `Cells::from_spec(&spec, hasher)` rebuilds the layer, checking the fingerprint of every layer and ring inside and reporting failures as `FromCellsSpecError` with the path of the failing cell. Specs nest through `PlacementSpec`, so `Cells<Ring>` and `Cells<Cells<Ring>>` both round-trip, and a spec whose depth doesn't match the type is rejected.
+- With the `serde` feature, `Directory` and `CellsSpec` serialize to JSON. A rule's key or prefix is a string when its bytes are valid UTF-8, and `{"hex": "…"}` otherwise. Malformed hex, unknown directory fields, and duplicate rules are rejected.
+
 ## [0.1.0] - 2026-10-28
 
 The first functional release of the placement crate. It freezes placement spec v1.

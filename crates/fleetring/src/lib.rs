@@ -201,7 +201,8 @@
 //! weights are explicit, so changes inside a cell never move keys to another cell, and
 //! [`Cells::diff`] tells cross-cell moves from in-cell changes. Every layer hashes keys with its
 //! own seed: [`CellsBuilder::build`] rejects a ring that shares its seed with a selector ring
-//! above it.
+//! above it. Layers travel as rings do: [`Cells::to_spec`] writes a [`CellsSpec`], and
+//! [`Cells::from_spec`] reads it back and checks the fingerprint of every layer and ring inside.
 //!
 //! ```
 //! use fleetring::{Cells, Directory, Node, Ring};
@@ -297,7 +298,7 @@
 //! | Feature | Default | Enables |
 //! |---|---|---|
 //! | `std` | yes | Nothing yet: it is reserved so that `no_std` + `alloc` support can land without breaking builds that set `default-features = false`. |
-//! | `serde` | no | `Serialize` and `Deserialize` for [`RingSpec`], the types it holds, and [`CellId`], so rings can be stored and shipped. Deserializing validates every value and ignores unknown fields. |
+//! | `serde` | no | `Serialize` and `Deserialize` for [`RingSpec`], [`CellsSpec`], and the types they hold, such as [`Directory`] and [`CellId`], so rings and cells layers can be stored and shipped. Deserializing validates every value and ignores unknown fields, except in a [`Directory`], which rejects them. |
 //! | `test-util` | no | The `test_util` module of test doubles, such as a hasher whose outputs a test chooses. Never enable it in production builds. |
 //!
 //! [architecture decision records]: https://github.com/fleetring/fleetring/tree/main/docs/adr
@@ -312,6 +313,7 @@
 mod bounded;
 mod cell_diff;
 mod cells;
+mod cells_spec;
 mod diagnostics;
 mod diff;
 mod directory;
@@ -338,6 +340,7 @@ mod vnodes;
 pub use bounded::{BoundedLoads, BoundedPlacement, Headroom, LoadView, LoadViewError};
 pub use cell_diff::{CellChange, CellMovementSummary, CellsDiff};
 pub use cells::{BuildCellsError, CellPlacement, Cells, CellsBuilder, Placement};
+pub use cells_spec::{CellSpec, CellsSpec, FromCellsSpecError, PlacementSpec};
 pub use diagnostics::{Diagnostic, NodeShare, Severity};
 pub use diff::{Change, Diff, MovementSummary};
 pub use directory::Directory;
@@ -363,16 +366,19 @@ const _: () = {
     assert_send_sync::<CellId>();
     assert_send_sync::<CellMovementSummary>();
     assert_send_sync::<CellPlacement<'static>>();
+    assert_send_sync::<CellSpec>();
     assert_send_sync::<Cells<Ring<Xxh3>>>();
     assert_send_sync::<Cells<Cells<Ring<Xxh3>>>>();
     assert_send_sync::<CellsBuilder<Ring<Xxh3>>>();
     assert_send_sync::<CellsDiff<'static, Ring<Xxh3>, std::vec::IntoIter<Vec<u8>>>>();
+    assert_send_sync::<CellsSpec>();
     assert_send_sync::<Change<'static, Vec<u8>>>();
     assert_send_sync::<Diagnostic>();
     assert_send_sync::<Diff<'static, Xxh3, std::vec::IntoIter<Vec<u8>>>>();
     assert_send_sync::<Directory>();
     assert_send_sync::<Epoch>();
     assert_send_sync::<Fingerprint>();
+    assert_send_sync::<FromCellsSpecError>();
     assert_send_sync::<FromSpecError>();
     assert_send_sync::<Headroom>();
     assert_send_sync::<Host>();
@@ -385,6 +391,7 @@ const _: () = {
     assert_send_sync::<NodeSpec>();
     assert_send_sync::<ParseFingerprintError>();
     assert_send_sync::<ParseLabelError>();
+    assert_send_sync::<PlacementSpec>();
     assert_send_sync::<Preference<'static>>();
     assert_send_sync::<ReplicaIter<'static>>();
     assert_send_sync::<ReplicaSet<'static>>();

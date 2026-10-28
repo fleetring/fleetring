@@ -1,0 +1,108 @@
+{
+  "format": 1,
+  "directory": {
+    "exact": [
+      {
+        "key": {
+          "hex": "ff00"
+        },
+        "cell": "us"
+      }
+    ],
+    "prefix": [
+      {
+        "prefix": "eu:",
+        "cell": "eu"
+      }
+    ]
+  },
+  "ring_selector": {
+    "format": 1,
+    "epoch": 0,
+    "hasher": "xxh3-64",
+    "seed": 7,
+    "strategy": {
+      "kind": "rendezvous"
+    },
+    "replication_factor": 3,
+    "nodes": [
+      {
+        "id": "eu",
+        "weight": 1,
+        "zone": null,
+        "host": null
+      },
+      {
+        "id": "us",
+        "weight": 2,
+        "zone": null,
+        "host": null
+      }
+    ],
+    "fingerprint": "04ea9bf2306fcee1"
+  },
+  "cells": [
+    {
+      "id": "eu",
+      "placement": {
+        "ring": {
+          "format": 1,
+          "epoch": 0,
+          "hasher": "xxh3-64",
+          "seed": 1,
+          "strategy": {
+            "kind": "rendezvous"
+          },
+          "replication_factor": 3,
+          "nodes": [
+            {
+              "id": "eu-1",
+              "weight": 1,
+              "zone": null,
+              "host": null
+            },
+            {
+              "id": "eu-2",
+              "weight": 1,
+              "zone": null,
+              "host": null
+            }
+          ],
+          "fingerprint": "526a9c2fc56b641a"
+        }
+      }
+    },
+    {
+      "id": "us",
+      "placement": {
+        "ring": {
+          "format": 1,
+          "epoch": 0,
+          "hasher": "xxh3-64",
+          "seed": 2,
+          "strategy": {
+            "kind": "vnodes",
+            "tokens_per_weight": 4
+          },
+          "replication_factor": 3,
+          "nodes": [
+            {
+              "id": "us-1",
+              "weight": 1,
+              "zone": "us-a",
+              "host": null
+            },
+            {
+              "id": "us-2",
+              "weight": 1,
+              "zone": "us-b",
+              "host": null
+            }
+          ],
+          "fingerprint": "401954efbda72fa6"
+        }
+      }
+    }
+  ],
+  "fingerprint": "fc2140c9fce878d5"
+}

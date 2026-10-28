@@ -4,7 +4,7 @@ Three libFuzzer targets check that no input reaching `fleetring` from outside ca
 
 | Target | Input | Checks |
 |---|---|---|
-| `spec_json` | arbitrary bytes, parsed as a JSON `RingSpec` | `Ring::from_spec` never panics; every spec that loads round-trips to the same fingerprint |
+| `spec_json` | arbitrary bytes, parsed as a JSON `RingSpec` and as a `CellsSpec` | `Ring::from_spec` and `Cells::from_spec` never panic; every spec that loads round-trips to the same fingerprint |
 | `builder` | arbitrary memberships and keys | `build()` returns `Ok` or `Err`, never panics; replica sets are distinct, sized `min(R, N)`, and a prefix of the preference list; filters exclude rejected nodes |
 | `lookup` | an arbitrary ring, key, liveness bitmap, and loads | filters exclude down nodes; bounded placements are full, distinct, and never over capacity unless flagged as saturated |
 

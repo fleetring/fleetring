@@ -17,7 +17,8 @@ categories = ["algorithms", "data-structures", "network-programming"]
 default = ["std"]
 # Reserved so `no_std + alloc` support can land without breaking `default-features = false` users.
 std = []
-# serde support for `RingSpec` and the types it holds, so rings can be stored and shipped (ADR-0008).
+# serde support for `RingSpec`, `CellsSpec`, and the types they hold, so rings and cells layers can be
+# stored and shipped (ADR-0008).
 serde = ["dep:serde"]
 # Test doubles for downstream tests. Never enable in production builds.
 test-util = []

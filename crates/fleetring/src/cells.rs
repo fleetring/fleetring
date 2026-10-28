@@ -31,7 +31,8 @@ use std::fmt;
 use smallvec::SmallVec;
 
 use crate::{
-    CellId, Directory, Fingerprint, Node, NodeId, Preference, ReplicaSet, Ring, StableHasher, Xxh3,
+    CellId, Directory, Fingerprint, FromCellsSpecError, Node, NodeId, PlacementSpec, Preference,
+    ReplicaSet, Ring, StableHasher, Xxh3,
 };
 
 /// The cells on a key's path, top to leaf. Paths up to four layers deep don't allocate.
@@ -110,6 +111,29 @@ pub trait Placement: sealed::Sealed {
     /// Returns whether any ring in the placement, at any depth, hashes with `seed`.
     #[doc(hidden)]
     fn hashes_with_seed(&self, seed: u64) -> bool;
+
+    /// Returns the placement's spec: a ring's [`RingSpec`](crate::RingSpec), or a layer's
+    /// [`CellsSpec`](crate::CellsSpec).
+    #[doc(hidden)]
+    fn to_placement_spec(&self) -> PlacementSpec;
+
+    /// Rebuilds a placement of this type from `spec`, giving every ring a clone of `hasher`.
+    /// `path` names the cell that holds the placement, top layer first, for errors.
+    #[doc(hidden)]
+    fn from_placement_spec(
+        spec: &PlacementSpec,
+        hasher: &Self::Hasher,
+        path: &mut Vec<CellId>,
+    ) -> Result<Self, FromCellsSpecError>
+    where
+        Self: Sized,
+        Self::Hasher: Clone;
+
+    /// Returns the number of layers on a key's path through this type: 0 for a ring.
+    #[doc(hidden)]
+    fn depth() -> usize
+    where
+        Self: Sized;
 }
 
 mod sealed {
@@ -134,6 +158,37 @@ impl<H: StableHasher> Placement for Ring<H> {
 
     fn hashes_with_seed(&self, seed: u64) -> bool {
         self.seed() == seed
+    }
+
+    fn to_placement_spec(&self) -> PlacementSpec {
+        PlacementSpec::Ring(self.to_spec())
+    }
+
+    fn from_placement_spec(
+        spec: &PlacementSpec,
+        hasher: &H,
+        path: &mut Vec<CellId>,
+    ) -> Result<Self, FromCellsSpecError>
+    where
+        H: Clone,
+    {
+        match spec {
+            PlacementSpec::Ring(ring) => Ring::from_spec(ring, hasher.clone()).map_err(|source| {
+                FromCellsSpecError::InvalidRing {
+                    path: path.clone(),
+                    source,
+                }
+            }),
+            PlacementSpec::Cells(_) => Err(FromCellsSpecError::DepthMismatch {
+                path: path.clone(),
+                expected: 0,
+                found: spec.depth(),
+            }),
+        }
+    }
+
+    fn depth() -> usize {
+        0
     }
 }
 
@@ -589,24 +644,11 @@ impl<P: Placement> Cells<P> {
     /// than `u32::MAX` bytes, which the encoding can't represent.
     #[must_use]
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut out = Encoder::default();
-        out.put_raw(LAYER_TAG);
-        out.put_u8(MODE_WITHIN);
-        out.put_rules(self.directory.exact_rules());
-        out.put_rules(self.directory.prefix_rules());
-        match &self.ring {
-            None => out.put_u8(0),
-            Some(ring) => {
-                out.put_u8(1);
-                out.put_u64(ring.fingerprint().get());
-            }
-        }
-        out.put_len(self.cells.len());
-        for (id, cell) in &self.cells {
-            out.put_bytes(id.as_str().as_bytes());
-            out.put_u64(cell.fingerprint().get());
-        }
-        Fingerprint::new(Xxh3.hash(&out.bytes, FINGERPRINT_SEED))
+        layer_fingerprint(
+            &self.directory,
+            self.ring.as_ref().map(Ring::fingerprint),
+            self.cells.iter().map(|(id, cell)| (id, cell.fingerprint())),
+        )
     }
 
     /// Returns the cell this layer's selector picks for `key`: directory rules first, then the
@@ -658,6 +700,62 @@ impl<P: Placement> Placement for Cells<P> {
                 .iter()
                 .any(|(_, cell)| cell.hashes_with_seed(seed))
     }
+
+    fn to_placement_spec(&self) -> PlacementSpec {
+        PlacementSpec::Cells(self.to_spec())
+    }
+
+    fn from_placement_spec(
+        spec: &PlacementSpec,
+        hasher: &P::Hasher,
+        path: &mut Vec<CellId>,
+    ) -> Result<Self, FromCellsSpecError>
+    where
+        P::Hasher: Clone,
+    {
+        match spec {
+            PlacementSpec::Cells(layer) => Self::from_spec_at(layer, hasher, path),
+            PlacementSpec::Ring(_) => Err(FromCellsSpecError::DepthMismatch {
+                path: path.clone(),
+                expected: Self::depth(),
+                found: 0,
+            }),
+        }
+    }
+
+    fn depth() -> usize {
+        P::depth() + 1
+    }
+}
+
+/// Computes the fingerprint of a layer from its directory, its selector ring's fingerprint if it
+/// has a selector ring, and its cells' IDs and fingerprints, which must come sorted by ID.
+///
+/// This is the encoding the module docs define. A layer's own fingerprint passes the fingerprints
+/// it computes; a spec's fingerprint check passes the ones the spec stores, once they are checked.
+pub(crate) fn layer_fingerprint<'c>(
+    directory: &Directory,
+    selector: Option<Fingerprint>,
+    cells: impl ExactSizeIterator<Item = (&'c CellId, Fingerprint)>,
+) -> Fingerprint {
+    let mut out = Encoder::default();
+    out.put_raw(LAYER_TAG);
+    out.put_u8(MODE_WITHIN);
+    out.put_rules(directory.exact_rules());
+    out.put_rules(directory.prefix_rules());
+    match selector {
+        None => out.put_u8(0),
+        Some(fingerprint) => {
+            out.put_u8(1);
+            out.put_u64(fingerprint.get());
+        }
+    }
+    out.put_len(cells.len());
+    for (id, fingerprint) in cells {
+        out.put_bytes(id.as_str().as_bytes());
+        out.put_u64(fingerprint.get());
+    }
+    Fingerprint::new(Xxh3.hash(&out.bytes, FINGERPRINT_SEED))
 }
 
 // Not derived: the derive would require `P: Clone` but not `P::Hasher: Clone`, which the selector

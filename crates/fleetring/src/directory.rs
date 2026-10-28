@@ -26,6 +26,16 @@ use crate::CellId;
 /// the order they were added in. A key or prefix has at most one rule of each kind: adding a
 /// second rule for it replaces the first.
 ///
+/// With the `serde` feature, a directory serializes as an object with two lists of rules,
+/// `exact` and `prefix`, each sorted by bytes. An exact rule is an object with the fields `key`
+/// and `cell`, and a prefix rule one with the fields `prefix` and `cell`; the catch-all is the
+/// prefix rule whose prefix is `""`. Keys and prefixes are bytes, so each is written as a string
+/// when its bytes are valid UTF-8, and otherwise as an object that holds them as lowercase hex
+/// digits, two per byte: `{"hex": "ff00"}`. Deserializing reads either form for any rule. It
+/// rejects malformed hex, unknown fields, and two rules of the same kind for the same bytes, in
+/// whichever forms they are written: a directory carries no fingerprint of its own that would
+/// catch a rule dropped or replaced on the way.
+///
 /// # Examples
 ///
 /// ```
@@ -45,6 +55,30 @@ use crate::CellId;
 /// assert_eq!(cell("eu:vip:legacy"), Some("eu"));
 /// // Every other key falls through to the catch-all, including keys that differ only in case.
 /// assert_eq!(cell("EU:tenant:acme"), Some("us"));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// With the `serde` feature, a directory round-trips through JSON, with non-UTF-8 bytes as hex:
+///
+/// ```
+/// # use fleetring::Directory;
+/// # #[cfg(feature = "serde")]
+/// # {
+/// let directory = Directory::new()
+///     .exact([0xff, 0x00], "us".parse()?)
+///     .prefix("eu:", "eu".parse()?)
+///     .catch_all("us".parse()?);
+/// let json = serde_json::to_string(&directory)?;
+/// assert_eq!(
+///     json,
+///     concat!(
+///         r#"{"exact":[{"key":{"hex":"ff00"},"cell":"us"}],"#,
+///         r#""prefix":[{"prefix":"","cell":"us"},{"prefix":"eu:","cell":"eu"}]}"#,
+///     )
+/// );
+/// let copy: Directory = serde_json::from_str(&json)?;
+/// assert_eq!(copy, directory);
+/// # }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Default, PartialEq, Eq)]

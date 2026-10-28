@@ -1,0 +1,159 @@
+{
+  "format": 1,
+  "directory": {
+    "exact": [],
+    "prefix": [
+      {
+        "prefix": "",
+        "cell": "us"
+      },
+      {
+        "prefix": "eu:",
+        "cell": "eu"
+      }
+    ]
+  },
+  "ring_selector": null,
+  "cells": [
+    {
+      "id": "eu",
+      "placement": {
+        "cells": {
+          "format": 1,
+          "directory": {
+            "exact": [],
+            "prefix": []
+          },
+          "ring_selector": {
+            "format": 1,
+            "epoch": 0,
+            "hasher": "xxh3-64",
+            "seed": 20,
+            "strategy": {
+              "kind": "rendezvous"
+            },
+            "replication_factor": 3,
+            "nodes": [
+              {
+                "id": "eu-1",
+                "weight": 1,
+                "zone": null,
+                "host": null
+              },
+              {
+                "id": "eu-2",
+                "weight": 1,
+                "zone": null,
+                "host": null
+              }
+            ],
+            "fingerprint": "cb4528ca3bfc6396"
+          },
+          "cells": [
+            {
+              "id": "eu-1",
+              "placement": {
+                "ring": {
+                  "format": 1,
+                  "epoch": 0,
+                  "hasher": "xxh3-64",
+                  "seed": 21,
+                  "strategy": {
+                    "kind": "rendezvous"
+                  },
+                  "replication_factor": 3,
+                  "nodes": [
+                    {
+                      "id": "a1",
+                      "weight": 1,
+                      "zone": null,
+                      "host": null
+                    }
+                  ],
+                  "fingerprint": "652fdb0b05cc5c13"
+                }
+              }
+            },
+            {
+              "id": "eu-2",
+              "placement": {
+                "ring": {
+                  "format": 1,
+                  "epoch": 0,
+                  "hasher": "xxh3-64",
+                  "seed": 22,
+                  "strategy": {
+                    "kind": "rendezvous"
+                  },
+                  "replication_factor": 3,
+                  "nodes": [
+                    {
+                      "id": "b1",
+                      "weight": 1,
+                      "zone": null,
+                      "host": null
+                    },
+                    {
+                      "id": "b2",
+                      "weight": 1,
+                      "zone": null,
+                      "host": null
+                    }
+                  ],
+                  "fingerprint": "1853cd8131e1874e"
+                }
+              }
+            }
+          ],
+          "fingerprint": "c0934fe01d81501d"
+        }
+      }
+    },
+    {
+      "id": "us",
+      "placement": {
+        "cells": {
+          "format": 1,
+          "directory": {
+            "exact": [],
+            "prefix": [
+              {
+                "prefix": "",
+                "cell": "us-1"
+              }
+            ]
+          },
+          "ring_selector": null,
+          "cells": [
+            {
+              "id": "us-1",
+              "placement": {
+                "ring": {
+                  "format": 1,
+                  "epoch": 0,
+                  "hasher": "xxh3-64",
+                  "seed": 30,
+                  "strategy": {
+                    "kind": "rendezvous"
+                  },
+                  "replication_factor": 3,
+                  "nodes": [
+                    {
+                      "id": "c1",
+                      "weight": 1,
+                      "zone": null,
+                      "host": null
+                    }
+                  ],
+                  "fingerprint": "4b7ab9694a97715e"
+                }
+              }
+            }
+          ],
+          "fingerprint": "6ef6c17e0801c861"
+        }
+      }
+    }
+  ],
+  "fingerprint": "db47e109b22716e9"
+}

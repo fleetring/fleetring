@@ -1,4 +1,4 @@
-//! The golden placement vectors through the public API (FR-014, FR-020, ADR-0008).
+//! The golden placement vectors through the public API (FR-014, FR-020, FR-021, ADR-0008).
 //!
 //! `tests/vectors/placement-v1.json` pins placement spec v1, and describes its own layout in
 //! its `layout` field. Most cases place keys on a ring; cells cases place them on a cells layer
@@ -110,9 +110,14 @@ trait Layer {
     fn cell_of(&self, key: &[u8]) -> String;
     fn primary(&self, key: &[u8]) -> String;
     fn layer_fingerprint(&self) -> Fingerprint;
+    /// The layer rebuilt from its own `CellsSpec`.
+    fn rebuilt_from_spec(&self) -> Box<dyn Layer>;
+    /// The layer rebuilt from the JSON text of its own `CellsSpec`.
+    #[cfg(feature = "serde")]
+    fn rebuilt_from_json(&self) -> Box<dyn Layer>;
 }
 
-impl<P: Placement<Hasher = Xxh3>> Layer for Cells<P> {
+impl<P: Placement<Hasher = Xxh3> + 'static> Layer for Cells<P> {
     fn place(&self, key: &[u8]) -> (Vec<String>, Vec<String>) {
         let placed = self.replicas(key);
         (path_ids(&placed), owned_ids(placed.replicas()))
@@ -135,6 +140,26 @@ impl<P: Placement<Hasher = Xxh3>> Layer for Cells<P> {
 
     fn layer_fingerprint(&self) -> Fingerprint {
         self.fingerprint()
+    }
+
+    fn rebuilt_from_spec(&self) -> Box<dyn Layer> {
+        let spec = self.to_spec();
+        assert_eq!(
+            spec.fingerprint,
+            self.fingerprint(),
+            "the spec stores the fingerprint"
+        );
+        Box::new(Cells::<P>::from_spec(&spec, Xxh3).expect("a layer's own spec loads"))
+    }
+
+    #[cfg(feature = "serde")]
+    fn rebuilt_from_json(&self) -> Box<dyn Layer> {
+        let spec = self.to_spec();
+        let json = serde_json::to_string_pretty(&spec).expect("a spec serializes");
+        let parsed: fleetring::CellsSpec =
+            serde_json::from_str(&json).expect("a written spec parses");
+        assert_eq!(parsed, spec, "the JSON text holds the whole spec");
+        Box::new(Cells::<P>::from_spec(&parsed, Xxh3).expect("a parsed spec loads"))
     }
 }
 
@@ -615,6 +640,47 @@ fn every_cells_filter_keeps_the_path_and_matches_its_replicas() {
                 );
             }
         }
+    }
+}
+
+/// Asserts that `rebuilt`, the layer of `case` rebuilt from `form`, has the case's fingerprint
+/// and gives every key of the case the path and replicas that `layer` does.
+fn assert_rebuilt(case: &Case, layer: &dyn Layer, rebuilt: &dyn Layer, form: &str) {
+    let at = format!("{}: rebuilt from {form}", case.name);
+    assert_eq!(
+        rebuilt.layer_fingerprint().to_string(),
+        text(&case.value["fingerprint"]),
+        "{at}: fingerprint"
+    );
+    for entry in array(&case.value["keys"]) {
+        let key = key_bytes(&entry["key"]);
+        assert_eq!(
+            rebuilt.place(&key),
+            layer.place(&key),
+            "{at}: key {}",
+            entry["key"]
+        );
+    }
+}
+
+/// FR-021: every cells layer rebuilds from its `CellsSpec` with the vector's fingerprint.
+#[test]
+fn every_cells_layer_round_trips_through_its_spec() {
+    for case in cells_cases() {
+        let layer = cells_layer(&case);
+        assert_rebuilt(&case, &*layer, &*layer.rebuilt_from_spec(), "its spec");
+    }
+}
+
+/// FR-021: every cells layer rebuilds from its `CellsSpec`'s JSON text with the vector's
+/// fingerprint. The first case's directory has an empty exact key, a catch-all, and a non-UTF-8
+/// prefix, so the JSON holds every form of rule.
+#[cfg(feature = "serde")]
+#[test]
+fn every_cells_layer_round_trips_through_json_text() {
+    for case in cells_cases() {
+        let layer = cells_layer(&case);
+        assert_rebuilt(&case, &*layer, &*layer.rebuilt_from_json(), "its JSON text");
     }
 }
 
