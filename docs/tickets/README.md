@@ -115,3 +115,4 @@ The critical path is: FR-001 → FR-003 / FR-004 / FR-005 (parallel) → FR-007 
 - **WASM bindings and the ring playground**, plus TypeScript and Python conformance kits built from the vectors.
 - **Client-side override cache**: home placement plus redirects, with a cache of actual placements.
 - **Load-aware rebalance planner** for hot-spot moves in `fleetringd` v0.2.
+- **Replica anti-entropy** ([ADR-0010](../adr/0010-replica-anti-entropy-hash-trees.md), proposed). An incremental XOR page checksum proves a follower matches its primary, and an on-demand, page-level BLAKE3 hash tree repairs only the pages that drifted. This belongs in the replication crate, not in `fleetring`.

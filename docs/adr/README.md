@@ -18,6 +18,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0007](0007-bounded-loads-policy.md) | Bounded loads as a deterministic policy applied at assignment time | Accepted |
 | [0008](0008-placement-spec-vectors-fingerprints.md) | Versioned placement spec, golden vectors, and ring fingerprints | Accepted |
 | [0009](0009-toolchain-lints-ci.md) | Toolchain, lint, dependency, and CI policy | Accepted |
+| [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred) |
 
 ## Template
 
