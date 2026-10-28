@@ -17,16 +17,20 @@ categories = ["database", "algorithms", "network-programming"]
 default = ["std"]
 # Reserved so `no_std + alloc` support can land without breaking `default-features = false` users.
 std = []
+# serde support for `RingSpec` and the types it holds, so rings can be stored and shipped (ADR-0008).
+serde = ["dep:serde"]
 # Test doubles for downstream tests. Never enable in production builds.
 test-util = []
 
 [dependencies]
+serde = { workspace = true, optional = true }
 smallvec.workspace = true
 thiserror.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 
 # dhat counts heap allocations for the allocation-free lookup check; it doesn't target wasm.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]

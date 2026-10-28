@@ -1,0 +1,37 @@
+{
+  "format": 1,
+  "epoch": 7,
+  "hasher": "xxh3-64",
+  "seed": 42,
+  "strategy": {
+    "kind": "rendezvous"
+  },
+  "replication_factor": 2,
+  "nodes": [
+    {
+      "id": "laptop-1",
+      "weight": 1,
+      "zone": "home",
+      "host": "desk"
+    },
+    {
+      "id": "laptop-2",
+      "weight": 1,
+      "zone": "home",
+      "host": "desk"
+    },
+    {
+      "id": "nas",
+      "weight": 4,
+      "zone": "garage",
+      "host": "nas.local"
+    },
+    {
+      "id": "vps",
+      "weight": 2,
+      "zone": null,
+      "host": null
+    }
+  ],
+  "fingerprint": "71699bba8f0655ae"
+}

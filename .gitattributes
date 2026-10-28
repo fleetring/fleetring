@@ -1,0 +1,2 @@
+# Golden vectors and spec fixtures are compared byte for byte; keep them LF on every OS.
+*.json text eol=lf

@@ -8,4 +8,5 @@ mod hasher;
 mod labels;
 mod placement;
 mod ring;
+mod spec;
 mod vnodes;

@@ -25,6 +25,9 @@ mod rendezvous;
 mod replica;
 mod ring;
 mod select;
+#[cfg(feature = "serde")]
+mod serde_impls;
+mod spec;
 mod strategy;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
@@ -38,6 +41,9 @@ pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
 pub use node::{Node, Weight};
 pub use replica::{Preference, ReplicaIter, ReplicaSet, ReplicationFactor};
 pub use ring::{BuildRingError, Ring, RingBuilder};
+pub use spec::{
+    Fingerprint, FromSpecError, NodeSpec, ParseFingerprintError, RingSpec, StrategySpec,
+};
 pub use strategy::{Strategy, VnodeParams};
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
@@ -49,6 +55,8 @@ const _: () = {
     assert_send_sync::<Change<'static, Vec<u8>>>();
     assert_send_sync::<Diff<'static, Xxh3, std::vec::IntoIter<Vec<u8>>>>();
     assert_send_sync::<Epoch>();
+    assert_send_sync::<Fingerprint>();
+    assert_send_sync::<FromSpecError>();
     assert_send_sync::<Headroom>();
     assert_send_sync::<Host>();
     assert_send_sync::<LoadView<'static, Xxh3>>();
@@ -56,6 +64,8 @@ const _: () = {
     assert_send_sync::<MovementSummary>();
     assert_send_sync::<Node>();
     assert_send_sync::<NodeId>();
+    assert_send_sync::<NodeSpec>();
+    assert_send_sync::<ParseFingerprintError>();
     assert_send_sync::<ParseLabelError>();
     assert_send_sync::<Preference<'static>>();
     assert_send_sync::<ReplicaIter<'static>>();
@@ -63,7 +73,9 @@ const _: () = {
     assert_send_sync::<ReplicationFactor>();
     assert_send_sync::<Ring<Xxh3>>();
     assert_send_sync::<RingBuilder>();
+    assert_send_sync::<RingSpec>();
     assert_send_sync::<Strategy>();
+    assert_send_sync::<StrategySpec>();
     assert_send_sync::<VnodeParams>();
     assert_send_sync::<Weight>();
     assert_send_sync::<Xxh3>();

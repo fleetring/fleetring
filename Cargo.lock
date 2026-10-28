@@ -98,6 +98,8 @@ version = "0.0.1"
 dependencies = [
  "dhat",
  "proptest",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror",
  "twox-hash",

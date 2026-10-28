@@ -1,7 +1,7 @@
 ---
 id: FR-013
 title: RingSpec, canonical encoding, fingerprint, and serde support
-status: todo
+status: done
 priority: P0
 size: M
 milestone: M3 Change and interop
@@ -34,12 +34,25 @@ Make rings portable. `fleetringd` stores them in the control db and ships them t
 
 ## Acceptance criteria
 
-- [ ] **Round trip:** `Ring::from_spec(&ring.to_spec(), h)` gives the same placements over a corpus and the same fingerprint, for every strategy that exists.
-- [ ] Changing any field that affects placement changes the fingerprint: seed, a weight, a zone, a host, R, strategy parameters, or the hasher. Changing only the epoch does not (proptest).
-- [ ] A spec whose stored fingerprint doesn't match is rejected with `FingerprintMismatch`. So is a correct spec loaded with a different seed.
-- [ ] `tests/fixtures/ring-spec-v1.json` deserializes, and re-serializing the same ring reproduces it byte for byte. This locks field names and field order.
-- [ ] Invalid labels or a zero weight in JSON produce a clear error, never a panic.
+- [x] **Round trip:** `Ring::from_spec(&ring.to_spec(), h)` gives the same placements over a corpus and the same fingerprint, for every strategy that exists.
+- [x] Changing any field that affects placement changes the fingerprint: seed, a weight, a zone, a host, R, strategy parameters, or the hasher. Changing only the epoch does not (proptest).
+- [x] A spec whose stored fingerprint doesn't match is rejected with `FingerprintMismatch`. So is a correct spec loaded with a different seed.
+- [x] `tests/fixtures/ring-spec-v1.json` deserializes, and re-serializing the same ring reproduces it byte for byte. This locks field names and field order.
+- [x] Invalid labels or a zero weight in JSON produce a clear error, never a panic.
 
 ## Notes
 
 - This ticket is P0 because `fleetringd` needs specs from day one. If FR-010 hasn't landed yet, it adds the vnode parameters later.
+
+## Progress
+
+- 2026-10-28: Done. A subagent built it in an isolated copy, and I merged it, extended it to vnodes, and re-verified it.
+  - **API:** `RingSpec`, `NodeSpec`, and `StrategySpec` (public fields, `#[non_exhaustive]`); `Fingerprint` (16 hex digits); `FromSpecError`; `Ring::to_spec`, `Ring::from_spec`, and `Ring::fingerprint`.
+  - **serde:** behind the `serde` feature. Labels and weights are validated on deserialization, and unknown fields are ignored.
+  - **Pinned vectors:** hex vectors for the canonical encoding. The single-node fingerprint `872e343c5916f7e2` was cross-checked against the C `xxhsum -H3`.
+- Deviations:
+  - **Not cached:** the fingerprint is computed on demand (one encoding plus 64 probe lookups) instead of being cached at build time.
+  - **One-way conversion:** only `From<&Node> for NodeSpec` exists.
+- Added during the merge:
+  - **`.gitattributes`:** pins `*.json` to LF so the byte-for-byte fixture test passes on Windows.
+  - **Faster spec tests:** they use 1 token per weight for vnodes, which took the spec suite from 193 s to 20 s in debug.
