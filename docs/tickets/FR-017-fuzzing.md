@@ -1,7 +1,7 @@
 ---
 id: FR-017
 title: Fuzzing for spec decoding, builder input, and lookup invariants
-status: in-progress
+status: done
 priority: P2
 size: S
 milestone: M4 Hardening and release
@@ -28,7 +28,7 @@ No input that arrives from the network or the control db can cause a panic.
 ## Acceptance criteria
 
 - [x] Each target runs at least 10M executions locally with no findings, or each finding is fixed and has a regression test.
-- [ ] The `Fuzz` workflow passes on GitHub.
+- [x] The `Fuzz` workflow passes on GitHub. *(Run 40649091579.)*
 - [x] `fuzz/README.md` explains how to run and triage.
 
 ## Progress
@@ -45,3 +45,4 @@ No input that arrives from the network or the control db can cause a panic.
 - 2026-10-28: Turned the nightly schedule off while the repository is private. Nightly runs would use about 750 of the org's 2,000 free Actions minutes a month, and public repositories don't pay for minutes. The workflow runs on demand, and the schedule is commented out in `fuzz.yml` for when the repository goes public. When it does, consider caching `fuzz/corpus/` between runs, so each run continues from the last one instead of restarting from the seeds.
 - 2026-10-28: The repository is public, so Actions minutes are free and the nightly schedule is back on.
 - 2026-10-28: The first GitHub run failed before fuzzing: the prebuilt cargo-fuzz from `taiki-e/install-action` defaults to the musl target, which the address sanitizer rejects. The workflow now passes `--target x86_64-unknown-linux-gnu`.
+- 2026-10-28: Done. Run 40649091579 fuzzed all three targets for 5 minutes each on `5846aeb` with no findings.

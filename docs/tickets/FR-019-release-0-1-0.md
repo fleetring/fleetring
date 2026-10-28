@@ -1,7 +1,7 @@
 ---
 id: FR-019
 title: Release fleetring 0.1.0 and freeze placement spec v1
-status: in-progress
+status: done
 priority: P1
 size: S
 milestone: M4 Hardening and release
@@ -26,10 +26,10 @@ Ship 0.1.0. From this release on, placement output for spec v1 never changes.
 
 ## Acceptance criteria
 
-- [ ] Every P0 and P1 ticket is done.
-- [ ] The maintainer runs `cargo publish -p fleetring`, and it succeeds.
-- [ ] The docs.rs build succeeds with all features.
-- [ ] The semver-checks job runs on PRs.
+- [x] Every P0 and P1 ticket is done.
+- [x] The maintainer runs `cargo publish -p fleetring`, and it succeeds.
+- [x] The docs.rs build succeeds with all features.
+- [x] The semver-checks job runs on PRs. *(It runs on every push and pull request, and passed on `5846aeb`.)*
 
 ## Progress
 
@@ -47,3 +47,4 @@ Ship 0.1.0. From this release on, placement output for spec v1 never changes.
   - ADR-0010 and ADR-0013 stay Proposed. They describe the replication layer and the daemon, not shipped crate behavior.
   - FR-021 (`CellsSpec`) ships after 0.1.0. Its JSON form is documented in rustdoc, like `RingSpec`'s, so it doesn't touch the frozen spec.
 - Remaining: the maintainer tags, publishes, and creates the GitHub release; then check docs.rs and the first semver-checks run.
+- 2026-10-28: Released. `fleetring` 0.1.0 is on crates.io, tagged `fleetring-v0.1.0` at `5846aeb`, with a [GitHub release](https://github.com/fleetring/fleetring/releases/tag/fleetring-v0.1.0). docs.rs built it with all features. Placement spec v1 is now frozen.

@@ -1,7 +1,7 @@
 ---
 id: FR-002
 title: CI pipeline across the platforms where determinism breaks
-status: in-progress
+status: done
 priority: P0
 size: M
 milestone: M0 Foundations
@@ -46,7 +46,7 @@ Make CI prove the determinism promise (ADR-0008) on every platform class where i
 - [x] The big-endian job really runs tests. Prove it on a throwaway branch: a test asserting `1u64.to_ne_bytes() == 1u64.to_le_bytes()` fails only on s390x. Remove the test afterwards. *(Proved from the job's log instead, and kept as a permanent check: see Progress.)*
 - [x] The i686 job runs tests, not just a build.
 - [x] The `wasm32-wasip1` job runs the test binary under wasmtime.
-- [ ] A full run takes less than about 15 minutes of wall time.
+- [x] A full run takes less than about 15 minutes of wall time. *(7 minutes on `5846aeb`.)*
 
 ## Notes
 
@@ -66,3 +66,4 @@ Make CI prove the determinism promise (ADR-0008) on every platform class where i
 - 2026-10-28, public runners:
   - The s390x job's log shows cargo running test binaries from `target/s390x-unknown-linux-gnu/release/deps/`, which only run under s390x emulation. A new CI step fails unless those binaries are big-endian (`MSB`, `S/390`), so a build for the wrong target can't pass silently. That replaces the one-off throwaway-branch proof.
   - Windows still took more than 16 minutes on the public runners. ADR-0014 runs the full feature and profile matrix on Linux only, and the suite once on macOS and Windows.
+- 2026-10-28: Done. CI on `5846aeb` passed all 14 jobs in 7 minutes; Windows took 3 minutes, and the s390x big-endian check passed.
