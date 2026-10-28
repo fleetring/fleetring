@@ -69,7 +69,10 @@ async fn positions_advance_once_per_commit_and_never_on_failure() -> TestResult 
 
 #[tokio::test]
 async fn a_slow_query_on_one_database_does_not_delay_writes_to_another() -> TestResult {
-    const SLOW_MS: i64 = 1000;
+    // A few durable writes against a long query: fsync is slow on some CI runners (about 100 ms on
+    // Windows), so many writes could outlast a short query without ever waiting on it.
+    const SLOW_MS: i64 = 3000;
+    const WRITES: i64 = 3;
     for kind in KINDS {
         let fx = Fixture::new(kind, config(Execution::Threads, 8, LONG));
         let (slow, busy) = (name("slow"), name("busy"));
@@ -82,7 +85,7 @@ async fn a_slow_query_on_one_database_does_not_delay_writes_to_another() -> Test
             tokio::spawn(async move { registry.query(&slow, statement).await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
-        for i in 0..20 {
+        for i in 0..WRITES {
             fx.registry
                 .execute(&busy, Transaction::from(fx.put(&format!("k{i}"), i)))
                 .await?;
