@@ -1,7 +1,7 @@
 ---
 id: FR-004
 title: "Domain types: NodeId, Zone, Host, Weight, ReplicationFactor, Node, Epoch"
-status: todo
+status: done
 priority: P0
 size: M
 milestone: M1 Hashing and model
@@ -37,15 +37,20 @@ Model identity and topology so that invalid values can't be represented (ADR-000
 
 ## Acceptance criteria
 
-- [ ] Property tests:
+- [x] Property tests:
   - every string that matches the grammar parses and round-trips through `Display`;
   - every string outside the grammar fails with the correct reason.
-- [ ] `Weight` and `ReplicationFactor` reject 0.
-- [ ] A compile-time assertion shows every type is `Send + Sync`.
-- [ ] Public signatures have no `bool` parameters and no `get_` prefixes. Pure constructors and accessors are `#[must_use]`.
-- [ ] Every public item is documented, with an example that uses `?`.
+- [x] `Weight` and `ReplicationFactor` reject 0.
+- [x] A compile-time assertion shows every type is `Send + Sync`.
+- [x] Public signatures have no `bool` parameters and no `get_` prefixes. Pure constructors and accessors are `#[must_use]`.
+- [x] Every public item is documented, with an example that uses `?`.
 
 ## Notes
 
 - serde impls arrive in FR-013. They deserialize through `TryFrom<String>`, so serde can never construct an invalid label.
 - Start with the strict grammar. Relaxing it later is non-breaking (ADR-0005).
+
+## Progress
+
+- 2026-10-27: Done. Label types come from one `macro_rules!` and share a single validator. `ParseLabelError` exposes `kind()`, and its message names the offending byte and index.
+- Deviation: `Weight` and `ReplicationFactor` follow `NonZero*` and provide `new(value) -> Option<Self>` instead of `TryFrom`, so they need no extra error types. Both also implement `From` for their `NonZero*` types.

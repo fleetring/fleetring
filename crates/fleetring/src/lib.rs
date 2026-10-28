@@ -13,14 +13,30 @@
 // floating point.
 #![deny(clippy::float_arithmetic)]
 
+mod epoch;
 mod hasher;
+mod label;
+mod node;
+mod replica;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
+pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
+pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
+pub use node::{Node, Weight};
+pub use replica::ReplicationFactor;
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Epoch>();
+    assert_send_sync::<Host>();
+    assert_send_sync::<Node>();
+    assert_send_sync::<NodeId>();
+    assert_send_sync::<ParseLabelError>();
+    assert_send_sync::<ReplicationFactor>();
+    assert_send_sync::<Weight>();
     assert_send_sync::<Xxh3>();
+    assert_send_sync::<Zone>();
 };

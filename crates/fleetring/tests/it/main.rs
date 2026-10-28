@@ -2,3 +2,4 @@
 //! fixtures.
 
 mod hasher;
+mod labels;
