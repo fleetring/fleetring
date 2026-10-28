@@ -14,9 +14,12 @@ pub mod control;
 mod daemon;
 mod data_dir;
 pub mod engine;
+mod environment;
 mod layout;
 mod membership;
 mod registry;
+#[cfg(feature = "simulation")]
+pub mod sim;
 mod sink;
 pub mod transport;
 
@@ -27,6 +30,7 @@ pub use config::{
 };
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
+pub use environment::{Environment, Network};
 pub use membership::{Membership, MembershipTasks, MembershipView};
 pub use registry::Registry;
 pub use sink::{Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink};
@@ -47,6 +51,8 @@ const _: () = {
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
     assert_debug_send_sync::<Daemon>();
+    assert_debug_send_sync::<Environment>();
+    assert_debug_send_sync::<Network>();
     assert_debug_send_sync::<Membership>();
     assert_debug_send_sync::<MembershipSettings>();
     assert_debug_send_sync::<MembershipTasks>();

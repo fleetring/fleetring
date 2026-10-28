@@ -49,3 +49,9 @@ Every committed transaction reaches the database's followers as a frame batch, a
 
 - Heartbeats send an empty database list today. Let `Membership::start` take a source of `DatabaseStatus` entries (role and position per hosted database). The control plane answers a heartbeat naming an unknown database with `NOT_FOUND`, which the membership loop currently treats as "rejoin", so tell the two apart.
 - Add the `Replication` and `Database` services to the daemon's router in `daemon.rs::serve` with `add_optional_service`. Use `Membership::view()` for placement and peer liveness.
+
+## Notes from FR-024
+
+- **Simulation:** add a `Write` operation and its acknowledgement in `sim/workload.rs`, its executor in `sim/client.rs::execute`, and the "no acknowledged write lost" check at the marked extension point in `sim/check.rs`.
+- **`transport::Peers`** still builds its own TCP endpoints. Give it a constructor that takes a `Network` and uses `Network::channel`, so replication runs under simulation.
+- **The data-role registry** must follow `config.engine.execution`, which the simulated `Environment` forces to `inline`.

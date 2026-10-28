@@ -1,0 +1,67 @@
+# Nightly sweep of the simulation harness over random seeds (FR-024, ADR-0020). Every failing
+# seed is printed with the command that reruns it alone; add it to the fixed seeds as a
+# regression test once it is fixed.
+name: Simulation sweep
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "How many random seeds to run"
+        required: false
+        default: "500"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Lets turmoil seed Tokio's scheduler, so a printed seed replays exactly.
+  RUSTFLAGS: --cfg tokio_unstable
+
+jobs:
+  sweep:
+    name: sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SEEDS: ${{ github.event.inputs.seeds || '500' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p fleetringd --features simulation --test sim --no-run
+      - name: run random seeds
+        run: |
+          failed=""
+          for _ in $(seq "$SEEDS"); do
+            seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+            if ! FLEETRING_SIM_SEED="$seed" cargo test -q -p fleetringd --features simulation \
+                --test sim > "seed-$seed.log" 2>&1; then
+              echo "::error::simulation seed $seed failed"
+              cat "seed-$seed.log"
+              failed="$failed $seed"
+            else
+              rm "seed-$seed.log"
+            fi
+          done
+          if [ -n "$failed" ]; then
+            {
+              echo "## Failing simulation seeds"
+              echo
+              for seed in $failed; do
+                echo "- \`RUSTFLAGS=\"--cfg tokio_unstable\" FLEETRING_SIM_SEED=$seed cargo test -p fleetringd --features simulation --test sim\`"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "failing seeds:$failed"
+            exit 1
+          fi
+          echo "all $SEEDS seeds passed"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: simulation-sweep-logs
+          path: seed-*.log
