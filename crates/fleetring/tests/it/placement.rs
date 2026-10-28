@@ -126,14 +126,23 @@ fn rejecting_every_node_yields_none() -> TestResult {
     Ok(())
 }
 
+/// Both placement strategies, with few vnode tokens so walks revisit nodes often.
+fn strategies() -> impl proptest::strategy::Strategy<Value = fleetring::Strategy> {
+    prop_oneof![
+        Just(fleetring::Strategy::Rendezvous),
+        Just(crate::vnodes::vnodes(16)),
+    ]
+}
+
 proptest! {
     #[test]
     fn filtering_nodes_equals_removing_them(
         nodes in fixtures::memberships_up_to(16),
         down in proptest::collection::vec(any::<bool>(), 16),
         key in "[a-z]{1,12}:[0-9]{1,6}",
+        strategy in strategies(),
     ) {
-        let ring = Ring::builder().nodes(nodes.clone()).build().expect("valid membership");
+        let ring = Ring::builder().strategy(strategy).nodes(nodes.clone()).build().expect("valid membership");
         let is_down = |node: &Node| down[index_of(&ring, node)];
         let survivors: Vec<Node> = ring.nodes().iter().filter(|n| !is_down(n)).cloned().collect();
         let filtered = ring.replicas_where(&key, |node| !is_down(node));
@@ -141,7 +150,7 @@ proptest! {
         if survivors.is_empty() {
             prop_assert!(filtered.is_none());
         } else {
-            let rebuilt = Ring::builder().nodes(survivors).build().expect("survivors are valid");
+            let rebuilt = Ring::builder().strategy(strategy).nodes(survivors).build().expect("survivors are valid");
             prop_assert_eq!(filtered.expect("some node is up").to_ids(), rebuilt.replicas(&key).to_ids());
             let rebuilt_list: Vec<_> = rebuilt.preference(&key).map(Node::id).cloned().collect();
             prop_assert_eq!(filtered_list, rebuilt_list);
@@ -153,8 +162,9 @@ proptest! {
         nodes in fixtures::memberships_up_to(16),
         key in "[a-z]{1,12}:[0-9]{1,6}",
         r in 1u8..=8,
+        strategy in strategies(),
     ) {
-        let ring = Ring::builder().nodes(nodes).build().expect("valid membership");
+        let ring = Ring::builder().strategy(strategy).nodes(nodes).build().expect("valid membership");
         let short = ring.replicas_n(&key, ReplicationFactor::new(r).expect("nonzero")).to_ids();
         let long = ring.replicas_n(&key, ReplicationFactor::new(r + 1).expect("nonzero")).to_ids();
         prop_assert_eq!(&short[..], &long[..short.len()]);
@@ -165,9 +175,10 @@ proptest! {
     fn placement_ignores_the_order_nodes_were_added(
         nodes in fixtures::memberships_up_to(16),
         key in "[a-z]{1,12}:[0-9]{1,6}",
+        strategy in strategies(),
     ) {
-        let forward = Ring::builder().nodes(nodes.clone()).build().expect("valid membership");
-        let backward = Ring::builder().nodes(nodes.into_iter().rev()).build().expect("valid membership");
+        let forward = Ring::builder().strategy(strategy).nodes(nodes.clone()).build().expect("valid membership");
+        let backward = Ring::builder().strategy(strategy).nodes(nodes.into_iter().rev()).build().expect("valid membership");
         prop_assert_eq!(forward.replicas(&key), backward.replicas(&key));
     }
 }

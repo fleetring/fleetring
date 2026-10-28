@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn check_replicas_do_not_allocate() -> Result<(), Box<dyn std::error::Error>> {
     use std::hint::black_box;
 
-    use fleetring::{Node, ReplicationFactor, Ring, Weight};
+    use fleetring::{Node, ReplicationFactor, Ring, Strategy, VnodeParams, Weight};
 
     // 1000 nodes over 8 zones, pairs of nodes sharing a host, mixed weights so that rendezvous
     // takes the logarithm path.
@@ -29,17 +29,23 @@ fn check_replicas_do_not_allocate() -> Result<(), Box<dyn std::error::Error>> {
             .with_weight(Weight::new(1 + i % 4).ok_or("zero weight")?);
         nodes.push(node);
     }
-    let ring = Ring::builder().nodes(nodes).build()?;
+    let rendezvous = Ring::builder().nodes(nodes.clone()).build()?;
+    let vnodes = Ring::builder()
+        .strategy(Strategy::Vnodes(VnodeParams::default()))
+        .nodes(nodes)
+        .build()?;
     let keys: Vec<String> = (0..500).map(|i| format!("agent:{i}")).collect();
     let factors: Vec<ReplicationFactor> = (1..=8).filter_map(ReplicationFactor::new).collect();
 
     let _profiler = dhat::Profiler::builder().testing().build();
     let before = dhat::HeapStats::get();
-    for key in &keys {
-        for &factor in &factors {
-            black_box(ring.replicas_n(key, factor));
+    for ring in [&rendezvous, &vnodes] {
+        for key in &keys {
+            for &factor in &factors {
+                black_box(ring.replicas_n(key, factor));
+            }
+            black_box(ring.primary(key));
         }
-        black_box(ring.primary(key));
     }
     let after = dhat::HeapStats::get();
     dhat::assert_eq!(
@@ -48,8 +54,8 @@ fn check_replicas_do_not_allocate() -> Result<(), Box<dyn std::error::Error>> {
         "replicas() allocated on a 1000-node, 8-zone ring"
     );
     println!(
-        "alloc_free: 0 allocations across {} lookups",
-        keys.len() * 9
+        "alloc_free: 0 allocations across {} lookups (rendezvous and vnodes)",
+        keys.len() * factors.len().saturating_add(1) * 2
     );
     Ok(())
 }

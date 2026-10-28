@@ -1,5 +1,9 @@
 //! Placement strategies (ADR-0004).
 
+use std::num::NonZeroU32;
+
+use crate::vnodes::TokenTable;
+
 /// The algorithm that ranks a ring's nodes for each key.
 ///
 /// For every key, a strategy produces a total order over the ring's nodes, and replica selection
@@ -37,4 +41,68 @@ pub enum Strategy {
     /// node.
     #[default]
     Rendezvous,
+
+    /// A weighted virtual-node ring: consistent hashing as in Dynamo and Cassandra.
+    ///
+    /// Each node places `weight × tokens_per_weight` tokens on a circle, and a key's order walks
+    /// clockwise from the key's hash, taking each node at its first token. A lookup costs a
+    /// binary search instead of one hash per node, which suits very large fleets. Balance is
+    /// approximate: a node's share is off by about 1/√tokens (±6% at 256 tokens), where
+    /// rendezvous is exact.
+    ///
+    /// Token counts grow with weight and a ring holds at most 2²² tokens, so keep weights
+    /// small, in relative units.
+    Vnodes(VnodeParams),
+}
+
+/// Parameters for [`Strategy::Vnodes`].
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroU32;
+///
+/// use fleetring::{Node, Ring, Strategy, VnodeParams};
+///
+/// let params = VnodeParams::new(NonZeroU32::new(64).ok_or("zero")?);
+/// let ring = Ring::builder()
+///     .strategy(Strategy::Vnodes(params))
+///     .nodes(["a", "b", "c"].map(|id| Node::new(id.parse().expect("valid id"))))
+///     .build()?;
+/// assert_eq!(ring.strategy(), Strategy::Vnodes(params));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VnodeParams {
+    tokens_per_weight: NonZeroU32,
+}
+
+impl VnodeParams {
+    /// The default number of tokens per unit of weight. It balances nodes to about ±6%.
+    pub const DEFAULT_TOKENS_PER_WEIGHT: NonZeroU32 = NonZeroU32::new(256).expect("256 is nonzero");
+
+    /// Returns parameters that give each node `weight × tokens_per_weight` tokens.
+    #[must_use]
+    pub const fn new(tokens_per_weight: NonZeroU32) -> Self {
+        Self { tokens_per_weight }
+    }
+
+    /// Returns the number of tokens per unit of weight.
+    #[must_use]
+    pub const fn tokens_per_weight(self) -> NonZeroU32 {
+        self.tokens_per_weight
+    }
+}
+
+impl Default for VnodeParams {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_TOKENS_PER_WEIGHT)
+    }
+}
+
+/// Each strategy's lookup structures, built with the ring.
+#[derive(Debug, Clone)]
+pub(crate) enum StrategyIndex {
+    Rendezvous,
+    Vnodes(TokenTable),
 }

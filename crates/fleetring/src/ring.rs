@@ -429,6 +429,8 @@ impl<H: StableHasher> RingBuilder<H> {
     /// - there are more than `u32::MAX` nodes ([`BuildRingError::TooManyNodes`]);
     /// - two nodes share an ID ([`BuildRingError::DuplicateNode`]);
     /// - a host label appears in more than one zone ([`BuildRingError::HostInMultipleZones`]).
+    /// - a [`Strategy::Vnodes`] ring would need more than 2²² tokens
+    ///   ([`BuildRingError::TooManyTokens`]).
     ///
     /// The checks run in that order, and each walks the nodes in canonical order, so the same
     /// nodes always produce the same error, whatever order they were added in.
@@ -447,7 +449,7 @@ impl<H: StableHasher> RingBuilder<H> {
             return Err(BuildRingError::DuplicateNode { id: id.clone() });
         }
         check_hosts(&nodes)?;
-        let precomputed = Precomputed::new(&nodes, &hasher, seed);
+        let precomputed = Precomputed::new(&nodes, &hasher, seed, strategy)?;
         Ok(Ring {
             hasher,
             seed,
@@ -531,6 +533,18 @@ pub enum BuildRingError {
         /// The most nodes a ring can hold.
         max: usize,
     },
+
+    /// A [`Strategy::Vnodes`] ring would need more tokens than a ring can hold.
+    ///
+    /// Each node needs `weight × tokens_per_weight` tokens, and a ring holds at most 2²². Lower
+    /// the weights or `tokens_per_weight`.
+    #[error("ring needs {total} tokens; the maximum is {max}")]
+    TooManyTokens {
+        /// The tokens the nodes would need, saturating at `u64::MAX`.
+        total: u64,
+        /// The most tokens a ring can hold.
+        max: u64,
+    },
 }
 
 /// Displays a zone label, or the default zone for `None`.
@@ -602,13 +616,17 @@ fn check_hosts(nodes: &[Node]) -> Result<(), BuildRingError> {
     )
 )]
 mod precomputed {
-    use super::{MAX_NODES, Ring};
+    use super::{BuildRingError, MAX_NODES, Ring};
     use crate::select::{Member, Members};
-    use crate::{Node, StableHasher};
+    use crate::strategy::StrategyIndex;
+    use crate::vnodes::{MAX_TOKENS, TokenTable, token_count};
+    use crate::{Node, StableHasher, Strategy};
 
     /// Placement data derived from a ring's validated, canonically ordered nodes.
     #[derive(Debug, Clone)]
     pub(super) struct Precomputed {
+        /// The strategy's lookup structures, such as a vnode ring's token table.
+        index: StrategyIndex,
         /// One entry per node, in canonical order.
         entries: Box<[Member]>,
         zone_count: usize,
@@ -622,7 +640,12 @@ mod precomputed {
 
     impl Precomputed {
         /// Derives the placement data for `nodes`, which `build` has validated and sorted.
-        pub(super) fn new(nodes: &[Node], hasher: &impl StableHasher, seed: u64) -> Self {
+        pub(super) fn new(
+            nodes: &[Node],
+            hasher: &impl StableHasher,
+            seed: u64,
+            strategy: Strategy,
+        ) -> Result<Self, BuildRingError> {
             let zones = distinct(nodes.iter().map(Node::zone));
             let hosts = distinct(nodes.iter().filter_map(Node::host));
             let mut entries = Vec::with_capacity(nodes.len());
@@ -644,7 +667,8 @@ mod precomputed {
                     host: to_index(host),
                 });
             }
-            Self {
+            let mut precomputed = Self {
+                index: StrategyIndex::Rendezvous,
                 entries: entries.into_boxed_slice(),
                 zone_count: zones.len(),
                 host_count: hosts.len() + unlabeled_hosts,
@@ -655,6 +679,31 @@ mod precomputed {
                 uniform_weights: nodes
                     .windows(2)
                     .all(|pair| pair[0].weight() == pair[1].weight()),
+            };
+            precomputed.index = match strategy {
+                Strategy::Rendezvous => StrategyIndex::Rendezvous,
+                Strategy::Vnodes(params) => {
+                    let members = precomputed.members();
+                    let per_weight = params.tokens_per_weight().get();
+                    let total = token_count(&members, per_weight);
+                    if total > MAX_TOKENS {
+                        return Err(BuildRingError::TooManyTokens {
+                            total,
+                            max: MAX_TOKENS,
+                        });
+                    }
+                    StrategyIndex::Vnodes(TokenTable::build(&members, hasher, seed, per_weight))
+                }
+            };
+            Ok(precomputed)
+        }
+
+        fn members(&self) -> Members<'_> {
+            Members {
+                entries: &self.entries,
+                zone_count: self.zone_count,
+                host_count: self.host_count,
+                uniform_weights: self.uniform_weights,
             }
         }
 
@@ -676,12 +725,12 @@ mod precomputed {
 
         /// Returns the per-node placement inputs that strategies and selection read.
         pub(crate) fn members(&self) -> Members<'_> {
-            Members {
-                entries: &self.precomputed.entries,
-                zone_count: self.precomputed.zone_count,
-                host_count: self.precomputed.host_count,
-                uniform_weights: self.precomputed.uniform_weights,
-            }
+            self.precomputed.members()
+        }
+
+        /// Returns the strategy's lookup structures.
+        pub(crate) fn strategy_index(&self) -> &StrategyIndex {
+            &self.precomputed.index
         }
 
         /// Returns the hash of node `index`'s ID under the ring's seed.

@@ -2,7 +2,9 @@
 
 use crate::rendezvous::Rendezvous;
 use crate::select::{self, CandidateOrder, Picks};
-use crate::{Node, Preference, ReplicaSet, ReplicationFactor, Ring, StableHasher, Strategy};
+use crate::strategy::StrategyIndex;
+use crate::vnodes::VnodeWalk;
+use crate::{Node, Preference, ReplicaSet, ReplicationFactor, Ring, StableHasher};
 
 impl<H: StableHasher> Ring<H> {
     /// Returns the key's home replica set at the ring's replication factor.
@@ -141,9 +143,14 @@ impl<H: StableHasher> Ring<H> {
         let nodes = self.nodes();
         let key_hash = self.key_hash(key.as_ref());
         let members = self.members();
-        let order = match self.strategy() {
-            Strategy::Rendezvous => Rendezvous::new(members, self.hasher(), self.seed(), key_hash)
-                .order(|index| eligible(&nodes[index])),
+        let eligible = |index: usize| eligible(&nodes[index]);
+        let order = match self.strategy_index() {
+            StrategyIndex::Rendezvous => {
+                Rendezvous::new(members, self.hasher(), self.seed(), key_hash).order(eligible)
+            }
+            StrategyIndex::Vnodes(table) => {
+                VnodeWalk::new(members, table, key_hash).order(eligible)
+            }
         };
         Preference::new(nodes, select::preference(&members, &order))
     }
@@ -173,12 +180,16 @@ impl<H: StableHasher> Ring<H> {
         r: usize,
         eligible: F,
     ) -> Picks {
-        match self.strategy() {
-            Strategy::Rendezvous => select::select(
-                &Rendezvous::new(self.members(), self.hasher(), self.seed(), key_hash),
+        let members = self.members();
+        match self.strategy_index() {
+            StrategyIndex::Rendezvous => select::select(
+                &Rendezvous::new(members, self.hasher(), self.seed(), key_hash),
                 r,
                 eligible,
             ),
+            StrategyIndex::Vnodes(table) => {
+                select::select(&VnodeWalk::new(members, table, key_hash), r, eligible)
+            }
         }
     }
 }

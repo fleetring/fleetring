@@ -26,6 +26,7 @@ mod select;
 mod strategy;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+mod vnodes;
 
 pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
@@ -33,7 +34,7 @@ pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
 pub use node::{Node, Weight};
 pub use replica::{Preference, ReplicaIter, ReplicaSet, ReplicationFactor};
 pub use ring::{BuildRingError, Ring, RingBuilder};
-pub use strategy::Strategy;
+pub use strategy::{Strategy, VnodeParams};
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
@@ -51,6 +52,7 @@ const _: () = {
     assert_send_sync::<Ring<Xxh3>>();
     assert_send_sync::<RingBuilder>();
     assert_send_sync::<Strategy>();
+    assert_send_sync::<VnodeParams>();
     assert_send_sync::<Weight>();
     assert_send_sync::<Xxh3>();
     assert_send_sync::<Zone>();
