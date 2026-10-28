@@ -5,8 +5,8 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::{
-    CheckpointMarker, Executed, FrameBatch, Position, ReplicaPosition, Rows, Snapshot, Statement,
-    Transaction,
+    CheckpointMarker, Executed, FrameBatch, PinnedSnapshot, Position, ReplicaPosition, Rows,
+    Snapshot, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -147,8 +147,10 @@ pub trait FrameSource: fmt::Debug + Send {
     ///
     /// # Errors
     ///
-    /// [`EngineError::InvalidPosition`] if `after` doesn't fit the log, and
-    /// [`EngineError::Storage`] if the log can't be read.
+    /// [`EngineError::InvalidPosition`] if `after` doesn't fit the log, including a position
+    /// from an earlier log generation that the engine can't vouch for continuing from, and
+    /// [`EngineError::Storage`] if the log can't be read. A follower at such a position can only
+    /// catch up from a snapshot.
     fn committed_since(
         &mut self,
         after: Option<&Position>,
@@ -163,6 +165,18 @@ pub trait FrameSource: fmt::Debug + Send {
     /// [`EngineError::CheckpointBlocked`] if the checkpoint couldn't complete, and
     /// [`EngineError::Storage`] if it failed.
     fn checkpoint(&mut self) -> Result<CheckpointMarker, EngineError>;
+
+    /// Pins a consistent copy of the database for a follower to read while writes go on.
+    ///
+    /// The call itself is quick; reading the copy happens elsewhere, through the returned
+    /// [`PinnedSnapshot`], without the database's thread. While it lives, the engine keeps its
+    /// files in place, so [`checkpoint`](Self::checkpoint) may fail with
+    /// [`EngineError::CheckpointBlocked`].
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if the log or the files can't be read.
+    fn pin_snapshot(&mut self) -> Result<PinnedSnapshot, EngineError>;
 }
 
 /// The frame-source operations that don't need an open primary.

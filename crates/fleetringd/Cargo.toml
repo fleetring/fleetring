@@ -32,6 +32,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 turmoil = { version = "0.7", optional = true }
+twox-hash = { workspace = true, features = ["alloc", "xxhash3_128"] }
 
 [features]
 # The simulation harness (`fleetringd::sim`): the daemon over turmoil's simulated network and

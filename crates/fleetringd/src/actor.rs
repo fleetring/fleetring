@@ -19,8 +19,8 @@ use tokio::time;
 use self::executor::{Executor, OpenRequest};
 use crate::engine::{
     CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineError, Executed,
-    Execution, FrameBatch, FrameSource, OpenMode, Position, ReplicaPosition, Rows, Shape, Snapshot,
-    Statement, Transaction,
+    Execution, FrameBatch, FrameSource, OpenMode, PinnedSnapshot, Position, ReplicaPosition, Rows,
+    Shape, Snapshot, Statement, Transaction,
 };
 use crate::sink::{
     Acknowledged, Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink,
@@ -37,6 +37,7 @@ pub(crate) enum Request {
     CommittedSince(Option<Position>, Reply<Option<FrameBatch>>),
     Checkpoint(Reply<CheckpointMarker>),
     Snapshot(PathBuf, Reply<Snapshot>),
+    PinSnapshot(Reply<PinnedSnapshot>),
     ReplicaPositions(Reply<Vec<ReplicaPosition>>),
 }
 
@@ -65,6 +66,9 @@ impl Request {
             Self::Snapshot(_, reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::PinSnapshot(reply) => {
+                let _ = reply.send(Err(error));
+            }
             Self::ReplicaPositions(reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -82,6 +86,7 @@ impl fmt::Debug for Request {
             Self::CommittedSince(..) => "CommittedSince",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Snapshot(..) => "Snapshot",
+            Self::PinSnapshot(_) => "PinSnapshot",
             Self::ReplicaPositions(_) => "ReplicaPositions",
         })
     }
@@ -260,6 +265,17 @@ impl DatabaseHandle {
         let destination = destination.into();
         self.call(|reply| Request::Snapshot(destination, reply))
             .await
+    }
+
+    /// Pins a consistent copy of a frame-source database for a follower to read without
+    /// blocking writes; see [`FrameSource::pin_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] unless the engine is a frame source, and [`DatabaseError`]
+    /// if the database is closed or the copy can't be pinned.
+    pub async fn pin_snapshot(&self) -> Result<PinnedSnapshot, DatabaseError> {
+        self.call(Request::PinSnapshot).await
     }
 
     /// How far each replica of a self-replicating database has got.
@@ -530,6 +546,14 @@ impl Actor {
             Request::Snapshot(destination, reply) => {
                 let result = self
                     .call(move |database| Ok(database.snapshot(&destination)?))
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::PinSnapshot(reply) => {
+                let result = self
+                    .call(|database| {
+                        Ok(frame_source(database, "pinning a snapshot")?.pin_snapshot()?)
+                    })
                     .await;
                 let _ = reply.send(result);
             }

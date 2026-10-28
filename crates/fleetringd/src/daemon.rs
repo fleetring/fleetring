@@ -339,7 +339,7 @@ fn start_data(
     let replication = Replication::start(
         ReplicationParts {
             node: config.node.id.clone(),
-            engine: Arc::new(engine),
+            engine: Arc::new(engine.clone()),
             membership: membership.clone(),
             peers: Arc::new(Peers::with_network(network)),
             addresses: Arc::new(membership.clone()),

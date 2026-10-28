@@ -17,7 +17,7 @@
 //! 2. The follower checks the epoch against the highest it has recorded for the database,
 //!    refuses a lower one, and records a higher one durably before it goes on.
 //! 3. A follower with no copy fetches one from the primary through the `Snapshot` RPC and moves
-//!    it into place (see [Initial copies](#initial-copies)). It then answers with a first
+//!    it into place (see [Snapshots](#snapshots)). It then answers with a first
 //!    `ReplicateAck` that holds the position its copy is at.
 //! 4. The primary sends `Batch`es from that position on. Each batch's `start` is exactly the
 //!    position it continues from, so the follower checks continuity by comparing bytes. It applies
@@ -47,21 +47,32 @@
 //! everything, the primary checkpoints (RESTART, ADR-0016 point 7). A follower that has been
 //! behind for longer than [`ReplicationSettings::lag_limit`] stops blocking checkpoints. Once the
 //! log restarts past it, it can no longer catch up from the log, and is flagged as needing a
-//! snapshot ([`FollowerProgress::needs_snapshot`]); snapshot catch-up is FR-032.
+//! snapshot ([`FollowerProgress::needs_snapshot`]). The engine also refuses to continue from an
+//! earlier-generation position other than the one its last checkpoint recorded durably, so a
+//! primary that restarted, and no longer knows its last checkpoint in memory, still finds such a
+//! follower when it reads the log for it. Either way, the primary sends the follower `Reseed`,
+//! and the follower re-seeds its copy from a snapshot and acknowledges the snapshot's position.
 //!
-//! # Initial copies
+//! # Snapshots
 //!
-//! A follower never starts from an empty file. The first time a database's stream reaches a
-//! follower without a copy, the follower calls `Snapshot` on the primary, which streams a
-//! [`DatabaseHandle::snapshot`](crate::DatabaseHandle::snapshot) of the database as one archive
-//! of the snapshot directory's files. The follower unpacks it into a staging directory, syncs it,
-//! and renames it into place. This is the minimal transfer FR-032 replaces with a checksummed,
-//! resumable one built on SQLite's online backup.
+//! A follower never starts from an empty file. When a database's stream reaches a follower
+//! without a copy, when the primary sends `Reseed`, or when [`Replication::seed`] is called, the
+//! follower calls `Snapshot` on the primary. The primary pins a consistent copy through the
+//! engine in one quick call on the database's thread, and streams the copy's files in chunks
+//! from a task of its own, so writes go on meanwhile; checkpoints wait until the transfer ends.
+//! The last chunk carries the copy's position and an XXH3-128 checksum of the stream, which
+//! catches corruption, not tampering. The follower writes the chunks into a staging directory
+//! as they arrive, verifies the checksum, syncs the files, and renames the directory into the
+//! database's place, moving any old copy aside first and removing it after. An interrupted or
+//! corrupt transfer is removed and restarts from the beginning; the database's place only ever
+//! holds a complete copy, or none. Staging directories a crash left behind are removed when
+//! replication starts.
 
 mod archive;
 mod epochs;
 mod follower;
 mod primary;
+mod snapshot;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -212,6 +223,33 @@ pub struct PrimaryRole {
     pub epoch: LeaseEpoch,
 }
 
+/// The error returned when [`Replication::seed`] can't seed a copy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SeedError {
+    /// The engine replicates itself, so there is no copy to seed.
+    #[error("{engine} databases replicate themselves")]
+    SelfReplicating {
+        /// The engine.
+        engine: EngineKind,
+    },
+    /// This node serves the database as its primary, or has it open.
+    #[error("{database} is open as a primary on this node")]
+    Primary {
+        /// The database.
+        database: DatabaseName,
+    },
+    /// The snapshot couldn't be fetched, verified, or installed. The old copy, if any, is still
+    /// in place.
+    #[error("seeding {database} failed: {reason}")]
+    Failed {
+        /// The database.
+        database: DatabaseName,
+        /// Why.
+        reason: String,
+    },
+}
+
 /// The error returned when a node can't serve a database as its primary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -265,6 +303,8 @@ pub struct FollowerStatus {
     pub position: Option<Position>,
     /// Where it last checkpointed at a primary's marker.
     pub checkpointed: Option<Position>,
+    /// How many snapshots have replaced the copy since this node started.
+    pub snapshots: u64,
 }
 
 /// One data node's replication: primary streams, follower copies, and the sink and service that
@@ -351,6 +391,7 @@ impl Replication {
         });
         // `inner` is new, so nothing else can have set the registry.
         let _set = inner.registry.set(built);
+        snapshot::sweep(inner.registry().root());
         Self { inner }
     }
 
@@ -489,12 +530,36 @@ impl Replication {
         if slot.is_none() && epoch.is_none() {
             return None;
         }
+        let snapshots = slot.as_ref().map_or(0, |slot| slot.snapshots());
         let (position, checkpointed) = slot.map(|slot| slot.positions()).unwrap_or_default();
         Some(FollowerStatus {
             epoch: epoch.map(LeaseEpoch::new),
             position,
             checkpointed,
+            snapshots,
         })
+    }
+
+    /// Seeds this node's copy of `database` with a snapshot from `from`, its primary at `epoch`,
+    /// replacing any copy here, and returns the position the copy is at.
+    ///
+    /// This is how a node newly added to a database's replica set gets its copy ahead of joining
+    /// it. The primary's stream would also seed it on first contact, through the same transfer.
+    /// Any stream applying to the copy here ends first; the primary reopens it from the new
+    /// position.
+    ///
+    /// # Errors
+    ///
+    /// [`SeedError::SelfReplicating`] if the engine replicates itself, [`SeedError::Primary`] if
+    /// this node has the database open, and [`SeedError::Failed`] if the epoch is stale or the
+    /// transfer fails.
+    pub async fn seed(
+        &self,
+        database: &DatabaseName,
+        from: &NodeId,
+        epoch: LeaseEpoch,
+    ) -> Result<Option<Position>, SeedError> {
+        snapshot::seed(&self.inner, database, from, epoch.get()).await
     }
 
     /// Checkpoints `database` now, if every follower holds everything, and ships the marker.
@@ -675,5 +740,6 @@ const _: () = {
     assert_debug_send_sync::<ReplicationParts>();
     assert_debug_send_sync::<ReplicationService>();
     assert_debug_send_sync::<ReplicationSettings>();
+    assert_debug_send_sync::<SeedError>();
     assert_debug_send_sync::<ServePrimaryError>();
 };

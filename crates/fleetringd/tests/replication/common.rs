@@ -115,6 +115,18 @@ impl Node {
     pub(crate) fn database_dir(&self, database: &str) -> PathBuf {
         self.root.join("databases").join(database)
     }
+
+    /// The nodes the ring this node sees places `database`'s `replicas` replicas on, in order.
+    pub(crate) fn replica_set(&self, database: &DatabaseName, replicas: u8) -> Vec<String> {
+        let factor = ReplicationFactor::new(replicas).expect("nonzero");
+        self.membership.ring().map_or_else(Vec::new, |ring| {
+            ring.replicas_n(database.as_str(), factor)
+                .to_ids()
+                .iter()
+                .map(|node| node.as_str().to_owned())
+                .collect()
+        })
+    }
 }
 
 /// A control daemon and data nodes.
