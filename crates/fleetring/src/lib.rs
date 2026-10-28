@@ -12,3 +12,15 @@
 // ADR-0003: placement must be bit-identical on every platform, so library code never uses
 // floating point.
 #![deny(clippy::float_arithmetic)]
+
+mod hasher;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
+
+pub use hasher::{StableHasher, Xxh3};
+
+// Public types must stay shareable across threads; a refactor that breaks this fails to compile.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Xxh3>();
+};
