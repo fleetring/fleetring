@@ -24,7 +24,7 @@
 3. **Purity where it pays.** Like `fleetring`, `fleetring-control` does no I/O and reads no clock: time arrives inside commands. That keeps it deterministic, unit-testable, and ready to sit behind Raft. It follows `fleetring`'s determinism rules: no floats and no `std::hash` collections.
 4. **Async boundaries follow ADR-0013.** Tokio lives in `fleetringd` only. SQLite calls run on a dedicated thread per open database, or inline under simulation (ADR-0020). The ring is published through `ArcSwap`.
 5. **Each open database is an actor** that owns its connection, serializes writes, captures committed frames, and streams them to followers (ADR-0013, ADR-0016).
-6. **Engine adapter.** The actor reaches storage through a `DatabaseEngine` trait. v0.1 implements it with plain SQLite through `rusqlite`. libSQL and Turso implementations come later behind the same trait.
+6. **Engine adapter.** The actor reaches storage through a `DatabaseEngine` trait with two shapes, a frame source or a self-replicating engine, and engine-defined positions and payloads (ADR-0016). v0.1 implements it with plain SQLite through `rusqlite`. libSQL, Turso, and Postgres adapters come later behind the same trait, and nothing above the adapter depends on SQLite's WAL.
 7. **Policy follows ADR-0009** for every crate. `unsafe_code` stays forbidden. If an engine adapter ever needs FFI, it lives in its own crate and opts out explicitly. The daemon crates may set a newer `rust-version` than `fleetring` if their dependencies need one; `fleetring` keeps its own MSRV.
 
 ## Alternatives considered

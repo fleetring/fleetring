@@ -15,7 +15,7 @@ Nodes exchange three kinds of traffic: control calls (join, heartbeat, leases, p
    - `Control`: `Join`, `Heartbeat`, `WatchMembership` (a server stream), `CreateDatabase`, `Locate`, `AcquireLease`, and the promotion calls.
    - `Replication`: `Replicate` (a bidirectional stream: batches and checkpoint markers from the primary, acknowledgements from the follower), `Fence` (the promotion step in ADR-0018), and `Snapshot` (a server stream of chunks).
    - `Database`, in v0.1 only: `Execute` and `Query` on a database's primary, for tests and the CLI. The router (MVP step 4) replaces it for applications.
-3. **Batches carry raw frames.** A batch holds its epoch, its start and end positions, and the frames as one byte string, never one message per frame.
+3. **Batches are opaque.** A batch holds its epoch, its engine-defined start and end positions, and the engine's payload as one byte string, never one message per frame or row. The protocol never parses positions or payloads (ADR-0016).
 4. **Versioning.** Fields evolve compatibly under protobuf's rules. A breaking change gets a new package version. Peers exchange protocol versions at `Join`, and a node refuses a version it doesn't support.
 5. **Security.** TLS through rustls is optional for a local cluster and required between machines. Mutual TLS and API keys arrive with the router.
 6. **Simulation.** tonic runs over turmoil's simulated TCP through a custom connector (ADR-0020), so the same services run in tests.

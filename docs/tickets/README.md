@@ -147,6 +147,17 @@ For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-
 
 ## Backlog (not yet ticketed)
 
+**Engines and durability.** These must fit behind the engine adapter without changing anything above it (ADR-0016):
+
+- **libSQL and Turso adapters** as frame sources, capturing commits inside the engine.
+- **Turso MVCC adapter**, for concurrent writers within one database.
+- **Postgres adapter**, self-replicating through streaming replication. `fleetringd` only places, leases, and fences.
+- **Durability sinks:** S3 snapshots and log archiving for point-in-time restore, as a trait separate from replicas (MVP step 5).
+- **Engine-changing migrations**, such as SQLite to Postgres behind an `upgrade` command (ADR-0021), after live migration (MVP step 3).
+
+**Placement crate.**
+
+
 - **Keyed hasher** (SipHash-1-3 with a secret key) for adversarial key spaces.
 - **`no_std + alloc`** support. The `std` feature is already reserved.
 - **WASM bindings and the ring playground**, plus TypeScript and Python conformance kits built from the vectors.

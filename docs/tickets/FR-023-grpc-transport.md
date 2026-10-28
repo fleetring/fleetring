@@ -20,6 +20,7 @@ Define the wire contract between nodes and run it over tonic, both on real netwo
 - **`fleetring-proto`:** `.proto` files for package `fleetring.v1`, with the `Control`, `Replication`, and `Database` services from ADR-0019, compiled with tonic and prost. Code generation needs no system `protoc`.
 - **Transport:** a tonic server in `fleetringd` and a pooled client per peer, with timeouts, retries with backoff for idempotent calls, and optional TLS through rustls.
 - **Simulation connector:** tonic over turmoil's TCP streams, so that the same services run in the simulation harness (FR-024).
+- **Opaque batches:** positions and payloads are `bytes` fields interpreted only by the engine adapter (ADR-0016). No SQLite types appear in the `.proto` files.
 - **Version check at `Join`:** a peer with an unsupported protocol version is refused with a clear error.
 
 ## Acceptance criteria
