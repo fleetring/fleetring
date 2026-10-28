@@ -14,6 +14,7 @@
 #![deny(clippy::float_arithmetic)]
 
 mod bounded;
+mod diff;
 mod epoch;
 mod hasher;
 mod label;
@@ -30,6 +31,7 @@ pub mod test_util;
 mod vnodes;
 
 pub use bounded::{BoundedLoads, BoundedPlacement, Headroom, LoadView, LoadViewError};
+pub use diff::{Change, Diff, MovementSummary};
 pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
 pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
@@ -44,11 +46,14 @@ const _: () = {
     assert_send_sync::<BoundedLoads>();
     assert_send_sync::<BoundedPlacement<'static>>();
     assert_send_sync::<BuildRingError>();
+    assert_send_sync::<Change<'static, Vec<u8>>>();
+    assert_send_sync::<Diff<'static, Xxh3, std::vec::IntoIter<Vec<u8>>>>();
     assert_send_sync::<Epoch>();
     assert_send_sync::<Headroom>();
     assert_send_sync::<Host>();
     assert_send_sync::<LoadView<'static, Xxh3>>();
     assert_send_sync::<LoadViewError>();
+    assert_send_sync::<MovementSummary>();
     assert_send_sync::<Node>();
     assert_send_sync::<NodeId>();
     assert_send_sync::<ParseLabelError>();
