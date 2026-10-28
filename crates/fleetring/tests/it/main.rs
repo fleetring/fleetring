@@ -4,4 +4,5 @@
 mod common;
 mod hasher;
 mod labels;
+mod placement;
 mod ring;

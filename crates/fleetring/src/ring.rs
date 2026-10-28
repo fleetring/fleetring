@@ -13,7 +13,7 @@ use self::precomputed::Precomputed;
 /// weights below 2⁶⁴.
 const MAX_NODES: usize = u32::MAX as usize;
 
-/// An immutable set of nodes and the settings that place databases on them.
+/// An immutable set of nodes and the settings that place keys on them.
 ///
 /// Build a ring with [`Ring::builder`]. [`RingBuilder::build`] validates every input, so a ring
 /// always has at least one node, no two of its nodes share an ID, and each of its host labels
@@ -162,7 +162,7 @@ impl<H> Ring<H> {
         self.precomputed.zone_count()
     }
 
-    /// Returns how many replicas each database gets, counting the primary.
+    /// Returns how many replicas each key gets, counting the primary.
     #[must_use]
     pub fn replication_factor(&self) -> ReplicationFactor {
         self.replication_factor
@@ -340,7 +340,7 @@ impl<H> RingBuilder<H> {
     /// Sets the seed for every hash the ring computes. The default is 0.
     ///
     /// Rings that differ only in seed place keys independently of each other, so changing the
-    /// seed moves almost every database.
+    /// seed moves almost every key.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
@@ -352,9 +352,9 @@ impl<H> RingBuilder<H> {
         self
     }
 
-    /// Sets how many replicas each database gets, counting the primary. The default is 3.
+    /// Sets how many replicas each key gets, counting the primary. The default is 3.
     ///
-    /// A ring with fewer nodes than this still places every database, on as many nodes as it
+    /// A ring with fewer nodes than this still places every key, on as many nodes as it
     /// can.
     pub fn replication_factor(mut self, replication_factor: ReplicationFactor) -> Self {
         self.replication_factor = replication_factor;
@@ -598,18 +598,19 @@ fn check_hosts(nodes: &[Node]) -> Result<(), BuildRingError> {
     not(test),
     expect(
         dead_code,
-        reason = "placement (FR-008, FR-009, FR-011) is the first reader"
+        reason = "bounded loads (FR-011) is the first reader of total_weight"
     )
 )]
 mod precomputed {
     use super::{MAX_NODES, Ring};
+    use crate::select::{Member, Members};
     use crate::{Node, StableHasher};
 
     /// Placement data derived from a ring's validated, canonically ordered nodes.
     #[derive(Debug, Clone)]
     pub(super) struct Precomputed {
         /// One entry per node, in canonical order.
-        entries: Box<[Entry]>,
+        entries: Box<[Member]>,
         zone_count: usize,
         /// Distinct host labels, plus one host for each unlabeled node.
         host_count: usize,
@@ -617,20 +618,6 @@ mod precomputed {
         total_weight: u64,
         /// Whether every node has the same weight, which lets rendezvous rank by raw draws alone.
         uniform_weights: bool,
-    }
-
-    /// One node's placement inputs.
-    #[derive(Debug, Clone, Copy)]
-    struct Entry {
-        /// `H(id, seed)`, the input to each of the node's draws (ADR-0005).
-        node_hash: u64,
-        weight: u32,
-        /// The node's position among the ring's distinct zones in sorted order, where the default
-        /// zone comes first.
-        zone: u32,
-        /// The node's position among the ring's distinct host labels in sorted order. Unlabeled
-        /// nodes are numbered after the labels, one host each, in canonical order.
-        host: u32,
     }
 
     impl Precomputed {
@@ -650,7 +637,7 @@ mod precomputed {
                         host
                     }
                 };
-                entries.push(Entry {
+                entries.push(Member {
                     node_hash: hasher.hash(node.id().as_str().as_bytes(), seed),
                     weight: node.weight().get(),
                     zone: to_index(position(&zones, &node.zone())),
@@ -687,7 +674,18 @@ mod precomputed {
             self.hasher.hash(key, self.seed)
         }
 
+        /// Returns the per-node placement inputs that strategies and selection read.
+        pub(crate) fn members(&self) -> Members<'_> {
+            Members {
+                entries: &self.precomputed.entries,
+                zone_count: self.precomputed.zone_count,
+                host_count: self.precomputed.host_count,
+                uniform_weights: self.precomputed.uniform_weights,
+            }
+        }
+
         /// Returns the hash of node `index`'s ID under the ring's seed.
+        #[cfg(test)]
         pub(crate) fn node_hash(&self, index: usize) -> u64 {
             self.precomputed.entries[index].node_hash
         }
@@ -696,6 +694,7 @@ mod precomputed {
         ///
         /// Zones are numbered in sorted order, starting with the default zone if any node is in
         /// it.
+        #[cfg(test)]
         pub(crate) fn zone_of(&self, index: usize) -> u32 {
             self.precomputed.entries[index].zone
         }
@@ -703,16 +702,19 @@ mod precomputed {
         /// Returns node `index`'s host, as an index below [`host_count`](Self::host_count).
         ///
         /// Two nodes share a host index exactly when they share a host label.
+        #[cfg(test)]
         pub(crate) fn host_of(&self, index: usize) -> u32 {
             self.precomputed.entries[index].host
         }
 
         /// Returns node `index`'s weight.
+        #[cfg(test)]
         pub(crate) fn weight_of(&self, index: usize) -> u32 {
             self.precomputed.entries[index].weight
         }
 
         /// Returns whether every node has the same weight.
+        #[cfg(test)]
         pub(crate) fn uniform_weights(&self) -> bool {
             self.precomputed.uniform_weights
         }
@@ -724,6 +726,7 @@ mod precomputed {
 
         /// Returns the number of distinct hosts, counting each unlabeled node as a host of its
         /// own.
+        #[cfg(test)]
         pub(crate) fn host_count(&self) -> usize {
             self.precomputed.host_count
         }

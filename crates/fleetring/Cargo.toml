@@ -21,11 +21,20 @@ std = []
 test-util = []
 
 [dependencies]
+smallvec.workspace = true
 thiserror.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+# dhat counts heap allocations for the allocation-free lookup check; it doesn't target wasm.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+dhat.workspace = true
+
+[[test]]
+name = "alloc_free"
+harness = false
 
 [lints]
 workspace = true

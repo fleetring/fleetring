@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8060235f527d54e879e30815797eea49523571a8f47fda7f3aa0af09eb51bf50 # shrinks to fixture = Fixture { node_hashes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 8324596570800534372, 136586696370393382, 3275919699028775908, 69360596, 0, 0, 21706116606181, 13797576206515155751], weights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 5, 1, 3, 1], zones: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], hosts: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 3, 2, 0] }, key_hash = 1877931478917285453, r = 5, node = Index(10404904796598626545), weight = 1

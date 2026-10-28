@@ -16,17 +16,13 @@
 mod epoch;
 mod hasher;
 mod label;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the rendezvous strategy (FR-008) is the first caller"
-    )
-)]
+mod lookup;
 mod math;
 mod node;
+mod rendezvous;
 mod replica;
 mod ring;
+mod select;
 mod strategy;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
@@ -35,7 +31,7 @@ pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
 pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
 pub use node::{Node, Weight};
-pub use replica::ReplicationFactor;
+pub use replica::{Preference, ReplicaIter, ReplicaSet, ReplicationFactor};
 pub use ring::{BuildRingError, Ring, RingBuilder};
 pub use strategy::Strategy;
 
@@ -48,6 +44,9 @@ const _: () = {
     assert_send_sync::<Node>();
     assert_send_sync::<NodeId>();
     assert_send_sync::<ParseLabelError>();
+    assert_send_sync::<Preference<'static>>();
+    assert_send_sync::<ReplicaIter<'static>>();
+    assert_send_sync::<ReplicaSet<'static>>();
     assert_send_sync::<ReplicationFactor>();
     assert_send_sync::<Ring<Xxh3>>();
     assert_send_sync::<RingBuilder>();

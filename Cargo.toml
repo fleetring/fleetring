@@ -13,6 +13,7 @@ authors = ["Sam Ruberti"]
 
 # Shared versions. A crate opts in with `name.workspace = true` once a ticket needs the dependency.
 [workspace.dependencies]
+dhat = "0.3"
 divan = "0.1"
 proptest = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
