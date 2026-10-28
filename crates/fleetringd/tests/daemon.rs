@@ -67,8 +67,18 @@ fn a_locked_data_directory_refuses_a_second_daemon() -> TestResult {
     let second = DataDir::lock(dir.path()).expect_err("second lock");
     assert!(matches!(second, DataDirError::InUse { .. }), "{second}");
     drop(first);
-    DataDir::lock(dir.path())?;
-    Ok(())
+    // A child process forked by another test in this binary holds copies of our descriptors until
+    // it execs, which can briefly keep the dropped lock alive, so allow the release a moment.
+    for _ in 0..50 {
+        match DataDir::lock(dir.path()) {
+            Ok(_) => return Ok(()),
+            Err(DataDirError::InUse { .. }) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("the data directory stayed locked after the first lock was dropped".into())
 }
 
 #[cfg(unix)]

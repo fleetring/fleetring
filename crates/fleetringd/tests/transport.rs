@@ -142,6 +142,7 @@ fn join_request(major: u32) -> JoinRequest {
             zone: Some("rack-a".into()),
             host: None,
             weight: 1,
+            address: None,
         }),
     }
 }

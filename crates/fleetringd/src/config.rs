@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,6 +24,7 @@ use crate::engine::EngineConfig;
 /// id = "laptop-1"
 /// zone = "home"
 /// weight = 2
+/// advertise = "10.0.0.2:7400"
 ///
 /// [control]
 /// address = "10.0.0.1:7400"
@@ -69,6 +70,11 @@ pub struct NodeConfig {
     /// The node's share of databases, relative to other nodes.
     #[serde(default = "default_weight")]
     pub weight: Weight,
+    /// The address peers and clients reach this node at. It defaults to the address the node
+    /// listens on, with the loopback address in place of an unspecified one, which only works
+    /// when every node runs on one machine; set it when they don't.
+    #[serde(default)]
+    pub advertise: Option<SocketAddr>,
 }
 
 fn default_weight() -> Weight {
@@ -76,7 +82,8 @@ fn default_weight() -> Weight {
 }
 
 impl NodeConfig {
-    /// Returns the member this node joins the cluster as.
+    /// Returns the member this node joins the cluster as, without an address; the daemon adds the
+    /// advertised one.
     #[must_use]
     pub fn to_member(&self) -> Member {
         let mut member = Member::new(self.id.clone()).with_weight(self.weight);
@@ -244,6 +251,16 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// The address a client on this machine dials to reach the control plane: `control.address`,
+    /// or `listen` if this node runs the control role. `None` if neither applies, or if `listen`
+    /// names port 0, which only the running daemon can resolve.
+    #[must_use]
+    pub fn control_target(&self) -> Option<SocketAddr> {
+        self.control.address.or_else(|| {
+            (self.role.runs_control() && self.listen.port() != 0).then(|| reachable(self.listen))
+        })
+    }
+
     /// Reads and validates a configuration file.
     ///
     /// # Errors
@@ -295,5 +312,19 @@ impl Config {
             });
         }
         Ok(())
+    }
+}
+
+/// The address a client on this machine dials to reach a server bound to `address`: the loopback
+/// address in place of an unspecified one, which not every platform accepts as a destination.
+pub(crate) fn reachable(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), v4.port())
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6.port())
+        }
+        other => other,
     }
 }

@@ -399,6 +399,48 @@ fn membership_changes_bump_the_membership_epoch() {
 }
 
 #[test]
+fn a_new_address_bumps_the_membership_epoch_but_moves_no_key() {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create("acme", 2)).expect("create");
+    let before = state.replica_set(&db("acme")).expect("replica set");
+    let fingerprint = state.ring().expect("ring").fingerprint();
+
+    let member = state.member(&id("a")).cloned().expect("member");
+    let moved = member.with_address("10.0.0.1:7400");
+    let joined = run(
+        &mut state,
+        10,
+        Action::Join {
+            member: moved.clone(),
+        },
+    );
+    assert!(matches!(
+        joined,
+        Ok(Applied::MemberJoined {
+            kind: JoinKind::Updated,
+            ..
+        })
+    ));
+    assert_eq!(state.membership_epoch().get(), 4);
+    assert_eq!(
+        state.member(&id("a")).and_then(Member::address),
+        Some("10.0.0.1:7400")
+    );
+    assert_eq!(state.replica_set(&db("acme")).expect("replica set"), before);
+    let ring = state.ring().expect("ring");
+    assert_eq!(ring.epoch().get(), 4);
+    assert_eq!(
+        ring.fingerprint(),
+        fingerprint,
+        "addresses aren't placed by"
+    );
+
+    // The same address again is a plain rejoin.
+    run(&mut state, 20, Action::Join { member: moved }).expect("rejoin");
+    assert_eq!(state.membership_epoch().get(), 4);
+}
+
+#[test]
 fn a_join_that_would_break_the_ring_is_rejected() {
     let mut state = State::new(config());
     let host: Host = "box".parse().expect("valid host");

@@ -73,5 +73,6 @@ pub use fault::{Fault, LossRate};
 pub use rng::SimRng;
 pub use trace::{DRIVER, Divergence, Event, EventKind, Replay, Trace};
 pub use workload::{
-    Ack, CreateAndAcquire, History, Operation, Operator, Outcome, Record, Script, Step, Workload,
+    Ack, CreateAndAcquire, CreateAndWrite, History, Operation, Operator, Outcome, Record, Script,
+    Step, WRITES_TABLE, Workload,
 };

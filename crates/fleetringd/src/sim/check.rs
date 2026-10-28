@@ -11,9 +11,10 @@
 //!
 //! # Extension points
 //!
-//! - **No acknowledged write is lost** (FR-030): once [`Operation`] carries database writes, add
-//!   a check that every acknowledged write is present on the database's primary after faults
-//!   heal, and on a quorum of its replicas, and call it from
+//! - **No acknowledged write is lost** (FR-030): [`Operation::Write`] carries database writes,
+//!   and [`History::acknowledged_writes`] lists the acknowledged ones. Add a check that each is
+//!   present on the database's primary after faults heal, and on a quorum of its replicas, and
+//!   call it from
 //!   [`Cluster::check`](crate::sim::Cluster::check) and [`Cluster::finish`](crate::sim::Cluster::finish).
 //! - **At most one primary per epoch** (FR-031): [`one_primary_per_epoch`] checks the leases
 //!   clients were granted. Once data nodes report their roles in heartbeats and accept writes,
@@ -221,7 +222,8 @@ pub fn acknowledged_control_survives(state: &State, history: &History) -> Result
                     return Err(violation(format!("acknowledged member {node} is lost")));
                 }
             }
-            (Operation::CreateDatabase { database, .. }, Ack::Created) => {
+            (Operation::CreateDatabase { database, .. }, Ack::Created)
+            | (Operation::Create { database, .. }, Ack::Opened { .. }) => {
                 if state.database(database).is_none() {
                     return Err(violation(format!(
                         "acknowledged database {database} is lost"
@@ -289,6 +291,13 @@ pub fn one_primary_per_epoch(history: &History) -> Result<(), Violation> {
                 Operation::AcquireLease { database, node }
                 | Operation::RenewLease { database, node, .. },
                 Ack::Lease { epoch, .. },
+            )
+            | (
+                Operation::Create { database, .. },
+                Ack::Opened {
+                    primary: node,
+                    epoch,
+                },
             ) => (database, node, *epoch),
             _ => continue,
         };

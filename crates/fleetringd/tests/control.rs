@@ -36,6 +36,7 @@ fn join_request(id: &str) -> JoinRequest {
             zone: None,
             host: None,
             weight: 1,
+            address: None,
         }),
     }
 }

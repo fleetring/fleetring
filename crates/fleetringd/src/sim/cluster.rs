@@ -230,6 +230,7 @@ impl ClusterBuilder {
             let data_dir = cluster.root.path().join(name);
             std::fs::create_dir_all(&data_dir)?;
             let mut config = host_config(name, *role, data_dir.clone(), self.timings)?;
+            config.node.advertise = Some(SocketAddr::new(cluster.sim.lookup(name.as_str()), PORT));
             if !role.runs_control() {
                 config.control.address = Some(control_address);
             }
@@ -286,6 +287,7 @@ fn host_config(
             zone: None,
             host: None,
             weight: Weight::ONE,
+            advertise: None,
         },
         data_dir,
         listen: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), PORT),
