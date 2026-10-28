@@ -19,24 +19,24 @@ mod environment;
 mod layout;
 mod membership;
 mod registry;
+pub mod replication;
 #[cfg(feature = "simulation")]
 pub mod sim;
 mod sink;
 pub mod transport;
 
-pub use actor::{DatabaseError, DatabaseHandle};
+pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
     Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, MembershipSettings, NodeConfig,
-    Role,
+    ReplicationConfig, Role,
 };
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
 pub use environment::{Environment, Network};
-pub use membership::{Membership, MembershipTasks, MembershipView};
+pub use membership::{DatabaseStatuses, Membership, MembershipTasks, MembershipView};
 pub use registry::Registry;
 pub use sink::{
-    Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink,
-    UnreplicatedSink,
+    Acknowledged, Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink,
 };
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
@@ -65,7 +65,9 @@ const _: () = {
     assert_debug_send_sync::<MembershipSettings>();
     assert_debug_send_sync::<MembershipTasks>();
     assert_debug_send_sync::<MembershipView>();
+    assert_debug_send_sync::<ReplicationConfig>();
     assert_debug_send_sync::<StartError>();
+    assert_debug_send_sync::<Stored>();
 
     // The log owns a SQLite connection, which moves between threads but isn't shared.
     const fn assert_debug_send<T: std::fmt::Debug + Send>() {}

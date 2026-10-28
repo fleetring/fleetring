@@ -1,4 +1,4 @@
-//! Where an open database's committed batches go: replication plugs in here (FR-030).
+//! Where an open database's committed batches go: the replication stream, or a test's sink.
 
 use std::fmt;
 use std::future::{self, Future};
@@ -31,19 +31,22 @@ pub trait ReplicationSink: fmt::Debug + Send + Sync + 'static {
 
 /// Completes when replication has stored a batch as durably as a write requires.
 #[must_use = "a write isn't acknowledged until its acknowledgement completes"]
-pub struct Acknowledgement(Pin<Box<dyn Future<Output = Result<(), ReplicationError>> + Send>>);
+pub struct Acknowledgement(
+    Pin<Box<dyn Future<Output = Result<Acknowledged, ReplicationError>> + Send>>,
+);
 
 impl Acknowledgement {
     /// An acknowledgement that completes with `future`.
     pub fn new(
-        future: impl Future<Output = Result<(), ReplicationError>> + Send + 'static,
+        future: impl Future<Output = Result<Acknowledged, ReplicationError>> + Send + 'static,
     ) -> Self {
         Self(Box::pin(future))
     }
 
-    /// An acknowledgement that is already complete.
+    /// An acknowledgement that is already complete, for a batch stored on its primary alone,
+    /// which is the whole replica set ([`Acknowledged::local`]).
     pub fn done() -> Self {
-        Self::new(future::ready(Ok(())))
+        Self::new(future::ready(Ok(Acknowledged::local())))
     }
 
     /// Waits for the acknowledgement.
@@ -51,8 +54,52 @@ impl Acknowledgement {
     /// # Errors
     ///
     /// [`ReplicationError`] if replication couldn't store the batch.
-    pub async fn wait(self) -> Result<(), ReplicationError> {
+    pub async fn wait(self) -> Result<Acknowledged, ReplicationError> {
         self.0.await
+    }
+}
+
+/// How durably an acknowledged batch is stored: how many replicas hold it, and how many the
+/// database should have.
+///
+/// A batch is acknowledged once W replicas hold it (ADR-0018), so `acknowledged_by` is W or more.
+/// The other followers usually catch up a moment later, so a count below `replicas` is normal and
+/// says nothing about the database's health; [`is_under_replicated`](Self::is_under_replicated)
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Acknowledged {
+    /// How many replicas, the primary included, held the batch durably when it was acknowledged.
+    pub acknowledged_by: u32,
+    /// How many replicas, the primary included, were reachable when the batch was published.
+    pub reachable: u32,
+    /// R, the size of the database's replica set.
+    pub replicas: u32,
+}
+
+impl Acknowledged {
+    /// A batch held by `acknowledged_by` of `replicas` replicas, with `reachable` of them
+    /// reachable when it was published.
+    #[must_use]
+    pub const fn new(acknowledged_by: u32, reachable: u32, replicas: u32) -> Self {
+        Self {
+            acknowledged_by,
+            reachable,
+            replicas,
+        }
+    }
+
+    /// A batch stored on its primary, which is the database's only replica.
+    #[must_use]
+    pub const fn local() -> Self {
+        Self::new(1, 1, 1)
+    }
+
+    /// Whether the database is under-replicated: fewer of its replicas were reachable than its
+    /// replica set holds, so some of them can't receive the batch until they come back.
+    #[must_use]
+    pub const fn is_under_replicated(&self) -> bool {
+        self.reachable < self.replicas
     }
 }
 
@@ -71,6 +118,17 @@ pub enum ReplicationError {
     Failed {
         /// Why.
         reason: String,
+    },
+    /// Too few of the database's replicas are reachable to store the batch as durably as a
+    /// write requires (ADR-0018). The write committed on the primary but isn't acknowledged.
+    #[error(
+        "database is under-replicated: {reachable} of the {required} replicas a write needs are reachable"
+    )]
+    UnderReplicated {
+        /// W, the replicas a write needs, the primary included.
+        required: usize,
+        /// The replicas reachable now, the primary included.
+        reachable: usize,
     },
 }
 
@@ -115,20 +173,6 @@ impl ReplicationSink for RecordingSink {
     }
 }
 
-/// The data role's sink until replication lands (FR-030): no follower stores anything yet, so it
-/// drops every batch and acknowledges it at once. A write is then stored on its primary alone.
-///
-/// The daemon builds its sink in one place, `daemon::replication_sink`; FR-030 replaces this sink
-/// there with the replication stream.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnreplicatedSink;
-
-impl ReplicationSink for UnreplicatedSink {
-    fn publish(&self, _batch: CommittedBatch) -> Acknowledgement {
-        Acknowledgement::done()
-    }
-}
-
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
     const fn assert_debug_send<T: fmt::Debug + Send>() {}
@@ -136,5 +180,5 @@ const _: () = {
     assert_debug_send_sync::<CommittedBatch>();
     assert_debug_send_sync::<RecordingSink>();
     assert_debug_send_sync::<ReplicationError>();
-    assert_debug_send_sync::<UnreplicatedSink>();
+    assert_debug_send_sync::<Acknowledged>();
 };

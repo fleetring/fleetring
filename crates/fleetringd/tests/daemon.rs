@@ -1,7 +1,9 @@
 //! FR-022: configuration, the data directory lock, and the binary's lifecycle.
 
 use std::error::Error;
+use std::time::Duration;
 
+use fleetringd::replication::ReplicationSettings;
 use fleetringd::{Config, ConfigError, DataDir, DataDirError, Role};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -42,6 +44,39 @@ fn invalid_fields_are_named_in_the_error() {
         assert!(matches!(error, ConfigError::Parse(_)), "{error}");
         assert!(error.to_string().contains(field), "{field}: {error}");
     }
+}
+
+#[test]
+fn the_replication_table_sets_replication_settings() -> TestResult {
+    let defaults = Config::from_toml(MINIMAL)?.replication.settings();
+    assert_eq!(defaults, ReplicationSettings::new());
+
+    let text = format!(
+        "{MINIMAL}\n[replication]\nack_timeout_ms = 750\ncheckpoint_threshold_bytes = 8192\n"
+    );
+    let settings = Config::from_toml(&text)?.replication.settings();
+    assert_eq!(
+        settings,
+        ReplicationSettings {
+            ack_timeout: Duration::from_millis(750),
+            checkpoint_threshold: 8192,
+            ..ReplicationSettings::new()
+        }
+    );
+
+    let text = format!("{MINIMAL}\n[replication]\nretry_interval_ms = 0\n");
+    let error = Config::from_toml(&text).expect_err("a zero retry interval");
+    assert!(
+        matches!(
+            error,
+            ConfigError::Invalid {
+                field: "replication.retry_interval_ms",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    Ok(())
 }
 
 #[test]

@@ -8,6 +8,7 @@ use tokio::sync::watch;
 
 use crate::clock::SimClock;
 use crate::control::ControlHandle;
+use crate::replication::Replication;
 use crate::sim::seeds::millis;
 use crate::sim::trace::{Event, EventKind, Trace};
 use crate::sim::workload::History;
@@ -40,6 +41,7 @@ pub(super) struct Inner {
 pub(super) struct Running {
     pub(super) control: Option<ControlHandle>,
     pub(super) membership: Option<Membership>,
+    pub(super) replication: Option<Replication>,
 }
 
 impl Shared {
@@ -90,6 +92,7 @@ pub(super) async fn run_host(name: String, config: Config, shared: Shared) -> tu
         Running {
             control: daemon.control(),
             membership: membership.clone(),
+            replication: daemon.replication(),
         },
     );
     shared.record(&name, EventKind::Started);

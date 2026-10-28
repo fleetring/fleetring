@@ -7,7 +7,9 @@
 //!   interval. A failed join or heartbeat is logged and tried again at the next interval, so a
 //!   control node outage, or a laptop that slept, needs no manual step: the node is marked down
 //!   while its heartbeats stop, and up again with the first one that arrives. If the control
-//!   plane no longer knows the node, because it was removed, the node joins again.
+//!   plane no longer knows the node, because it was removed, the node joins again. Each heartbeat
+//!   reports the databases a [`DatabaseStatuses`] source lists; one the control plane doesn't
+//!   know is left out and the heartbeat resent, so it never reads as an unknown node.
 //! - **Ring publication.** The node follows `WatchMembership`. Each update carries the members
 //!   and their liveness; when the membership epoch changes, the task rebuilds the ring with
 //!   [`membership_ring`], the function the control plane builds its own ring with, so every node
@@ -32,15 +34,17 @@ use fleetring::{Diagnostic, Epoch, Fingerprint, NodeId, Ring, Severity};
 use fleetring_control::{Liveness, Member, membership_ring};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
-    HeartbeatRequest, JoinRequest, MembershipUpdate, WatchMembershipRequest,
+    DatabaseStatus, HeartbeatRequest, HeartbeatResponse, JoinRequest, MembershipUpdate,
+    WatchMembershipRequest,
 };
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
 use tokio::time::{MissedTickBehavior, timeout};
-use tonic::Code;
+use tonic::{Code, Status};
 
 use crate::MembershipSettings;
-use crate::control::{ControlClient, member_from, node_to_proto};
+use crate::control::{ControlClient, member_from, missing_database, node_to_proto};
 
 /// How many heartbeat replies in a row may report a later membership epoch than the published one
 /// before the membership stream counts as stalled and is reopened.
@@ -112,7 +116,8 @@ pub struct Membership {
 
 impl Membership {
     /// Joins the cluster as `member` through `client`, and starts the heartbeat and ring
-    /// publication tasks on the current Tokio runtime.
+    /// publication tasks on the current Tokio runtime. Heartbeats report no databases; see
+    /// [`Membership::start_reporting`].
     ///
     /// The tasks run until the returned [`MembershipTasks`] is stopped or dropped.
     ///
@@ -125,13 +130,36 @@ impl Membership {
         client: ControlClient,
         settings: &MembershipSettings,
     ) -> (Self, MembershipTasks) {
+        Self::start_reporting(member, client, settings, NoDatabases)
+    }
+
+    /// Starts membership as [`Membership::start`] does, with every heartbeat reporting the
+    /// databases `databases` lists at that moment: each one's role, epoch, and position.
+    ///
+    /// The control plane refuses a heartbeat that names a database it doesn't know. The
+    /// heartbeat is then sent again at once without that database, so the node stays live and
+    /// doesn't rejoin; only an unknown node makes it rejoin.
+    ///
+    /// # Panics
+    ///
+    /// If called outside a Tokio runtime.
+    #[must_use]
+    pub fn start_reporting(
+        member: Member,
+        client: ControlClient,
+        settings: &MembershipSettings,
+        databases: impl DatabaseStatuses,
+    ) -> (Self, MembershipTasks) {
         let (membership, publisher) = Self::unstarted();
         let interval = settings.heartbeat_interval();
         let resubscribe = Arc::new(Notify::new());
         let heartbeat = tokio::spawn(heartbeat_loop(
-            member,
-            client.clone(),
-            interval,
+            Heartbeats {
+                member,
+                client: client.clone(),
+                interval,
+                databases: Box::new(databases),
+            },
             Arc::clone(&resubscribe),
             membership.updates.clone(),
         ));
@@ -189,6 +217,31 @@ impl Membership {
         let mut updates = self.updates.clone();
         let view = updates.wait_for(|view| condition(view)).await.ok()?;
         Some(Arc::clone(&view))
+    }
+}
+
+/// Where a data node's heartbeats learn which databases it hosts (FR-029, FR-030).
+///
+/// The heartbeat task calls [`statuses`](Self::statuses) once per heartbeat, so it must answer
+/// quickly and without waiting.
+pub trait DatabaseStatuses: fmt::Debug + Send + Sync + 'static {
+    /// The role, epoch, and position of every database this node hosts, one entry each.
+    fn statuses(&self) -> Vec<DatabaseStatus>;
+}
+
+impl<T: DatabaseStatuses + ?Sized> DatabaseStatuses for Arc<T> {
+    fn statuses(&self) -> Vec<DatabaseStatus> {
+        (**self).statuses()
+    }
+}
+
+/// Reports no databases.
+#[derive(Debug, Clone, Copy, Default)]
+struct NoDatabases;
+
+impl DatabaseStatuses for NoDatabases {
+    fn statuses(&self) -> Vec<DatabaseStatus> {
+        Vec::new()
     }
 }
 
@@ -376,19 +429,57 @@ fn log_change(previous: &MembershipView, view: &MembershipView, same_members: bo
     }
 }
 
-/// Joins, then sends a heartbeat every `interval`, forever. Never fails: every error is logged and
-/// the step is tried again at the next interval.
-async fn heartbeat_loop(
+/// What the heartbeat task sends, and where.
+#[derive(Debug)]
+struct Heartbeats {
     member: Member,
     client: ControlClient,
     interval: Duration,
+    databases: Box<dyn DatabaseStatuses>,
+}
+
+impl Heartbeats {
+    /// Sends one heartbeat. A database the control plane doesn't know is dropped from the
+    /// report and the heartbeat sent again, so that it never reads as an unknown node.
+    async fn send(&self, id: &str) -> Result<Result<HeartbeatResponse, Status>, Elapsed> {
+        let mut databases = self.databases.statuses();
+        loop {
+            let request = HeartbeatRequest {
+                node_id: id.to_owned(),
+                databases: databases.clone(),
+            };
+            let result = timeout(self.interval, self.client.heartbeat(request)).await;
+            if let Ok(Err(status)) = &result
+                && let Some(missing) = missing_database(status)
+                && databases.iter().any(|status| status.database == missing)
+            {
+                tracing::debug!(node = %id, database = missing, "the control plane doesn't know this database; leaving it out");
+                databases.retain(|status| status.database != missing);
+                continue;
+            }
+            return result;
+        }
+    }
+}
+
+/// Joins, then sends a heartbeat every `interval`, forever. Never fails: every error is logged and
+/// the step is tried again at the next interval.
+async fn heartbeat_loop(
+    heartbeats: Heartbeats,
     resubscribe: Arc<Notify>,
     published: watch::Receiver<Arc<MembershipView>>,
 ) {
+    let Heartbeats {
+        member,
+        client,
+        interval,
+        ..
+    } = &heartbeats;
+    let interval = *interval;
     let id = member.id().to_string();
     let join = JoinRequest {
         protocol: Some(PROTOCOL_VERSION),
-        node: Some(node_to_proto(&member)),
+        node: Some(node_to_proto(member)),
     };
     let mut joined = false;
     let mut failing = false;
@@ -417,12 +508,7 @@ async fn heartbeat_loop(
                 }
             }
         }
-        let request = HeartbeatRequest {
-            node_id: id.clone(),
-            // No database has a role yet, so the node reports none.
-            databases: Vec::new(),
-        };
-        match timeout(interval, client.heartbeat(request)).await {
+        match heartbeats.send(&id).await {
             Ok(Ok(response)) => {
                 if failing {
                     tracing::info!(node = %id, "heartbeats are reaching the control plane again");

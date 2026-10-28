@@ -3,8 +3,10 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use fleetring_proto::v1::DatabaseStatus;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
@@ -15,9 +17,12 @@ use crate::control::{ControlHandle, ControlNode, ControlOptions, ControlService,
 use crate::data::{DataNode, DatabaseService};
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
-use crate::sink::UnreplicatedSink;
-use crate::transport::{control_server, database_server};
-use crate::{Config, ConfigError, DataDir, DataDirError, Membership, MembershipTasks, Registry};
+use crate::replication::{Replication, ReplicationParts};
+use crate::transport::{Peers, control_server, database_server};
+use crate::{
+    Config, ConfigError, DataDir, DataDirError, DatabaseStatuses, Membership, MembershipTasks,
+    Registry,
+};
 
 /// How long shutdown waits for open connections to close before it drops them.
 ///
@@ -31,6 +36,10 @@ pub(crate) const CONTROL_DB: &str = "control.db";
 /// The directory, inside the data directory, that holds a data node's databases.
 pub(crate) const DATABASES_DIR: &str = "databases";
 
+/// The directory, inside the data directory, where replication keeps its own durable state,
+/// such as each database's highest epoch.
+pub(crate) const REPLICATION_DIR: &str = "replication";
+
 /// A started daemon that holds its data directory.
 #[derive(Debug)]
 pub struct Daemon {
@@ -41,23 +50,12 @@ pub struct Daemon {
     data: Option<DataRole>,
 }
 
-/// What the data role runs: membership, and the databases this node hosts.
+/// What the data role runs: membership, and the databases this node hosts and replicates.
 #[derive(Debug)]
 struct DataRole {
     membership: Membership,
     tasks: MembershipTasks,
-    registry: Registry,
-}
-
-/// The replication sink every database on this node publishes its committed batches to.
-///
-/// **Replication plugs in here (FR-030).** No follower stores anything yet, so the sink
-/// acknowledges every batch at once, and a write's reply counts the primary alone (see
-/// `data::service::ACKNOWLEDGED_BY`). Replication replaces [`UnreplicatedSink`] with a sink that
-/// ships each batch to the database's followers and completes its acknowledgement once the write
-/// quorum holds it, and makes the reply count the replicas that acknowledged.
-fn replication_sink() -> UnreplicatedSink {
-    UnreplicatedSink
+    replication: Replication,
 }
 
 /// The gRPC listener, bound before any service starts so its address is known.
@@ -108,8 +106,11 @@ impl Daemon {
     /// from the data directory and serves the `Control` service there. A role that hosts data
     /// keeps its databases under `databases/` in the data directory, serves the `Database`
     /// service (see [`data`](crate::data)), joins the cluster with its advertised address, sends
-    /// heartbeats, and publishes the ring (see [`Membership`]). A node that runs both roles
-    /// reaches its own control node through `listen`.
+    /// heartbeats, and publishes the ring (see [`Membership`]). It also serves the `Replication`
+    /// service: it streams every database it is primary for to that database's followers, keeps
+    /// copies of those it follows, and reports both in its heartbeats (see
+    /// [`replication`](crate::replication)). A node that runs both roles reaches its own control
+    /// node through `listen`.
     ///
     /// It runs in [`Environment::production`]; see [`Daemon::start_with`].
     ///
@@ -123,8 +124,8 @@ impl Daemon {
     }
 
     /// Starts the daemon as [`Daemon::start`] does, in `environment`: its listener and peer
-    /// connections use the environment's network, the control node stamps commands with its
-    /// clock, and blocking storage calls run as its execution says.
+    /// connections, replication's included, use the environment's network, the control node and
+    /// replication read its clock, and blocking storage calls run as its execution says.
     ///
     /// With [`Execution::Inline`], the returned [`Daemon::config`] has `[engine] execution` set to
     /// inline as well.
@@ -151,7 +152,7 @@ impl Daemon {
         let network = environment.network();
         let (listener, address) = bind(&config, network).await?;
         let data = if config.role.hosts_data() {
-            Some(start_data(&config, &data_dir, network, address)?)
+            Some(start_data(&config, &data_dir, &environment, address)?)
         } else {
             None
         };
@@ -221,7 +222,16 @@ impl Daemon {
     /// The databases this node hosts, if this daemon hosts data.
     #[must_use]
     pub fn registry(&self) -> Option<Registry> {
-        self.data.as_ref().map(|data| data.registry.clone())
+        self.data
+            .as_ref()
+            .map(|data| data.replication.registry().clone())
+    }
+
+    /// The node's replication, if this daemon hosts data: the streams of the databases it is
+    /// primary for, and its copies of those it follows.
+    #[must_use]
+    pub fn replication(&self) -> Option<Replication> {
+        self.data.as_ref().map(|data| data.replication.clone())
     }
 
     /// Serves until `shutdown` completes, then stops taking work, finishes in-flight writes, closes
@@ -233,10 +243,10 @@ impl Daemon {
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
         shutdown.await;
         tracing::info!(node = %self.config.node.id, "fleetringd shutting down");
-        let registry = match self.data {
+        let replication = match self.data {
             Some(data) => {
                 data.tasks.stop().await;
-                Some(data.registry)
+                Some(data.replication)
             }
             None => None,
         };
@@ -261,9 +271,11 @@ impl Daemon {
                 let _aborted = task.await;
             }
         }
-        // No call is running any more: finish the writes databases accepted, then close them.
-        if let Some(registry) = registry {
-            registry.close_all().await;
+        // No call is running any more: stop the primaries' streams, finish the writes databases
+        // accepted, then close them.
+        if let Some(replication) = replication {
+            replication.stop();
+            replication.registry().close_all().await;
         }
         drop(self.data_dir);
         tracing::info!("fleetringd stopped");
@@ -287,21 +299,20 @@ fn advertised(config: &Config, bound: SocketAddr) -> SocketAddr {
     config.node.advertise.unwrap_or_else(|| reachable(bound))
 }
 
-/// Starts the data role: the registry under `databases/`, membership with the advertised
-/// address, and the node behind the `Database` service.
+/// Starts the data role: membership with the advertised address, the registry under
+/// `databases/` with replication around it, and the node behind the `Database` service.
+///
+/// Replication finds peers through membership, whose members carry the addresses they
+/// advertised, dials them on the environment's network, and keeps its own state under
+/// `replication/`. Heartbeats report every database it is primary for or follows.
 fn start_data(
     config: &Config,
     data_dir: &DataDir,
-    network: Network,
+    environment: &Environment,
     bound: SocketAddr,
 ) -> Result<(DataRole, DataNode), StartError> {
     let engine = SqliteEngine::new(config.engine.page_size)?;
-    let registry = Registry::new(
-        engine,
-        replication_sink(),
-        data_dir.path().join(DATABASES_DIR),
-        config.engine.clone(),
-    );
+    let network = environment.network();
     let control = network.control_client(
         config
             .control
@@ -313,14 +324,65 @@ fn start_data(
         .node
         .to_member()
         .with_address(advertised(config, bound).to_string());
-    let (membership, tasks) = Membership::start(member, control.clone(), &config.membership);
-    let node = DataNode::new(config.node.id.clone(), registry.clone(), control);
+    // Replication reads membership, and heartbeats report replication's databases, so membership
+    // starts first and learns its source of statuses as soon as replication exists.
+    let statuses = ReplicationStatuses::default();
+    let (membership, tasks) = Membership::start_reporting(
+        member,
+        control.clone(),
+        &config.membership,
+        statuses.clone(),
+    );
+    let settings = config.replication.settings();
+    let databases = data_dir.path().join(DATABASES_DIR);
+    let engine_config = config.engine.clone();
+    let replication = Replication::start(
+        ReplicationParts {
+            node: config.node.id.clone(),
+            engine: Arc::new(engine),
+            membership: membership.clone(),
+            peers: Arc::new(Peers::with_network(network)),
+            addresses: Arc::new(membership.clone()),
+            clock: environment.clock(),
+            execution: config.engine.execution,
+            state_dir: data_dir.path().join(REPLICATION_DIR),
+            settings: settings.clone(),
+        },
+        move |sink| Registry::new(engine, sink, databases, engine_config),
+    );
+    statuses.set(replication.clone());
+    let node = DataNode::new(
+        config.node.id.clone(),
+        replication.clone(),
+        control,
+        settings.ack_timeout,
+    );
     let role = DataRole {
         membership,
         tasks,
-        registry,
+        replication,
     };
     Ok((role, node))
+}
+
+/// The databases a data node's heartbeats report: those of its replication, once it exists.
+#[derive(Debug, Clone, Default)]
+struct ReplicationStatuses(Arc<OnceLock<Replication>>);
+
+impl ReplicationStatuses {
+    fn set(&self, replication: Replication) {
+        // Set once, right after replication starts.
+        let _set = self.0.set(replication);
+    }
+}
+
+impl DatabaseStatuses for ReplicationStatuses {
+    fn statuses(&self) -> Vec<DatabaseStatus> {
+        self.0
+            .get()
+            .map(DatabaseStatuses::statuses)
+            .unwrap_or_default()
+    }
 }
 
 /// Binds `listen` on `network`, and returns the listener with the address it bound.
@@ -348,8 +410,8 @@ async fn bind(config: &Config, network: Network) -> Result<(Listener, SocketAddr
     }
 }
 
-/// Serves on `listener`: the `Control` service if `control` runs here, and the `Database`
-/// service if `data` does. The data role's `Replication` service will join them.
+/// Serves on `listener`: the `Control` service if `control` runs here, and the `Database` and
+/// `Replication` services if `data` does.
 fn serve(
     listener: Listener,
     address: SocketAddr,
@@ -365,7 +427,8 @@ fn serve(
         .add_optional_service(
             control.map(|node| control_server(ControlService::new(node.handle()))),
         )
-        .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))));
+        .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))))
+        .add_optional_service(data.map(|node| node.replication().server()));
     let task = match listener {
         Listener::Tcp(listener) => {
             tokio::spawn(router.serve_with_incoming_shutdown(TcpIncoming::from(listener), shutdown))

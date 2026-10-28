@@ -3,9 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use fleetring::NodeId;
-use fleetring_control::DatabaseName;
+use fleetring::{NodeId, ReplicationFactor};
+use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::{AcquireLeaseRequest, LocateRequest, Placement};
 use tonic::Status;
 
@@ -13,23 +14,56 @@ use crate::control::ControlClient;
 use crate::data::redirect::not_primary;
 use crate::data::service::database_status;
 use crate::engine::EngineError;
+use crate::replication::{PrimaryRole, Replication};
 use crate::{DatabaseError, Registry};
 
 /// A lease this node holds, as far as it knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HeldLease {
     /// The lease's epoch.
-    pub(crate) epoch: u64,
-    /// The size of the database's replica set when the lease was taken.
-    pub(crate) replicas: u32,
+    pub(crate) epoch: LeaseEpoch,
+    /// The database's replication factor, R.
+    pub(crate) replication_factor: ReplicationFactor,
 }
 
-/// The data role's database side: the open databases, and the leases this node holds.
+impl HeldLease {
+    /// The lease `placement` names, with the database's replication factor: the placement's,
+    /// or the size of its replica set from a control node that doesn't send one.
+    fn of(placement: &Placement) -> Self {
+        let size = if placement.replicas.is_empty() {
+            placement.followers.len() + 1
+        } else {
+            placement.replicas.len()
+        };
+        let factor = if placement.replication_factor == 0 {
+            u32::try_from(size).unwrap_or(u32::MAX)
+        } else {
+            placement.replication_factor
+        };
+        Self {
+            epoch: LeaseEpoch::new(placement.epoch),
+            replication_factor: u8::try_from(factor)
+                .ok()
+                .and_then(ReplicationFactor::new)
+                .unwrap_or(ReplicationFactor::ONE),
+        }
+    }
+
+    /// R, the size the database's replica set should have.
+    pub(crate) fn replicas(self) -> u32 {
+        u32::from(self.replication_factor.get())
+    }
+}
+
+/// The data role's database side: the open databases, the leases this node holds, and the
+/// replication that ships their writes to their followers.
 ///
 /// A node serves a database only while it holds the database's lease. It learns that it does
 /// when it takes the first lease in [`DataNode::create`], or, after a restart, from the control
-/// plane the first time a request for the database arrives. Any other request is redirected to
-/// the primary the control plane names. Cloning is cheap and shares the node.
+/// plane the first time a request for the database arrives. Either way it then serves the
+/// database as its primary through [`Replication::serve_primary`], at the lease's epoch. Any
+/// other request is redirected to the primary the control plane names. Cloning is cheap and
+/// shares the node.
 #[derive(Debug, Clone)]
 pub(crate) struct DataNode {
     inner: Arc<Inner>,
@@ -38,25 +72,41 @@ pub(crate) struct DataNode {
 #[derive(Debug)]
 struct Inner {
     id: NodeId,
-    registry: Registry,
+    replication: Replication,
     control: ControlClient,
+    /// How long a node that starts serving a database waits for its followers' streams before
+    /// it takes writes.
+    writable_wait: Duration,
     leases: Mutex<BTreeMap<DatabaseName, HeldLease>>,
 }
 
 impl DataNode {
-    pub(crate) fn new(id: NodeId, registry: Registry, control: ControlClient) -> Self {
+    /// A node with ID `id` that keeps its databases in `replication`'s registry, and asks the
+    /// control plane through `control`. A database it starts serving waits up to `writable_wait`
+    /// for enough followers to take writes.
+    pub(crate) fn new(
+        id: NodeId,
+        replication: Replication,
+        control: ControlClient,
+        writable_wait: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 id,
-                registry,
+                replication,
                 control,
+                writable_wait,
                 leases: Mutex::new(BTreeMap::new()),
             }),
         }
     }
 
     pub(crate) fn registry(&self) -> &Registry {
-        &self.inner.registry
+        self.inner.replication.registry()
+    }
+
+    pub(crate) fn replication(&self) -> &Replication {
+        &self.inner.replication
     }
 
     /// Returns the lease this node holds on `name`, so the caller may serve it locally.
@@ -74,12 +124,11 @@ impl DataNode {
         match placement.primary.as_deref() {
             Some(primary) if primary == self.inner.id.as_str() => {
                 // A primary that restarted learns its lease again here. Its database must exist.
-                self.inner
-                    .registry
+                self.registry()
                     .open(name)
                     .await
                     .map_err(|error| missing_file(name, &error))?;
-                Ok(self.hold(name, &placement))
+                Ok(self.serve(name, &placement).await)
             }
             Some(primary) => Err(redirect(name, &placement, primary)),
             None => Err(Status::failed_precondition(format!(
@@ -103,7 +152,7 @@ impl DataNode {
         match placement.primary.as_deref() {
             Some(primary) if primary == id => {
                 self.create_file(name).await?;
-                self.hold(name, &placement);
+                self.serve(name, &placement).await;
                 Ok(placement)
             }
             Some(primary) => Err(redirect(name, &placement, primary)),
@@ -128,14 +177,14 @@ impl DataNode {
                 tracing::info!(database = %name, epoch = lease.epoch, "took the first lease");
                 self.create_file(name).await?;
                 let placement = self.locate(name).await?;
-                self.hold(name, &placement);
+                self.serve(name, &placement).await;
                 Ok(placement)
             }
         }
     }
 
     async fn create_file(&self, name: &DatabaseName) -> Result<(), Status> {
-        match self.inner.registry.create(name).await {
+        match self.registry().create(name).await {
             Ok(_) => {
                 tracing::info!(database = %name, "created the database");
                 Ok(())
@@ -162,22 +211,37 @@ impl DataNode {
         self.leases().get(name).copied()
     }
 
-    fn hold(&self, name: &DatabaseName, placement: &Placement) -> HeldLease {
-        let size = if placement.replicas.is_empty() {
-            placement.followers.len() + 1
-        } else {
-            placement.replicas.len()
-        };
-        let lease = HeldLease {
-            epoch: placement.epoch,
-            replicas: u32::try_from(size).unwrap_or(u32::MAX),
-        };
-        if self.leases().insert(name.clone(), lease).is_none() {
+    /// Records the lease `placement` names, serves the database as its primary at the lease's
+    /// epoch if this node didn't already, and waits until enough followers are connected for a
+    /// write to reach its quorum, or `writable_wait` passes.
+    async fn serve(&self, name: &DatabaseName, placement: &Placement) -> HeldLease {
+        let lease = HeldLease::of(placement);
+        let previous = self.leases().insert(name.clone(), lease);
+        if previous != Some(lease) {
             tracing::info!(
                 database = %name,
-                epoch = lease.epoch,
-                replicas = lease.replicas,
+                epoch = lease.epoch.get(),
+                replication_factor = lease.replication_factor.get(),
                 "serving as primary",
+            );
+            let role = PrimaryRole {
+                replication_factor: lease.replication_factor,
+                epoch: lease.epoch,
+            };
+            if let Err(error) = self.inner.replication.serve_primary(name.clone(), role) {
+                tracing::warn!(database = %name, %error, "not replicating");
+            }
+        }
+        if !self
+            .inner
+            .replication
+            .await_writable(name, self.inner.writable_wait)
+            .await
+        {
+            tracing::warn!(
+                database = %name,
+                wait = ?self.inner.writable_wait,
+                "too few followers are connected for writes to reach their quorum",
             );
         }
         lease

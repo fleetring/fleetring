@@ -114,6 +114,9 @@ message Placement {
   repeated string followers = 5;
   // The whole replica set in the ring's preference order, the primary included.
   repeated Replica replicas = 6;
+  // How many replicas the database should have. The replica set is smaller while there are
+  // fewer members. 0 from a control node that predates the field.
+  uint32 replication_factor = 7;
 }
 
 // One member of a database's replica set, as the control plane knows it.

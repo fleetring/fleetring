@@ -3,8 +3,8 @@
 //! One control host and three data hosts. A client creates databases with three replicas through
 //! the `Database` service and then writes to them, while the test partitions a data node from
 //! the control node, cuts the client off from a data node, and crashes and restarts a primary.
-//! Every acknowledgement lands in the history, for the "no acknowledged write is lost" check
-//! that replication adds (FR-030).
+//! Every acknowledged write must be on a write quorum of its database's replicas, which
+//! [`Cluster::finish`] checks against each host's copy on disk (FR-030).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -61,14 +61,18 @@ fn writes_under_faults(seed: u64) -> TestResult {
     let mut written = 0;
     for (operation, ack) in history.acknowledged() {
         if let (Operation::Write { .. }, ack) = (operation, ack) {
-            assert_eq!(
-                *ack,
-                Ack::Written {
-                    acknowledged_by: 1,
-                    replicas: 3,
-                    under_replicated: true,
-                },
-                "{operation}"
+            let Ack::Written {
+                acknowledged_by,
+                replicas,
+                ..
+            } = *ack
+            else {
+                panic!("{operation} was acknowledged with {ack}");
+            };
+            assert_eq!(replicas, 3, "{operation}: {ack}");
+            assert!(
+                (2..=3).contains(&acknowledged_by),
+                "{operation} was acknowledged by a write quorum of 2 of 3: {ack}"
             );
             written += 1;
         }

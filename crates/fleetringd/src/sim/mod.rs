@@ -67,7 +67,7 @@ pub mod seeds;
 mod trace;
 mod workload;
 
-pub use check::{ControlLog, Invariant, Violation};
+pub use check::{ControlLog, Invariant, ReplicaRows, Violation};
 pub use cluster::{Cluster, ClusterBuilder, PORT, Report, SimError, TRACE_VAR, Timings};
 pub use fault::{Fault, LossRate};
 pub use rng::SimRng;
