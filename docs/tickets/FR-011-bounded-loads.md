@@ -1,7 +1,7 @@
 ---
 id: FR-011
 title: Bounded-load placement policy
-status: todo
+status: done
 priority: P1
 size: M
 milestone: M2 Placement core
@@ -31,15 +31,26 @@ Implement ADR-0007: consistent hashing with bounded loads (MTZ forwarding) as a 
 
 ## Acceptance criteria
 
-- [ ] With every load at zero, the result equals home placement and `is_home()` is true.
-- [ ] A node is never chosen with `load + item > capacity` unless `is_saturated()` is true.
-- [ ] **Simulation.** Place 100k items one at a time, with count loads and ε = 25%, on the FR-006 fixtures, for both strategies:
+- [x] With every load at zero, the result equals home placement and `is_home()` is true.
+- [x] A node is never chosen with `load + item > capacity` unless `is_saturated()` is true.
+- [x] **Simulation.** Place 100k items one at a time, with count loads and ε = 25%, on the FR-006 fixtures, for both strategies:
   - No node ever exceeds its capacity, except in placements flagged as saturated.
   - On fixtures with N ≥ 2R, the saturation count is 0.
-- [ ] Zone and host diversity rules still hold under filtering (reuse the FR-009 property checks).
-- [ ] There is no overflow for loads up to `u64::MAX` and weights up to `u32::MAX`. Prove it with proptest in debug builds.
-- [ ] Results are deterministic. Golden vectors for them are added in FR-014.
+- [x] Zone and host diversity rules still hold under filtering (reuse the FR-009 property checks).
+- [x] There is no overflow for loads up to `u64::MAX` and weights up to `u32::MAX`. Prove it with proptest in debug builds.
+- [x] Results are deterministic. Golden vectors for them are added in FR-014.
 
 ## Out of scope
 
 - Rebalancing existing databases (hot-spot moves). That belongs to `fleetringd` in v0.2.
+
+## Progress
+
+- 2026-10-28: Done. A subagent built it in an isolated copy, and I merged and re-verified it. Its tests run with both strategies.
+  - **API:** `BoundedLoads::new(Headroom::from_percent(25))` → `load_view(&ring, (id, u64)…)` → `LoadView::replicas(key, item_load)` → `BoundedPlacement` with `is_saturated()` and `is_home()`.
+  - **Capacity:** computed as `⌊q/d⌋·f + ⌈(q mod d)·f/d⌉`, which stays below 2¹⁰⁸ for any input. Proptests run at the extremes (`u64::MAX` loads, `u32::MAX` weights, ε = `u16::MAX`).
+  - **Simulation** (100k placements, ε = 25%): `three_zones(4)` peaked at 1.0065× the fair share and `fleet(12, 3)` at 1.0073×, with no saturations. `homelab` (N = R) saturates by construction.
+- Decisions made during the merge:
+  - **Replica count:** `r = min(R, N)`, the number of replicas actually placed. ADR-0007 and spec §9 are updated to match.
+  - **Saturation fill:** it comes from the home replica set, which provably equals filling from the preference list and avoids an allocation.
+  - **Headroom range:** ε is a `u16` percentage.

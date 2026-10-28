@@ -605,16 +605,6 @@ fn check_hosts(nodes: &[Node]) -> Result<(), BuildRingError> {
 
 /// Placement data derived from a ring's nodes at build time, and the crate-internal accessors
 /// that placement reads it through.
-// One expectation covers the data and its accessors. Per-item expectations can't hold on every
-// supported toolchain: Rust 1.88 counts fields read by `expect`ed accessors as used, and later
-// releases don't.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "bounded loads (FR-011) is the first reader of total_weight"
-    )
-)]
 mod precomputed {
     use super::{BuildRingError, MAX_NODES, Ring};
     use crate::select::{Member, Members};

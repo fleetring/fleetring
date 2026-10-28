@@ -13,6 +13,7 @@
 // floating point.
 #![deny(clippy::float_arithmetic)]
 
+mod bounded;
 mod epoch;
 mod hasher;
 mod label;
@@ -28,6 +29,7 @@ mod strategy;
 pub mod test_util;
 mod vnodes;
 
+pub use bounded::{BoundedLoads, BoundedPlacement, Headroom, LoadView, LoadViewError};
 pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
 pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
@@ -39,9 +41,14 @@ pub use strategy::{Strategy, VnodeParams};
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BoundedLoads>();
+    assert_send_sync::<BoundedPlacement<'static>>();
     assert_send_sync::<BuildRingError>();
     assert_send_sync::<Epoch>();
+    assert_send_sync::<Headroom>();
     assert_send_sync::<Host>();
+    assert_send_sync::<LoadView<'static, Xxh3>>();
+    assert_send_sync::<LoadViewError>();
     assert_send_sync::<Node>();
     assert_send_sync::<NodeId>();
     assert_send_sync::<ParseLabelError>();

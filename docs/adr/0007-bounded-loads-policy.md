@@ -22,14 +22,16 @@ The control db already holds an authoritative db→node map (ADR-0001), and clie
 2. **Bounded loads is a separate policy,** applied when a database is created or re-placed:
 
    ```rust
-   let policy = BoundedLoads::new(Headroom::percent(25));         // ε = 0.25
-   let view = policy.load_view(&ring, current_loads)?;            // (NodeId, u64) pairs, any unit
+   let policy = BoundedLoads::new(Headroom::from_percent(25));    // ε = 25%
+   let view = policy.load_view(&ring, current_loads)?;            // (id, u64) pairs, any unit
    let placed = view.replicas("agent:sam-researcher", item_load); // deterministic
    ```
 
+   *(This sketch shows the API as implemented in FR-011. ε is a `u16` percentage, which keeps the capacity arithmetic within 128 bits.)*
+
    - **Load unit.** The caller picks it: database count, bytes, QPS, or anything else that fits in a `u64`. Loads count every replica a node hosts.
    - **Binding.** The view borrows the ring, so a snapshot can't be used with a different ring. Building a view fails on node IDs the ring doesn't know.
-   - **Capacity.** Node *i*'s capacity is `⌈(100 + ε%) · (total + r·item) · wᵢ / (100 · W)⌉`, computed in `u128` (ADR-0003). Here `total` is the current load summed over all nodes, `r` is the number of replicas being placed, and `W` is the ring's total weight.
+   - **Capacity.** Node *i*'s capacity is `⌈(100 + ε%) · (total + r·item) · wᵢ / (100 · W)⌉`, computed in `u128` (ADR-0003). Here `total` is the current load summed over all nodes, `r` is the number of replicas being placed (`min(R, N)`), and `W` is the ring's total weight. The implementation evaluates the formula as `⌊q/d⌋·f + ⌈(q mod d)·f/d⌉` so that no intermediate value overflows.
    - **Selection.** The policy picks `replicas_where(key, |n| load(n) + item ≤ capacity(n))`, which keeps zone and host diversity (ADR-0006). This is the MTZ forwarding rule applied to our preference order.
    - **Saturation.** If fewer than R nodes are eligible, which can happen with large items, the remaining slots are filled from the unfiltered preference list and the result reports `is_saturated()`. The policy never fails and never returns an empty set.
    - **Home placement check.** `is_home()` reports whether the result matches home placement. If it doesn't, the daemon must record an override.
