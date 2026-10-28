@@ -1,0 +1,14 @@
+[package]
+name = "fleetring-wal"
+description = "Read, validate, and mirror SQLite WAL files for FleetRing's SQLite engine adapter."
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

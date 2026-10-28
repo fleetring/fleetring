@@ -94,7 +94,12 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-features
+      - run: cargo check --workspace --exclude fleetringd --all-features --all-targets
+      # The daemon may need a newer toolchain than the libraries (ADR-0015, point 7).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - run: cargo +1.89 check -p fleetringd --all-features --all-targets
 
   docs:
     name: docs
@@ -117,7 +122,7 @@ jobs:
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
-      - run: cargo test -p fleetring --all-features --target i686-unknown-linux-gnu --no-fail-fast
+      - run: cargo test -p fleetring -p fleetring-control -p fleetring-wal --all-features --target i686-unknown-linux-gnu --no-fail-fast
 
   # Emulated targets run optimized with fewer proptest cases to stay fast; the native debug jobs
   # still catch overflow, and every property runs at full strength there.
@@ -132,7 +137,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - run: cross test -p fleetring --all-features --release --target s390x-unknown-linux-gnu --no-fail-fast
+      - run: cross test -p fleetring -p fleetring-control -p fleetring-wal --all-features --release --target s390x-unknown-linux-gnu --no-fail-fast
       # Proves the tests above ran big-endian: a build for the host by mistake would leave
       # little-endian (LSB) binaries here, or none at all.
       - name: test binaries are big-endian
@@ -155,7 +160,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasmtime
-      - run: cargo test -p fleetring --all-features --release --target wasm32-wasip1 --no-fail-fast
+      - run: cargo test -p fleetring -p fleetring-control -p fleetring-wal --all-features --release --target wasm32-wasip1 --no-fail-fast
       - run: cargo build -p fleetring --all-features --target wasm32-unknown-unknown
 
   # An implementation written from docs/spec/placement-v1.md alone must reproduce every golden

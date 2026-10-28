@@ -29,7 +29,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test -p fleetring --all-features --release -- --ignored
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo +1.88 check --workspace --all-features --all-targets
+cargo +1.88 check --workspace --exclude fleetringd --all-features --all-targets
+cargo +1.89 check -p fleetringd --all-features --all-targets
 cargo package -p fleetring --list      # review: no stray or oversized files
 cargo publish -p fleetring --dry-run
 ```
