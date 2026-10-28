@@ -4,17 +4,24 @@
 
 One database per agent, tenant, or device, spread across nodes you own. FleetRing decides where each database lives, routes traffic to it, and moves it when nodes join or leave.
 
-> **Status:** early development (`0.0.x`). APIs will change. Not production-ready.
+> **Status:** early development. The placement crate works today and is heading for 0.1.0; the router, live migration, and CLI are planned. APIs will change. Not production-ready.
 
 ## Why
 
 SQLite is now a server-side building block, and a database per agent or tenant is cheap. The hard part is **where each one lives, how clients find it, and how it moves** without losing writes. FleetRing handles that, vendor-neutral and self-hostable.
 
-## Planned features
+## Features
 
-- Consistent hashing: weighted rendezvous (default) or a virtual-node ring, with identical placement on every platform
-- Placement API: `key → database → node`, with zone-aware replicas
+**Available now**, in the `fleetring` crate:
+
+- Consistent hashing: weighted rendezvous (default) or a virtual-node ring, with identical placement on every platform, verified in CI on big-endian, 32-bit, and wasm targets
+- Placement API: database name → nodes, with zone- and host-aware replicas and deterministic failover
 - Bounded loads, applied when a database is created or moved: it skips nodes that would end up more than a set headroom above their share of bytes or traffic
+- Cells: a directory or ring picks a region or tenant pool, and a ring inside it picks the nodes
+- Ring diffs for migration planning, fingerprints that catch diverging peers, and topology diagnostics
+
+**Planned:**
+
 - Router that works with existing libSQL and Turso clients
 - Live migration when nodes join or leave, with zero lost writes
 - CLI: `fleetring up`, `node add/remove`, `db create/locate/move`, `status`
@@ -31,7 +38,7 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 
 ## Roadmap
 
-- [ ] `fleetring` ring and placement crate
+- [x] `fleetring` ring and placement crate (0.1.0 release in progress)
 - [ ] Router sidecar (libSQL/Hrana protocol)
 - [ ] Live migration
 - [ ] Demo: 10k agents with live rebalancing
