@@ -14,15 +14,28 @@ authors.workspace = true
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 fleetring = { path = "../fleetring", features = ["serde"] }
+fleetring-proto = { version = "0.0.0", path = "../fleetring-proto" }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 toml = "1.1.8"
+tonic = "0.14"
+tower = { version = "0.5", features = ["util"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tokio-stream = { version = "0.1", optional = true }
+turmoil = { version = "0.7", optional = true }
+
+[features]
+# Runs the transport over turmoil's simulated network, for the simulation harness (ADR-0020).
+simulation = ["dep:turmoil", "dep:hyper-util", "dep:tower", "dep:tokio-stream"]
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+tokio-stream = "0.1"
+
