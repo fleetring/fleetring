@@ -22,7 +22,9 @@ use crate::engine::{
     Execution, FrameBatch, FrameSource, OpenMode, Position, ReplicaPosition, Rows, Shape, Snapshot,
     Statement, Transaction,
 };
-use crate::sink::{Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink};
+use crate::sink::{
+    Acknowledged, Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink,
+};
 
 type Reply<T> = oneshot::Sender<Result<T, DatabaseError>>;
 
@@ -146,6 +148,17 @@ impl DatabaseError {
     }
 }
 
+/// A write transaction that committed, and how durably replication stored it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stored {
+    /// The rows the transaction's statements inserted, updated, or deleted.
+    pub rows_affected: u64,
+    /// How replication acknowledged the transaction's batch, or `None` if it committed no batch
+    /// because it changed nothing or the engine replicates itself.
+    pub acknowledged: Option<Acknowledged>,
+}
+
 /// A cheap, cloneable handle to an open database's actor.
 ///
 /// A handle stops working when its database closes, after an idle timeout or an eviction:
@@ -185,7 +198,7 @@ impl DatabaseHandle {
     ///
     /// [`DatabaseError`] if the database is closed, a statement fails (nothing commits), or
     /// replication fails (the write committed locally).
-    pub async fn execute(&self, transaction: Transaction) -> Result<Executed, DatabaseError> {
+    pub async fn execute(&self, transaction: Transaction) -> Result<Stored, DatabaseError> {
         let permit = self.reserve().await.ok_or_else(|| self.closed())?;
         self.execute_reserved(permit, transaction).await
     }
@@ -273,14 +286,18 @@ impl DatabaseHandle {
         &self,
         permit: mpsc::Permit<'_, Request>,
         transaction: Transaction,
-    ) -> Result<Executed, DatabaseError> {
+    ) -> Result<Stored, DatabaseError> {
         let (reply, result) = oneshot::channel();
         permit.send(Request::Execute(transaction, reply));
         let (executed, acknowledgement) = self.await_reply(result).await?;
-        if let Some(acknowledgement) = acknowledgement {
-            acknowledgement.wait().await?;
-        }
-        Ok(executed)
+        let acknowledged = match acknowledgement {
+            Some(acknowledgement) => Some(acknowledgement.wait().await?),
+            None => None,
+        };
+        Ok(Stored {
+            rows_affected: executed.rows_affected,
+            acknowledged,
+        })
     }
 
     pub(crate) async fn query_reserved(

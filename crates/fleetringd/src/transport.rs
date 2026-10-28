@@ -20,6 +20,8 @@ use fleetring_proto::v1::replication_server::{Replication, ReplicationServer};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
+use crate::environment::Network;
+
 /// Timeouts for connections to peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportConfig {
@@ -45,17 +47,78 @@ impl Default for TransportConfig {
 #[derive(Debug)]
 pub struct Peers {
     config: TransportConfig,
+    network: Network,
     channels: Mutex<BTreeMap<SocketAddr, Channel>>,
+    named: Mutex<BTreeMap<String, Channel>>,
 }
 
 impl Peers {
-    /// An empty pool.
+    /// An empty pool over real TCP.
     #[must_use]
     pub fn new(config: TransportConfig) -> Self {
         Self {
             config,
+            network: Network::Tcp(config),
             channels: Mutex::new(BTreeMap::new()),
+            named: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// An empty pool whose [`channel_to`](Self::channel_to) dials over `network`, so that the
+    /// same code runs over real TCP and under simulation (ADR-0020).
+    #[must_use]
+    pub fn with_network(network: Network) -> Self {
+        #[cfg_attr(
+            not(feature = "simulation"),
+            expect(
+                clippy::infallible_destructuring_match,
+                reason = "the simulated network adds a second variant"
+            )
+        )]
+        let config = match network {
+            Network::Tcp(config) => config,
+            #[cfg(feature = "simulation")]
+            Network::Simulated => TransportConfig::default(),
+        };
+        Self {
+            network,
+            ..Self::new(config)
+        }
+    }
+
+    /// The channel to `address`, given as `host:port`, over the pool's network. It connects
+    /// lazily, on the first call, and is shared until [`forget`](Self::forget) drops it.
+    ///
+    /// # Errors
+    ///
+    /// The transport error if `address` doesn't form a valid endpoint.
+    ///
+    /// # Panics
+    ///
+    /// If the pool's lock was poisoned by a panic in another thread.
+    pub fn channel_to(&self, address: &str) -> Result<Channel, tonic::transport::Error> {
+        let mut named = self.named.lock().expect("peer pool lock poisoned");
+        if let Some(channel) = named.get(address) {
+            return Ok(channel.clone());
+        }
+        let channel = self.network.channel(address)?;
+        named.insert(address.to_owned(), channel.clone());
+        Ok(channel)
+    }
+
+    /// Drops the shared channel to `address`, so that the next call dials a new connection.
+    ///
+    /// A connection can stall without failing, behind a partition or a peer that lost power;
+    /// a caller that sees a call stall forgets the channel rather than queueing behind it.
+    ///
+    /// # Panics
+    ///
+    /// If the pool's lock was poisoned by a panic in another thread.
+    pub fn forget(&self, address: &str) {
+        self.named
+            .lock()
+            .expect("peer pool lock poisoned")
+            .remove(address);
     }
 
     /// The channel to `peer`. It connects lazily, on the first call.

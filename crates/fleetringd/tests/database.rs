@@ -1,15 +1,16 @@
 //! FR-033: the `Database` service, the cluster client, and the command line, over real TCP.
 //!
 //! Each test starts a control daemon and three data daemons in process, on loopback ports the
-//! operating system picks.
+//! operating system picks. Writes replicate to their followers through the daemons' own
+//! `Replication` services (FR-030).
 
 use std::error::Error;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::ReplicationFactor;
-use fleetring_control::{DatabaseName, Liveness};
+use fleetring_control::{DatabaseName, Liveness, Role};
 use fleetring_proto::v1::ExecuteRequest;
 use fleetringd::data::{Client, Location, primary_hint};
 use fleetringd::engine::{Statement, Value};
@@ -186,9 +187,12 @@ async fn create_exec_query_and_locate_work_end_to_end() -> TestResult {
         )
         .await?;
     assert_eq!(written.rows_affected, 2);
-    assert_eq!(written.acknowledged_by, 1, "no followers until replication");
+    assert!(
+        written.acknowledged_by >= 2,
+        "a write quorum of 2 holds it: {written:?}"
+    );
     assert_eq!(written.replicas, 3);
-    assert!(written.under_replicated);
+    assert!(!written.under_replicated, "every replica is live");
 
     let rows = client
         .query(
@@ -235,6 +239,146 @@ async fn create_exec_query_and_locate_work_end_to_end() -> TestResult {
         .await?;
     assert_eq!((written.acknowledged_by, written.replicas), (1, 1));
     assert!(!written.under_replicated);
+
+    cluster.stop().await;
+    Ok(())
+}
+
+/// The database file of `database` in data daemon `id`'s data directory.
+fn database_file(dir: &Path, id: &str, database: &str) -> PathBuf {
+    dir.join(id)
+        .join("databases")
+        .join(database)
+        .join("data.db")
+}
+
+/// The values of table `notes` in a scratch copy of the SQLite files at `path`, so that the
+/// daemon's own files stay untouched.
+fn notes_in(path: &Path) -> Result<Vec<i64>, Box<dyn Error>> {
+    let scratch = tempfile::tempdir()?;
+    let copy = scratch.path().join("data.db");
+    std::fs::copy(path, &copy)?;
+    let wal = path.with_file_name("data.db-wal");
+    if wal.try_exists()? {
+        std::fs::copy(&wal, scratch.path().join("data.db-wal"))?;
+    }
+    let connection = rusqlite::Connection::open(&copy)?;
+    let mut statement = connection.prepare("SELECT n FROM notes ORDER BY n")?;
+    let values = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(values)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_replicate_to_every_follower_through_the_daemons() -> TestResult {
+    const ROWS: i64 = 40;
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let client = cluster.client()?;
+    let orders = name("orders")?;
+
+    let created = client.create_database(&orders, three()?).await?;
+    let primary = created.primary.clone().ok_or("no primary after create")?;
+    client
+        .execute(
+            &orders,
+            Statement::new("CREATE TABLE notes (n INTEGER PRIMARY KEY, body TEXT)"),
+        )
+        .await?;
+    for n in 0..ROWS {
+        let written = client
+            .execute(
+                &orders,
+                Statement::with_params(
+                    "INSERT INTO notes (n, body) VALUES (?, ?)",
+                    [Value::Integer(n), Value::from(format!("note {n}"))],
+                ),
+            )
+            .await?;
+        assert!(
+            written.acknowledged_by >= 2 && written.acknowledged_by <= 3,
+            "write {n} reached a quorum of 2 of 3: {written:?}"
+        );
+        assert_eq!(written.replicas, 3);
+        assert!(!written.under_replicated, "write {n}: {written:?}");
+    }
+
+    // Every follower acknowledges everything, then the primary checkpoints and ships the marker.
+    let replication = cluster
+        .data_daemon(primary.as_str())?
+        .replication()
+        .ok_or("no replication on the primary")?;
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let caught_up = replication.primary_status(&orders).is_some_and(|status| {
+                status.committed.is_some()
+                    && status.followers.len() == 2
+                    && status
+                        .followers
+                        .iter()
+                        .all(|follower| follower.acknowledged == status.committed)
+            });
+            if caught_up {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let marker = replication.checkpoint(&orders).await?;
+    for follower in created.followers() {
+        let replication = cluster
+            .data_daemon(follower.node.as_str())?
+            .replication()
+            .ok_or("no replication on a follower")?;
+        tokio::time::timeout(HANG_GUARD, async {
+            while !replication
+                .follower_status(&orders)
+                .is_some_and(|status| status.checkpointed.as_ref() == Some(&marker.position))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+    }
+
+    let expected: Vec<i64> = (0..ROWS).collect();
+    let primary_file = database_file(dir.path(), primary.as_str(), "orders");
+    let primary_bytes = std::fs::read(&primary_file)?;
+    for follower in created.followers() {
+        let file = database_file(dir.path(), follower.node.as_str(), "orders");
+        assert_eq!(notes_in(&file)?, expected, "{}'s rows", follower.node);
+        assert!(
+            std::fs::read(&file)? == primary_bytes,
+            "{}'s copy differs from the primary's after the checkpoint",
+            follower.node
+        );
+    }
+
+    // Heartbeats carry every replica's role and position to the control plane.
+    let located = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let located = client.locate(&orders).await?;
+            if located
+                .replicas
+                .iter()
+                .all(|replica| replica.position.is_some())
+            {
+                return Ok::<_, tonic::Status>(located);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    for replica in &located.replicas {
+        let role = if replica.node == primary {
+            Role::Primary
+        } else {
+            Role::Follower
+        };
+        assert_eq!(replica.reported_role, Some(role), "{}", replica.node);
+    }
 
     cluster.stop().await;
     Ok(())
@@ -494,9 +638,10 @@ mod binary {
             ))
             .await?,
         )?;
-        assert_eq!(
-            table,
-            "0 rows affected; acknowledged by 1 of 3 replicas; under-replicated\n"
+        assert!(
+            [2, 3].iter().any(|count| table
+                == format!("0 rows affected; acknowledged by {count} of 3 replicas\n")),
+            "{table}"
         );
         let insert = stdout(
             &fleetringd(args(
@@ -515,9 +660,10 @@ mod binary {
             ))
             .await?,
         )?;
-        assert_eq!(
-            insert,
-            "1 row affected; acknowledged by 1 of 3 replicas; under-replicated\n"
+        assert!(
+            [2, 3].iter().any(|count| insert
+                == format!("1 row affected; acknowledged by {count} of 3 replicas\n")),
+            "{insert}"
         );
 
         let rows = stdout(

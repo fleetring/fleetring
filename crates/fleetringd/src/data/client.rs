@@ -86,11 +86,13 @@ pub struct ReplicaInfo {
 pub struct Written {
     /// The rows the statement inserted, updated, or deleted.
     pub rows_affected: u64,
-    /// How many replicas, the primary included, hold the write.
+    /// How many replicas, the primary included, held the write when it was acknowledged: the
+    /// write quorum W or more.
     pub acknowledged_by: u32,
-    /// The size of the database's replica set.
+    /// R, the size the database's replica set should have.
     pub replicas: u32,
-    /// Whether fewer replicas than the replica set hold the write.
+    /// Whether the database is under-replicated: fewer than R of its replicas were reachable, so
+    /// the write can't reach them all until they come back.
     pub under_replicated: bool,
 }
 
@@ -221,14 +223,15 @@ impl Client {
         location(self.placement(name).await?)
     }
 
-    /// Runs one write statement on the database's primary, and waits until replication has
-    /// acknowledged it.
+    /// Runs one write statement on the database's primary, and waits until a write quorum of its
+    /// replicas holds it.
     ///
     /// # Errors
     ///
     /// `INVALID_ARGUMENT` if the statement fails, `FAILED_PRECONDITION` if the database has no
     /// primary yet, `UNAVAILABLE` if the primary can't be reached, and `ABORTED` if the write
-    /// may or may not have taken effect.
+    /// may or may not have taken effect, as when it committed on the primary but too few
+    /// replicas were reachable to acknowledge it.
     pub async fn execute(
         &self,
         name: &DatabaseName,

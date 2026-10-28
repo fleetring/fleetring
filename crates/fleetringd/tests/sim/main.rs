@@ -7,6 +7,7 @@ mod cluster;
 mod control;
 mod database;
 mod membership;
+mod replication;
 
 use std::error::Error;
 

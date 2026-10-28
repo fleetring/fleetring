@@ -2,15 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use fleetring_control::DatabaseName;
 use tokio::sync::{oneshot, watch};
 
-use crate::actor::{self, ActorConfig, DatabaseError, DatabaseHandle};
+use crate::actor::{self, ActorConfig, DatabaseError, DatabaseHandle, Stored};
 use crate::engine::{
-    DatabaseEngine, EngineConfig, EngineError, Executed, OpenMode, Rows, Statement, Transaction,
+    DatabaseEngine, EngineConfig, EngineError, OpenMode, Rows, Statement, Transaction,
 };
 use crate::layout;
 use crate::sink::ReplicationSink;
@@ -129,7 +129,7 @@ impl Registry {
         &self,
         name: &DatabaseName,
         transaction: Transaction,
-    ) -> Result<Executed, DatabaseError> {
+    ) -> Result<Stored, DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
@@ -198,6 +198,16 @@ impl Registry {
         for closed in waits {
             wait_closed(closed).await;
         }
+    }
+
+    /// The directory that holds `name`'s storage, whether or not it is open.
+    pub(crate) fn location(&self, name: &DatabaseName) -> PathBuf {
+        self.inner.root.join(layout::database_dir(name))
+    }
+
+    /// The directory every database's storage lives under.
+    pub(crate) fn root(&self) -> &Path {
+        &self.inner.root
     }
 
     /// Returns a handle to the database's actor, starting one if the database isn't open.
@@ -271,7 +281,7 @@ impl Registry {
             name: name.clone(),
             engine: Arc::clone(&inner.engine),
             sink: Arc::clone(&inner.sink),
-            location: inner.root.join(layout::database_dir(name)),
+            location: self.location(name),
             mode,
             execution: inner.config.execution,
             idle_timeout: inner.config.idle_timeout,

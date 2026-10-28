@@ -23,5 +23,7 @@ pub use node::{
     SubmitError,
 };
 pub use redirect::{LEADER_METADATA_KEY, leader_hint, not_leader};
-pub use service::{ControlService, MembershipStream, rejection_status};
+pub use service::{
+    ControlService, MISSING_DATABASE_KEY, MembershipStream, missing_database, rejection_status,
+};
 pub(crate) use service::{member_from, node_to_proto};

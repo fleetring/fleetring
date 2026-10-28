@@ -19,6 +19,7 @@ use fleetring_proto::v1::{
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::control::node::{ControlHandle, SubmitError};
@@ -52,7 +53,9 @@ impl ControlService {
 
 /// Maps a rejection to the gRPC status a caller receives, with the rejection's message.
 ///
-/// - `NOT_FOUND`: an unknown member or database.
+/// - `NOT_FOUND`: an unknown member or database. An unknown database also names itself in the
+///   [`MISSING_DATABASE_KEY`] metadata, so that a caller can tell the two apart
+///   ([`missing_database`]).
 /// - `ALREADY_EXISTS`: the database exists, or the member is already fenced.
 /// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, or a join that
 ///   would make an invalid ring.
@@ -62,8 +65,13 @@ impl ControlService {
 pub fn rejection_status(rejection: &Rejection) -> Status {
     let message = rejection.to_string();
     match rejection {
-        Rejection::UnknownMember { .. } | Rejection::UnknownDatabase { .. } => {
-            Status::not_found(message)
+        Rejection::UnknownMember { .. } => Status::not_found(message),
+        Rejection::UnknownDatabase { database } => {
+            let mut status = Status::not_found(message);
+            if let Ok(value) = MetadataValue::try_from(database.as_str()) {
+                status.metadata_mut().insert(MISSING_DATABASE_KEY, value);
+            }
+            status
         }
         Rejection::DatabaseExists { .. } | Rejection::AlreadyFenced { .. } => {
             Status::already_exists(message)
@@ -73,6 +81,20 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
         }
         _ => Status::failed_precondition(message),
     }
+}
+
+/// The metadata key of a `NOT_FOUND` status about an unknown database; its value names the
+/// database.
+pub const MISSING_DATABASE_KEY: &str = "fleetring-missing-database";
+
+/// The database a `NOT_FOUND` status says doesn't exist, or `None` if the status is about
+/// something else, such as an unknown member.
+#[must_use]
+pub fn missing_database(status: &Status) -> Option<&str> {
+    if status.code() != tonic::Code::NotFound {
+        return None;
+    }
+    status.metadata().get(MISSING_DATABASE_KEY)?.to_str().ok()
 }
 
 fn submit_status(error: SubmitError) -> Status {
@@ -217,6 +239,7 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
         primary: primary.map(ToString::to_string),
         followers,
         replicas,
+        replication_factor: u32::from(database.replication_factor().get()),
     })
 }
 

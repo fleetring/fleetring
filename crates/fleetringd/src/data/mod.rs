@@ -13,9 +13,13 @@
 //! - **Creation is driven by the primary itself.** The client registers the database with the
 //!   control plane, which places it with the ring, then calls `Create` on the first live member
 //!   of the replica set. That node takes the first lease and creates the database file through
-//!   its registry. Followers receive their copies from replication (FR-030, FR-032).
-//! - **Acknowledgements:** a write's reply says how many replicas hold it and whether that is
-//!   fewer than the replica set. Until replication lands (FR-030), only the primary does.
+//!   its registry, then serves it as primary through [`Replication`](crate::replication::Replication),
+//!   which streams it to its followers; each fetches its first copy from the primary.
+//! - **Acknowledgements:** a write is acknowledged once a write quorum of W replicas holds it
+//!   (ADR-0018). Its reply says how many replicas held it then (W or more), the replica set's
+//!   size R, and whether the database is under-replicated: fewer than R replicas reachable. A
+//!   write that committed on the primary without reaching its quorum fails with `ABORTED`, since
+//!   it may still replicate later.
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
 

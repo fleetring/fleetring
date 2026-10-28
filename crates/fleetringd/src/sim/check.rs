@@ -7,20 +7,19 @@
 //! - [`ring_converged`] once faults heal ([`Cluster::await_ring`](crate::sim::Cluster::await_ring));
 //! - [`control_log_replays`] and [`acknowledged_control_survives`] whenever the control host is
 //!   crashed or stopped, and at the end of a run;
-//! - [`one_primary_per_epoch`] at every check and at the end.
+//! - [`one_primary_per_epoch`] at every check and at the end;
+//! - [`acknowledged_writes_replicated`] whenever the test asks
+//!   ([`Cluster::check_writes`](crate::sim::Cluster::check_writes)), once replicas converge, and
+//!   at the end, and [`replicas_converged`] once the network heals
+//!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged)).
 //!
 //! # Extension points
 //!
-//! - **No acknowledged write is lost** (FR-030): [`Operation::Write`] carries database writes,
-//!   and [`History::acknowledged_writes`] lists the acknowledged ones. Add a check that each is
-//!   present on the database's primary after faults heal, and on a quorum of its replicas, and
-//!   call it from
-//!   [`Cluster::check`](crate::sim::Cluster::check) and [`Cluster::finish`](crate::sim::Cluster::finish).
 //! - **At most one primary per epoch** (FR-031): [`one_primary_per_epoch`] checks the leases
 //!   clients were granted. Once data nodes report their roles in heartbeats and accept writes,
 //!   extend it with every node that acknowledged a write as primary, keyed by database and epoch.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -43,6 +42,10 @@ pub enum Invariant {
     AcknowledgedControlSurvives,
     /// No two nodes were granted a database's lease at the same epoch.
     OnePrimaryPerEpoch,
+    /// Every acknowledged write is on at least W of its database's replicas.
+    AcknowledgedWritesReplicated,
+    /// Once the network heals, every replica of a database holds the same rows.
+    ReplicasConverged,
 }
 
 impl fmt::Display for Invariant {
@@ -52,6 +55,8 @@ impl fmt::Display for Invariant {
             Self::ControlLogReplays => "control log replays",
             Self::AcknowledgedControlSurvives => "acknowledged control operations survive",
             Self::OnePrimaryPerEpoch => "one primary per epoch",
+            Self::AcknowledgedWritesReplicated => "acknowledged writes are on a write quorum",
+            Self::ReplicasConverged => "replicas converged",
         })
     }
 }
@@ -315,6 +320,73 @@ pub fn one_primary_per_epoch(history: &History) -> Result<(), Violation> {
     Ok(())
 }
 
+/// The rows each replica of a database holds, by host.
+pub type ReplicaRows = BTreeMap<String, BTreeSet<i64>>;
+
+/// Checks that every write to `database` that `history` says was acknowledged is held by at least
+/// `required` of `replicas`.
+///
+/// # Errors
+///
+/// [`Invariant::AcknowledgedWritesReplicated`] naming the first write held by too few replicas,
+/// and the replicas that hold it.
+pub fn acknowledged_writes_replicated(
+    history: &History,
+    database: &DatabaseName,
+    replicas: &ReplicaRows,
+    required: usize,
+) -> Result<(), Violation> {
+    for (written, value) in history.acknowledged_writes() {
+        if written != database {
+            continue;
+        }
+        let holders: Vec<&str> = replicas
+            .iter()
+            .filter(|(_, rows)| rows.contains(&value))
+            .map(|(host, _)| host.as_str())
+            .collect();
+        if holders.len() < required {
+            return Err(Violation::new(
+                Invariant::AcknowledgedWritesReplicated,
+                format!(
+                    "acknowledged write {value} to {database} is on {holders:?}, fewer than {required} replicas"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that every replica of `database` holds the same rows.
+///
+/// # Errors
+///
+/// [`Invariant::ReplicasConverged`] naming two replicas that differ.
+pub fn replicas_converged(
+    database: &DatabaseName,
+    replicas: &ReplicaRows,
+) -> Result<(), Violation> {
+    let mut all = replicas.iter();
+    let Some((first, rows)) = all.next() else {
+        return Ok(());
+    };
+    for (host, other) in all {
+        if other != rows {
+            let only_first: Vec<&i64> = rows.difference(other).take(5).collect();
+            let only_other: Vec<&i64> = other.difference(rows).take(5).collect();
+            return Err(Violation::new(
+                Invariant::ReplicasConverged,
+                format!(
+                    "{database}: {first} has {} rows, {host} has {}; only on {first}: {only_first:?}, only on {host}: {only_other:?}",
+                    rows.len(),
+                    other.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -395,6 +467,45 @@ mod tests {
             Ack::Created,
         ));
         assert!(acknowledged_control_survives(&state, &history).is_err());
+    }
+
+    fn written(value: i64) -> Record {
+        acknowledged(
+            Operation::Write {
+                database: "db".parse().expect("name"),
+                value,
+            },
+            Ack::Written {
+                acknowledged_by: 2,
+                replicas: 3,
+                under_replicated: false,
+            },
+        )
+    }
+
+    #[test]
+    fn an_acknowledged_write_on_too_few_replicas_is_a_violation() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let mut history = History::default();
+        history.push(written(1));
+        history.push(written(2));
+        let mut replicas = ReplicaRows::new();
+        replicas.insert("a".into(), BTreeSet::from([1, 2, 3]));
+        replicas.insert("b".into(), BTreeSet::from([1, 2]));
+        replicas.insert("c".into(), BTreeSet::from([1]));
+        assert_eq!(
+            acknowledged_writes_replicated(&history, &db, &replicas, 2),
+            Ok(())
+        );
+        let violation =
+            acknowledged_writes_replicated(&history, &db, &replicas, 3).expect_err("too few");
+        assert_eq!(
+            violation.invariant(),
+            Invariant::AcknowledgedWritesReplicated
+        );
+        assert!(violation.detail().contains("write 2"), "{violation}");
+        let violation = replicas_converged(&db, &replicas).expect_err("they differ");
+        assert_eq!(violation.invariant(), Invariant::ReplicasConverged);
     }
 
     #[test]

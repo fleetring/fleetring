@@ -74,7 +74,8 @@ pub enum Operation {
         /// How many replicas it should have.
         replication_factor: u32,
     },
-    /// Inserts `value` into the database's [`WRITES_TABLE`] on its primary.
+    /// Inserts `value` into the database's [`WRITES_TABLE`] on its primary, through the data
+    /// plane, and waits for the write quorum to hold it.
     Write {
         /// The database.
         database: DatabaseName,
@@ -209,13 +210,14 @@ pub enum Ack {
         /// The primary's lease epoch.
         epoch: LeaseEpoch,
     },
-    /// A write is stored, and must never be lost.
+    /// A write committed and a write quorum stored it: it must never be lost.
     Written {
-        /// How many replicas, the primary included, hold it.
+        /// How many replicas, the primary included, held it when it was acknowledged: W or
+        /// more.
         acknowledged_by: u32,
-        /// The size of the database's replica set.
+        /// R, the size the database's replica set should have.
         replicas: u32,
-        /// Whether fewer replicas than the replica set hold it.
+        /// Whether fewer than R of the database's replicas were reachable.
         under_replicated: bool,
     },
 }

@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use fleetring_control::{ControlConfig, Member, Millis};
 use serde::Deserialize;
 
 use crate::engine::EngineConfig;
+use crate::replication::ReplicationSettings;
 
 /// Everything a daemon needs to start.
 ///
@@ -32,6 +33,7 @@ use crate::engine::EngineConfig;
 ///
 /// The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
 /// `[membership]` table sets how often a data node sends heartbeats; see [`MembershipSettings`].
+/// The `[replication]` table paces replication; see [`ReplicationConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -53,6 +55,9 @@ pub struct Config {
     /// How the data role reports to the control plane.
     #[serde(default)]
     pub membership: MembershipSettings,
+    /// How the data role replicates its databases.
+    #[serde(default)]
+    pub replication: ReplicationConfig,
 }
 
 /// A node's identity and the attributes placement uses.
@@ -132,6 +137,82 @@ impl Default for MembershipSettings {
         Self {
             heartbeat_interval_ms: NonZeroU64::new(1_000).unwrap_or(NonZeroU64::MIN),
         }
+    }
+}
+
+/// The `[replication]` table: how a data node paces and bounds replication.
+///
+/// Every field is optional; the defaults are those of [`ReplicationSettings::new`].
+///
+/// ```toml
+/// [replication]
+/// max_in_flight = 8                  # batches in flight to one follower
+/// ack_timeout_ms = 5000              # how long a write waits for its quorum
+/// stall_timeout_ms = 2000            # how long a stream may go without an acknowledgement
+/// open_timeout_ms = 30000            # how long a stream may take to open
+/// retry_interval_ms = 200            # how long to wait before reopening a failed stream
+/// checkpoint_threshold_bytes = 4194304
+/// lag_limit_ms = 60000               # how long a follower may block checkpoints
+/// retained_bytes = 67108864          # published batches kept for followers
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicationConfig {
+    /// How many batches may be in flight to one follower.
+    pub max_in_flight: NonZeroUsize,
+    /// How long a write waits for its quorum before it fails unacknowledged, in milliseconds.
+    pub ack_timeout_ms: u64,
+    /// How long a stream with batches in flight may go without an acknowledgement before it is
+    /// reopened, in milliseconds.
+    pub stall_timeout_ms: u64,
+    /// How long a stream may take to open, the follower's initial copy included, in milliseconds.
+    pub open_timeout_ms: u64,
+    /// How long the primary waits before reopening a failed stream, in milliseconds.
+    pub retry_interval_ms: u64,
+    /// How many bytes of batches may be published after a checkpoint before the next one is due.
+    pub checkpoint_threshold_bytes: u64,
+    /// How long a follower may stay behind before it stops blocking checkpoints, in milliseconds.
+    pub lag_limit_ms: u64,
+    /// How many bytes of published batches the primary keeps for followers that are behind.
+    pub retained_bytes: usize,
+}
+
+impl ReplicationConfig {
+    /// Returns the settings replication runs with.
+    #[must_use]
+    pub fn settings(&self) -> ReplicationSettings {
+        ReplicationSettings {
+            max_in_flight: self.max_in_flight,
+            ack_timeout: Duration::from_millis(self.ack_timeout_ms),
+            stall_timeout: Duration::from_millis(self.stall_timeout_ms),
+            open_timeout: Duration::from_millis(self.open_timeout_ms),
+            retry_interval: Duration::from_millis(self.retry_interval_ms),
+            checkpoint_threshold: self.checkpoint_threshold_bytes,
+            lag_limit: Duration::from_millis(self.lag_limit_ms),
+            retained_bytes: self.retained_bytes,
+        }
+    }
+}
+
+impl From<&ReplicationSettings> for ReplicationConfig {
+    fn from(settings: &ReplicationSettings) -> Self {
+        let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            max_in_flight: settings.max_in_flight,
+            ack_timeout_ms: millis(settings.ack_timeout),
+            stall_timeout_ms: millis(settings.stall_timeout),
+            open_timeout_ms: millis(settings.open_timeout),
+            retry_interval_ms: millis(settings.retry_interval),
+            checkpoint_threshold_bytes: settings.checkpoint_threshold,
+            lag_limit_ms: millis(settings.lag_limit),
+            retained_bytes: settings.retained_bytes,
+        }
+    }
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self::from(&ReplicationSettings::new())
     }
 }
 
@@ -291,8 +372,8 @@ impl Config {
     /// # Errors
     ///
     /// [`ConfigError::Missing`] if a field this role needs is absent, and
-    /// [`ConfigError::Invalid`] if a data node's heartbeat interval isn't well below the heartbeat
-    /// timeout.
+    /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
+    /// interval isn't well below the heartbeat timeout.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.role == Role::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
@@ -309,6 +390,12 @@ impl Config {
                     "{interval} ms leaves room for fewer than {HEARTBEATS_PER_TIMEOUT} heartbeats \
                      in control.heartbeat_timeout_ms ({timeout} ms)"
                 ),
+            });
+        }
+        if self.replication.retry_interval_ms == 0 {
+            return Err(ConfigError::Invalid {
+                field: "replication.retry_interval_ms",
+                reason: "must be at least 1 ms".to_owned(),
             });
         }
         Ok(())

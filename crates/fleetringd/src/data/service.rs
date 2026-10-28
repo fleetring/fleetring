@@ -7,16 +7,10 @@ use fleetring_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::DatabaseError;
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::node::DataNode;
 use crate::engine::{EngineError, Transaction};
-
-/// How many replicas hold a write once its acknowledgement completes.
-///
-/// No follower stores writes yet, so only the primary does. Replication (FR-030) replaces this
-/// with the count its acknowledgement reports.
-const ACKNOWLEDGED_BY: u32 = 1;
+use crate::{Acknowledged, DatabaseError};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
 /// the rest (see [`not_primary`](crate::data::not_primary)).
@@ -37,7 +31,9 @@ impl DatabaseService {
 ///   committed.
 /// - `UNAVAILABLE`: the database closed before it took the request, which never ran; retry.
 /// - `ABORTED`: the request may or may not have taken effect: the database stopped after taking
-///   it, or replication failed after the write committed locally.
+///   it, or the write committed on the primary but replication couldn't store it on a write
+///   quorum, because too few replicas are reachable (under-replicated) or they didn't acknowledge
+///   it in time. Such a write may still reach the followers later.
 /// - `NOT_FOUND`: the database has no copy here.
 /// - `UNIMPLEMENTED`: the engine can't run this kind of request.
 /// - `INTERNAL`: storage failed.
@@ -83,17 +79,23 @@ impl Database for DatabaseService {
         let name: DatabaseName = parse("database name", &request.database)?;
         let statement = statement(request.sql, request.params)?;
         let lease = self.node.route(&name).await?;
-        let executed = self
+        let stored = self
             .node
             .registry()
             .execute(&name, Transaction::from(statement))
             .await
             .map_err(|error| database_status(&error))?;
+        // A write that committed no batch has nothing new to replicate: report how many replicas
+        // hold everything committed so far.
+        let acknowledged = stored
+            .acknowledged
+            .or_else(|| self.node.replication().holders(&name))
+            .unwrap_or_else(|| Acknowledged::new(1, 1, lease.replicas()));
         Ok(Response::new(ExecuteResponse {
-            rows_affected: executed.rows_affected,
-            acknowledged_by: ACKNOWLEDGED_BY,
-            under_replicated: ACKNOWLEDGED_BY < lease.replicas,
-            replicas: lease.replicas,
+            rows_affected: stored.rows_affected,
+            acknowledged_by: acknowledged.acknowledged_by,
+            under_replicated: acknowledged.is_under_replicated(),
+            replicas: acknowledged.replicas,
         }))
     }
 

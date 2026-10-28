@@ -1,6 +1,6 @@
 //! A simulated cluster of real daemons, one turmoil host per node.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -9,23 +9,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fleetring::{NodeId, Weight};
-use fleetring_control::State;
+use fleetring::{NodeId, ReplicationFactor, Weight};
+use fleetring_control::{DatabaseName, Quorums, State};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
 use crate::control::ControlHandle;
-use crate::daemon::CONTROL_DB;
+use crate::daemon::{CONTROL_DB, DATABASES_DIR};
 use crate::engine::{EngineConfig, Execution};
+use crate::layout;
+use crate::replication::{Replication, ReplicationSettings};
 use crate::sim::SimRng;
-use crate::sim::check::{self, ControlLog, Violation};
+use crate::sim::check::{self, ControlLog, ReplicaRows, Violation};
 use crate::sim::client::{Session, run_client};
 use crate::sim::fault::{Fault, LossRate};
 use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
-use crate::sim::workload::{History, Workload};
-use crate::{Config, ControlSettings, Membership, MembershipSettings, NodeConfig, Role};
+use crate::sim::workload::{Ack, History, Operation, WRITES_TABLE, Workload};
+use crate::{
+    Config, ControlSettings, Membership, MembershipSettings, NodeConfig, ReplicationConfig, Role,
+};
 
 /// The port every simulated daemon listens on.
 pub const PORT: u16 = 7400;
@@ -114,6 +118,7 @@ pub struct ClusterBuilder {
     operation_timeout: Duration,
     max_latency: Duration,
     configure: Vec<(String, Configure)>,
+    replication: Option<ReplicationSettings>,
 }
 
 impl fmt::Debug for ClusterBuilder {
@@ -125,11 +130,20 @@ impl fmt::Debug for ClusterBuilder {
             .field("duration", &self.duration)
             .field("operation_timeout", &self.operation_timeout)
             .field("max_latency", &self.max_latency)
+            .field("replication", &self.replication)
             .finish_non_exhaustive()
     }
 }
 
 impl ClusterBuilder {
+    /// Runs every host's replication with `settings`, through its `[replication]` table. The
+    /// default is [`ReplicationSettings::new`].
+    #[must_use]
+    pub fn replication(mut self, settings: ReplicationSettings) -> Self {
+        self.replication = Some(settings);
+        self
+    }
+
     /// Adds a host named `name` that runs `role`. The name is also the node's ID.
     #[must_use]
     pub fn host(mut self, name: &str, role: Role) -> Self {
@@ -234,6 +248,9 @@ impl ClusterBuilder {
             if !role.runs_control() {
                 config.control.address = Some(control_address);
             }
+            if let Some(settings) = &self.replication {
+                config.replication = ReplicationConfig::from(settings);
+            }
             for (_, configure) in self.configure.iter().filter(|(host, _)| host == name) {
                 configure(&mut config);
             }
@@ -306,6 +323,7 @@ fn host_config(
         membership: MembershipSettings {
             heartbeat_interval_ms: nonzero("the heartbeat interval", timings.heartbeat_interval)?,
         },
+        replication: ReplicationConfig::default(),
     })
 }
 
@@ -366,6 +384,7 @@ impl Cluster {
             operation_timeout: OPERATION_TIMEOUT,
             max_latency: MAX_LATENCY,
             configure: Vec::new(),
+            replication: None,
         }
     }
 
@@ -687,6 +706,106 @@ impl Cluster {
         Ok(log)
     }
 
+    /// Returns host `name`'s replication, while its daemon runs and hosts data.
+    #[must_use]
+    pub fn replication(&self, name: &str) -> Option<Replication> {
+        self.shared
+            .lock()
+            .running
+            .get(name)
+            .and_then(|running| running.replication.clone())
+    }
+
+    /// Returns the rows each data host's copy of `database` holds, read from its files on disk.
+    ///
+    /// A host without a copy holds no rows. Reading copies the files first, and SQLite's recovery
+    /// replays a follower's mirrored log as a promotion would, so the copy shows exactly what the
+    /// host would serve.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Simulation`] if a copy can't be read.
+    pub fn replica_rows(&self, database: &DatabaseName) -> Result<ReplicaRows, SimError> {
+        let mut rows = ReplicaRows::new();
+        for host in self.hosts.iter().filter(|host| host.role.hosts_data()) {
+            let dir = host
+                .data_dir
+                .join(DATABASES_DIR)
+                .join(layout::database_dir(database));
+            let held = read_rows(&dir).map_err(|error| {
+                SimError::Simulation(format!(
+                    "can't read {}'s copy of {database}: {error}",
+                    host.name
+                ))
+            })?;
+            rows.insert(host.name.clone(), held);
+        }
+        Ok(rows)
+    }
+
+    /// Checks that every acknowledged write is on at least W replicas of its database, reading
+    /// each host's copy from disk. It holds at any moment.
+    ///
+    /// # Errors
+    ///
+    /// A [`Violation`] of
+    /// [`Invariant::AcknowledgedWritesReplicated`](check::Invariant::AcknowledgedWritesReplicated),
+    /// or [`SimError::Simulation`] if a copy can't be read.
+    pub fn check_writes(&self) -> Result<(), SimError> {
+        let history = self.history();
+        for (database, factor) in created(&history) {
+            let rows = self.replica_rows(&database)?;
+            let required = usize::from(Quorums::new(factor).write());
+            check::acknowledged_writes_replicated(&history, &database, &rows, required)?;
+        }
+        Ok(())
+    }
+
+    /// Steps until the followers of every database created through the data plane have
+    /// acknowledged everything its primary committed, then checks that every replica holds the
+    /// same rows and that every acknowledged write survived.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Timeout`] if the followers don't catch up within `limit`, or a [`Violation`]
+    /// of [`Invariant::ReplicasConverged`](check::Invariant::ReplicasConverged) or
+    /// [`Invariant::AcknowledgedWritesReplicated`](check::Invariant::AcknowledgedWritesReplicated).
+    pub fn await_replicas_converged(&mut self, limit: Duration) -> Result<Duration, SimError> {
+        let took = self.run_until(limit, "replicas catching up", Self::replicas_caught_up)?;
+        for (database, _) in created(&self.history()) {
+            let rows = self.replica_rows(&database)?;
+            check::replicas_converged(&database, &rows)?;
+        }
+        self.check_writes()?;
+        Ok(took)
+    }
+
+    /// Returns whether the followers of every database created through the data plane have
+    /// acknowledged everything its primary committed.
+    #[must_use]
+    pub fn replicas_caught_up(&self) -> bool {
+        created(&self.history()).iter().all(|(database, _)| {
+            self.primary_replication(database)
+                .and_then(|replication| replication.primary_status(database))
+                .is_some_and(|status| {
+                    status.followers.iter().all(|follower| {
+                        follower.reported && follower.acknowledged == status.committed
+                    })
+                })
+        })
+    }
+
+    /// Returns the replication of the running host that serves `database` as its primary.
+    #[must_use]
+    pub fn primary_replication(&self, database: &DatabaseName) -> Option<Replication> {
+        self.shared
+            .lock()
+            .running
+            .values()
+            .filter_map(|running| running.replication.clone())
+            .find(|replication| replication.primary_status(database).is_some())
+    }
+
     /// Injects `fault`, records it in the trace, and, for a crash or stop of the control host,
     /// checks its log.
     ///
@@ -883,6 +1002,7 @@ impl Cluster {
             });
         }
         stopped?;
+        self.check_writes()?;
         let log = self.check_control_log()?;
         if let Some(control) = control
             && *control.state() != *log.state()
@@ -911,6 +1031,59 @@ impl Drop for Cluster {
             eprintln!("trace of seed {}:\n{}", self.seed, self.trace());
         }
     }
+}
+
+/// Every database an acknowledged [`Operation::Create`] created, with its replication factor.
+fn created(history: &History) -> Vec<(DatabaseName, ReplicationFactor)> {
+    let databases: BTreeMap<DatabaseName, ReplicationFactor> = history
+        .acknowledged()
+        .filter_map(|(operation, ack)| match (operation, ack) {
+            (
+                Operation::Create {
+                    database,
+                    replication_factor,
+                },
+                Ack::Opened { .. },
+            ) => {
+                let factor = u8::try_from(*replication_factor)
+                    .ok()
+                    .and_then(ReplicationFactor::new)?;
+                Some((database.clone(), factor))
+            }
+            _ => None,
+        })
+        .collect();
+    databases.into_iter().collect()
+}
+
+/// Reads the values in the [`WRITES_TABLE`] of the SQLite copy in `dir`, from a scratch copy of
+/// its files.
+fn read_rows(dir: &Path) -> Result<BTreeSet<i64>, Box<dyn std::error::Error>> {
+    let database = dir.join("data.db");
+    if !database.try_exists()? {
+        return Ok(BTreeSet::new());
+    }
+    let scratch = tempfile::tempdir()?;
+    let copy = scratch.path().join("data.db");
+    std::fs::copy(&database, &copy)?;
+    let wal = dir.join("data.db-wal");
+    if wal.try_exists()? {
+        std::fs::copy(&wal, scratch.path().join("data.db-wal"))?;
+    }
+    let connection = rusqlite::Connection::open(&copy)?;
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [WRITES_TABLE],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let mut statement = connection.prepare(&format!("SELECT value FROM {WRITES_TABLE}"))?;
+    let keys = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<BTreeSet<i64>, _>>()?;
+    Ok(keys)
 }
 
 /// A link as an ordered pair of host names, so both directions name it the same way.
