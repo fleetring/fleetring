@@ -1,0 +1,38 @@
+# An example fleetringd configuration, and the one the container image starts with (FR-034).
+#
+# It runs a one-node cluster: the control role and the data role in one process. To change it,
+# mount your own file over /etc/fleetring/fleetringd.toml, or override single fields with flags:
+# `--node-id`, `--data-dir`, `--listen`, `--advertise`, `--control`, and `--role`.
+
+# Where the node keeps its databases. The daemon locks it, so one directory serves one daemon.
+# The container image declares /data as a volume.
+data_dir = "/data"
+
+# The address the node serves gRPC on, for clients and for other nodes. 0.0.0.0 accepts
+# connections on every interface, so the port can be published from a container.
+listen = "0.0.0.0:7400"
+
+# `both` runs the control plane and hosts databases in one process. In a larger cluster, one node
+# runs `both` (or `control`), and every other node runs `data` and sets `control.address`.
+role = "both"
+
+[node]
+# The node's stable ID: 1 to 64 lowercase letters, digits, `-`, `_`, `.`, or `:`. Placement
+# depends on it, so never change it once the node holds data.
+id = "node-1"
+
+# The failure domain replicas spread across first, and the machine, when several nodes share one.
+# zone = "home"
+# host = "nas-1"
+
+# The node's share of databases, relative to the other nodes.
+# weight = 1
+
+# The IP address and port other nodes and clients reach this node at. It defaults to `listen`,
+# with the loopback address in place of 0.0.0.0, which only works when everything runs on one
+# machine (or in one container). Set it to the host's address and published port otherwise.
+# advertise = "192.0.2.10:7400"
+
+# [control]
+# The control node's address. Required when `role = "data"`.
+# address = "192.0.2.1:7400"

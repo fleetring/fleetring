@@ -35,7 +35,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M3 Change and interop | FR-012 – FR-015, FR-020, FR-021 | Diff, `RingSpec` and fingerprint, spec v1 with golden vectors, diagnostics, and cells |
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
-| M6 Replication and failover | FR-030 – FR-033 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, and a CLI |
+| M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
 
 ## Index
 
@@ -74,6 +74,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-031](FR-031-leases-failover.md) | Leases, epochs, quorums, and failover | P0 | L | FR-030 | todo |
 | [FR-032](FR-032-snapshot-catch-up.md) | Snapshot catch-up | P1 | M | FR-030 | done |
 | [FR-033](FR-033-database-api-cli.md) | Database API and CLI for `fleetringd` v0.1 | P1 | M | FR-026, FR-028 | in-progress |
+| [FR-034](FR-034-release-builds.md) | Release builds, ARM CI, and container images for `fleetringd` | P1 | M | FR-022 | in-progress |
 
 ## Dependency graph
 
@@ -129,6 +130,7 @@ flowchart LR
   FR030 --> FR032[FR-032 snapshot catch-up]
   FR026 --> FR033[FR-033 database API + CLI]
   FR028 --> FR033
+  FR022 --> FR034[FR-034 release builds]
 ```
 
 ## Critical path and estimate
@@ -141,7 +143,7 @@ The critical path is: FR-001 → FR-003 / FR-004 / FR-005 (parallel) → FR-007 
 | P0 + P1: the 0.1.0 release | 18 tickets | ≈ 28 engineer-days |
 | Everything, including P2 | 20 tickets | ≈ 29 engineer-days |
 
-For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-029 → FR-030 → FR-031, with FR-025 → FR-026 and FR-027 running in parallel. All twelve daemon tickets come to about 24 engineer-days.
+For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-029 → FR-030 → FR-031, with FR-025 → FR-026 and FR-027 running in parallel. All thirteen daemon tickets come to about 26 engineer-days.
 
 `docs/mvp.md` allows 4–6 weeks for all eight MVP steps, with the ring crate as step 1. At about three weeks, P0 alone takes more than a proportional share. If the timeline is fixed, start `fleetringd` once P0 is done and run P1 in parallel. P2 can slip past 0.1.0 without affecting placement.
 
