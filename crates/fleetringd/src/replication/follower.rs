@@ -12,14 +12,15 @@ use fleetring_control::DatabaseName;
 use fleetring_proto::v1::replicate_message::Message;
 use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
-    FenceRequest, FenceResponse, ReplicateAck, ReplicateMessage, SnapshotChunk, SnapshotRequest,
+    FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest, PromoteResponse,
+    ReplicateAck, ReplicateMessage, SnapshotChunk, SnapshotRequest,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::epochs::EpochError;
+use super::failover::{self, Reconciled};
 use super::primary::held;
 use super::{Inner, PRIMARY_METADATA_KEY, snapshot};
 use crate::engine::{
@@ -55,8 +56,9 @@ impl ReplicationService {
 pub(super) struct FollowerSlot {
     /// Counts the streams that have opened; only the latest may apply.
     sessions: watch::Sender<u64>,
-    /// Held by the stream applying batches, so that a newer stream waits for an older one.
-    pub(super) applying: tokio::sync::Mutex<()>,
+    /// Held by whatever changes the copy: the stream applying batches or re-seeding it, a fence,
+    /// a fetch, or a seed. A newer stream waits for an older one.
+    applying: Arc<tokio::sync::Mutex<()>>,
     positions: Mutex<Positions>,
     /// How many snapshots have replaced the copy since this node started.
     snapshots: AtomicU64,
@@ -69,6 +71,11 @@ struct Positions {
 }
 
 impl FollowerSlot {
+    /// The lock held by whatever changes the copy.
+    pub(super) fn applying(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.applying
+    }
+
     /// Starts a new session, which ends every older one.
     pub(super) fn begin(&self) -> u64 {
         let mut session = 0;
@@ -93,7 +100,7 @@ impl FollowerSlot {
         (positions.position, positions.checkpointed)
     }
 
-    fn set_position(&self, position: Option<Position>) {
+    pub(super) fn set_position(&self, position: Option<Position>) {
         self.positions
             .lock()
             .expect("follower lock poisoned")
@@ -158,7 +165,7 @@ impl Replication for ReplicationService {
                 inner.engine.kind()
             )));
         }
-        admit(inner, &name, open.epoch).await?;
+        failover::admit_stream(inner, &name, open.epoch, primary.as_ref()).await?;
         if inner.primary(&name).is_some() || inner.registry().is_open(&name) {
             return Err(Status::failed_precondition(format!(
                 "{name} is open as a primary on this node"
@@ -173,6 +180,7 @@ impl Replication for ReplicationService {
             session,
             name,
             epoch: open.epoch,
+            epoch_start: open.epoch_start.and_then(held),
             primary,
         };
         tokio::spawn(async move {
@@ -186,9 +194,28 @@ impl Replication for ReplicationService {
 
     async fn fence(
         &self,
-        _request: Request<FenceRequest>,
+        request: Request<FenceRequest>,
     ) -> Result<Response<FenceResponse>, Status> {
-        Err(Status::unimplemented("fencing arrives with failover"))
+        failover::fence_rpc(&self.inner, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn fetch(
+        &self,
+        request: Request<FetchRequest>,
+    ) -> Result<Response<FetchResponse>, Status> {
+        failover::fetch_rpc(&self.inner, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn promote(
+        &self,
+        request: Request<PromoteRequest>,
+    ) -> Result<Response<PromoteResponse>, Status> {
+        failover::promote_rpc(&self.inner, request.into_inner())?;
+        Ok(Response::new(PromoteResponse {}))
     }
 
     async fn snapshot(
@@ -208,6 +235,8 @@ struct Follow {
     session: u64,
     name: DatabaseName,
     epoch: u64,
+    /// Where the epoch's log began, if its primary was promoted to it.
+    epoch_start: Option<Position>,
     primary: Option<NodeId>,
 }
 
@@ -220,7 +249,7 @@ impl Follow {
         acks: &Acks,
     ) -> Result<(), Status> {
         let inner = &self.inner;
-        let _applying = self.slot.applying.lock().await;
+        let _applying = self.slot.applying().lock().await;
         if !self.slot.is_current(self.session) {
             return Err(Status::aborted("a newer stream replaced this one"));
         }
@@ -235,7 +264,7 @@ impl Follow {
                 .await
                 .map_err(|_| Status::deadline_exceeded("fetching the initial copy timed out"))??;
         }
-        let mut follower = {
+        let follower = {
             let engine = Arc::clone(&inner.engine);
             let location = location.clone();
             blocking(inner.execution, move || match engine.capability() {
@@ -246,10 +275,28 @@ impl Follow {
             .map_err(engine_status)?
         };
         let mut position = follower.position();
-        self.slot.set_position(position.clone());
-        if !send_ack(acks, position.as_ref()).await {
+        let reconciled = failover::reconcile(
+            inner,
+            &self.name,
+            self.epoch,
+            self.epoch_start.as_ref(),
+            follower,
+        )
+        .await?;
+        // `None` while the copy waits for the primary to re-seed it: it takes no frames until then.
+        let (mut follower, first) = match reconciled {
+            Reconciled::Follows(follower) => {
+                position = follower.position();
+                self.slot.set_position(position.clone());
+                (Some(follower), ack(position.as_ref()))
+            }
+            // The copy stays closed until the primary answers with `Reseed`.
+            Reconciled::NeedsSnapshot => (None, needs_snapshot(position.as_ref())),
+        };
+        if acks.send(Ok(first)).await.is_err() {
             return Ok(());
         }
+        let mut noted = false;
         let mut sessions = self.slot.sessions.subscribe();
         loop {
             let message = tokio::select! {
@@ -268,6 +315,10 @@ impl Follow {
             match message {
                 Message::Batch(batch) => {
                     admit(inner, &self.name, batch.epoch).await?;
+                    let Some(open) = follower.take() else {
+                        // Sent before the primary learned that the copy needs a snapshot.
+                        continue;
+                    };
                     if held(batch.start.clone()) != position {
                         return Err(Status::failed_precondition(format!(
                             "batch starts at {}, but the copy is at {}",
@@ -281,43 +332,69 @@ impl Follow {
                         payload: Payload::from(batch.payload),
                     };
                     let (returned, applied) = blocking(inner.execution, move || {
-                        let applied = follower.apply(&frames);
-                        (follower, applied)
+                        let mut open = open;
+                        let applied = open.apply(&frames);
+                        (open, applied)
                     })
                     .await?;
-                    follower = returned;
-                    position = Some(applied.map_err(engine_status)?);
-                    self.slot.set_position(position.clone());
-                    if !send_ack(acks, position.as_ref()).await {
+                    let reply = match applied {
+                        Ok(end) => {
+                            follower = Some(returned);
+                            position = Some(end);
+                            failover::note_applied(inner, &self.name, self.epoch, &mut noted)
+                                .await?;
+                            self.slot.set_position(position.clone());
+                            ack(position.as_ref())
+                        }
+                        // The frames start at the copy's position but don't continue its log:
+                        // the copy diverged from the primary's at or before that position, as a
+                        // replica that missed an epoch can (ADR-0022). Only a snapshot brings it
+                        // in line; it takes no frames until then.
+                        Err(EngineError::InvalidPayload(error)) => {
+                            tracing::warn!(database = %self.name, at = ?position, %error, "the primary's frames don't continue the copy; it needs a snapshot");
+                            drop(returned);
+                            needs_snapshot(position.as_ref())
+                        }
+                        Err(error) => return Err(engine_status(error)),
+                    };
+                    if acks.send(Ok(reply)).await.is_err() {
                         return Ok(());
                     }
                 }
                 Message::Checkpoint(marker) => {
                     admit(inner, &self.name, marker.epoch).await?;
+                    let Some(open) = follower.take() else {
+                        continue;
+                    };
                     let marker = CheckpointMarker {
                         position: Position::from(marker.position),
                     };
                     if position.as_ref() != Some(&marker.position) {
                         tracing::debug!(database = %self.name, at = ?position, marker = %marker.position, "skipping a checkpoint marker the copy isn't at");
+                        follower = Some(open);
                         continue;
                     }
                     let (returned, checkpointed) = blocking(inner.execution, move || {
-                        let checkpointed = follower.checkpoint(&marker).map(|()| marker.position);
-                        (follower, checkpointed)
+                        let mut open = open;
+                        let checkpointed = open.checkpoint(&marker).map(|()| marker.position);
+                        (open, checkpointed)
                     })
                     .await?;
-                    follower = returned;
+                    follower = Some(returned);
                     self.slot
                         .set_checkpointed(checkpointed.map_err(engine_status)?);
                 }
                 Message::Reseed(reseed) => {
                     admit(inner, &self.name, reseed.epoch).await?;
-                    // The copy is replaced underneath the open follower, so close it first.
-                    drop(follower);
+                    // The copy is replaced underneath the open follower, so close it first. The
+                    // apply lock stays held throughout, so no fence or fetch sees a half-swapped
+                    // copy.
+                    drop(follower.take());
                     let (reopened, at) = self.reseed(&location).await?;
-                    follower = reopened;
+                    follower = Some(reopened);
                     position = at;
-                    if !send_ack(acks, position.as_ref()).await {
+                    noted = true;
+                    if acks.send(Ok(ack(position.as_ref()))).await.is_err() {
                         return Ok(());
                     }
                 }
@@ -403,17 +480,23 @@ pub(super) async fn admit(
         })
         .await?
     };
-    admitted.map_err(|error| match error {
-        EpochError::Stale { .. } => Status::failed_precondition(error.to_string()),
-        EpochError::Io(_) => Status::internal(error.to_string()),
-    })
+    admitted.map_err(failover::epoch_status)
 }
 
-async fn send_ack(acks: &Acks, position: Option<&Position>) -> bool {
-    let ack = ReplicateAck {
+/// Acknowledges that the copy holds the log up to `position`.
+fn ack(position: Option<&Position>) -> ReplicateAck {
+    ReplicateAck {
         position: position.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
-    };
-    acks.send(Ok(ack)).await.is_ok()
+        needs_snapshot: false,
+    }
+}
+
+/// Tells the primary that the copy, at `position`, can't follow its log and needs a snapshot.
+fn needs_snapshot(position: Option<&Position>) -> ReplicateAck {
+    ReplicateAck {
+        needs_snapshot: true,
+        ..ack(position)
+    }
 }
 
 /// Runs `call` where blocking calls run: on a blocking thread, or inline under simulation.
@@ -429,7 +512,7 @@ pub(super) async fn blocking<T: Send + 'static>(
     }
 }
 
-fn engine_status(error: EngineError) -> Status {
+pub(super) fn engine_status(error: EngineError) -> Status {
     match error {
         EngineError::InvalidPayload(_) | EngineError::InvalidPosition { .. } => {
             Status::failed_precondition(error.to_string())

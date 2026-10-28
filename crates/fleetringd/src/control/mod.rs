@@ -9,14 +9,18 @@
 //! - [`ControlService`] serves the `Control` gRPC service over a handle.
 //! - [`ControlClient`] calls the service, retrying and following leader redirects
 //!   ([`not_leader`]).
+//! - [`Failover`] ticks the state machine on a timer, starts promotions for expired leases, and
+//!   tells each promotion's candidate (ADR-0018).
 
 mod client;
+mod failover;
 mod log;
 mod node;
 mod redirect;
 mod service;
 
 pub use client::ControlClient;
+pub use failover::{Failover, FailoverSettings};
 pub use log::{CommandLog, LogError, LogIndex, Recovered};
 pub use node::{
     Committed, ControlHandle, ControlNode, ControlOptions, OpenError, RecoverySummary, StorageIo,

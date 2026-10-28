@@ -121,4 +121,11 @@ pub enum Action {
         /// The promotion's epoch.
         epoch: LeaseEpoch,
     },
+
+    /// Changes nothing but the time.
+    ///
+    /// The control node submits one when no other command has arrived for a while, so that
+    /// liveness and lease expiry, which are judged at the time of the last command, move on
+    /// without traffic.
+    Tick,
 }

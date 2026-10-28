@@ -501,3 +501,105 @@ fn rejection_messages_are_lowercase() {
         "epoch 1 of database 'acme' is stale; the current epoch is 2"
     );
 }
+
+fn heartbeat_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> Action {
+    Action::Heartbeat {
+        id: id(node),
+        replicas: vec![
+            fleetring_control::HostedReplica::new(
+                db(database),
+                fleetring_control::Role::Follower,
+                Position::new(position),
+            )
+            .with_log_epoch(LeaseEpoch::new(log_epoch)),
+        ],
+    }
+}
+
+#[test]
+fn a_tick_only_moves_time_and_lets_a_promotion_become_due() {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create("acme", 3)).expect("create");
+    let replicas = state.replica_set(&db("acme")).expect("replica set");
+    run(&mut state, 0, acquire("acme", &replicas[0])).expect("lease");
+    for follower in &replicas[1..] {
+        run(
+            &mut state,
+            900,
+            heartbeat(follower.as_str(), &[("acme", &[1])]),
+        )
+        .expect("heartbeat");
+    }
+
+    let before = state.clone();
+    let Ok(Applied::Ticked { at: ticked }) = run(&mut state, 1_100, Action::Tick) else {
+        panic!("ticked");
+    };
+    assert_eq!(ticked, at(1_100));
+    assert_eq!(state.now(), at(1_100));
+    let mut moved = before.clone();
+    run(&mut moved, 1_100, Action::Tick).expect("tick");
+    assert_eq!(moved, state, "a tick is deterministic");
+    assert_eq!(
+        state.databases().collect::<Vec<_>>(),
+        before.databases().collect::<Vec<_>>()
+    );
+    assert_eq!(state.membership_epoch(), before.membership_epoch());
+
+    // Expiry plus the margin is 1 200 ms; the followers are live until 3 900 ms.
+    assert!(state.promotions_due(at(1_200)).is_empty());
+    assert_eq!(state.promotions_due(at(1_201)), vec![db("acme")]);
+    // A tick past expiry makes the promotion due at the state's own time.
+    run(&mut state, 1_300, Action::Tick).expect("tick");
+    assert_eq!(state.promotions_due(at(0)), vec![db("acme")]);
+    run(&mut state, 1_300, start("acme")).expect("promotion started");
+    assert!(
+        state.promotions_due(at(1_300)).is_empty(),
+        "already in progress"
+    );
+    // Once nobody is live, nothing is due.
+    assert!(state.promotions_due(at(10_000)).is_empty());
+}
+
+#[test]
+fn the_candidate_has_the_newest_log_epoch_before_the_highest_position() {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create("acme", 3)).expect("create");
+    let replicas = state.replica_set(&db("acme")).expect("replica set");
+    run(&mut state, 0, acquire("acme", &replicas[0])).expect("lease");
+    // The second replica holds a longer log, but from an older primary.
+    run(
+        &mut state,
+        900,
+        heartbeat_at(replicas[1].as_str(), "acme", 1, &[9]),
+    )
+    .expect("heartbeat");
+    run(
+        &mut state,
+        900,
+        heartbeat_at(replicas[2].as_str(), "acme", 2, &[5]),
+    )
+    .expect("heartbeat");
+    let Ok(Applied::PromotionStarted {
+        candidate,
+        position,
+        ..
+    }) = run(&mut state, 1_300, start("acme"))
+    else {
+        panic!("promotion started");
+    };
+    assert_eq!(candidate, replicas[2]);
+    assert_eq!(position, Position::new([5]));
+}
+
+#[test]
+fn reports_without_a_log_epoch_load_from_old_logs() {
+    let old = r#"{"database":"acme","role":"follower","position":[1,2]}"#;
+    let replica: fleetring_control::HostedReplica =
+        serde_json::from_str(old).expect("an old report loads");
+    assert_eq!(replica.log_epoch(), LeaseEpoch::ZERO);
+    assert_eq!(serde_json::to_string(&replica).expect("serializes"), old);
+    let tick = serde_json::to_string(&Action::Tick).expect("serializes");
+    let back: Action = serde_json::from_str(&tick).expect("a tick loads");
+    assert_eq!(back, Action::Tick);
+}

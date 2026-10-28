@@ -106,11 +106,23 @@ impl NodeConfig {
 /// survives two lost heartbeats without being marked down.
 pub const HEARTBEATS_PER_TIMEOUT: u64 = 3;
 
+/// How many lease renewals must fit in the lease duration, so that a primary survives two lost
+/// renewals without its lease expiring.
+pub const LEASE_RENEWALS_PER_DURATION: u64 = 3;
+
+/// How many times a primary renews a lease within its duration, unless `lease_renewal_ms` says
+/// otherwise.
+const DEFAULT_RENEWALS_PER_DURATION: u64 = 5;
+
+/// How often the control node looks for expired leases, by default.
+const DEFAULT_TICK_INTERVAL: Millis = Millis::new(250);
+
 /// The `[membership]` table: how a data node reports to the control plane.
 ///
 /// ```toml
 /// [membership]
 /// heartbeat_interval_ms = 1000
+/// on_shutdown = "leave"           # or "stay"
 /// ```
 ///
 /// [`HEARTBEATS_PER_TIMEOUT`] intervals must fit in `control.heartbeat_timeout_ms`. A data-only
@@ -122,6 +134,24 @@ pub struct MembershipSettings {
     /// How often the node sends a heartbeat, in milliseconds. The node also retries a failed
     /// join, and reopens a broken membership stream, at this interval.
     pub heartbeat_interval_ms: NonZeroU64,
+    /// Whether a graceful shutdown leaves the cluster, or stays a member that is marked down
+    /// until it starts again.
+    pub on_shutdown: OnShutdown,
+}
+
+/// What a data node does with its membership when it shuts down gracefully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum OnShutdown {
+    /// Leave the cluster: the control plane removes the member at once and rebuilds the ring
+    /// without it, so its replicas move to other nodes. The default: a planned departure is no
+    /// failure.
+    #[default]
+    Leave,
+    /// Stay a member: the control plane marks it down once its heartbeats stop, and its
+    /// replica sets keep their places for when it starts again, as across a restart.
+    Stay,
 }
 
 impl MembershipSettings {
@@ -136,6 +166,7 @@ impl Default for MembershipSettings {
     fn default() -> Self {
         Self {
             heartbeat_interval_ms: NonZeroU64::new(1_000).unwrap_or(NonZeroU64::MIN),
+            on_shutdown: OnShutdown::Leave,
         }
     }
 }
@@ -226,10 +257,18 @@ impl Default for ReplicationConfig {
 /// [control]
 /// address = "10.0.0.1:7400"   # required on a data-only node
 /// lease_duration_ms = 10000
+/// lease_renewal_ms = 2000     # how often a primary renews each lease; a fifth of the lease
+///                             # duration if unset
 /// failover_margin_ms = 2000
 /// heartbeat_timeout_ms = 5000
+/// tick_interval_ms = 250      # how often the control node looks for expired leases
 /// snapshot_every = 1000       # commands between snapshots
 /// ```
+///
+/// The defaults suit a local network: a primary that dies is replaced about
+/// `lease_duration_ms + failover_margin_ms` after its last renewal. A data node checks that
+/// [`LEASE_RENEWALS_PER_DURATION`] renewals fit in the lease duration, against its own
+/// `[control]` table, so keep that table's timings equal to the control node's.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControlSettings {
@@ -237,11 +276,17 @@ pub struct ControlSettings {
     pub address: Option<SocketAddr>,
     /// How long a lease lasts after it is granted or renewed, in milliseconds.
     pub lease_duration_ms: NonZeroU64,
+    /// How often a primary renews each lease it holds, in milliseconds. Unset, it is a fifth of
+    /// the lease duration.
+    pub lease_renewal_ms: Option<NonZeroU64>,
     /// How long past a lease's expiry the control node waits before failing over, in
     /// milliseconds.
     pub failover_margin_ms: u64,
     /// How long a member stays live after its last heartbeat, in milliseconds.
     pub heartbeat_timeout_ms: NonZeroU64,
+    /// How often the control node looks for expired leases, and how long it lets pass without a
+    /// command before it ticks, in milliseconds.
+    pub tick_interval_ms: NonZeroU64,
     /// How many commands the control node applies between snapshots.
     pub snapshot_every: NonZeroU64,
 }
@@ -255,6 +300,23 @@ impl ControlSettings {
             .with_failover_margin(Millis::new(self.failover_margin_ms))
             .with_heartbeat_timeout(Millis::new(self.heartbeat_timeout_ms.get()))
     }
+
+    /// Returns how often a primary renews each lease: `lease_renewal_ms`, or a fifth of the lease
+    /// duration.
+    #[must_use]
+    pub fn lease_renewal(&self) -> Duration {
+        let millis = self.lease_renewal_ms.map_or_else(
+            || (self.lease_duration_ms.get() / DEFAULT_RENEWALS_PER_DURATION).max(1),
+            NonZeroU64::get,
+        );
+        Duration::from_millis(millis)
+    }
+
+    /// Returns how often the control node looks for expired leases.
+    #[must_use]
+    pub fn tick_interval(&self) -> Duration {
+        Duration::from_millis(self.tick_interval_ms.get())
+    }
 }
 
 impl Default for ControlSettings {
@@ -264,8 +326,10 @@ impl Default for ControlSettings {
         Self {
             address: None,
             lease_duration_ms: nonzero(config.lease_duration()),
+            lease_renewal_ms: None,
             failover_margin_ms: config.failover_margin().get(),
             heartbeat_timeout_ms: nonzero(config.heartbeat_timeout()),
+            tick_interval_ms: nonzero(DEFAULT_TICK_INTERVAL),
             snapshot_every: crate::control::ControlOptions::default().snapshot_every(),
         }
     }
@@ -373,7 +437,8 @@ impl Config {
     ///
     /// [`ConfigError::Missing`] if a field this role needs is absent, and
     /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
-    /// interval isn't well below the heartbeat timeout.
+    /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
+    /// below the lease duration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.role == Role::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
@@ -389,6 +454,17 @@ impl Config {
                 reason: format!(
                     "{interval} ms leaves room for fewer than {HEARTBEATS_PER_TIMEOUT} heartbeats \
                      in control.heartbeat_timeout_ms ({timeout} ms)"
+                ),
+            });
+        }
+        let renewal = u64::try_from(self.control.lease_renewal().as_millis()).unwrap_or(u64::MAX);
+        let lease = self.control.lease_duration_ms.get();
+        if self.role.hosts_data() && renewal.saturating_mul(LEASE_RENEWALS_PER_DURATION) > lease {
+            return Err(ConfigError::Invalid {
+                field: "control.lease_renewal_ms",
+                reason: format!(
+                    "{renewal} ms leaves room for fewer than {LEASE_RENEWALS_PER_DURATION} renewals \
+                     in control.lease_duration_ms ({lease} ms)"
                 ),
             });
         }

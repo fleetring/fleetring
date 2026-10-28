@@ -34,8 +34,8 @@ use fleetring::{Diagnostic, Epoch, Fingerprint, NodeId, Ring, Severity};
 use fleetring_control::{Liveness, Member, membership_ring};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
-    DatabaseStatus, HeartbeatRequest, HeartbeatResponse, JoinRequest, MembershipUpdate,
-    WatchMembershipRequest,
+    DatabaseStatus, HeartbeatRequest, HeartbeatResponse, JoinRequest, LeaveRequest,
+    MembershipUpdate, WatchMembershipRequest,
 };
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
@@ -43,8 +43,8 @@ use tokio::time::error::Elapsed;
 use tokio::time::{MissedTickBehavior, timeout};
 use tonic::{Code, Status};
 
-use crate::MembershipSettings;
 use crate::control::{ControlClient, member_from, missing_database, node_to_proto};
+use crate::{MembershipSettings, OnShutdown};
 
 /// How many heartbeat replies in a row may report a later membership epoch than the published one
 /// before the membership stream counts as stalled and is reopened.
@@ -152,6 +152,7 @@ impl Membership {
     ) -> (Self, MembershipTasks) {
         let (membership, publisher) = Self::unstarted();
         let interval = settings.heartbeat_interval();
+        let id = member.id().to_string();
         let resubscribe = Arc::new(Notify::new());
         let heartbeat = tokio::spawn(heartbeat_loop(
             Heartbeats {
@@ -163,8 +164,18 @@ impl Membership {
             Arc::clone(&resubscribe),
             membership.updates.clone(),
         ));
-        let watch = tokio::spawn(watch_loop(client, interval, resubscribe, publisher));
-        (membership, MembershipTasks { heartbeat, watch })
+        let watch = tokio::spawn(watch_loop(client.clone(), interval, resubscribe, publisher));
+        let tasks = MembershipTasks {
+            heartbeat,
+            watch,
+            leave: Leave {
+                client,
+                id,
+                limit: interval,
+                on_shutdown: settings.on_shutdown,
+            },
+        };
+        (membership, tasks)
     }
 
     /// A membership with an empty view, and the publisher that updates it.
@@ -250,14 +261,48 @@ impl DatabaseStatuses for NoDatabases {
 pub struct MembershipTasks {
     heartbeat: JoinHandle<()>,
     watch: JoinHandle<()>,
+    leave: Leave,
+}
+
+/// How a node leaves the cluster when it shuts down gracefully.
+#[derive(Debug)]
+struct Leave {
+    client: ControlClient,
+    id: String,
+    /// How long the control plane gets to answer.
+    limit: Duration,
+    on_shutdown: OnShutdown,
 }
 
 impl MembershipTasks {
-    /// Stops sending heartbeats and following the membership, and waits for both tasks to end.
+    /// Stops sending heartbeats, leaves the cluster unless the settings say to stay, stops
+    /// following the membership, and waits for both tasks to end.
     ///
-    /// The node stays a member: the control plane marks it down once its heartbeats stop.
+    /// Leaving tells the control plane that this is a planned departure rather than a failure:
+    /// the member is removed at once, and the ring is rebuilt without it. If the control plane
+    /// doesn't answer within one heartbeat interval, the node stops anyway and is marked down
+    /// once its heartbeats are missed, as a node that stays is. Dropping the tasks instead stops
+    /// them without leaving.
     pub async fn stop(mut self) {
         self.heartbeat.abort();
+        let Leave {
+            client,
+            id,
+            limit,
+            on_shutdown,
+        } = &self.leave;
+        if *on_shutdown == OnShutdown::Leave {
+            let request = LeaveRequest {
+                node_id: id.clone(),
+            };
+            match timeout(*limit, client.leave(request)).await {
+                Ok(Ok(response)) => {
+                    tracing::info!(node = %id, epoch = response.membership_epoch, "left the cluster");
+                }
+                Ok(Err(status)) => tracing::warn!(node = %id, %status, "can't leave the cluster"),
+                Err(_) => tracing::warn!(node = %id, "leaving the cluster timed out"),
+            }
+        }
         self.watch.abort();
         for task in [&mut self.heartbeat, &mut self.watch] {
             if let Err(error) = task.await

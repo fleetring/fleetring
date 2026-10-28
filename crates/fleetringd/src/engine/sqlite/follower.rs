@@ -6,8 +6,9 @@ use fleetring_wal::{Batch, Mirror, MirrorError};
 use rusqlite::{Connection, OpenFlags};
 
 use super::{
-    Checkpoint, DATABASE_FILE, checkpoint, encode_position, keep_wal_on_close, remove_if_present,
-    shm_path, storage, wal_path, write_marker,
+    Checkpoint, DATABASE_FILE, checkpoint, decode_position, encode_position, frame_batch,
+    keep_wal_on_close, read_marker, read_wal_file, remove_if_present, shm_path, storage, wal_path,
+    write_marker,
 };
 use crate::engine::{CheckpointMarker, EngineError, FrameBatch, FrameFollower, Position};
 
@@ -22,6 +23,9 @@ use crate::engine::{CheckpointMarker, EngineError, FrameBatch, FrameFollower, Po
 pub struct SqliteFollower {
     database: PathBuf,
     mirror: Mirror,
+    /// Where the primary's last checkpoint the copy followed ended, as `data.db-checkpoint`
+    /// records it: the mirrored generation continues from there.
+    checkpointed: Option<fleetring_wal::Position>,
 }
 
 impl SqliteFollower {
@@ -37,7 +41,12 @@ impl SqliteFollower {
             return Err(EngineError::NotFound);
         }
         let mirror = Mirror::open(wal_path(&database)).map_err(mirror_error)?;
-        Ok(Self { database, mirror })
+        let checkpointed = read_marker(&database)?;
+        Ok(Self {
+            database,
+            mirror,
+            checkpointed,
+        })
     }
 
     /// Copies the mirrored frames into the database file.
@@ -72,6 +81,7 @@ impl FrameFollower for SqliteFollower {
                 // The primary checkpointed at `end`; recorded first, as the primary does, so the
                 // copy keeps vouching for it if it is promoted.
                 write_marker(&self.database, end).map_err(storage)?;
+                self.checkpointed = Some(end);
                 // The old generation's frames are gone once the new one starts.
                 self.checkpoint_database(Checkpoint::Truncate)?;
             }
@@ -79,6 +89,32 @@ impl FrameFollower for SqliteFollower {
         }
         let end = self.mirror.append(&decoded).map_err(mirror_error)?;
         Ok(encode_position(end))
+    }
+
+    fn committed_since(&self, after: Option<&Position>) -> Result<Option<FrameBatch>, EngineError> {
+        Ok(read_wal_file(self.mirror.path(), after, self.checkpointed)?
+            .as_ref()
+            .map(frame_batch))
+    }
+
+    fn truncate_to(&mut self, position: &Position) -> Result<(), EngineError> {
+        let decoded = decode_position(position)?;
+        // The frames up to the last checkpoint are in the database file, not the WAL, so a copy
+        // can't be cut back to or below it.
+        let below_checkpoint = self
+            .checkpointed
+            .is_some_and(|checkpointed| position <= &encode_position(checkpointed));
+        if below_checkpoint {
+            return Err(EngineError::InvalidPosition {
+                position: position.clone(),
+            });
+        }
+        self.mirror.truncate(decoded).map_err(|error| match error {
+            MirrorError::Truncate(_) | MirrorError::NoGeneration => EngineError::InvalidPosition {
+                position: position.clone(),
+            },
+            other => mirror_error(other),
+        })
     }
 
     fn checkpoint(&mut self, marker: &CheckpointMarker) -> Result<(), EngineError> {

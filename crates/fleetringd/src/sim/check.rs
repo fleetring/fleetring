@@ -13,11 +13,6 @@
 //!   at the end, and [`replicas_converged`] once the network heals
 //!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged)).
 //!
-//! # Extension points
-//!
-//! - **At most one primary per epoch** (FR-031): [`one_primary_per_epoch`] checks the leases
-//!   clients were granted. Once data nodes report their roles in heartbeats and accept writes,
-//!   extend it with every node that acknowledged a write as primary, keyed by database and epoch.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -283,7 +278,11 @@ fn check_lease(
     }
 }
 
-/// Checks that no two nodes were acknowledged as a database's lease holder at the same epoch.
+/// Checks that no two nodes were acknowledged as a database's lease holder at the same epoch, and
+/// that at most one node acknowledged writes to a database as its primary in any epoch.
+///
+/// Lease holders come from granted and renewed leases and from data-plane creations; primaries
+/// from the node and epoch each acknowledged write reports.
 ///
 /// # Errors
 ///
@@ -292,6 +291,14 @@ pub fn one_primary_per_epoch(history: &History) -> Result<(), Violation> {
     let mut holders: BTreeMap<(&DatabaseName, LeaseEpoch), &NodeId> = BTreeMap::new();
     for (operation, ack) in history.acknowledged() {
         let (database, node, epoch) = match (operation, ack) {
+            (
+                Operation::Write { database, .. },
+                Ack::Written {
+                    primary: Some(node),
+                    epoch,
+                    ..
+                },
+            ) => (database, node, *epoch),
             (
                 Operation::AcquireLease { database, node }
                 | Operation::RenewLease { database, node, .. },
@@ -479,8 +486,46 @@ mod tests {
                 acknowledged_by: 2,
                 replicas: 3,
                 under_replicated: false,
+                primary: Some("a".parse().expect("id")),
+                epoch: LeaseEpoch::new(1),
             },
         )
+    }
+
+    fn written_by(value: i64, primary: &str, epoch: u64) -> Record {
+        acknowledged(
+            Operation::Write {
+                database: "db".parse().expect("name"),
+                value,
+            },
+            Ack::Written {
+                acknowledged_by: 2,
+                replicas: 3,
+                under_replicated: false,
+                primary: Some(primary.parse().expect("id")),
+                epoch: LeaseEpoch::new(epoch),
+            },
+        )
+    }
+
+    #[test]
+    fn two_nodes_acknowledging_writes_at_one_epoch_is_a_violation() {
+        let mut history = History::default();
+        history.push(lease("db", "a", 1, 10));
+        history.push(written_by(1, "a", 1));
+        history.push(written_by(2, "b", 2));
+        history.push(written_by(3, "b", 2));
+        assert_eq!(one_primary_per_epoch(&history), Ok(()));
+        history.push(written_by(4, "c", 2));
+        let violation = one_primary_per_epoch(&history).expect_err("two primaries");
+        assert!(violation.detail().contains("b and c"), "{violation}");
+        let mut history = History::default();
+        history.push(lease("db", "a", 1, 10));
+        history.push(written_by(1, "b", 1));
+        assert!(
+            one_primary_per_epoch(&history).is_err(),
+            "a lease and a write disagree"
+        );
     }
 
     #[test]

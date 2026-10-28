@@ -12,9 +12,11 @@ use fleetring_control::{
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    self as proto, AcquireLeaseRequest, CreateDatabaseRequest, CreateDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LocateRequest,
-    LocateResponse, MembershipUpdate, Placement, RenewLeaseRequest, WatchMembershipRequest,
+    self as proto, AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, LocateRequest,
+    LocateResponse, MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest,
+    RecordFencedResponse, RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -160,7 +162,8 @@ fn replica_from(status: proto::DatabaseStatus) -> Result<HostedReplica, Status> 
         parse("database name", &status.database)?,
         role,
         Position::new(status.position),
-    ))
+    )
+    .with_log_epoch(LeaseEpoch::new(status.epoch)))
 }
 
 fn engine_from(engine: i32) -> Result<Engine, Status> {
@@ -196,6 +199,9 @@ fn lease_response(database: &DatabaseName, lease: &Lease) -> LeaseResponse {
 
 /// Where a database lives: its lease holder as primary, the rest of its replica set, and what the
 /// control plane knows about each replica.
+///
+/// While a promotion is in progress the database has no primary: the old holder's lease is at an
+/// older epoch than the database's, and nobody holds the new one yet.
 fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     let database = state.database(name).ok_or_else(|| {
         rejection_status(&Rejection::UnknownDatabase {
@@ -205,7 +211,10 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     let replicas = state
         .replica_set(name)
         .map_err(|rejection| rejection_status(&rejection))?;
-    let primary = database.lease().map(Lease::holder);
+    let primary = database
+        .lease()
+        .filter(|lease| lease.epoch() == database.epoch())
+        .map(Lease::holder);
     let followers = replicas
         .iter()
         .filter(|id| Some(*id) != primary)
@@ -406,6 +415,95 @@ impl Control for ControlService {
             (Applied::LeaseRenewed { database, lease }, _) => {
                 Ok(Response::new(lease_response(&database, &lease)))
             }
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn leave(
+        &self,
+        request: Request<LeaveRequest>,
+    ) -> Result<Response<LeaveResponse>, Status> {
+        let id = parse("node id", &request.get_ref().node_id)?;
+        match self.submit(Action::Leave { id }).await? {
+            (
+                Applied::MemberLeft {
+                    membership_epoch, ..
+                },
+                _,
+            ) => Ok(Response::new(LeaveResponse {
+                membership_epoch: membership_epoch.get(),
+            })),
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn start_promotion(
+        &self,
+        request: Request<StartPromotionRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
+        let database = parse("database name", &request.get_ref().database)?;
+        match self.submit(Action::StartPromotion { database }).await? {
+            (
+                Applied::PromotionStarted {
+                    database,
+                    epoch,
+                    candidate,
+                    ..
+                },
+                _,
+            ) => Ok(Response::new(PromotionResponse {
+                database: database.to_string(),
+                epoch: epoch.get(),
+                candidate: candidate.to_string(),
+            })),
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn record_fenced(
+        &self,
+        request: Request<RecordFencedRequest>,
+    ) -> Result<Response<RecordFencedResponse>, Status> {
+        let request = request.into_inner();
+        let action = Action::RecordFenced {
+            database: parse("database name", &request.database)?,
+            node: parse("node id", &request.node_id)?,
+            epoch: LeaseEpoch::new(request.epoch),
+            position: Position::new(request.position),
+        };
+        match self.submit(action).await? {
+            (Applied::FenceRecorded { fenced, needed, .. }, _) => {
+                Ok(Response::new(RecordFencedResponse {
+                    fenced: u32::from(fenced),
+                    needed: u32::from(needed),
+                }))
+            }
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn complete_promotion(
+        &self,
+        request: Request<CompletePromotionRequest>,
+    ) -> Result<Response<CompletePromotionResponse>, Status> {
+        let request = request.into_inner();
+        let action = Action::CompletePromotion {
+            database: parse("database name", &request.database)?,
+            epoch: LeaseEpoch::new(request.epoch),
+        };
+        match self.submit(action).await? {
+            (
+                Applied::PromotionCompleted {
+                    database,
+                    lease,
+                    adopted,
+                    ..
+                },
+                _,
+            ) => Ok(Response::new(CompletePromotionResponse {
+                lease: Some(lease_response(&database, &lease)),
+                adopted: adopted.as_bytes().to_vec(),
+            })),
             (other, _) => Err(unexpected(&other)),
         }
     }

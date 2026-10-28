@@ -8,7 +8,7 @@
 //! - [`State`] holds the members with their placement attributes and liveness, the membership
 //!   epoch, and every database with its engine, epoch, lease, and any promotion in progress.
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create a database, acquire or
-//!   renew a lease, start a promotion, record a fenced member, or complete a promotion.
+//!   renew a lease, start a promotion, record a fenced member, complete a promotion, or tick.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -26,7 +26,10 @@
 //!   failover margin, issues the next epoch, and completes only once Q replica-set members, the
 //!   candidate included, are fenced at it.
 //! - **Candidates** are live replica-set members. A promotion picks the one that reported the most
-//!   advanced position, preferring the earliest in the ring's preference order on ties.
+//!   advanced log: the highest log epoch (the epoch of the primary that wrote its last frames),
+//!   then the highest position, preferring the earliest in the ring's preference order on ties.
+//!   [`State::promotions_due`] lists the databases a promotion may start for.
+//! - **Ticks** change only the time, so liveness and lease expiry advance without other traffic.
 //! - **Positions** are opaque bytes compared lexicographically (ADR-0016).
 //!
 //! # Examples

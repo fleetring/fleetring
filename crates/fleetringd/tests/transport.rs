@@ -9,11 +9,13 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::replicate_message::Message;
 use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, Batch, CreateDatabaseRequest, CreateDatabaseResponse, FenceRequest,
-    FenceResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse,
-    LocateRequest, LocateResponse, MembershipUpdate, Node, ProtocolVersion, RenewLeaseRequest,
-    ReplicateAck, ReplicateMessage, ReplicateOpen, SnapshotChunk, SnapshotRequest,
-    WatchMembershipRequest,
+    AcquireLeaseRequest, Batch, CompletePromotionRequest, CompletePromotionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, FenceRequest, FenceResponse, FetchRequest,
+    FetchResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse,
+    LeaveRequest, LeaveResponse, LocateRequest, LocateResponse, MembershipUpdate, Node,
+    PromoteRequest, PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest,
+    RecordFencedResponse, RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen,
+    SnapshotChunk, SnapshotRequest, StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use fleetringd::transport::{
@@ -87,6 +89,34 @@ impl Control for StubControl {
     ) -> Result<Response<LeaseResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
+
+    async fn leave(
+        &self,
+        _request: Request<LeaveRequest>,
+    ) -> Result<Response<LeaveResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn start_promotion(
+        &self,
+        _request: Request<StartPromotionRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn record_fenced(
+        &self,
+        _request: Request<RecordFencedRequest>,
+    ) -> Result<Response<RecordFencedResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn complete_promotion(
+        &self,
+        _request: Request<CompletePromotionRequest>,
+    ) -> Result<Response<CompletePromotionResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
 }
 
 /// Acknowledges every batch with its end position.
@@ -109,6 +139,7 @@ impl Replication for StubReplication {
                 if let Some(Message::Batch(batch)) = message.message {
                     let ack = ReplicateAck {
                         position: batch.end,
+                        needs_snapshot: false,
                     };
                     if acks.send(Ok(ack)).await.is_err() {
                         break;
@@ -130,6 +161,20 @@ impl Replication for StubReplication {
         &self,
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn fetch(
+        &self,
+        _request: Request<FetchRequest>,
+    ) -> Result<Response<FetchResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn promote(
+        &self,
+        _request: Request<PromoteRequest>,
+    ) -> Result<Response<PromoteResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }
@@ -208,6 +253,7 @@ async fn a_four_mib_batch_round_trips_as_one_message() -> TestResult {
             message: Some(Message::Open(ReplicateOpen {
                 database: "tenant:acme".into(),
                 epoch: 1,
+                epoch_start: None,
             })),
         },
         ReplicateMessage {

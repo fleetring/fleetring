@@ -43,6 +43,7 @@ A new follower, or one too far behind to resume in the current WAL generation, c
     - `tests/actor/pinned.rs`: a pinned snapshot holds off checkpoints but not writes, and its copy catches up and ends byte-identical; a snapshot whose WAL restarts under it fails `confirm`; a reopened primary refuses a position behind its last checkpoint and accepts the marker.
     - `src/replication/archive.rs` unit tests: round trips at every chunk size, corruption, truncation, and hostile names.
     - Simulation: `a_follower_restarted_past_a_checkpoint_catches_up_through_a_snapshot` crashes a follower, writes until the primary has checkpointed past it twice, restarts it, and checks that it re-seeded, converges, and that every acknowledged write holds, on the fixed seeds, with a replay comparison.
+- 2026-10-28: Integration with FR-031. `Reseed` is the one way a copy the log can't serve catches up: besides a follower behind the last checkpoint, it now covers a follower that can't truncate a divergent tail or whose primary's frames don't continue its copy, which asks for it with `ReplicateAck.needs_snapshot`. Every installed snapshot records the primary's epoch as the copy's log epoch, the re-seed holds the apply lock that fencing takes, and the follower loads and enforces its `data.db-checkpoint` marker (never truncating to or behind it). FR-030's simulation scenario stops followers with the default `on_shutdown` again. Details in FR-031's Progress.
 
 ## Notes for later tickets
 

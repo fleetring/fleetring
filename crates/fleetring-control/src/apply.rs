@@ -85,6 +85,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         Action::CompletePromotion { database, epoch } => {
             complete_promotion(state, now, database, epoch)
         }
+        Action::Tick => Ok(Applied::Ticked { at: now }),
     }?;
     state.now = now;
     Ok(applied)
@@ -178,6 +179,12 @@ pub enum Applied {
         /// The most advanced position among the fenced members. The new primary adopts this
         /// log before it accepts writes (ADR-0018, point 4).
         adopted: Position,
+    },
+
+    /// Time moved on, and nothing else changed.
+    Ticked {
+        /// The state's time after the tick.
+        at: Timestamp,
     },
 }
 
@@ -542,15 +549,52 @@ fn renew_lease(
 }
 
 fn start_promotion(state: &mut State, now: Timestamp, database: DatabaseName) -> Outcome {
+    let PromotionPlan {
+        epoch,
+        candidate,
+        position,
+    } = plan_promotion(state, now, &database)?;
+
+    let db = database_mut(state, &database)?;
+    db.set_epoch(epoch);
+    db.set_promotion(Some(Promotion::new(epoch, candidate.clone(), now)));
+    Ok(Applied::PromotionStarted {
+        database,
+        epoch,
+        candidate,
+        position,
+    })
+}
+
+/// What a promotion of one database would do if it started now.
+#[derive(Debug)]
+pub(crate) struct PromotionPlan {
+    pub(crate) epoch: LeaseEpoch,
+    pub(crate) candidate: NodeId,
+    pub(crate) position: Position,
+}
+
+/// Checks whether a promotion of `database` may start at `now`, and picks its epoch and
+/// candidate, without changing anything.
+///
+/// The candidate is the live replica-set member whose log is the most advanced: the highest log
+/// epoch, then the highest position, and the earliest in preference order on ties.
+pub(crate) fn plan_promotion(
+    state: &State,
+    now: Timestamp,
+    database: &DatabaseName,
+) -> Result<PromotionPlan, Rejection> {
     let config = state.config;
-    let db = state.database_or_reject(&database)?;
+    let db = state.database_or_reject(database)?;
     let Some(lease) = db.lease() else {
-        return Err(Rejection::NoLease { database });
+        return Err(Rejection::NoLease {
+            database: database.clone(),
+        });
     };
     let available_after = lease.expires_at().saturating_add(config.failover_margin());
     if now <= available_after {
         return Err(Rejection::LeaseNotExpired {
-            database,
+            database: database.clone(),
             available_after,
         });
     }
@@ -561,7 +605,9 @@ fn start_promotion(state: &mut State, now: Timestamp, database: DatabaseName) ->
                 .saturating_add(config.failover_margin()),
         );
         if state.is_live(promotion.candidate(), now) && now <= stalled_after {
-            return Err(Rejection::PromotionInProgress { database });
+            return Err(Rejection::PromotionInProgress {
+                database: database.clone(),
+            });
         }
     }
     let epoch = db
@@ -571,33 +617,30 @@ fn start_promotion(state: &mut State, now: Timestamp, database: DatabaseName) ->
             database: database.clone(),
         })?;
 
-    let mut best: Option<(&NodeId, &Position)> = None;
-    let replicas = state.replica_set(&database)?;
+    let mut best: Option<(&NodeId, LeaseEpoch, &Position)> = None;
+    let replicas = state.replica_set(database)?;
     for id in &replicas {
         if !state.is_live(id, now) {
             continue;
         }
-        let Some(report) = state.report(id, &database) else {
+        let Some(report) = state.report(id, database) else {
             continue;
         };
+        let rank = (report.log_epoch(), report.position());
         // Strictly greater, so the earliest in preference order wins ties (ADR-0018, point 7).
-        if best.is_none_or(|(_, position)| report.position() > position) {
-            best = Some((id, report.position()));
+        if best.is_none_or(|(_, log_epoch, position)| rank > (log_epoch, position)) {
+            best = Some((id, report.log_epoch(), report.position()));
         }
     }
-    let Some((candidate, position)) = best else {
-        return Err(Rejection::NoCandidate { database });
+    let Some((candidate, _, position)) = best else {
+        return Err(Rejection::NoCandidate {
+            database: database.clone(),
+        });
     };
-    let (candidate, position) = (candidate.clone(), position.clone());
-
-    let db = database_mut(state, &database)?;
-    db.set_epoch(epoch);
-    db.set_promotion(Some(Promotion::new(epoch, candidate.clone(), now)));
-    Ok(Applied::PromotionStarted {
-        database,
+    Ok(PromotionPlan {
         epoch,
-        candidate,
-        position,
+        candidate: candidate.clone(),
+        position: position.clone(),
     })
 }
 

@@ -46,6 +46,14 @@ service Control {
   rpc Locate(LocateRequest) returns (LocateResponse);
   rpc AcquireLease(AcquireLeaseRequest) returns (LeaseResponse);
   rpc RenewLease(RenewLeaseRequest) returns (LeaseResponse);
+  // Removes a member, as a node does when it shuts down gracefully.
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+  // The promotion calls (ADR-0018): the control node starts a promotion once a lease has
+  // expired by the failover margin and tells the candidate, which fences replicas, records each
+  // one, and completes the promotion.
+  rpc StartPromotion(StartPromotionRequest) returns (PromotionResponse);
+  rpc RecordFenced(RecordFencedRequest) returns (RecordFencedResponse);
+  rpc CompletePromotion(CompletePromotionRequest) returns (CompletePromotionResponse);
 }
 
 message JoinRequest {
@@ -61,6 +69,8 @@ message JoinResponse {
 message DatabaseStatus {
   string database = 1;
   Role role = 2;
+  // The epoch of the primary that wrote the last frames of this replica's log: the primary's
+  // own epoch on a primary. Promotions rank logs by it before their positions.
   uint64 epoch = 3;
   bytes position = 4;
 }
@@ -110,6 +120,8 @@ message Placement {
   string database = 1;
   Engine engine = 2;
   uint64 epoch = 3;
+  // The lease holder, which serves writes at `epoch`. Unset before the first lease and while a
+  // promotion to `epoch` is in progress.
   optional string primary = 4;
   repeated string followers = 5;
   // The whole replica set in the ring's preference order, the primary included.
@@ -147,6 +159,49 @@ message LeaseResponse {
   uint64 expires_at_ms = 3;
 }
 
+message LeaveRequest {
+  string node_id = 1;
+}
+
+message LeaveResponse {
+  uint64 membership_epoch = 1;
+}
+
+message StartPromotionRequest {
+  string database = 1;
+}
+
+message PromotionResponse {
+  string database = 1;
+  // The promotion's new epoch.
+  uint64 epoch = 2;
+  string candidate = 3;
+}
+
+message RecordFencedRequest {
+  string database = 1;
+  string node_id = 2;
+  uint64 epoch = 3;
+  bytes position = 4;
+}
+
+message RecordFencedResponse {
+  // How many replica-set members are fenced at the promotion's epoch, and how many must be.
+  uint32 fenced = 1;
+  uint32 needed = 2;
+}
+
+message CompletePromotionRequest {
+  string database = 1;
+  uint64 epoch = 2;
+}
+
+message CompletePromotionResponse {
+  LeaseResponse lease = 1;
+  // The most advanced position among the fenced members, as the control plane compares them.
+  bytes adopted = 2;
+}
+
 // ---- Replication ------------------------------------------------------------------------------
 
 service Replication {
@@ -155,6 +210,10 @@ service Replication {
   // A promotion fences a replica at a new epoch and learns its position (ADR-0018).
   rpc Fence(FenceRequest) returns (FenceResponse);
   rpc Snapshot(SnapshotRequest) returns (stream SnapshotChunk);
+  // A candidate fetches the frames it lacks from the most advanced fenced member.
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  // The control node asks a promotion's candidate to carry it out.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
 }
 
 message ReplicateMessage {
@@ -169,6 +228,10 @@ message ReplicateMessage {
 message ReplicateOpen {
   string database = 1;
   uint64 epoch = 2;
+  // Where this epoch's log begins: the position its primary adopted when it was promoted. A
+  // follower whose log came from an earlier epoch and runs past it truncates back to it first.
+  // Unset for an epoch that started with the database.
+  optional bytes epoch_start = 3;
 }
 
 // One or more committed transactions, as the engine encodes them.
@@ -192,17 +255,50 @@ message Reseed {
 
 message ReplicateAck {
   bytes position = 1;
+  // Set when the follower's copy, at `position`, can't follow this epoch's log: on the first
+  // acknowledgement, when it diverges before a point it can be cut back to, or later, when the
+  // primary's frames don't continue it. The position isn't on the primary's log. The primary
+  // answers with `Reseed`, and the follower takes no frames until it has.
+  bool needs_snapshot = 2;
 }
 
 message FenceRequest {
   string database = 1;
   uint64 epoch = 2;
+  // The node being promoted at `epoch`, the only one whose stream the replica accepts at it.
+  // Empty from a caller that predates the field.
+  string candidate = 3;
 }
 
 message FenceResponse {
   uint64 epoch = 1;
   bytes position = 2;
+  // The epoch of the primary that wrote the last frames of the replica's log.
+  uint64 log_epoch = 3;
 }
+
+message FetchRequest {
+  string database = 1;
+  // The promotion's epoch, at which the replica must already be fenced.
+  uint64 epoch = 2;
+  // The position the caller holds; empty for an empty log.
+  bytes after = 3;
+}
+
+message FetchResponse {
+  // Every committed transaction after `after`, or unset if there is none.
+  optional Batch batch = 1;
+  // The epoch of the primary that wrote the last frames of the replica's log.
+  uint64 log_epoch = 2;
+}
+
+message PromoteRequest {
+  string database = 1;
+  uint64 epoch = 2;
+  uint32 replication_factor = 3;
+}
+
+message PromoteResponse {}
 
 message SnapshotRequest {
   string database = 1;
@@ -254,6 +350,9 @@ message ExecuteResponse {
   bool under_replicated = 3;
   // The size of the database's replica set.
   uint32 replicas = 4;
+  // The primary that acknowledged the write, and the epoch it serves at.
+  string primary = 5;
+  uint64 epoch = 6;
 }
 
 message QueryRequest {

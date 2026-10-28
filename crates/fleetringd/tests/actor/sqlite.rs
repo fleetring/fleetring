@@ -337,6 +337,130 @@ async fn a_follower_rejects_a_batch_that_skips_ahead() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_follower_truncates_a_divergent_tail_and_serves_its_frames() -> TestResult {
+    let fx = sqlite(Execution::Threads);
+    let db = name("divergent");
+    fx.create(&db).await?;
+    let handle = fx.registry.open(&db).await?;
+    handle.snapshot(fx.path("follower")).await?;
+    let _ = fx.sink.take();
+    for i in 0..3 {
+        handle
+            .execute(Transaction::from(fx.put(&format!("k{i}"), i)))
+            .await?;
+    }
+    let batches = fx.sink.take();
+    let engine = SqliteEngine::new(PAGE_SIZE)?;
+    let EngineCapability::FrameSource(frames) = engine.capability() else {
+        panic!("sqlite is a frame source");
+    };
+    let mut follower = frames.open_follower(&fx.path("follower"))?;
+    for published in &batches {
+        follower.apply(&published.batch)?;
+    }
+
+    // A promoted member reads what it holds after a position, as a candidate fetches it.
+    let fetched = follower
+        .committed_since(Some(&batches[0].batch.end))
+        .expect("readable")
+        .expect("two transactions");
+    assert_eq!(fetched.start, batches[1].batch.start);
+    assert_eq!(fetched.end, batches[2].batch.end);
+    assert!(
+        follower
+            .committed_since(follower.position().as_ref())?
+            .is_none()
+    );
+
+    // The last two transactions were never acknowledged: cut them off, durably.
+    let adopted = batches[0].batch.end.clone();
+    follower.truncate_to(&adopted)?;
+    assert_eq!(follower.position(), Some(adopted.clone()));
+    drop(follower);
+    let mut follower = frames.open_follower(&fx.path("follower"))?;
+    assert_eq!(
+        follower.position(),
+        Some(adopted),
+        "the cut survives a reopen"
+    );
+    // The log continues from there, with the same frames or with others.
+    follower.apply(&batches[1].batch)?;
+    assert_eq!(follower.position(), Some(batches[1].batch.end.clone()));
+
+    // A position that isn't in the copy's log can't be cut back to.
+    let bogus = Position::new(WalPosition::default().to_bytes());
+    let error = follower.truncate_to(&bogus).expect_err("not in this log");
+    assert!(
+        matches!(error, EngineError::InvalidPosition { .. }),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_follower_never_truncates_to_or_below_its_last_checkpoint() -> TestResult {
+    let fx = sqlite(Execution::Threads);
+    let db = name("checkpointed");
+    fx.create(&db).await?;
+    let handle = fx.registry.open(&db).await?;
+    handle.snapshot(fx.path("follower")).await?;
+    let start = handle.position().await?;
+    handle.execute(Transaction::from(fx.put("a", 1))).await?;
+    let behind = handle.position().await?.ok_or("a position")?;
+    handle.execute(Transaction::from(fx.put("b", 2))).await?;
+    let engine = SqliteEngine::new(PAGE_SIZE)?;
+    let EngineCapability::FrameSource(frames) = engine.capability() else {
+        panic!("sqlite is a frame source");
+    };
+    let mut follower = frames.open_follower(&fx.path("follower"))?;
+    follower.apply(
+        &handle
+            .committed_since(start)
+            .await?
+            .ok_or("the first generation")?,
+    )?;
+    let marker = handle.checkpoint().await?;
+    handle.execute(Transaction::from(fx.put("c", 3))).await?;
+    handle.execute(Transaction::from(fx.put("d", 4))).await?;
+    let next = handle
+        .committed_since(Some(marker.position.clone()))
+        .await?
+        .ok_or("the next generation")?;
+    // The follower records the primary's checkpoint as the next generation reaches it.
+    follower.apply(&next)?;
+    drop(follower);
+    let mut follower = frames.open_follower(&fx.path("follower"))?;
+
+    // It serves the next generation from the checkpoint, as the primary does, and refuses every
+    // other earlier-generation position.
+    let served = follower
+        .committed_since(Some(&marker.position))?
+        .ok_or("the next generation")?;
+    assert_eq!(served.end, next.end);
+    let error = follower
+        .committed_since(Some(&behind))
+        .expect_err("behind the checkpoint");
+    assert!(
+        matches!(error, EngineError::InvalidPosition { .. }),
+        "{error:?}"
+    );
+
+    // The frames up to the checkpoint are in the database file now, so the copy can't be cut
+    // back to it or behind it: only a snapshot would do.
+    for position in [&marker.position, &behind] {
+        let error = follower
+            .truncate_to(position)
+            .expect_err("at or behind the checkpoint");
+        assert!(
+            matches!(error, EngineError::InvalidPosition { .. }),
+            "{error:?}"
+        );
+    }
+    assert_eq!(follower.position(), Some(next.end), "nothing was cut");
+    Ok(())
+}
+
+#[tokio::test]
 async fn queries_run_on_the_read_connection_and_cannot_write() -> TestResult {
     let fx = sqlite(Execution::Threads);
     let db = name("reads");

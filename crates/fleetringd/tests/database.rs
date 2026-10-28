@@ -574,6 +574,78 @@ async fn a_restarted_primary_serves_its_database_again() -> TestResult {
     Ok(())
 }
 
+/// Timings short enough for a failover to finish quickly over loopback.
+const FAST_LEASES: &str = "lease_duration_ms = 800\nfailover_margin_ms = 100\n\
+                           heartbeat_timeout_ms = 500\ntick_interval_ms = 20\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let control_text = format!(
+        "{}\n[control]\n{FAST_LEASES}",
+        config(dir.path(), "control", "control", None)
+    );
+    let control = Daemon::start(Config::from_toml(&control_text)?).await?;
+    let address = control.control_address().ok_or("no control address")?;
+    let mut data = Vec::new();
+    for id in DATA {
+        let text = format!(
+            "{}{FAST_LEASES}",
+            config(dir.path(), id, "data", Some(address))
+        );
+        data.push(Daemon::start(Config::from_toml(&text)?).await?);
+    }
+    let cluster = Cluster { control, data };
+    cluster.converge().await?;
+    let client = cluster.client()?;
+    let acme = name("acme")?;
+    let location = client.create_database(&acme, three()?).await?;
+    let old = location.primary.clone().ok_or("no primary")?;
+    client
+        .execute(&acme, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    let first = client
+        .execute(&acme, Statement::new("INSERT INTO t VALUES (1)"))
+        .await?;
+    assert_eq!(first.primary.as_ref(), Some(&old));
+
+    // The primary goes away; the next write fails until a follower takes over, then succeeds
+    // when retried, as `fleetringd db exec` would be.
+    let Cluster { control, mut data } = cluster;
+    let index = data
+        .iter()
+        .position(|daemon| daemon.config().node.id == old)
+        .ok_or("primary isn't a data daemon")?;
+    data.remove(index).run_until(async {}).await;
+    let written = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client
+                .execute(&acme, Statement::new("INSERT INTO t VALUES (2)"))
+                .await
+            {
+                Ok(written) => return Ok(written),
+                Err(status) if matches!(status.code(), Code::Unavailable | Code::Aborted) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+    })
+    .await??;
+    let new = written.primary.clone().ok_or("no primary named")?;
+    assert_ne!(new, old);
+    assert_eq!(written.epoch.get(), 2);
+    let rows = client
+        .query(&acme, Statement::new("SELECT DISTINCT x FROM t ORDER BY x"))
+        .await?;
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    Cluster { control, data }.stop().await;
+    Ok(())
+}
+
 #[cfg(unix)]
 mod binary {
     use std::process::{Command, Output};

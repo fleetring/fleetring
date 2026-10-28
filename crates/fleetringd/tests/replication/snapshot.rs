@@ -11,11 +11,12 @@ use std::time::Duration;
 use fleetring_control::LeaseEpoch;
 use fleetring_proto::v1::replication_server::Replication as ReplicationRpc;
 use fleetring_proto::v1::{
-    FenceRequest, FenceResponse, ReplicateMessage, SnapshotChunk, SnapshotRequest,
+    FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest, PromoteResponse,
+    ReplicateMessage, SnapshotChunk, SnapshotRequest,
 };
 use fleetringd::DatabaseError;
 use fleetringd::engine::{Statement, Transaction, Value};
-use fleetringd::replication::{ReplicationService, ReplicationSettings, SeedError};
+use fleetringd::replication::{PrimaryRole, ReplicationService, ReplicationSettings, SeedError};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -216,6 +217,20 @@ impl ReplicationRpc for Tamper {
         self.inner.fence(request).await
     }
 
+    async fn fetch(
+        &self,
+        request: Request<FetchRequest>,
+    ) -> Result<Response<FetchResponse>, Status> {
+        self.inner.fetch(request).await
+    }
+
+    async fn promote(
+        &self,
+        request: Request<PromoteRequest>,
+    ) -> Result<Response<PromoteResponse>, Status> {
+        self.inner.promote(request).await
+    }
+
     async fn snapshot(
         &self,
         request: Request<SnapshotRequest>,
@@ -364,5 +379,57 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
         .execute(&db, put(2, 4_000))
         .await?;
     cluster.await_caught_up("a", &db).await?;
+    Ok(())
+}
+
+/// A follower whose log came from an earlier epoch and runs past where the new epoch's log
+/// began, in a newer generation than that point, can't cut its tail back there: the frames up to
+/// its last checkpoint are in its database file. The primary re-seeds it instead, once, and
+/// replication goes on from the snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> TestResult {
+    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
+    let db = name("diverged");
+    cluster.create("a", &db, 2).await?;
+    let primary = &cluster.node("a").replication;
+    let registry = cluster.node("a").registry();
+    let follower = &cluster.node("b").replication;
+
+    registry.execute(&db, put(1, 1_000)).await?;
+    cluster.await_caught_up("a", &db).await?;
+    let start = primary.primary_status(&db).ok_or("primary")?.committed;
+    registry.execute(&db, put(2, 1_000)).await?;
+    cluster.await_caught_up("a", &db).await?;
+    primary.checkpoint(&db).await?;
+    // The follower takes the next generation, and with it the checkpoint, at epoch 1.
+    registry.execute(&db, put(3, 1_000)).await?;
+    cluster.await_caught_up("a", &db).await?;
+    let before = follower.follower_status(&db).ok_or("follows")?.snapshots;
+
+    // Epoch 2's log began back at `start`, before that checkpoint.
+    let epoch = PrimaryRole {
+        epoch: LeaseEpoch::new(2),
+        ..crate::common::role(2)
+    };
+    primary.lead(&db, epoch, start).await?;
+    assert!(primary.await_writable(&db, HANG_GUARD).await);
+    registry.execute(&db, put(4, 1_000)).await?;
+    cluster.await_caught_up("a", &db).await?;
+    let status = follower.follower_status(&db).ok_or("follows")?;
+    assert_eq!(status.snapshots, before + 1, "re-seeded once: {status:?}");
+    assert_eq!(status.epoch, Some(LeaseEpoch::new(2)));
+
+    // The re-seeded copy is epoch 2's log, so the streams serving again reopens, which carry
+    // the same start, neither cut it back nor re-seed it.
+    primary.serve_primary(db.clone(), epoch)?;
+    assert!(primary.await_writable(&db, HANG_GUARD).await);
+    registry.execute(&db, put(5, 1_000)).await?;
+    cluster.await_caught_up("a", &db).await?;
+    let status = follower.follower_status(&db).ok_or("follows")?;
+    assert_eq!(
+        status.snapshots,
+        before + 1,
+        "not re-seeded again: {status:?}"
+    );
     Ok(())
 }
