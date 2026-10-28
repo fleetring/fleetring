@@ -1,12 +1,12 @@
 # FleetRing tickets
 
-Local tickets for the `fleetring` ring and placement crate, which is MVP step 1 in [`docs/mvp.md`](../mvp.md). Design decisions are recorded in [`docs/adr/`](../adr/README.md), and tickets link to the ADRs they implement.
+Local tickets for FleetRing: the `fleetring` placement crate (MVP step 1 in [`docs/mvp.md`](../mvp.md), released as 0.1.0) and the `fleetringd` daemon (MVP step 2). Design decisions are recorded in [`docs/adr/`](../adr/README.md), and tickets link to the ADRs they implement.
 
 ## Conventions
 
 - **One file per ticket**, named `FR-NNN-short-slug.md`. Each file starts with YAML front matter:
   - `status`: `todo`, `in-progress`, `blocked`, or `done`
-  - `priority`: `P0` blocks `fleetringd` work, `P1` is required for 0.1.0, `P2` may slip past 0.1.0
+  - `priority`: `P0` blocks `fleetringd` work, `P1` is required for 0.1.0, `P2` may slip past 0.1.0. For daemon tickets (FR-022 on), `P0` is required for `fleetringd` v0.1, `P1` should ship with it, and `P2` may slip.
   - `size`: `S` is half a day or less, `M` is 1–2 days, `L` is 3–4 days
   - `depends_on`: the IDs of prerequisite tickets
   - `adrs`: the ADRs the ticket implements
@@ -34,6 +34,8 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M2 Placement core | FR-007 – FR-011 | Ring, rendezvous, topology-aware replica sets, vnode ring, and bounded loads |
 | M3 Change and interop | FR-012 – FR-015, FR-020, FR-021 | Diff, `RingSpec` and fingerprint, spec v1 with golden vectors, diagnostics, and cells |
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
+| M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
+| M6 Replication and failover | FR-030 – FR-033 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, and a CLI |
 
 ## Index
 
@@ -60,6 +62,18 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-019](FR-019-release-0-1-0.md) | Release `fleetring` 0.1.0 and freeze placement spec v1 | P1 | S | FR-014, FR-016, FR-018 | done |
 | [FR-020](FR-020-cells.md) | Cells: nested placement with directories and per-cell rings | P1 | L | FR-012, FR-013 | done |
 | [FR-021](FR-021-cells-spec.md) | `CellsSpec`: serializable cells layers | P2 | M | FR-013, FR-020 | todo |
+| [FR-022](FR-022-daemon-skeleton.md) | Workspace crates and the `fleetringd` skeleton | P0 | M | — | todo |
+| [FR-023](FR-023-grpc-transport.md) | gRPC protocol crate and node transport | P0 | M | FR-022 | todo |
+| [FR-024](FR-024-simulation-harness.md) | Simulation harness with turmoil | P0 | M | FR-022, FR-023 | todo |
+| [FR-025](FR-025-wal-format.md) | WAL format library | P0 | M | FR-022 | todo |
+| [FR-026](FR-026-database-actor.md) | Engine adapter and per-database actor | P0 | L | FR-022, FR-025 | todo |
+| [FR-027](FR-027-control-state-machine.md) | Control state machine | P0 | M | FR-022 | todo |
+| [FR-028](FR-028-control-node.md) | Control node service and client | P0 | M | FR-023, FR-027 | todo |
+| [FR-029](FR-029-membership.md) | Membership, heartbeats, and ring publication | P0 | M | FR-028 | todo |
+| [FR-030](FR-030-replication-stream.md) | Replication stream and follower mirroring | P0 | L | FR-023, FR-026, FR-029 | todo |
+| [FR-031](FR-031-leases-failover.md) | Leases, epochs, quorums, and failover | P0 | L | FR-030 | todo |
+| [FR-032](FR-032-snapshot-catch-up.md) | Snapshot catch-up | P1 | M | FR-030 | todo |
+| [FR-033](FR-033-database-api-cli.md) | Database API and CLI for `fleetringd` v0.1 | P1 | M | FR-026, FR-028 | todo |
 
 ## Dependency graph
 
@@ -98,6 +112,23 @@ flowchart LR
   FR013 --> FR020
   FR013 --> FR021[FR-021 cells spec]
   FR020 --> FR021
+  FR022[FR-022 daemon skeleton] --> FR023[FR-023 gRPC transport]
+  FR022 --> FR024[FR-024 simulation harness]
+  FR023 --> FR024
+  FR022 --> FR025[FR-025 WAL format]
+  FR022 --> FR026[FR-026 database actor]
+  FR025 --> FR026
+  FR022 --> FR027[FR-027 control state machine]
+  FR023 --> FR028[FR-028 control node]
+  FR027 --> FR028
+  FR028 --> FR029[FR-029 membership + ring]
+  FR023 --> FR030[FR-030 replication stream]
+  FR026 --> FR030
+  FR029 --> FR030
+  FR030 --> FR031[FR-031 leases + failover]
+  FR030 --> FR032[FR-032 snapshot catch-up]
+  FR026 --> FR033[FR-033 database API + CLI]
+  FR028 --> FR033
 ```
 
 ## Critical path and estimate
@@ -109,6 +140,8 @@ The critical path is: FR-001 → FR-003 / FR-004 / FR-005 (parallel) → FR-007 
 | P0: unblocks `fleetringd` | 10 tickets | ≈ 14 engineer-days |
 | P0 + P1: the 0.1.0 release | 18 tickets | ≈ 28 engineer-days |
 | Everything, including P2 | 20 tickets | ≈ 29 engineer-days |
+
+For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-029 → FR-030 → FR-031, with FR-025 → FR-026 and FR-027 running in parallel. All twelve daemon tickets come to about 24 engineer-days.
 
 `docs/mvp.md` allows 4–6 weeks for all eight MVP steps, with the ring crate as step 1. At about three weeks, P0 alone takes more than a proportional share. If the timeline is fixed, start `fleetringd` once P0 is done and run P1 in parallel. P2 can slip past 0.1.0 without affecting placement.
 
