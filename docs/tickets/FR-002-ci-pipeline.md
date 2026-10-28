@@ -1,7 +1,7 @@
 ---
 id: FR-002
 title: CI pipeline across the platforms where determinism breaks
-status: todo
+status: in-progress
 priority: P0
 size: M
 milestone: M0 Foundations
@@ -53,3 +53,8 @@ Make CI prove the determinism promise (ADR-0008) on every platform class where i
 - Run tests with `--no-fail-fast`.
 - On wasm, property tests can be cfg'd out: proptest's fork and failure persistence features don't work there. Golden vectors and unit tests must still run (see FR-014).
 - The existing Conventional Commits workflow stays as it is.
+
+## Progress
+
+- 2026-10-27: `.github/workflows/ci.yml` (10 jobs) and `deny.toml` are written. The YAML and TOML parse, and the `deny.toml` keys follow the current cargo-deny template (no `version` fields).
+- Still open: none of the acceptance criteria can be checked until the workflow runs on GitHub. `cross`, `wasmtime`, and `cargo-deny` aren't installed locally.
