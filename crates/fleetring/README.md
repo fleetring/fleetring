@@ -23,6 +23,7 @@ Give `fleetring` a key and it tells you which nodes hold it, in what order, and 
 - **Replicas that survive failures.** Replica sets spread across zones, then hosts. Filtering out a down node gives exactly the replica set of a ring built without it, so every router fails over the same way.
 - **Minimal churn.** Adding, removing, or reweighting one node changes at most one replica of any key.
 - **Operations built in.** Bounded loads, ring diffs for migration planning, fingerprints that catch divergent peers, and diagnostics for skewed topologies.
+- **Layers when you need them.** A `Cells` layer sends each key to a cell, such as a region or a tenant pool, through directory rules or a weighted ring. The cell's own ring then places the key's replicas, and layers nest to any depth.
 - **Small and fast.** No I/O, no async runtime, no unsafe code. Replica lookups don't allocate for up to 8 replicas. They take about 1.5 µs at 100 nodes, and 0.4 µs on a 1000-node vnode ring ([benchmarks](https://github.com/fleetring/fleetring/blob/main/docs/perf.md)).
 
 ## Quickstart

@@ -1,4 +1,4 @@
-//! Validated labels: node IDs, zones, and hosts (ADR-0005).
+//! Validated labels: node IDs, cell IDs, zones, and hosts (ADR-0005, ADR-0012).
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -18,6 +18,8 @@ pub enum LabelKind {
     Zone,
     /// A [`Host`].
     Host,
+    /// A [`CellId`].
+    CellId,
 }
 
 impl fmt::Display for LabelKind {
@@ -26,11 +28,12 @@ impl fmt::Display for LabelKind {
             Self::NodeId => "node id",
             Self::Zone => "zone",
             Self::Host => "host",
+            Self::CellId => "cell id",
         })
     }
 }
 
-/// The error returned when a string is not a valid [`NodeId`], [`Zone`], or [`Host`].
+/// The error returned when a string is not a valid [`NodeId`], [`CellId`], [`Zone`], or [`Host`].
 ///
 /// Labels are 1 to 64 bytes of lowercase ASCII letters, digits, `-`, `_`, `.`, and `:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +97,7 @@ const fn is_label_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b':')
 }
 
-/// Defines a validated label newtype. The three label types differ only in name and docs.
+/// Defines a validated label newtype. The label types differ only in name and docs.
 macro_rules! label {
     ($(#[$meta:meta])* pub struct $name:ident(LabelKind::$kind:ident);) => {
         $(#[$meta])*
@@ -212,6 +215,27 @@ label! {
     /// # Ok::<(), fleetring::ParseLabelError>(())
     /// ```
     pub struct Host(LabelKind::Host);
+}
+
+label! {
+    /// The identity of a cell in a [`Cells`](crate::Cells) layer: a region, a cell, a tenant pool,
+    /// or a jurisdiction.
+    ///
+    /// A layer's selector maps each key to a cell ID, and a selector ring names its cells with
+    /// nodes whose [`NodeId`]s spell the cell IDs. Cell IDs use the same grammar as [`NodeId`]:
+    /// 1 to 64 bytes of lowercase ASCII letters, digits, `-`, `_`, `.`, and `:`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring::CellId;
+    ///
+    /// let cell: CellId = "eu-west".parse()?;
+    /// assert_eq!(cell.as_str(), "eu-west");
+    /// assert!("EU West".parse::<CellId>().is_err());
+    /// # Ok::<(), fleetring::ParseLabelError>(())
+    /// ```
+    pub struct CellId(LabelKind::CellId);
 }
 
 #[cfg(test)]

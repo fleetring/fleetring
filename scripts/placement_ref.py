@@ -1,7 +1,8 @@
 """Independent reference implementation of FleetRing placement spec v1.
 
 Written from docs/spec/placement-v1.md alone, not ported from the Rust crate, to show that the
-spec is complete: it recomputes every vector in the golden file and reports any mismatch. It
+spec is complete: it recomputes every vector in the golden file, rings and cells layers alike,
+and reports any mismatch. It
 needs only the PyPI `xxhash` package, which wraps the C xxHash library, and Python's integers,
 which are exact at any size, so no product can overflow.
 
@@ -284,9 +285,116 @@ class Ring:
             probes += le32(len(members)) + b"".join(le32(j) for j in members)
         return H(self.encoding() + probes, 0)
 
+    # Section 13: a ring inside a cells layer.
+
+    def seeds(self) -> set[int]:
+        """The seeds of every ring in this placement: just this ring's."""
+        return {self.seed}
+
+    def leaf(self, key: bytes) -> tuple[list[str], "Ring"]:
+        """A ring is its own leaf, with an empty path."""
+        return [], self
+
 
 def string(data: bytes) -> bytes:
     return le32(len(data)) + data
+
+
+# Section 13: composition (cells).
+
+LAYER_TAG = b"CELL"
+MODE_WITHIN = 0
+
+
+class Cells:
+    """A validated cells layer: directory rules, an optional selector ring, and cells, each a
+    ring or another layer."""
+
+    def __init__(self, spec: dict) -> None:
+        directory = spec.get("directory", {})
+        self.exact = {bytes.fromhex(k): cell for k, cell in directory.get("exact", {}).items()}
+        self.prefixes = {bytes.fromhex(p): cell for p, cell in directory.get("prefix", {}).items()}
+        self.selector = Ring(spec["selector"]) if "selector" in spec else None
+        self.cells: dict[str, Ring | Cells] = {}
+        for entry in spec["cells"]:
+            cell_id = entry["cell"]
+            if not LABEL.fullmatch(cell_id):
+                raise ValueError(f"bad cell id {cell_id!r}")
+            if cell_id in self.cells:
+                raise ValueError(f"two cells share the ID {cell_id!r}")
+            if ("ring" in entry) == ("layer" in entry):
+                raise ValueError(f"cell {cell_id!r} must be exactly one of a ring and a layer")
+            self.cells[cell_id] = Ring(entry["ring"]) if "ring" in entry else Cells(entry["layer"])
+        if not self.cells:
+            raise ValueError("a layer needs at least one cell")
+        for target in list(self.exact.values()) + list(self.prefixes.values()):
+            if not LABEL.fullmatch(target):
+                raise ValueError(f"bad cell id {target!r} in a directory rule")
+
+        # The rejection rules of section 13.1.
+        catch_all = b"" in self.prefixes
+        if self.selector is None and not catch_all:
+            raise ValueError("no selector ring and no catch-all rule, so some keys reach no cell")
+        if self.selector is not None and catch_all:
+            raise ValueError("the catch-all rule matches every key, so the selector ring is unused")
+        rule_targets = set(self.exact.values()) | set(self.prefixes.values())
+        ring_targets = set(self.selector.ids) if self.selector else set()
+        unknown = (rule_targets | ring_targets) - set(self.cells)
+        if unknown:
+            raise ValueError(f"selector targets {sorted(unknown)} are not cells of the layer")
+        unreachable = set(self.cells) - rule_targets - ring_targets
+        if unreachable:
+            raise ValueError(f"cells {sorted(unreachable)} are unreachable")
+        if self.selector is not None:
+            for cell_id, cell in self.cells.items():
+                if self.selector.seed in cell.seeds():
+                    raise ValueError(f"cell {cell_id!r} holds a ring with the selector ring's seed")
+
+        # Canonical order: cells sorted by ID, comparing bytes.
+        self.ids = sorted(self.cells, key=str.encode)
+
+    def seeds(self) -> set[int]:
+        """The seeds of every ring in this layer, at any depth: selector rings and cell rings."""
+        seeds = {self.selector.seed} if self.selector else set()
+        for cell in self.cells.values():
+            seeds |= cell.seeds()
+        return seeds
+
+    def select(self, key: bytes) -> str:
+        """Section 13.2: an exact rule, else the longest matching prefix, else the selector ring."""
+        if key in self.exact:
+            return self.exact[key]
+        matches = [prefix for prefix in self.prefixes if key.startswith(prefix)]
+        if matches:
+            return self.prefixes[max(matches, key=len)]
+        # The key's preferred primary on the selector ring: the first entry of its preference list.
+        assert self.selector is not None, "validation guarantees a selector ring here"
+        return self.selector.ids[self.selector.preference(key)[0]]
+
+    def leaf(self, key: bytes) -> tuple[list[str], Ring]:
+        """Section 13.3: the key's path, top to leaf, and its leaf ring."""
+        cell_id = self.select(key)
+        path, ring = self.cells[cell_id].leaf(key)
+        return [cell_id] + path, ring
+
+    def encoding(self) -> bytes:
+        """Section 13.5: the layer's canonical encoding."""
+        out = LAYER_TAG + bytes([MODE_WITHIN])
+        for rules in (self.exact, self.prefixes):
+            out += le32(len(rules))
+            for pattern in sorted(rules):  # bytes compare bytewise
+                out += string(pattern) + string(rules[pattern].encode())
+        if self.selector is None:
+            out += bytes([0])
+        else:
+            out += bytes([1]) + le64(self.selector.fingerprint())
+        out += le32(len(self.ids))
+        for cell_id in self.ids:
+            out += string(cell_id.encode()) + le64(self.cells[cell_id].fingerprint())
+        return out
+
+    def fingerprint(self) -> int:
+        return H(self.encoding(), 0)
 
 
 def optional(label: Optional[str]) -> bytes:
@@ -359,6 +467,36 @@ def check_case(case: dict, checker: Checker) -> None:
             checker.check("bounded placements", (ids(replicas), saturated, home), want, context)
 
 
+def check_cells_case(case: dict, checker: Checker) -> None:
+    name = case["name"]
+    try:
+        layer = Cells(case["layer"])
+    except ValueError as error:
+        checker.check("layers", str(error), "a valid layer", name)
+        return
+    checker.check("layers", True, True, name)
+    checker.check("layer fingerprints", f"{layer.fingerprint():016x}", case["fingerprint"], name)
+
+    for entry in case["keys"]:
+        key = bytes.fromhex(entry["key"])
+        path, ring = layer.leaf(key)
+        got = (path, [ring.ids[i] for i in ring.replicas(key)])
+        want = (entry["path"], entry["replicas"])
+        checker.check("cell placements", got, want, f"{name}: key {entry['key']} (path, replicas)")
+
+    # Filters apply inside the leaf ring only: the path never depends on them.
+    for scenario in case.get("filters", []):
+        down = set(scenario["down"])
+        for entry in scenario["keys"]:
+            key = bytes.fromhex(entry["key"])
+            path, ring = layer.leaf(key)
+            replicas = ring.replicas(key, lambda i: ring.ids[i] not in down)
+            got = (path, [ring.ids[i] for i in replicas])
+            want = (entry["path"], entry["replicas"])
+            context = f"{name}: key {entry['key']} with {sorted(down)} down (path, replicas)"
+            checker.check("filtered cell placements", got, want, context)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} PATH/TO/placement-v1.json", file=sys.stderr)
@@ -377,7 +515,10 @@ def main(argv: list[str]) -> int:
     for entry in vectors["neg_log2_q32"]:
         checker.check("neg_log2_q32", L(int(entry["x"], 16)), entry["l"], f"L({entry['x']})")
     for case in vectors["cases"]:
-        check_case(case, checker)
+        if "layer" in case:
+            check_cells_case(case, checker)
+        else:
+            check_case(case, checker)
 
     summary = ", ".join(f"{count} {category}" for category, count in checker.counts.items())
     print(f"placement_ref: {len(vectors['cases'])} cases; checked {summary}")

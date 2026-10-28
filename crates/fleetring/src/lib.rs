@@ -50,6 +50,8 @@
 //! - `chat_failover`: chat rooms that fail over deterministically when nodes go down.
 //! - `rebalance`: the migration plan and movement summary for adding a node.
 //! - `bounded_loads`: LLM conversations placed on GPU nodes by KV-cache memory.
+//! - `regional_cells`: EU and US tenants kept in their regions by residency rules, every other
+//!   tenant hashed to a region, and zone-aware rings inside each region.
 //! - `spec_roundtrip`: a ring shipped from a control plane to a router as JSON.
 //!
 //! Run one with `cargo run -p fleetring --example database_fleet`. `spec_roundtrip` also needs
@@ -185,6 +187,42 @@
 //! a bug or a misconfiguration, such as a wrong seed or hasher, and must fail loudly rather than
 //! route keys.
 //!
+//! ## Cells
+//!
+//! Large fleets place keys in layers: a directory or a ring picks the *cell*, such as a region, a
+//! jurisdiction, or a tenant pool, and the cell's own ring picks the nodes. A [`Cells`] layer
+//! does both. Its selector applies a [`Directory`] of exact-key and longest-prefix rules first,
+//! for residency and pinning, then a selector ring whose nodes are the cells, weighted by their
+//! shares of the remaining keys. Each cell is a [`Ring`] or another `Cells` layer, so
+//! `Cells<Cells<Ring>>` places keys by region, then by cell.
+//!
+//! All of a key's replicas live in one cell, spread across that cell's zones and hosts, and
+//! [`Cells::replicas`] returns them with the key's path of cells as a [`CellPlacement`]. Cell
+//! weights are explicit, so changes inside a cell never move keys to another cell, and
+//! [`Cells::diff`] tells cross-cell moves from in-cell changes. Every layer hashes keys with its
+//! own seed: [`CellsBuilder::build`] rejects a ring that shares its seed with a selector ring
+//! above it.
+//!
+//! ```
+//! use fleetring::{Cells, Directory, Node, Ring};
+//!
+//! let ring = |seed: u64, ids: [&str; 2]| {
+//!     Ring::builder()
+//!         .seed(seed)
+//!         .nodes(ids.map(|id| Node::new(id.parse().expect("valid id"))))
+//!         .build()
+//! };
+//! let fleet = Cells::builder()
+//!     .directory(Directory::new().prefix("eu:", "eu".parse()?).catch_all("us".parse()?))
+//!     .cell("eu".parse()?, ring(1, ["eu-1", "eu-2"])?)
+//!     .cell("us".parse()?, ring(2, ["us-1", "us-2"])?)
+//!     .build()?;
+//! let placed = fleet.replicas("eu:tenant:acme");
+//! assert_eq!(placed.to_string(), format!("eu {}", placed.replicas()));
+//! assert!(placed.replicas().iter().all(|node| node.id().as_str().starts_with("eu-")));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! # Choosing a strategy
 //!
 //! A [`Strategy`] ranks the nodes for each key. Both strategies keep membership changes minimal
@@ -250,7 +288,7 @@
 //!   differently.
 //!
 //! Bounded-load placements are part of the spec too, and also depend on the loads, the headroom,
-//! and the item's load. The spec doesn't cover [`Ring::estimate_movement`],
+//! and the item's load. So are [`Cells`] layers: their paths, replicas, and fingerprints. The spec doesn't cover [`Ring::estimate_movement`],
 //! [`Ring::expected_shares`], or [`Ring::diagnostics`], which sample synthetic keys that a later
 //! release may change. A custom [`StableHasher`] is only as stable as its implementation, so pin
 //! its output with test vectors.
@@ -260,7 +298,7 @@
 //! | Feature | Default | Enables |
 //! |---|---|---|
 //! | `std` | yes | Nothing yet: it is reserved so that `no_std` + `alloc` support can land without breaking builds that set `default-features = false`. |
-//! | `serde` | no | `Serialize` and `Deserialize` for [`RingSpec`] and the types it holds, so rings can be stored and shipped. Deserializing validates every value and ignores unknown fields. |
+//! | `serde` | no | `Serialize` and `Deserialize` for [`RingSpec`], the types it holds, and [`CellId`], so rings can be stored and shipped. Deserializing validates every value and ignores unknown fields. |
 //! | `test-util` | no | The `test_util` module of test doubles, such as a hasher whose outputs a test chooses. Never enable it in production builds. |
 //!
 //! [architecture decision records]: https://github.com/fleetring/fleetring/tree/main/docs/adr
@@ -273,8 +311,11 @@
 #![deny(clippy::float_arithmetic)]
 
 mod bounded;
+mod cell_diff;
+mod cells;
 mod diagnostics;
 mod diff;
+mod directory;
 mod epoch;
 mod hasher;
 mod label;
@@ -296,11 +337,14 @@ mod vectors;
 mod vnodes;
 
 pub use bounded::{BoundedLoads, BoundedPlacement, Headroom, LoadView, LoadViewError};
+pub use cell_diff::{CellChange, CellMovementSummary, CellsDiff};
+pub use cells::{BuildCellsError, CellPlacement, Cells, CellsBuilder, Placement};
 pub use diagnostics::{Diagnostic, NodeShare, Severity};
 pub use diff::{Change, Diff, MovementSummary};
+pub use directory::Directory;
 pub use epoch::Epoch;
 pub use hasher::{StableHasher, Xxh3};
-pub use label::{Host, LabelKind, NodeId, ParseLabelError, Zone};
+pub use label::{CellId, Host, LabelKind, NodeId, ParseLabelError, Zone};
 pub use node::{Node, Weight};
 pub use replica::{Preference, ReplicaIter, ReplicaSet, ReplicationFactor};
 pub use ring::{BuildRingError, Ring, RingBuilder};
@@ -314,10 +358,20 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<BoundedLoads>();
     assert_send_sync::<BoundedPlacement<'static>>();
+    assert_send_sync::<BuildCellsError>();
     assert_send_sync::<BuildRingError>();
+    assert_send_sync::<CellChange<'static, Vec<u8>>>();
+    assert_send_sync::<CellId>();
+    assert_send_sync::<CellMovementSummary>();
+    assert_send_sync::<CellPlacement<'static>>();
+    assert_send_sync::<Cells<Ring<Xxh3>>>();
+    assert_send_sync::<Cells<Cells<Ring<Xxh3>>>>();
+    assert_send_sync::<CellsBuilder<Ring<Xxh3>>>();
+    assert_send_sync::<CellsDiff<'static, Ring<Xxh3>, std::vec::IntoIter<Vec<u8>>>>();
     assert_send_sync::<Change<'static, Vec<u8>>>();
     assert_send_sync::<Diagnostic>();
     assert_send_sync::<Diff<'static, Xxh3, std::vec::IntoIter<Vec<u8>>>>();
+    assert_send_sync::<Directory>();
     assert_send_sync::<Epoch>();
     assert_send_sync::<Fingerprint>();
     assert_send_sync::<FromSpecError>();

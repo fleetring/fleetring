@@ -1,7 +1,8 @@
-//! The golden placement vectors through the public API (FR-014, ADR-0008).
+//! The golden placement vectors through the public API (FR-014, FR-020, ADR-0008).
 //!
 //! `tests/vectors/placement-v1.json` pins placement spec v1, and describes its own layout in
-//! its `layout` field. `include_str!` embeds it, so these tests also run on targets without a
+//! its `layout` field. Most cases place keys on a ring; cells cases place them on a cells layer
+//! (spec section 13) instead. `include_str!` embeds it, so these tests also run on targets without a
 //! filesystem, such as wasm32-wasip1. The unit tests in `src/vectors.rs` check the logarithm
 //! vectors and the freeze guard, and `scripts/placement_ref.py` checks the whole file against an
 //! independent implementation of the spec.
@@ -11,8 +12,8 @@ use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
 use fleetring::{
-    BoundedLoads, Headroom, Node, ReplicaSet, ReplicationFactor, Ring, StableHasher, Strategy,
-    VnodeParams, Weight, Xxh3,
+    BoundedLoads, CellId, CellPlacement, Cells, Directory, Fingerprint, Headroom, Node, Placement,
+    ReplicaSet, ReplicationFactor, Ring, StableHasher, Strategy, VnodeParams, Weight, Xxh3,
 };
 use serde_json::Value;
 
@@ -25,7 +26,7 @@ fn vectors() -> &'static Value {
     PARSED.get_or_init(|| serde_json::from_str(VECTORS).expect("placement-v1.json is valid JSON"))
 }
 
-/// One placement case of the file.
+/// One placement case of the file: a ring case, or a cells case.
 struct Case {
     name: &'static str,
     value: &'static Value,
@@ -34,31 +35,7 @@ struct Case {
 impl Case {
     /// Builds the ring the case describes.
     fn ring(&self) -> Ring {
-        let ring = &self.value["ring"];
-        assert_eq!(ring["hasher"], Xxh3.algorithm(), "{}: hasher", self.name);
-        let strategy = match text(&ring["strategy"]["kind"]) {
-            "rendezvous" => Strategy::Rendezvous,
-            "vnodes" => {
-                let tokens = u32::try_from(number(&ring["strategy"]["tokens_per_weight"]))
-                    .ok()
-                    .and_then(NonZeroU32::new)
-                    .unwrap_or_else(|| panic!("{}: bad tokens_per_weight", self.name));
-                Strategy::Vnodes(VnodeParams::new(tokens))
-            }
-            other => panic!("{}: unknown strategy {other:?}", self.name),
-        };
-        let replication = u8::try_from(number(&ring["replication_factor"]))
-            .ok()
-            .and_then(ReplicationFactor::new)
-            .unwrap_or_else(|| panic!("{}: bad replication factor", self.name));
-        let nodes: Vec<Node> = array(&ring["nodes"]).iter().map(node).collect();
-        Ring::builder()
-            .strategy(strategy)
-            .seed(hex64(&ring["seed"]))
-            .replication_factor(replication)
-            .nodes(nodes)
-            .build()
-            .unwrap_or_else(|error| panic!("{}: the ring does not build: {error}", self.name))
+        ring(&self.value["ring"], self.name)
     }
 
     /// The case's filter or bounded-load scenarios under `field`, if it has any.
@@ -69,14 +46,162 @@ impl Case {
     }
 }
 
-/// Every placement case, in file order.
+/// Every ring case, in file order.
 fn cases() -> Vec<Case> {
+    all_cases()
+        .into_iter()
+        .filter(|case| case.value.get("ring").is_some())
+        .collect()
+}
+
+/// Every cells case, in file order.
+fn cells_cases() -> Vec<Case> {
+    all_cases()
+        .into_iter()
+        .filter(|case| case.value.get("layer").is_some())
+        .collect()
+}
+
+/// Every case of both kinds, in file order.
+fn all_cases() -> Vec<Case> {
     array(&vectors()["cases"])
         .iter()
         .map(|value| Case {
             name: text(&value["name"]),
             value,
         })
+        .collect()
+}
+
+/// Builds a ring the file describes, as a case's ring, a selector ring, or a cell's ring.
+fn ring(ring: &Value, name: &str) -> Ring {
+    assert_eq!(ring["hasher"], Xxh3.algorithm(), "{name}: hasher");
+    let strategy = match text(&ring["strategy"]["kind"]) {
+        "rendezvous" => Strategy::Rendezvous,
+        "vnodes" => {
+            let tokens = u32::try_from(number(&ring["strategy"]["tokens_per_weight"]))
+                .ok()
+                .and_then(NonZeroU32::new)
+                .unwrap_or_else(|| panic!("{name}: bad tokens_per_weight"));
+            Strategy::Vnodes(VnodeParams::new(tokens))
+        }
+        other => panic!("{name}: unknown strategy {other:?}"),
+    };
+    let replication = u8::try_from(number(&ring["replication_factor"]))
+        .ok()
+        .and_then(ReplicationFactor::new)
+        .unwrap_or_else(|| panic!("{name}: bad replication factor"));
+    let nodes: Vec<Node> = array(&ring["nodes"]).iter().map(node).collect();
+    Ring::builder()
+        .strategy(strategy)
+        .seed(hex64(&ring["seed"]))
+        .replication_factor(replication)
+        .nodes(nodes)
+        .build()
+        .unwrap_or_else(|error| panic!("{name}: the ring does not build: {error}"))
+}
+
+/// What the cells checks need from a built layer, whatever its depth.
+trait Layer {
+    /// The key's path and replica IDs.
+    fn place(&self, key: &[u8]) -> (Vec<String>, Vec<String>);
+    /// The key's replica IDs among the nodes that aren't `down`, empty when none is up.
+    fn place_where(&self, key: &[u8], down: &BTreeSet<&str>) -> Vec<String>;
+    fn cell_of(&self, key: &[u8]) -> String;
+    fn primary(&self, key: &[u8]) -> String;
+    fn layer_fingerprint(&self) -> Fingerprint;
+}
+
+impl<P: Placement<Hasher = Xxh3>> Layer for Cells<P> {
+    fn place(&self, key: &[u8]) -> (Vec<String>, Vec<String>) {
+        let placed = self.replicas(key);
+        (path_ids(&placed), owned_ids(placed.replicas()))
+    }
+
+    fn place_where(&self, key: &[u8], down: &BTreeSet<&str>) -> Vec<String> {
+        let filtered = self.replicas_where(key, |node| !down.contains(node.id().as_str()));
+        filtered
+            .map(|placed| owned_ids(placed.replicas()))
+            .unwrap_or_default()
+    }
+
+    fn cell_of(&self, key: &[u8]) -> String {
+        Cells::cell_of(self, key).to_string()
+    }
+
+    fn primary(&self, key: &[u8]) -> String {
+        Cells::primary(self, key).id().to_string()
+    }
+
+    fn layer_fingerprint(&self) -> Fingerprint {
+        self.fingerprint()
+    }
+}
+
+/// Builds the layer a cells case describes. A layer's cells are all rings, or all layers whose
+/// cells are rings: `Cells<Ring>` or `Cells<Cells<Ring>>`.
+fn cells_layer(case: &Case) -> Box<dyn Layer> {
+    let value = &case.value["layer"];
+    let entries = array(&value["cells"]);
+    if entries.iter().all(|entry| entry.get("ring").is_some()) {
+        Box::new(layer(value, case.name, &|entry| {
+            ring(&entry["ring"], case.name)
+        }))
+    } else {
+        Box::new(layer(value, case.name, &|entry| {
+            layer(&entry["layer"], case.name, &|inner| {
+                ring(&inner["ring"], case.name)
+            })
+        }))
+    }
+}
+
+/// Builds a layer the file describes, building each cell entry with `cell`.
+fn layer<P: Placement<Hasher = Xxh3>>(
+    value: &Value,
+    name: &str,
+    cell: &dyn Fn(&Value) -> P,
+) -> Cells<P> {
+    let mut directory = Directory::new();
+    if let Some(rules) = value.get("directory") {
+        for (key, id) in rules["exact"].as_object().expect("exact is an object") {
+            directory = directory.exact(hex_bytes(key), cell_id(id));
+        }
+        for (prefix, id) in rules["prefix"].as_object().expect("prefix is an object") {
+            directory = directory.prefix(hex_bytes(prefix), cell_id(id));
+        }
+    }
+    let mut builder = Cells::builder().directory(directory);
+    if let Some(selector) = value.get("selector") {
+        builder = builder.ring_selector(ring(selector, name));
+    }
+    for entry in array(&value["cells"]) {
+        builder = builder.cell(cell_id(&entry["cell"]), cell(entry));
+    }
+    builder
+        .build()
+        .unwrap_or_else(|error| panic!("{name}: the layer does not build: {error}"))
+}
+
+fn cell_id(value: &Value) -> CellId {
+    text(value).parse().expect("vector cell IDs are valid")
+}
+
+/// A placement's path, as IDs.
+fn path_ids(placed: &CellPlacement<'_>) -> Vec<String> {
+    placed.path().iter().map(|cell| cell.to_string()).collect()
+}
+
+/// A replica set's IDs, in order, as owned strings.
+fn owned_ids(replicas: &ReplicaSet<'_>) -> Vec<String> {
+    replicas.iter().map(|node| node.id().to_string()).collect()
+}
+
+/// The strings of a JSON array, such as a key entry's expected path.
+fn strings(value: &Value) -> Vec<String> {
+    array(value)
+        .iter()
+        .map(|item| text(item).to_owned())
         .collect()
 }
 
@@ -142,13 +267,18 @@ fn decimal(value: &Value) -> u128 {
 
 /// Parses a key written as lowercase hex.
 fn key_bytes(value: &Value) -> Vec<u8> {
-    let digits = text(value).as_bytes();
-    assert!(digits.len().is_multiple_of(2), "odd-length key {value}");
+    hex_bytes(text(value))
+}
+
+/// Parses bytes written as lowercase hex, such as a key or a directory rule's prefix.
+fn hex_bytes(text: &str) -> Vec<u8> {
+    let digits = text.as_bytes();
+    assert!(digits.len().is_multiple_of(2), "odd-length hex {text:?}");
     digits
         .chunks(2)
         .map(|pair| {
             let pair = std::str::from_utf8(pair).expect("hex digits are ASCII");
-            u8::from_str_radix(pair, 16).unwrap_or_else(|_| panic!("bad hex key {value}"))
+            u8::from_str_radix(pair, 16).unwrap_or_else(|_| panic!("bad hex {text:?}"))
         })
         .collect()
 }
@@ -188,9 +318,15 @@ fn every_xxh3_vector_matches() {
 
 #[test]
 fn every_ring_builds_with_its_fingerprint() {
+    let all = all_cases();
+    let names: BTreeSet<&str> = all.iter().map(|case| case.name).collect();
+    assert_eq!(names.len(), all.len(), "case names are unique");
+    assert_eq!(
+        cases().len() + cells_cases().len(),
+        all.len(),
+        "every case has a ring or a layer"
+    );
     let cases = cases();
-    let names: BTreeSet<&str> = cases.iter().map(|case| case.name).collect();
-    assert_eq!(names.len(), cases.len(), "case names are unique");
     for case in &cases {
         let ring = case.ring();
         assert_eq!(
@@ -422,4 +558,126 @@ fn the_cases_cover_every_required_shape() {
         .filter(|shape| !shapes.contains(shape))
         .collect();
     assert!(missing.is_empty(), "no case covers {missing:?}");
+}
+
+#[test]
+fn every_cells_layer_builds_with_its_fingerprint() {
+    for case in cells_cases() {
+        let layer = cells_layer(&case);
+        assert_eq!(
+            layer.layer_fingerprint().to_string(),
+            text(&case.value["fingerprint"]),
+            "{}: fingerprint",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn every_cells_key_maps_to_its_path_and_replicas() {
+    for case in cells_cases() {
+        let layer = cells_layer(&case);
+        for entry in array(&case.value["keys"]) {
+            let key = key_bytes(&entry["key"]);
+            let at = format!("{}: key {}", case.name, entry["key"]);
+            let (path, replicas) = layer.place(&key);
+            assert_eq!(path, strings(&entry["path"]), "{at}: path");
+            assert_eq!(replicas, strings(&entry["replicas"]), "{at}: replicas");
+            assert_eq!(
+                Some(&layer.cell_of(&key)),
+                path.last(),
+                "{at}: cell_of is the leaf"
+            );
+            assert_eq!(
+                Some(&layer.primary(&key)),
+                replicas.first(),
+                "{at}: the primary heads the replica set"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_cells_filter_keeps_the_path_and_matches_its_replicas() {
+    for case in cells_cases() {
+        let layer = cells_layer(&case);
+        for filter in case.scenarios("filters") {
+            let down: BTreeSet<&str> = array(&filter["down"]).iter().map(text).collect();
+            for entry in array(&filter["keys"]) {
+                let key = key_bytes(&entry["key"]);
+                let at = format!("{}: key {} with {down:?} down", case.name, entry["key"]);
+                let (path, _) = layer.place(&key);
+                assert_eq!(path, strings(&entry["path"]), "{at}: path");
+                assert_eq!(
+                    layer.place_where(&key, &down),
+                    strings(&entry["replicas"]),
+                    "{at}: replicas"
+                );
+            }
+        }
+    }
+}
+
+/// The file keeps covering what FR-020 requires of cells. It is append-only, so this only fails
+/// if the file is replaced.
+#[test]
+fn the_cells_cases_cover_every_required_shape() {
+    let mut shapes = BTreeSet::new();
+    for case in cells_cases() {
+        let value = &case.value["layer"];
+        let directory = value.get("directory");
+        let has_catch_all = directory
+            .and_then(|rules| rules["prefix"].as_object())
+            .is_some_and(|prefixes| prefixes.contains_key(""));
+        match (directory.is_some(), value.get("selector").is_some()) {
+            (true, false) if has_catch_all => shapes.insert("directory with a catch-all"),
+            (false, true) => shapes.insert("ring alone"),
+            (true, true) => shapes.insert("directory and ring"),
+            _ => false,
+        };
+        let entries = array(&value["cells"]);
+        if entries.iter().any(|entry| entry.get("layer").is_some()) {
+            shapes.insert("nested layers");
+        }
+        let mut kinds = BTreeSet::new();
+        let mut rings: Vec<&Value> = value.get("selector").into_iter().collect();
+        for entry in entries {
+            match entry.get("layer") {
+                Some(inner) => {
+                    rings.extend(inner.get("selector"));
+                    rings.extend(array(&inner["cells"]).iter().map(|cell| &cell["ring"]));
+                }
+                None => rings.push(&entry["ring"]),
+            }
+        }
+        for ring in rings {
+            kinds.insert(text(&ring["strategy"]["kind"]));
+        }
+        if kinds.len() > 1 {
+            shapes.insert("mixed strategies");
+        }
+        for filter in case.scenarios("filters") {
+            shapes.insert("filter");
+            if array(&filter["keys"])
+                .iter()
+                .any(|entry| array(&entry["replicas"]).is_empty())
+            {
+                shapes.insert("every node of a cell down");
+            }
+        }
+    }
+    let required = [
+        "directory with a catch-all",
+        "ring alone",
+        "directory and ring",
+        "nested layers",
+        "mixed strategies",
+        "filter",
+        "every node of a cell down",
+    ];
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|shape| !shapes.contains(shape))
+        .collect();
+    assert!(missing.is_empty(), "no cells case covers {missing:?}");
 }

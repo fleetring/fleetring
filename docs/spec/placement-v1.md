@@ -181,3 +181,73 @@ The fingerprint always uses XXH3 with seed 0, whatever the ring's hasher and see
 - This is placement spec version 1. Any change to the output of §3–§9 or §11 for the same inputs requires a new version, whatever the crate version.
 - The vectors file is append-only. New cases MAY be added, but existing cases MUST NOT change.
 - Ring specs record the format version (§10). A reader MUST reject versions it doesn't implement.
+
+## 13. Composition (cells)
+
+A **cells layer** places a key in two steps: its **selector** picks one of its **cells**, and that cell places the key. A cell is a ring (§2) or another cells layer, so layers nest, for example a layer of regions whose cells are layers of cells whose cells are rings. All of a key's replicas come from one ring, the key's **leaf ring**, which spreads them across its own zones and hosts (§7). Layers partition keys; they never spread one key's replicas across cells.
+
+**Layer inputs.**
+
+| Input | Domain | Default |
+|---|---|---|
+| Cells | 1 to 2³² − 1 cells with distinct IDs, each a ring or a cells layer | — |
+| Cell ID | 1–64 bytes of `[a-z0-9._:-]`, the grammar of node IDs (§2) | — |
+| Exact rules | byte strings, each mapping to a cell ID; a byte string has at most one exact rule | none |
+| Prefix rules | byte strings, each mapping to a cell ID; a byte string has at most one prefix rule | none |
+| Selector ring | absent, or a ring (§2) whose node IDs are cell IDs | absent |
+
+The exact and prefix rules form the layer's **directory**. The prefix rule for the empty byte string, if there is one, is the **catch-all**. The selector ring's node weights are its cells' shares of the keys it selects for. They are explicit inputs, never derived from the cells' contents, so a change inside a cell never changes which cell any key maps to.
+
+**Canonical order.** Cells are sorted by ID, comparing bytes. The rules of each kind are sorted by their byte strings, comparing bytes, so a byte string sorts before every longer string it is a prefix of.
+
+A layer MUST be rejected if any of these hold:
+- it has no cells;
+- two cells share an ID;
+- it has no selector ring and no catch-all, so some keys would reach no cell;
+- it has a selector ring and a catch-all, so the selector ring would never be used;
+- a rule maps to a cell ID that is not a cell of the layer;
+- a node of the selector ring has an ID that is not a cell of the layer;
+- a cell is the target of no rule and no node of the selector ring;
+- it has a selector ring, and some ring inside one of its cells has the selector ring's seed. The rings inside a cell are the cell itself if it is a ring, and otherwise its selector ring, if it has one, and the rings inside each of its cells, at every depth.
+
+A nested layer is validated as a layer in its own right.
+
+**Selecting a cell.** A layer's cell for a key `k` is given by the first of these steps that applies:
+
+1. **Exact rule:** the cell of the exact rule whose byte string equals `k`.
+2. **Longest prefix:** the cell of the prefix rule with the longest byte string among those that are a prefix of `k`. The empty string is a prefix of every key, so the catch-all applies to every key that no other rule matches.
+3. **Selector ring:** the ID of `k`'s preferred primary on the selector ring (§7), read as a cell ID. The first pass of §7 always takes the first node of the candidate order, so this is the first node of `k`'s candidate order on the selector ring (§5, §6). The selector ring's replication factor, zones, and hosts don't affect the choice.
+
+Rules compare raw bytes, with no normalization (§1). The rejection rules above guarantee that step 3 is reached only when the layer has a selector ring, and that every step yields a cell of the layer.
+
+**Placing a key.** A key's **path** is the list of cell IDs that the layers choose, from the top layer to the leaf. The top layer selects a cell for the key. If that cell is a ring, it is the key's leaf ring and the path ends; otherwise the cell is a layer, which selects again. Each selector ring hashes the key with its own seed (§3), and so does the leaf ring.
+
+The key's replica set is its replica set on the leaf ring (§7), at the leaf ring's replication factor, and its preference list is its preference list on the leaf ring.
+
+**Filters.** A filter (§8) applies only inside the leaf ring. The path never depends on a filter: when a filter rejects every node of the leaf ring, the key has no eligible replicas, and it does not move to another cell.
+
+**Seed independence.** The last rejection rule keeps every ring's key hash independent of the selector rings above it. A ring sharing a seed with a selector ring above it would hash keys in step with that selector's choice. Under vnodes, a cell's keys would all come from the arcs the cell won above, so the cell's ring would see a skewed slice of its circle. Under rendezvous, a node whose ID equals its cell's ID would draw exactly as its cell did, and so win far more than its share of the cell's keys.
+
+*Informative:* one rule keeps seeds distinct. Give each ring the seed `H(path, 0)` (§3), where `path` is the UTF-8 bytes of the IDs of the cells that hold the ring, joined with `/`: `eu/eu-3` for the ring of cell `eu-3` inside cell `eu`, `eu` for the selector ring of cell `eu`, and the empty string for the top layer's selector ring.
+
+**Layer fingerprint.** A layer's fingerprint covers its directory, its selector ring, and its cells, at every depth. Little-endian throughout; `string(b)` is `le32(len(b)) ‖ b`.
+
+```text
+encoding = "CELL"                                    # layer tag: the 4 bytes 43 45 4c 4c
+           u8 mode                                   # 0 = within: all replicas in one cell
+           le32(exact_rule_count)
+           for each exact rule, in canonical order:
+             string(byte_string) ‖ string(cell_id)
+           le32(prefix_rule_count)
+           for each prefix rule, in canonical order:
+             string(byte_string) ‖ string(cell_id)
+           u8 selector_present ‖ [le64(selector_fingerprint)]   # 0 = absent, 1 = present
+           le32(cell_count)
+           for each cell, in canonical order:
+             string(cell_id) ‖ le64(cell_fingerprint)
+fingerprint = XXH3_64bits_withSeed(encoding, 0)
+```
+
+`selector_fingerprint` is the selector ring's fingerprint (§11), which covers the cells' weights. A cell's fingerprint is its ring's fingerprint (§11) or, for a nested layer, that layer's fingerprint by this section. Epochs appear nowhere, so they never affect a layer's fingerprint. The layer tag sets a layer's encoding apart from a ring's (§10), which starts with its format version. Version 1 defines only mode 0. Peers compare layers by their fingerprints, as they compare rings (§11).
+
+**Versioning.** §12 applies to this section too: a change to the paths, replica sets, or fingerprints this section gives for the same inputs requires a new spec version. The golden vectors for cells layers are cases in the same vectors file, described by its `layout` field.

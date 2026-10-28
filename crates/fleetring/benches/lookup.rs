@@ -175,3 +175,87 @@ mod bounded {
         });
     }
 }
+
+mod cells {
+    use fleetring::{Cells, Node, Ring, Strategy, VnodeParams, Weight};
+
+    use super::{Bencher, keys};
+
+    /// Cells in the layer, and nodes in each cell's ring: 10,000 nodes in all.
+    const CELLS: usize = 100;
+    const NODES_PER_CELL: usize = 100;
+
+    /// Cell `cell`'s ring: nodes over 8 zones with weights cycling 1..=4, under a seed of its own.
+    fn cell_ring(cell: usize, strategy: Strategy) -> Ring {
+        let members = (0..NODES_PER_CELL).map(|i| {
+            let weight = u32::try_from(1 + i % 4).expect("small weight");
+            Node::new(format!("c{cell:03}-n{i:03}").parse().expect("valid id"))
+                .with_zone(format!("zone-{}", i % 8).parse().expect("valid zone"))
+                .with_weight(Weight::new(weight).expect("nonzero"))
+        });
+        Ring::builder()
+            .strategy(strategy)
+            .seed(1 + u64::try_from(cell).expect("small index"))
+            .nodes(members)
+            .build()
+            .expect("valid ring")
+    }
+
+    /// A layer of 100 cells of 100 nodes, selected by a ring of the same strategy whose cells
+    /// all weigh 1.
+    fn layer(strategy: Strategy) -> Cells {
+        let selector = Ring::builder()
+            .strategy(strategy)
+            .seed(0)
+            .nodes((0..CELLS).map(|c| Node::new(format!("cell-{c:03}").parse().expect("valid id"))))
+            .build()
+            .expect("valid selector ring");
+        Cells::builder()
+            .ring_selector(selector)
+            .cells((0..CELLS).map(|c| {
+                let id = format!("cell-{c:03}").parse().expect("valid cell id");
+                (id, cell_ring(c, strategy))
+            }))
+            .build()
+            .expect("valid layer")
+    }
+
+    fn bench_replicas(bencher: Bencher, fleet: &Cells) {
+        let keys = keys();
+        let mut next = 0;
+        bencher.bench_local(|| {
+            next = (next + 1) % keys.len();
+            divan::black_box(fleet.replicas(divan::black_box(&keys[next])))
+        });
+    }
+
+    /// `replicas`, R = 3, through a rendezvous selector ring to a rendezvous cell ring.
+    ///
+    /// Each lookup reaches one of 100 rings, so the benches take many short samples, which keeps
+    /// their medians stable.
+    #[divan::bench(sample_count = 1000, sample_size = 20)]
+    fn rendezvous_100x100(bencher: Bencher) {
+        bench_replicas(bencher, &layer(Strategy::Rendezvous));
+    }
+
+    /// `replicas`, R = 3, through a vnode selector ring to a vnode cell ring.
+    #[divan::bench(sample_count = 1000, sample_size = 20)]
+    fn vnodes_100x100(bencher: Bencher) {
+        bench_replicas(bencher, &layer(Strategy::Vnodes(VnodeParams::default())));
+    }
+
+    /// For comparison: `replicas`, R = 3, on one flat rendezvous ring of all 10,000 nodes.
+    #[divan::bench(sample_count = 20)]
+    fn flat_rendezvous_10000(bencher: Bencher) {
+        let ring = Ring::builder()
+            .nodes((0..CELLS).flat_map(|c| cell_ring(c, Strategy::Rendezvous).nodes().to_vec()))
+            .build()
+            .expect("valid ring");
+        let keys = keys();
+        let mut next = 0;
+        bencher.bench_local(|| {
+            next = (next + 1) % keys.len();
+            divan::black_box(ring.replicas(divan::black_box(&keys[next])))
+        });
+    }
+}

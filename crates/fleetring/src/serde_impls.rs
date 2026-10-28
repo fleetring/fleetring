@@ -12,7 +12,8 @@ use serde::de::{self, Deserialize, Deserializer, Unexpected, Visitor};
 use serde::ser::{Serialize, Serializer};
 
 use crate::{
-    Epoch, Fingerprint, Host, LabelKind, NodeId, ParseLabelError, ReplicationFactor, Weight, Zone,
+    CellId, Epoch, Fingerprint, Host, LabelKind, NodeId, ParseLabelError, ReplicationFactor,
+    Weight, Zone,
 };
 
 /// Implements serde for label types: each is a string that must match the label grammar.
@@ -32,7 +33,7 @@ macro_rules! label_serde {
     )*};
 }
 
-label_serde!(NodeId, Zone, Host);
+label_serde!(NodeId, Zone, Host, CellId);
 
 /// Deserializes a label of type `T`, rejecting strings outside the label grammar.
 struct LabelVisitor<T> {

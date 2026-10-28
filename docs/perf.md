@@ -19,6 +19,7 @@ Shared CI runners are too noisy to gate on timings, so CI only builds the benche
 | Vnode `replicas`, R = 3, N = 1000 | ≤ 1 µs | 0.42 µs | met |
 | Vnode `build`, N = 1000 at 256 tokens per weight (weights 1–4, 640k tokens) | ≤ 100 ms | 19 ms | met |
 | `diff` throughput, N = 100, adding one node | ≥ 100k keys/s | 350k keys/s | met |
+| Cells `replicas`, R = 3, 100 cells × 100 nodes, rendezvous selector and cells (FR-020) | ≤ 5 µs | 2.3–3.5 µs | met |
 
 ## Measurements
 
@@ -39,10 +40,22 @@ Shared CI runners are too noisy to gate on timings, so CI only builds the benche
 | `LoadView::replicas` (bounded loads), rendezvous, mixed weights | 346 ns | 551 ns | 3.67 µs | 23.2 µs |
 | `diff` + `summarize`, per key, rendezvous, mixed weights | — | 0.55 µs | 2.85 µs | — |
 
+### Cells
+
+FR-020's layout, from `cargo bench -p fleetring --bench lookup -- cells`, measured 2026-10-28 on the same laptop: 100 cells of 100 nodes each, 10,000 nodes in all. Each cell's ring spreads its nodes over 8 zones with weights cycling 1–4, and the selector ring weighs every cell 1. Each lookup reaches one of the 100 cell rings, so the two cells benches take 1000 samples of 20 lookups each.
+
+| Benchmark | Median |
+|---|---|
+| `Cells::replicas` (R = 3), rendezvous selector ring and cell rings | 2.3–3.5 µs |
+| `Cells::replicas` (R = 3), vnode selector ring and cell rings, 256 tokens per weight | 0.31–0.53 µs |
+| `Ring::replicas` (R = 3), one flat rendezvous ring of all 10,000 nodes, for comparison | 90–92 µs |
+
 ## Notes
 
 - **Rendezvous cost:** about 8.5 ns per node with uniform weights. That's one 16-byte XXH3 hash plus the champion scan.
   - Mixed weights add about 1.7 ns per node for the table-based logarithm. ADR-0003 records why the table replaced repeated squaring, which costs 105.6 ns per call.
 - **Vnode lookups:** they are nearly flat in N because of the binary search. N = 3 is slower than N = 10 because R = 3 makes the walk find *every* node, including the lightest one, which owns the fewest tokens. With 10 nodes, three distinct zones turn up within a few tokens.
 - **Bounded loads:** a placement runs two selections, home placement and then the filtered one, plus the capacity checks, so it costs about twice a plain `replicas` call.
+- **Cells:** a lookup costs one selector lookup plus one cell lookup. With rendezvous, that is a 100-way `primary` on the selector ring, a 100-way `replicas` in the cell (1.55 µs), and a binary search for the cell's ID. Splitting 10,000 nodes into 100 cells makes rendezvous lookups 25 to 40 times faster than one flat ring, as ADR-0012 predicted.
+  - The cells medians are ranges because they varied between runs on a laptop that was also running other builds. The rendezvous layer measured 2.3 µs when benchmarked alone and up to 3.5 µs in the full `cells` group, while the flat rings above stayed within a few percent of their recorded values. Re-measure on quiet reference hardware before a release.
 - **Allocation:** `replicas` and `primary` allocate nothing for R ≤ 8, and `tests/alloc_free.rs` enforces this. `preference` allocates O(N) by design.

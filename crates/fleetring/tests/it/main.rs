@@ -2,6 +2,7 @@
 //! fixtures.
 
 mod bounded;
+mod cells;
 mod common;
 mod diagnostics;
 mod diff;

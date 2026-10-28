@@ -50,8 +50,8 @@ use serde_json::{Map, Value, json};
 
 use crate::math::neg_log2_q32;
 use crate::{
-    BoundedLoads, Headroom, Host, Node, ReplicationFactor, Ring, StableHasher, Strategy,
-    VnodeParams, Weight, Xxh3, Zone,
+    BoundedLoads, CellId, CellPlacement, Cells, Directory, Headroom, Host, Node, Placement,
+    ReplicationFactor, Ring, StableHasher, Strategy, VnodeParams, Weight, Xxh3, Zone,
 };
 
 /// The vector file.
@@ -86,6 +86,8 @@ const LAYOUT: &[&str] = &[
     "cases[].keys: each key's replica set at the ring's replication factor, preferred primary first (spec sections 5 to 7).",
     "cases[].filters: the down nodes are ineligible (spec section 8); each key's replica set among the other nodes, empty when every node is down.",
     "cases[].bounded: bounded-load placements (spec section 9). headroom is the percentage epsilon, item_load is the load of the key being placed, loads lists node loads (unlisted nodes have load 0), and capacity is every node's capacity for this item load. Each key's placement lists its replicas, whether it is saturated, and whether it is home.",
+    "cases[].layer: a cells layer (spec section 13), in a case that has it in place of a ring. directory maps exact keys and prefixes, in lowercase hex, to cell IDs; selector, if present, is a ring whose node IDs are cell IDs; cells lists each cell's ID with its ring or a nested layer, in the order supplied. The fingerprint is the layer's (spec section 13).",
+    "cases[].keys[].path: in a cells case, the cells on the key's path, top to leaf; replicas is the key's replica set on the leaf ring. In a cells case's filters, the down nodes are ineligible in whichever cell the key reaches, and the path is the key's unfiltered path, which a filter never changes.",
 ];
 
 /// Field names in the order the file lists them. Each kind of object uses some of them, and this
@@ -101,7 +103,14 @@ const FIELD_ORDER: &[&str] = &[
     "input",
     "name",
     "description",
+    "cell",
     "ring",
+    "layer",
+    "directory",
+    "exact",
+    "prefix",
+    "selector",
+    "cells",
     "fingerprint",
     "down",
     "headroom",
@@ -125,6 +134,7 @@ const FIELD_ORDER: &[&str] = &[
     "zone",
     "host",
     "key",
+    "path",
     "replicas",
     "saturated",
     "home",
@@ -133,8 +143,9 @@ const FIELD_ORDER: &[&str] = &[
     "cases",
 ];
 
-/// Fields whose values map node IDs to numbers. They list their IDs in bytewise order.
-const ID_MAPS: &[&str] = &["loads", "capacity"];
+/// Fields whose values map node IDs to numbers, or hex keys and prefixes to cell IDs. They list
+/// their keys in bytewise order.
+const ID_MAPS: &[&str] = &["loads", "capacity", "exact", "prefix"];
 
 /// The sections every checkpoint freezes in full, besides the cases.
 const REFERENCE_SECTIONS: [&str; 3] = ["xxh3_64", "log2_table", "neg_log2_q32"];
@@ -151,6 +162,10 @@ const GOLDEN_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// One placement case: a ring, the keys placed on it, and optional filter and bounded-load
 /// scenarios on the same ring.
+///
+/// A cells case (spec section 13) places its keys on a [`Layer`] instead, and ignores the ring
+/// settings and bounded-load scenarios. Rings inside a layer are described by cases too, whose
+/// names label their panics.
 struct Case {
     name: &'static str,
     description: &'static str,
@@ -161,6 +176,7 @@ struct Case {
     keys: Vec<Vec<u8>>,
     filters: Vec<Filter>,
     bounded: Vec<Scenario>,
+    layer: Option<Box<Layer>>,
 }
 
 /// Nodes that are down, so that a filter makes them ineligible.
@@ -189,6 +205,15 @@ impl Case {
             keys: standard_keys(),
             filters: Vec::new(),
             bounded: Vec::new(),
+            layer: None,
+        }
+    }
+
+    /// Starts a cells case on `layer`, with the [standard keys](standard_keys).
+    fn cells(name: &'static str, description: &'static str, layer: Layer) -> Self {
+        Self {
+            layer: Some(Box::new(layer)),
+            ..Self::new(name, description)
         }
     }
 
@@ -257,6 +282,9 @@ impl Case {
 
     /// Computes the case's expected outputs with the public API.
     fn expected(&self) -> Value {
+        if let Some(layer) = &self.layer {
+            return self.cells_expected(layer);
+        }
         let ring = self.ring();
         let keys: Vec<Value> = self
             .keys
@@ -320,6 +348,190 @@ impl Case {
             "nodes": nodes,
         })
     }
+
+    /// Computes a cells case's expected outputs with the public API. A layer's cells are all
+    /// rings or all nested layers of rings, the shapes `Cells<Ring>` and `Cells<Cells<Ring>>`.
+    fn cells_expected(&self, layer: &Layer) -> Value {
+        if layer
+            .cells
+            .iter()
+            .all(|(_, cell)| matches!(cell, Member::Ring(_)))
+        {
+            self.cells_case(layer, &layer.build(self.name, &Member::ring))
+        } else {
+            let nested = |cell: &Member| cell.layer(self.name).build(self.name, &Member::ring);
+            self.cells_case(layer, &layer.build(self.name, &nested))
+        }
+    }
+
+    /// The expected outputs of a cells case whose layer built as `cells`.
+    fn cells_case<P: Placement<Hasher = Xxh3>>(&self, layer: &Layer, cells: &Cells<P>) -> Value {
+        let keys: Vec<Value> = self
+            .keys
+            .iter()
+            .map(|key| {
+                let placed = cells.replicas(key);
+                json!({
+                    "key": hex(key),
+                    "path": path(&placed),
+                    "replicas": ids(&placed.replicas().to_ids()),
+                })
+            })
+            .collect();
+        let mut case = json!({
+            "name": self.name,
+            "description": self.description,
+            "layer": layer.json(),
+            "fingerprint": cells.fingerprint().to_string(),
+            "keys": keys,
+        });
+        if !self.filters.is_empty() {
+            let filters: Vec<Value> = self
+                .filters
+                .iter()
+                .map(|filter| filter.expected_cells(cells))
+                .collect();
+            case["filters"] = filters.into();
+        }
+        case
+    }
+}
+
+/// A cells layer of a cells case (spec section 13): directory rules, an optional selector ring,
+/// and cells, each a ring or a nested layer, in the order supplied.
+struct Layer {
+    exact: Vec<(Vec<u8>, &'static str)>,
+    prefixes: Vec<(Vec<u8>, &'static str)>,
+    selector: Option<Case>,
+    cells: Vec<(&'static str, Member)>,
+}
+
+/// One cell of a [`Layer`].
+enum Member {
+    /// A ring, described by a ring case's settings and nodes.
+    Ring(Case),
+    /// A nested layer.
+    Layer(Layer),
+}
+
+impl Layer {
+    /// Starts a layer with no rules, no selector ring, and no cells.
+    fn new() -> Self {
+        Self {
+            exact: Vec::new(),
+            prefixes: Vec::new(),
+            selector: None,
+            cells: Vec::new(),
+        }
+    }
+
+    /// Adds an exact rule.
+    fn exact(mut self, key: impl AsRef<[u8]>, cell: &'static str) -> Self {
+        self.exact.push((key.as_ref().to_vec(), cell));
+        self
+    }
+
+    /// Adds a prefix rule; the empty prefix is the catch-all.
+    fn prefix(mut self, prefix: impl AsRef<[u8]>, cell: &'static str) -> Self {
+        self.prefixes.push((prefix.as_ref().to_vec(), cell));
+        self
+    }
+
+    /// Sets the selector ring, whose node IDs are cell IDs.
+    fn selector(mut self, ring: Case) -> Self {
+        self.selector = Some(ring);
+        self
+    }
+
+    /// Adds a cell that is a ring.
+    fn ring(mut self, id: &'static str, ring: Case) -> Self {
+        self.cells.push((id, Member::Ring(ring)));
+        self
+    }
+
+    /// Adds a cell that is a nested layer.
+    fn layer(mut self, id: &'static str, layer: Layer) -> Self {
+        self.cells.push((id, Member::Layer(layer)));
+        self
+    }
+
+    /// Builds the layer, building each cell with `cell`.
+    fn build<P: Placement<Hasher = Xxh3>>(
+        &self,
+        case: &str,
+        cell: &dyn Fn(&Member) -> P,
+    ) -> Cells<P> {
+        let mut directory = Directory::new();
+        for (key, id) in &self.exact {
+            directory = directory.exact(key, label::<CellId>(id));
+        }
+        for (prefix, id) in &self.prefixes {
+            directory = directory.prefix(prefix, label::<CellId>(id));
+        }
+        let mut builder = Cells::builder().directory(directory);
+        if let Some(selector) = &self.selector {
+            builder = builder.ring_selector(selector.ring());
+        }
+        builder
+            .cells(
+                self.cells
+                    .iter()
+                    .map(|(id, member)| (label::<CellId>(id), cell(member))),
+            )
+            .build()
+            .unwrap_or_else(|error| panic!("case {case}: invalid layer: {error}"))
+    }
+
+    /// The layer as the vector file describes it.
+    fn json(&self) -> Value {
+        let rules = |rules: &[(Vec<u8>, &'static str)]| -> Map<String, Value> {
+            rules
+                .iter()
+                .map(|(bytes, id)| (hex(bytes), Value::from(*id)))
+                .collect()
+        };
+        let mut layer = Map::new();
+        if !self.exact.is_empty() || !self.prefixes.is_empty() {
+            layer.insert(
+                "directory".to_owned(),
+                json!({"exact": rules(&self.exact), "prefix": rules(&self.prefixes)}),
+            );
+        }
+        if let Some(selector) = &self.selector {
+            layer.insert("selector".to_owned(), selector.ring_json());
+        }
+        let cells: Vec<Value> = self
+            .cells
+            .iter()
+            .map(|(id, member)| match member {
+                Member::Ring(ring) => json!({"cell": id, "ring": ring.ring_json()}),
+                Member::Layer(layer) => json!({"cell": id, "layer": layer.json()}),
+            })
+            .collect();
+        layer.insert("cells".to_owned(), cells.into());
+        Value::Object(layer)
+    }
+}
+
+impl Member {
+    /// Builds the cell's ring; the cell must be a ring.
+    fn ring(&self) -> Ring {
+        match self {
+            Self::Ring(ring) => ring.ring(),
+            Self::Layer(_) => panic!("a layer whose cells mix rings and layers can't be built"),
+        }
+    }
+
+    /// Returns the cell's nested layer; the cell must be a layer.
+    fn layer(&self, case: &str) -> &Layer {
+        match self {
+            Self::Layer(layer) => layer,
+            Self::Ring(ring) => panic!(
+                "case {case}: cell ring {} sits beside nested layers, which can't be built",
+                ring.name
+            ),
+        }
+    }
 }
 
 impl Filter {
@@ -333,6 +545,23 @@ impl Filter {
                     .map(|replicas| replicas.to_ids())
                     .unwrap_or_default();
                 json!({"key": hex(key), "replicas": ids(&replicas)})
+            })
+            .collect();
+        json!({"down": self.down, "keys": keys})
+    }
+
+    /// The filtered placement of every scenario key on a cells layer: the key's path, and its
+    /// replica set among the nodes that are up, empty when every node of its cell is down.
+    fn expected_cells<P: Placement<Hasher = Xxh3>>(&self, cells: &Cells<P>) -> Value {
+        let keys: Vec<Value> = scenario_keys()
+            .iter()
+            .map(|key| {
+                let placed = cells.replicas(key);
+                let replicas = cells
+                    .replicas_where(key, |node| !self.down.contains(&node.id().as_str()))
+                    .map(|filtered| filtered.replicas().to_ids())
+                    .unwrap_or_default();
+                json!({"key": hex(key), "path": path(&placed), "replicas": ids(&replicas)})
             })
             .collect();
         json!({"down": self.down, "keys": keys})
@@ -913,6 +1142,197 @@ fn catalog() -> Vec<Case> {
         .nodes(zones_and_hosts())
         .seed(0xdead_beef)
         .replication(5),
+        // Cells (spec section 13).
+        Case::cells(
+            "cells-directory-catch-all",
+            "A directory alone: an exact rule beats every prefix rule, the longest matching prefix wins, matching is bytewise and case-sensitive, and the catch-all (the empty prefix) takes every other key. The empty key has an exact rule of its own.",
+            Layer::new()
+                .exact(b"", "eu-vip")
+                .exact(b"eu:vip:globex", "eu")
+                .exact(b"tenant:acme", "eu")
+                .prefix(b"eu:", "eu")
+                .prefix(b"eu:vip:", "eu-vip")
+                .prefix([0xff], "eu-vip")
+                .prefix(b"", "us")
+                .ring(
+                    "us",
+                    ring("us").seed(11).nodes(cell_nodes("us", &[2, 2, 2])),
+                )
+                .ring(
+                    "eu",
+                    ring("eu").vnodes(8).seed(12).nodes(cell_nodes("eu", &[2, 2])),
+                )
+                .ring(
+                    "eu-vip",
+                    ring("eu-vip").seed(13).replication(2).nodes(nodes(&[
+                        ("vip-a", 2, None, Some("vip-h1")),
+                        ("vip-b", 1, None, Some("vip-h1")),
+                        ("vip-c", 1, None, None),
+                    ])),
+                ),
+        )
+        .keys(
+            [
+                &b""[..],
+                b"eu:tenant:1",
+                b"eu:vip:initech",
+                b"eu:vip:globex",
+                b"eu:vip:",
+                b"eu:vip",
+                b"eu:",
+                b"eu",
+                b"EU:tenant:1",
+                b"tenant:acme",
+                b"tenant:acme:2",
+                &[0xff],
+                &[0xff, 0xfe],
+                &[0xfe, 0xff],
+                &[0x00],
+                "café".as_bytes(),
+                b"us:tenant:9",
+            ]
+            .map(<[u8]>::to_vec)
+            .to_vec(),
+        ),
+        Case::cells(
+            "cells-ring-only",
+            "A selector ring alone, whose nodes are cells weighing 1, 2, and 3: the key's preferred primary on the selector ring is its cell, and the cell's own ring, under a seed of its own, places the replicas.",
+            Layer::new()
+                .selector(ring("selector").seed(GOLDEN_SEED).nodes(nodes(&[
+                    ("cell-c", 3, None, None),
+                    ("cell-a", 1, None, None),
+                    ("cell-b", 2, None, None),
+                ])))
+                .ring(
+                    "cell-a",
+                    ring("cell-a").seed(1).nodes(cell_nodes("a", &[2, 2, 2])),
+                )
+                .ring(
+                    "cell-b",
+                    ring("cell-b").vnodes(4).seed(2).nodes(cell_nodes("b", &[3, 3])),
+                )
+                .ring(
+                    "cell-c",
+                    ring("cell-c").seed(3).replication(2).nodes(nodes(&[
+                        ("c-n1", 1, None, Some("c-h1")),
+                        ("c-n2", 2, None, Some("c-h1")),
+                        ("c-n3", 1, None, Some("c-h2")),
+                        ("c-n4", 3, None, Some("c-h2")),
+                    ])),
+                ),
+        )
+        .keys(
+            standard_keys()
+                .into_iter()
+                .chain((0..16).map(|i| format!("tenant:{i}").into_bytes()))
+                .collect(),
+        ),
+        Case::cells(
+            "cells-directory-and-ring",
+            "Directory rules first, then a vnode selector ring for every key no rule matches. Filters take down nodes inside cells but never change a key's cell: a key whose cell is entirely down has no replicas.",
+            Layer::new()
+                .prefix(b"eu:", "eu")
+                .prefix(b"us:", "us")
+                .exact(b"room:general", "ap")
+                .exact(b"user:42", "ap")
+                .selector(ring("selector").vnodes(16).seed(7).nodes(nodes(&[
+                    ("eu", 1, None, None),
+                    ("us", 2, None, None),
+                    ("ap", 1, None, None),
+                ])))
+                .ring(
+                    "eu",
+                    ring("eu").seed(101).nodes(cell_nodes("eu", &[2, 2, 2])),
+                )
+                .ring(
+                    "us",
+                    ring("us").seed(102).nodes(cell_nodes("us", &[3, 3])),
+                )
+                .ring(
+                    "ap",
+                    ring("ap").vnodes(8).seed(103).nodes(cell_nodes("ap", &[1, 1])),
+                ),
+        )
+        .keys(
+            standard_keys()
+                .into_iter()
+                .chain(
+                    ["eu:tenant:1", "us:tenant:2", "eu:", "us:", "ap:tenant:3"]
+                        .map(|key| key.as_bytes().to_vec()),
+                )
+                .collect(),
+        )
+        .filter(&["ap-n1", "ap-n2"])
+        .filter(&["eu-n1", "us-n1", "us-n4"]),
+        Case::cells(
+            "cells-nested-mixed-strategies",
+            "Two layers of cells, region then cell: a residency directory with a rendezvous ring fallback picks the region; eu picks its cell with a vnode selector ring alone, and us with a directory and a rendezvous ring; the leaf rings mix rendezvous and vnodes. Each path names the key's region, then its cell.",
+            Layer::new()
+                .prefix(b"eu:", "eu")
+                .prefix(b"us:", "us")
+                .selector(ring("regions").seed(0x0123).nodes(nodes(&[
+                    ("us", 1, None, None),
+                    ("eu", 1, None, None),
+                ])))
+                .layer(
+                    "eu",
+                    Layer::new()
+                        .selector(ring("eu").vnodes(4).seed(0x0e00).nodes(nodes(&[
+                            ("eu-1", 1, None, None),
+                            ("eu-2", 2, None, None),
+                        ])))
+                        .ring(
+                            "eu-1",
+                            ring("eu-1").seed(0x0e01).nodes(cell_nodes("eu1", &[2, 2])),
+                        )
+                        .ring(
+                            "eu-2",
+                            ring("eu-2")
+                                .vnodes(8)
+                                .seed(0x0e02)
+                                .nodes(cell_nodes("eu2", &[2, 2, 2])),
+                        ),
+                )
+                .layer(
+                    "us",
+                    Layer::new()
+                        .exact(b"us:tenant:big", "us-2")
+                        .prefix(b"us:priority:", "us-2")
+                        .selector(ring("us").seed(0x0f00).nodes(nodes(&[
+                            ("us-1", 3, None, None),
+                            ("us-2", 1, None, None),
+                        ])))
+                        .ring(
+                            "us-1",
+                            ring("us-1").vnodes(2).seed(0x0f01).nodes(cell_nodes("us1", &[3])),
+                        )
+                        .ring(
+                            "us-2",
+                            ring("us-2")
+                                .seed(0x0f02)
+                                .replication(2)
+                                .nodes(cell_nodes("us2", &[1, 1, 1])),
+                        ),
+                ),
+        )
+        .keys(
+            standard_keys()
+                .into_iter()
+                .chain(
+                    [
+                        "eu:tenant:1",
+                        "eu:tenant:2",
+                        "eu:tenant:3",
+                        "eu:tenant:4",
+                        "us:tenant:big",
+                        "us:priority:7",
+                        "us:tenant:5",
+                        "us:tenant:6",
+                    ]
+                    .map(|key| key.as_bytes().to_vec()),
+                )
+                .collect(),
+        ),
     ]
 }
 
@@ -1031,6 +1451,33 @@ fn byte_order_nodes() -> Vec<Node> {
         ("0", 1, None, None),
         ("node-20", 1, None, None),
     ])
+}
+
+/// A ring for a cells layer, as a ring case named `name` with no keys of its own. Selector rings
+/// name their cells with nodes.
+fn ring(name: &'static str) -> Case {
+    Case::new(name, "").keys(Vec::new())
+}
+
+/// Weight-1 nodes of one cell in zones `{prefix}-z1`, `{prefix}-z2`, …, with `sizes[k]` nodes in
+/// zone `k + 1`, named `{prefix}-n1` onward across the zones. The prefix keeps node IDs unique
+/// across cells, so a filter's down nodes name one node each.
+fn cell_nodes(prefix: &str, sizes: &[usize]) -> Vec<Node> {
+    sizes
+        .iter()
+        .zip(1..)
+        .flat_map(|(&size, zone)| (0..size).map(move |_| zone))
+        .zip(1..)
+        .map(|(zone, i)| {
+            Node::new(label(&format!("{prefix}-n{i}")))
+                .with_zone(label(&format!("{prefix}-z{zone}")))
+        })
+        .collect()
+}
+
+/// A placement's cell path, as IDs.
+fn path<'a>(placed: &CellPlacement<'a>) -> Vec<&'a str> {
+    placed.path().iter().map(|cell| cell.as_str()).collect()
 }
 
 /// Loads of `load` on each of the six nodes `node-1` to `node-6`.

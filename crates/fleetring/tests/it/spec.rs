@@ -572,7 +572,7 @@ mod hashers {
 /// Tests of the serde form, which `tests/fixtures/ring-spec-v1.json` locks.
 #[cfg(feature = "serde")]
 mod json {
-    use fleetring::NodeId;
+    use fleetring::{CellId, NodeId};
 
     use super::*;
 
@@ -639,9 +639,21 @@ mod json {
             "18446744073709551615"
         );
         assert_eq!(serde_json::to_string(&label::<NodeId>("nas"))?, r#""nas""#);
+        assert_eq!(serde_json::to_string(&label::<CellId>("eu"))?, r#""eu""#);
         // Escaped strings deserialize too: labels and fingerprints never borrow from the input.
         let id: NodeId = serde_json::from_str(r#""laptop-1""#)?;
         assert_eq!(id.as_str(), "laptop-1");
+        let cell: CellId = serde_json::from_str(r#""eu-west""#)?;
+        assert_eq!(cell.as_str(), "eu-west");
+        let error = serde_json::from_str::<CellId>(r#""EU""#)
+            .err()
+            .ok_or("an uppercase cell id deserialized")?;
+        assert!(
+            error
+                .to_string()
+                .contains("cell id has invalid byte 'E' at index 0"),
+            "{error}"
+        );
         let fingerprint: Fingerprint = serde_json::from_str(r#""00000000000000ab""#)?;
         assert_eq!(fingerprint, Fingerprint::new(0xab));
         Ok(())

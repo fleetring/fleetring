@@ -12,7 +12,9 @@
     "cases[].fingerprint: the ring's fingerprint (spec section 11).",
     "cases[].keys: each key's replica set at the ring's replication factor, preferred primary first (spec sections 5 to 7).",
     "cases[].filters: the down nodes are ineligible (spec section 8); each key's replica set among the other nodes, empty when every node is down.",
-    "cases[].bounded: bounded-load placements (spec section 9). headroom is the percentage epsilon, item_load is the load of the key being placed, loads lists node loads (unlisted nodes have load 0), and capacity is every node's capacity for this item load. Each key's placement lists its replicas, whether it is saturated, and whether it is home."
+    "cases[].bounded: bounded-load placements (spec section 9). headroom is the percentage epsilon, item_load is the load of the key being placed, loads lists node loads (unlisted nodes have load 0), and capacity is every node's capacity for this item load. Each key's placement lists its replicas, whether it is saturated, and whether it is home.",
+    "cases[].layer: a cells layer (spec section 13), in a case that has it in place of a ring. directory maps exact keys and prefixes, in lowercase hex, to cell IDs; selector, if present, is a ring whose node IDs are cell IDs; cells lists each cell's ID with its ring or a nested layer, in the order supplied. The fingerprint is the layer's (spec section 13).",
+    "cases[].keys[].path: in a cells case, the cells on the key's path, top to leaf; replicas is the key's replica set on the leaf ring. In a cells case's filters, the down nodes are ineligible in whichever cell the key reaches, and the path is the key's unfiltered path, which a filter never changes."
   ],
   "xxh3_64": {
     "input": "byte i of the input is (31 * i + 7) mod 256",
@@ -3071,6 +3073,464 @@
         {"key": "6b65792d33", "replicas": ["north-2", "west-5", "east-1", "north-4", "north-5"]},
         {"key": "6b65792d34", "replicas": ["west-2", "east-4", "north-5", "east-2", "north-3"]},
         {"key": "6b65792d35", "replicas": ["west-4", "east-3", "north-4", "east-5", "north-5"]}
+      ]
+    },
+    {
+      "name": "cells-directory-catch-all",
+      "description": "A directory alone: an exact rule beats every prefix rule, the longest matching prefix wins, matching is bytewise and case-sensitive, and the catch-all (the empty prefix) takes every other key. The empty key has an exact rule of its own.",
+      "layer": {
+        "directory": {
+          "exact": {"": "eu-vip", "65753a7669703a676c6f626578": "eu", "74656e616e743a61636d65": "eu"},
+          "prefix": {"": "us", "65753a": "eu", "65753a7669703a": "eu-vip", "ff": "eu-vip"}
+        },
+        "cells": [
+          {
+            "cell": "us",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "rendezvous"},
+              "seed": "000000000000000b",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "us-n1", "weight": 1, "zone": "us-z1"},
+                {"id": "us-n2", "weight": 1, "zone": "us-z1"},
+                {"id": "us-n3", "weight": 1, "zone": "us-z2"},
+                {"id": "us-n4", "weight": 1, "zone": "us-z2"},
+                {"id": "us-n5", "weight": 1, "zone": "us-z3"},
+                {"id": "us-n6", "weight": 1, "zone": "us-z3"}
+              ]
+            }
+          },
+          {
+            "cell": "eu",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "vnodes", "tokens_per_weight": 8},
+              "seed": "000000000000000c",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "eu-n1", "weight": 1, "zone": "eu-z1"},
+                {"id": "eu-n2", "weight": 1, "zone": "eu-z1"},
+                {"id": "eu-n3", "weight": 1, "zone": "eu-z2"},
+                {"id": "eu-n4", "weight": 1, "zone": "eu-z2"}
+              ]
+            }
+          },
+          {
+            "cell": "eu-vip",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "rendezvous"},
+              "seed": "000000000000000d",
+              "replication_factor": 2,
+              "nodes": [
+                {"id": "vip-a", "weight": 2, "host": "vip-h1"},
+                {"id": "vip-b", "weight": 1, "host": "vip-h1"},
+                {"id": "vip-c", "weight": 1}
+              ]
+            }
+          }
+        ]
+      },
+      "fingerprint": "415b6831742b4fa7",
+      "keys": [
+        {"key": "", "path": ["eu-vip"], "replicas": ["vip-b", "vip-c"]},
+        {"key": "65753a74656e616e743a31", "path": ["eu"], "replicas": ["eu-n3", "eu-n1", "eu-n4"]},
+        {"key": "65753a7669703a696e6974656368", "path": ["eu-vip"], "replicas": ["vip-a", "vip-c"]},
+        {"key": "65753a7669703a676c6f626578", "path": ["eu"], "replicas": ["eu-n2", "eu-n3", "eu-n4"]},
+        {"key": "65753a7669703a", "path": ["eu-vip"], "replicas": ["vip-c", "vip-a"]},
+        {"key": "65753a766970", "path": ["eu"], "replicas": ["eu-n3", "eu-n1", "eu-n4"]},
+        {"key": "65753a", "path": ["eu"], "replicas": ["eu-n2", "eu-n3", "eu-n1"]},
+        {"key": "6575", "path": ["us"], "replicas": ["us-n3", "us-n2", "us-n6"]},
+        {"key": "45553a74656e616e743a31", "path": ["us"], "replicas": ["us-n1", "us-n6", "us-n4"]},
+        {"key": "74656e616e743a61636d65", "path": ["eu"], "replicas": ["eu-n1", "eu-n3", "eu-n2"]},
+        {"key": "74656e616e743a61636d653a32", "path": ["us"], "replicas": ["us-n5", "us-n1", "us-n3"]},
+        {"key": "ff", "path": ["eu-vip"], "replicas": ["vip-a", "vip-c"]},
+        {"key": "fffe", "path": ["eu-vip"], "replicas": ["vip-b", "vip-c"]},
+        {"key": "feff", "path": ["us"], "replicas": ["us-n1", "us-n5", "us-n4"]},
+        {"key": "00", "path": ["us"], "replicas": ["us-n3", "us-n5", "us-n2"]},
+        {"key": "636166c3a9", "path": ["us"], "replicas": ["us-n5", "us-n4", "us-n2"]},
+        {"key": "75733a74656e616e743a39", "path": ["us"], "replicas": ["us-n3", "us-n2", "us-n6"]}
+      ]
+    },
+    {
+      "name": "cells-ring-only",
+      "description": "A selector ring alone, whose nodes are cells weighing 1, 2, and 3: the key's preferred primary on the selector ring is its cell, and the cell's own ring, under a seed of its own, places the replicas.",
+      "layer": {
+        "selector": {
+          "hasher": "xxh3-64",
+          "strategy": {"kind": "rendezvous"},
+          "seed": "9e3779b97f4a7c15",
+          "replication_factor": 3,
+          "nodes": [
+            {"id": "cell-c", "weight": 3},
+            {"id": "cell-a", "weight": 1},
+            {"id": "cell-b", "weight": 2}
+          ]
+        },
+        "cells": [
+          {
+            "cell": "cell-a",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "rendezvous"},
+              "seed": "0000000000000001",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "a-n1", "weight": 1, "zone": "a-z1"},
+                {"id": "a-n2", "weight": 1, "zone": "a-z1"},
+                {"id": "a-n3", "weight": 1, "zone": "a-z2"},
+                {"id": "a-n4", "weight": 1, "zone": "a-z2"},
+                {"id": "a-n5", "weight": 1, "zone": "a-z3"},
+                {"id": "a-n6", "weight": 1, "zone": "a-z3"}
+              ]
+            }
+          },
+          {
+            "cell": "cell-b",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "vnodes", "tokens_per_weight": 4},
+              "seed": "0000000000000002",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "b-n1", "weight": 1, "zone": "b-z1"},
+                {"id": "b-n2", "weight": 1, "zone": "b-z1"},
+                {"id": "b-n3", "weight": 1, "zone": "b-z1"},
+                {"id": "b-n4", "weight": 1, "zone": "b-z2"},
+                {"id": "b-n5", "weight": 1, "zone": "b-z2"},
+                {"id": "b-n6", "weight": 1, "zone": "b-z2"}
+              ]
+            }
+          },
+          {
+            "cell": "cell-c",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "rendezvous"},
+              "seed": "0000000000000003",
+              "replication_factor": 2,
+              "nodes": [
+                {"id": "c-n1", "weight": 1, "host": "c-h1"},
+                {"id": "c-n2", "weight": 2, "host": "c-h1"},
+                {"id": "c-n3", "weight": 1, "host": "c-h2"},
+                {"id": "c-n4", "weight": 3, "host": "c-h2"}
+              ]
+            }
+          }
+        ]
+      },
+      "fingerprint": "65ad9d667685753c",
+      "keys": [
+        {"key": "", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "00", "path": ["cell-c"], "replicas": ["c-n2", "c-n4"]},
+        {"key": "fffe", "path": ["cell-c"], "replicas": ["c-n4", "c-n1"]},
+        {"key": "c328", "path": ["cell-b"], "replicas": ["b-n3", "b-n4", "b-n5"]},
+        {"key": "636166c3a9", "path": ["cell-a"], "replicas": ["a-n6", "a-n2", "a-n3"]},
+        {"key": "6167656e743a73616d2d72657365617263686572", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "726f6f6d3a67656e6572616c", "path": ["cell-b"], "replicas": ["b-n3", "b-n5", "b-n1"]},
+        {"key": "74656e616e743a61636d65", "path": ["cell-a"], "replicas": ["a-n4", "a-n2", "a-n6"]},
+        {"key": "54454e414e543a41434d45", "path": ["cell-b"], "replicas": ["b-n6", "b-n2", "b-n1"]},
+        {"key": "757365723a3432", "path": ["cell-b"], "replicas": ["b-n4", "b-n2", "b-n6"]},
+        {"key": "6b65792d30", "path": ["cell-c"], "replicas": ["c-n4", "c-n1"]},
+        {"key": "6b65792d31", "path": ["cell-b"], "replicas": ["b-n1", "b-n5", "b-n3"]},
+        {"key": "6b65792d32", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "6b65792d33", "path": ["cell-b"], "replicas": ["b-n3", "b-n4", "b-n6"]},
+        {"key": "6b65792d34", "path": ["cell-a"], "replicas": ["a-n1", "a-n3", "a-n5"]},
+        {"key": "6b65792d35", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "74656e616e743a30", "path": ["cell-c"], "replicas": ["c-n1", "c-n4"]},
+        {"key": "74656e616e743a31", "path": ["cell-c"], "replicas": ["c-n3", "c-n2"]},
+        {"key": "74656e616e743a32", "path": ["cell-a"], "replicas": ["a-n5", "a-n1", "a-n4"]},
+        {"key": "74656e616e743a33", "path": ["cell-b"], "replicas": ["b-n6", "b-n2", "b-n1"]},
+        {"key": "74656e616e743a34", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "74656e616e743a35", "path": ["cell-b"], "replicas": ["b-n5", "b-n3", "b-n4"]},
+        {"key": "74656e616e743a36", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "74656e616e743a37", "path": ["cell-b"], "replicas": ["b-n6", "b-n2", "b-n1"]},
+        {"key": "74656e616e743a38", "path": ["cell-c"], "replicas": ["c-n1", "c-n3"]},
+        {"key": "74656e616e743a39", "path": ["cell-c"], "replicas": ["c-n4", "c-n2"]},
+        {"key": "74656e616e743a3130", "path": ["cell-c"], "replicas": ["c-n3", "c-n1"]},
+        {"key": "74656e616e743a3131", "path": ["cell-a"], "replicas": ["a-n4", "a-n5", "a-n2"]},
+        {"key": "74656e616e743a3132", "path": ["cell-a"], "replicas": ["a-n2", "a-n3", "a-n6"]},
+        {"key": "74656e616e743a3133", "path": ["cell-c"], "replicas": ["c-n2", "c-n4"]},
+        {"key": "74656e616e743a3134", "path": ["cell-b"], "replicas": ["b-n2", "b-n6", "b-n1"]},
+        {"key": "74656e616e743a3135", "path": ["cell-c"], "replicas": ["c-n4", "c-n1"]}
+      ]
+    },
+    {
+      "name": "cells-directory-and-ring",
+      "description": "Directory rules first, then a vnode selector ring for every key no rule matches. Filters take down nodes inside cells but never change a key's cell: a key whose cell is entirely down has no replicas.",
+      "layer": {
+        "directory": {
+          "exact": {"726f6f6d3a67656e6572616c": "ap", "757365723a3432": "ap"},
+          "prefix": {"65753a": "eu", "75733a": "us"}
+        },
+        "selector": {
+          "hasher": "xxh3-64",
+          "strategy": {"kind": "vnodes", "tokens_per_weight": 16},
+          "seed": "0000000000000007",
+          "replication_factor": 3,
+          "nodes": [
+            {"id": "eu", "weight": 1},
+            {"id": "us", "weight": 2},
+            {"id": "ap", "weight": 1}
+          ]
+        },
+        "cells": [
+          {
+            "cell": "eu",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "rendezvous"},
+              "seed": "0000000000000065",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "eu-n1", "weight": 1, "zone": "eu-z1"},
+                {"id": "eu-n2", "weight": 1, "zone": "eu-z1"},
+                {"id": "eu-n3", "weight": 1, "zone": "eu-z2"},
+                {"id": "eu-n4", "weight": 1, "zone": "eu-z2"},
+                {"id": "eu-n5", "weight": 1, "zone": "eu-z3"},
+                {"id": "eu-n6", "weight": 1, "zone": "eu-z3"}
+              ]
+            }
+          },
+          {
+            "cell": "us",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "rendezvous"},
+              "seed": "0000000000000066",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "us-n1", "weight": 1, "zone": "us-z1"},
+                {"id": "us-n2", "weight": 1, "zone": "us-z1"},
+                {"id": "us-n3", "weight": 1, "zone": "us-z1"},
+                {"id": "us-n4", "weight": 1, "zone": "us-z2"},
+                {"id": "us-n5", "weight": 1, "zone": "us-z2"},
+                {"id": "us-n6", "weight": 1, "zone": "us-z2"}
+              ]
+            }
+          },
+          {
+            "cell": "ap",
+            "ring": {
+              "hasher": "xxh3-64",
+              "strategy": {"kind": "vnodes", "tokens_per_weight": 8},
+              "seed": "0000000000000067",
+              "replication_factor": 3,
+              "nodes": [
+                {"id": "ap-n1", "weight": 1, "zone": "ap-z1"},
+                {"id": "ap-n2", "weight": 1, "zone": "ap-z2"}
+              ]
+            }
+          }
+        ]
+      },
+      "fingerprint": "d4d54860e3a06f85",
+      "keys": [
+        {"key": "", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+        {"key": "00", "path": ["ap"], "replicas": ["ap-n1", "ap-n2"]},
+        {"key": "fffe", "path": ["ap"], "replicas": ["ap-n1", "ap-n2"]},
+        {"key": "c328", "path": ["ap"], "replicas": ["ap-n1", "ap-n2"]},
+        {"key": "636166c3a9", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+        {"key": "6167656e743a73616d2d72657365617263686572", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+        {"key": "726f6f6d3a67656e6572616c", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+        {"key": "74656e616e743a61636d65", "path": ["us"], "replicas": ["us-n4", "us-n3", "us-n6"]},
+        {"key": "54454e414e543a41434d45", "path": ["us"], "replicas": ["us-n3", "us-n4", "us-n6"]},
+        {"key": "757365723a3432", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+        {"key": "6b65792d30", "path": ["us"], "replicas": ["us-n2", "us-n5", "us-n4"]},
+        {"key": "6b65792d31", "path": ["us"], "replicas": ["us-n6", "us-n2", "us-n4"]},
+        {"key": "6b65792d32", "path": ["us"], "replicas": ["us-n4", "us-n1", "us-n5"]},
+        {"key": "6b65792d33", "path": ["us"], "replicas": ["us-n4", "us-n2", "us-n3"]},
+        {"key": "6b65792d34", "path": ["us"], "replicas": ["us-n6", "us-n1", "us-n4"]},
+        {"key": "6b65792d35", "path": ["eu"], "replicas": ["eu-n1", "eu-n5", "eu-n3"]},
+        {"key": "65753a74656e616e743a31", "path": ["eu"], "replicas": ["eu-n2", "eu-n6", "eu-n4"]},
+        {"key": "75733a74656e616e743a32", "path": ["us"], "replicas": ["us-n3", "us-n6", "us-n5"]},
+        {"key": "65753a", "path": ["eu"], "replicas": ["eu-n6", "eu-n3", "eu-n2"]},
+        {"key": "75733a", "path": ["us"], "replicas": ["us-n1", "us-n4", "us-n3"]},
+        {"key": "61703a74656e616e743a33", "path": ["us"], "replicas": ["us-n2", "us-n5", "us-n4"]}
+      ],
+      "filters": [
+        {
+          "down": ["ap-n1", "ap-n2"],
+          "keys": [
+            {"key": "", "path": ["ap"], "replicas": []},
+            {"key": "fffe", "path": ["ap"], "replicas": []},
+            {"key": "636166c3a9", "path": ["ap"], "replicas": []},
+            {"key": "6167656e743a73616d2d72657365617263686572", "path": ["ap"], "replicas": []},
+            {"key": "726f6f6d3a67656e6572616c", "path": ["ap"], "replicas": []},
+            {"key": "74656e616e743a61636d65", "path": ["us"], "replicas": ["us-n4", "us-n3", "us-n6"]},
+            {"key": "757365723a3432", "path": ["ap"], "replicas": []},
+            {"key": "6b65792d30", "path": ["us"], "replicas": ["us-n2", "us-n5", "us-n4"]},
+            {"key": "6b65792d31", "path": ["us"], "replicas": ["us-n6", "us-n2", "us-n4"]},
+            {"key": "6b65792d32", "path": ["us"], "replicas": ["us-n4", "us-n1", "us-n5"]},
+            {"key": "6b65792d33", "path": ["us"], "replicas": ["us-n4", "us-n2", "us-n3"]},
+            {"key": "6b65792d34", "path": ["us"], "replicas": ["us-n6", "us-n1", "us-n4"]}
+          ]
+        },
+        {
+          "down": ["eu-n1", "us-n1", "us-n4"],
+          "keys": [
+            {"key": "", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+            {"key": "fffe", "path": ["ap"], "replicas": ["ap-n1", "ap-n2"]},
+            {"key": "636166c3a9", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+            {"key": "6167656e743a73616d2d72657365617263686572", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+            {"key": "726f6f6d3a67656e6572616c", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+            {"key": "74656e616e743a61636d65", "path": ["us"], "replicas": ["us-n6", "us-n3", "us-n5"]},
+            {"key": "757365723a3432", "path": ["ap"], "replicas": ["ap-n2", "ap-n1"]},
+            {"key": "6b65792d30", "path": ["us"], "replicas": ["us-n2", "us-n5", "us-n3"]},
+            {"key": "6b65792d31", "path": ["us"], "replicas": ["us-n6", "us-n2", "us-n3"]},
+            {"key": "6b65792d32", "path": ["us"], "replicas": ["us-n5", "us-n2", "us-n6"]},
+            {"key": "6b65792d33", "path": ["us"], "replicas": ["us-n2", "us-n5", "us-n3"]},
+            {"key": "6b65792d34", "path": ["us"], "replicas": ["us-n6", "us-n2", "us-n5"]}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cells-nested-mixed-strategies",
+      "description": "Two layers of cells, region then cell: a residency directory with a rendezvous ring fallback picks the region; eu picks its cell with a vnode selector ring alone, and us with a directory and a rendezvous ring; the leaf rings mix rendezvous and vnodes. Each path names the key's region, then its cell.",
+      "layer": {
+        "directory": {
+          "exact": {},
+          "prefix": {"65753a": "eu", "75733a": "us"}
+        },
+        "selector": {
+          "hasher": "xxh3-64",
+          "strategy": {"kind": "rendezvous"},
+          "seed": "0000000000000123",
+          "replication_factor": 3,
+          "nodes": [
+            {"id": "us", "weight": 1},
+            {"id": "eu", "weight": 1}
+          ]
+        },
+        "cells": [
+          {
+            "cell": "eu",
+            "layer": {
+              "selector": {
+                "hasher": "xxh3-64",
+                "strategy": {"kind": "vnodes", "tokens_per_weight": 4},
+                "seed": "0000000000000e00",
+                "replication_factor": 3,
+                "nodes": [
+                  {"id": "eu-1", "weight": 1},
+                  {"id": "eu-2", "weight": 2}
+                ]
+              },
+              "cells": [
+                {
+                  "cell": "eu-1",
+                  "ring": {
+                    "hasher": "xxh3-64",
+                    "strategy": {"kind": "rendezvous"},
+                    "seed": "0000000000000e01",
+                    "replication_factor": 3,
+                    "nodes": [
+                      {"id": "eu1-n1", "weight": 1, "zone": "eu1-z1"},
+                      {"id": "eu1-n2", "weight": 1, "zone": "eu1-z1"},
+                      {"id": "eu1-n3", "weight": 1, "zone": "eu1-z2"},
+                      {"id": "eu1-n4", "weight": 1, "zone": "eu1-z2"}
+                    ]
+                  }
+                },
+                {
+                  "cell": "eu-2",
+                  "ring": {
+                    "hasher": "xxh3-64",
+                    "strategy": {"kind": "vnodes", "tokens_per_weight": 8},
+                    "seed": "0000000000000e02",
+                    "replication_factor": 3,
+                    "nodes": [
+                      {"id": "eu2-n1", "weight": 1, "zone": "eu2-z1"},
+                      {"id": "eu2-n2", "weight": 1, "zone": "eu2-z1"},
+                      {"id": "eu2-n3", "weight": 1, "zone": "eu2-z2"},
+                      {"id": "eu2-n4", "weight": 1, "zone": "eu2-z2"},
+                      {"id": "eu2-n5", "weight": 1, "zone": "eu2-z3"},
+                      {"id": "eu2-n6", "weight": 1, "zone": "eu2-z3"}
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "cell": "us",
+            "layer": {
+              "directory": {
+                "exact": {"75733a74656e616e743a626967": "us-2"},
+                "prefix": {"75733a7072696f726974793a": "us-2"}
+              },
+              "selector": {
+                "hasher": "xxh3-64",
+                "strategy": {"kind": "rendezvous"},
+                "seed": "0000000000000f00",
+                "replication_factor": 3,
+                "nodes": [
+                  {"id": "us-1", "weight": 3},
+                  {"id": "us-2", "weight": 1}
+                ]
+              },
+              "cells": [
+                {
+                  "cell": "us-1",
+                  "ring": {
+                    "hasher": "xxh3-64",
+                    "strategy": {"kind": "vnodes", "tokens_per_weight": 2},
+                    "seed": "0000000000000f01",
+                    "replication_factor": 3,
+                    "nodes": [
+                      {"id": "us1-n1", "weight": 1, "zone": "us1-z1"},
+                      {"id": "us1-n2", "weight": 1, "zone": "us1-z1"},
+                      {"id": "us1-n3", "weight": 1, "zone": "us1-z1"}
+                    ]
+                  }
+                },
+                {
+                  "cell": "us-2",
+                  "ring": {
+                    "hasher": "xxh3-64",
+                    "strategy": {"kind": "rendezvous"},
+                    "seed": "0000000000000f02",
+                    "replication_factor": 2,
+                    "nodes": [
+                      {"id": "us2-n1", "weight": 1, "zone": "us2-z1"},
+                      {"id": "us2-n2", "weight": 1, "zone": "us2-z2"},
+                      {"id": "us2-n3", "weight": 1, "zone": "us2-z3"}
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "fingerprint": "fb9874c1c6f2f79d",
+      "keys": [
+        {"key": "", "path": ["us", "us-1"], "replicas": ["us1-n1", "us1-n3", "us1-n2"]},
+        {"key": "00", "path": ["us", "us-1"], "replicas": ["us1-n2", "us1-n3", "us1-n1"]},
+        {"key": "fffe", "path": ["eu", "eu-2"], "replicas": ["eu2-n6", "eu2-n3", "eu2-n1"]},
+        {"key": "c328", "path": ["eu", "eu-2"], "replicas": ["eu2-n5", "eu2-n4", "eu2-n2"]},
+        {"key": "636166c3a9", "path": ["us", "us-2"], "replicas": ["us2-n1", "us2-n2"]},
+        {"key": "6167656e743a73616d2d72657365617263686572", "path": ["us", "us-1"], "replicas": ["us1-n1", "us1-n3", "us1-n2"]},
+        {"key": "726f6f6d3a67656e6572616c", "path": ["us", "us-1"], "replicas": ["us1-n1", "us1-n3", "us1-n2"]},
+        {"key": "74656e616e743a61636d65", "path": ["us", "us-1"], "replicas": ["us1-n1", "us1-n3", "us1-n2"]},
+        {"key": "54454e414e543a41434d45", "path": ["us", "us-1"], "replicas": ["us1-n1", "us1-n3", "us1-n2"]},
+        {"key": "757365723a3432", "path": ["eu", "eu-2"], "replicas": ["eu2-n4", "eu2-n2", "eu2-n5"]},
+        {"key": "6b65792d30", "path": ["eu", "eu-1"], "replicas": ["eu1-n1", "eu1-n3", "eu1-n2"]},
+        {"key": "6b65792d31", "path": ["eu", "eu-2"], "replicas": ["eu2-n4", "eu2-n1", "eu2-n5"]},
+        {"key": "6b65792d32", "path": ["eu", "eu-2"], "replicas": ["eu2-n3", "eu2-n5", "eu2-n1"]},
+        {"key": "6b65792d33", "path": ["eu", "eu-2"], "replicas": ["eu2-n1", "eu2-n4", "eu2-n5"]},
+        {"key": "6b65792d34", "path": ["eu", "eu-2"], "replicas": ["eu2-n2", "eu2-n6", "eu2-n3"]},
+        {"key": "6b65792d35", "path": ["eu", "eu-2"], "replicas": ["eu2-n5", "eu2-n3", "eu2-n1"]},
+        {"key": "65753a74656e616e743a31", "path": ["eu", "eu-2"], "replicas": ["eu2-n6", "eu2-n4", "eu2-n1"]},
+        {"key": "65753a74656e616e743a32", "path": ["eu", "eu-2"], "replicas": ["eu2-n6", "eu2-n3", "eu2-n1"]},
+        {"key": "65753a74656e616e743a33", "path": ["eu", "eu-2"], "replicas": ["eu2-n5", "eu2-n1", "eu2-n4"]},
+        {"key": "65753a74656e616e743a34", "path": ["eu", "eu-2"], "replicas": ["eu2-n6", "eu2-n2", "eu2-n4"]},
+        {"key": "75733a74656e616e743a626967", "path": ["us", "us-2"], "replicas": ["us2-n3", "us2-n1"]},
+        {"key": "75733a7072696f726974793a37", "path": ["us", "us-2"], "replicas": ["us2-n1", "us2-n2"]},
+        {"key": "75733a74656e616e743a35", "path": ["us", "us-2"], "replicas": ["us2-n2", "us2-n3"]},
+        {"key": "75733a74656e616e743a36", "path": ["us", "us-1"], "replicas": ["us1-n2", "us1-n1", "us1-n3"]}
       ]
     }
   ]
