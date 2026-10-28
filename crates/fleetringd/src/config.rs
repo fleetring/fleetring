@@ -10,6 +10,8 @@ use fleetring::{Host, NodeId, Weight, Zone};
 use fleetring_control::{ControlConfig, Millis};
 use serde::Deserialize;
 
+use crate::engine::EngineConfig;
+
 /// Everything a daemon needs to start.
 ///
 /// ```toml
@@ -42,6 +44,9 @@ pub struct Config {
     /// Which roles this daemon runs.
     #[serde(default)]
     pub role: Role,
+    /// How the data role runs its open databases.
+    #[serde(default)]
+    pub engine: EngineConfig,
 }
 
 /// A node's identity and the attributes placement uses.

@@ -7,16 +7,24 @@
 //! The library exposes the daemon's building blocks so that tests, including the simulation
 //! harness (ADR-0020), run the same code as the binary.
 
+mod actor;
 pub mod clock;
 mod config;
 pub mod control;
 mod daemon;
 mod data_dir;
+pub mod engine;
+mod layout;
+mod registry;
+mod sink;
 pub mod transport;
 
+pub use actor::{DatabaseError, DatabaseHandle};
 pub use config::{Config, ConfigError, ControlSettings, NodeConfig, Role};
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
+pub use registry::Registry;
+pub use sink::{Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink};
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
