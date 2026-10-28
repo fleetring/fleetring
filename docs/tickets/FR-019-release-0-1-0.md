@@ -1,7 +1,7 @@
 ---
 id: FR-019
 title: Release fleetring 0.1.0 and freeze placement spec v1
-status: todo
+status: in-progress
 priority: P1
 size: S
 milestone: M4 Hardening and release
@@ -30,3 +30,12 @@ Ship 0.1.0. From this release on, placement output for spec v1 never changes.
 - [ ] The maintainer runs `cargo publish -p fleetring`, and it succeeds.
 - [ ] The docs.rs build succeeds with all features.
 - [ ] The semver-checks job runs on PRs.
+
+## Progress
+
+- 2026-10-28: `RELEASING.md` holds the full checklist: pre-flight, spec freeze, version and changelog, package verification, tag and publish, and turning on `cargo semver-checks` once 0.1.0 is the baseline.
+- Remaining:
+  - FR-020 (cells ship in 0.1.0);
+  - green CI on GitHub (FR-002 needs a push);
+  - the version bump, changelog entry, and spec freeze;
+  - the publish, which the maintainer does.
