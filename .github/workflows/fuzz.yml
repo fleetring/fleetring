@@ -29,7 +29,9 @@ jobs:
           seeds="fuzz/seeds/${{ matrix.target }}"
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
           if [ -d "$seeds" ]; then extra="$seeds"; else extra=""; fi
-          cargo fuzz run ${{ matrix.target }} "fuzz/corpus/${{ matrix.target }}" $extra -- -max_total_time=300
+          # The prebuilt cargo-fuzz targets musl by default, which the address sanitizer rejects.
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
+            "fuzz/corpus/${{ matrix.target }}" $extra -- -max_total_time=300
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
