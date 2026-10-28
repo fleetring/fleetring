@@ -13,12 +13,14 @@ message ProtocolVersion {
   uint32 minor = 2;
 }
 
-// A node's identity and placement attributes.
+// A node's identity and placement attributes, and the address its peers reach it at.
 message Node {
   string id = 1;
   optional string zone = 2;
   optional string host = 3;
   uint32 weight = 4;
+  // `host:port`. Not a placement attribute. Unset by nodes older than this field.
+  optional string address = 5;
 }
 
 // The storage engine behind a database (ADR-0021).
@@ -110,6 +112,19 @@ message Placement {
   uint64 epoch = 3;
   optional string primary = 4;
   repeated string followers = 5;
+  // The whole replica set in the ring's preference order, the primary included.
+  repeated Replica replicas = 6;
+}
+
+// One member of a database's replica set, as the control plane knows it.
+message Replica {
+  string node_id = 1;
+  // `host:port`, if the member advertised one.
+  optional string address = 2;
+  bool live = 3;
+  // What the member last reported for the database in a heartbeat, if it has.
+  Role reported_role = 4;
+  optional bytes position = 5;
 }
 
 message AcquireLeaseRequest {
@@ -194,9 +209,15 @@ message SnapshotChunk {
 
 // ---- Database (v0.1 only; the router replaces it) ---------------------------------------------
 
+// Every data node serves it. A node that doesn't hold a database's lease answers UNAVAILABLE and
+// names the primary as `host:port` in the `fleetring-primary` metadata entry.
 service Database {
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
+  // Makes the receiving node the primary of a database the control plane has created but not
+  // leased yet: it takes the first lease and creates the database. Repeating it on the primary
+  // is harmless.
+  rpc Create(CreateRequest) returns (CreateResponse);
 }
 
 message Value {
@@ -219,6 +240,8 @@ message ExecuteResponse {
   uint64 rows_affected = 1;
   uint32 acknowledged_by = 2;
   bool under_replicated = 3;
+  // The size of the database's replica set.
+  uint32 replicas = 4;
 }
 
 message QueryRequest {
@@ -234,4 +257,12 @@ message Row {
 message QueryResponse {
   repeated string columns = 1;
   repeated Row rows = 2;
+}
+
+message CreateRequest {
+  string database = 1;
+}
+
+message CreateResponse {
+  Placement placement = 1;
 }

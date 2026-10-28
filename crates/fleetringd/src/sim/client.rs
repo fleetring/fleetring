@@ -2,20 +2,23 @@
 
 use std::time::Duration;
 
-use fleetring::NodeId;
-use fleetring_control::{Action, LeaseEpoch};
+use fleetring::{NodeId, ReplicationFactor};
+use fleetring_control::{Action, DatabaseName, LeaseEpoch};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, CreateDatabaseRequest, Engine, HeartbeatRequest, JoinRequest,
     LeaseResponse, LocateRequest, LocateResponse, Node, RenewLeaseRequest,
 };
 
-use crate::control::{ControlClient, rejection_status};
+use crate::control::rejection_status;
+use crate::data::Client;
+use crate::engine::{Statement, Value};
+use crate::environment::Network;
 use crate::sim::SimRng;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
-use crate::sim::workload::{Ack, Operation, Outcome, Record, Step, Workload};
-use crate::transport::{Backoff, sim};
+use crate::sim::workload::{Ack, Operation, Outcome, Record, Step, WRITES_TABLE, Workload};
+use crate::transport::Backoff;
 
 /// Retries for simulated clients: quick, because simulated calls fail fast.
 const CLIENT_BACKOFF: Backoff = Backoff {
@@ -44,8 +47,7 @@ pub(super) async fn run_client(
         timeout,
         shared,
     } = session;
-    let client =
-        ControlClient::with_connector(control, sim::channel_to).with_backoff(CLIENT_BACKOFF);
+    let client = Client::new(control, Network::Simulated).with_backoff(CLIENT_BACKOFF);
     loop {
         match workload.next(&mut rng) {
             Step::Run(operation) => {
@@ -90,7 +92,8 @@ pub(super) async fn run_client(
 }
 
 /// Sends `operation` and returns its outcome.
-async fn execute(client: &ControlClient, shared: &Shared, operation: &Operation) -> Outcome {
+async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outcome {
+    let client = data.control();
     let result = match operation {
         Operation::Join { node } => client
             .join(JoinRequest {
@@ -100,6 +103,7 @@ async fn execute(client: &ControlClient, shared: &Shared, operation: &Operation)
                     zone: None,
                     host: None,
                     weight: 1,
+                    address: None,
                 }),
             })
             .await
@@ -150,11 +154,63 @@ async fn execute(client: &ControlClient, shared: &Shared, operation: &Operation)
             })
             .await
             .map(lease_ack),
+        Operation::Create {
+            database,
+            replication_factor,
+        } => create(data, database, *replication_factor).await,
+        Operation::Write { database, value } => data
+            .execute(
+                database,
+                Statement::with_params(
+                    format!("INSERT INTO {WRITES_TABLE} (value) VALUES (?)"),
+                    [Value::Integer(*value)],
+                ),
+            )
+            .await
+            .map(|written| Ack::Written {
+                acknowledged_by: written.acknowledged_by,
+                replicas: written.replicas,
+                under_replicated: written.under_replicated,
+            }),
     };
     result.map_or_else(
         |status| Outcome::from_status(&status),
         Outcome::Acknowledged,
     )
+}
+
+/// Creates `database` if it doesn't exist yet, then its writes table.
+async fn create(
+    client: &Client,
+    database: &DatabaseName,
+    replication_factor: u32,
+) -> Result<Ack, tonic::Status> {
+    let replication_factor = u8::try_from(replication_factor)
+        .ok()
+        .and_then(ReplicationFactor::new)
+        .ok_or_else(|| tonic::Status::invalid_argument("invalid replication factor"))?;
+    let location = match client.create_database(database, replication_factor).await {
+        Ok(location) => location,
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            client.locate(database).await?
+        }
+        Err(status) => return Err(status),
+    };
+    let primary = location
+        .primary
+        .ok_or_else(|| tonic::Status::internal("created without a primary"))?;
+    client
+        .execute(
+            database,
+            Statement::new(format!(
+                "CREATE TABLE IF NOT EXISTS {WRITES_TABLE} (value INTEGER NOT NULL)"
+            )),
+        )
+        .await?;
+    Ok(Ack::Opened {
+        primary,
+        epoch: location.epoch,
+    })
 }
 
 fn located(response: LocateResponse) -> Result<Ack, tonic::Status> {

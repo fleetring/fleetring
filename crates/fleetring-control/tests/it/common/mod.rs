@@ -126,6 +126,10 @@ fn action(state: &State, op: Op) -> Action {
             if b.is_multiple_of(7) {
                 joining = joining.with_weight(Weight::new(3).expect("nonzero"));
             }
+            // Members move between addresses, so replays cover them too.
+            if b.is_multiple_of(2) {
+                joining = joining.with_address(format!("{node}.local:{}", 7400 + b % 3));
+            }
             Action::Join { member: joining }
         }
         1 if b.is_multiple_of(3) => Action::Leave { id: id(node) },

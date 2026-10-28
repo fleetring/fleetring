@@ -1,8 +1,9 @@
 //! Workloads: clients that issue operations and record which ones were acknowledged.
 //!
 //! A [`Workload`] decides what a client does next; the harness runs the operation, records it in
-//! the [`History`] and the trace, and tells the workload how it ended. Only control operations
-//! exist so far. Database writes join [`Operation`] when replication lands (FR-030).
+//! the [`History`] and the trace, and tells the workload how it ended. Control operations go to
+//! the control plane; [`Operation::Create`] and [`Operation::Write`] go through the data plane's
+//! `Database` service, as the command line's do.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -63,7 +64,28 @@ pub enum Operation {
         /// The lease's epoch.
         epoch: LeaseEpoch,
     },
+    /// Creates a SQLite database through the data plane, as `fleetringd db create` does: the
+    /// control plane places it, and the first live member of its replica set takes the lease and
+    /// opens it. Then creates its [`WRITES_TABLE`]. A database that already exists counts as
+    /// created once its table is there, so the operation can be repeated until it succeeds.
+    Create {
+        /// The database.
+        database: DatabaseName,
+        /// How many replicas it should have.
+        replication_factor: u32,
+    },
+    /// Inserts `value` into the database's [`WRITES_TABLE`] on its primary.
+    Write {
+        /// The database.
+        database: DatabaseName,
+        /// The value, unique within the run.
+        value: i64,
+    },
 }
+
+/// The table [`Operation::Create`] makes and [`Operation::Write`] inserts into: one `value`
+/// column, one row per acknowledged write.
+pub const WRITES_TABLE: &str = "writes";
 
 impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,6 +104,11 @@ impl fmt::Display for Operation {
                 node,
                 epoch,
             } => write!(f, "renew {database} for {node} at epoch {}", epoch.get()),
+            Self::Create {
+                database,
+                replication_factor,
+            } => write!(f, "open {database} rf {replication_factor}"),
+            Self::Write { database, value } => write!(f, "write {value} to {database}"),
         }
     }
 }
@@ -175,6 +202,22 @@ pub enum Ack {
         /// When it expires, in control-plane milliseconds.
         expires_at_ms: u64,
     },
+    /// The database exists, with a primary that serves it.
+    Opened {
+        /// The primary.
+        primary: NodeId,
+        /// The primary's lease epoch.
+        epoch: LeaseEpoch,
+    },
+    /// A write is stored, and must never be lost.
+    Written {
+        /// How many replicas, the primary included, hold it.
+        acknowledged_by: u32,
+        /// The size of the database's replica set.
+        replicas: u32,
+        /// Whether fewer replicas than the replica set hold it.
+        under_replicated: bool,
+    },
 }
 
 impl fmt::Display for Ack {
@@ -192,6 +235,20 @@ impl fmt::Display for Ack {
                 epoch,
                 expires_at_ms,
             } => write!(f, "lease epoch {} until {expires_at_ms}", epoch.get()),
+            Self::Opened { primary, epoch } => {
+                write!(f, "opened on {primary} at epoch {}", epoch.get())
+            }
+            Self::Written {
+                acknowledged_by,
+                replicas,
+                under_replicated,
+            } => {
+                write!(f, "written to {acknowledged_by} of {replicas}")?;
+                if *under_replicated {
+                    f.write_str(", under-replicated")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -276,6 +333,18 @@ impl History {
         self.records
             .iter()
             .filter_map(|record| Some((&record.operation, record.outcome.ack()?)))
+    }
+
+    /// Returns every acknowledged write, as its database and value, in completion order. Each
+    /// must be found on the database after any fault.
+    pub fn acknowledged_writes(&self) -> impl Iterator<Item = (&DatabaseName, i64)> {
+        self.acknowledged()
+            .filter_map(|(operation, ack)| match (operation, ack) {
+                (Operation::Write { database, value }, Ack::Written { .. }) => {
+                    Some((database, *value))
+                }
+                _ => None,
+            })
     }
 
     /// Returns how many operations finished.
@@ -606,6 +675,86 @@ impl Workload for CreateAndAcquire {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// The longest pause between two operations of [`CreateAndWrite`], in milliseconds.
+const MAX_WRITE_PAUSE_MS: u64 = 30;
+
+/// Creates databases through the data plane, then writes to them.
+///
+/// It creates every database first, repeating each [`Operation::Create`] until it is
+/// acknowledged, then sends the given number of [`Operation::Write`]s, each to a random database
+/// and with the next value: 0, 1, 2, …. A write is sent once, whatever its outcome, so the
+/// history tells which values must survive. The workload finishes after its last write.
+#[derive(Debug, Clone)]
+pub struct CreateAndWrite {
+    replication_factor: u32,
+    databases: Vec<(DatabaseName, bool)>,
+    writes: u32,
+    next_value: i64,
+    pause: bool,
+}
+
+impl CreateAndWrite {
+    /// Creates `databases` databases named `db-0`, `db-1`, …, with `replication_factor`
+    /// replicas, then sends `writes` writes.
+    ///
+    /// # Panics
+    ///
+    /// If `db-N` isn't a valid database name, which it always is.
+    #[must_use]
+    pub fn new(databases: u32, replication_factor: u32, writes: u32) -> Self {
+        Self {
+            replication_factor,
+            databases: (0..databases)
+                .map(|k| {
+                    let name = format!("db-{k}");
+                    let name = name
+                        .parse()
+                        .unwrap_or_else(|error| panic!("'{name}' is a valid name: {error}"));
+                    (name, false)
+                })
+                .collect(),
+            writes,
+            next_value: 0,
+            pause: false,
+        }
+    }
+}
+
+impl Workload for CreateAndWrite {
+    fn next(&mut self, rng: &mut SimRng) -> Step {
+        if self.pause {
+            self.pause = false;
+            return Step::Sleep(Duration::from_millis(1 + rng.below(MAX_WRITE_PAUSE_MS)));
+        }
+        self.pause = true;
+        if let Some((database, _)) = self.databases.iter().find(|(_, created)| !created) {
+            return Step::Run(Operation::Create {
+                database: database.clone(),
+                replication_factor: self.replication_factor,
+            });
+        }
+        if self.writes == 0 || self.databases.is_empty() {
+            return Step::Done;
+        }
+        self.writes -= 1;
+        let (database, _) = &self.databases[rng.index(self.databases.len())];
+        let value = self.next_value;
+        self.next_value += 1;
+        Step::Run(Operation::Write {
+            database: database.clone(),
+            value,
+        })
+    }
+
+    fn observe(&mut self, operation: &Operation, outcome: &Outcome) {
+        if let (Operation::Create { database, .. }, Outcome::Acknowledged(_)) = (operation, outcome)
+            && let Some((_, created)) = self.databases.iter_mut().find(|(name, _)| name == database)
+        {
+            *created = true;
         }
     }
 }

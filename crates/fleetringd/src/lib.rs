@@ -12,6 +12,7 @@ pub mod clock;
 mod config;
 pub mod control;
 mod daemon;
+pub mod data;
 mod data_dir;
 pub mod engine;
 mod environment;
@@ -33,7 +34,10 @@ pub use data_dir::{DataDir, DataDirError};
 pub use environment::{Environment, Network};
 pub use membership::{Membership, MembershipTasks, MembershipView};
 pub use registry::Registry;
-pub use sink::{Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink};
+pub use sink::{
+    Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink,
+    UnreplicatedSink,
+};
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
@@ -51,6 +55,10 @@ const _: () = {
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
     assert_debug_send_sync::<Daemon>();
+    assert_debug_send_sync::<data::Client>();
+    assert_debug_send_sync::<data::Location>();
+    assert_debug_send_sync::<data::ReplicaInfo>();
+    assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<Environment>();
     assert_debug_send_sync::<Network>();
     assert_debug_send_sync::<Membership>();

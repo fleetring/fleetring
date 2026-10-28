@@ -105,6 +105,10 @@ pub(crate) fn member_from(node: Option<proto::Node>) -> Result<Member, Status> {
     if let Some(host) = &node.host {
         member = member.with_host(parse("host", host)?);
     }
+    // An empty address is no address, as a node too old to send one.
+    if let Some(address) = node.address.filter(|address| !address.is_empty()) {
+        member = member.with_address(address);
+    }
     // Proto3 can't tell an unset weight from 0, so 0 means the default weight.
     Ok(member.with_weight(Weight::new(node.weight).unwrap_or(Weight::ONE)))
 }
@@ -115,6 +119,7 @@ pub(crate) fn node_to_proto(member: &Member) -> proto::Node {
         zone: member.zone().map(ToString::to_string),
         host: member.host().map(ToString::to_string),
         weight: member.weight().get(),
+        address: member.address().map(str::to_owned),
     }
 }
 
@@ -144,6 +149,14 @@ fn engine_from(engine: i32) -> Result<Engine, Status> {
     }
 }
 
+fn role_to_proto(role: Role) -> proto::Role {
+    match role {
+        Role::Primary => proto::Role::Primary,
+        Role::Follower => proto::Role::Follower,
+        _ => proto::Role::Unspecified,
+    }
+}
+
 fn engine_to_proto(engine: Engine) -> proto::Engine {
     match engine {
         Engine::Sqlite => proto::Engine::Sqlite,
@@ -159,7 +172,8 @@ fn lease_response(database: &DatabaseName, lease: &Lease) -> LeaseResponse {
     }
 }
 
-/// Where a database lives: its lease holder as primary, and the rest of its replica set.
+/// Where a database lives: its lease holder as primary, the rest of its replica set, and what the
+/// control plane knows about each replica.
 fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     let database = state.database(name).ok_or_else(|| {
         rejection_status(&Rejection::UnknownDatabase {
@@ -175,12 +189,34 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
         .filter(|id| Some(*id) != primary)
         .map(ToString::to_string)
         .collect();
+    let now = state.now();
+    let replicas = replicas
+        .iter()
+        .map(|id| {
+            let report = state.report(id, name);
+            proto::Replica {
+                node_id: id.to_string(),
+                address: state
+                    .member(id)
+                    .and_then(Member::address)
+                    .map(str::to_owned),
+                live: state.liveness(id, now) == Some(Liveness::Live),
+                reported_role: report
+                    .map_or(proto::Role::Unspecified, |report| {
+                        role_to_proto(report.role())
+                    })
+                    .into(),
+                position: report.map(|report| report.position().as_bytes().to_vec()),
+            }
+        })
+        .collect();
     Ok(Placement {
         database: name.to_string(),
         engine: engine_to_proto(database.engine()).into(),
         epoch: database.epoch().get(),
         primary: primary.map(ToString::to_string),
         followers,
+        replicas,
     })
 }
 

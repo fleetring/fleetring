@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DatabaseName, Position, Timestamp};
 
-/// A member's placement attributes: the ID, zone, host, and weight that the ring places by.
+/// A member's placement attributes, the ID, zone, host, and weight that the ring places by, and
+/// the address its peers reach it at.
+///
+/// The address isn't a placement attribute: [`Member::to_node`] leaves it out, so it never moves
+/// a key. It is still part of the membership, so a member that rejoins with a new address bumps
+/// the membership epoch, and every node learns the address with the next membership update. It
+/// arrives inside the `Join` command, so replaying the log restores it.
 ///
 /// # Examples
 ///
@@ -15,10 +21,12 @@ use crate::{DatabaseName, Position, Timestamp};
 ///
 /// let member = Member::new("nas".parse()?)
 ///     .with_zone("garage".parse()?)
-///     .with_weight(Weight::new(2).expect("2 is nonzero"));
+///     .with_weight(Weight::new(2).expect("2 is nonzero"))
+///     .with_address("10.0.0.7:7400");
 /// let node = member.to_node();
 /// assert_eq!(node.id().as_str(), "nas");
 /// assert_eq!(node.weight().get(), 2);
+/// assert_eq!(member.address(), Some("10.0.0.7:7400"));
 /// # Ok::<(), fleetring::ParseLabelError>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +35,9 @@ pub struct Member {
     zone: Option<Zone>,
     host: Option<Host>,
     weight: Weight,
+    // Absent from states and logs written before members had addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
 }
 
 impl Member {
@@ -38,6 +49,7 @@ impl Member {
             zone: None,
             host: None,
             weight: Weight::ONE,
+            address: None,
         }
     }
 
@@ -59,6 +71,13 @@ impl Member {
     #[must_use]
     pub fn with_weight(mut self, weight: Weight) -> Self {
         self.weight = weight;
+        self
+    }
+
+    /// Sets the address peers reach the member at, as `host:port`.
+    #[must_use]
+    pub fn with_address(mut self, address: impl Into<String>) -> Self {
+        self.address = Some(address.into());
         self
     }
 
@@ -86,6 +105,12 @@ impl Member {
         self.weight
     }
 
+    /// Returns the address peers reach the member at, as `host:port`, if it advertised one.
+    #[must_use]
+    pub fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
     /// Returns the ring node with the member's placement attributes.
     #[must_use]
     pub fn to_node(&self) -> Node {
@@ -107,6 +132,7 @@ impl From<&Node> for Member {
             zone: node.zone().cloned(),
             host: node.host().cloned(),
             weight: node.weight(),
+            address: None,
         }
     }
 }

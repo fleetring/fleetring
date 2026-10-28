@@ -5,6 +5,7 @@
 
 mod cluster;
 mod control;
+mod database;
 mod membership;
 
 use std::error::Error;

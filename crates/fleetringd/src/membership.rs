@@ -241,23 +241,8 @@ impl Publisher {
     /// Publishes the membership in `update`, rebuilding the ring only if the epoch changed.
     fn apply(&self, update: MembershipUpdate) {
         let epoch = Epoch::new(update.membership_epoch);
-        let members = match update
-            .members
-            .into_iter()
-            .map(|member| {
-                let liveness = if member.live {
-                    Liveness::Live
-                } else {
-                    Liveness::Down
-                };
-                member_from(member.node).map(|member| (member, liveness))
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(mut members) => {
-                members.sort_by(|(a, _), (b, _)| a.id().cmp(b.id()));
-                members
-            }
+        let members = match members_from(update) {
+            Ok(members) => members,
             Err(status) => {
                 tracing::error!(%status, epoch = epoch.get(), "ignoring an invalid membership update");
                 return;
@@ -293,6 +278,39 @@ impl Publisher {
         self.current.store(Arc::clone(&view));
         self.updates.send_replace(view);
     }
+}
+
+impl MembershipView {
+    /// The view one membership update describes, with the ring rebuilt from it.
+    ///
+    /// # Errors
+    ///
+    /// `INTERNAL` if the update names an invalid member or its members can't form a ring.
+    pub(crate) fn from_update(update: MembershipUpdate) -> Result<Self, tonic::Status> {
+        let epoch = Epoch::new(update.membership_epoch);
+        let members = members_from(update)
+            .map_err(|status| tonic::Status::internal(format!("invalid membership: {status}")))?;
+        rebuild(epoch, members)
+            .ok_or_else(|| tonic::Status::internal("the membership can't form a ring"))
+    }
+}
+
+/// The members an update carries, with their liveness, in ID order.
+fn members_from(update: MembershipUpdate) -> Result<Vec<(Member, Liveness)>, tonic::Status> {
+    let mut members = update
+        .members
+        .into_iter()
+        .map(|member| {
+            let liveness = if member.live {
+                Liveness::Live
+            } else {
+                Liveness::Down
+            };
+            member_from(member.node).map(|member| (member, liveness))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    members.sort_by(|(a, _), (b, _)| a.id().cmp(b.id()));
+    Ok(members)
 }
 
 /// Builds the view for a new membership epoch, or `None` if its members can't form a ring.
@@ -507,6 +525,7 @@ mod tests {
                         zone: None,
                         host: None,
                         weight: 1,
+                        address: None,
                     }),
                     live,
                 })

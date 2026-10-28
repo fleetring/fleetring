@@ -115,6 +115,20 @@ impl ReplicationSink for RecordingSink {
     }
 }
 
+/// The data role's sink until replication lands (FR-030): no follower stores anything yet, so it
+/// drops every batch and acknowledges it at once. A write is then stored on its primary alone.
+///
+/// The daemon builds its sink in one place, `daemon::replication_sink`; FR-030 replaces this sink
+/// there with the replication stream.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnreplicatedSink;
+
+impl ReplicationSink for UnreplicatedSink {
+    fn publish(&self, _batch: CommittedBatch) -> Acknowledgement {
+        Acknowledgement::done()
+    }
+}
+
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
     const fn assert_debug_send<T: fmt::Debug + Send>() {}
@@ -122,4 +136,5 @@ const _: () = {
     assert_debug_send_sync::<CommittedBatch>();
     assert_debug_send_sync::<RecordingSink>();
     assert_debug_send_sync::<ReplicationError>();
+    assert_debug_send_sync::<UnreplicatedSink>();
 };
