@@ -1,10 +1,43 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/*"]
+
 [workspace.package]
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fleetring/fleetring"
 homepage = "https://fleetring.dev"
+authors = ["Sam Ruberti"]
+
+# Shared versions. A crate opts in with `name.workspace = true` once a ticket needs the dependency.
 [workspace.dependencies]
+divan = "0.1"
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = "1"
+smallvec = "1"
+thiserror = "2"
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
+
+# Lint policy from ADR-0009. CI turns warnings into errors; source never does.
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+unwrap_used = "warn"
+
+# Hashing and property-testing dependencies dominate debug test runs, so optimize them even there.
+[profile.dev.package."*"]
+opt-level = 2

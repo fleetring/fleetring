@@ -1,7 +1,7 @@
 ---
 id: FR-001
 title: "Workspace hygiene: edition 2024, MSRV, lints, licenses"
-status: todo
+status: done
 priority: P0
 size: S
 milestone: M0 Foundations
@@ -39,18 +39,25 @@ Set up the workspace so it enforces ADR-0009 before any real code lands.
 
 ## Acceptance criteria
 
-- [ ] These all pass on stable:
+- [x] These all pass on stable:
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   - `cargo test --workspace`
   - `cargo doc --no-deps`
-- [ ] `cargo +1.88 check --workspace --all-features` passes.
-- [ ] `cargo package -p fleetring --list` includes both license files and a README.
-- [ ] `cargo publish -p fleetring --dry-run` succeeds.
-- [ ] Temporarily adding `std::collections::HashMap` to the crate makes clippy fail. Check this once and don't commit it.
-- [ ] No placeholder code remains.
+- [x] `cargo +1.88 check --workspace --all-features` passes.
+- [x] `cargo package -p fleetring --list` includes both license files and a README.
+- [x] `cargo publish -p fleetring --dry-run` succeeds.
+- [x] Temporarily adding `std::collections::HashMap` to the crate makes clippy fail. Check this once and don't commit it.
+- [x] No placeholder code remains.
 
 ## Notes
 
 - Declare a dependency only in `[workspace.dependencies]` until a ticket actually uses it, so unused dependencies never ship.
 - Don't add a `rust-toolchain.toml` (see ADR-0009).
+
+## Progress
+
+- 2026-10-27: Done. fmt, clippy, test, doc, and MSRV 1.88 all pass. `cargo package` includes both licenses (symlinked from the root) and a crate README, and `cargo publish --dry-run` succeeds. A temporary `HashMap` makes clippy fail as intended.
+- Deviation: the `serde` feature isn't declared yet. Cargo rejects a feature that names an undeclared optional dependency, so the feature lands with FR-013.
+- Added: `[profile.dev.package."*"] opt-level = 2`, so hashing and proptest run fast in debug test builds.
+- The MIT copyright line reads "2026 Sam Ruberti". Change it if the holder should be an organization.

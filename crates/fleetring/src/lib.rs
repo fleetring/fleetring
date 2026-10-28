@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Consistent-hashing placement for fleets of SQLite, libSQL, and Turso databases.
+//!
+//! FleetRing decides where each database lives in a fleet of nodes you own: one database per
+//! agent, tenant, or device. This crate is the placement core. It is a pure, deterministic
+//! library: the same ring and key produce the same placement on every platform, Rust release,
+//! and crate release.
+//!
+//! The design is recorded in the [architecture decision records].
+//!
+//! [architecture decision records]: https://github.com/fleetring/fleetring/tree/main/docs/adr
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// ADR-0003: placement must be bit-identical on every platform, so library code never uses
+// floating point.
+#![deny(clippy::float_arithmetic)]

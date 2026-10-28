@@ -1,15 +1,29 @@
 [package]
 name = "fleetring"
-version = "0.0.1"
-edition = "2021"
 description = "Consistent-hashing placement and routing for fleets of SQLite, libSQL, and Turso databases: one database per agent, tenant, or device."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/fleetring/fleetring"
-homepage = "https://fleetring.dev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 documentation = "https://docs.rs/fleetring"
 readme = "README.md"
 keywords = ["sqlite", "libsql", "turso", "consistent-hashing", "distributed"]
 categories = ["database", "algorithms", "network-programming"]
-authors = ["Sam Ruberti"]
+
+[features]
+default = ["std"]
+# Reserved so `no_std + alloc` support can land without breaking `default-features = false` users.
+std = []
+# Test doubles for downstream tests. Never enable in production builds.
+test-util = []
 
 [dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
