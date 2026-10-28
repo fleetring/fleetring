@@ -3,21 +3,27 @@
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
-use crate::clock::SystemClock;
-use crate::control::{
-    ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService, OpenError,
-};
-use crate::transport::{TransportConfig, control_server};
+use crate::control::{ControlHandle, ControlNode, ControlOptions, ControlService, OpenError};
+use crate::engine::Execution;
+use crate::environment::{Environment, Network};
+use crate::transport::control_server;
 use crate::{Config, ConfigError, DataDir, DataDirError, Membership, MembershipTasks};
 
+/// How long shutdown waits for open connections to close before it drops them.
+///
+/// HTTP/2's graceful shutdown waits for the peer to acknowledge it, so a peer that vanished, such
+/// as a machine that lost power, would otherwise hold shutdown until TCP gives up on it.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// The control node's database file, inside the data directory.
-const CONTROL_DB: &str = "control.db";
+pub(crate) const CONTROL_DB: &str = "control.db";
 
 /// A started daemon that holds its data directory.
 #[derive(Debug)]
@@ -69,25 +75,49 @@ impl Daemon {
     /// data-only node serves no services yet, so peers can already reach it. A node that runs
     /// both roles reaches its own control node through `listen`.
     ///
+    /// It runs in [`Environment::production`]; see [`Daemon::start_with`].
+    ///
     /// # Errors
     ///
     /// [`StartError`] if the configuration is invalid, another daemon holds the directory, the
     /// control log can't be recovered, or `listen` can't be bound.
     pub async fn start(config: Config) -> Result<Self, StartError> {
+        Self::start_with(config, Environment::production()).await
+    }
+
+    /// Starts the daemon as [`Daemon::start`] does, in `environment`: its listener and peer
+    /// connections use the environment's network, the control node stamps commands with its
+    /// clock, and blocking storage calls run as its execution says.
+    ///
+    /// With [`Execution::Inline`], the returned [`Daemon::config`] has `[engine] execution` set to
+    /// inline as well.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError`] if the configuration is invalid, another daemon holds the directory, the
+    /// control log can't be recovered, or `listen` can't be bound.
+    pub async fn start_with(
+        mut config: Config,
+        environment: Environment,
+    ) -> Result<Self, StartError> {
         config.validate()?;
+        if environment.execution() == Execution::Inline {
+            config.engine.execution = Execution::Inline;
+        }
         let data_dir = DataDir::lock(&config.data_dir)?;
         let control = if config.role.runs_control() {
-            Some(open_control(&config, &data_dir).await?)
+            Some(open_control(&config, &data_dir, &environment).await?)
         } else {
             None
         };
-        let server = serve(&config, control.as_ref()).await?;
+        let network = environment.network();
+        let server = serve(&config, control.as_ref(), network).await?;
         let membership = config.role.hosts_data().then(|| {
             let address = config
                 .control
                 .address
                 .unwrap_or_else(|| reachable(server.address));
-            let client = ControlClient::new(address.to_string(), TransportConfig::default());
+            let client = network.control_client(address.to_string());
             Membership::start(config.node.to_member(), client, &config.membership)
         });
         tracing::info!(
@@ -150,6 +180,8 @@ impl Daemon {
     /// Serves until `shutdown` completes, then stops taking work, finishes in-flight writes, closes
     /// its databases, and releases the data directory.
     ///
+    /// Connections get a few seconds to close; any still open after that are dropped.
+    ///
     /// The node stays a member; the control plane marks it down once its heartbeats stop.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
         shutdown.await;
@@ -163,49 +195,81 @@ impl Daemon {
         if let Some(control) = self.control {
             control.shutdown().await;
         }
-        match self.server.task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(%error, "gRPC server failed"),
-            Err(error) => tracing::error!(%error, "gRPC server task failed"),
+        let mut task = self.server.task;
+        match tokio::time::timeout(SHUTDOWN_GRACE, &mut task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => tracing::error!(%error, "gRPC server failed"),
+            Ok(Err(error)) => tracing::error!(%error, "gRPC server task failed"),
+            Err(_) => {
+                tracing::warn!(
+                    grace = ?SHUTDOWN_GRACE,
+                    "connections didn't close in time; dropping them",
+                );
+                task.abort();
+                // The task was aborted, so it can only end cancelled.
+                let _aborted = task.await;
+            }
         }
         drop(self.data_dir);
         tracing::info!("fleetringd stopped");
     }
 }
 
-async fn open_control(config: &Config, data_dir: &DataDir) -> Result<ControlNode, StartError> {
+async fn open_control(
+    config: &Config,
+    data_dir: &DataDir,
+    environment: &Environment,
+) -> Result<ControlNode, StartError> {
     let options = ControlOptions::new(config.control.control_config())
-        .with_snapshot_every(config.control.snapshot_every);
-    Ok(ControlNode::open(data_dir.path().join(CONTROL_DB), options, SystemClock).await?)
+        .with_snapshot_every(config.control.snapshot_every)
+        .with_storage_io(environment.control_storage_io());
+    let path = data_dir.path().join(CONTROL_DB);
+    Ok(ControlNode::open(path, options, environment.clock()).await?)
 }
 
-/// Binds `listen` and serves the `Control` service if `control` runs here. The data role's
-/// `Replication` and `Database` services will join it.
+/// Binds `listen` on `network` and serves the `Control` service if `control` runs here. The data
+/// role's `Replication` and `Database` services will join it.
 async fn serve(
     config: &Config,
     control: Option<&ControlNode>,
+    network: Network,
 ) -> Result<RunningServer, StartError> {
     let listen_error = |source| StartError::Listen {
         address: config.listen,
         source,
     };
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .map_err(listen_error)?;
-    let address = listener.local_addr().map_err(listen_error)?;
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = Server::builder()
-        .add_optional_service(
-            control.map(|node| control_server(ControlService::new(node.handle()))),
-        )
-        .serve_with_incoming_shutdown(TcpIncoming::from(listener), async {
-            // A dropped sender also means stop.
-            let _stop = stopped.await;
-        });
+    // A dropped sender also means stop.
+    let shutdown = async {
+        let _stop = stopped.await;
+    };
+    let router = Server::builder().add_optional_service(
+        control.map(|node| control_server(ControlService::new(node.handle()))),
+    );
+    let (address, task) = match network {
+        Network::Tcp(_) => {
+            let listener = tokio::net::TcpListener::bind(config.listen)
+                .await
+                .map_err(listen_error)?;
+            let address = listener.local_addr().map_err(listen_error)?;
+            let server = router.serve_with_incoming_shutdown(TcpIncoming::from(listener), shutdown);
+            (address, tokio::spawn(server))
+        }
+        #[cfg(feature = "simulation")]
+        Network::Simulated => {
+            let listener = turmoil::net::TcpListener::bind(config.listen)
+                .await
+                .map_err(listen_error)?;
+            let address = listener.local_addr().map_err(listen_error)?;
+            let incoming = crate::transport::sim::incoming(listener);
+            let server = router.serve_with_incoming_shutdown(incoming, shutdown);
+            (address, tokio::spawn(server))
+        }
+    };
     Ok(RunningServer {
         address,
         stop,
-        task: tokio::spawn(server),
+        task,
     })
 }
 

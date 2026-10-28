@@ -22,6 +22,7 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile = { version = "3.27.0", optional = true }
 thiserror.workspace = true
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 toml = "1.1.8"
@@ -33,11 +34,16 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 turmoil = { version = "0.7", optional = true }
 
 [features]
-# Runs the transport over turmoil's simulated network, for the simulation harness (ADR-0020).
-simulation = ["dep:turmoil", "dep:hyper-util", "dep:tower"]
+# The simulation harness (`fleetringd::sim`): the daemon over turmoil's simulated network and
+# clock (ADR-0020).
+simulation = ["dep:turmoil", "dep:hyper-util", "dep:tower", "dep:tempfile"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "sim"
+required-features = ["simulation"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

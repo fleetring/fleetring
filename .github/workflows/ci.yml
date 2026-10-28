@@ -85,6 +85,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p fleetring --all-features --release --no-fail-fast -- --ignored
 
+  # The simulation harness's fixed seeds (FR-024, ADR-0020). `--cfg tokio_unstable` lets turmoil
+  # seed Tokio's scheduler, so each seed must replay its trace exactly, simulated times included.
+  # The test jobs above run the same tests without it, comparing event order only.
+  simulation:
+    name: simulation (fixed seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg tokio_unstable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p fleetringd --features simulation --test sim --no-fail-fast
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest

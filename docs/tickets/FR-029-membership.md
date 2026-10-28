@@ -66,3 +66,7 @@ Data nodes join the cluster and report liveness, and every node holds the same `
     - The run is repeated with the same seed and its traces compared: event order and each node's publication sequence.
     - Simulated times aren't compared. Tokio seeds its internal `select!` randomness only under `--cfg tokio_unstable`, so events can shift by a few milliseconds.
     - Also: real-TCP convergence of a control daemon and two data daemons, a both-roles daemon joining itself, config validation, and unit tests for view publication.
+
+## Follow-up from FR-024
+
+- **At 100 ms network latency, about 1 seed in 200 misses the two-heartbeat-interval bound after a node restart (seed 111).** The cause: `watch_loop` gives opening the stream 200 ms, then sleeps a full interval after a timeout. The harness uses 0–20 ms latency by default. Retrying the stream open sooner would make the bound hold at higher latency.

@@ -64,7 +64,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-021](FR-021-cells-spec.md) | `CellsSpec`: serializable cells layers | P2 | M | FR-013, FR-020 | done |
 | [FR-022](FR-022-daemon-skeleton.md) | Workspace crates and the `fleetringd` skeleton | P0 | M | — | done |
 | [FR-023](FR-023-grpc-transport.md) | gRPC protocol crate and node transport | P0 | M | FR-022 | done |
-| [FR-024](FR-024-simulation-harness.md) | Simulation harness with turmoil | P0 | M | FR-022, FR-023 | todo |
+| [FR-024](FR-024-simulation-harness.md) | Simulation harness with turmoil | P0 | M | FR-022, FR-023 | done |
 | [FR-025](FR-025-wal-format.md) | WAL format library | P0 | M | FR-022 | done |
 | [FR-026](FR-026-database-actor.md) | Engine adapter and per-database actor | P0 | L | FR-022, FR-025 | done |
 | [FR-027](FR-027-control-state-machine.md) | Control state machine | P0 | M | FR-022 | done |

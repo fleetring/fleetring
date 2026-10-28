@@ -39,3 +39,8 @@ One writer per database, automatic failover when a primary dies, and no acknowle
 
 - **Liveness is evaluated at the time of the last applied command**, so it only changes when some command arrives. A lone node that stops sending heartbeats isn't marked down until another command lands. Failover needs a periodic tick: a new `Action` the control node submits on a timer, so expiry and liveness advance without traffic.
 - **No planned leave:** the protocol has no `Leave` RPC. Add one, and call it from `MembershipTasks::stop`, so a graceful shutdown leaves instead of looking like a failure.
+
+## Notes from FR-024
+
+- **Extend `sim::check::one_primary_per_epoch`** with the roles data nodes report. Today it checks control-plane grants only.
+- **Crashes are modeled as power loss:** peers' connections stall rather than reset. A process kill, where peers get a reset, isn't modeled; doing it deterministically would mean closing connections in a sorted order.
