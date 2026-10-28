@@ -17,7 +17,7 @@ This is the checklist for publishing the `fleetring` crate (FR-019). A release f
 
 ## 3. Version and changelog
 
-- [ ] Set `version` in `[workspace.package]` (root `Cargo.toml`). `0.0.1` is a placeholder already on crates.io, so the first real release is `0.1.0`.
+- [ ] Set `version` in `[workspace.package]` (root `Cargo.toml`).
 - [ ] In `CHANGELOG.md`, rename `[Unreleased]` to `[0.1.0] - YYYY-MM-DD`, start a new empty `[Unreleased]`, and update the compare links.
 - [ ] Note any MSRV change. Policy: raise it only in a minor release, never to a toolchain younger than six months (ADR-0009).
 
@@ -43,9 +43,9 @@ cargo publish -p fleetring --dry-run
 5. Create a GitHub release from the tag. Use the changelog entry as the body, with links to the placement spec and the ADR index.
 6. Check that docs.rs built the crate with all features.
 
-## 6. After the first release
+## 6. Semver checks
 
-Turn on semver checking against the published baseline by adding this job to `.github/workflows/ci.yml`:
+The `semver-checks` job in `.github/workflows/ci.yml` compares every change with the latest release on crates.io. It runs this job:
 
 ```yaml
   semver:

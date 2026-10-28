@@ -4,7 +4,7 @@
 
 One database per agent, tenant, or device, spread across nodes you own. FleetRing decides where each database lives, routes traffic to it, and moves it when nodes join or leave.
 
-> **Status:** early development. The placement crate works today and is heading for 0.1.0; the router, live migration, and CLI are planned. APIs will change. Not production-ready.
+> **Status:** early development. The placement crate is released as 0.1.0; the router, live migration, and CLI are planned. APIs will change. Not production-ready.
 
 ## Why
 
@@ -38,7 +38,7 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 
 ## Roadmap
 
-- [x] `fleetring` ring and placement crate (0.1.0 release in progress)
+- [x] `fleetring` ring and placement crate (0.1.0)
 - [ ] Router sidecar (libSQL/Hrana protocol)
 - [ ] Live migration
 - [ ] Demo: 10k agents with live rebalancing
@@ -47,7 +47,7 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 ## Design docs
 
 - [`docs/adr/`](docs/adr/): architecture decision records, one per decision, explaining why the placement crate works the way it does.
-- [`docs/spec/`](docs/spec/): the placement spec. [Version 1](docs/spec/placement-v1.md) defines placement precisely enough that every implementation, in any language, puts each key on the same nodes. It stays a draft until `fleetring` 0.1.0 freezes it.
+- [`docs/spec/`](docs/spec/): the placement spec. [Version 1](docs/spec/placement-v1.md) defines placement precisely enough that every implementation, in any language, puts each key on the same nodes. It is frozen as of `fleetring` 0.1.0.
 - [`docs/tickets/`](docs/tickets/): the work plan for the placement crate, with each ticket's scope, status, and acceptance criteria.
 
 ## License

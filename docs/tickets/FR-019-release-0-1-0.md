@@ -39,3 +39,11 @@ Ship 0.1.0. From this release on, placement output for spec v1 never changes.
   - green CI on GitHub (FR-002 needs a push);
   - the version bump, changelog entry, and spec freeze;
   - the publish, which the maintainer does.
+- 2026-10-28: Release prepared.
+  - Spec v1 is marked Final, the workspace version is 0.1.0, and `CHANGELOG.md` has the 0.1.0 entry.
+  - CI has a `semver-checks` job that compares each change with the latest release on crates.io.
+  - The cells benchmarks were re-measured on an idle machine: 2.19 µs (rendezvous) and 0.30 µs (vnodes) per lookup, against 87 µs for one flat 10,000-node ring.
+  - `cargo package --list` is reviewed and `cargo publish --dry-run` passes.
+  - ADR-0010 and ADR-0013 stay Proposed. They describe the replication layer and the daemon, not shipped crate behavior.
+  - FR-021 (`CellsSpec`) ships after 0.1.0. Its JSON form is documented in rustdoc, like `RingSpec`'s, so it doesn't touch the frozen spec.
+- Remaining: the maintainer tags, publishes, and creates the GitHub release; then check docs.rs and the first semver-checks run.

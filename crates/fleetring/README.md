@@ -4,7 +4,7 @@
 
 Give `fleetring` a key and it tells you which nodes hold it, in what order, and what moves when the fleet changes. The answer is bit-identical on every platform and in every language that implements the [placement spec](https://github.com/fleetring/fleetring/blob/main/docs/spec/placement-v1.md).
 
-> **Status:** early development (`0.0.x`). APIs and placement output may change until 0.1.0 freezes placement spec v1.
+> **Status:** 0.1. The API may still change in 0.x releases, but placement output is fixed: [placement spec v1](https://github.com/fleetring/fleetring/blob/main/docs/spec/placement-v1.md) is frozen.
 
 ## Use it for
 

@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-The first functional release of the placement crate. Releasing it as 0.1.0 also freezes placement spec v1.
+## [0.1.0] - 2026-10-28
+
+The first functional release of the placement crate. It freezes placement spec v1.
 
 ### Added
 
@@ -25,7 +27,7 @@ The first functional release of the placement crate. Releasing it as 0.1.0 also 
 - **Ring specs and fingerprints.** `RingSpec`, `NodeSpec`, and `StrategySpec` describe a ring portably. `Ring::to_spec` writes a spec, and `Ring::from_spec` validates one and rebuilds its ring. A `Fingerprint`, from `Ring::fingerprint`, covers every placement input and the placements of 64 probe keys, so peers can detect rings that would place keys differently.
 - **Cells: nested placement** (ADR-0012). A `Cells` layer picks a cell for each key with a `Directory` of exact-key and longest-prefix rules, then a selector ring whose nodes are the cells, weighted explicitly; the cell's own ring places all of the key's replicas. Cells are `Ring`s or nested layers, through the sealed `Placement` trait, and `Cells::replicas` returns a `CellPlacement`: the key's path of `CellId`s plus its `ReplicaSet`. `CellsBuilder::build` validates every selector target and rejects a ring that shares a seed with a selector ring above it (`BuildCellsError`). `Cells::fingerprint` covers every layer, and `Cells::diff` tells cross-cell moves from in-cell changes (`CellChange`, `CellMovementSummary`). Placement spec v1 gains a composition section, with golden vectors.
 - **Diagnostics.** `Ring::diagnostics` reports under-replication, too few hosts or zones, zones that receive far more than their share of replicas, and vnode nodes with too few tokens. `Ring::expected_shares` reports each node's exact share of primaries and its estimated share of replicas.
-- **Placement spec v1** (draft), in `docs/spec/placement-v1.md`: the normative, language-neutral definition of placement, from byte encodings to the fingerprint, so ports in other languages can match the Rust crate exactly.
+- **Placement spec v1**, frozen by this release, in `docs/spec/placement-v1.md`: the normative, language-neutral definition of placement, from byte encodings to the fingerprint, so ports in other languages can match the Rust crate exactly.
 - **Feature flags.** `serde` serializes ring specs, `test-util` adds the `test_util::TableHasher` test double, and `std`, on by default, is reserved for future `no_std` support.
 - **Documentation and examples.** A crate-level guide to the concepts, the choice of strategy, and the determinism guarantees. Seven runnable examples cover a database fleet, key-value sharding, chat-room failover, rebalancing, bounded loads, regional cells, and a ring spec round trip.
 - **Benchmarks** for lookups, builds, bounded loads, and diffs, with budgets and results in `docs/perf.md`.
@@ -39,5 +41,6 @@ The first functional release of the placement crate. Releasing it as 0.1.0 also 
 
 A placeholder that reserved the crate name on crates.io. It has no placement functionality.
 
-[Unreleased]: https://github.com/fleetring/fleetring/commits/main
+[Unreleased]: https://github.com/fleetring/fleetring/compare/fleetring-v0.1.0...HEAD
+[0.1.0]: https://github.com/fleetring/fleetring/releases/tag/fleetring-v0.1.0
 [0.0.1]: https://crates.io/crates/fleetring/0.0.1

@@ -160,6 +160,19 @@ jobs:
       - run: pip install xxhash
       - run: python scripts/placement_ref.py crates/fleetring/tests/vectors/placement-v1.json
 
+  # Compares the public API with the latest release on crates.io, so a breaking change can't
+  # ship without the version bump it needs (FR-019).
+  semver:
+    name: semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - run: cargo semver-checks --package fleetring
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

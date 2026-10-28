@@ -280,9 +280,8 @@
 //!   bytes, and the output of the default [`Xxh3`] hasher has been frozen since xxHash 0.8.0.
 //! - **Independence from construction order:** a ring depends on its set of nodes, never on the
 //!   order they were added in.
-//! - **Stability across releases:** from 0.1.0, which freezes placement spec v1, changing which
-//!   nodes any key maps to requires a new spec version, whatever the crate version. Until then,
-//!   `0.0.x` releases may still change placement.
+//! - **Stability across releases:** placement spec v1 is frozen as of 0.1.0. Changing which
+//!   nodes any key maps to requires a new spec version, whatever the crate version.
 //! - **Detectable divergence:** a different hasher, seed, or strategy changes the
 //!   [`Fingerprint`], and so does a hasher or port that places any of the 64 probe keys
 //!   differently.

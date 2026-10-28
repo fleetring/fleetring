@@ -1,6 +1,6 @@
 # FleetRing placement spec, version 1
 
-- **Status:** Draft. This document becomes Final at `fleetring` 0.1.0 (FR-019), and from then on its outputs never change.
+- **Status:** Final, as of `fleetring` 0.1.0 (FR-019). Its outputs never change: a change to which nodes a key maps to needs a new spec version.
 - **Normative:** yes. The key words MUST, MUST NOT, SHOULD, and MAY are used as in RFC 2119.
 - **Conformance:** an implementation conforms if it reproduces every case in `crates/fleetring/tests/vectors/placement-v1.json` bit for bit. The Rust crate `fleetring` is the reference implementation. The vector file's `layout` field describes its format, and `scripts/placement_ref.py` is an independent Python implementation of this spec that passes every vector.
 - **Decisions behind this spec:** ADR-0002 (hashing), ADR-0003 (integer arithmetic), ADR-0004 (strategies), ADR-0006 (replica selection), ADR-0007 (bounded loads), ADR-0008 (versioning and fingerprints).
