@@ -421,9 +421,12 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "fleetring",
+ "fleetring-control",
  "fleetring-proto",
  "hyper-util",
+ "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1536,6 +1539,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

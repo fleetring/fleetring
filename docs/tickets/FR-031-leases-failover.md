@@ -29,3 +29,8 @@ One writer per database, automatic failover when a primary dies, and no acknowle
 - [ ] Simulation invariant: at most one primary acknowledges writes in any epoch.
 - [ ] With default settings, killing a primary in a three-node cluster moves writes to a new primary within the lease duration plus the margin plus one second.
 - [ ] While the control node is down, current primaries keep accepting writes.
+
+## Notes from FR-028
+
+- The control service has no promotion RPCs or expiry timer yet. Add the promotion calls named in ADR-0019 to the proto, and have the service turn an expired lease into `StartPromotion`, then `RecordFenced` from fenced replicas, then `CompletePromotion`. Liveness only changes through commands, so something must submit a command to act on an expiry.
+- Decide whether a primary's heartbeat also renews its lease. `DatabaseStatus.epoch` in heartbeats is ignored today, and that is its only possible use.

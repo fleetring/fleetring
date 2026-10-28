@@ -26,7 +26,7 @@ struct Cli {
     /// Overrides `listen`.
     #[arg(long)]
     listen: Option<SocketAddr>,
-    /// Overrides `control`.
+    /// Overrides `control.address`.
     #[arg(long)]
     control: Option<SocketAddr>,
     /// Overrides `role`: `both`, `data`, or `control`.
@@ -46,7 +46,7 @@ impl Cli {
             config.listen = listen;
         }
         if self.control.is_some() {
-            config.control = self.control;
+            config.control.address = self.control;
         }
         if let Some(role) = self.role {
             config.role = role;
@@ -73,14 +73,17 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let daemon = match Config::load(&cli.config)
-        .map(|config| cli.apply(config))
-        .map_err(Box::<dyn Error>::from)
-        .and_then(|config| Daemon::start(config).map_err(Box::<dyn Error>::from))
-    {
+    let config = match Config::load(&cli.config) {
+        Ok(config) => cli.apply(config),
+        Err(error) => {
+            report(&error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let daemon = match Daemon::start(config).await {
         Ok(daemon) => daemon,
         Err(error) => {
-            report(error.as_ref());
+            report(&error);
             return ExitCode::FAILURE;
         }
     };

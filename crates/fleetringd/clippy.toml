@@ -7,3 +7,8 @@ disallowed-types = [
 ]
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+# Daemon code reads time only through `clock::Clock` or `tokio::time` (ADR-0020).
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "read time through `clock::Clock` (ADR-0020)" },
+    { path = "std::time::Instant::now", reason = "read time through `tokio::time` (ADR-0020)" },
+]
