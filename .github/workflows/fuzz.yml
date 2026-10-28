@@ -1,10 +1,12 @@
-# Nightly fuzzing (FR-017). Untrusted ring specs and arbitrary memberships must never panic, and
+# Fuzzing (FR-017). Untrusted ring specs and arbitrary memberships must never panic, and
 # every ring must keep its placement invariants (ADR-0006, ADR-0007, ADR-0008).
 name: Fuzz
 
 on:
-  schedule:
-    - cron: "17 3 * * *"
+  # On demand only while the repository is private, where nightly runs would use over a third
+  # of the free Actions minutes. Uncomment the schedule when the repository goes public.
+  # schedule:
+  #   - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:

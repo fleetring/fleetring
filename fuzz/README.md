@@ -21,7 +21,7 @@ cargo +nightly fuzz run lookup -- -max_total_time=300
 
 `fuzz/seeds/` holds committed seed inputs. `fuzz/corpus/` is where the fuzzer saves what it discovers; it is gitignored.
 
-The `Fuzz` GitHub workflow runs each target for five minutes every night, and on demand.
+The `Fuzz` GitHub workflow runs each target for five minutes. While the repository is private it runs only on demand, so start it from the Actions tab. The nightly schedule comes back when the repository goes public.
 
 ## Triage
 
