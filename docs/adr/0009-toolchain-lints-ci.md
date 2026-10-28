@@ -1,6 +1,6 @@
 # ADR-0009: Toolchain, lint, dependency, and CI policy
 
-- **Status:** Accepted (2026-10-27)
+- **Status:** Accepted (2026-10-27); the `test` row of decision 6 amended by [ADR-0014](0014-os-test-matrix.md)
 - **Date:** 2026-10-27
 - **Related:** ADR-0002, ADR-0003, ADR-0008; tickets FR-001, FR-002, FR-016, FR-017, FR-019
 
@@ -55,6 +55,8 @@ The workspace is a fresh skeleton: edition 2021, a placeholder `add()`, no lints
    | commits | the existing Conventional Commits check |
    | fuzz | nightly toolchain, run on a schedule (FR-017) |
    | semver | `cargo semver-checks`, starting with 0.1.0 |
+
+   *Amended by ADR-0014:* macOS and Windows run the suite once, with `--all-features`. Linux keeps the full feature and profile matrix.
 
 7. **Commits** keep the existing Conventional Commits rules, using the crate area as the scope (`feat(ring): …`, `test(spec): …`) and a `Refs: FR-NNN` trailer.
 

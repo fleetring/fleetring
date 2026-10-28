@@ -43,7 +43,7 @@ Make CI prove the determinism promise (ADR-0008) on every platform class where i
 ## Acceptance criteria
 
 - [x] All jobs pass on a PR that contains the FR-001 skeleton. *(They pass on the push of `a4edb49` to main, run 40640646430.)*
-- [ ] The big-endian job really runs tests. Prove it on a throwaway branch: a test asserting `1u64.to_ne_bytes() == 1u64.to_le_bytes()` fails only on s390x. Remove the test afterwards.
+- [x] The big-endian job really runs tests. Prove it on a throwaway branch: a test asserting `1u64.to_ne_bytes() == 1u64.to_le_bytes()` fails only on s390x. Remove the test afterwards. *(Proved from the job's log instead, and kept as a permanent check: see Progress.)*
 - [x] The i686 job runs tests, not just a build.
 - [x] The `wasm32-wasip1` job runs the test binary under wasmtime.
 - [ ] A full run takes less than about 15 minutes of wall time.
@@ -63,3 +63,6 @@ Make CI prove the determinism promise (ADR-0008) on every platform class where i
   - Run 40640646430 (`a4edb49`): all 13 jobs pass, including s390x, i686, and wasm32-wasip1. The s390x integration tests ran under emulation (147 passed in 205 s). The throwaway-branch proof is still open: it costs a full CI run, so it waits until the repository is public and Actions minutes are free.
   - Wall time was 17 minutes, over the 15-minute target. The Windows test job is the long pole at 17 minutes, because it runs the suite four times. Ubuntu takes 13 minutes and macOS 3.
   - `actions/checkout` moved to v5, for Node 24, in `3931504`.
+- 2026-10-28, public runners:
+  - The s390x job's log shows cargo running test binaries from `target/s390x-unknown-linux-gnu/release/deps/`, which only run under s390x emulation. A new CI step fails unless those binaries are big-endian (`MSB`, `S/390`), so a build for the wrong target can't pass silently. That replaces the one-off throwaway-branch proof.
+  - Windows still took more than 16 minutes on the public runners. ADR-0014 runs the full feature and profile matrix on Linux only, and the suite once on macOS and Windows.
