@@ -36,7 +36,7 @@ Implement ADR-0002: a placement hash that never changes, behind a trait so users
 
 ## Acceptance criteria
 
-- [ ] The vectors pass on every CI target, including s390x, i686, and wasm.
+- [x] The vectors pass on every CI target, including s390x, i686, and wasm. *(Run 40640646430.)*
 - [x] A compile test or doc test shows `Ring<Box<dyn StableHasher>>` compiles. Until FR-007 lands, use a stand-in generic function.
 - [x] No `std::hash` trait or type is used for placement (clippy `disallowed-types` enforces this).
 - [x] Every public item is documented, and the examples use `?`.

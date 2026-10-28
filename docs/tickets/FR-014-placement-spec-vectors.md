@@ -50,7 +50,7 @@ Make placement verifiable across platforms, crate versions, and languages, and p
 ## Acceptance criteria
 
 - [x] The Python reference passes every vector. This is the proof that the spec is complete and portable, and it lowers the risk for the v0.2 TypeScript and Python SDKs.
-- [ ] The vectors pass on every CI target: Linux, macOS, Windows, i686, s390x, and wasm32-wasip1. *(They pass on aarch64-apple-darwin, and are embedded with `include_str!` for the other targets. Waiting on FR-002's first CI run.)*
+- [x] The vectors pass on every CI target: Linux, macOS, Windows, i686, s390x, and wasm32-wasip1. *(Run 40640646430.)*
 - [x] Changing an existing expected value fails CI.
 - [x] The spec header says `Status: Draft` until FR-019 changes it to `Final`.
 

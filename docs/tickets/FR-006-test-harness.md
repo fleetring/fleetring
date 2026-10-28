@@ -36,7 +36,7 @@ Build shared fixtures so property, statistical, and benchmark code all test agai
 
 ## Acceptance criteria
 
-- [ ] The corpora are byte-identical on every platform. A checksum test proves it on s390x, i686, and wasm. *(The checksum test exists and passes on aarch64-apple-darwin. Other platforms wait on FR-002's first CI run.)*
+- [x] The corpora are byte-identical on every platform. A checksum test proves it on s390x, i686, and wasm. *(The checksum tests pass on every CI target in run 40640646430.)*
 - [x] The statistics helpers are unit-tested on known inputs. For example, a perfectly uniform distribution gives χ² = 0, and a single skewed bin fails.
 - [x] Generators shrink to small, readable counterexamples.
 - [x] Commit proptest regression files (`proptest-regressions/`). *(None exist yet, because no property has failed. Failures under `tests/it` write to `crates/fleetring/tests/proptest-regressions/`.)*
