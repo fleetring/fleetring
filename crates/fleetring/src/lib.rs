@@ -16,6 +16,14 @@
 mod epoch;
 mod hasher;
 mod label;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the rendezvous strategy (FR-008) is the first caller"
+    )
+)]
+mod math;
 mod node;
 mod replica;
 #[cfg(any(test, feature = "test-util"))]

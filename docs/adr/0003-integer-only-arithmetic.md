@@ -25,6 +25,13 @@ Prior art: Ceph CRUSH's `straw2` bucket is weighted rendezvous hashing with a fi
    - **Baseline:** bit-by-bit repeated squaring. It runs 32 iterations of a 64×64→128-bit multiply, takes about ten lines with no tables, and is monotone by construction.
    - **Alternative:** a 1025-entry Q32 table with linear interpolation, the approach Ceph uses.
    - **Choice:** FR-005 benchmarks both. If the baseline misses the FR-016 lookup budget by more than 2×, we switch to the table before the spec freezes at 0.1.0.
+   - **Outcome (FR-005, 2026-10-27): the table.** On an Apple M-series machine in release mode, squaring took 105.6 ns per call and the table 2.4 ns. At 100 nodes, squaring alone would cost about 10 µs per lookup, roughly 5× the 2 µs budget. Spec v1 pins:
+     - `T[j] = round(2³² · log₂(1 + j/1024))` for `j` in `0..=1024`;
+     - `v = x + 1`, `e = ⌊log₂ v⌋`, and the Q1.63 mantissa `m = v · 2^(63 − e)`;
+     - the top 10 fractional bits of `m` index `T`, and the low 53 bits interpolate linearly, rounding down;
+     - `L = (64 − e) · 2³² − fraction`, and `L = 0` when `x = u64::MAX`.
+
+     The worst-case error is 738 Q32 units (1.7 × 10⁻⁷). That's a smooth bias far below statistical noise. `L` is still exact at powers of two and still monotone. Repeated squaring stays in the code, but only to build `T` at compile time.
 5. **Comparison is exact.** For a given key, node *a* precedes node *b* when `L_a · w_b < L_b · w_a`, computed in `u128`. The largest product is 2³⁸ · 2³², so this can't overflow, and it compares `L_a/w_a` with `L_b/w_b` exactly. Ties go to the larger raw draw `x`, then the smaller `NodeId` (bytewise). The result is a total order that's identical on every platform.
 6. **Exact shortcuts are allowed.** Because `L` is monotone, nodes of equal weight compare by raw draw alone, with no logarithm. Implementations may use this and similar shortcuts, such as memoizing `L` or bounding by the integer part of log₂, only if their output is bit-identical to the definition. The golden vectors (ADR-0008) catch violations.
 7. **Arithmetic can't overflow.** Placement arithmetic widens to `u128` or uses explicit `wrapping_*` or `checked_*` operations. The math module enables `clippy::arithmetic_side_effects`, and CI runs the tests in both debug and release builds.

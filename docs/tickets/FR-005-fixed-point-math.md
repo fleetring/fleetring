@@ -1,7 +1,7 @@
 ---
 id: FR-005
 title: Fixed-point −log₂ and exact score comparison
-status: todo
+status: done
 priority: P0
 size: M
 milestone: M1 Hashing and model
@@ -30,16 +30,23 @@ Implement the integer-only arithmetic from ADR-0003 as a small, crate-private mo
 
 ## Acceptance criteria
 
-- [ ] Boundary values:
+- [x] Boundary values:
   - `neg_log2_q32(u64::MAX) == 0`
   - `neg_log2_q32(0) == 64 << 32`
   - whenever `x + 1 == 2^k`, the result is exactly `(64 − k) << 32`.
-- [ ] **Monotone:** `x ≤ y` implies `L(x) ≥ L(y)`. Check this with a strided sweep of 2²⁰ inputs plus proptest pairs.
-- [ ] **Accurate:** results are within 4 Q32 ulps (2⁻³⁰) of an `f64` reference computed in tests. Floats are allowed in tests.
-- [ ] The score comparator is a total order: antisymmetric, transitive (proptest over triples), and consistent with the rule that equal weights compare by raw draw (ADR-0003 point 6).
-- [ ] Nothing overflows for any input: run proptest in debug mode, where overflow panics, with extreme weights and draws.
+- [x] **Monotone:** `x ≤ y` implies `L(x) ≥ L(y)`. Check this with a strided sweep of 2²⁰ inputs plus proptest pairs.
+- [x] **Accurate:** results are within 740 Q32 units (1.7 × 10⁻⁷) of an `f64` reference computed in tests. That is the table's interpolation bound; the squaring baseline would have achieved 1 unit. Floats are allowed in tests. *(The bound changed when the table was chosen; see ADR-0003, point 4.)*
+- [x] The score comparator is a total order: antisymmetric, transitive (proptest over triples), and consistent with the rule that equal weights compare by raw draw (ADR-0003 point 6).
+- [x] Nothing overflows for any input: run proptest in debug mode, where overflow panics, with extreme weights and draws.
 - [ ] Emit `x → L(x)` vectors for the spec kit (FR-014).
 
 ## Notes
 
 - Floats are banned in this module and the rest of the library (`clippy::float_arithmetic`). Only `#[cfg(test)]` code may use them.
+
+## Progress
+
+- 2026-10-27: Done. Measured in release mode on an Apple M-series machine: repeated squaring took 105.6 ns per call, and the 1025-entry table with linear interpolation took 2.4 ns. Squaring would put a 100-node lookup at about 10 µs, roughly 5× the budget, so the **table** is pinned (ADR-0003, point 4, records the details).
+- A `const fn` (48-bit repeated squaring, rounded) builds the table at compile time. A test proves each entry is correctly rounded: every entry is within 0.5 of the f64 value, and none sits within 2⁻¹⁴ units of a rounding boundary.
+- Error is at most 740 Q32 units, and the measured worst case nearly reaches the theoretical 738. `L` is exact at powers of two and monotone across the full domain.
+- Deviations: no `ceil_div_u128` helper, because `u128::div_ceil` covers it (FR-011). `Score.index` is a `usize`.
