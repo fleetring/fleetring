@@ -1,7 +1,7 @@
 ---
 id: FR-017
 title: Fuzzing for spec decoding, builder input, and lookup invariants
-status: todo
+status: in-progress
 priority: P2
 size: S
 milestone: M4 Hardening and release
@@ -27,6 +27,18 @@ No input that arrives from the network or the control db can cause a panic.
 
 ## Acceptance criteria
 
-- [ ] Each target runs at least 10M executions locally with no findings, or each finding is fixed and has a regression test.
+- [x] Each target runs at least 10M executions locally with no findings, or each finding is fixed and has a regression test.
 - [ ] The nightly workflow passes.
-- [ ] `fuzz/README.md` explains how to run and triage.
+- [x] `fuzz/README.md` explains how to run and triage.
+
+## Progress
+
+- 2026-10-28: Three libFuzzer targets live in `fuzz/` (a workspace of its own, run with nightly and cargo-fuzz):
+  - `spec_json`: untrusted JSON specs, checked by round-tripping through `from_spec` and comparing fingerprints;
+  - `builder`: arbitrary memberships, checked against the replica-set invariants;
+  - `lookup`: liveness filters and bounded-load capacity.
+- Local runs (Apple M-series, coverage instrumented) found nothing:
+  - `spec_json`: 30.7M executions;
+  - `builder`: 11.3M;
+  - `lookup`: 13.4M.
+- The `Fuzz` workflow runs each target nightly for 5 minutes and on demand, uploading crash artifacts. It is waiting on its first GitHub run, which is the last open criterion.

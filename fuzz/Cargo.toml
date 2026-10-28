@@ -1,0 +1,40 @@
+[package]
+name = "fleetring-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+fleetring = { path = "../crates/fleetring", features = ["serde"] }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[[bin]]
+name = "spec_json"
+path = "fuzz_targets/spec_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "builder"
+path = "fuzz_targets/builder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lookup"
+path = "fuzz_targets/lookup.rs"
+test = false
+doc = false
+bench = false
+
+# A workspace of its own: fuzzing needs nightly, and the main workspace's lints and members
+# don't apply here.
+[workspace]
+members = ["."]

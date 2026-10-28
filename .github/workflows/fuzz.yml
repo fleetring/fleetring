@@ -1,0 +1,37 @@
+# Nightly fuzzing (FR-017). Untrusted ring specs and arbitrary memberships must never panic, and
+# every ring must keep its placement invariants (ADR-0006, ADR-0007, ADR-0008).
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [spec_json, builder, lookup]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: fuzz for five minutes
+        run: |
+          seeds="fuzz/seeds/${{ matrix.target }}"
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          if [ -d "$seeds" ]; then extra="$seeds"; else extra=""; fi
+          cargo fuzz run ${{ matrix.target }} "fuzz/corpus/${{ matrix.target }}" $extra -- -max_total_time=300
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: fuzz/artifacts
