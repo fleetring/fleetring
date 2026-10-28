@@ -1,7 +1,7 @@
 ---
 id: FR-006
 title: Deterministic test harness, key corpora, and balance statistics
-status: todo
+status: done
 priority: P0
 size: S
 milestone: M1 Hashing and model
@@ -17,7 +17,7 @@ Build shared fixtures so property, statistical, and benchmark code all test agai
 
 ## Scope
 
-- **Location:** `crates/fleetring/tests/common/`. This is internal test code, not public API. Benches can include it with `#[path = "../tests/common/mod.rs"]`.
+- **Location:** `crates/fleetring/tests/it/common/`. All integration tests are one binary (`tests/it/main.rs`). This is internal test code, not public API. Benches can include it with `#[path = "../tests/it/common/mod.rs"]`.
 - **PRNG:** an in-tree splitmix64. `rand` is not allowed (ADR-0009).
 - **Key corpora**, each generated at 10k, 100k, and 1M keys:
   - sequential `tenant:{:06}`;
@@ -37,6 +37,23 @@ Build shared fixtures so property, statistical, and benchmark code all test agai
 ## Acceptance criteria
 
 - [ ] The corpora are byte-identical on every platform. A checksum test proves it on s390x, i686, and wasm. *(The checksum test exists and passes on aarch64-apple-darwin. Other platforms wait on FR-002's first CI run.)*
-- [ ] The statistics helpers are unit-tested on known inputs. For example, a perfectly uniform distribution gives χ² = 0, and a single skewed bin fails.
-- [ ] Generators shrink to small, readable counterexamples.
-- [ ] Commit proptest regression files (`proptest-regressions/`). *(None exist yet, because no property has failed. Failures under `tests/it` write to `crates/fleetring/tests/proptest-regressions/`.)*
+- [x] The statistics helpers are unit-tested on known inputs. For example, a perfectly uniform distribution gives χ² = 0, and a single skewed bin fails.
+- [x] Generators shrink to small, readable counterexamples.
+- [x] Commit proptest regression files (`proptest-regressions/`). *(None exist yet, because no property has failed. Failures under `tests/it` write to `crates/fleetring/tests/proptest-regressions/`.)*
+
+## Progress
+
+- 2026-10-27: Done (built by a subagent in an isolated copy, then merged and re-verified).
+  - Modules: `prng`, `corpus` (`Corpus::ALL`, sizes `SMALL`, `MEDIUM`, `LARGE`), `fixtures` (with `memberships()` strategies), and `stats` (`tally`, `balance`/`Balance`, `assert_balanced` with a pinned failure format).
+- Corpus checksums (first 10,000 keys) are pinned for the cross-platform CI check:
+  - sequential: `0x8d0a1f588e046af3`
+  - agents: `0x2a86b5a649795fe1`
+  - uuids: `0x9afbf7d2faaa7b44`
+  - binary: `0x9a6c67add988dcb0`
+
+  A separate Python implementation reproduces all four corpora byte for byte.
+- Deviations:
+  - **Critical value:** χ² critical values use Wilson–Hilferty at z = 4.7534 instead of a table. It is slightly lenient at small df, by 15% at df 1, and has no df cap.
+  - **`binary` corpus:** apart from one empty first key, every key is 1–256 bytes long. With uniform lengths, repeated empty keys would pile onto one node and fail the 5σ check.
+  - **Checksum fold:** multiply-xor rather than rotate-xor.
+- Checked on correct placements: ideal weighted placements of every corpus pass `assert_balanced` at 100k keys, and also at 1M in the release `--ignored` job.
