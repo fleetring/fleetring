@@ -1,0 +1,205 @@
+# Release builds of `fleetringd` (FR-034). A `fleetringd-vX.Y.Z` tag builds the daemon for every
+# target on a native runner, packages each build with the licenses and a README, checksums the
+# archives, and attaches them to the tag's GitHub release. A manual run is a dry run: it builds
+# and packages everything as workflow artifacts and publishes nothing.
+#
+# The `fleetring` crate is released separately, to crates.io, from `fleetring-v*` tags
+# (RELEASING.md).
+name: Release
+
+on:
+  push:
+    tags: ["fleetringd-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The compiler for every archive. Keep it equal to RUST_VERSION in the Dockerfile.
+  RUST_VERSION: "1.99"
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      # The tag names the version `fleetringd --version` prints, so they must agree.
+      - id: version
+        name: read the version and check it against the tag
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/fleetringd/Cargo.toml | head -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::crates/fleetringd/Cargo.toml has no version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "fleetringd-v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match fleetringd's version, $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # GitHub is retiring its Intel macOS runners, and Apple's toolchain builds for both
+          # architectures, so both macOS targets build on Apple Silicon.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      # Linux builds run in Debian 12, so the binaries need glibc 2.36, not the runner's 2.39,
+      # and match the container image's runtime.
+      - name: build (in rust:${{ env.RUST_VERSION }}-slim-bookworm)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/fleetring" -w /fleetring \
+            -e CARGO_INCREMENTAL -e CARGO_TERM_COLOR \
+            -e RUSTFLAGS="--remap-path-prefix=/usr/local/cargo=/cargo" \
+            "rust:$RUST_VERSION-slim-bookworm" \
+            cargo build --locked --release -p fleetringd --target "$TARGET"
+
+      - uses: dtolnay/rust-toolchain@master
+        if: runner.os != 'Linux'
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      # The remaps keep the runner's directories out of the binary. Windows links the C runtime
+      # statically, so the binary runs without the Visual C++ redistributable.
+      - name: build
+        if: runner.os != 'Linux'
+        run: |
+          rustflags="--remap-path-prefix=$GITHUB_WORKSPACE=/fleetring"
+          rustflags="$rustflags --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          if [ "$TARGET" = x86_64-pc-windows-msvc ]; then
+            rustflags="$rustflags -C target-feature=+crt-static"
+          fi
+          RUSTFLAGS="$rustflags" cargo build --locked --release -p fleetringd --target "$TARGET"
+
+      # Every target but Intel macOS runs on its runner.
+      - name: smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          case "$TARGET" in *-windows-*) exe=.exe ;; *) exe="" ;; esac
+          printed=$("target/$TARGET/release/fleetringd$exe" --version)
+          echo "$printed"
+          test "$printed" = "fleetringd $VERSION"
+
+      - name: package
+        run: |
+          name="fleetringd-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp LICENSE-APACHE LICENSE-MIT "dist/$name/"
+          cp crates/fleetringd/README.md "dist/$name/README.md"
+          cd dist
+          case "$TARGET" in
+            *-windows-*)
+              cp "../target/$TARGET/release/fleetringd.exe" "$name/"
+              7z a -tzip "$name.zip" "$name" > /dev/null
+              ;;
+            *-linux-*)
+              cp "../target/$TARGET/release/fleetringd" "$name/"
+              tar --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
+              ;;
+            *)
+              cp "../target/$TARGET/release/fleetringd" "$name/"
+              tar --uid 0 --gid 0 --numeric-owner -czf "$name.tar.gz" "$name"
+              ;;
+          esac
+          rm -r "$name"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleetringd-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: checksums and release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fleetringd-*
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cp scripts/install.sh dist/
+          cd dist
+          for file in *; do
+            sha256sum "$file" > "$file.sha256"
+          done
+          sha256sum -- *.tar.gz *.zip install.sh > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleetringd-${{ env.VERSION }}-dist
+          path: dist/*
+          if-no-files-found: error
+
+      # Only a tag publishes; a manual run stops at the artifacts above. Rerunning a tag's
+      # workflow replaces the release's files.
+      - name: publish the GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            exit 0
+          fi
+          flags=()
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          cat > notes.md <<EOF
+          The \`fleetringd\` daemon, version $VERSION.
+
+          Install the binary for this machine, verified against \`SHA256SUMS\`:
+
+          \`\`\`sh
+          curl -fsSL https://github.com/$GH_REPO/releases/download/$TAG/install.sh | sh -s -- --version $VERSION
+          \`\`\`
+
+          Or run the container image: \`docker run ghcr.io/fleetring/fleetringd:$VERSION\`.
+          EOF
+          gh release create "$TAG" dist/* --verify-tag --title "fleetringd $VERSION" \
+            --notes-file notes.md "${flags[@]}"

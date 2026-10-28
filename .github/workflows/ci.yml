@@ -85,6 +85,23 @@ jobs:
             cargo run -p fleetring --all-features --example "$(basename "$example" .rs)"
           done
 
+  # Linux ARM64, natively, where most small self-hosted machines run (FR-034). macOS ARM64 is
+  # covered above: `macos-latest` is an Apple Silicon runner.
+  test-arm64:
+    name: test (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: all features
+        run: cargo test --workspace --all-features --no-fail-fast
+      - name: simulation (fixed seeds)
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+        run: cargo test -p fleetringd --features simulation --test sim --no-fail-fast
+
   statistics:
     name: statistical suite (release)
     runs-on: ubuntu-latest

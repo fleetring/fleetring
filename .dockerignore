@@ -1,0 +1,11 @@
+# The image builds `fleetringd` from the workspace; send Docker only what that needs.
+**/target
+.git
+.github
+.githooks
+**/.DS_Store
+fuzz
+docs
+scripts
+Dockerfile
+.dockerignore

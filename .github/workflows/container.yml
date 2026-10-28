@@ -1,0 +1,169 @@
+# The `fleetringd` container image (FR-034). A `fleetringd-vX.Y.Z` tag builds `linux/amd64` and
+# `linux/arm64`, each natively on a runner of its own architecture (no QEMU), pushes both to
+# ghcr.io/fleetring/fleetringd by digest, and joins them into one multi-arch manifest tagged
+# `X.Y.Z`, plus `X.Y` and `latest` for a final release. A manual run builds and smoke-tests both
+# images and pushes nothing.
+name: Container
+
+on:
+  push:
+    tags: ["fleetringd-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/fleetring/fleetringd
+  DESCRIPTION: The FleetRing daemon. Places, replicates, and fails over SQLite databases across machines you own.
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        name: read the version and check it against the tag
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/fleetringd/Cargo.toml | head -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::crates/fleetringd/Cargo.toml has no version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "fleetringd-v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match fleetringd's version, $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      # Builds into the runner's Docker first, to check the image before anything is pushed.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: fleetringd:smoke
+      - name: smoke test
+        run: |
+          printed=$(docker run --rm fleetringd:smoke --version)
+          echo "$printed"
+          test "$printed" = "fleetringd $VERSION"
+          user=$(docker image inspect --format '{{.Config.User}}' fleetringd:smoke)
+          echo "runs as $user"
+          test "$user" = "65532:65532"
+
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # The same build again, from the builder's cache, pushed by digest only; the merge job tags
+      # the manifest that joins both architectures.
+      - id: push
+        if: github.ref_type == 'tag'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=fleetringd
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: record the digest
+        if: github.ref_type == 'tag'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: push the manifest
+    needs: [version, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # A prerelease (`X.Y.Z-rc.1`) gets its own tag only; a final release also moves `X.Y` and
+      # `latest`.
+      - name: create the manifest
+        working-directory: digests
+        env:
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          tags=(--tag "$IMAGE:$VERSION")
+          case "$VERSION" in
+            *-*) ;;
+            *) tags+=(--tag "$IMAGE:${VERSION%.*}" --tag "$IMAGE:latest") ;;
+          esac
+          sources=()
+          for digest in *; do
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create "${tags[@]}" \
+            --annotation "index:org.opencontainers.image.title=fleetringd" \
+            --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.licenses=MIT OR Apache-2.0" \
+            "${sources[@]}"
+      - name: inspect
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"

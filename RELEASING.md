@@ -1,6 +1,6 @@
 # Releasing `fleetring`
 
-This is the checklist for publishing the `fleetring` crate (FR-019). A release freezes placement behavior as well as the API, so work through it in order.
+This is the checklist for publishing the `fleetring` crate (FR-019). A release freezes placement behavior as well as the API, so work through it in order. The `fleetringd` daemon has its own process, in [Releasing `fleetringd`](#releasing-fleetringd).
 
 ## 1. Pre-flight
 
@@ -62,3 +62,39 @@ The `semver-checks` job in `.github/workflows/ci.yml` compares every change with
 ```
 
 Placement compatibility is separate from API compatibility. `cargo semver-checks` guards the API. The frozen vectors and their lock guard placement, and a placement change needs a new spec version whatever the crate version says.
+
+# Releasing `fleetringd`
+
+The daemon is released separately from the crate (FR-034). It isn't published to crates.io (`publish = false`); a release is a set of prebuilt binaries and a container image, made by CI from a `fleetringd-vX.Y.Z` tag. Two workflows run on the tag:
+
+- `.github/workflows/release.yml` builds `fleetringd` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. It packages each with the licenses and `crates/fleetringd/README.md`, writes `SHA256SUMS` and a `.sha256` per file, and attaches the archives, the checksums, and `scripts/install.sh` to the tag's GitHub release, creating it if needed.
+- `.github/workflows/container.yml` builds the `Dockerfile` natively for `linux/amd64` and `linux/arm64` and pushes one manifest to `ghcr.io/fleetring/fleetringd`, tagged `X.Y.Z`. A final release also moves `X.Y` and `latest`; a prerelease (`X.Y.Z-rc.1`) gets its own tag only.
+
+## 1. Pre-flight
+
+- [ ] CI is green on `main`, including `test (ubuntu-24.04-arm)` and `simulation (fixed seeds)`.
+- [ ] A manual run of both workflows (Actions → Release, and Actions → Container → Run workflow) passes. It builds and smoke-tests every archive and both images, and publishes nothing. Download the `fleetringd-<version>-dist` artifact and try an archive.
+- [ ] `RUST_VERSION` agrees in `.github/workflows/release.yml` and the `Dockerfile`.
+
+## 2. Version
+
+- [ ] Set `version` in `crates/fleetringd/Cargo.toml`; `fleetringd --version` prints it. Both workflows fail if the tag doesn't match it.
+- [ ] Commit: `chore(release): fleetringd X.Y.Z`.
+
+`CHANGELOG.md` documents the `fleetring` crate only; the daemon's notes go in its GitHub release.
+
+## 3. Tag
+
+```sh
+git tag -a fleetringd-vX.Y.Z -m "fleetringd X.Y.Z"
+git push origin main fleetringd-vX.Y.Z
+```
+
+## 4. After the workflows finish
+
+- [ ] The release lists five archives, `SHA256SUMS`, a `.sha256` for each file, and `install.sh`. Edit its notes to summarize the changes.
+- [ ] `curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh -s -- --version X.Y.Z` installs a binary that prints `fleetringd X.Y.Z`.
+- [ ] `docker run --rm ghcr.io/fleetring/fleetringd:X.Y.Z --version` prints the same, on both architectures.
+- [ ] The first time only: make the `fleetringd` package public in the organization's GitHub package settings, and link it to this repository.
+
+A failed workflow can be rerun on the same tag: the release workflow replaces the release's files, and the container workflow pushes the manifest again. Never move a published tag; release a new patch version instead.

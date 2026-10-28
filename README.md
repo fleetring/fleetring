@@ -26,6 +26,33 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Live migration when nodes join or leave, with zero lost writes
 - CLI: `fleetring up`, `node add/remove`, `db create/locate/move`, `status`
 
+## Install
+
+The placement crate is on crates.io: `cargo add fleetring`.
+
+The `fleetringd` daemon ships as one binary. Each `fleetringd` release has three ways to install it:
+
+- **Binaries** for Linux (glibc 2.36 or newer) and macOS on x86_64 and ARM64, and for Windows on x86_64. They're on the [releases page](https://github.com/fleetring/fleetring/releases) as `fleetringd-<version>-<target>.tar.gz` (`.zip` on Windows), with a `SHA256SUMS` file.
+- **The install script** picks the archive for your OS and CPU, verifies its checksum, and installs `fleetringd` to `/usr/local/bin` as root, or to `~/.local/bin` otherwise:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh
+  # A given version, somewhere else:
+  curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
+    | sh -s -- --version 0.1.0 --prefix /opt/fleetring
+  ```
+
+- **Docker**, for `linux/amd64` and `linux/arm64`. The image runs a one-node cluster from [`deploy/fleetringd.toml`](deploy/fleetringd.toml) as a non-root user, with its databases in the `/data` volume:
+
+  ```sh
+  docker run -d --name fleetringd -p 7400:7400 -v fleetring-data:/data ghcr.io/fleetring/fleetringd
+  docker exec fleetringd fleetringd status --config /etc/fleetring/fleetringd.toml
+  ```
+
+  Mount your own configuration over `/etc/fleetring/fleetringd.toml` to change it.
+
+To build from source instead: `cargo install --locked --git https://github.com/fleetring/fleetring fleetringd`.
+
 ## The placement crate
 
 The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-purpose: *deterministic, cross-language placement with zone-aware replicas*. FleetRing uses it to place SQLite databases, but it works for anything keyed: key-value shards, chat rooms, actors, queue partitions, and inference sessions.
