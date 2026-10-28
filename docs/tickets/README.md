@@ -58,6 +58,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-017](FR-017-fuzzing.md) | Fuzzing for spec decoding, builder input, lookup invariants | P2 | S | FR-013 | todo |
 | [FR-018](FR-018-docs-examples.md) | Crate documentation, examples, README accuracy | P1 | M | FR-011, FR-012, FR-013 | done |
 | [FR-019](FR-019-release-0-1-0.md) | Release `fleetring` 0.1.0 and freeze placement spec v1 | P1 | S | FR-014, FR-016, FR-018 | todo |
+| [FR-020](FR-020-cells.md) | Cells: nested placement with directories and per-cell rings | P1 | L | FR-012, FR-013 | todo |
 
 ## Dependency graph
 
@@ -92,6 +93,8 @@ flowchart LR
   FR014 --> FR019[FR-019 release 0.1.0]
   FR016 --> FR019
   FR018 --> FR019
+  FR012 --> FR020[FR-020 cells]
+  FR013 --> FR020
 ```
 
 ## Critical path and estimate
@@ -101,15 +104,13 @@ The critical path is: FR-001 → FR-003 / FR-004 / FR-005 (parallel) → FR-007 
 | Scope | Tickets | Estimate (one engineer) |
 |---|---|---|
 | P0: unblocks `fleetringd` | 10 tickets | ≈ 14 engineer-days |
-| P0 + P1: the 0.1.0 release | 17 tickets | ≈ 25 engineer-days |
-| Everything, including P2 | 19 tickets | ≈ 26 engineer-days |
+| P0 + P1: the 0.1.0 release | 18 tickets | ≈ 28 engineer-days |
+| Everything, including P2 | 20 tickets | ≈ 29 engineer-days |
 
 `docs/mvp.md` allows 4–6 weeks for all eight MVP steps, with the ring crate as step 1. At about three weeks, P0 alone takes more than a proportional share. If the timeline is fixed, start `fleetringd` once P0 is done and run P1 in parallel. P2 can slip past 0.1.0 without affecting placement.
 
 ## Backlog (not yet ticketed)
 
-- **Placement pools and residency** (key prefix → pool → ring) for EU/US tenants and sovereign deployments. This needs its own ADR first.
-- **Hierarchical rendezvous** for fleets beyond about 1000 nodes. This would be spec v2, and only if FR-016 shows it's needed.
 - **Keyed hasher** (SipHash-1-3 with a secret key) for adversarial key spaces.
 - **`no_std + alloc`** support. The `std` feature is already reserved.
 - **WASM bindings and the ring playground**, plus TypeScript and Python conformance kits built from the vectors.

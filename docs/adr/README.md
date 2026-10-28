@@ -20,6 +20,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0009](0009-toolchain-lints-ci.md) | Toolchain, lint, dependency, and CI policy | Accepted |
 | [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred) |
 | [0011](0011-generic-placement-core.md) | `fleetring` is general-purpose placement infrastructure; the product stays SQLite-focused | Accepted |
+| [0012](0012-cells-nested-placement.md) | Cells: nested placement by composing rings (directory or ring picks the cell, the cell's ring picks nodes) | Accepted |
 
 ## Template
 
