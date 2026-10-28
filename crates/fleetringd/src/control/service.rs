@@ -96,7 +96,7 @@ where
         .map_err(|error| Status::invalid_argument(format!("invalid {field}: {error}")))
 }
 
-fn member_from(node: Option<proto::Node>) -> Result<Member, Status> {
+pub(crate) fn member_from(node: Option<proto::Node>) -> Result<Member, Status> {
     let node = node.ok_or_else(|| Status::invalid_argument("missing node"))?;
     let mut member = Member::new(parse("node id", &node.id)?);
     if let Some(zone) = &node.zone {
@@ -109,7 +109,7 @@ fn member_from(node: Option<proto::Node>) -> Result<Member, Status> {
     Ok(member.with_weight(Weight::new(node.weight).unwrap_or(Weight::ONE)))
 }
 
-fn node_to_proto(member: &Member) -> proto::Node {
+pub(crate) fn node_to_proto(member: &Member) -> proto::Node {
     proto::Node {
         id: member.id().to_string(),
         zone: member.zone().map(ToString::to_string),
@@ -184,16 +184,25 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     })
 }
 
-/// The membership as of the state's time.
-fn membership_update(state: &State) -> MembershipUpdate {
+/// Whether each member is live as of the state's time, in ID order.
+fn live_flags(state: &State) -> Vec<bool> {
     let now = state.now();
+    state
+        .members()
+        .map(|member| state.liveness(member.id(), now) == Some(Liveness::Live))
+        .collect()
+}
+
+/// The membership as of the state's time.
+fn membership_update(state: &State, live: &[bool]) -> MembershipUpdate {
     MembershipUpdate {
         membership_epoch: state.membership_epoch().get(),
         members: state
             .members()
-            .map(|member| proto::Member {
+            .zip(live)
+            .map(|(member, &live)| proto::Member {
                 node: Some(node_to_proto(member)),
-                live: state.liveness(member.id(), now) == Some(Liveness::Live),
+                live,
             })
             .collect(),
     }
@@ -238,18 +247,30 @@ impl Control for ControlService {
         }))
     }
 
+    /// Sends the membership once its epoch passes `after_epoch`, then again whenever the epoch
+    /// grows or a member's liveness changes. Liveness is judged at the time of the last applied
+    /// command, so it changes only as commands, such as other members' heartbeats, arrive.
     async fn watch_membership(
         &self,
         request: Request<WatchMembershipRequest>,
     ) -> Result<Response<Self::WatchMembershipStream>, Status> {
-        let mut last = request.into_inner().after_epoch;
+        let after_epoch = request.into_inner().after_epoch;
+        // The epoch and liveness the watcher holds: none until the first state is seen.
+        let mut held: Option<(u64, Vec<bool>)> = None;
         let updates = WatchStream::new(self.node.watch()).filter_map(move |state| {
             let epoch = state.membership_epoch().get();
-            // Epochs only grow, so a higher one is a change the watcher hasn't seen.
-            (epoch > last).then(|| {
-                last = epoch;
-                Ok(membership_update(&state))
-            })
+            let live = live_flags(&state);
+            // Epochs only grow, and members change only with the epoch, so a higher epoch or new
+            // liveness flags are a change the watcher hasn't seen.
+            let send = match &held {
+                None => epoch > after_epoch,
+                Some((held_epoch, held_live)) => {
+                    epoch > (*held_epoch).max(after_epoch) || live != *held_live
+                }
+            };
+            let update = send.then(|| Ok(membership_update(&state, &live)));
+            held = Some((epoch, live));
+            update
         });
         Ok(Response::new(Box::pin(updates)))
     }

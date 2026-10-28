@@ -83,8 +83,12 @@ lease_duration_ms = 3000
 failover_margin_ms = 0
 heartbeat_timeout_ms = 1500
 snapshot_every = 50
+
+[membership]
+heartbeat_interval_ms = 500
 "#;
     let config = Config::from_toml(text)?;
+    assert_eq!(config.membership.heartbeat_interval_ms.get(), 500);
     assert_eq!(config.control.address, Some("10.0.0.1:7400".parse()?));
     assert_eq!(config.control.snapshot_every.get(), 50);
     let timings = config.control.control_config();

@@ -106,6 +106,23 @@ impl ControlClient {
             .clone()
     }
 
+    /// Drops every connection the client holds, so the next call dials again.
+    ///
+    /// Use it when calls time out without failing: a connection can stay open while nothing
+    /// crosses it, for example after a network partition or a machine's sleep. Streams already
+    /// open keep their connection.
+    ///
+    /// # Panics
+    ///
+    /// If the client's lock was poisoned by a panic in another thread.
+    pub fn reconnect(&self) {
+        self.shared
+            .channels
+            .lock()
+            .expect("control client lock poisoned")
+            .clear();
+    }
+
     /// Joins the cluster. Retried.
     ///
     /// # Errors

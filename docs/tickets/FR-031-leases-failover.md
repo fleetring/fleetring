@@ -34,3 +34,8 @@ One writer per database, automatic failover when a primary dies, and no acknowle
 
 - The control service has no promotion RPCs or expiry timer yet. Add the promotion calls named in ADR-0019 to the proto, and have the service turn an expired lease into `StartPromotion`, then `RecordFenced` from fenced replicas, then `CompletePromotion`. Liveness only changes through commands, so something must submit a command to act on an expiry.
 - Decide whether a primary's heartbeat also renews its lease. `DatabaseStatus.epoch` in heartbeats is ignored today, and that is its only possible use.
+
+## Notes from FR-029
+
+- **Liveness is evaluated at the time of the last applied command**, so it only changes when some command arrives. A lone node that stops sending heartbeats isn't marked down until another command lands. Failover needs a periodic tick: a new `Action` the control node submits on a timer, so expiry and liveness advance without traffic.
+- **No planned leave:** the protocol has no `Leave` RPC. Add one, and call it from `MembershipTasks::stop`, so a graceful shutdown leaves instead of looking like a failure.
