@@ -26,6 +26,7 @@ use tonic::Status;
 
 use super::archive::{Packer, Unpacker, remove_dir_if_present};
 use super::epochs::sync_dir;
+use super::failover;
 use super::follower::{admit, blocking};
 use super::primary::held;
 use super::{Inner, SeedError};
@@ -183,6 +184,11 @@ pub(super) async fn fetch(
         }
         Err(status) => Err(status),
     };
+    // The copy is now the log of the primary at `epoch`, which it ranks by in promotions and
+    // which keeps a later stream at that epoch from cutting it back.
+    if installed.is_ok() {
+        failover::set_log_epoch(inner, database, epoch).await?;
+    }
     if installed.is_err() {
         let removed = {
             let staging = staging.clone();
@@ -341,7 +347,7 @@ pub(super) async fn seed(
     // have stopped.
     let slot = inner.slot(database);
     slot.begin();
-    let _applying = slot.applying.lock().await;
+    let _applying = slot.applying().lock().await;
     let location = inner.registry().location(database);
     let position = time::timeout(
         inner.settings.open_timeout,

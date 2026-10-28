@@ -133,6 +133,7 @@ fn action(state: &State, op: Op) -> Action {
             Action::Join { member: joining }
         }
         1 if b.is_multiple_of(3) => Action::Leave { id: id(node) },
+        1 if b % 3 == 1 => Action::Tick,
         1 | 8 => create(DATABASES[a % DATABASES.len()], 1 + op.b % 3),
         2..=7 => {
             let mut replicas: Vec<HostedReplica> = DATABASES
@@ -141,7 +142,10 @@ fn action(state: &State, op: Op) -> Action {
                 .filter(|(i, name)| (b >> i) & 1 == 1 && state.database(&db(name)).is_some())
                 .map(|(i, name)| {
                     let position = vec![op.b.rotate_left(u32::try_from(i).expect("small")), op.a];
+                    // Some replicas report the epoch their log came from, as newer nodes do.
+                    let log_epoch = LeaseEpoch::new(u64::from(op.a % 3));
                     HostedReplica::new(db(name), Role::Follower, Position::new(position))
+                        .with_log_epoch(log_epoch)
                 })
                 .collect();
             if b.is_multiple_of(11) {

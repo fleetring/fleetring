@@ -178,6 +178,7 @@ impl Cluster {
         let addresses = Arc::new(addresses);
         let membership_settings = MembershipSettings {
             heartbeat_interval_ms: std::num::NonZeroU64::new(100).ok_or("nonzero")?,
+            ..MembershipSettings::default()
         };
         let network = Network::default();
         let mut nodes = Vec::new();

@@ -43,6 +43,7 @@ async fn heartbeats_report_databases_and_leave_out_unknown_ones() -> TestResult 
     let network = Network::default();
     let settings = MembershipSettings {
         heartbeat_interval_ms: std::num::NonZeroU64::new(50).ok_or("nonzero")?,
+        ..MembershipSettings::default()
     };
     let (_membership, _tasks) = Membership::start_reporting(
         Member::new(id("a")),

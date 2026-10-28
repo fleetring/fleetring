@@ -12,9 +12,11 @@ use fleetring_control::{Action, ControlConfig, Member, Millis, State, Timestamp,
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CreateDatabaseRequest, CreateDatabaseResponse, DatabaseStatus, Engine,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LocateRequest,
-    LocateResponse, MembershipUpdate, Node, RenewLeaseRequest, Role, WatchMembershipRequest,
+    AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, DatabaseStatus, Engine, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    LocateRequest, LocateResponse, MembershipUpdate, Node, PromotionResponse, RecordFencedRequest,
+    RecordFencedResponse, RenewLeaseRequest, Role, StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
@@ -272,6 +274,128 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
     Ok(())
 }
 
+#[tokio::test]
+async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_leaves() -> TestResult
+{
+    let dir = tempfile::tempdir()?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
+         [control]\nlease_duration_ms = 300\nfailover_margin_ms = 0\ntick_interval_ms = 20\n",
+        dir.path().join("data")
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let control = client(daemon.control_address().ok_or("no control address")?);
+    for id in ["a", "b", "c"] {
+        control.join(join_request(id)).await?;
+    }
+    let database = "tenant:acme".to_owned();
+    control
+        .create_database(CreateDatabaseRequest {
+            database: database.clone(),
+            replication_factor: 3,
+            engine: Engine::Sqlite.into(),
+        })
+        .await?;
+    control
+        .acquire_lease(AcquireLeaseRequest {
+            database: database.clone(),
+            node_id: "a".into(),
+        })
+        .await?;
+    // "a" stops renewing; "b" holds the longer log, from epoch 1's primary.
+    let report = |node: &str, position: u8| HeartbeatRequest {
+        node_id: node.into(),
+        databases: vec![DatabaseStatus {
+            database: database.clone(),
+            role: Role::Follower.into(),
+            epoch: 1,
+            position: vec![0, position],
+        }],
+    };
+    let locate = || async {
+        control
+            .locate(LocateRequest {
+                database: database.clone(),
+            })
+            .await?
+            .placement
+            .ok_or_else(|| Status::internal("no placement"))
+    };
+    // The timer notices the expiry on its own and starts a promotion: no primary at epoch 2.
+    let started = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            control.heartbeat(report("b", 2)).await?;
+            control.heartbeat(report("c", 1)).await?;
+            let placement = locate().await?;
+            if placement.epoch == 2 {
+                return Ok::<_, Status>(placement);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "no promotion started")??;
+    assert_eq!(started.primary, None, "no primary while the promotion runs");
+    let busy = control
+        .start_promotion(StartPromotionRequest {
+            database: database.clone(),
+        })
+        .await
+        .expect_err("already in progress");
+    assert_eq!(busy.code(), Code::FailedPrecondition, "{busy}");
+
+    let fence = |node: &str, position: u8| RecordFencedRequest {
+        database: database.clone(),
+        node_id: node.into(),
+        epoch: 2,
+        position: vec![0, position],
+    };
+    let first = control.record_fenced(fence("b", 2)).await?;
+    assert_eq!((first.fenced, first.needed), (1, 2));
+    let early = control
+        .complete_promotion(CompletePromotionRequest {
+            database: database.clone(),
+            epoch: 2,
+        })
+        .await
+        .expect_err("one fenced member is too few");
+    assert_eq!(early.code(), Code::FailedPrecondition, "{early}");
+    let second = control.record_fenced(fence("c", 1)).await?;
+    assert_eq!((second.fenced, second.needed), (2, 2));
+    let twice = control
+        .record_fenced(fence("c", 1))
+        .await
+        .expect_err("fenced already");
+    assert_eq!(twice.code(), Code::AlreadyExists, "{twice}");
+    let completed = control
+        .complete_promotion(CompletePromotionRequest {
+            database: database.clone(),
+            epoch: 2,
+        })
+        .await?;
+    assert_eq!(completed.lease.map(|lease| lease.epoch), Some(2));
+    assert_eq!(completed.adopted, vec![0, 2]);
+    let promoted = locate().await?;
+    assert_eq!(promoted.primary.as_deref(), Some("b"));
+    assert_eq!(promoted.epoch, 2);
+
+    let left = control
+        .leave(LeaveRequest {
+            node_id: "a".into(),
+        })
+        .await?;
+    assert_eq!(left.membership_epoch, 4);
+    let gone = control
+        .leave(LeaveRequest {
+            node_id: "a".into(),
+        })
+        .await
+        .expect_err("left already");
+    assert_eq!(gone.code(), Code::NotFound, "{gone}");
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 /// A control node that isn't the leader: it answers every call with a redirect.
@@ -332,6 +456,31 @@ impl Control for Redirecting {
         &self,
         _: Request<RenewLeaseRequest>,
     ) -> Result<Response<LeaseResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn leave(&self, _: Request<LeaveRequest>) -> Result<Response<LeaveResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn start_promotion(
+        &self,
+        _: Request<StartPromotionRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn record_fenced(
+        &self,
+        _: Request<RecordFencedRequest>,
+    ) -> Result<Response<RecordFencedResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn complete_promotion(
+        &self,
+        _: Request<CompletePromotionRequest>,
+    ) -> Result<Response<CompletePromotionResponse>, Status> {
         self.redirect()
     }
 }

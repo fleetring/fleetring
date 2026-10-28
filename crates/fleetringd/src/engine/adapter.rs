@@ -213,6 +213,30 @@ pub trait FrameFollower: fmt::Debug + Send {
     /// [`EngineError::InvalidPosition`] unless the copy is exactly at the marker, and
     /// [`EngineError::Storage`] if the checkpoint fails.
     fn checkpoint(&mut self, marker: &CheckpointMarker) -> Result<(), EngineError>;
+
+    /// Every transaction the copy holds after `after` as one batch, or `None` if there is none.
+    ///
+    /// A promotion's candidate fetches the frames it lacks from the most advanced fenced member
+    /// this way (ADR-0018, point 4). `after` is a position of this log, or `None` to read the
+    /// whole current log.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::InvalidPosition`] if `after` doesn't fit the copy's log, and
+    /// [`EngineError::Storage`] if it can't be read.
+    fn committed_since(&self, after: Option<&Position>) -> Result<Option<FrameBatch>, EngineError>;
+
+    /// Discards everything the copy holds past `position`, durably, so that it is at `position`.
+    ///
+    /// A member whose log runs past the position a new primary adopted truncates it this way
+    /// before it accepts the new epoch's frames (ADR-0018, point 5).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::InvalidPosition`] if `position` isn't a transaction boundary of the copy's
+    /// current log, for example because it is in an older generation, and
+    /// [`EngineError::Storage`] if the copy can't be written.
+    fn truncate_to(&mut self, position: &Position) -> Result<(), EngineError>;
 }
 
 /// The operations on an open database whose engine replicates itself.

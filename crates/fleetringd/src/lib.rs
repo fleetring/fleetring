@@ -27,8 +27,8 @@ pub mod transport;
 
 pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
-    Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, MembershipSettings, NodeConfig,
-    ReplicationConfig, Role,
+    Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION,
+    MembershipSettings, NodeConfig, OnShutdown, ReplicationConfig, Role,
 };
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
@@ -65,6 +65,7 @@ const _: () = {
     assert_debug_send_sync::<MembershipSettings>();
     assert_debug_send_sync::<MembershipTasks>();
     assert_debug_send_sync::<MembershipView>();
+    assert_debug_send_sync::<OnShutdown>();
     assert_debug_send_sync::<ReplicationConfig>();
     assert_debug_send_sync::<StartError>();
     assert_debug_send_sync::<Stored>();

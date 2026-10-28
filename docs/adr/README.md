@@ -26,10 +26,11 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0015](0015-fleetringd-architecture.md) | `fleetringd` architecture and crate layout | Accepted |
 | [0016](0016-wal-frame-replication.md) | Replication through engine adapters, starting with SQLite WAL shipping | Accepted |
 | [0017](0017-control-state-machine.md) | A control plane built as a deterministic state machine: one node now, Raft later | Accepted |
-| [0018](0018-leases-epochs-quorums.md) | Leases, epochs, and quorums: one writer per database, no acknowledged write lost | Accepted |
+| [0018](0018-leases-epochs-quorums.md) | Leases, epochs, and quorums: one writer per database, no acknowledged write lost | Accepted (points 4, 5, 7 amended by 0022) |
 | [0019](0019-grpc-transport.md) | Nodes talk gRPC over tonic | Accepted |
 | [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Accepted |
 | [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Accepted |
+| [0022](0022-failover-protocol.md) | Failover: the candidate drives the promotion, and logs are ranked by log epoch | Accepted |
 | [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Proposed |
 
 ## Template

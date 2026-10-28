@@ -87,22 +87,48 @@ pub struct Timings {
     pub heartbeat_timeout: Duration,
     /// How long a lease lasts after it is granted or renewed.
     pub lease_duration: Duration,
+    /// How often a primary renews each lease.
+    pub lease_renewal: Duration,
     /// How long past a lease's expiry the control node waits before failing over.
     pub failover_margin: Duration,
+    /// How often the control node looks for expired leases.
+    pub tick_interval: Duration,
     /// How many commands the control node applies between snapshots.
     pub snapshot_every: NonZeroU64,
 }
 
 impl Default for Timings {
-    /// A 200 ms heartbeat, a 1 s heartbeat timeout, 2 s leases, a 400 ms failover margin, and a
-    /// snapshot every 50 commands, so a short run crosses several snapshots.
+    /// A 200 ms heartbeat, a 1 s heartbeat timeout, 2 s leases renewed every 400 ms, a 400 ms
+    /// failover margin, a 100 ms tick, and a snapshot every 50 commands, so a short run crosses
+    /// several snapshots.
     fn default() -> Self {
         Self {
             heartbeat_interval: Duration::from_millis(200),
             heartbeat_timeout: Duration::from_millis(1_000),
             lease_duration: Duration::from_millis(2_000),
+            lease_renewal: Duration::from_millis(400),
             failover_margin: Duration::from_millis(400),
+            tick_interval: Duration::from_millis(100),
             snapshot_every: NonZeroU64::new(50).unwrap_or(NonZeroU64::MIN),
+        }
+    }
+}
+
+impl Timings {
+    /// The daemon's own defaults, as a LAN deployment runs them: 1 s heartbeats, a 5 s heartbeat
+    /// timeout, 10 s leases renewed every 2 s, a 2 s failover margin, and a 250 ms tick.
+    #[must_use]
+    pub fn daemon_defaults() -> Self {
+        let control = ControlSettings::default();
+        let membership = MembershipSettings::default();
+        Self {
+            heartbeat_interval: membership.heartbeat_interval(),
+            heartbeat_timeout: Duration::from_millis(control.heartbeat_timeout_ms.get()),
+            lease_duration: Duration::from_millis(control.lease_duration_ms.get()),
+            lease_renewal: control.lease_renewal(),
+            failover_margin: Duration::from_millis(control.failover_margin_ms),
+            tick_interval: control.tick_interval(),
+            snapshot_every: control.snapshot_every,
         }
     }
 }
@@ -311,8 +337,10 @@ fn host_config(
         control: ControlSettings {
             address: None,
             lease_duration_ms: nonzero("the lease duration", timings.lease_duration)?,
+            lease_renewal_ms: Some(nonzero("the lease renewal", timings.lease_renewal)?),
             failover_margin_ms: millis(timings.failover_margin),
             heartbeat_timeout_ms: nonzero("the heartbeat timeout", timings.heartbeat_timeout)?,
+            tick_interval_ms: nonzero("the tick interval", timings.tick_interval)?,
             snapshot_every: timings.snapshot_every,
         },
         role,
@@ -322,6 +350,7 @@ fn host_config(
         },
         membership: MembershipSettings {
             heartbeat_interval_ms: nonzero("the heartbeat interval", timings.heartbeat_interval)?,
+            ..MembershipSettings::default()
         },
         replication: ReplicationConfig::default(),
     })
@@ -507,6 +536,18 @@ impl Cluster {
     /// The client is a turmoil host of its own, so faults can name it. Its generator is forked
     /// from the cluster's seed in the order clients are added.
     pub fn client(&mut self, name: &str, workload: impl Workload) {
+        self.add_client(name, None, workload);
+    }
+
+    /// Adds a client named `name` that runs `workload`, sending each database call to the data
+    /// node `entry` first instead of locating the primary through the control plane, as
+    /// `fleetringd db exec --node` does. It follows redirects from there, and reaches a primary
+    /// while the control node is down.
+    pub fn client_through(&mut self, name: &str, entry: &str, workload: impl Workload) {
+        self.add_client(name, Some(format!("{entry}:{PORT}")), workload);
+    }
+
+    fn add_client(&mut self, name: &str, entry: Option<String>, workload: impl Workload) {
         let rng = self.rng.fork();
         let shared = self.shared.clone();
         let control = format!("{}:{PORT}", self.control);
@@ -521,6 +562,7 @@ impl Cluster {
         let session = Session {
             name: client,
             control,
+            entry,
             timeout: self.operation_timeout,
             shared,
         };

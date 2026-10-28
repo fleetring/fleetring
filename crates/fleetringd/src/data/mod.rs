@@ -4,8 +4,11 @@
 //! for tests and the command line; the router replaces it for applications (MVP step 4).
 //!
 //! - **Who serves a request:** the node that holds the database's lease. A node learns that it
-//!   does when it takes the first lease, or, after a restart, from the control plane on the
-//!   database's first request.
+//!   does when it takes the first lease or completes a promotion, or, after a restart, from the
+//!   control plane. It renews its leases, and stops serving a database once it learns of a newer
+//!   epoch: a renewal the control plane refuses, or a fence or a stream at that epoch.
+//! - **Failover:** while a promotion is in progress a database has no primary, and requests for it
+//!   fail with `UNAVAILABLE`; a client retries, and reaches the new primary once it serves.
 //! - **Redirects, not forwarding:** any other node answers `UNAVAILABLE` and names the primary as
 //!   `host:port` in the [`PRIMARY_METADATA_KEY`] metadata entry, as a control node that isn't the
 //!   leader does. A write then crosses one hop, and a lost reply is never doubled by a proxy.
@@ -25,11 +28,13 @@
 
 mod client;
 mod convert;
+mod lease;
 mod node;
 mod redirect;
 mod service;
 
 pub use client::{Client, Location, ReplicaInfo, Written};
+pub(crate) use lease::{LeaseKeeper, LeaseSettings};
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};
 pub(crate) use service::DatabaseService;

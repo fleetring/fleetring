@@ -13,8 +13,11 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
 use crate::config::reachable;
-use crate::control::{ControlHandle, ControlNode, ControlOptions, ControlService, OpenError};
-use crate::data::{DataNode, DatabaseService};
+use crate::control::{
+    ControlHandle, ControlNode, ControlOptions, ControlService, Failover, FailoverSettings,
+    OpenError,
+};
+use crate::data::{DataNode, DatabaseService, LeaseKeeper, LeaseSettings};
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
 use crate::replication::{Replication, ReplicationParts};
@@ -46,16 +49,25 @@ pub struct Daemon {
     config: Config,
     data_dir: DataDir,
     server: RunningServer,
-    control: Option<ControlNode>,
+    control: Option<ControlRole>,
     data: Option<DataRole>,
 }
 
-/// What the data role runs: membership, and the databases this node hosts and replicates.
+/// What the control role runs: the control node, and its failover timer.
+#[derive(Debug)]
+struct ControlRole {
+    node: ControlNode,
+    failover: Failover,
+}
+
+/// What the data role runs: membership, the databases this node hosts and replicates, and the
+/// task that keeps their leases.
 #[derive(Debug)]
 struct DataRole {
     membership: Membership,
     tasks: MembershipTasks,
     replication: Replication,
+    keeper: LeaseKeeper,
 }
 
 /// The gRPC listener, bound before any service starts so its address is known.
@@ -145,7 +157,14 @@ impl Daemon {
         }
         let data_dir = DataDir::lock(&config.data_dir)?;
         let control = if config.role.runs_control() {
-            Some(open_control(&config, &data_dir, &environment).await?)
+            let node = open_control(&config, &data_dir, &environment).await?;
+            let failover = Failover::start(
+                node.handle(),
+                environment.clock(),
+                environment.network(),
+                FailoverSettings::new().with_tick_interval(config.control.tick_interval()),
+            );
+            Some(ControlRole { node, failover })
         } else {
             None
         };
@@ -159,7 +178,7 @@ impl Daemon {
         let server = serve(
             listener,
             address,
-            control.as_ref(),
+            control.as_ref().map(|role| &role.node),
             data.as_ref().map(|(_, node)| node),
         );
         let data = data.map(|(role, _)| role);
@@ -210,7 +229,7 @@ impl Daemon {
     /// A handle to the control node, if this daemon runs control.
     #[must_use]
     pub fn control(&self) -> Option<ControlHandle> {
-        self.control.as_ref().map(ControlNode::handle)
+        self.control.as_ref().map(|role| role.node.handle())
     }
 
     /// The node's membership and ring, if this daemon hosts data.
@@ -239,12 +258,14 @@ impl Daemon {
     ///
     /// Connections get a few seconds to close; any still open after that are dropped.
     ///
-    /// The node stays a member; the control plane marks it down once its heartbeats stop.
+    /// A data node leaves the cluster first, so the control plane removes it at once instead of
+    /// waiting for its heartbeats to stop; its leases expire and fail over as usual.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
         shutdown.await;
         tracing::info!(node = %self.config.node.id, "fleetringd shutting down");
         let replication = match self.data {
             Some(data) => {
+                drop(data.keeper);
                 data.tasks.stop().await;
                 Some(data.replication)
             }
@@ -254,7 +275,8 @@ impl Daemon {
         // so the server can finish.
         let _server_gone = self.server.stop.send(());
         if let Some(control) = self.control {
-            control.shutdown().await;
+            control.failover.stop().await;
+            control.node.shutdown().await;
         }
         let mut task = self.server.task;
         match tokio::time::timeout(SHUTDOWN_GRACE, &mut task).await {
@@ -357,10 +379,19 @@ fn start_data(
         control,
         settings.ack_timeout,
     );
+    let keeper = LeaseKeeper::start(
+        node.clone(),
+        LeaseSettings {
+            renew_interval: config.control.lease_renewal(),
+            fence_timeout: settings.stall_timeout,
+            transfer_timeout: settings.open_timeout,
+        },
+    );
     let role = DataRole {
         membership,
         tasks,
         replication,
+        keeper,
     };
     Ok((role, node))
 }

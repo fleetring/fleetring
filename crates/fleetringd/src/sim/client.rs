@@ -31,6 +31,8 @@ const CLIENT_BACKOFF: Backoff = Backoff {
 pub(super) struct Session {
     pub(super) name: String,
     pub(super) control: String,
+    /// The data node database calls go to first, if not the primary the control plane names.
+    pub(super) entry: Option<String>,
     pub(super) timeout: Duration,
     pub(super) shared: Shared,
 }
@@ -44,10 +46,15 @@ pub(super) async fn run_client(
     let Session {
         name,
         control,
+        entry,
         timeout,
         shared,
     } = session;
     let client = Client::new(control, Network::Simulated).with_backoff(CLIENT_BACKOFF);
+    let client = match entry {
+        Some(entry) => client.with_entry(entry),
+        None => client,
+    };
     loop {
         match workload.next(&mut rng) {
             Step::Run(operation) => {
@@ -171,6 +178,8 @@ async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outco
                 acknowledged_by: written.acknowledged_by,
                 replicas: written.replicas,
                 under_replicated: written.under_replicated,
+                primary: written.primary,
+                epoch: written.epoch,
             }),
     };
     result.map_or_else(

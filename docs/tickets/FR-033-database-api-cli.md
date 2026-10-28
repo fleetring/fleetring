@@ -1,7 +1,7 @@
 ---
 id: FR-033
 title: Database API and CLI for fleetringd v0.1
-status: in-progress
+status: done
 priority: P1
 size: M
 milestone: M6 Replication and failover
@@ -24,7 +24,7 @@ Create databases, run SQL on their primaries, and see where they live, before th
 
 ## Acceptance criteria
 
-- [ ] On a three-node local cluster, `db create`, `db exec`, and `db locate` work end to end, and `db exec` keeps working through a primary failover after a retry. *(End to end works; failover needs FR-031.)*
+- [x] On a three-node local cluster, `db create`, `db exec`, and `db locate` work end to end, and `db exec` keeps working through a primary failover after a retry.
 - [x] `fleetring status` shows the same ring fingerprint on every node.
 - [x] A request sent to a node that isn't the primary is redirected correctly.
 
@@ -45,4 +45,4 @@ Create databases, run SQL on their primaries, and see where they live, before th
   - **For FR-030:** report positions in heartbeats so `locate` shows them; count follower acknowledgements in `ExecuteResponse`; followers find peers through `Membership::view()` (members now carry addresses) or a placement's `replicas`; add the lost-write check over `History::acknowledged_writes`.
   - **For FR-031:** a node keeps serving a database once it holds its lease, without renewing it or checking expiry. Renewal, demotion when a newer epoch appears, and dropping the local lease entry (`data::node::DataNode`) belong there, as does the failover half of the first criterion.
 - 2026-10-28: Acknowledgement counts are real. FR-030's replication runs in the daemon: `ExecuteResponse.acknowledged_by` is how many replicas held the write when its write quorum was reached (W or more), `replicas` is the database's replication factor (from `Placement.replication_factor`, proto field 7), and `under_replicated` says fewer than R replicas were reachable. `data::service::ACKNOWLEDGED_BY`, `daemon::replication_sink()`, and `UnreplicatedSink` are gone. A write that commits without reaching its quorum is still `ABORTED` (outcome unknown). The sim database test now expects 2 or 3 of 3, and `Cluster::finish` checks every acknowledged write against each host's copy.
-
+- 2026-10-28: Done with FR-031. `db exec` keeps working through a primary failover after a retry: `tests/database.rs::db_exec_keeps_working_through_a_primary_failover_after_a_retry` stops the primary of a three-node TCP cluster and retries the write until the new primary acknowledges it at epoch 2, and the simulation's failover tests do the same through `data::Client::execute`. While a promotion runs, the database has no primary, and `execute` fails with `UNAVAILABLE` (failing over), which is worth retrying. `Written` gains `primary` and `epoch` (no longer `Copy`).

@@ -236,41 +236,55 @@ impl SqliteDatabase {
         }
     }
 
-    /// Reads every commit after `after`. A batch that starts a new generation continues only
-    /// from the end of the last checkpoint: any other earlier-generation position is refused,
-    /// because the frames between it and that end are gone.
+    /// Reads every commit after `after`, as [`read_wal_file`] describes.
     fn read_wal(&self, after: Option<&Position>) -> Result<Option<Batch>, EngineError> {
-        let decoded = after.map(decode_position).transpose()?;
-        let batch = self.read_wal_unchecked(after, decoded)?;
-        if let (Some(position), Some(batch)) = (after, &batch)
-            && batch.header().is_some()
-            && decoded != self.checkpointed
-        {
-            return Err(EngineError::InvalidPosition {
-                position: position.clone(),
-            });
-        }
-        Ok(batch)
+        read_wal_file(&self.wal_path(), after, self.checkpointed)
     }
+}
 
-    fn read_wal_unchecked(
-        &self,
-        after: Option<&Position>,
-        decoded: Option<fleetring_wal::Position>,
-    ) -> Result<Option<Batch>, EngineError> {
-        read_committed_file(self.wal_path(), decoded).map_err(|error| match (error, after) {
-            (
-                ReadFileError::Read(
-                    ReadError::UnknownGeneration { .. }
-                    | ReadError::PastEnd { .. }
-                    | ReadError::NotCommitBoundary { .. },
-                ),
-                Some(position),
-            ) => EngineError::InvalidPosition {
-                position: position.clone(),
-            },
-            (other, _) => storage(other),
-        })
+/// Reads every commit after `after` from the WAL at `wal`, whose last checkpoint ended at
+/// `checkpointed`.
+///
+/// A batch that starts a new generation continues only from the end of the last checkpoint: any
+/// other earlier-generation position is refused, because the frames between it and that end are
+/// gone.
+fn read_wal_file(
+    wal: &Path,
+    after: Option<&Position>,
+    checkpointed: Option<fleetring_wal::Position>,
+) -> Result<Option<Batch>, EngineError> {
+    let decoded = after.map(decode_position).transpose()?;
+    let batch = read_committed_file(wal, decoded).map_err(|error| match (error, after) {
+        (
+            ReadFileError::Read(
+                ReadError::UnknownGeneration { .. }
+                | ReadError::PastEnd { .. }
+                | ReadError::NotCommitBoundary { .. },
+            ),
+            Some(position),
+        ) => EngineError::InvalidPosition {
+            position: position.clone(),
+        },
+        (other, _) => storage(other),
+    })?;
+    if let (Some(position), Some(batch)) = (after, &batch)
+        && batch.header().is_some()
+        && decoded != checkpointed
+    {
+        return Err(EngineError::InvalidPosition {
+            position: position.clone(),
+        });
+    }
+    Ok(batch)
+}
+
+/// The batch a primary ships or a follower serves: `batch` with its positions and payload
+/// encoded.
+fn frame_batch(batch: &Batch) -> FrameBatch {
+    FrameBatch {
+        start: encode_position(batch.start()),
+        end: encode_position(batch.end()),
+        payload: batch.to_bytes().into(),
     }
 }
 
@@ -367,14 +381,7 @@ impl FrameSource for SqliteDatabase {
         &mut self,
         after: Option<&Position>,
     ) -> Result<Option<FrameBatch>, EngineError> {
-        let Some(batch) = self.read_wal(after)? else {
-            return Ok(None);
-        };
-        Ok(Some(FrameBatch {
-            start: encode_position(batch.start()),
-            end: encode_position(batch.end()),
-            payload: batch.to_bytes().into(),
-        }))
+        Ok(self.read_wal(after)?.as_ref().map(frame_batch))
     }
 
     fn checkpoint(&mut self) -> Result<CheckpointMarker, EngineError> {

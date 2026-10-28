@@ -81,7 +81,7 @@ pub struct ReplicaInfo {
 }
 
 /// The result of a write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Written {
     /// The rows the statement inserted, updated, or deleted.
@@ -94,6 +94,10 @@ pub struct Written {
     /// Whether the database is under-replicated: fewer than R of its replicas were reachable, so
     /// the write can't reach them all until they come back.
     pub under_replicated: bool,
+    /// The primary that acknowledged the write, if it said.
+    pub primary: Option<NodeId>,
+    /// The epoch it acknowledged the write at, or 0 if it didn't say.
+    pub epoch: LeaseEpoch,
 }
 
 /// A client for a whole cluster.
@@ -229,9 +233,10 @@ impl Client {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT` if the statement fails, `FAILED_PRECONDITION` if the database has no
-    /// primary yet, `UNAVAILABLE` if the primary can't be reached, and `ABORTED` if the write
-    /// may or may not have taken effect, as when it committed on the primary but too few
-    /// replicas were reachable to acknowledge it.
+    /// primary yet, `UNAVAILABLE` if the primary can't be reached or the database is failing
+    /// over, and `ABORTED` if the write may or may not have taken effect, as when it committed on
+    /// the primary but too few replicas were reachable to acknowledge it. `UNAVAILABLE` and
+    /// `ABORTED` are worth retrying after a failover; an `ABORTED` write may then apply twice.
     pub async fn execute(
         &self,
         name: &DatabaseName,
@@ -253,6 +258,8 @@ impl Client {
             acknowledged_by: response.acknowledged_by,
             replicas: response.replicas,
             under_replicated: response.under_replicated,
+            primary: response.primary.parse().ok(),
+            epoch: LeaseEpoch::new(response.epoch),
         })
     }
 
@@ -370,7 +377,14 @@ fn placement_of(placement: Option<proto::Placement>) -> Result<proto::Placement,
 /// The address of the database's primary.
 fn primary_address(name: &DatabaseName, placement: &proto::Placement) -> Result<String, Status> {
     let primary = placement.primary.as_deref().ok_or_else(|| {
-        Status::failed_precondition(format!("database {name} has no primary yet"))
+        if placement.epoch > 0 {
+            Status::unavailable(format!(
+                "database {name} is failing over to epoch {}; retry",
+                placement.epoch
+            ))
+        } else {
+            Status::failed_precondition(format!("database {name} has no primary yet"))
+        }
     })?;
     placement
         .replicas

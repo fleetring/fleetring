@@ -50,8 +50,10 @@
 //! snapshot ([`FollowerProgress::needs_snapshot`]). The engine also refuses to continue from an
 //! earlier-generation position other than the one its last checkpoint recorded durably, so a
 //! primary that restarted, and no longer knows its last checkpoint in memory, still finds such a
-//! follower when it reads the log for it. Either way, the primary sends the follower `Reseed`,
-//! and the follower re-seeds its copy from a snapshot and acknowledges the snapshot's position.
+//! follower when it reads the log for it. A follower whose copy diverges from a new epoch's log
+//! before a point it can be cut back to says so in its first acknowledgement (ADR-0022). In every
+//! case, the primary sends the follower `Reseed`, and the follower re-seeds its copy from a
+//! snapshot and acknowledges the snapshot's position.
 //!
 //! # Snapshots
 //!
@@ -70,6 +72,7 @@
 
 mod archive;
 mod epochs;
+mod failover;
 mod follower;
 mod primary;
 mod snapshot;
@@ -86,6 +89,7 @@ use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{DatabaseName, LeaseEpoch, Quorums};
 use fleetring_proto::v1::replication_server::ReplicationServer;
 use fleetring_proto::v1::{DatabaseStatus, Role};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use self::epochs::Epochs;
@@ -102,6 +106,7 @@ use crate::sink::{
 use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
 
+pub use self::failover::{Fenced, PromotionRequest};
 pub use self::follower::ReplicationService;
 
 /// The metadata key on a `Replicate` stream that names the primary, so that a follower without a
@@ -260,6 +265,20 @@ pub enum ServePrimaryError {
         /// The engine.
         engine: EngineKind,
     },
+    /// This node has seen a newer epoch than the one it was asked to lead at.
+    #[error("epoch {epoch} is superseded: this node has seen epoch {highest}")]
+    Superseded {
+        /// The epoch it was asked to lead at.
+        epoch: LeaseEpoch,
+        /// The highest epoch it has seen.
+        highest: LeaseEpoch,
+    },
+    /// The node couldn't record that it leads the database.
+    #[error("can't record the lease: {reason}")]
+    Failed {
+        /// Why.
+        reason: String,
+    },
 }
 
 /// How far a primary's followers have got, as [`Replication::primary_status`] reports it.
@@ -289,7 +308,8 @@ pub struct FollowerProgress {
     pub reported: bool,
     /// Whether its stream is open.
     pub connected: bool,
-    /// Whether the log restarted past it, so it can only catch up from a snapshot (FR-032).
+    /// Whether the log can't catch it up, because the log restarted past it or its copy diverges
+    /// from this epoch's log, so it is being re-seeded from a snapshot.
     pub needs_snapshot: bool,
 }
 
@@ -327,6 +347,8 @@ struct Inner {
     execution: Execution,
     settings: ReplicationSettings,
     epochs: Epochs,
+    /// Promotions the control node asked this node to carry out.
+    promotions: watch::Sender<BTreeMap<DatabaseName, PromotionRequest>>,
     registry: OnceLock<Registry>,
     primaries: Mutex<BTreeMap<DatabaseName, Served>>,
     followers: Mutex<BTreeMap<DatabaseName, Arc<FollowerSlot>>>,
@@ -381,6 +403,7 @@ impl Replication {
             execution,
             settings,
             epochs: Epochs::new(state_dir.join("epochs")),
+            promotions: watch::Sender::new(BTreeMap::new()),
             registry: OnceLock::new(),
             primaries: Mutex::default(),
             followers: Mutex::default(),
@@ -416,7 +439,8 @@ impl Replication {
     /// Serves `database` as its primary at `role`'s epoch: opens a stream to each follower in its
     /// replica set, and from then on acknowledges its writes once the write quorum holds them.
     ///
-    /// Serving it again replaces the previous role and reopens every stream.
+    /// Serving it again replaces the previous role and reopens every stream. A node that holds a
+    /// lease calls [`lead`](Self::lead) instead, which records the epoch durably first.
     ///
     /// # Errors
     ///
@@ -435,7 +459,12 @@ impl Replication {
                 engine: self.inner.engine.kind(),
             });
         }
-        let primary = Arc::new(Primary::new(database.clone(), role));
+        let start = self
+            .inner
+            .epochs
+            .record(&database)
+            .start_of(role.epoch.get());
+        let primary = Arc::new(Primary::new(database.clone(), role, start));
         let driver = tokio::spawn(primary::drive(
             Arc::clone(&self.inner),
             Arc::clone(&primary),
@@ -594,7 +623,7 @@ impl DatabaseStatuses for Replication {
                 DatabaseStatus {
                     database: name.to_string(),
                     role: Role::Follower.into(),
-                    epoch: self.inner.epochs.highest(name).unwrap_or(0),
+                    epoch: self.inner.epochs.record(name).log_epoch(),
                     position: position.into_bytes(),
                 },
             );
@@ -731,7 +760,9 @@ fn refused(error: ReplicationError) -> Acknowledgement {
 
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
+    assert_debug_send_sync::<Fenced>();
     assert_debug_send_sync::<FollowerProgress>();
+    assert_debug_send_sync::<PromotionRequest>();
     assert_debug_send_sync::<FollowerStatus>();
     assert_debug_send_sync::<PrimaryRole>();
     assert_debug_send_sync::<PrimaryStatus>();

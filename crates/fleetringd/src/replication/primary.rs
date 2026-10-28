@@ -30,6 +30,9 @@ use crate::transport::replication_client;
 pub(super) struct Primary {
     name: DatabaseName,
     role: PrimaryRole,
+    /// Where the epoch's log began, if this node was promoted to it: followers whose logs came
+    /// from earlier epochs truncate back to it (ADR-0018, point 5).
+    start: Option<Position>,
     state: Mutex<State>,
     /// Bumped whenever a batch is published, a follower acknowledges, or a checkpoint ends, so
     /// streams and waiting writes look again.
@@ -85,10 +88,11 @@ enum Plan {
 }
 
 impl Primary {
-    pub(super) fn new(name: DatabaseName, role: PrimaryRole) -> Self {
+    pub(super) fn new(name: DatabaseName, role: PrimaryRole, start: Option<Position>) -> Self {
         Self {
             name,
             role,
+            start,
             state: Mutex::default(),
             changed: watch::Sender::new(0),
         }
@@ -661,6 +665,7 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
     let open = Message::Open(ReplicateOpen {
         database: primary.name.to_string(),
         epoch: primary.role.epoch.get(),
+        epoch_start: primary.start.clone().map(Position::into_bytes),
     });
     if outgoing.send(message(open)).await.is_err() {
         return stream_failed("stream closed");
@@ -685,6 +690,11 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
             return stream_failed("opening the stream timed out");
         }
     };
+    if first.needs_snapshot {
+        // The copy diverges from this epoch's log where it can't be cut back. Its position isn't
+        // on this log, so it is never counted as acknowledging anything.
+        return reseed(inner, primary, node, &outgoing, &mut acks, 0).await;
+    }
     let mut sent = held(first.position);
     primary.acknowledged(node, sent.clone(), settings.retained_bytes);
     tracing::debug!(database = %primary.name, follower = %node, position = ?sent, "replication stream open");
@@ -752,6 +762,10 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
         }
         tokio::select! {
             ack = acks.message() => match ack {
+                Ok(Some(ack)) if ack.needs_snapshot => {
+                    // The follower acknowledges nothing it was sent after this.
+                    return reseed(inner, primary, node, &outgoing, &mut acks, 0).await;
+                }
                 Ok(Some(ack)) => {
                     let position = held(ack.position);
                     while in_flight.front().is_some_and(|end| Some(end) <= position.as_ref()) {
@@ -812,8 +826,8 @@ fn log_moved_past(primary: &Primary, sent: Option<&Position>, error: &DatabaseEr
     ) && sent < primary.committed().as_ref()
 }
 
-/// Has `node` replace its copy with a snapshot, because the log no longer holds what it needs,
-/// and waits until it acknowledges the snapshot's position. Acknowledgements of the `in_flight`
+/// Has `node` replace its copy with a snapshot, because the log no longer holds what it needs or
+/// its copy doesn't follow the log, and waits until it acknowledges the snapshot's position. Acknowledgements of the `in_flight`
 /// batches sent before arrive first.
 async fn reseed(
     inner: &Inner,
@@ -824,7 +838,7 @@ async fn reseed(
     in_flight: usize,
 ) -> StreamEnd {
     primary.needs_snapshot(node);
-    tracing::info!(database = %primary.name, follower = %node, "follower is behind the last checkpoint; re-seeding it from a snapshot");
+    tracing::info!(database = %primary.name, follower = %node, "the log can't catch the follower up; re-seeding it from a snapshot");
     let request = message(Message::Reseed(proto::Reseed {
         epoch: primary.role.epoch.get(),
     }));

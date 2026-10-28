@@ -3,7 +3,7 @@
 use fleetring::{Host, Node, NodeId, Weight, Zone};
 use serde::{Deserialize, Serialize};
 
-use crate::{DatabaseName, Position, Timestamp};
+use crate::{DatabaseName, LeaseEpoch, Position, Timestamp};
 
 /// A member's placement attributes, the ID, zone, host, and weight that the ring places by, and
 /// the address its peers reach it at.
@@ -164,6 +164,13 @@ pub struct HostedReplica {
     database: DatabaseName,
     role: Role,
     position: Position,
+    // Absent from logs written before replicas reported it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    log_epoch: LeaseEpoch,
+}
+
+fn is_zero(epoch: &LeaseEpoch) -> bool {
+    *epoch == LeaseEpoch::ZERO
 }
 
 impl HostedReplica {
@@ -175,7 +182,25 @@ impl HostedReplica {
             database,
             role,
             position,
+            log_epoch: LeaseEpoch::ZERO,
         }
+    }
+
+    /// Says that the last frames of the replica's log came from the primary of `log_epoch`.
+    ///
+    /// Promotions rank candidates by this epoch before their positions, because positions on
+    /// logs written by different primaries don't compare (ADR-0018). A replica that doesn't
+    /// report it counts as epoch 0.
+    #[must_use]
+    pub fn with_log_epoch(mut self, log_epoch: LeaseEpoch) -> Self {
+        self.log_epoch = log_epoch;
+        self
+    }
+
+    /// Returns the epoch of the primary that wrote the last frames of the replica's log.
+    #[must_use]
+    pub fn log_epoch(&self) -> LeaseEpoch {
+        self.log_epoch
     }
 
     /// Returns the database.
@@ -203,6 +228,7 @@ impl HostedReplica {
                 role: self.role,
                 position: self.position,
                 at,
+                log_epoch: self.log_epoch,
             },
         )
     }
@@ -214,6 +240,9 @@ pub struct Report {
     role: Role,
     position: Position,
     at: Timestamp,
+    // Absent from states written before replicas reported it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    log_epoch: LeaseEpoch,
 }
 
 impl Report {
@@ -233,5 +262,12 @@ impl Report {
     #[must_use]
     pub fn at(&self) -> Timestamp {
         self.at
+    }
+
+    /// Returns the epoch of the primary that wrote the last frames of the member's log, or
+    /// [`LeaseEpoch::ZERO`] if it didn't say.
+    #[must_use]
+    pub fn log_epoch(&self) -> LeaseEpoch {
+        self.log_epoch
     }
 }

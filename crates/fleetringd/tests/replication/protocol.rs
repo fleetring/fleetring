@@ -18,6 +18,7 @@ fn open(database: &str, epoch: u64) -> ReplicateMessage {
         message: Some(Message::Open(ReplicateOpen {
             database: database.to_owned(),
             epoch,
+            epoch_start: None,
         })),
     }
 }
@@ -92,6 +93,57 @@ async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResu
     })
     .await?;
     cluster.await_caught_up("a", &db).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_whose_copy_the_frames_dont_continue_asks_for_a_snapshot() -> TestResult {
+    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
+    let db = name("unfollowable");
+    cluster.create("a", &db, 2).await?;
+    let peers = Peers::new(TransportConfig::default());
+    let mut client = replication_client(peers.channel(cluster.address("b").parse()?));
+    let (sender, receiver) = mpsc::channel(8);
+    sender.send(open("unfollowable", 1)).await?;
+    let mut acks = client
+        .replicate(ReceiverStream::new(receiver))
+        .await?
+        .into_inner();
+    let first = guarded("the first acknowledgement", acks.message())
+        .await??
+        .ok_or("no acknowledgement")?;
+    assert!(!first.needs_snapshot);
+
+    // Frames that start where the copy is but don't continue its log.
+    let foreign = |end: u8| ReplicateMessage {
+        message: Some(Message::Batch(Batch {
+            epoch: 1,
+            start: first.position.clone(),
+            end: vec![end; 20],
+            payload: vec![0xa5; 64],
+        })),
+    };
+    sender.send(foreign(0xfe)).await?;
+    let reply = guarded("the reply to foreign frames", acks.message())
+        .await??
+        .ok_or("no reply")?;
+    assert!(reply.needs_snapshot, "{reply:?}");
+    assert_eq!(reply.position, first.position);
+
+    // Until it is re-seeded, the copy takes no frames and acknowledges none.
+    sender.send(foreign(0xff)).await?;
+    drop(sender);
+    let ended = guarded("the stream ending", acks.message()).await??;
+    assert!(ended.is_none(), "{ended:?}");
+    let status = cluster
+        .node("b")
+        .replication
+        .follower_status(&db)
+        .ok_or("not following")?;
+    assert_eq!(
+        status.position.map(|position| position.into_bytes()),
+        Some(first.position)
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

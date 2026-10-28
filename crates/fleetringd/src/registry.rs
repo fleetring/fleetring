@@ -200,6 +200,24 @@ impl Registry {
         }
     }
 
+    /// Closes `name` if it is open, after it finishes the requests it already accepted, and
+    /// waits until it has closed.
+    ///
+    /// A request that arrives later opens it again.
+    ///
+    /// # Panics
+    ///
+    /// If the registry's lock was poisoned by a panic in another thread.
+    pub async fn close(&self, name: &DatabaseName) {
+        let closed = self.inner.lock().entries.get_mut(name).map(|entry| {
+            entry.begin_closing();
+            entry.closed.clone()
+        });
+        if let Some(closed) = closed {
+            wait_closed(closed).await;
+        }
+    }
+
     /// The directory that holds `name`'s storage, whether or not it is open.
     pub(crate) fn location(&self, name: &DatabaseName) -> PathBuf {
         self.inner.root.join(layout::database_dir(name))

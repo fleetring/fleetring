@@ -96,6 +96,8 @@ impl Database for DatabaseService {
             acknowledged_by: acknowledged.acknowledged_by,
             under_replicated: acknowledged.is_under_replicated(),
             replicas: acknowledged.replicas,
+            primary: self.node.id().to_string(),
+            epoch: lease.epoch.get(),
         }))
     }
 

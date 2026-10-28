@@ -30,8 +30,8 @@ pub enum Operation {
         /// The node.
         node: NodeId,
     },
-    /// Removes `node`, as an operator on the control host would. There is no `Leave` RPC yet, so
-    /// it is submitted to the control node in process.
+    /// Removes `node`, as an operator on the control host would: it is submitted to the control
+    /// node in process, not through the `Leave` RPC a node calls when it shuts down.
     Leave {
         /// The node.
         node: NodeId,
@@ -219,6 +219,10 @@ pub enum Ack {
         replicas: u32,
         /// Whether fewer than R of the database's replicas were reachable.
         under_replicated: bool,
+        /// The primary that acknowledged it, if it said.
+        primary: Option<NodeId>,
+        /// The epoch it acknowledged it at, or 0 if it didn't say.
+        epoch: LeaseEpoch,
     },
 }
 
@@ -244,10 +248,15 @@ impl fmt::Display for Ack {
                 acknowledged_by,
                 replicas,
                 under_replicated,
+                primary,
+                epoch,
             } => {
                 write!(f, "written to {acknowledged_by} of {replicas}")?;
                 if *under_replicated {
                     f.write_str(", under-replicated")?;
+                }
+                if let Some(primary) = primary {
+                    write!(f, " by {primary} at epoch {}", epoch.get())?;
                 }
                 Ok(())
             }

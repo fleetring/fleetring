@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use fleetring::{BuildRingError, Epoch, Node, NodeId, ReplicationFactor, Ring};
 use serde::{Deserialize, Serialize};
 
+use crate::apply::plan_promotion;
 use crate::{
     ControlConfig, Database, DatabaseName, Liveness, Member, Quorums, Rejection, Report, Timestamp,
 };
@@ -163,6 +164,54 @@ impl State {
     pub fn quorums(&self, database: &DatabaseName) -> Result<Quorums, Rejection> {
         let replicas = self.replica_set(database)?;
         Ok(quorums_for(replicas.len()))
+    }
+
+    /// Returns every database a `StartPromotion` stamped `at` would start a promotion for, in
+    /// name order.
+    ///
+    /// That is every database whose lease expired more than the failover margin before `at`,
+    /// with no promotion in progress, or one whose candidate is down or has stalled, and with a
+    /// live candidate. The control node asks this on a timer, so that a failover starts without
+    /// waiting for traffic and without logging commands that would only be rejected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring::ReplicationFactor;
+    /// use fleetring_control::{
+    ///     apply, Action, Command, ControlConfig, Engine, HostedReplica, Member, Position, Role,
+    ///     State, Timestamp,
+    /// };
+    ///
+    /// let mut state = State::new(ControlConfig::new());
+    /// let run = |state: &mut State, millis, action| {
+    ///     apply(state, Command::new(Timestamp::from_millis(millis), action))
+    /// };
+    /// for id in ["a", "b"] {
+    ///     run(&mut state, 0, Action::Join { member: Member::new(id.parse()?) })?;
+    /// }
+    /// let db = || "tenant:acme".parse();
+    /// run(&mut state, 0, Action::CreateDatabase {
+    ///     name: db()?,
+    ///     replication_factor: ReplicationFactor::new(2).ok_or("zero")?,
+    ///     engine: Engine::Sqlite,
+    /// })?;
+    /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
+    /// // "b" keeps reporting its copy; "a" goes quiet.
+    /// let report = HostedReplica::new(db()?, Role::Follower, Position::new([1]));
+    /// run(&mut state, 12_000, Action::Heartbeat { id: "b".parse()?, replicas: vec![report] })?;
+    /// assert!(state.promotions_due(Timestamp::from_millis(11_000)).is_empty());
+    /// assert_eq!(state.promotions_due(Timestamp::from_millis(12_001)), vec![db()?]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn promotions_due(&self, at: Timestamp) -> Vec<DatabaseName> {
+        let at = at.max(self.now);
+        self.databases
+            .keys()
+            .filter(|name| plan_promotion(self, at, name).is_ok())
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn database_or_reject(&self, name: &DatabaseName) -> Result<&Database, Rejection> {

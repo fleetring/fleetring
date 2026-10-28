@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CreateDatabaseRequest, CreateDatabaseResponse, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LocateRequest, LocateResponse,
-    MembershipUpdate, RenewLeaseRequest, WatchMembershipRequest,
+    AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, LocateRequest,
+    LocateResponse, MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
@@ -27,10 +29,10 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 /// - **Redirects:** a reply of "not the leader, try X" (see [`not_leader`](super::not_leader))
 ///   switches the client to X and repeats the call there, so callers never see it. Later calls
 ///   go straight to X.
-/// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `renew_lease`, and opening
-///   `watch_membership`) retry transient failures with [`retry`]. `create_database` and
-///   `acquire_lease` are sent once per leader, because a lost reply would make a retry fail with
-///   "already exists".
+/// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `renew_lease`,
+///   `record_fenced`, and opening `watch_membership`) retry transient failures with [`retry`].
+///   `create_database`, `acquire_lease`, `leave`, `start_promotion`, and `complete_promotion`
+///   are sent once per leader, because a lost reply would make a retry fail as already done.
 ///
 /// Cloning is cheap; clones share the current leader and connections.
 #[derive(Clone)]
@@ -217,6 +219,68 @@ impl ControlClient {
         self.retrying(|mut client| {
             let request = request.clone();
             async move { client.renew_lease(request).await }
+        })
+        .await
+    }
+
+    /// Leaves the cluster. Sent once per leader, not retried.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn leave(&self, request: LeaveRequest) -> Result<LeaveResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<Channel>| {
+            let request = request.clone();
+            async move { client.leave(request).await }
+        })
+        .await
+    }
+
+    /// Starts a promotion. Sent once per leader, not retried.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn start_promotion(
+        &self,
+        request: StartPromotionRequest,
+    ) -> Result<PromotionResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<Channel>| {
+            let request = request.clone();
+            async move { client.start_promotion(request).await }
+        })
+        .await
+    }
+
+    /// Records a fenced member. Retried: recording one twice fails with `ALREADY_EXISTS`, which
+    /// means it is recorded.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt.
+    pub async fn record_fenced(
+        &self,
+        request: RecordFencedRequest,
+    ) -> Result<RecordFencedResponse, Status> {
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.record_fenced(request).await }
+        })
+        .await
+    }
+
+    /// Completes a promotion. Sent once per leader, not retried.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn complete_promotion(
+        &self,
+        request: CompletePromotionRequest,
+    ) -> Result<CompletePromotionResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<Channel>| {
+            let request = request.clone();
+            async move { client.complete_promotion(request).await }
         })
         .await
     }
