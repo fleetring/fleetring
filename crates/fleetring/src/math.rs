@@ -166,9 +166,10 @@ mod tests {
     #[test]
     fn is_non_increasing_across_a_strided_sweep() {
         // 2²⁰ points spread over the whole domain, plus every value near both ends.
+        // Step in u64: the stride doesn't fit in a 32-bit usize (i686, wasm32).
         let stride = u64::MAX / (1 << 20);
         let mut previous = neg_log2_q32(0);
-        for x in (0..=u64::MAX - stride).step_by(usize::try_from(stride).expect("64-bit host")) {
+        for x in (0..1u64 << 20).map(|step| step * stride) {
             let current = neg_log2_q32(x);
             assert!(
                 current <= previous,
