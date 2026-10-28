@@ -31,3 +31,16 @@ Every committed transaction reaches the database's followers as a frame batch, a
 - [ ] No write is acknowledged before W replicas have fsynced it (tested with a follower that delays its acknowledgements).
 - [ ] Simulation: with partitions and follower restarts during writes, every acknowledged write is on at least W replicas, and every follower converges once the network heals.
 - [ ] Throughput and p99 acknowledgement latency for small transactions are measured and recorded in `docs/perf.md`.
+
+## Notes from FR-026
+
+- **Plug in:** implement `ReplicationSink` and pass it to `Registry::new`. Its `Acknowledgement` completes once W − 1 followers have acknowledged. The actor publishes right after each commit without blocking; the writer waits on the acknowledgement, so batches can pipeline.
+- **Primary side:**
+  - `DatabaseHandle::committed_since(Some(follower_ack))` catches a follower up;
+  - `checkpoint()` returns the marker to ship (RESTART, not TRUNCATE; see ADR-0016 point 7);
+  - `position()` goes into heartbeats;
+  - `snapshot(dir)` gives a new follower its initial copy. Followers must start from a snapshot, never from an empty file.
+- **Follower side:** take the `EngineCapability::FrameSource` capability, call `open_follower(dir)`, then `apply(&batch)`, which fsyncs before returning, and acknowledge the returned position. Call `checkpoint(&marker)` on markers. These calls block, so run them on a blocking thread.
+- **`Daemon` doesn't own a `Registry` yet.** Wire it in here or in FR-033.
+- **Known cost:** capture rereads the whole WAL on every commit. The checkpoint threshold keeps that bounded; an incremental reader in `fleetring-wal` would remove it.
+- **Two `Position` types:** `fleetringd::engine::Position` and `fleetring_control::Position`, with conversions between them. Consider one shared type in a small common crate.
