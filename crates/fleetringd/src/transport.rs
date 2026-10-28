@@ -296,4 +296,27 @@ pub mod sim {
             )),
         )
     }
+
+    /// A channel to `address`, given as `host:port`, on the simulated network.
+    ///
+    /// Its signature fits [`ControlClient::with_connector`](crate::control::ControlClient::with_connector),
+    /// so a control client can follow redirects between simulated hosts.
+    ///
+    /// # Errors
+    ///
+    /// The transport error if the endpoint can't be built.
+    pub fn channel_to(address: &str) -> Result<Channel, tonic::transport::Error> {
+        let address = address.to_owned();
+        Ok(
+            Endpoint::try_from("http://simulated")?.connect_with_connector_lazy(tower::service_fn(
+                move |_uri| {
+                    let address = address.clone();
+                    async move {
+                        let stream = turmoil::net::TcpStream::connect(address.as_str()).await?;
+                        Ok::<_, io::Error>(TokioIo::new(stream))
+                    }
+                },
+            )),
+        )
+    }
 }

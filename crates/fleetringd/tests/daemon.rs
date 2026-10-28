@@ -21,7 +21,8 @@ fn a_minimal_config_defaults_to_both_roles_and_weight_one() -> TestResult {
     assert_eq!(config.node.weight.get(), 1);
     assert_eq!(config.role, Role::Both);
     assert!(config.role.hosts_data() && config.role.runs_control());
-    assert_eq!(config.control, None);
+    assert_eq!(config.control.address, None);
+    assert_eq!(config.control, fleetringd::ControlSettings::default());
     Ok(())
 }
 
@@ -51,7 +52,7 @@ fn a_data_only_node_needs_the_control_address() {
         matches!(
             error,
             ConfigError::Missing {
-                field: "control",
+                field: "control.address",
                 ..
             }
         ),
@@ -80,7 +81,7 @@ mod binary {
     fn write_config(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         let config = dir.join("node.toml");
         let text = format!(
-            "data_dir = {:?}\nlisten = \"127.0.0.1:7400\"\n\n[node]\nid = \"node-1\"\n",
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"node-1\"\n",
             dir.join("data")
         );
         std::fs::write(&config, text)?;

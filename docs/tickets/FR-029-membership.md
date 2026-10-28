@@ -28,3 +28,9 @@ Data nodes join the cluster and report liveness, and every node holds the same `
 - [ ] After a join, a leave, or a node going down, every live node publishes a ring with the same fingerprint within two heartbeat intervals (simulation test).
 - [ ] A node that misses heartbeats is marked down, and marked up again when they resume.
 - [ ] Ring lookups never wait on a membership update: readers only load the `ArcSwap`.
+
+## Notes from FR-028
+
+- Data nodes call `ControlClient::join`, run a heartbeat loop, and consume `watch_membership` (current membership first, then one update per epoch change), then rebuild the ring and publish it through `ArcSwap`.
+- A data-only role starts no server yet. This ticket adds it.
+- Liveness changes alone don't bump the membership epoch, so they don't produce a `WatchMembership` update. Decide whether data nodes need liveness pushed or can ask for it.

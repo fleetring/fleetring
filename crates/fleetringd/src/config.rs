@@ -3,9 +3,11 @@
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use fleetring::{Host, NodeId, Weight, Zone};
+use fleetring_control::{ControlConfig, Millis};
 use serde::Deserialize;
 
 /// Everything a daemon needs to start.
@@ -13,14 +15,18 @@ use serde::Deserialize;
 /// ```toml
 /// data_dir = "/var/lib/fleetring"
 /// listen = "0.0.0.0:7400"
-/// control = "10.0.0.1:7400"
 /// role = "data"
 ///
 /// [node]
 /// id = "laptop-1"
 /// zone = "home"
 /// weight = 2
+///
+/// [control]
+/// address = "10.0.0.1:7400"
 /// ```
+///
+/// The `[control]` table also holds the control node's timings; see [`ControlSettings`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -30,9 +36,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// The address this node serves on.
     pub listen: SocketAddr,
-    /// The control node's address. Required unless this node runs the control role itself.
+    /// How to reach the control plane, and how the control node runs.
     #[serde(default)]
-    pub control: Option<SocketAddr>,
+    pub control: ControlSettings,
     /// Which roles this daemon runs.
     #[serde(default)]
     pub role: Role,
@@ -57,6 +63,61 @@ pub struct NodeConfig {
 
 fn default_weight() -> Weight {
     Weight::ONE
+}
+
+/// The `[control]` table: the control node's address, and the settings it runs with.
+///
+/// Every field is optional. The timings are those of `fleetring_control::ControlConfig`; they
+/// apply when the control node creates its log, and an existing log keeps the timings it was
+/// created with.
+///
+/// ```toml
+/// [control]
+/// address = "10.0.0.1:7400"   # required on a data-only node
+/// lease_duration_ms = 10000
+/// failover_margin_ms = 2000
+/// heartbeat_timeout_ms = 5000
+/// snapshot_every = 1000       # commands between snapshots
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlSettings {
+    /// The control node's address. Required unless this node runs the control role itself.
+    pub address: Option<SocketAddr>,
+    /// How long a lease lasts after it is granted or renewed, in milliseconds.
+    pub lease_duration_ms: NonZeroU64,
+    /// How long past a lease's expiry the control node waits before failing over, in
+    /// milliseconds.
+    pub failover_margin_ms: u64,
+    /// How long a member stays live after its last heartbeat, in milliseconds.
+    pub heartbeat_timeout_ms: NonZeroU64,
+    /// How many commands the control node applies between snapshots.
+    pub snapshot_every: NonZeroU64,
+}
+
+impl ControlSettings {
+    /// Returns the timing rules for a new control state.
+    #[must_use]
+    pub fn control_config(&self) -> ControlConfig {
+        ControlConfig::new()
+            .with_lease_duration(Millis::new(self.lease_duration_ms.get()))
+            .with_failover_margin(Millis::new(self.failover_margin_ms))
+            .with_heartbeat_timeout(Millis::new(self.heartbeat_timeout_ms.get()))
+    }
+}
+
+impl Default for ControlSettings {
+    fn default() -> Self {
+        let config = ControlConfig::new();
+        let nonzero = |millis: Millis| NonZeroU64::new(millis.get()).unwrap_or(NonZeroU64::MIN);
+        Self {
+            address: None,
+            lease_duration_ms: nonzero(config.lease_duration()),
+            failover_margin_ms: config.failover_margin().get(),
+            heartbeat_timeout_ms: nonzero(config.heartbeat_timeout()),
+            snapshot_every: crate::control::ControlOptions::default().snapshot_every(),
+        }
+    }
 }
 
 /// Which roles a daemon runs (ADR-0015, point 2).
@@ -143,9 +204,9 @@ impl Config {
     ///
     /// [`ConfigError::Missing`] if a field this role needs is absent.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.role == Role::Data && self.control.is_none() {
+        if self.role == Role::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
-                field: "control",
+                field: "control.address",
                 reason: "a data-only node must know the control node's address",
             });
         }
