@@ -147,6 +147,19 @@ jobs:
       - run: cargo test -p fleetring --all-features --release --target wasm32-wasip1 --no-fail-fast
       - run: cargo build -p fleetring --all-features --target wasm32-unknown-unknown
 
+  # An implementation written from docs/spec/placement-v1.md alone must reproduce every golden
+  # vector, which shows the spec, not just the Rust crate, defines placement (FR-014).
+  spec-reference:
+    name: spec reference (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install xxhash
+      - run: python scripts/placement_ref.py crates/fleetring/tests/vectors/placement-v1.json
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

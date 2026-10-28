@@ -1,7 +1,7 @@
 ---
 id: FR-014
 title: Placement spec v1, golden vectors, and an independent reference check
-status: todo
+status: done
 priority: P1
 size: L
 milestone: M3 Change and interop
@@ -42,14 +42,22 @@ Make placement verifiable across platforms, crate versions, and languages, and p
     - empty keys, non-UTF-8 keys, and 1 KiB keys
     - liveness filters
     - bounded-load views, including saturation
-- **Generator:** `cargo xtask vectors`, in a new `crates/xtask` with `publish = false` and an alias in `.cargo/config.toml`. It only appends new cases and refuses to change existing ones.
+- **Generator:** an `#[ignore]` test in `src/vectors.rs`, which can read private items such as the log table. Run `FLEETRING_WRITE_VECTORS=1 cargo test -p fleetring --all-features --lib vectors -- --ignored`. It only appends new cases and refuses to change existing ones; without the variable, it fails if the file is stale.
 - **Conformance test:** embeds the vector file with `include_str!`, so it runs on WASI and emulated targets that have no filesystem access.
-- **Freeze guard:** a test fails if any existing case's expected output changes. Check it against a committed SHA-256 of the canonicalized existing cases.
+- **Freeze guard:** `placement-v1.lock` holds append-only checkpoints, `<count> <XXH3-64 digest>`, computed over the canonical form of the reference sections plus the first `count` cases. A test fails if any frozen case changes.
 - **Independent reference:** `scripts/placement_ref.py` is a minimal implementation written only from the spec, using the PyPI `xxhash` package and plain integer math. A small CI job runs it against the vector file.
 
 ## Acceptance criteria
 
-- [ ] The Python reference passes every vector. This is the proof that the spec is complete and portable, and it lowers the risk for the v0.2 TypeScript and Python SDKs.
-- [ ] The vectors pass on every CI target: Linux, macOS, Windows, i686, s390x, and wasm32-wasip1.
-- [ ] Changing an existing expected value fails CI.
-- [ ] The spec header says `Status: Draft` until FR-019 changes it to `Final`.
+- [x] The Python reference passes every vector. This is the proof that the spec is complete and portable, and it lowers the risk for the v0.2 TypeScript and Python SDKs.
+- [ ] The vectors pass on every CI target: Linux, macOS, Windows, i686, s390x, and wasm32-wasip1. *(They pass on aarch64-apple-darwin, and are embedded with `include_str!` for the other targets. Waiting on FR-002's first CI run.)*
+- [x] Changing an existing expected value fails CI.
+- [x] The spec header says `Status: Draft` until FR-019 changes it to `Final`.
+
+## Progress
+
+- 2026-10-28: Done. A subagent built it in an isolated copy, and I merged and re-verified it.
+  - **Vectors:** 49 cases (30 rendezvous, 19 vnodes) with 892 key entries, 16 filter scenarios, and 25 bounded-load scenarios (300 placements, 108 of them saturated). The file also includes the 39 XXH3 vectors, all 1025 table entries, and 65 `L(x)` pairs. It even pins an exact rendezvous tie that a brute-force search found.
+  - **Python reference:** `scripts/placement_ref.py` was written from the spec text and passes every vector. The new `spec-reference` CI job runs it.
+- Spec fix found by the Python reference: §9 said a placement is saturated when it has fewer than R members, but the implementation uses r = min(R, N). The spec and ADR-0007 now say r, and `home` and N are defined. Rust behavior is unchanged.
+- Freeze lock: `49 eef9c811be4bedef`.

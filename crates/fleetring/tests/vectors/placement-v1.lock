@@ -1,0 +1,15 @@
+# Freeze guard for placement-v1.json: the golden vectors are append-only (ADR-0008, FR-014).
+#
+# Each line `<count> <digest>` is a checkpoint that freezes the file's xxh3_64, log2_table, and
+# neg_log2_q32 sections and its first <count> cases. <digest> is the XXH3-64, seed 0, of their
+# canonical form (compact JSON with object keys sorted bytewise; see
+# crates/fleetring/src/vectors.rs) as 16 lowercase hex digits. The unit tests check every line,
+# so editing, reordering, or removing a frozen case fails, while appending a case doesn't.
+#
+# This file is append-only too: never edit or remove a line. To add cases, append them to the
+# catalog in crates/fleetring/src/vectors.rs and run
+#
+#     FLEETRING_WRITE_VECTORS=1 cargo test -p fleetring --all-features --lib vectors -- --ignored
+#
+# which appends the new cases to placement-v1.json and one checkpoint covering them here.
+49 eef9c811be4bedef

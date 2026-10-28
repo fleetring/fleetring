@@ -33,7 +33,7 @@ The control db already holds an authoritative db→node map (ADR-0001), and clie
    - **Binding.** The view borrows the ring, so a snapshot can't be used with a different ring. Building a view fails on node IDs the ring doesn't know.
    - **Capacity.** Node *i*'s capacity is `⌈(100 + ε%) · (total + r·item) · wᵢ / (100 · W)⌉`, computed in `u128` (ADR-0003). Here `total` is the current load summed over all nodes, `r` is the number of replicas being placed (`min(R, N)`), and `W` is the ring's total weight. The implementation evaluates the formula as `⌊q/d⌋·f + ⌈(q mod d)·f/d⌉` so that no intermediate value overflows.
    - **Selection.** The policy picks `replicas_where(key, |n| load(n) + item ≤ capacity(n))`, which keeps zone and host diversity (ADR-0006). This is the MTZ forwarding rule applied to our preference order.
-   - **Saturation.** If fewer than R nodes are eligible, which can happen with large items, the remaining slots are filled from the unfiltered preference list and the result reports `is_saturated()`. The policy never fails and never returns an empty set.
+   - **Saturation.** If fewer than r = min(R, N) nodes are eligible, which can happen with large items, the remaining slots are filled from the unfiltered preference list and the result reports `is_saturated()`. A placement is saturated exactly when some replica sits on a node without room. The policy never fails and never returns an empty set.
    - **Home placement check.** `is_home()` reports whether the result matches home placement. If it doesn't, the daemon must record an override.
    - **Determinism.** The same ring, key, loads, ε, and item load give the same result on every platform.
 

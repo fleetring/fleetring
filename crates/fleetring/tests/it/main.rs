@@ -10,4 +10,5 @@ mod labels;
 mod placement;
 mod ring;
 mod spec;
+mod vectors;
 mod vnodes;

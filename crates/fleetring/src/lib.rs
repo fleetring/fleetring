@@ -291,6 +291,8 @@ mod spec;
 mod strategy;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+#[cfg(test)]
+mod vectors;
 mod vnodes;
 
 pub use bounded::{BoundedLoads, BoundedPlacement, Headroom, LoadView, LoadViewError};
