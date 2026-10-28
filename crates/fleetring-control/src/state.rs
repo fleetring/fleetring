@@ -131,8 +131,8 @@ impl State {
     /// Returns [`BuildRingError::NoNodes`] if the cluster has no members. `apply` rejects joins
     /// that would make any other error possible.
     pub fn ring(&self) -> Result<Ring, BuildRingError> {
-        build_ring(
-            self.members.values().map(|entry| entry.member.to_node()),
+        membership_ring(
+            self.members.values().map(|entry| &entry.member),
             self.membership_epoch,
         )
     }
@@ -187,6 +187,41 @@ impl State {
     pub(crate) fn is_live(&self, id: &NodeId, at: Timestamp) -> bool {
         self.liveness(id, at) == Some(Liveness::Live)
     }
+}
+
+/// Builds the ring the control plane places by: `members` at `epoch`, with the default strategy
+/// and seed.
+///
+/// [`State::ring`] calls it, and so must every node that rebuilds the ring from a membership it
+/// was sent, so that all of them compute the same fingerprint. The order of `members` doesn't
+/// matter.
+///
+/// # Errors
+///
+/// [`BuildRingError::NoNodes`] if `members` is empty, or another [`BuildRingError`] if the
+/// members can't form a ring, which `apply` never lets a membership reach.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring_control::{apply, membership_ring, Action, Command, ControlConfig, Member, State, Timestamp};
+///
+/// let mut state = State::new(ControlConfig::new());
+/// let members = [Member::new("a".parse()?), Member::new("b".parse()?)];
+/// for member in &members {
+///     let join = Action::Join { member: member.clone() };
+///     apply(&mut state, Command::new(Timestamp::from_millis(0), join))?;
+/// }
+/// let rebuilt = membership_ring(members.iter().rev(), state.membership_epoch())?;
+/// assert_eq!(rebuilt.fingerprint(), state.ring()?.fingerprint());
+/// assert_eq!(rebuilt.epoch(), state.membership_epoch());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn membership_ring<'a>(
+    members: impl IntoIterator<Item = &'a Member>,
+    epoch: Epoch,
+) -> Result<Ring, BuildRingError> {
+    build_ring(members.into_iter().map(Member::to_node), epoch)
 }
 
 /// Builds a ring over `nodes` at `epoch` with the default strategy and seed.

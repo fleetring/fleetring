@@ -12,6 +12,7 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
 fleetring = { path = "../fleetring", features = ["serde"] }
 fleetring-control = { version = "0.0.0", path = "../fleetring-control" }

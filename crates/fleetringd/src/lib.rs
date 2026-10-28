@@ -15,14 +15,19 @@ mod daemon;
 mod data_dir;
 pub mod engine;
 mod layout;
+mod membership;
 mod registry;
 mod sink;
 pub mod transport;
 
 pub use actor::{DatabaseError, DatabaseHandle};
-pub use config::{Config, ConfigError, ControlSettings, NodeConfig, Role};
+pub use config::{
+    Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, MembershipSettings, NodeConfig,
+    Role,
+};
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
+pub use membership::{Membership, MembershipTasks, MembershipView};
 pub use registry::Registry;
 pub use sink::{Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink};
 
@@ -42,6 +47,10 @@ const _: () = {
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
     assert_debug_send_sync::<Daemon>();
+    assert_debug_send_sync::<Membership>();
+    assert_debug_send_sync::<MembershipSettings>();
+    assert_debug_send_sync::<MembershipTasks>();
+    assert_debug_send_sync::<MembershipView>();
     assert_debug_send_sync::<StartError>();
 
     // The log owns a SQLite connection, which moves between threads but isn't shared.

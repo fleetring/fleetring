@@ -5,9 +5,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fleetring::{Host, NodeId, Weight, Zone};
-use fleetring_control::{ControlConfig, Millis};
+use fleetring_control::{ControlConfig, Member, Millis};
 use serde::Deserialize;
 
 use crate::engine::EngineConfig;
@@ -28,7 +29,8 @@ use crate::engine::EngineConfig;
 /// address = "10.0.0.1:7400"
 /// ```
 ///
-/// The `[control]` table also holds the control node's timings; see [`ControlSettings`].
+/// The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
+/// `[membership]` table sets how often a data node sends heartbeats; see [`MembershipSettings`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -47,6 +49,9 @@ pub struct Config {
     /// How the data role runs its open databases.
     #[serde(default)]
     pub engine: EngineConfig,
+    /// How the data role reports to the control plane.
+    #[serde(default)]
+    pub membership: MembershipSettings,
 }
 
 /// A node's identity and the attributes placement uses.
@@ -68,6 +73,59 @@ pub struct NodeConfig {
 
 fn default_weight() -> Weight {
     Weight::ONE
+}
+
+impl NodeConfig {
+    /// Returns the member this node joins the cluster as.
+    #[must_use]
+    pub fn to_member(&self) -> Member {
+        let mut member = Member::new(self.id.clone()).with_weight(self.weight);
+        if let Some(zone) = &self.zone {
+            member = member.with_zone(zone.clone());
+        }
+        if let Some(host) = &self.host {
+            member = member.with_host(host.clone());
+        }
+        member
+    }
+}
+
+/// How many heartbeat intervals must fit in the control plane's heartbeat timeout, so that a node
+/// survives two lost heartbeats without being marked down.
+pub const HEARTBEATS_PER_TIMEOUT: u64 = 3;
+
+/// The `[membership]` table: how a data node reports to the control plane.
+///
+/// ```toml
+/// [membership]
+/// heartbeat_interval_ms = 1000
+/// ```
+///
+/// [`HEARTBEATS_PER_TIMEOUT`] intervals must fit in `control.heartbeat_timeout_ms`. A data-only
+/// node checks this against its own `[control]` table, so keep that table's timeout equal to the
+/// control node's.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MembershipSettings {
+    /// How often the node sends a heartbeat, in milliseconds. The node also retries a failed
+    /// join, and reopens a broken membership stream, at this interval.
+    pub heartbeat_interval_ms: NonZeroU64,
+}
+
+impl MembershipSettings {
+    /// Returns the heartbeat interval.
+    #[must_use]
+    pub fn heartbeat_interval(&self) -> Duration {
+        Duration::from_millis(self.heartbeat_interval_ms.get())
+    }
+}
+
+impl Default for MembershipSettings {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: NonZeroU64::new(1_000).unwrap_or(NonZeroU64::MIN),
+        }
+    }
 }
 
 /// The `[control]` table: the control node's address, and the settings it runs with.
@@ -175,6 +233,14 @@ pub enum ConfigError {
         /// Why the field is needed.
         reason: &'static str,
     },
+    /// A field's value conflicts with another field.
+    #[error("config field `{field}` is invalid: {reason}")]
+    Invalid {
+        /// The invalid field.
+        field: &'static str,
+        /// What is wrong with it.
+        reason: String,
+    },
 }
 
 impl Config {
@@ -207,12 +273,25 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Missing`] if a field this role needs is absent.
+    /// [`ConfigError::Missing`] if a field this role needs is absent, and
+    /// [`ConfigError::Invalid`] if a data node's heartbeat interval isn't well below the heartbeat
+    /// timeout.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.role == Role::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
                 field: "control.address",
                 reason: "a data-only node must know the control node's address",
+            });
+        }
+        let interval = self.membership.heartbeat_interval_ms.get();
+        let timeout = self.control.heartbeat_timeout_ms.get();
+        if self.role.hosts_data() && interval.saturating_mul(HEARTBEATS_PER_TIMEOUT) > timeout {
+            return Err(ConfigError::Invalid {
+                field: "membership.heartbeat_interval_ms",
+                reason: format!(
+                    "{interval} ms leaves room for fewer than {HEARTBEATS_PER_TIMEOUT} heartbeats \
+                     in control.heartbeat_timeout_ms ({timeout} ms)"
+                ),
             });
         }
         Ok(())

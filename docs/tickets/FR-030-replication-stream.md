@@ -44,3 +44,8 @@ Every committed transaction reaches the database's followers as a frame batch, a
 - **`Daemon` doesn't own a `Registry` yet.** Wire it in here or in FR-033.
 - **Known cost:** capture rereads the whole WAL on every commit. The checkpoint threshold keeps that bounded; an incremental reader in `fleetring-wal` would remove it.
 - **Two `Position` types:** `fleetringd::engine::Position` and `fleetring_control::Position`, with conversions between them. Consider one shared type in a small common crate.
+
+## Notes from FR-029
+
+- Heartbeats send an empty database list today. Let `Membership::start` take a source of `DatabaseStatus` entries (role and position per hosted database). The control plane answers a heartbeat naming an unknown database with `NOT_FOUND`, which the membership loop currently treats as "rejoin", so tell the two apart.
+- Add the `Replication` and `Database` services to the daemon's router in `daemon.rs::serve` with `add_optional_service`. Use `Membership::view()` for placement and peer liveness.

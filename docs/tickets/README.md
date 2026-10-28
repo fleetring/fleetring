@@ -69,7 +69,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-026](FR-026-database-actor.md) | Engine adapter and per-database actor | P0 | L | FR-022, FR-025 | done |
 | [FR-027](FR-027-control-state-machine.md) | Control state machine | P0 | M | FR-022 | done |
 | [FR-028](FR-028-control-node.md) | Control node service and client | P0 | M | FR-023, FR-027 | done |
-| [FR-029](FR-029-membership.md) | Membership, heartbeats, and ring publication | P0 | M | FR-028 | todo |
+| [FR-029](FR-029-membership.md) | Membership, heartbeats, and ring publication | P0 | M | FR-028 | done |
 | [FR-030](FR-030-replication-stream.md) | Replication stream and follower mirroring | P0 | L | FR-023, FR-026, FR-029 | todo |
 | [FR-031](FR-031-leases-failover.md) | Leases, epochs, quorums, and failover | P0 | L | FR-030 | todo |
 | [FR-032](FR-032-snapshot-catch-up.md) | Snapshot catch-up | P1 | M | FR-030 | todo |

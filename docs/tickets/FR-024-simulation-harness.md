@@ -31,3 +31,9 @@ Run whole clusters in one test process, on a simulated network and clock, with a
 - [ ] A test partitions and heals the network, and crashes and restarts a host.
 - [ ] A failing seed can be rerun alone with one command, which is printed on failure.
 - [ ] The fixed CI seeds finish in under two minutes.
+
+## Notes from FR-029
+
+- **Exact replay** needs `RUSTFLAGS="--cfg tokio_unstable"` in the simulation CI job, so turmoil can seed Tokio's scheduler RNG. Without it, event order replays but simulated times drift by a few milliseconds.
+- **`Daemon` can't run under turmoil yet:** it binds a real TCP listener, uses `SystemClock`, and dials with `ControlClient::new`. `membership_sim.rs` assembles `ControlNode`, `ControlService`, and `Membership` by hand. Let `Daemon::start` take an injected incoming stream, a connector, and a clock, so the harness runs the real daemon.
+- **Partitions in turmoil leave connections stalled**, not failed. Every client loop needs per-call timeouts and a reconnect, as `Membership` has.

@@ -76,7 +76,7 @@ pub use database::{
     Quorums,
 };
 pub use member::{HostedReplica, Liveness, Member, Report, Role};
-pub use state::State;
+pub use state::{State, membership_ring};
 pub use time::{Millis, Timestamp};
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
