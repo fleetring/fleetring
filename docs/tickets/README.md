@@ -36,7 +36,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
-| M7 Durability and operations | FR-035 – FR-037 | Configurable durability per database, a history checker for every simulation run, and a CLI that lists, drops, and inspects |
+| M7 Durability and operations | FR-035 – FR-038 | Configurable durability per database, a history checker for every simulation run, and a CLI that lists, drops, and inspects |
 
 ## Index
 
