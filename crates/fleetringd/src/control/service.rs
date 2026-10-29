@@ -13,10 +13,11 @@ use fleetring_control::{
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     self as proto, AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, LocateRequest,
-    LocateResponse, MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
+    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
+    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
+    MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -386,6 +387,19 @@ impl Control for ControlService {
         }
     }
 
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        match self.submit(Action::DropDatabase { name }).await? {
+            (Applied::DatabaseDropped { epoch, .. }, _) => {
+                Ok(Response::new(DropDatabaseResponse { epoch: epoch.get() }))
+            }
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
     async fn locate(
         &self,
         request: Request<LocateRequest>,
@@ -395,6 +409,18 @@ impl Control for ControlService {
         Ok(Response::new(LocateResponse {
             placement: Some(placement(&state, &name)?),
         }))
+    }
+
+    async fn list_databases(
+        &self,
+        _request: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
+        let state = self.node.state();
+        let databases = state
+            .databases()
+            .map(|database| placement(&state, database.name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(ListDatabasesResponse { databases }))
     }
 
     async fn acquire_lease(

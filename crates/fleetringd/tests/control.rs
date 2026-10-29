@@ -13,8 +13,9 @@ use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, DatabaseStatus, Engine, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, DatabaseStatus, DropDatabaseRequest,
+    DropDatabaseResponse, Engine, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
     LocateRequest, LocateResponse, MembershipUpdate, Node, PromotionResponse, RecordFencedRequest,
     RecordFencedResponse, RenewLeaseRequest, Role, StartPromotionRequest, WatchMembershipRequest,
 };
@@ -442,7 +443,21 @@ impl Control for Redirecting {
         self.redirect()
     }
 
+    async fn drop_database(
+        &self,
+        _: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        self.redirect()
+    }
+
     async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn list_databases(
+        &self,
+        _: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
         self.redirect()
     }
 

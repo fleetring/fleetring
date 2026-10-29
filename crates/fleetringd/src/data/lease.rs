@@ -8,6 +8,11 @@
 //!   node can be granted a newer epoch meanwhile (point 6). Safety never depends on this timer:
 //!   followers fenced at a newer epoch refuse the old primary's batches, so it can't acknowledge
 //!   a write however long it takes to notice.
+//! - **Dropped databases.** A renewal refused as an unknown database means the database was
+//!   dropped: the primary stops serving it and deletes its copy, within one renewal interval of
+//!   the drop. Its streams end with it, and a follower whose stream ends asks the control plane
+//!   whether the database still exists; if not, it deletes its copy too. A node that was away
+//!   makes the same check for every database it has a record of when it recovers.
 //! - **After a restart**, the node asks the control plane about every database it has an epoch
 //!   record for, and leads each one whose lease it holds at once, rather than when the first
 //!   request arrives. The same pass reads its copies' positions, so its heartbeats report them.
@@ -27,7 +32,9 @@ use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::{DatabaseName, LeaseEpoch};
-use fleetring_proto::v1::{CompletePromotionRequest, RecordFencedRequest, RenewLeaseRequest};
+use fleetring_proto::v1::{
+    CompletePromotionRequest, Placement, RecordFencedRequest, RenewLeaseRequest,
+};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tonic::{Code, Status};
@@ -76,6 +83,9 @@ impl LeaseKeeper {
 
 async fn run(node: DataNode, settings: LeaseSettings) {
     let mut promotions = node.replication().promotions();
+    let mut ended = node.replication().ended_streams();
+    let mut seen_ended: BTreeMap<DatabaseName, u64> = BTreeMap::new();
+    let mut checking = JoinSet::new();
     let mut running: BTreeMap<DatabaseName, (LeaseEpoch, AbortOnDrop)> = BTreeMap::new();
     let mut renewing: Option<AbortOnDrop> = None;
     // Databases this node serves again after a restart, each waiting for its followers.
@@ -99,6 +109,22 @@ async fn run(node: DataNode, settings: LeaseSettings) {
                 }
             }
             Some(_) = restarting.join_next() => {}
+            Some(_) = checking.join_next() => {}
+            changed = ended.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let counts = ended.borrow_and_update().clone();
+                for (database, count) in counts {
+                    if seen_ended.insert(database.clone(), count) == Some(count) {
+                        continue;
+                    }
+                    let node = node.clone();
+                    checking.spawn(async move {
+                        discard_if_dropped(&node, &database).await;
+                    });
+                }
+            }
             changed = promotions.changed() => {
                 if changed.is_err() {
                     return;
@@ -156,8 +182,16 @@ async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
         let placement = match node.locate(name).await {
             Ok(placement) => placement,
             Err(status) if is_unreachable(&status) => return false,
+            Err(status) if missing_database(&status).is_some() => {
+                discard(node, name).await;
+                continue;
+            }
             Err(_) => continue,
         };
+        if is_past_incarnation(node, name, &placement) {
+            discard(node, name).await;
+            continue;
+        }
         if placement.primary.as_deref() != Some(node.id().as_str()) {
             continue;
         }
@@ -202,6 +236,12 @@ async fn renew_all(node: &DataNode, limit: Duration) {
         };
         match renewed {
             Ok(Ok(_)) => {}
+            Ok(Err(status)) if missing_database(&status).is_some() => {
+                tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped");
+                if node.forget(&database, epoch) {
+                    discard(node, &database).await;
+                }
+            }
             Ok(Err(status)) if is_lost(&status) => {
                 tracing::warn!(database = %database, epoch = epoch.get(), %status, "lost the lease");
                 demote(node, &database, epoch).await;
@@ -220,6 +260,41 @@ async fn renew_all(node: &DataNode, limit: Duration) {
 async fn demote(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) {
     if node.forget(database, epoch) {
         node.replication().demote(database).await;
+    }
+}
+
+/// Asks the control plane whether `database` still exists, and discards this node's copy if it
+/// doesn't, or if the copy belongs to a database that was dropped and created again under the
+/// name. A control plane that can't be reached, or any other failure, leaves the copy alone: the
+/// next ended stream or recovery pass asks again.
+async fn discard_if_dropped(node: &DataNode, database: &DatabaseName) {
+    match node.locate(database).await {
+        Ok(placement) if is_past_incarnation(node, database, &placement) => {
+            discard(node, database).await;
+        }
+        Ok(_) => {}
+        Err(status) if missing_database(&status).is_some() => discard(node, database).await,
+        Err(status) => {
+            tracing::debug!(database = %database, %status, "can't ask whether the database still exists");
+        }
+    }
+}
+
+/// Whether this node's copy of `database` comes from a database that was dropped and created
+/// again under the name: the control plane never issues an epoch below one a replica has seen, so
+/// a placement below the recorded epoch belongs to a new database.
+fn is_past_incarnation(node: &DataNode, database: &DatabaseName, placement: &Placement) -> bool {
+    node.replication()
+        .highest_epoch(database)
+        .is_some_and(|highest| placement.epoch < highest.get())
+}
+
+/// Removes every trace of `database`, which the control plane no longer knows: the lease this
+/// node holds on it, its streams, its files, and its epochs.
+async fn discard(node: &DataNode, database: &DatabaseName) {
+    node.forget_any(database);
+    if let Err(error) = node.replication().discard(database).await {
+        tracing::warn!(database = %database, %error, "can't delete the dropped database's files");
     }
 }
 

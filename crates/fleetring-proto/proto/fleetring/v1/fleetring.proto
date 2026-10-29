@@ -43,7 +43,12 @@ service Control {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  // Removes a database for good: its record, lease, and any promotion. Its replicas close and
+  // delete their copies once they learn of it; `Locate` answers NOT_FOUND from then on.
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
   rpc Locate(LocateRequest) returns (LocateResponse);
+  // Every database's placement, in name order.
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   rpc AcquireLease(AcquireLeaseRequest) returns (LeaseResponse);
   rpc RenewLease(RenewLeaseRequest) returns (LeaseResponse);
   // Removes a member, as a node does when it shuts down gracefully.
@@ -111,8 +116,23 @@ message CreateDatabaseResponse {
   Placement placement = 1;
 }
 
+message DropDatabaseRequest {
+  string database = 1;
+}
+
+message DropDatabaseResponse {
+  // The epoch the database was at when it was dropped.
+  uint64 epoch = 1;
+}
+
 message LocateRequest {
   string database = 1;
+}
+
+message ListDatabasesRequest {}
+
+message ListDatabasesResponse {
+  repeated Placement databases = 1;
 }
 
 message LocateResponse {
@@ -329,6 +349,20 @@ service Database {
   // leased yet: it takes the first lease and creates the database. Repeating it on the primary
   // is harmless.
   rpc Create(CreateRequest) returns (CreateResponse);
+  // What this node knows on its own, without asking the control plane: its membership epoch and
+  // ring fingerprint, and the databases it serves with their roles.
+  rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
+}
+
+message NodeStatusRequest {}
+
+message NodeStatusResponse {
+  string node_id = 1;
+  uint64 membership_epoch = 2;
+  // Unset while the node has no ring.
+  optional uint64 ring_fingerprint = 3;
+  // The databases this node is primary for or follows, in name order.
+  repeated DatabaseStatus databases = 4;
 }
 
 message Value {

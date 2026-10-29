@@ -45,12 +45,23 @@ struct Cluster {
 
 impl Cluster {
     async fn start(dir: &Path) -> Result<Self, Box<dyn Error>> {
-        let control =
-            Daemon::start(Config::from_toml(&config(dir, "control", "control", None))?).await?;
+        Self::start_with(dir, "").await
+    }
+
+    /// Starts the cluster with `control_settings` appended to every daemon's `[control]` table.
+    async fn start_with(dir: &Path, control_settings: &str) -> Result<Self, Box<dyn Error>> {
+        let control_text = format!(
+            "{}\n[control]\n{control_settings}",
+            config(dir, "control", "control", None)
+        );
+        let control = Daemon::start(Config::from_toml(&control_text)?).await?;
         let address = control.control_address().ok_or("no control address")?;
         let mut data = Vec::new();
         for id in DATA {
-            let text = config(dir, id, "data", Some(address));
+            let text = format!(
+                "{}{control_settings}",
+                config(dir, id, "data", Some(address))
+            );
             data.push(Daemon::start(Config::from_toml(&text)?).await?);
         }
         let cluster = Self { control, data };
@@ -581,22 +592,7 @@ const FAST_LEASES: &str = "lease_duration_ms = 800\nfailover_margin_ms = 100\n\
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let control_text = format!(
-        "{}\n[control]\n{FAST_LEASES}",
-        config(dir.path(), "control", "control", None)
-    );
-    let control = Daemon::start(Config::from_toml(&control_text)?).await?;
-    let address = control.control_address().ok_or("no control address")?;
-    let mut data = Vec::new();
-    for id in DATA {
-        let text = format!(
-            "{}{FAST_LEASES}",
-            config(dir.path(), id, "data", Some(address))
-        );
-        data.push(Daemon::start(Config::from_toml(&text)?).await?);
-    }
-    let cluster = Cluster { control, data };
-    cluster.converge().await?;
+    let cluster = Cluster::start_with(dir.path(), FAST_LEASES).await?;
     let client = cluster.client()?;
     let acme = name("acme")?;
     let location = client.create_database(&acme, three()?).await?;
@@ -648,11 +644,297 @@ async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> Tes
     Ok(())
 }
 
+/// Waits until `condition` holds, polling every 20 ms, or fails after the hang guard.
+async fn wait_until(what: &str, mut condition: impl AsyncFnMut() -> bool) -> TestResult {
+    let waited = tokio::time::timeout(HANG_GUARD, async {
+        while !condition().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    waited.map_err(|_| format!("timed out waiting until {what}").into())
+}
+
+/// The directory of `database`'s copy in data daemon `id`'s data directory.
+fn database_dir(dir: &Path, id: &str, database: &str) -> PathBuf {
+    dir.join(id).join("databases").join(database)
+}
+
+/// Whether every data daemon has a copy of `database` on disk.
+fn every_node_has(dir: &Path, database: &str) -> bool {
+    DATA.iter()
+        .all(|id| database_file(dir, id, database).is_file())
+}
+
+/// Whether no data daemon has any trace of `database` on disk: its copy or its epoch record.
+fn no_node_has(dir: &Path, database: &str) -> bool {
+    DATA.iter().all(|id| {
+        !database_dir(dir, id, database).exists()
+            && !dir
+                .join(id)
+                .join("replication")
+                .join("epochs")
+                .join(database)
+                .exists()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn db_list_shows_every_database_with_its_primary_and_filters_by_node() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let client = cluster.client()?;
+    assert!(client.list_databases().await?.is_empty());
+
+    let names = ["orders", "acme", "notes"];
+    let mut created = Vec::new();
+    for text in names {
+        created.push(client.create_database(&name(text)?, three()?).await?);
+    }
+    let listed = client.list_databases().await?;
+    let mut sorted = names.to_vec();
+    sorted.sort_unstable();
+    let listed_names: Vec<String> = listed.iter().map(|l| l.database.to_string()).collect();
+    assert_eq!(listed_names, sorted, "sorted by name");
+    for location in &listed {
+        let made = created
+            .iter()
+            .find(|c| c.database == location.database)
+            .ok_or("listed a database that wasn't created")?;
+        assert_eq!(location.primary, made.primary, "{}", location.database);
+        assert_eq!(location.epoch.get(), 1, "{}", location.database);
+        assert_eq!(location.replicas.len(), 3, "{}", location.database);
+        let replicas: Vec<_> = location.replicas.iter().map(|r| &r.node).collect();
+        let expected: Vec<_> = made.replicas.iter().map(|r| &r.node).collect();
+        assert_eq!(replicas, expected, "{}", location.database);
+    }
+
+    // `--node` keeps the databases a node is primary for.
+    let node = created[0].primary.clone().ok_or("no primary")?;
+    let mine: Vec<&Location> = listed
+        .iter()
+        .filter(|location| location.primary.as_ref() == Some(&node))
+        .collect();
+    assert!(!mine.is_empty());
+    for location in &mine {
+        assert_eq!(
+            client.locate(&location.database).await?.primary,
+            Some(node.clone())
+        );
+    }
+
+    cluster.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_database_removes_it_from_every_node() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start_with(dir.path(), FAST_LEASES).await?;
+    let client = cluster.client()?;
+    let orders = name("orders")?;
+    let kept = name("kept")?;
+    let created = client.create_database(&orders, three()?).await?;
+    let primary = created.primary.clone().ok_or("no primary")?;
+    client.create_database(&kept, three()?).await?;
+    for database in [&orders, &kept] {
+        client
+            .execute(database, Statement::new("CREATE TABLE t (x)"))
+            .await?;
+        client
+            .execute(database, Statement::new("INSERT INTO t VALUES (1)"))
+            .await?;
+    }
+    wait_until("every node holds a copy of orders", async || {
+        every_node_has(dir.path(), "orders") && every_node_has(dir.path(), "kept")
+    })
+    .await?;
+    let primary_registry = cluster
+        .data_daemon(primary.as_str())?
+        .registry()
+        .ok_or("no registry")?;
+    assert!(primary_registry.is_open(&orders));
+
+    // The drop is a control command; the control plane forgets the database at once.
+    let epoch = client.drop_database(&orders).await?;
+    assert_eq!(epoch.get(), 1);
+    let gone = client.locate(&orders).await.expect_err("dropped");
+    assert_eq!(gone.code(), Code::NotFound, "{gone}");
+    let listed: Vec<String> = client
+        .list_databases()
+        .await?
+        .iter()
+        .map(|location| location.database.to_string())
+        .collect();
+    assert_eq!(listed, ["kept"]);
+    let again = client
+        .drop_database(&orders)
+        .await
+        .expect_err("already dropped");
+    assert_eq!(again.code(), Code::NotFound, "{again}");
+
+    // The primary stops at its next renewal, the followers' streams end, and every node deletes
+    // its copy and its epoch record.
+    wait_until("every node deleted its copy of orders", async || {
+        no_node_has(dir.path(), "orders")
+    })
+    .await?;
+    assert!(
+        !primary_registry.is_open(&orders),
+        "the primary closed it first"
+    );
+    for id in DATA {
+        let replication = cluster
+            .data_daemon(id)?
+            .replication()
+            .ok_or("no replication")?;
+        assert_eq!(
+            replication.serving(&orders),
+            None,
+            "{id} still serves orders"
+        );
+        assert_eq!(
+            replication.highest_epoch(&orders),
+            None,
+            "{id} remembers an epoch"
+        );
+    }
+
+    // A write to a dropped database finds no database, at the control plane and at its old
+    // primary alike; the other database is untouched.
+    let refused = client
+        .execute(&orders, Statement::new("INSERT INTO t VALUES (2)"))
+        .await
+        .expect_err("dropped");
+    assert_eq!(refused.code(), Code::NotFound, "{refused}");
+    let old_primary = cluster
+        .data_daemon(primary.as_str())?
+        .listen_address()
+        .to_string();
+    let at_primary = cluster
+        .client()?
+        .with_entry(old_primary)
+        .execute(&orders, Statement::new("INSERT INTO t VALUES (2)"))
+        .await
+        .expect_err("dropped");
+    assert_eq!(at_primary.code(), Code::NotFound, "{at_primary}");
+    let rows = client
+        .query(&kept, Statement::new("SELECT x FROM t"))
+        .await?;
+    assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+    assert!(every_node_has(dir.path(), "kept"));
+
+    // The name is free again, and the new database starts from epoch 1 on every node.
+    let recreated = client.create_database(&orders, three()?).await?;
+    assert_eq!(recreated.epoch.get(), 1);
+    client
+        .execute(&orders, Statement::new("CREATE TABLE t (y)"))
+        .await?;
+    let written = client
+        .execute(&orders, Statement::new("INSERT INTO t VALUES (7)"))
+        .await?;
+    assert!(written.acknowledged_by >= 2, "{written:?}");
+    wait_until("every node holds the new orders", async || {
+        every_node_has(dir.path(), "orders")
+    })
+    .await?;
+
+    cluster.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_node_shows_what_each_data_node_knows() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let client = cluster.client()?;
+    let acme = name("acme")?;
+    let created = client.create_database(&acme, three()?).await?;
+    let primary = created.primary.clone().ok_or("no primary")?;
+    client
+        .execute(&acme, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    wait_until("every node holds a copy of acme", async || {
+        every_node_has(dir.path(), "acme")
+    })
+    .await?;
+
+    let state = cluster.control.control().ok_or("no control")?.state();
+    let fingerprint = state.ring()?.fingerprint();
+    for daemon in &cluster.data {
+        let address = daemon.listen_address().to_string();
+        let id = daemon.config().node.id.clone();
+        let status = client.node_status(&address).await?;
+        assert_eq!(status.node, id);
+        assert_eq!(status.fingerprint, Some(fingerprint), "{id}");
+        assert_eq!(status.membership_epoch, state.membership_epoch(), "{id}");
+        // Followers report their copy once a stream has opened it, which may take a moment.
+        wait_until("the node reports acme", async || {
+            client
+                .node_status(&address)
+                .await
+                .is_ok_and(|status| status.databases.iter().any(|d| d.database == acme))
+        })
+        .await?;
+        let status = client.node_status(&address).await?;
+        let served = status
+            .databases
+            .iter()
+            .find(|d| d.database == acme)
+            .ok_or("acme not served")?;
+        let role = if id == primary {
+            Role::Primary
+        } else {
+            Role::Follower
+        };
+        assert_eq!(served.role, role, "{id}");
+        assert_eq!(served.epoch.get(), 1, "{id}");
+    }
+
+    // The control node hosts no data, so it has no node status to give.
+    let control = cluster.control_address()?;
+    let refused = client
+        .node_status(&control)
+        .await
+        .expect_err("no data role");
+    assert_eq!(refused.code(), Code::Unimplemented, "{refused}");
+
+    cluster.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_call_to_a_data_node_names_the_control_node() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let control = cluster.control_address()?;
+    for daemon in &cluster.data {
+        let data_node = daemon.listen_address().to_string();
+        let wrong = Client::new(data_node, Network::default());
+        let refused = wrong
+            .locate(&name("acme")?)
+            .await
+            .expect_err("a data node runs no control plane");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        assert_eq!(
+            refused.message(),
+            format!("this node runs no control plane; the control node is {control}")
+        );
+        let listed = wrong.list_databases().await.expect_err("same for a list");
+        assert_eq!(listed.code(), Code::FailedPrecondition, "{listed}");
+    }
+    cluster.stop().await;
+    Ok(())
+}
+
 #[cfg(unix)]
 mod binary {
     use std::process::{Command, Output};
 
-    use super::{Cluster, TestResult, config, follower_address, name};
+    use super::{
+        Cluster, FAST_LEASES, Location, TestResult, config, every_node_has, follower_address, name,
+        no_node_has, three, wait_until,
+    };
 
     /// Runs `fleetringd` with `args` on a blocking thread, so the daemons in this process keep
     /// serving.
@@ -816,6 +1098,135 @@ mod binary {
             stderr.contains("Client specified an invalid argument"),
             "{stderr}"
         );
+
+        cluster.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_command_line_lists_drops_and_asks_a_node() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let cluster = Cluster::start_with(dir.path(), FAST_LEASES).await?;
+        let control = cluster.control_address()?;
+        let client = cluster.client()?;
+        let mut locations = Vec::new();
+        for text in ["orders", "acme"] {
+            locations.push(client.create_database(&name(text)?, three()?).await?);
+        }
+
+        let listed = stdout(&fleetringd(args(&["db", "list"], &control)).await?)?;
+        let lines: Vec<&str> = listed.lines().collect();
+        assert!(lines[0].starts_with("NAME  "), "{listed}");
+        assert!(lines[1].starts_with("acme  "), "sorted by name: {listed}");
+        assert!(lines[2].starts_with("orders  "), "sorted by name: {listed}");
+        for location in &locations {
+            let primary = location.primary.clone().ok_or("no primary")?;
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with(location.database.as_str()))
+                .ok_or("database not listed")?;
+            let replicas: Vec<String> = location
+                .replicas
+                .iter()
+                .map(|replica| replica.node.to_string())
+                .collect();
+            let cells: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(
+                cells,
+                [
+                    location.database.as_str(),
+                    "sqlite",
+                    "1",
+                    "3",
+                    primary.as_str(),
+                    &replicas.join(",")
+                ],
+                "{line}"
+            );
+        }
+        assert!(
+            lines[3].starts_with("2 databases; primaries per node: "),
+            "{listed}"
+        );
+        for id in super::DATA {
+            assert!(lines[3].contains(&format!(" {id}=")), "{listed}");
+        }
+
+        let primary = locations[0].primary.clone().ok_or("no primary")?;
+        let filtered = stdout(
+            &fleetringd(args(&["db", "list", "--node", primary.as_str()], &control)).await?,
+        )?;
+        let expected: Vec<&Location> = locations
+            .iter()
+            .filter(|location| location.primary.as_ref() == Some(&primary))
+            .collect();
+        assert_eq!(filtered.lines().count(), expected.len() + 2, "{filtered}");
+        for location in expected {
+            assert!(filtered.contains(location.database.as_str()), "{filtered}");
+        }
+
+        // Each data node reports the control plane's fingerprint on its own.
+        let fingerprint = cluster
+            .control
+            .control()
+            .ok_or("no control")?
+            .state()
+            .ring()?
+            .fingerprint();
+        for daemon in &cluster.data {
+            let address = daemon.listen_address().to_string();
+            let status = stdout(
+                &fleetringd(vec!["status".to_owned(), "--node".to_owned(), address]).await?,
+            )?;
+            assert!(
+                status.starts_with(&format!("node: {}\n", daemon.config().node.id)),
+                "{status}"
+            );
+            assert!(
+                status.contains(&format!("ring fingerprint: {fingerprint}\n")),
+                "{status}"
+            );
+        }
+
+        // A control call aimed at a data node names the control node.
+        let wrong = fleetringd(args(
+            &["db", "list"],
+            &cluster.data[0].listen_address().to_string(),
+        ))
+        .await?;
+        assert!(!wrong.status.success());
+        let stderr = String::from_utf8_lossy(&wrong.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "this node runs no control plane; the control node is {control}"
+            )),
+            "{stderr}"
+        );
+
+        // Without a terminal, dropping needs `--yes`.
+        wait_until("every node holds a copy of orders", async || {
+            every_node_has(dir.path(), "orders")
+        })
+        .await?;
+        let asked = fleetringd(args(&["db", "drop", "orders"], &control)).await?;
+        assert!(!asked.status.success());
+        assert!(
+            String::from_utf8_lossy(&asked.stderr).contains("pass --yes"),
+            "{}",
+            String::from_utf8_lossy(&asked.stderr)
+        );
+        assert!(client.locate(&name("orders")?).await.is_ok());
+        let dropped =
+            stdout(&fleetringd(args(&["db", "drop", "orders", "--yes"], &control)).await?)?;
+        assert_eq!(dropped, "dropped orders at epoch 1\n");
+        let gone = fleetringd(args(&["db", "locate", "orders"], &control)).await?;
+        assert!(!gone.status.success());
+        wait_until("every node deleted its copy of orders", async || {
+            no_node_has(dir.path(), "orders")
+        })
+        .await?;
+        let listed = stdout(&fleetringd(args(&["db", "list"], &control)).await?)?;
+        assert!(!listed.contains("orders"), "{listed}");
 
         cluster.stop().await;
         Ok(())

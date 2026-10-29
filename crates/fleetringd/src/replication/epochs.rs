@@ -211,6 +211,26 @@ impl Epochs {
         })
     }
 
+    /// Deletes `database`'s record, as when the database is dropped, so that a database created
+    /// again under the name starts from no epoch here.
+    ///
+    /// It blocks on the file system.
+    pub(super) fn forget(&self, database: &DatabaseName) -> io::Result<()> {
+        let mut cache = self.lock();
+        cache.remove(database);
+        let dir = self.root.join(layout::database_dir(database));
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = dir.parent() {
+            // The parent may not exist if the record was never written.
+            let _ = sync_dir(parent);
+        }
+        Ok(())
+    }
+
     /// Every database with a record that names it, in name order.
     ///
     /// It walks the store's directory, so it blocks on the file system.
@@ -339,6 +359,13 @@ mod tests {
         let reopened = Epochs::new(dir.path().to_owned());
         assert_eq!(reopened.highest(&db), Some(5));
         assert!(reopened.admit(&db, 4).is_err());
+
+        reopened.forget(&db).expect("forget");
+        assert_eq!(reopened.highest(&db), None);
+        reopened.forget(&db).expect("forgetting twice is harmless");
+        let again = Epochs::new(dir.path().to_owned());
+        assert_eq!(again.highest(&db), None);
+        again.admit(&db, 1).expect("the name starts over");
     }
 
     #[test]

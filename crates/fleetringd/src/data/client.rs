@@ -5,19 +5,19 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fleetring::{NodeId, ReplicationFactor};
+use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{DatabaseName, Engine, LeaseEpoch, Liveness, Role};
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::{
-    self as proto, CreateDatabaseRequest, CreateRequest, ExecuteRequest, LocateRequest,
-    QueryRequest, WatchMembershipRequest,
+    self as proto, CreateDatabaseRequest, CreateRequest, DropDatabaseRequest, ExecuteRequest,
+    ListDatabasesRequest, LocateRequest, NodeStatusRequest, QueryRequest, WatchMembershipRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status};
 
 use crate::MembershipView;
 use crate::control::ControlClient;
-use crate::data::convert::{location, params_to_proto, rows_from_proto};
+use crate::data::convert::{location, node_status, params_to_proto, rows_from_proto};
 use crate::data::redirect::primary_hint;
 use crate::engine::{Position, Rows, Statement};
 use crate::environment::Network;
@@ -80,6 +80,35 @@ pub struct ReplicaInfo {
     pub position: Option<Position>,
 }
 
+/// What one data node knows on its own, as [`Client::node_status`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NodeStatus {
+    /// The node.
+    pub node: NodeId,
+    /// The membership epoch it has published, or 0 before it has heard from the control plane.
+    pub membership_epoch: Epoch,
+    /// The fingerprint of the ring it places by, once it has one.
+    pub fingerprint: Option<Fingerprint>,
+    /// The databases it serves, in name order.
+    pub databases: Vec<ServedDatabase>,
+}
+
+/// A database one node serves, as primary or follower.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServedDatabase {
+    /// The database.
+    pub database: DatabaseName,
+    /// The node's role for it.
+    pub role: Role,
+    /// The epoch of the primary that wrote the last frames of the node's copy: its own epoch on
+    /// a primary.
+    pub epoch: LeaseEpoch,
+    /// Where its copy is, if it knows.
+    pub position: Option<Position>,
+}
+
 /// The result of a write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -102,8 +131,9 @@ pub struct Written {
 
 /// A client for a whole cluster.
 ///
-/// - **Control calls** (`create_database`, `locate`, `status`) go to the control plane through a
-///   [`ControlClient`], which follows leader redirects and retries what is safe to retry.
+/// - **Control calls** (`create_database`, `drop_database`, `locate`, `list_databases`, `status`)
+///   go to the control plane through a [`ControlClient`], which follows leader redirects and
+///   retries what is safe to retry.
 /// - **Database calls** (`execute`, `query`) go to the database's primary, which the client
 ///   locates through the control plane. A node that isn't the primary answers with a redirect
 ///   ([`not_primary`](crate::data::not_primary)), and the client follows up to four of them.
@@ -218,6 +248,22 @@ impl Client {
         location(placement_of(created.placement)?)
     }
 
+    /// Drops a database for good, and returns the epoch it was at. Its primary stops serving it
+    /// within one lease renewal, and every replica deletes its copy once it learns of the drop.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if there is no such database, or the status of the failed control call.
+    pub async fn drop_database(&self, name: &DatabaseName) -> Result<LeaseEpoch, Status> {
+        let response = self
+            .control
+            .drop_database(DropDatabaseRequest {
+                database: name.to_string(),
+            })
+            .await?;
+        Ok(LeaseEpoch::new(response.epoch))
+    }
+
     /// Finds where a database lives. Retried.
     ///
     /// # Errors
@@ -225,6 +271,38 @@ impl Client {
     /// `NOT_FOUND` if there is no such database, or the status of the last attempt.
     pub async fn locate(&self, name: &DatabaseName) -> Result<Location, Status> {
         location(self.placement(name).await?)
+    }
+
+    /// Lists where every database lives, in name order. Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt, or `INTERNAL` if a reply is invalid.
+    pub async fn list_databases(&self) -> Result<Vec<Location>, Status> {
+        self.control
+            .list_databases(ListDatabasesRequest {})
+            .await?
+            .databases
+            .into_iter()
+            .map(location)
+            .collect()
+    }
+
+    /// Asks the data node at `address` (`host:port`) what it knows on its own: its membership
+    /// epoch, ring fingerprint, and the databases it serves. Nothing is asked of the control
+    /// plane, so the answer shows whether the node agrees with it.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` if the node can't be reached, `UNIMPLEMENTED` if it hosts no data, or
+    /// `INTERNAL` if its reply is invalid.
+    pub async fn node_status(&self, address: &str) -> Result<NodeStatus, Status> {
+        let response = self
+            .database(address)?
+            .node_status(NodeStatusRequest {})
+            .await?
+            .into_inner();
+        node_status(response)
     }
 
     /// Runs one write statement on the database's primary, and waits until a write quorum of its

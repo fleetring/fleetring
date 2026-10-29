@@ -23,6 +23,12 @@
 //!   size R, and whether the database is under-replicated: fewer than R replicas reachable. A
 //!   write that committed on the primary without reaching its quorum fails with `ABORTED`, since
 //!   it may still replicate later.
+//! - **Dropping** is a control command: `Control.DropDatabase` removes the database from the
+//!   control plane at its current epoch. The primary learns of it when its next lease renewal is
+//!   refused as an unknown database, within one renewal interval, and stops serving it; its
+//!   streams end, and each follower whose stream ends asks the control plane whether the database
+//!   still exists. Every replica then closes its copy through its registry and deletes the files.
+//!   A write to a dropped database fails with `NOT_FOUND`.
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
 
@@ -33,7 +39,7 @@ mod node;
 mod redirect;
 mod service;
 
-pub use client::{Client, Location, ReplicaInfo, Written};
+pub use client::{Client, Location, NodeStatus, ReplicaInfo, ServedDatabase, Written};
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};
