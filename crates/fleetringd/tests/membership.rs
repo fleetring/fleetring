@@ -152,8 +152,8 @@ async fn a_control_daemon_and_two_data_daemons_converge_on_one_ring() -> TestRes
         converge(&daemon.membership().ok_or("no membership")?, 2, fingerprint).await?;
     }
 
-    // A data-only daemon serves on `listen` with no services yet, so a call reaches it and is
-    // refused as unimplemented.
+    // A data-only daemon runs no control plane, so a control call that reaches it is refused and
+    // told where the control node is.
     let peer = format!("http://{}", data[0].listen_address());
     let mut client = control_client(Endpoint::from_shared(peer)?.connect().await?);
     let refused = client
@@ -169,7 +169,14 @@ async fn a_control_daemon_and_two_data_daemons_converge_on_one_ring() -> TestRes
         })
         .await
         .expect_err("a data-only node serves no control service");
-    assert_eq!(refused.code(), Code::Unimplemented, "{refused}");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert_eq!(
+        refused.message(),
+        format!(
+            "this node runs no control plane; the control node is {}",
+            control.control_address().ok_or("no control address")?
+        )
+    );
 
     for daemon in data {
         daemon.run_until(async {}).await;

@@ -1,15 +1,17 @@
 //! The `fleetringd` binary: the daemon, and the commands that talk to a running cluster.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::Write as _;
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, Liveness};
-use fleetringd::data::{Client, Location, ReplicaInfo};
+use fleetring_control::{DatabaseName, Liveness, Role as DatabaseRole};
+use fleetringd::data::{Client, Location, NodeStatus, ReplicaInfo};
 use fleetringd::engine::{Rows, Statement, Value};
 use fleetringd::{Config, Daemon, MembershipView, Network, Role};
 use tracing_subscriber::EnvFilter;
@@ -58,11 +60,16 @@ struct DaemonArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Creates, writes, reads, and locates databases.
+    /// Creates, lists, writes, reads, locates, and drops databases.
     #[command(subcommand)]
     Db(DbCommand),
-    /// Shows the members with their liveness, the membership epoch, and the ring fingerprint.
+    /// Shows the members with their liveness, the membership epoch, and the ring fingerprint, as
+    /// the control plane sees them; with `--node`, as one data node sees them.
     Status {
+        /// Asks this data node (`host:port`) instead of the control plane: its membership epoch,
+        /// ring fingerprint, and the databases it serves. Nothing else is needed.
+        #[arg(long, conflicts_with_all = ["control", "config"])]
+        node: Option<String>,
         #[command(flatten)]
         target: Target,
     },
@@ -91,6 +98,25 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
+    /// Lists every database with its engine, epoch, replication factor, primary, and replicas.
+    List {
+        /// Lists only the databases this node is primary for.
+        #[arg(long)]
+        node: Option<NodeId>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Drops a database for good: every replica deletes its copy.
+    Drop {
+        /// The database's name.
+        name: DatabaseName,
+        /// Drops without asking. Without it, the command asks first on a terminal, and refuses
+        /// elsewhere.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        target: Target,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -111,13 +137,15 @@ struct SqlArgs {
     target: Target,
 }
 
-/// How a command finds the control plane.
+/// How a command finds the control plane. Commands talk to the control node, which knows every
+/// database's placement; data nodes redirect database calls to the right primary on their own.
 #[derive(Debug, Args)]
 struct Target {
-    /// The control node's address, `host:port`.
+    /// The control node's address, `host:port`: the node that runs the control role, not any node
+    /// in the cluster. A data-only node answers with the control node's address.
     #[arg(long, conflicts_with = "config")]
     control: Option<String>,
-    /// A daemon's configuration file, to take the control address from.
+    /// A daemon's configuration file, to take the control node's address from.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -264,7 +292,15 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn Error>> {
 
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     let output = match command {
-        Command::Status { target } => {
+        Command::Status {
+            node: Some(node),
+            target: _,
+        } => {
+            // The node answers on its own; the client never asks the control plane here.
+            let client = Client::new(node.clone(), Network::default());
+            format_node_status(&client.node_status(&node).await.map_err(failed)?)
+        }
+        Command::Status { node: None, target } => {
             format_status(&target.client()?.status().await.map_err(failed)?)
         }
         Command::Db(DbCommand::Create {
@@ -305,6 +341,24 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Db(DbCommand::Locate { name, target }) => {
             format_location(&target.client()?.locate(&name).await.map_err(failed)?)
         }
+        Command::Db(DbCommand::List { node, target }) => {
+            let mut databases = target.client()?.list_databases().await.map_err(failed)?;
+            if let Some(node) = &node {
+                databases.retain(|location| location.primary.as_ref() == Some(node));
+            }
+            format_databases(&databases)
+        }
+        Command::Db(DbCommand::Drop { name, yes, target }) => {
+            if !yes {
+                confirm_drop(&name)?;
+            }
+            let epoch = target
+                .client()?
+                .drop_database(&name)
+                .await
+                .map_err(failed)?;
+            format!("dropped {name} at epoch {}\n", epoch.get())
+        }
     };
     print!("{output}");
     Ok(())
@@ -321,6 +375,28 @@ impl SqlArgs {
             self.name,
             Statement::with_params(self.sql, self.params),
         ))
+    }
+}
+
+/// Asks on the terminal whether to drop `name`, and refuses without a terminal.
+fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err(format!("pass --yes to drop {name} without a prompt").into());
+    }
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "drop {name}? Every replica deletes its copy, for good. [y/N] "
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    stdin.lock().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        Err(format!("not dropping {name}").into())
     }
 }
 
@@ -394,6 +470,117 @@ fn format_location(location: &Location) -> String {
             "  {}: {position} ({})",
             replica.node,
             liveness(replica.liveness)
+        );
+    }
+    output
+}
+
+/// The databases as a table sorted by name, then how many each node is primary for.
+fn format_databases(databases: &[Location]) -> String {
+    let mut rows: Vec<[String; 6]> = databases
+        .iter()
+        .map(|location| {
+            let replicas: Vec<String> = location
+                .replicas
+                .iter()
+                .map(|replica| replica.node.to_string())
+                .collect();
+            [
+                location.database.to_string(),
+                location.engine.to_string(),
+                location.epoch.get().to_string(),
+                location.replicas.len().to_string(),
+                location
+                    .primary
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string),
+                replicas.join(","),
+            ]
+        })
+        .collect();
+    rows.sort();
+    let header = ["NAME", "ENGINE", "EPOCH", "RF", "PRIMARY", "REPLICAS"];
+    let mut widths: Vec<usize> = header.iter().map(|title| title.len()).collect();
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut output = String::new();
+    let line = |output: &mut String, cells: &[&str]| {
+        let mut columns = Vec::with_capacity(cells.len());
+        for (index, cell) in cells.iter().enumerate() {
+            let padding = widths[index].saturating_sub(cell.chars().count());
+            // The last column isn't padded, so lines have no trailing spaces.
+            if index + 1 == cells.len() {
+                columns.push((*cell).to_owned());
+            } else {
+                columns.push(format!("{cell}{}", " ".repeat(padding)));
+            }
+        }
+        output.push_str(columns.join("  ").trim_end());
+        output.push('\n');
+    };
+    line(&mut output, &header);
+    for row in &rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        line(&mut output, &cells);
+    }
+    // Every node in a replica set is counted, so a node with no primaries shows as 0.
+    let mut primaries: BTreeMap<&NodeId, usize> = BTreeMap::new();
+    for location in databases {
+        for replica in &location.replicas {
+            primaries.entry(&replica.node).or_default();
+        }
+        if let Some(primary) = &location.primary {
+            *primaries.entry(primary).or_default() += 1;
+        }
+    }
+    let summary: Vec<String> = primaries
+        .iter()
+        .map(|(node, count)| format!("{node}={count}"))
+        .collect();
+    let _ = writeln!(
+        output,
+        "{} database{}; primaries per node: {}",
+        databases.len(),
+        plural(u64::try_from(databases.len()).unwrap_or(u64::MAX)),
+        if summary.is_empty() {
+            "none".to_owned()
+        } else {
+            summary.join(" ")
+        }
+    );
+    output
+}
+
+fn format_node_status(status: &NodeStatus) -> String {
+    let fingerprint = status
+        .fingerprint
+        .map_or_else(|| "none".to_owned(), |fingerprint| fingerprint.to_string());
+    let mut output = format!(
+        "node: {}\nmembership epoch: {}\nring fingerprint: {fingerprint}\ndatabases:\n",
+        status.node,
+        status.membership_epoch.get(),
+    );
+    if status.databases.is_empty() {
+        output.push_str("  none\n");
+    }
+    for database in &status.databases {
+        let role = match database.role {
+            DatabaseRole::Primary => "primary",
+            DatabaseRole::Follower => "follower",
+            _ => "unknown",
+        };
+        let position = database
+            .position
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
+        let _ = writeln!(
+            output,
+            "  {} {role} epoch={} position={position}",
+            database.database,
+            database.epoch.get(),
         );
     }
     output

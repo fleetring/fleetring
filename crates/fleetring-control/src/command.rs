@@ -82,6 +82,17 @@ pub enum Action {
         engine: Engine,
     },
 
+    /// Removes a database for good: its record, its lease, any promotion in progress, and every
+    /// member's report of it.
+    ///
+    /// The lease holder learns of the drop when its next renewal is refused as an unknown
+    /// database, and followers when their streams end and the control plane no longer knows the
+    /// database. Logs written before this action existed never contain it.
+    DropDatabase {
+        /// The database's name.
+        name: DatabaseName,
+    },
+
     /// Grants a database's first lease, at epoch 1.
     ///
     /// Later leases come only from promotions, which fence a quorum first.

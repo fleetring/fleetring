@@ -74,8 +74,9 @@ impl HeldLease {
 /// arrives. It then leads the database through [`Replication::lead`], at the lease's epoch. It
 /// stops as soon as it learns of a newer epoch: from a renewal the control plane refuses, or
 /// from a fence or a stream at that epoch, which [`DataNode::route`] sees in the replication's
-/// highest epoch. Any other request is redirected to the primary the control plane names.
-/// Cloning is cheap and shares the node.
+/// highest epoch. A renewal refused as an unknown database means the database was dropped, and
+/// the node deletes its copy (see [`LeaseKeeper`](crate::data::LeaseKeeper)). Any other request
+/// is redirected to the primary the control plane names. Cloning is cheap and shares the node.
 #[derive(Debug, Clone)]
 pub(crate) struct DataNode {
     pub(super) inner: Arc<Inner>,
@@ -289,6 +290,11 @@ impl DataNode {
         } else {
             false
         }
+    }
+
+    /// Forgets whatever lease this node holds on `name`, as when the database is dropped.
+    pub(super) fn forget_any(&self, name: &DatabaseName) {
+        self.leases().remove(name);
     }
 
     /// Leads `name` under `lease` if this node doesn't already, records the lease, and waits

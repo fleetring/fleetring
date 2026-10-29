@@ -3,12 +3,12 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
-use fleetring::NodeId;
+use fleetring::{Epoch, Fingerprint, NodeId};
 use fleetring_control::{DatabaseName, Engine, LeaseEpoch, Liveness, Role};
 use fleetring_proto::v1::{self as proto, value::Value as Kind};
 use tonic::Status;
 
-use crate::data::client::{Location, ReplicaInfo};
+use crate::data::client::{Location, NodeStatus, ReplicaInfo, ServedDatabase};
 use crate::engine::{Position, Rows, Statement, Value};
 
 /// Parses `text` as `field`, or answers `INVALID_ARGUMENT`.
@@ -153,6 +153,39 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         epoch: LeaseEpoch::new(placement.epoch),
         primary,
         replicas,
+    })
+}
+
+/// The status a node reported.
+pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeStatus, Status> {
+    let databases = response
+        .databases
+        .into_iter()
+        .map(|status| {
+            let role = match proto::Role::try_from(status.role) {
+                Ok(proto::Role::Primary) => Role::Primary,
+                Ok(proto::Role::Follower) => Role::Follower,
+                _ => {
+                    return Err(Status::internal(format!(
+                        "the reply gives database {} no role",
+                        status.database
+                    )));
+                }
+            };
+            Ok(ServedDatabase {
+                database: parse_reply("database name", &status.database)?,
+                role,
+                epoch: LeaseEpoch::new(status.epoch),
+                // An empty position is an empty log, or none reported yet.
+                position: (!status.position.is_empty()).then(|| Position::from(status.position)),
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok(NodeStatus {
+        node: parse_reply("node id", &response.node_id)?,
+        membership_epoch: Epoch::new(response.membership_epoch),
+        fingerprint: response.ring_fingerprint.map(Fingerprint::new),
+        databases,
     })
 }
 

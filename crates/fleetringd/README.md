@@ -28,7 +28,14 @@ fleetringd db exec notes "CREATE TABLE note (body TEXT)" --config fleetringd.tom
 fleetringd db exec notes "INSERT INTO note VALUES (?)" "hello" --config fleetringd.toml
 fleetringd db query notes "SELECT body FROM note" --config fleetringd.toml
 fleetringd db locate notes --config fleetringd.toml
+fleetringd db list --config fleetringd.toml
+fleetringd status --node 127.0.0.1:7400
+fleetringd db drop notes --yes --config fleetringd.toml
 ```
+
+`db list` shows every database with its engine, epoch, replication factor, primary, and replicas, and ends with how many databases each node is primary for; `--node <id>` keeps the databases one node is primary for. `status --node <host:port>` asks one data node what it believes on its own, so its ring fingerprint can be compared with `status`. `db drop` removes a database for good: every replica deletes its copy within a few seconds. It asks first on a terminal; `--yes` skips the question.
+
+The subcommands take `--control <host:port>`, the address of the node that runs the control role, or `--config <file>` to read it from a daemon's configuration. A control call sent to a data-only node answers with the control node's address.
 
 `fleetringd --help` lists every flag and subcommand. [`deploy/fleetringd.toml`](https://github.com/fleetring/fleetring/blob/main/deploy/fleetringd.toml) documents the main settings, including a multi-node cluster's.
 

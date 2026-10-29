@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, LocateRequest,
-    LocateResponse, MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
+    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
+    MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
     RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
@@ -29,10 +30,11 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 /// - **Redirects:** a reply of "not the leader, try X" (see [`not_leader`](super::not_leader))
 ///   switches the client to X and repeats the call there, so callers never see it. Later calls
 ///   go straight to X.
-/// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `renew_lease`,
-///   `record_fenced`, and opening `watch_membership`) retry transient failures with [`retry`].
-///   `create_database`, `acquire_lease`, `leave`, `start_promotion`, and `complete_promotion`
-///   are sent once per leader, because a lost reply would make a retry fail as already done.
+/// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `list_databases`,
+///   `renew_lease`, `record_fenced`, and opening `watch_membership`) retry transient failures
+///   with [`retry`]. `create_database`, `drop_database`, `acquire_lease`, `leave`,
+///   `start_promotion`, and `complete_promotion` are sent once per leader, because a lost reply
+///   would make a retry fail as already done.
 ///
 /// Cloning is cheap; clones share the current leader and connections.
 #[derive(Clone)]
@@ -179,6 +181,36 @@ impl ControlClient {
             async move { client.create_database(request).await }
         })
         .await
+    }
+
+    /// Drops a database. Sent once per leader, not retried: a retry after a lost reply would fail
+    /// with `NOT_FOUND`, which the caller can read as done.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn drop_database(
+        &self,
+        request: DropDatabaseRequest,
+    ) -> Result<DropDatabaseResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<Channel>| {
+            let request = request.clone();
+            async move { client.drop_database(request).await }
+        })
+        .await
+    }
+
+    /// Lists every database's placement. Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt.
+    pub async fn list_databases(
+        &self,
+        request: ListDatabasesRequest,
+    ) -> Result<ListDatabasesResponse, Status> {
+        self.retrying(|mut client| async move { client.list_databases(request).await })
+            .await
     }
 
     /// Finds where a database lives. Retried.
