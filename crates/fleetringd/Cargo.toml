@@ -1,7 +1,7 @@
 [package]
 name = "fleetringd"
 description = "The FleetRing daemon: places, replicates, and fails over SQLite databases across machines you own."
-version = "0.0.0"
+version = "0.1.0"
 publish = false
 edition.workspace = true
 # `File::try_lock` (data directory lock) needs 1.89. `fleetring` keeps its own MSRV (ADR-0015).
