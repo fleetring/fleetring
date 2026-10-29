@@ -75,7 +75,8 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 
 - [`docs/adr/`](docs/adr/): architecture decision records, one per decision, explaining why the placement crate works the way it does.
 - [`docs/spec/`](docs/spec/): the placement spec. [Version 1](docs/spec/placement-v1.md) defines placement precisely enough that every implementation, in any language, puts each key on the same nodes. It is frozen as of `fleetring` 0.1.0.
-- [`docs/tickets/`](docs/tickets/): the work plan for the placement crate, with each ticket's scope, status, and acceptance criteria.
+- [`docs/tickets/`](docs/tickets/): the work plan, with each ticket's scope, status, and acceptance criteria.
+- [`docs/roadmap.md`](docs/roadmap.md): the epics between today and a release that is safe to depend on, and [`docs/review.md`](docs/review.md), the known bottlenecks and the standards behind the design.
 
 ## License
 
