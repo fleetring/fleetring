@@ -30,6 +30,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0019](0019-grpc-transport.md) | Nodes talk gRPC over tonic | Accepted |
 | [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Accepted |
 | [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Accepted |
+| [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Proposed |
 
 ## Template
 
