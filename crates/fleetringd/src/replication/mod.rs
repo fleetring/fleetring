@@ -465,6 +465,17 @@ impl Replication {
         self.inner.membership.view()
     }
 
+    /// The membership this node places by, for a watcher of its changes.
+    pub(crate) fn membership(&self) -> Membership {
+        self.inner.membership.clone()
+    }
+
+    /// How replication paces itself.
+    #[must_use]
+    pub fn settings(&self) -> &ReplicationSettings {
+        &self.inner.settings
+    }
+
     /// How many streams following each database have ended since this node started. A watcher
     /// that sees a count grow checks whether the control plane still knows the database, since
     /// a dropped database's streams end and are never reopened.
@@ -574,6 +585,28 @@ impl Replication {
                 .count();
             let reachable = primary.reachable(inner, &quorum.followers);
             quorum.admits(reachable) && reachable >= live
+        })
+        .await
+    }
+
+    /// Waits until `follower` has acknowledged everything `database`'s primary has committed, or
+    /// until `limit` passes. Returns whether it has, and `false` if this node isn't the primary.
+    ///
+    /// A node that hands a lease over waits for this first, so the new primary starts with the
+    /// whole log and the promotion has nothing to fetch.
+    pub async fn await_caught_up(
+        &self,
+        database: &DatabaseName,
+        follower: &NodeId,
+        limit: Duration,
+    ) -> bool {
+        self.await_followers(database, limit, |_, primary, quorum| {
+            let status = primary.status(quorum);
+            status.followers.iter().any(|progress| {
+                progress.node == *follower
+                    && progress.reported
+                    && progress.acknowledged == status.committed
+            })
         })
         .await
     }

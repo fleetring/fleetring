@@ -53,3 +53,12 @@ id = "node-1"
 # retry it cleanly. It lies between the write quorum and the replication factor, and defaults to
 # the write quorum; a default outside that range for a database is clamped into it.
 # min_replicas = 2
+
+# [membership]
+# What a graceful stop (SIGINT, SIGTERM, `fleetringd stop`) does with the node's membership.
+#   "leave"   the default: the node drains first, handing each database it is primary for to
+#             the most advanced follower so clients see a short redirect instead of a failover,
+#             then leaves the cluster and the ring is rebuilt without it
+#   "stay"    the node stays a member, marked down once its heartbeats stop, and keeps its
+#             leases and its places in replica sets for a quick restart; nothing drains
+# on_shutdown = "leave"

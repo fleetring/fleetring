@@ -27,12 +27,23 @@ const HANG_GUARD: Duration = Duration::from_secs(60);
 const DATA: [&str; 3] = ["data-1", "data-2", "data-3"];
 
 fn config(dir: &Path, id: &str, role: &str, control: Option<SocketAddr>) -> String {
+    config_with(dir, id, role, control, "")
+}
+
+/// A configuration with `membership_settings` appended to its `[membership]` table.
+fn config_with(
+    dir: &Path,
+    id: &str,
+    role: &str,
+    control: Option<SocketAddr>,
+    membership_settings: &str,
+) -> String {
     let control = control.map_or_else(String::new, |address| {
         format!("\n[control]\naddress = \"{address}\"\n")
     });
     format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
-         \n[membership]\nheartbeat_interval_ms = 100\n{control}",
+         \n[membership]\nheartbeat_interval_ms = 100\n{membership_settings}{control}",
         dir.join(id)
     )
 }
@@ -50,15 +61,17 @@ impl Cluster {
 
     /// Starts the cluster with `control_settings` appended to every daemon's `[control]` table.
     async fn start_with(dir: &Path, control_settings: &str) -> Result<Self, Box<dyn Error>> {
-        Self::start_configured(dir, control_settings, "").await
+        Self::start_configured(dir, control_settings, "", "").await
     }
 
-    /// Starts the cluster with `control_settings` appended to every daemon's `[control]` table
-    /// and `control_tables` appended to the control daemon's configuration.
+    /// Starts the cluster with `control_settings` appended to every daemon's `[control]` table,
+    /// `control_tables` appended to the control daemon's configuration, and
+    /// `membership_settings` to every data daemon's `[membership]` table.
     async fn start_configured(
         dir: &Path,
         control_settings: &str,
         control_tables: &str,
+        membership_settings: &str,
     ) -> Result<Self, Box<dyn Error>> {
         let control_text = format!(
             "{}\n[control]\n{control_settings}\n{control_tables}",
@@ -70,7 +83,7 @@ impl Cluster {
         for id in DATA {
             let text = format!(
                 "{}{control_settings}",
-                config(dir, id, "data", Some(address))
+                config_with(dir, id, "data", Some(address), membership_settings)
             );
             data.push(Daemon::start(Config::from_toml(&text)?).await?);
         }
@@ -546,10 +559,13 @@ async fn status_shows_the_ring_every_node_publishes() -> TestResult {
     Ok(())
 }
 
+/// A node that stays a member across a quick restart (`on_shutdown = "stay"`) keeps its leases:
+/// it doesn't drain, and serves its databases again once it is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_primary_serves_its_database_again() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let Cluster { control, mut data } = Cluster::start(dir.path()).await?;
+    let Cluster { control, mut data } =
+        Cluster::start_configured(dir.path(), "", "", "on_shutdown = \"stay\"\n").await?;
     let cluster_control = control.control_address().ok_or("no control address")?;
     let client = Client::new(cluster_control.to_string(), network());
     let acme = name("acme")?;
@@ -959,6 +975,7 @@ async fn databases_take_the_cluster_default_durability_unless_told_otherwise() -
         dir.path(),
         "",
         "[replication]\nacks = \"all\"\nmin_replicas = 9\n",
+        "",
     )
     .await?;
     let client = cluster.client()?;
@@ -1479,4 +1496,202 @@ mod binary {
         cluster.stop().await;
         Ok(())
     }
+}
+
+/// How many databases the drain test spreads over the three nodes.
+const DRAINED_DATABASES: usize = 50;
+
+/// What a client writing through a drain saw.
+#[derive(Debug, Default)]
+struct WriterReport {
+    /// How many writes succeeded.
+    written: u64,
+    /// How many writes needed at least one retry.
+    retried: u64,
+    /// The most retries one write needed.
+    max_retries: u32,
+    /// A write that failed with a status retrying can't fix, if any.
+    rejected: Option<String>,
+}
+
+/// Writes one row at a time to each of `databases` in turn until `stop` is set, retrying a
+/// write that is refused as `UNAVAILABLE` or `ABORTED`, as `fleetringd db exec` would be.
+async fn write_until_stopped(
+    client: Client,
+    databases: Vec<DatabaseName>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> WriterReport {
+    use std::sync::atomic::Ordering;
+    let mut report = WriterReport::default();
+    let mut value = 0_i64;
+    'writes: while !stop.load(Ordering::SeqCst) {
+        for database in &databases {
+            value += 1;
+            let mut retries = 0_u32;
+            loop {
+                let written = client
+                    .execute(
+                        database,
+                        Statement::with_params("INSERT INTO t VALUES (?)", [Value::Integer(value)]),
+                    )
+                    .await;
+                match written {
+                    Ok(_) => break,
+                    Err(status)
+                        if matches!(status.code(), Code::Unavailable | Code::Aborted)
+                            && !stop.load(Ordering::SeqCst) =>
+                    {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(status) => {
+                        report.rejected = Some(format!("{database}: {status}"));
+                        break 'writes;
+                    }
+                }
+            }
+            report.written += 1;
+            if retries > 0 {
+                report.retried += 1;
+                report.max_retries = report.max_retries.max(retries);
+            }
+        }
+    }
+    report
+}
+
+/// Draining a node hands every database it is primary for to a follower, through the same
+/// epoch and fencing rules as a failover, while a client keeps writing: it sees `UNAVAILABLE`
+/// and redirects for a moment and retries, but nothing is refused for good. The drained node
+/// stays a member and a follower; stopping it afterwards costs nothing more, and it leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draining_a_node_moves_its_primaries_while_a_client_keeps_writing() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let client = cluster.client()?;
+    let mut primaries: std::collections::BTreeMap<String, Vec<DatabaseName>> =
+        std::collections::BTreeMap::new();
+    for k in 0..DRAINED_DATABASES {
+        let database = name(&format!("db-{k}"))?;
+        let location = client.create_database(&database, three()?).await?;
+        client
+            .execute(&database, Statement::new("CREATE TABLE t (x)"))
+            .await?;
+        let primary = location.primary.ok_or("no primary")?;
+        primaries
+            .entry(primary.to_string())
+            .or_default()
+            .push(database);
+    }
+    // The ring spreads the primaries; drain the node that holds the most.
+    let (drained, mine) = primaries
+        .iter()
+        .max_by_key(|(_, databases)| databases.len())
+        .map(|(node, databases)| (node.clone(), databases.clone()))
+        .ok_or("no primaries")?;
+    assert!(
+        primaries.len() == DATA.len() && mine.len() >= DRAINED_DATABASES / 6,
+        "primaries per node: {:?}",
+        primaries
+            .iter()
+            .map(|(node, databases)| (node, databases.len()))
+            .collect::<Vec<_>>()
+    );
+    let drained_id: fleetring::NodeId = drained.parse()?;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = tokio::spawn(write_until_stopped(
+        cluster.client()?,
+        mine.clone(),
+        std::sync::Arc::clone(&stop),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = tokio::time::Instant::now();
+    let mut announced = client.drain_node(&drained_id).await?;
+    announced.sort();
+    let mut expected = mine.clone();
+    expected.sort();
+    assert_eq!(
+        announced, expected,
+        "the drain names every lease the node holds"
+    );
+    wait_until("every primary has moved", async || {
+        for database in &mine {
+            let Ok(location) = client.locate(database).await else {
+                return false;
+            };
+            if location.primary.as_ref() == Some(&drained_id)
+                || location.primary.is_none()
+                || location.epoch.get() != 2
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .await?;
+    let took = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = writer.await?;
+    eprintln!(
+        "drained {} primaries of {drained} in {took:?}; the client wrote {} rows, {} with retries (at most {})",
+        mine.len(),
+        report.written,
+        report.retried,
+        report.max_retries
+    );
+    assert_eq!(report.rejected, None, "a write was refused for good");
+    assert!(report.written > 0);
+
+    // The drained node is still a member and a follower of what it used to lead.
+    for database in &mine {
+        let location = client.locate(database).await?;
+        assert!(
+            location
+                .replicas
+                .iter()
+                .any(|replica| replica.node == drained_id),
+            "{database}: {location:?}"
+        );
+        assert_eq!(location.epoch.get(), 2, "{database}");
+    }
+    let status = client.status().await?;
+    assert_eq!(status.liveness(&drained_id), Some(Liveness::Live));
+    // Every row the client wrote is on the new primary.
+    for database in mine.iter().take(3) {
+        let rows = client
+            .query(database, Statement::new("SELECT count(*) FROM t"))
+            .await?;
+        assert!(matches!(
+            rows.rows.first().and_then(|row| row.first()),
+            Some(Value::Integer(_))
+        ));
+    }
+
+    // Stopping the drained node now leaves nothing to hand over; it leaves the cluster.
+    let Cluster { control, mut data } = cluster;
+    let index = data
+        .iter()
+        .position(|daemon| daemon.config().node.id == drained_id)
+        .ok_or("the drained node isn't a data daemon")?;
+    data.remove(index).run_until(async {}).await;
+    wait_until("the drained node has left", async || {
+        client
+            .status()
+            .await
+            .is_ok_and(|view| view.liveness(&drained_id).is_none())
+    })
+    .await?;
+    for database in &mine {
+        let location = client.locate(database).await?;
+        assert_ne!(location.primary.as_ref(), Some(&drained_id), "{database}");
+        assert_eq!(
+            location.epoch.get(),
+            2,
+            "{database}: a stop after a drain costs no epoch"
+        );
+    }
+    Cluster { control, data }.stop().await;
+    Ok(())
 }

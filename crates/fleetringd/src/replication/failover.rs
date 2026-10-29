@@ -569,6 +569,45 @@ impl Replication {
         })
     }
 
+    /// Tells `node` that it is the candidate of `database`'s promotion to `epoch`, as the control
+    /// node does, waiting at most `limit`. A node that hands a lease over calls it so that the
+    /// target starts at once rather than at the control node's next notice.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` if `node` has no known address or doesn't answer in time, and the status it
+    /// answered with otherwise.
+    pub async fn promote_peer(
+        &self,
+        node: &NodeId,
+        database: &DatabaseName,
+        epoch: LeaseEpoch,
+        replication_factor: ReplicationFactor,
+        limit: Duration,
+    ) -> Result<(), Status> {
+        let inner = &self.inner;
+        let address = inner
+            .addresses
+            .address(node)
+            .ok_or_else(|| Status::unavailable(format!("no address for {node}")))?;
+        let channel = inner
+            .peers
+            .channel_to(&address)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let request = PromoteRequest {
+            database: database.to_string(),
+            epoch: epoch.get(),
+            replication_factor: u32::from(replication_factor.get()),
+        };
+        tokio::time::timeout(limit, replication_client(channel).promote(request))
+            .await
+            .map_err(|_| {
+                inner.peers.forget(&address);
+                Status::unavailable(format!("{node} didn't answer the promotion in time"))
+            })??;
+        Ok(())
+    }
+
     /// Fetches what this node's copy of `database` lacks from `node`, fenced at `epoch`, and
     /// applies it durably, waiting at most `limit` for the transfer. Returns the copy's new
     /// position.

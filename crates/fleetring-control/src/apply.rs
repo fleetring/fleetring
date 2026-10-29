@@ -98,6 +98,8 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             complete_promotion(state, now, database, epoch)
         }
         Action::Tick => Ok(Applied::Ticked { at: now }),
+        Action::Drain { id } => drain(state, id),
+        Action::TransferLease { database, target } => transfer_lease(state, now, database, target),
     }?;
     state.now = now;
     Ok(applied)
@@ -218,6 +220,12 @@ pub enum Applied {
     Ticked {
         /// The state's time after the tick.
         at: Timestamp,
+    },
+
+    /// A member is draining: it gets no new lease, and it may hand its leases over.
+    MemberDraining {
+        /// The member's ID.
+        id: NodeId,
     },
 }
 
@@ -410,6 +418,22 @@ pub enum Rejection {
         /// The promotion quorum Q.
         needed: u8,
     },
+
+    /// The node is draining, so it can't take a lease or be a promotion's candidate.
+    #[error("node '{id}' is draining")]
+    MemberDraining {
+        /// The node's ID.
+        id: NodeId,
+    },
+
+    /// Only a draining holder may hand a lease over before it expires.
+    #[error("node '{id}' holds the lease of database '{database}' and is not draining")]
+    HolderNotDraining {
+        /// The holder's ID.
+        id: NodeId,
+        /// The database.
+        database: DatabaseName,
+    },
 }
 
 fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
@@ -443,6 +467,7 @@ fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
             member,
             last_heartbeat: now,
             reports: BTreeMap::new(),
+            draining: false,
         },
     );
     Ok(Applied::MemberJoined {
@@ -588,6 +613,9 @@ fn acquire_lease(
     if !state.is_live(&node, now) {
         return Err(Rejection::MemberDown { id: node });
     }
+    if state.is_draining(&node) {
+        return Err(Rejection::MemberDraining { id: node });
+    }
     if !state.replica_set(&database)?.contains(&node) {
         return Err(Rejection::NotInReplicaSet { id: node, database });
     }
@@ -676,7 +704,8 @@ pub(crate) struct PromotionPlan {
 /// candidate, without changing anything.
 ///
 /// The candidate is the live replica-set member whose log is the most advanced: the highest log
-/// epoch, then the highest position, and the earliest in preference order on ties.
+/// epoch, then the highest position, and the earliest in preference order on ties. A draining
+/// member is never the candidate.
 pub(crate) fn plan_promotion(
     state: &State,
     now: Timestamp,
@@ -696,6 +725,19 @@ pub(crate) fn plan_promotion(
             available_after,
         });
     }
+    promotion_in_progress(state, now, db)?;
+    let epoch = next_epoch(db)?;
+    let (candidate, position) = best_candidate(state, now, database, None)?;
+    Ok(PromotionPlan {
+        epoch,
+        candidate,
+        position,
+    })
+}
+
+/// Rejects a new promotion while one is in progress whose candidate is live and hasn't stalled.
+fn promotion_in_progress(state: &State, now: Timestamp, db: &Database) -> Result<(), Rejection> {
+    let config = state.config;
     if let Some(promotion) = db.promotion() {
         let stalled_after = promotion.started_at().saturating_add(
             config
@@ -704,21 +746,34 @@ pub(crate) fn plan_promotion(
         );
         if state.is_live(promotion.candidate(), now) && now <= stalled_after {
             return Err(Rejection::PromotionInProgress {
-                database: database.clone(),
+                database: db.name().clone(),
             });
         }
     }
-    let epoch = db
-        .epoch()
+    Ok(())
+}
+
+fn next_epoch(db: &Database) -> Result<LeaseEpoch, Rejection> {
+    db.epoch()
         .next()
         .ok_or_else(|| Rejection::LeaseEpochExhausted {
-            database: database.clone(),
-        })?;
+            database: db.name().clone(),
+        })
+}
 
+/// Picks the live replica-set member of `database` with the most advanced log, by log epoch and
+/// then position, preferring the earliest in preference order on ties. A draining member is
+/// skipped, and so is `excluded`: a transfer never hands a lease back to its holder.
+fn best_candidate(
+    state: &State,
+    now: Timestamp,
+    database: &DatabaseName,
+    excluded: Option<&NodeId>,
+) -> Result<(NodeId, Position), Rejection> {
     let mut best: Option<(&NodeId, LeaseEpoch, &Position)> = None;
     let replicas = state.replica_set(database)?;
     for id in &replicas {
-        if !state.is_live(id, now) {
+        if Some(id) == excluded || !state.is_live(id, now) || state.is_draining(id) {
             continue;
         }
         let Some(report) = state.report(id, database) else {
@@ -735,10 +790,73 @@ pub(crate) fn plan_promotion(
             database: database.clone(),
         });
     };
-    Ok(PromotionPlan {
+    Ok((candidate.clone(), position.clone()))
+}
+
+fn drain(state: &mut State, id: NodeId) -> Outcome {
+    let Some(entry) = state.members.get_mut(&id) else {
+        return Err(Rejection::UnknownMember { id });
+    };
+    entry.draining = true;
+    Ok(Applied::MemberDraining { id })
+}
+
+/// Starts a promotion for `database` at the next epoch without waiting for its lease to expire,
+/// because the holder is draining. The candidate is `target` if given, which must be a live
+/// replica-set member that isn't draining, and otherwise the most advanced such member.
+fn transfer_lease(
+    state: &mut State,
+    now: Timestamp,
+    database: DatabaseName,
+    target: Option<NodeId>,
+) -> Outcome {
+    let db = state.database_or_reject(&database)?;
+    let Some(lease) = db.lease() else {
+        return Err(Rejection::NoLease { database });
+    };
+    let holder = lease.holder().clone();
+    if !state.is_draining(&holder) {
+        return Err(Rejection::HolderNotDraining {
+            id: holder,
+            database,
+        });
+    }
+    promotion_in_progress(state, now, db)?;
+    let epoch = next_epoch(db)?;
+    let (candidate, position) = match target {
+        Some(target) => {
+            require_member(state, &target)?;
+            if !state.replica_set(&database)?.contains(&target) {
+                return Err(Rejection::NotInReplicaSet {
+                    id: target,
+                    database,
+                });
+            }
+            if target == holder || state.is_draining(&target) {
+                return Err(Rejection::MemberDraining { id: target });
+            }
+            if !state.is_live(&target, now) {
+                return Err(Rejection::MemberDown { id: target });
+            }
+            let position = state
+                .report(&target, &database)
+                .map(|report| report.position().clone())
+                .unwrap_or_default();
+            (target, position)
+        }
+        None => best_candidate(state, now, &database, Some(&holder))?,
+    };
+
+    let db = database_mut(state, &database)?;
+    db.set_epoch(epoch);
+    db.set_promotion(Some(
+        Promotion::new(epoch, candidate.clone(), now).handed_over_by(holder),
+    ));
+    Ok(Applied::PromotionStarted {
+        database,
         epoch,
-        candidate: candidate.clone(),
-        position: position.clone(),
+        candidate,
+        position,
     })
 }
 

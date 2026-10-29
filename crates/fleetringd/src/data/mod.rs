@@ -9,6 +9,8 @@
 //!   epoch: a renewal the control plane refuses, or a fence or a stream at that epoch.
 //! - **Failover:** while a promotion is in progress a database has no primary, and requests for it
 //!   fail with `UNAVAILABLE`; a client retries, and reaches the new primary once it serves.
+//! - **Draining:** a node that is about to leave hands its leases over first (the `drain` module):
+//!   each database answers `UNAVAILABLE` for a moment, then redirects to its new primary.
 //! - **Redirects, not forwarding:** any other node answers `UNAVAILABLE` and names the primary as
 //!   `host:port` in the [`PRIMARY_METADATA_KEY`] metadata entry, as a control node that isn't the
 //!   leader does. A write then crosses one hop, and a lost reply is never doubled by a proxy.
@@ -36,6 +38,7 @@
 
 mod client;
 pub(crate) mod convert;
+mod drain;
 mod lease;
 mod node;
 mod redirect;
@@ -45,6 +48,7 @@ pub use client::{
     Client, DatabaseSpec, DurabilityChange, Location, NodeStatus, ReplicaInfo, ServedDatabase,
     Written,
 };
+pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};

@@ -63,6 +63,9 @@ enum Command {
     /// Creates, lists, writes, reads, locates, and drops databases.
     #[command(subcommand)]
     Db(DbCommand),
+    /// Drains a node.
+    #[command(subcommand)]
+    Node(NodeCommand),
     /// Shows the members with their liveness, the membership epoch, and the ring fingerprint, as
     /// the control plane sees them; with `--node`, as one data node sees them.
     Status {
@@ -141,6 +144,19 @@ enum DbCommand {
         /// elsewhere.
         #[arg(long)]
         yes: bool,
+        #[command(flatten)]
+        target: Target,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeCommand {
+    /// Hands every database the node is primary for to a follower, without waiting for a
+    /// failover. The node gets no new primaries afterwards, and stays a follower until it stops
+    /// or restarts; stopping it then costs clients only a redirect.
+    Drain {
+        /// The node's ID.
+        id: NodeId,
         #[command(flatten)]
         target: Target,
     },
@@ -412,6 +428,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .map_err(failed)?;
             format!("dropped {name} at epoch {}\n", epoch.get())
         }
+        Command::Node(NodeCommand::Drain { id, target }) => {
+            let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
+            format_drain(&id, &primaries)
+        }
     };
     print!("{output}");
     Ok(())
@@ -612,6 +632,24 @@ fn format_databases(databases: &[Location]) -> String {
             summary.join(" ")
         }
     );
+    output
+}
+
+/// What a drain is about to move: the databases the node is primary for.
+fn format_drain(id: &NodeId, primaries: &[DatabaseName]) -> String {
+    let mut output = format!(
+        "draining {id}: {} database{} to hand over",
+        primaries.len(),
+        plural(u64::try_from(primaries.len()).unwrap_or(u64::MAX))
+    );
+    if primaries.is_empty() {
+        output.push('\n');
+        return output;
+    }
+    output.push_str(":\n");
+    for database in primaries {
+        let _ = writeln!(output, "  {database}");
+    }
     output
 }
 

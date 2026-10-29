@@ -17,14 +17,14 @@ use crate::control::{
     ControlHandle, ControlNode, ControlOptions, ControlService, DurabilityDefaults, Failover,
     FailoverSettings, NoControl, OpenError,
 };
-use crate::data::{DataNode, DatabaseService, LeaseKeeper, LeaseSettings};
+use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSettings};
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
 use crate::replication::{Replication, ReplicationParts};
 use crate::transport::{Peers, control_server, database_server};
 use crate::{
     Config, ConfigError, DataDir, DataDirError, DatabaseStatuses, Membership, MembershipTasks,
-    Registry,
+    OnShutdown, Registry,
 };
 
 /// How long shutdown waits for open connections to close before it drops them.
@@ -67,7 +67,9 @@ struct DataRole {
     membership: Membership,
     tasks: MembershipTasks,
     replication: Replication,
+    node: DataNode,
     keeper: LeaseKeeper,
+    drain: DrainSettings,
 }
 
 /// The gRPC listener, bound before any service starts so its address is known.
@@ -260,13 +262,21 @@ impl Daemon {
     ///
     /// Connections get a few seconds to close; any still open after that are dropped.
     ///
-    /// A data node leaves the cluster first, so the control plane removes it at once instead of
-    /// waiting for its heartbeats to stop; its leases expire and fail over as usual.
+    /// A data node that leaves on shutdown (`[membership] on_shutdown = "leave"`, the default)
+    /// drains first: it hands every lease it holds to a follower, so that clients see a short
+    /// redirect instead of a failover, and then leaves, so the control plane removes it at once
+    /// instead of waiting for its heartbeats to stop. A lease that can't be handed over expires
+    /// and fails over as usual. One that stays does neither.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
         shutdown.await;
         tracing::info!(node = %self.config.node.id, "fleetringd shutting down");
         let replication = match self.data {
             Some(data) => {
+                if self.config.membership.on_shutdown == OnShutdown::Leave {
+                    // Heartbeats go on meanwhile, and the server still answers, so peers can
+                    // fence this node and clients get redirected.
+                    data.node.drain_before_leaving(data.drain).await;
+                }
                 drop(data.keeper);
                 data.tasks.stop().await;
                 Some(data.replication)
@@ -381,19 +391,23 @@ fn start_data(
         control,
         settings.ack_timeout,
     );
+    let drain = DrainSettings::new(settings.stall_timeout, settings.ack_timeout);
     let keeper = LeaseKeeper::start(
         node.clone(),
         LeaseSettings {
             renew_interval: config.control.lease_renewal(),
             fence_timeout: settings.stall_timeout,
             transfer_timeout: settings.open_timeout,
+            drain,
         },
     );
     let role = DataRole {
         membership,
         tasks,
         replication,
+        node: node.clone(),
         keeper,
+        drain,
     };
     Ok((role, node))
 }

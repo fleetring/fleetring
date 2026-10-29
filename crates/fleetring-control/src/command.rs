@@ -165,6 +165,31 @@ pub enum Action {
     /// liveness and lease expiry, which are judged at the time of the last command, move on
     /// without traffic.
     Tick,
+
+    /// Marks a member as draining: it gets no new lease and is never a promotion's candidate,
+    /// and it may hand its leases over with [`Action::TransferLease`].
+    ///
+    /// A member stays draining until it leaves or joins again. Logs written before this action
+    /// existed never contain it.
+    Drain {
+        /// The member's ID.
+        id: NodeId,
+    },
+
+    /// Hands a database's lease from its draining holder to another replica, without waiting for
+    /// the lease to expire: issues the next epoch and starts a promotion whose candidate is
+    /// `target`, or, if none is named, the most advanced live replica that isn't draining.
+    ///
+    /// The candidate then fences a quorum and completes the promotion exactly as after an
+    /// expiry (ADR-0022), so a transfer is as safe as a failover. Logs written before this
+    /// action existed never contain it.
+    TransferLease {
+        /// The database.
+        database: DatabaseName,
+        /// The replica to hand the lease to, if the holder has one in mind: usually the follower
+        /// that has acknowledged everything it committed.
+        target: Option<NodeId>,
+    },
 }
 
 /// What a heartbeat does with a report for a database the control plane doesn't know.
