@@ -74,6 +74,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             replication_factor,
             engine,
         } => create_database(state, name, replication_factor, engine),
+        Action::DropDatabase { name } => drop_database(state, name),
         Action::AcquireLease { database, node } => acquire_lease(state, now, database, node),
         Action::RenewLease {
             database,
@@ -131,6 +132,15 @@ pub enum Applied {
     DatabaseCreated {
         /// The database's name.
         database: DatabaseName,
+    },
+
+    /// A database was dropped, with its lease and any promotion.
+    DatabaseDropped {
+        /// The database's name.
+        database: DatabaseName,
+        /// The epoch the database was at when it was dropped. A node still serving it at that
+        /// epoch stops once its next renewal is refused.
+        epoch: LeaseEpoch,
     },
 
     /// A database's first lease was granted.
@@ -489,6 +499,22 @@ fn create_database(
         Database::new(name.clone(), replication_factor, engine),
     );
     Ok(Applied::DatabaseCreated { database: name })
+}
+
+/// Removes the database with every member's report of it, so that no stale report outlives it.
+/// Reports are replaced wholesale by each heartbeat anyway; dropping them here keeps a snapshot
+/// taken right after the drop identical to one taken after the next heartbeats.
+fn drop_database(state: &mut State, name: DatabaseName) -> Outcome {
+    let Some(database) = state.databases.remove(&name) else {
+        return Err(Rejection::UnknownDatabase { database: name });
+    };
+    for entry in state.members.values_mut() {
+        entry.reports.remove(&name);
+    }
+    Ok(Applied::DatabaseDropped {
+        database: name,
+        epoch: database.epoch(),
+    })
 }
 
 fn acquire_lease(

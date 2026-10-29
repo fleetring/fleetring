@@ -16,6 +16,7 @@
 //!   frames it lacks from the most advanced fenced member.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -633,6 +634,37 @@ impl Replication {
         slot.set_position(Some(position.clone()));
         tracing::info!(database = %database, from = %node, %position, "caught up from the most advanced fenced member");
         Ok(Some(position))
+    }
+
+    /// Removes every trace of `database` from this node, because the control plane dropped it:
+    /// stops serving it as primary, ends any stream following it, closes it, deletes its files,
+    /// and forgets its epochs, so that a database created again under the name starts over.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error if the files can't be deleted. The database is closed and no longer served
+    /// either way; the next check deletes again.
+    pub async fn discard(&self, database: &DatabaseName) -> io::Result<()> {
+        let inner = &self.inner;
+        let removed = inner.lock_primaries().remove(database);
+        drop(removed);
+        let slot = inner.slot(database);
+        // The stream, fence, or fetch holding the copy finishes first; a stream that begins later
+        // finds the copy gone and ends with `NOT_FOUND` until the primary gives up.
+        let exclusive = exclusive(inner, &slot).await;
+        let deleted = inner.registry().remove(database).await;
+        let forgotten = {
+            let inner = Arc::clone(inner);
+            let database = database.clone();
+            blocking(inner.execution, move || inner.epochs.forget(&database))
+                .await
+                .map_err(|status| io::Error::other(status.message().to_owned()))
+                .and_then(|forgotten| forgotten)
+        };
+        drop(exclusive);
+        inner.lock_followers().remove(database);
+        tracing::info!(database = %database, "discarded the dropped database");
+        deleted.and(forgotten)
     }
 
     /// Every database this node has an epoch record for, in name order: those it leads or led,

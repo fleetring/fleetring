@@ -36,7 +36,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
-| M7 Durability and operations | FR-035 – FR-037 | Configurable durability per database, and a history checker for every simulation run |
+| M7 Durability and operations | FR-035 – FR-038 | Configurable durability per database, a history checker for every simulation run, and a CLI that lists, drops, and inspects |
 
 ## Index
 
@@ -78,7 +78,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-034](FR-034-release-builds.md) | Release builds, ARM CI, and container images for `fleetringd` | P1 | M | FR-022 | done |
 | [FR-035](FR-035-configurable-durability.md) | Configurable durability (`acks`, `min_replicas`, per database) | P1 | L | FR-030, FR-031 | todo |
 | [FR-036](FR-036-history-checker.md) | History checker for simulation runs | P1 | M | FR-024, FR-031 | todo |
-| [FR-037](FR-037-cli-polish.md) | CLI: list databases, per-node status, and clear answers from data-only nodes | P2 | S | FR-033 | todo |
+| [FR-037](FR-037-cli-polish.md) | CLI polish: `db list`, `db drop`, `status --node`, clear answers from data-only nodes | P1 | M | FR-033 | done |
 
 ## Dependency graph
 

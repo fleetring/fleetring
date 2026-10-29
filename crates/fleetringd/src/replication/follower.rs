@@ -207,9 +207,16 @@ impl Replication for ReplicationService {
             primary,
         };
         tokio::spawn(async move {
-            if let Err(status) = stream.run(inbound, &acks).await {
-                tracing::debug!(database = %stream.name, %status, "replication stream ended");
-                let _ = acks.send(Err(status)).await;
+            match stream.run(inbound, &acks).await {
+                Ok(()) => stream.inner.stream_ended(&stream.name),
+                Err(status) => {
+                    tracing::debug!(database = %stream.name, %status, "replication stream ended");
+                    // A stream a newer one replaced says nothing about the database.
+                    if status.code() != tonic::Code::Aborted {
+                        stream.inner.stream_ended(&stream.name);
+                    }
+                    let _ = acks.send(Err(status)).await;
+                }
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(replies))))

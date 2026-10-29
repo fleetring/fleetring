@@ -3,14 +3,15 @@
 use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
 use fleetring_proto::v1::{
-    CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse, QueryRequest, QueryResponse,
+    CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse, NodeStatusRequest,
+    NodeStatusResponse, QueryRequest, QueryResponse,
 };
 use tonic::{Request, Response, Status};
 
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::node::DataNode;
 use crate::engine::{EngineError, Transaction};
-use crate::{Acknowledged, DatabaseError};
+use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
 /// the rest (see [`not_primary`](crate::data::not_primary)).
@@ -126,6 +127,22 @@ impl Database for DatabaseService {
         let placement = self.node.create(&name).await?;
         Ok(Response::new(CreateResponse {
             placement: Some(placement),
+        }))
+    }
+
+    /// Answers from this node alone: its published membership view and the databases its
+    /// replication serves or follows, as its heartbeats report them.
+    async fn node_status(
+        &self,
+        _request: Request<NodeStatusRequest>,
+    ) -> Result<Response<NodeStatusResponse>, Status> {
+        let replication = self.node.replication();
+        let view = replication.membership_view();
+        Ok(Response::new(NodeStatusResponse {
+            node_id: self.node.id().to_string(),
+            membership_epoch: view.epoch().get(),
+            ring_fingerprint: view.fingerprint().map(|fingerprint| fingerprint.get()),
+            databases: replication.statuses(),
         }))
     }
 }

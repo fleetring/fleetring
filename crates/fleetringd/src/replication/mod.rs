@@ -349,6 +349,11 @@ struct Inner {
     epochs: Epochs,
     /// Promotions the control node asked this node to carry out.
     promotions: watch::Sender<BTreeMap<DatabaseName, PromotionRequest>>,
+    /// How many streams have ended, by the database they followed. A stream that ends may mean
+    /// the database was dropped; the node asks the control plane (see [`ended_streams`]).
+    ///
+    /// [`ended_streams`]: Replication::ended_streams
+    ended: watch::Sender<BTreeMap<DatabaseName, u64>>,
     registry: OnceLock<Registry>,
     primaries: Mutex<BTreeMap<DatabaseName, Served>>,
     followers: Mutex<BTreeMap<DatabaseName, Arc<FollowerSlot>>>,
@@ -404,6 +409,7 @@ impl Replication {
             settings,
             epochs: Epochs::new(state_dir.join("epochs")),
             promotions: watch::Sender::new(BTreeMap::new()),
+            ended: watch::Sender::new(BTreeMap::new()),
             registry: OnceLock::new(),
             primaries: Mutex::default(),
             followers: Mutex::default(),
@@ -422,6 +428,18 @@ impl Replication {
     #[must_use]
     pub fn registry(&self) -> &Registry {
         self.inner.registry()
+    }
+
+    /// The membership view this node places by.
+    pub(crate) fn membership_view(&self) -> Arc<crate::MembershipView> {
+        self.inner.membership.view()
+    }
+
+    /// How many streams following each database have ended since this node started. A watcher
+    /// that sees a count grow checks whether the control plane still knows the database, since
+    /// a dropped database's streams end and are never reopened.
+    pub(crate) fn ended_streams(&self) -> watch::Receiver<BTreeMap<DatabaseName, u64>> {
+        self.inner.ended.subscribe()
     }
 
     /// The `Replication` gRPC server, with FleetRing's message limits, for the node's router.
@@ -746,6 +764,13 @@ impl Inner {
 
     fn slot_if_any(&self, database: &DatabaseName) -> Option<Arc<FollowerSlot>> {
         self.lock_followers().get(database).cloned()
+    }
+
+    /// Counts one more ended stream of `database`.
+    fn stream_ended(&self, database: &DatabaseName) {
+        self.ended.send_modify(|ended| {
+            *ended.entry(database.clone()).or_default() += 1;
+        });
     }
 
     /// The replica set of `primary`'s database in the current membership view.

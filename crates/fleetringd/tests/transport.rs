@@ -10,12 +10,13 @@ use fleetring_proto::v1::replicate_message::Message;
 use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, Batch, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, FenceRequest, FenceResponse, FetchRequest,
-    FetchResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse,
-    LeaveRequest, LeaveResponse, LocateRequest, LocateResponse, MembershipUpdate, Node,
-    PromoteRequest, PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen,
-    SnapshotChunk, SnapshotRequest, StartPromotionRequest, WatchMembershipRequest,
+    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
+    FenceRequest, FenceResponse, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest,
+    PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
+    RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen, SnapshotChunk,
+    SnapshotRequest, StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use fleetringd::transport::{
@@ -70,10 +71,24 @@ impl Control for StubControl {
         Err(Status::unimplemented("stub"))
     }
 
+    async fn drop_database(
+        &self,
+        _request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
     async fn locate(
         &self,
         _request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn list_databases(
+        &self,
+        _request: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 

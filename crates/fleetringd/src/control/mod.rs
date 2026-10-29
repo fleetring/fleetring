@@ -11,7 +11,10 @@
 //!   ([`not_leader`]).
 //! - [`Failover`] ticks the state machine on a timer, starts promotions for expired leases, and
 //!   tells each promotion's candidate (ADR-0018).
+//! - [`NoControl`] is what a node that runs no control plane serves in the service's place: every
+//!   call fails with `FAILED_PRECONDITION` and names the control node.
 
+mod absent;
 mod client;
 mod failover;
 mod log;
@@ -19,6 +22,7 @@ mod node;
 mod redirect;
 mod service;
 
+pub use absent::NoControl;
 pub use client::ControlClient;
 pub use failover::{Failover, FailoverSettings};
 pub use log::{CommandLog, LogError, LogIndex, Recovered};
