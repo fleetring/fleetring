@@ -79,6 +79,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-034](FR-034-release-builds.md) | Release builds, ARM CI, and container images for `fleetringd` | P1 | M | FR-022 | done |
 | [FR-035](FR-035-configurable-durability.md) | Configurable durability (`acks`, `min_replicas`, per database) | P1 | L | FR-030, FR-031 | todo |
 | [FR-036](FR-036-history-checker.md) | History checker for simulation runs | P1 | M | FR-024, FR-031 | todo |
+| [FR-037](FR-037-cli-polish.md) | CLI: list databases, per-node status, and clear answers from data-only nodes | P2 | S | FR-033 | todo |
 | [FR-038](FR-038-graceful-departure.md) | Graceful departure: drain a node's primaries before it leaves | P1 | M | FR-031 | todo |
 | [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | todo |
 
@@ -141,6 +142,7 @@ flowchart LR
   FR031 --> FR035
   FR024 --> FR036[FR-036 history checker]
   FR031 --> FR036
+  FR033 --> FR037[FR-037 CLI polish]
   FR031 --> FR038[FR-038 graceful departure]
   FR030 --> FR039[FR-039 change streams]
 ```
