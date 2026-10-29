@@ -17,6 +17,7 @@ use tonic::transport::Channel;
 use tonic::{Code, Response, Status};
 
 use crate::MembershipView;
+use crate::changes::SinkStatus;
 use crate::control::ControlClient;
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, location, node_status, params_to_proto, rows_from_proto,
@@ -155,6 +156,8 @@ pub struct NodeStatus {
     pub fingerprint: Option<Fingerprint>,
     /// The databases it serves, in name order.
     pub databases: Vec<ServedDatabase>,
+    /// Each change sink's progress on each database the node feeds it (FR-039).
+    pub sinks: Vec<SinkStatus>,
 }
 
 /// A database one node serves, as primary or follower.

@@ -429,6 +429,27 @@ message NodeStatusResponse {
   optional uint64 ring_fingerprint = 3;
   // The databases this node is primary for or follows, in name order.
   repeated DatabaseStatus databases = 4;
+  // Each change sink's progress on each database this node feeds it, in sink and database
+  // order (FR-039).
+  repeated ChangeSinkStatus sinks = 5;
+}
+
+// One change sink's progress on one database.
+message ChangeSinkStatus {
+  string sink = 1;
+  string database = 2;
+  // The last position the sink took; empty if none yet.
+  bytes position = 3;
+  // The write quorum's position; empty if it holds no batch yet.
+  bytes acknowledged = 4;
+  // Batches published since the sink's position, as far as the primary knows.
+  uint64 backlog = 5;
+  // Deliveries that failed and were retried.
+  uint64 failures = 6;
+  // Times the log moved past the sink's position, so the stream skipped ahead.
+  uint64 resets = 7;
+  // The last delivery failure's reason; empty if none.
+  string last_error = 8;
 }
 
 message Value {

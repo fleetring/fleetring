@@ -55,7 +55,17 @@ struct State {
     checkpoints: u64,
     /// The last checkpoint's marker.
     marker: Option<CheckpointMarker>,
+    /// How many batches have been published since this primary started serving.
+    published: u64,
     followers: BTreeMap<NodeId, Progress>,
+    /// How far each change stream's sink has got (FR-039).
+    sinks: BTreeMap<String, SinkProgress>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SinkProgress {
+    position: Option<Position>,
+    behind_since: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +118,50 @@ impl Primary {
 
     pub(super) fn committed(&self) -> Option<Position> {
         self.lock().committed.clone()
+    }
+
+    /// How many batches have been published since this primary started serving.
+    pub(super) fn published(&self) -> u64 {
+        self.lock().published
+    }
+
+    /// The highest position the write quorum holds: every batch ending at or before it is
+    /// acknowledged, or would be if its writer were still waiting (ADR-0018). `None` while no
+    /// batch is.
+    ///
+    /// With `quorum.needed` followers required, that is the `needed`-th highest position the
+    /// followers have reported, capped at the log's end; the primary alone decides when
+    /// `needed` is 0.
+    pub(super) fn quorum_held(&self, quorum: &Quorum) -> Option<Position> {
+        let state = self.lock();
+        let committed = state.committed.as_ref()?;
+        if quorum.needed == 0 {
+            return Some(committed.clone());
+        }
+        let mut acked: Vec<&Position> = quorum
+            .followers
+            .iter()
+            .filter_map(|node| state.followers.get(node))
+            .filter(|progress| progress.reported)
+            .filter_map(|progress| progress.acked.as_ref())
+            .collect();
+        acked.sort_unstable_by(|a, b| b.cmp(a));
+        let held = acked.get(quorum.needed - 1)?;
+        Some((*held).min(committed).clone())
+    }
+
+    /// A subscription to this primary's changes, for a change stream's pump.
+    pub(super) fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Records that a change stream's `sink` has delivered up to `position`.
+    pub(super) fn sink_delivered(&self, sink: &str, position: Option<Position>, now: Timestamp) {
+        let mut state = self.lock();
+        let behind = position < state.committed;
+        let progress = state.sinks.entry(sink.to_owned()).or_default();
+        progress.position = position;
+        progress.behind_since = behind.then_some(now);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -300,6 +354,17 @@ impl Primary {
             return None;
         }
         let limit = u64::try_from(lag_limit.as_millis()).unwrap_or(u64::MAX);
+        // A sink that is behind holds the checkpoint back, until it has been for `lag_limit`.
+        let committed = state.committed.clone();
+        for progress in state.sinks.values_mut() {
+            if progress.position == committed {
+                continue;
+            }
+            let since = *progress.behind_since.get_or_insert(now);
+            if now.as_millis().saturating_sub(since.as_millis()) < limit {
+                return None;
+            }
+        }
         let mut excluded = Vec::new();
         for node in followers {
             let resumable = state.followers.get(node).is_some_and(|progress| {
@@ -400,6 +465,7 @@ impl State {
         if Some(&batch.end) > self.committed.as_ref() {
             self.committed = Some(batch.end.clone());
         }
+        self.published = self.published.saturating_add(1);
         self.recent.push_back(batch);
         self.prune(retained_bytes);
     }

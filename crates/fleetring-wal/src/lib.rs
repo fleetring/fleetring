@@ -47,7 +47,7 @@ mod mirror;
 mod position;
 mod reader;
 
-pub use batch::{Batch, DecodeBatchError};
+pub use batch::{Batch, CutError, DecodeBatchError};
 pub use checksum::ChecksumOrder;
 pub use frame::{FRAME_HEADER_LEN, FrameError, FrameHeader};
 pub use header::{HeaderError, Salts, WAL_HEADER_LEN, WalHeader};

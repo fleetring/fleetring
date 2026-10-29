@@ -9,6 +9,7 @@
 //! - [`MemoryEngine`] is a self-replicating test engine that has no WAL at all.
 
 mod adapter;
+mod changes;
 mod config;
 mod memory;
 mod pinned;
@@ -18,8 +19,10 @@ mod statement;
 
 pub use adapter::{
     Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError, EngineKind,
-    FrameFollower, FrameSource, FrameSourceEngine, OpenMode, SelfReplicating, Shape,
+    FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, OpenMode, SelfReplicating,
+    Shape,
 };
+pub use changes::{Column, LogicalSupport, RowChange, RowOperation};
 pub use config::{EngineConfig, Execution};
 pub use memory::MemoryEngine;
 pub use pinned::{PinnedSnapshot, SnapshotFile, SnapshotGuard};
@@ -31,6 +34,10 @@ const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     const fn assert_debug_send<T: std::fmt::Debug + Send + ?Sized>() {}
     assert_debug_send_sync::<CheckpointMarker>();
+    assert_debug_send_sync::<Column>();
+    assert_debug_send_sync::<LogicalSupport>();
+    assert_debug_send_sync::<RowChange>();
+    assert_debug_send_sync::<RowOperation>();
     assert_debug_send_sync::<EngineConfig>();
     assert_debug_send_sync::<EngineError>();
     assert_debug_send_sync::<EngineKind>();
@@ -55,4 +62,5 @@ const _: () = {
     assert_debug_send_sync::<Value>();
     assert_debug_send::<dyn Database>();
     assert_debug_send::<dyn FrameFollower>();
+    assert_debug_send::<dyn LogicalChanges>();
 };

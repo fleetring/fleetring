@@ -384,6 +384,9 @@ struct Inner {
     ///
     /// [`ended_streams`]: Replication::ended_streams
     ended: watch::Sender<BTreeMap<DatabaseName, u64>>,
+    /// The databases this node serves as primary, each with its epoch, for the change streams
+    /// that follow them (FR-039).
+    served: watch::Sender<BTreeMap<DatabaseName, LeaseEpoch>>,
     registry: OnceLock<Registry>,
     primaries: Mutex<BTreeMap<DatabaseName, Served>>,
     followers: Mutex<BTreeMap<DatabaseName, Arc<FollowerSlot>>>,
@@ -440,6 +443,7 @@ impl Replication {
             epochs: Epochs::new(state_dir.join("epochs")),
             promotions: watch::Sender::new(BTreeMap::new()),
             ended: watch::Sender::new(BTreeMap::new()),
+            served: watch::Sender::new(BTreeMap::new()),
             registry: OnceLock::new(),
             primaries: Mutex::default(),
             followers: Mutex::default(),
@@ -531,8 +535,11 @@ impl Replication {
         let previous = self
             .inner
             .lock_primaries()
-            .insert(database, Served { primary, driver });
+            .insert(database.clone(), Served { primary, driver });
         drop(previous);
+        self.inner.served.send_modify(|served| {
+            served.insert(database, role.epoch);
+        });
         Ok(())
     }
 
@@ -545,6 +552,9 @@ impl Replication {
     pub fn stop_primary(&self, database: &DatabaseName) {
         let removed = self.inner.lock_primaries().remove(database);
         drop(removed);
+        self.inner.served.send_modify(|served| {
+            served.remove(database);
+        });
     }
 
     /// Stops every primary's streams.
@@ -555,6 +565,25 @@ impl Replication {
     pub fn stop(&self) {
         let primaries = std::mem::take(&mut *self.inner.lock_primaries());
         drop(primaries);
+        self.inner.served.send_modify(BTreeMap::clear);
+    }
+
+    /// The databases this node serves as primary, each with its epoch, as they change. A change
+    /// stream starts a pump for each one it is configured for (FR-039).
+    pub(crate) fn served(&self) -> watch::Receiver<BTreeMap<DatabaseName, LeaseEpoch>> {
+        self.inner.served.subscribe()
+    }
+
+    /// A feed of `database`'s acknowledged positions, if this node is its primary.
+    #[must_use]
+    pub(crate) fn primary_feed(&self, database: &DatabaseName) -> Option<PrimaryFeed> {
+        let primary = self.inner.primary(database)?;
+        let changes = primary.changes();
+        Some(PrimaryFeed {
+            inner: Arc::clone(&self.inner),
+            primary,
+            changes,
+        })
     }
 
     /// Waits until `database`'s primary has enough followers connected, live, and reporting for
@@ -768,6 +797,57 @@ impl DatabaseStatuses for Replication {
     }
 }
 
+/// What a change stream's pump reads from a database's primary: how far the write quorum has
+/// got, so that the pump never hands out a batch the quorum doesn't hold (FR-039).
+///
+/// The feed follows the [`Primary`] that served the database when it was taken. A primary that
+/// is replaced, by a new epoch, or stopped, ends the feed: [`changed`](Self::changed) fails,
+/// and the pump takes a fresh feed.
+#[derive(Debug)]
+pub(crate) struct PrimaryFeed {
+    inner: Arc<Inner>,
+    primary: Arc<Primary>,
+    changes: watch::Receiver<u64>,
+}
+
+impl PrimaryFeed {
+    /// The epoch the primary serves.
+    pub(crate) fn epoch(&self) -> LeaseEpoch {
+        self.primary.role().epoch
+    }
+
+    /// The highest position the write quorum holds, or `None` if it holds no batch yet.
+    pub(crate) fn acknowledged(&self) -> Option<Position> {
+        let quorum = self.inner.followers_of(&self.primary);
+        self.primary.quorum_held(&quorum)
+    }
+
+    /// How many batches the primary has published since it started serving.
+    pub(crate) fn published(&self) -> u64 {
+        self.primary.published()
+    }
+
+    /// Records that `sink` has delivered up to `position`, so that the primary holds
+    /// checkpoints back while the sink is behind, as it does for a follower.
+    pub(crate) fn delivered(&self, sink: &str, position: Option<Position>) {
+        self.primary
+            .sink_delivered(sink, position, self.inner.clock.now());
+    }
+
+    /// Whether the primary this feed follows still serves the database.
+    pub(crate) fn is_current(&self) -> bool {
+        self.inner
+            .primary(self.primary.name())
+            .is_some_and(|current| Arc::ptr_eq(&current, &self.primary))
+    }
+
+    /// Waits until something changed: a batch was published or acknowledged, or a follower came
+    /// or went. Fails once the primary is replaced or stopped.
+    pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.changes.changed().await
+    }
+}
+
 /// The [`ReplicationSink`] that [`Replication::start`] hands the registry: it refuses a write
 /// while fewer than the database's `min_replicas` are reachable, gives each committed batch to
 /// the database's primary streams, and acknowledges it once the write quorum holds it.
@@ -927,6 +1007,7 @@ const _: () = {
     assert_debug_send_sync::<FollowerProgress>();
     assert_debug_send_sync::<PromotionRequest>();
     assert_debug_send_sync::<FollowerStatus>();
+    assert_debug_send_sync::<PrimaryFeed>();
     assert_debug_send_sync::<PrimaryRole>();
     assert_debug_send_sync::<PrimaryStatus>();
     assert_debug_send_sync::<ReplicatedSink>();

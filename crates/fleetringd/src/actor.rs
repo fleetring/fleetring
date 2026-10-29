@@ -3,7 +3,8 @@
 //! The actor serializes writes, sends reads to the engine's read path, and turns each committed
 //! write transaction of a frame-source engine into exactly one batch for the
 //! [`ReplicationSink`]. It closes the database when it has been idle for the configured time, or
-//! when the registry evicts it.
+//! when the registry evicts it. A database that logical change streams read also records its row
+//! changes from the moment it opens (FR-039).
 
 mod executor;
 
@@ -19,8 +20,8 @@ use tokio::time;
 use self::executor::{Executor, OpenRequest};
 use crate::engine::{
     CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineError, Executed,
-    Execution, FrameBatch, FrameSource, OpenMode, PinnedSnapshot, Position, ReplicaPosition, Rows,
-    Shape, Snapshot, Statement, Transaction,
+    Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode, PinnedSnapshot, Position,
+    ReplicaPosition, RowChange, Rows, Shape, Snapshot, Statement, Transaction,
 };
 use crate::sink::{
     Acknowledged, Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink,
@@ -35,6 +36,9 @@ pub(crate) enum Request {
     Query(Statement, Reply<Rows>),
     Position(Reply<Option<Position>>),
     CommittedSince(Option<Position>, Reply<Option<FrameBatch>>),
+    CommittedBetween(Option<Position>, Position, Reply<Option<FrameBatch>>),
+    RowChanges(Option<Position>, Position, Reply<Vec<RowChange>>),
+    ReleaseChanges(Position, Reply<()>),
     Checkpoint(Reply<CheckpointMarker>),
     Snapshot(PathBuf, Reply<Snapshot>),
     PinSnapshot(Reply<PinnedSnapshot>),
@@ -58,6 +62,15 @@ impl Request {
                 let _ = reply.send(Err(error));
             }
             Self::CommittedSince(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::CommittedBetween(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::RowChanges(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::ReleaseChanges(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::Checkpoint(reply) => {
@@ -84,6 +97,9 @@ impl fmt::Debug for Request {
             Self::Query(..) => "Query",
             Self::Position(_) => "Position",
             Self::CommittedSince(..) => "CommittedSince",
+            Self::CommittedBetween(..) => "CommittedBetween",
+            Self::RowChanges(..) => "RowChanges",
+            Self::ReleaseChanges(..) => "ReleaseChanges",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Snapshot(..) => "Snapshot",
             Self::PinSnapshot(_) => "PinSnapshot",
@@ -251,6 +267,49 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Every committed transaction after `after` up to `until`, as one batch, for a change
+    /// stream that may not read past the write quorum's acknowledgements.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] unless the engine is a frame source, and [`DatabaseError`]
+    /// if the database is closed or the positions don't fit its log.
+    pub(crate) async fn committed_between(
+        &self,
+        after: Option<Position>,
+        until: Position,
+    ) -> Result<Option<FrameBatch>, DatabaseError> {
+        self.call(|reply| Request::CommittedBetween(after, until, reply))
+            .await
+    }
+
+    /// The row changes of the transactions after `after` up to `until`, in commit order.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] unless the engine records row changes, and
+    /// [`DatabaseError`] if the database is closed or the changes can't be read.
+    pub(crate) async fn row_changes(
+        &self,
+        after: Option<Position>,
+        until: Position,
+    ) -> Result<Vec<RowChange>, DatabaseError> {
+        self.call(|reply| Request::RowChanges(after, until, reply))
+            .await
+    }
+
+    /// Lets the engine forget recorded row changes that every change stream has delivered, up to
+    /// `before`.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] unless the engine records row changes, and
+    /// [`DatabaseError`] if the database is closed.
+    pub(crate) async fn release_changes(&self, before: Position) -> Result<(), DatabaseError> {
+        self.call(|reply| Request::ReleaseChanges(before, reply))
+            .await
+    }
+
     /// Checkpoints a frame-source database's log, and returns the marker for followers.
     ///
     /// This is the only way a database checkpoints: the engine never does on its own.
@@ -371,6 +430,18 @@ pub(crate) struct ActorConfig {
     pub(crate) idle_timeout: Duration,
     pub(crate) mailbox: usize,
     pub(crate) thread_name: String,
+    /// Whether the database records row changes for logical change streams.
+    pub(crate) changes: ChangeRecording,
+}
+
+/// Whether a database records its row changes from the moment it opens (FR-039).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChangeRecording {
+    /// No logical change stream reads the database.
+    #[default]
+    Off,
+    /// A logical change stream reads it, so every write records its row changes.
+    On,
 }
 
 /// A started actor, as the registry holds it.
@@ -420,6 +491,7 @@ async fn run(
         execution,
         idle_timeout,
         thread_name,
+        changes,
         ..
     } = config;
     let opened = Executor::open(OpenRequest {
@@ -452,7 +524,7 @@ async fn run(
         last: None,
         failed: None,
     };
-    actor.start().await;
+    actor.start(changes).await;
     actor
         .serve(&mut mailbox, close_requested, idle_timeout)
         .await;
@@ -478,13 +550,26 @@ struct Actor {
 }
 
 impl Actor {
-    /// Finds where the log ends, so the first write's batch holds only that write.
-    async fn start(&mut self) {
+    /// Finds where the log ends, so the first write's batch holds only that write, and starts
+    /// recording row changes if a logical change stream reads the database.
+    async fn start(&mut self, changes: ChangeRecording) {
+        let name = self.name.clone();
         let position = self
             .executor
-            .run(|database| match database.capability() {
-                DatabaseCapability::FrameSource(frames) => frames.position(),
-                _ => Ok(None),
+            .run(move |database| {
+                if changes == ChangeRecording::On {
+                    match database.logical_changes() {
+                        Some(logical) => logical.start_recording()?,
+                        None => tracing::warn!(
+                            database = %name,
+                            "a logical change stream reads this database, but its engine can't record row changes"
+                        ),
+                    }
+                }
+                match database.capability() {
+                    DatabaseCapability::FrameSource(frames) => frames.position(),
+                    _ => Ok(None),
+                }
             })
             .await;
         match position {
@@ -543,6 +628,32 @@ impl Actor {
                     .call(move |database| {
                         Ok(frame_source(database, "reading committed batches")?
                             .committed_since(after.as_ref())?)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::CommittedBetween(after, until, reply) => {
+                let result = self
+                    .call(move |database| {
+                        Ok(frame_source(database, "reading committed batches")?
+                            .committed_between(after.as_ref(), &until)?)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::RowChanges(after, until, reply) => {
+                let result = self
+                    .call(move |database| {
+                        Ok(logical_changes(database, "reading row changes")?
+                            .changes_between(after.as_ref(), &until)?)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::ReleaseChanges(before, reply) => {
+                let result = self
+                    .call(move |database| {
+                        Ok(logical_changes(database, "releasing row changes")?.release(&before)?)
                     })
                     .await;
                 let _ = reply.send(result);
@@ -668,6 +779,18 @@ impl Actor {
         self.failed = Some(Arc::clone(&source));
         source
     }
+}
+
+fn logical_changes<'a>(
+    database: &'a mut dyn Database,
+    operation: &'static str,
+) -> Result<&'a mut dyn LogicalChanges, DatabaseError> {
+    database
+        .logical_changes()
+        .ok_or(DatabaseError::Unsupported {
+            operation,
+            needed: Shape::FrameSource,
+        })
 }
 
 fn frame_source<'a>(

@@ -8,7 +8,8 @@ use std::{io, mem};
 use fleetring_control::DatabaseName;
 use tokio::sync::{oneshot, watch};
 
-use crate::actor::{self, ActorConfig, DatabaseError, DatabaseHandle, Stored};
+use crate::actor::{self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Stored};
+use crate::changes::DatabaseMatchers;
 use crate::engine::{
     DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Statement, Transaction,
 };
@@ -23,6 +24,11 @@ use crate::sink::ReplicationSink;
 /// has two actors at once, so it never has two writers.
 ///
 /// Databases live under `root`, one directory each. Cloning a registry is cheap and shares it.
+///
+/// A database that a logical change stream reads ([`with_recorded_changes`]) records its row
+/// changes from the moment it opens (FR-039).
+///
+/// [`with_recorded_changes`]: Self::with_recorded_changes
 #[derive(Debug, Clone)]
 pub struct Registry {
     inner: Arc<Inner>,
@@ -34,6 +40,8 @@ struct Inner {
     sink: Arc<dyn ReplicationSink>,
     root: PathBuf,
     config: EngineConfig,
+    /// The databases that record row changes.
+    recorded: DatabaseMatchers,
     state: Mutex<State>,
 }
 
@@ -92,8 +100,28 @@ impl Registry {
                 sink: Arc::new(sink),
                 root: root.into(),
                 config,
+                recorded: DatabaseMatchers::none(),
                 state: Mutex::default(),
             }),
+        }
+    }
+
+    /// The same registry, with every database that `recorded` matches recording its row changes
+    /// from the moment it opens, for logical change streams (FR-039).
+    ///
+    /// Call it before any database opens; a registry with open databases keeps them as they
+    /// are.
+    ///
+    /// # Panics
+    ///
+    /// If the registry has been cloned, so that its settings can no longer change.
+    #[must_use]
+    pub fn with_recorded_changes(self, recorded: DatabaseMatchers) -> Self {
+        let mut inner = Arc::into_inner(self.inner)
+            .expect("a registry's recorded databases are set before it is shared");
+        inner.recorded = recorded;
+        Self {
+            inner: Arc::new(inner),
         }
     }
 
@@ -341,6 +369,11 @@ impl Registry {
             idle_timeout: inner.config.idle_timeout,
             mailbox: inner.config.mailbox.get(),
             thread_name: format!("fleetring-db-{id}"),
+            changes: if inner.recorded.matches(name) {
+                ChangeRecording::On
+            } else {
+                ChangeRecording::Off
+            },
         };
         let registry = Arc::downgrade(inner);
         let exiting = name.clone();

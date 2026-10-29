@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
+use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::reachable;
 use crate::control::{
     ControlHandle, ControlNode, ControlOptions, ControlService, DurabilityDefaults, Failover,
@@ -43,6 +44,9 @@ pub(crate) const DATABASES_DIR: &str = "databases";
 /// such as each database's highest epoch.
 pub(crate) const REPLICATION_DIR: &str = "replication";
 
+/// The directory, inside the data directory, where change streams keep each sink's positions.
+pub(crate) const CHANGES_DIR: &str = "changes";
+
 /// A started daemon that holds its data directory.
 #[derive(Debug)]
 pub struct Daemon {
@@ -67,6 +71,7 @@ struct DataRole {
     membership: Membership,
     tasks: MembershipTasks,
     replication: Replication,
+    changes: ChangeStreams,
     node: DataNode,
     keeper: LeaseKeeper,
     drain: DrainSettings,
@@ -111,6 +116,9 @@ pub enum StartError {
     /// The `[engine]` configuration is invalid.
     #[error("invalid engine configuration")]
     Engine(#[from] InvalidPageSizeError),
+    /// A `[[changes.sink]]` entry can't be built.
+    #[error("invalid change sink configuration")]
+    Sink(#[from] BuildSinkError),
 }
 
 impl Daemon {
@@ -257,6 +265,13 @@ impl Daemon {
         self.data.as_ref().map(|data| data.replication.clone())
     }
 
+    /// The node's change streams, if this daemon hosts data: the sinks fed from the databases
+    /// it is primary for (FR-039).
+    #[must_use]
+    pub fn change_streams(&self) -> Option<ChangeStreams> {
+        self.data.as_ref().map(|data| data.changes.clone())
+    }
+
     /// Serves until `shutdown` completes, then stops taking work, finishes in-flight writes, closes
     /// its databases, and releases the data directory.
     ///
@@ -279,6 +294,9 @@ impl Daemon {
                 }
                 drop(data.keeper);
                 data.tasks.stop().await;
+                // Sinks get what is acknowledged so far; a pump that can't finish continues
+                // from its recorded position next time.
+                data.changes.stop(data.drain.handover).await;
                 Some(data.replication)
             }
             None => None,
@@ -370,6 +388,7 @@ fn start_data(
     let settings = config.replication.settings();
     let databases = data_dir.path().join(DATABASES_DIR);
     let engine_config = config.engine.clone();
+    let recorded = config.changes.recorded_databases();
     let replication = Replication::start(
         ReplicationParts {
             node: config.node.id.clone(),
@@ -382,12 +401,27 @@ fn start_data(
             state_dir: data_dir.path().join(REPLICATION_DIR),
             settings: settings.clone(),
         },
-        move |sink| Registry::new(engine, sink, databases, engine_config),
+        move |sink| {
+            Registry::new(engine, sink, databases, engine_config).with_recorded_changes(recorded)
+        },
     );
     statuses.set(replication.clone());
+    let sinks = config
+        .changes
+        .sink
+        .iter()
+        .map(|sink| build_sink(sink, config.engine.execution))
+        .collect::<Result<Vec<_>, _>>()?;
+    let changes = ChangeStreams::start(ChangeParts {
+        sinks,
+        replication: replication.clone(),
+        state_dir: data_dir.path().join(CHANGES_DIR),
+        settings: ChangeSettings::new(),
+    });
     let node = DataNode::new(
         config.node.id.clone(),
         replication.clone(),
+        changes.clone(),
         control,
         settings.ack_timeout,
     );
@@ -405,6 +439,7 @@ fn start_data(
         membership,
         tasks,
         replication,
+        changes,
         node: node.clone(),
         keeper,
         drain,

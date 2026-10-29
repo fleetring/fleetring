@@ -7,7 +7,11 @@
 //! Each checkpoint first records the position it covers in `data.db-checkpoint`, durably, so
 //! that after a restart the adapter still knows which earlier-generation position the current
 //! generation continues from, and refuses every other one (FR-032).
+//!
+//! Row changes for logical change streams are recorded by the `changes` module, in a side table
+//! inside the database (FR-039).
 
+mod changes;
 mod follower;
 mod pins;
 
@@ -25,11 +29,13 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, ToSql};
 
 pub use follower::SqliteFollower;
 
+use self::changes::Recorder;
 use self::pins::Pins;
 use crate::engine::{
     CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError,
-    EngineKind, Executed, FrameBatch, FrameFollower, FrameSource, FrameSourceEngine, OpenMode,
-    PinnedSnapshot, Position, Rows, Snapshot, SnapshotFile, Statement, Transaction, Value,
+    EngineKind, Executed, FrameBatch, FrameFollower, FrameSource, FrameSourceEngine,
+    LogicalChanges, LogicalSupport, OpenMode, PinnedSnapshot, Position, RowChange, Rows, Snapshot,
+    SnapshotFile, Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -122,6 +128,10 @@ impl DatabaseEngine for SqliteEngine {
         EngineCapability::FrameSource(self)
     }
 
+    fn logical_support(&self) -> LogicalSupport {
+        LogicalSupport::Supported
+    }
+
     fn open(&self, location: &Path, mode: OpenMode) -> Result<Box<dyn Database>, EngineError> {
         let path = location.join(DATABASE_FILE);
         let exists = path.try_exists().map_err(storage)?;
@@ -157,6 +167,11 @@ struct SqliteDatabase {
     /// Where the last checkpoint ended: the only earlier-generation position the current
     /// generation is known to continue from.
     checkpointed: Option<fleetring_wal::Position>,
+    /// The log's end as of the last read of it, which is the position the next transaction
+    /// starts from. Kept for the change recorder.
+    end: Option<fleetring_wal::Position>,
+    /// The row-change recorder, once a logical change stream asked for one.
+    recorder: Option<Recorder>,
 }
 
 impl SqliteDatabase {
@@ -210,6 +225,8 @@ impl SqliteDatabase {
             reader,
             pins,
             checkpointed,
+            end: None,
+            recorder: None,
         })
     }
 
@@ -217,11 +234,14 @@ impl SqliteDatabase {
         wal_path(&self.path)
     }
 
-    fn run_statements(&self, transaction: &Transaction) -> Result<(), EngineError> {
+    fn run_statements(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
         for statement in transaction.statements() {
             run(&self.writer, statement)?;
             if self.writer.is_autocommit() {
                 return Err(EngineError::TransactionControl);
+            }
+            if let Some(recorder) = &mut self.recorder {
+                recorder.after_statement(&self.writer)?;
             }
         }
         Ok(())
@@ -236,9 +256,17 @@ impl SqliteDatabase {
         }
     }
 
-    /// Reads every commit after `after`, as [`read_wal_file`] describes.
-    fn read_wal(&self, after: Option<&Position>) -> Result<Option<Batch>, EngineError> {
-        read_wal_file(&self.wal_path(), after, self.checkpointed)
+    /// Reads every commit after `after`, as [`read_wal_file`] describes, and remembers where the
+    /// log ends.
+    fn read_wal(&mut self, after: Option<&Position>) -> Result<Option<Batch>, EngineError> {
+        let batch = read_wal_file(&self.wal_path(), after, self.checkpointed)?;
+        match (&batch, after) {
+            (Some(batch), _) => self.end = Some(batch.end()),
+            (None, None) => self.end = None,
+            // Nothing after a valid position: the end is where it was.
+            (None, Some(_)) => {}
+        }
+        Ok(batch)
     }
 }
 
@@ -290,20 +318,42 @@ fn frame_batch(batch: &Batch) -> FrameBatch {
 
 impl Database for SqliteDatabase {
     fn execute(&mut self, transaction: &Transaction) -> Result<Executed, EngineError> {
-        let before = self.writer.total_changes();
         self.writer
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(classify)?;
+        let start = self.end;
+        if let Some(recorder) = &mut self.recorder
+            && let Err(error) = recorder.begin(&self.writer, start)
+        {
+            self.roll_back();
+            return Err(error);
+        }
+        let before = self.writer.total_changes();
         if let Err(error) = self.run_statements(transaction) {
             self.roll_back();
             return Err(error);
         }
+        // The recorder's own rows aren't the transaction's.
+        let recorded = match &self.recorder {
+            Some(recorder) => match recorder.recorded(&self.writer, start) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    self.roll_back();
+                    return Err(error);
+                }
+            },
+            None => 0,
+        };
         if let Err(error) = self.writer.execute_batch("COMMIT") {
             self.roll_back();
             return Err(classify(error));
         }
         Ok(Executed {
-            rows_affected: self.writer.total_changes().saturating_sub(before),
+            rows_affected: self
+                .writer
+                .total_changes()
+                .saturating_sub(before)
+                .saturating_sub(recorded),
         })
     }
 
@@ -363,6 +413,10 @@ impl Database for SqliteDatabase {
         DatabaseCapability::FrameSource(self)
     }
 
+    fn logical_changes(&mut self) -> Option<&mut dyn LogicalChanges> {
+        Some(self)
+    }
+
     fn close(self: Box<Self>) -> Result<(), EngineError> {
         let Self { reader, writer, .. } = *self;
         reader.close().map_err(|(_, error)| storage(error))?;
@@ -382,6 +436,24 @@ impl FrameSource for SqliteDatabase {
         after: Option<&Position>,
     ) -> Result<Option<FrameBatch>, EngineError> {
         Ok(self.read_wal(after)?.as_ref().map(frame_batch))
+    }
+
+    fn committed_between(
+        &mut self,
+        after: Option<&Position>,
+        until: &Position,
+    ) -> Result<Option<FrameBatch>, EngineError> {
+        let Some(batch) = self.read_wal(after)? else {
+            return Ok(None);
+        };
+        let end = decode_position(until)?;
+        if batch.end() == end {
+            return Ok(Some(frame_batch(&batch)));
+        }
+        let cut = batch.up_to(end).map_err(|_| EngineError::InvalidPosition {
+            position: until.clone(),
+        })?;
+        Ok(Some(frame_batch(&cut)))
     }
 
     fn checkpoint(&mut self) -> Result<CheckpointMarker, EngineError> {
@@ -427,6 +499,39 @@ impl FrameSource for SqliteDatabase {
             files,
             pin,
         ))
+    }
+}
+
+impl LogicalChanges for SqliteDatabase {
+    fn start_recording(&mut self) -> Result<(), EngineError> {
+        if self.recorder.is_some() {
+            return Ok(());
+        }
+        // The first recorded transaction starts where the log ends now.
+        let _primed = self.read_wal(None)?;
+        self.recorder = Some(Recorder::install(&self.writer)?);
+        Ok(())
+    }
+
+    fn changes_between(
+        &mut self,
+        after: Option<&Position>,
+        until: &Position,
+    ) -> Result<Vec<RowChange>, EngineError> {
+        // A reader at the log's beginning holds everything since the last checkpoint, whose end
+        // is the position those transactions started from.
+        let checkpointed = self.checkpointed.map(fleetring_wal::Position::to_bytes);
+        let lower = after
+            .map(Position::as_bytes)
+            .or(checkpointed.as_ref().map(<[u8; 20]>::as_slice));
+        changes::changes_between(&self.reader, lower, until.as_bytes())
+    }
+
+    fn release(&mut self, before: &Position) -> Result<(), EngineError> {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.release(before.as_bytes());
+        }
+        Ok(())
     }
 }
 

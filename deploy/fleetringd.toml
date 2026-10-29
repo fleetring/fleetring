@@ -62,3 +62,31 @@ id = "node-1"
 #   "stay"    the node stays a member, marked down once its heartbeats stop, and keeps its
 #             leases and its places in replica sets for a quick restart; nothing drains
 # on_shutdown = "leave"
+
+# [[changes.sink]]
+# Change streams (FR-039): each entry sends every acknowledged batch of the databases it names
+# to a sink, beside replication and never in a write's acknowledgement path. Delivery is at least
+# once, in commit order, resuming after a restart from the position kept under
+# `<data_dir>/changes/<name>/`; `status --node` shows each sink's position and backlog.
+#
+# `name`       1 to 64 lowercase letters, digits, `-`, or `_`; unique
+# `kind`       "file"     appends one JSON line per batch to `<path>/<database>.ndjson`
+#              "webhook"  POSTs each batch as JSON to `url`, retrying 5xx with backoff
+# `format`     "logical"  (the default) the rows each transaction inserted, updated, or deleted,
+#                         with their keys and values; schema changes aren't included
+#              "physical" the opaque batch, for a mirror or an archive the same engine applies
+# `databases`  exact names or prefixes ending in `*`; `["*"]` streams every database
+#
+# name = "archive"
+# kind = "file"
+# format = "logical"
+# databases = ["tenant:*", "ledger"]
+# path = "/data/changes"
+#
+# [[changes.sink]]
+# name = "hooks"
+# kind = "webhook"
+# databases = ["*"]
+# url = "http://127.0.0.1:8080/changes"
+# timeout_ms = 5000      # how long one request may take
+# retries = 5            # retries before the change is handed back and retried later

@@ -11,6 +11,7 @@ use fleetring_proto::v1::{AcquireLeaseRequest, LocateRequest, Placement};
 use tokio::sync::watch;
 use tonic::Status;
 
+use crate::changes::ChangeStreams;
 use crate::control::ControlClient;
 use crate::data::convert::durability_of;
 use crate::data::redirect::not_primary;
@@ -96,6 +97,7 @@ pub(crate) struct DataNode {
 pub(super) struct Inner {
     pub(super) id: NodeId,
     pub(super) replication: Replication,
+    pub(super) changes: ChangeStreams,
     pub(super) control: ControlClient,
     /// How long a node that starts serving a database waits for its followers' streams before
     /// it takes writes.
@@ -160,6 +162,7 @@ impl DataNode {
     pub(crate) fn new(
         id: NodeId,
         replication: Replication,
+        changes: ChangeStreams,
         control: ControlClient,
         writable_wait: Duration,
     ) -> Self {
@@ -167,6 +170,7 @@ impl DataNode {
             inner: Arc::new(Inner {
                 id,
                 replication,
+                changes,
                 control,
                 writable_wait,
                 leases: Mutex::new(BTreeMap::new()),
@@ -183,6 +187,10 @@ impl DataNode {
 
     pub(crate) fn replication(&self) -> &Replication {
         &self.inner.replication
+    }
+
+    pub(crate) fn change_streams(&self) -> &ChangeStreams {
+        &self.inner.changes
     }
 
     /// This node's ID.

@@ -11,6 +11,7 @@ use fleetring::{Host, NodeId, Weight, Zone};
 use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
+use crate::changes::ChangesConfig;
 use crate::control::DurabilityDefaults;
 use crate::engine::EngineConfig;
 use crate::replication::ReplicationSettings;
@@ -34,7 +35,8 @@ use crate::replication::ReplicationSettings;
 ///
 /// The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
 /// `[membership]` table sets how often a data node sends heartbeats; see [`MembershipSettings`].
-/// The `[replication]` table paces replication; see [`ReplicationConfig`].
+/// The `[replication]` table paces replication; see [`ReplicationConfig`]. The `[changes]`
+/// table lists the sinks that receive each database's changes; see [`ChangesConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -59,6 +61,9 @@ pub struct Config {
     /// How the data role replicates its databases.
     #[serde(default)]
     pub replication: ReplicationConfig,
+    /// Where the data role streams its databases' changes (FR-039).
+    #[serde(default)]
+    pub changes: ChangesConfig,
 }
 
 /// A node's identity and the attributes placement uses.
@@ -460,7 +465,7 @@ impl Config {
     /// [`ConfigError::Missing`] if a field this role needs is absent, and
     /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
     /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
-    /// below the lease duration.
+    /// below the lease duration, or a `[[changes.sink]]` entry is invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.role == Role::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
@@ -496,7 +501,7 @@ impl Config {
                 reason: "must be at least 1 ms".to_owned(),
             });
         }
-        Ok(())
+        self.changes.validate()
     }
 }
 
