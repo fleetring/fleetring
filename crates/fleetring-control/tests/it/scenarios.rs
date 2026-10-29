@@ -633,3 +633,102 @@ fn reports_without_a_log_epoch_load_from_old_logs() {
     let back: Action = serde_json::from_str(&tick).expect("a tick loads");
     assert_eq!(back, Action::Tick);
 }
+
+fn drop_db(database: &str) -> Action {
+    Action::DropDatabase { name: db(database) }
+}
+
+#[test]
+fn dropping_a_database_removes_its_lease_promotion_and_reports() {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create("acme", 3)).expect("create");
+    run(&mut state, 0, create("other", 3)).expect("create another");
+    let rs = state.replica_set(&db("acme")).expect("replica set");
+    run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
+    for replica in &rs[1..] {
+        run(
+            &mut state,
+            1_000,
+            heartbeat(replica.as_str(), &[("acme", &[3]), ("other", &[1])]),
+        )
+        .expect("heartbeat");
+    }
+    run(&mut state, 1_201, start("acme")).expect("promotion starts");
+    assert!(
+        state
+            .database(&db("acme"))
+            .is_some_and(|d| d.promotion().is_some())
+    );
+
+    let Ok(Applied::DatabaseDropped { database, epoch }) = run(&mut state, 1_300, drop_db("acme"))
+    else {
+        panic!("dropped");
+    };
+    assert_eq!((database, epoch), (db("acme"), LeaseEpoch::new(2)));
+    assert!(state.database(&db("acme")).is_none());
+    assert_eq!(state.databases().count(), 1, "the other database stays");
+    for replica in &rs {
+        assert!(
+            state.report(replica, &db("acme")).is_none(),
+            "{replica}'s report is gone"
+        );
+    }
+    assert!(
+        state.report(&rs[1], &db("other")).is_some(),
+        "reports of other databases stay"
+    );
+    assert!(matches!(
+        state.replica_set(&db("acme")),
+        Err(Rejection::UnknownDatabase { .. })
+    ));
+    assert!(state.promotions_due(at(10_000)).is_empty());
+
+    // Every later command that names the database is rejected as unknown: the old holder's
+    // renewal, the promotion's fences and completion, and a second drop.
+    let unknown = Rejection::UnknownDatabase {
+        database: db("acme"),
+    };
+    assert_eq!(reject(&mut state, 1_400, renew("acme", &rs[0], 1)), unknown);
+    assert_eq!(
+        reject(&mut state, 1_400, fence("acme", &rs[1], 2, &[3])),
+        unknown
+    );
+    assert_eq!(reject(&mut state, 1_400, complete("acme", 2)), unknown);
+    assert_eq!(reject(&mut state, 1_400, drop_db("acme")), unknown);
+    assert_eq!(
+        reject(&mut state, 1_400, drop_db("never")),
+        Rejection::UnknownDatabase {
+            database: db("never"),
+        }
+    );
+
+    // The name is free again, and the new database starts from epoch 0.
+    run(&mut state, 1_500, create("acme", 2)).expect("create again");
+    assert_eq!(
+        state.database(&db("acme")).map(|d| d.epoch()),
+        Some(LeaseEpoch::ZERO)
+    );
+    // A heartbeat that still reports the old copy is counted, with the report kept out only while
+    // the database doesn't exist.
+    run(
+        &mut state,
+        1_600,
+        heartbeat(rs[1].as_str(), &[("acme", &[3])]),
+    )
+    .expect("heartbeat");
+}
+
+#[test]
+fn a_drop_survives_the_log_and_old_logs_load_without_it() {
+    let dropped = serde_json::to_string(&drop_db("acme")).expect("serializes");
+    assert_eq!(dropped, r#"{"drop_database":{"name":"acme"}}"#);
+    let back: Action = serde_json::from_str(&dropped).expect("a drop loads");
+    assert_eq!(back, drop_db("acme"));
+    let applied = Applied::DatabaseDropped {
+        database: db("acme"),
+        epoch: LeaseEpoch::new(3),
+    };
+    let encoded = serde_json::to_string(&applied).expect("serializes");
+    let back: Applied = serde_json::from_str(&encoded).expect("an outcome loads");
+    assert_eq!(back, applied);
+}

@@ -52,9 +52,11 @@ proptest! {
                 }
                 _ => {}
             }
+            // A dropped database is gone; one created again under its name starts over.
             for db in before.databases() {
-                let now = after.database(db.name()).map(|db| db.epoch());
-                assert!(now >= Some(db.epoch()), "epoch of {} went backwards", db.name());
+                if let Some(now) = after.database(db.name()).map(|db| db.epoch()) {
+                    assert!(now >= db.epoch(), "epoch of {} went backwards", db.name());
+                }
             }
         });
     }
@@ -64,15 +66,19 @@ proptest! {
         ops in prop::collection::vec(arb_op(), 1..300),
     ) {
         let mut granted: BTreeMap<DatabaseName, BTreeSet<LeaseEpoch>> = BTreeMap::new();
-        drive(&ops, |_, _, outcome, _| {
-            if let Ok(
+        drive(&ops, |_, _, outcome, _| match outcome {
+            Ok(
                 Applied::LeaseGranted { database, lease }
                 | Applied::PromotionCompleted { database, lease, .. },
-            ) = outcome
-            {
+            ) => {
                 let fresh = granted.entry(database.clone()).or_default().insert(lease.epoch());
                 assert!(fresh, "two leases of {database} at epoch {}", lease.epoch());
             }
+            // A database created again under a dropped name is a new database.
+            Ok(Applied::DatabaseDropped { database, .. }) => {
+                granted.remove(database);
+            }
+            _ => {}
         });
     }
 

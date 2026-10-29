@@ -51,13 +51,16 @@ const _: () = {
     assert_debug_send_sync::<control::ControlOptions>();
     assert_debug_send_sync::<control::ControlService>();
     assert_debug_send_sync::<control::LogError>();
+    assert_debug_send_sync::<control::NoControl>();
     assert_debug_send_sync::<control::OpenError>();
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
     assert_debug_send_sync::<Daemon>();
     assert_debug_send_sync::<data::Client>();
     assert_debug_send_sync::<data::Location>();
+    assert_debug_send_sync::<data::NodeStatus>();
     assert_debug_send_sync::<data::ReplicaInfo>();
+    assert_debug_send_sync::<data::ServedDatabase>();
     assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<Environment>();
     assert_debug_send_sync::<Network>();

@@ -15,7 +15,7 @@ use tonic::transport::server::TcpIncoming;
 use crate::config::reachable;
 use crate::control::{
     ControlHandle, ControlNode, ControlOptions, ControlService, Failover, FailoverSettings,
-    OpenError,
+    NoControl, OpenError,
 };
 use crate::data::{DataNode, DatabaseService, LeaseKeeper, LeaseSettings};
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
@@ -180,6 +180,7 @@ impl Daemon {
             address,
             control.as_ref().map(|role| &role.node),
             data.as_ref().map(|(_, node)| node),
+            control_address(&config, address),
         );
         let data = data.map(|(role, _)| role);
         tracing::info!(
@@ -316,6 +317,12 @@ async fn open_control(
     Ok(ControlNode::open(path, options, environment.clock()).await?)
 }
 
+/// The address this node reaches the control plane at: `[control] address`, or else its own
+/// listener, which the control role shares.
+fn control_address(config: &Config, bound: SocketAddr) -> SocketAddr {
+    config.control.address.unwrap_or_else(|| reachable(bound))
+}
+
 /// The data role's address for peers: `[node] advertise`, or else the address it serves on.
 fn advertised(config: &Config, bound: SocketAddr) -> SocketAddr {
     config.node.advertise.unwrap_or_else(|| reachable(bound))
@@ -335,13 +342,7 @@ fn start_data(
 ) -> Result<(DataRole, DataNode), StartError> {
     let engine = SqliteEngine::new(config.engine.page_size)?;
     let network = environment.network();
-    let control = network.control_client(
-        config
-            .control
-            .address
-            .unwrap_or_else(|| reachable(bound))
-            .to_string(),
-    );
+    let control = network.control_client(control_address(config, bound).to_string());
     let member = config
         .node
         .to_member()
@@ -442,12 +443,14 @@ async fn bind(config: &Config, network: Network) -> Result<(Listener, SocketAddr
 }
 
 /// Serves on `listener`: the `Control` service if `control` runs here, and the `Database` and
-/// `Replication` services if `data` does.
+/// `Replication` services if `data` does. A node without the control role answers control calls
+/// with [`NoControl`], which names the control node at `control_address`.
 fn serve(
     listener: Listener,
     address: SocketAddr,
     control: Option<&ControlNode>,
     data: Option<&DataNode>,
+    control_address: SocketAddr,
 ) -> RunningServer {
     let (stop, stopped) = oneshot::channel::<()>();
     // A dropped sender also means stop.
@@ -457,6 +460,11 @@ fn serve(
     let router = Server::builder()
         .add_optional_service(
             control.map(|node| control_server(ControlService::new(node.handle()))),
+        )
+        .add_optional_service(
+            control
+                .is_none()
+                .then(|| control_server(NoControl::new(control_address.to_string()))),
         )
         .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))))
         .add_optional_service(data.map(|node| node.replication().server()));

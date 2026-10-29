@@ -1,16 +1,16 @@
 //! The open databases of one data node: opened on first use, closed when idle, and capped.
 
-use std::collections::BTreeMap;
-use std::mem;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::{io, mem};
 
 use fleetring_control::DatabaseName;
 use tokio::sync::{oneshot, watch};
 
 use crate::actor::{self, ActorConfig, DatabaseError, DatabaseHandle, Stored};
 use crate::engine::{
-    DatabaseEngine, EngineConfig, EngineError, OpenMode, Rows, Statement, Transaction,
+    DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Statement, Transaction,
 };
 use crate::layout;
 use crate::sink::ReplicationSink;
@@ -40,6 +40,8 @@ struct Inner {
 #[derive(Debug, Default)]
 struct State {
     entries: BTreeMap<DatabaseName, Entry>,
+    /// Databases whose files are being deleted; a request for one finds no database.
+    removing: BTreeSet<DatabaseName>,
     clock: u64,
     next_id: u64,
 }
@@ -218,6 +220,34 @@ impl Registry {
         }
     }
 
+    /// Closes `name` if it is open, then deletes its files, so that no copy of it remains on this
+    /// node. A request that arrives meanwhile, or after, finds no database until one is created
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error if the files can't be deleted; the database stays closed.
+    ///
+    /// # Panics
+    ///
+    /// If the registry's lock was poisoned by a panic in another thread.
+    pub async fn remove(&self, name: &DatabaseName) -> io::Result<()> {
+        self.inner.lock().removing.insert(name.clone());
+        self.close(name).await;
+        let location = self.location(name);
+        let removed = match self.inner.config.execution {
+            Execution::Inline => remove_dir_if_present(&location),
+            Execution::Threads => {
+                tokio::task::spawn_blocking(move || remove_dir_if_present(&location))
+                    .await
+                    .map_err(io::Error::other)
+                    .and_then(|removed| removed)
+            }
+        };
+        self.inner.lock().removing.remove(name);
+        removed
+    }
+
     /// The directory that holds `name`'s storage, whether or not it is open.
     pub(crate) fn location(&self, name: &DatabaseName) -> PathBuf {
         self.inner.root.join(layout::database_dir(name))
@@ -244,6 +274,12 @@ impl Registry {
 
     fn next(&self, name: &DatabaseName, mode: OpenMode) -> Result<Next, DatabaseError> {
         let mut state = self.inner.lock();
+        if state.removing.contains(name) {
+            return Err(DatabaseError::Open {
+                name: name.clone(),
+                source: Arc::new(EngineError::NotFound),
+            });
+        }
         state.clock += 1;
         let now = state.clock;
         if let Some(entry) = state.entries.get_mut(name) {
@@ -339,6 +375,15 @@ fn forget(registry: &Weak<Inner>, name: &DatabaseName, id: u64) {
         if state.entries.get(name).is_some_and(|entry| entry.id == id) {
             state.entries.remove(name);
         }
+    }
+}
+
+/// Deletes `dir` and everything in it, if it exists.
+fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
