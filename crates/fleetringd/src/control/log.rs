@@ -211,17 +211,46 @@ impl CommandLog {
     /// [`LogError`] if the command can't be encoded or written, including when `index` is
     /// already taken. After an error the command may or may not be durable.
     pub fn append(&mut self, index: LogIndex, command: &Command) -> Result<(), LogError> {
-        let text = serde_json::to_string(command).map_err(|source| LogError::Encode {
-            what: "a command",
+        self.append_all([(index, command)])
+    }
+
+    /// Appends `commands`, each at its index, in one transaction, and waits until all of them
+    /// are on stable storage.
+    ///
+    /// The group costs one sync however many commands it holds, so a writer that logs everything
+    /// queued behind a command as one group keeps up with a burst of commands on a disk whose
+    /// syncs are slow, where logging them one at a time would fall ever further behind. Either
+    /// every command in the group is logged or none is.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError`] if a command can't be encoded or written, including when an index is already
+    /// taken. Nothing from the group is logged then.
+    pub fn append_all<'c>(
+        &mut self,
+        commands: impl IntoIterator<Item = (LogIndex, &'c Command)>,
+    ) -> Result<(), LogError> {
+        let path = self.path.clone();
+        let sqlite = |source| LogError::Sqlite {
+            path: path.clone(),
             source,
-        })?;
-        self.connection
-            .execute(
-                "INSERT INTO commands (log_index, command) VALUES (?1, ?2)",
-                params![to_sql(index)?, text],
-            )
-            .map_err(|source| self.sqlite(source))?;
-        Ok(())
+        };
+        let transaction = self.connection.transaction().map_err(sqlite)?;
+        {
+            let mut insert = transaction
+                .prepare_cached("INSERT INTO commands (log_index, command) VALUES (?1, ?2)")
+                .map_err(sqlite)?;
+            for (index, command) in commands {
+                let text = serde_json::to_string(command).map_err(|source| LogError::Encode {
+                    what: "a command",
+                    source,
+                })?;
+                insert
+                    .execute(params![to_sql(index)?, text])
+                    .map_err(sqlite)?;
+            }
+        }
+        transaction.commit().map_err(sqlite)
     }
 
     /// Stores `state` as the snapshot after the command at `index`, replacing older snapshots.

@@ -1,4 +1,11 @@
 //! The control node: one writer that stamps, logs, applies, and publishes every command.
+//!
+//! The writer takes the commands queued behind the one it picks up as a group: it logs the group
+//! in one transaction, so a sync covers all of them, then applies them one at a time in log
+//! order and answers each. Each command still gets its own index and stamp, and a replay of the
+//! log can't tell which commands shared a sync. Without grouping, every command costs a sync of
+//! its own, and on a disk whose syncs are slow the writer falls behind a steady stream of
+//! heartbeats and ticks: its queue, and every control call's wait, then grow without bound.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
@@ -163,14 +170,11 @@ impl Committed {
     }
 }
 
+type Reply = oneshot::Sender<Result<Committed, SubmitError>>;
+
 enum Mail {
-    Submit {
-        action: Action,
-        reply: oneshot::Sender<Result<Committed, SubmitError>>,
-    },
-    Stop {
-        done: oneshot::Sender<()>,
-    },
+    Submit { action: Action, reply: Reply },
+    Stop { done: oneshot::Sender<()> },
 }
 
 /// A cheap, cloneable handle that submits commands to the control node and reads its state.
@@ -183,8 +187,8 @@ pub struct ControlHandle {
 impl ControlHandle {
     /// Stamps, logs, and applies `action`, and returns the result once it is durable.
     ///
-    /// Commands from every handle apply one at a time, in log order. When the mailbox is full,
-    /// this waits for room.
+    /// Commands from every handle apply one at a time, in log order; those queued together are
+    /// logged with one sync. When the mailbox is full, this waits for room.
     ///
     /// # Errors
     ///
@@ -368,8 +372,8 @@ impl Writer {
     }
 
     async fn run(mut self, mut inbox: mpsc::Receiver<Mail>) {
-        while let Some(mail) = inbox.recv().await {
-            if let Flow::Stop(done) = self.handle(mail) {
+        while let Some(first) = inbox.recv().await {
+            if let Flow::Stop(done) = self.handle_group(first, &mut inbox) {
                 self.stop(done);
                 return;
             }
@@ -377,8 +381,8 @@ impl Writer {
     }
 
     fn run_blocking(mut self, mut inbox: mpsc::Receiver<Mail>) {
-        while let Some(mail) = inbox.blocking_recv() {
-            if let Flow::Stop(done) = self.handle(mail) {
+        while let Some(first) = inbox.blocking_recv() {
+            if let Flow::Stop(done) = self.handle_group(first, &mut inbox) {
                 self.stop(done);
                 return;
             }
@@ -393,29 +397,72 @@ impl Writer {
         }
     }
 
-    fn handle(&mut self, mail: Mail) -> Flow {
-        match mail {
-            Mail::Submit { action, reply } => match self.commit(action) {
-                Ok(committed) => {
-                    // A caller that gave up still had its command applied, as logged.
-                    let _unheard = reply.send(Ok(committed));
-                    Flow::Continue
+    /// Handles `first` and everything queued behind it as one group. A stop request ends the
+    /// group: the commands before it are committed, and the writer stops after them.
+    fn handle_group(&mut self, first: Mail, inbox: &mut mpsc::Receiver<Mail>) -> Flow {
+        let mut submits = Vec::new();
+        let mut stop = None;
+        let mut next = Some(first);
+        while let Some(mail) = next.take() {
+            match mail {
+                Mail::Submit { action, reply } => submits.push((action, reply)),
+                Mail::Stop { done } => {
+                    stop = Some(done);
+                    break;
                 }
-                Err(error) => {
-                    tracing::error!(error = %error, "control log write failed; stopping the writer");
-                    let _unheard = reply.send(Err(SubmitError::Storage(error)));
-                    Flow::Stop(None)
-                }
-            },
-            Mail::Stop { done } => Flow::Stop(Some(done)),
+            }
+            next = inbox.try_recv().ok();
+        }
+        match (self.commit_group(submits), stop) {
+            (Flow::Continue, None) => Flow::Continue,
+            (Flow::Continue, Some(done)) => Flow::Stop(Some(done)),
+            (Flow::Stop(_), stop) => Flow::Stop(stop),
         }
     }
 
-    /// Stamps, logs, applies, publishes, and snapshots one command.
-    fn commit(&mut self, action: Action) -> Result<Committed, LogError> {
-        let index = self.last_index.next().ok_or(LogError::Exhausted)?;
-        let command = Command::new(self.clock.now(), action);
-        self.log.append(index, &command)?;
+    /// Stamps and numbers `submits` in order, logs them in one transaction, then applies,
+    /// publishes, and answers each. Nothing is answered before the whole group is durable.
+    fn commit_group(&mut self, submits: Vec<(Action, Reply)>) -> Flow {
+        let mut commands = Vec::with_capacity(submits.len());
+        let mut replies = Vec::with_capacity(submits.len());
+        let mut last = self.last_index;
+        let mut exhausted = None;
+        for (action, reply) in submits {
+            let Some(index) = last.next() else {
+                exhausted = Some(reply);
+                break;
+            };
+            last = index;
+            commands.push((index, Command::new(self.clock.now(), action)));
+            replies.push(reply);
+        }
+        if !commands.is_empty()
+            && let Err(error) = self
+                .log
+                .append_all(commands.iter().map(|(index, command)| (*index, command)))
+        {
+            tracing::error!(error = %error, "control log write failed; stopping the writer");
+            // The first waiter learns why; the rest see the writer stop.
+            if let Some(reply) = replies.into_iter().next() {
+                let _unheard = reply.send(Err(SubmitError::Storage(error)));
+            }
+            return Flow::Stop(None);
+        }
+        for ((index, command), reply) in commands.into_iter().zip(replies) {
+            let committed = self.apply_logged(index, command);
+            // A caller that gave up still had its command applied, as logged.
+            let _unheard = reply.send(Ok(committed));
+        }
+        if let Some(reply) = exhausted {
+            tracing::error!("control log index is exhausted; stopping the writer");
+            let _unheard = reply.send(Err(SubmitError::Storage(LogError::Exhausted)));
+            return Flow::Stop(None);
+        }
+        Flow::Continue
+    }
+
+    /// Applies the command logged at `index`, publishes the state, and snapshots when one is due.
+    fn apply_logged(&mut self, index: LogIndex, command: Command) -> Committed {
         self.last_index = index;
         let outcome = apply(&mut self.state, command.clone());
         let state = if outcome.is_ok() {
@@ -426,18 +473,18 @@ impl Writer {
             // A rejection changes nothing, so the published state is still current.
             Arc::clone(&self.publish.borrow())
         };
-        if index.get() % self.snapshot_every.get() == 0 {
+        if index.get().is_multiple_of(self.snapshot_every.get()) {
             match self.log.save_snapshot(index, &self.state) {
                 Ok(()) => tracing::debug!(index = index.get(), "control snapshot saved"),
                 // The log alone still recovers everything; the next snapshot tries again.
                 Err(error) => tracing::warn!(error = %error, "can't save a control snapshot"),
             }
         }
-        Ok(Committed {
+        Committed {
             index,
             command,
             outcome,
             state,
-        })
+        }
     }
 }
