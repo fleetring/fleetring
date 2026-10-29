@@ -81,7 +81,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-036](FR-036-history-checker.md) | History checker for simulation runs | P1 | M | FR-024, FR-031 | done |
 | [FR-037](FR-037-cli-polish.md) | CLI polish: `db list`, `db drop`, `status --node`, clear answers from data-only nodes | P1 | M | FR-033 | done |
 | [FR-038](FR-038-graceful-departure.md) | Graceful departure: drain a node's primaries before it leaves | P1 | M | FR-031 | done |
-| [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | todo |
+| [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | done |
 
 ## Dependency graph
 

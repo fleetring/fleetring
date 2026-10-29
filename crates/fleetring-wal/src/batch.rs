@@ -232,6 +232,50 @@ impl Batch {
         ))
     }
 
+    /// The part of this batch up to `end`, a commit boundary inside it: a shorter batch with the
+    /// same start, or this batch unchanged when `end` is its end.
+    ///
+    /// A reader that may only hand out transactions up to a known position, such as a change
+    /// stream that stops at the write quorum's acknowledgements, cuts a batch here.
+    ///
+    /// # Errors
+    ///
+    /// [`CutError::OutsideBatch`] if `end` isn't in the batch's generation or isn't between its
+    /// start and its end, and [`CutError::NotCommitBoundary`] if `end` isn't just past a commit
+    /// frame.
+    pub fn up_to(&self, end: Position) -> Result<Self, CutError> {
+        let outside = || CutError::OutsideBatch {
+            position: end,
+            start: self.start,
+            end: self.end(),
+        };
+        if end.generation() != self.start.generation() {
+            return Err(outside());
+        }
+        let len = end
+            .offset()
+            .checked_sub(self.start.offset())
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(outside)?;
+        if len == 0 || len > self.frames.len() {
+            return Err(outside());
+        }
+        let frame_len = header::frame_len(self.page_size);
+        if !len.is_multiple_of(frame_len) {
+            return Err(CutError::NotCommitBoundary { position: end });
+        }
+        let last = frame::frame_header(&self.frames[len - frame_len..len]);
+        if !last.is_commit() {
+            return Err(CutError::NotCommitBoundary { position: end });
+        }
+        Ok(Self::from_valid_frames(
+            self.header,
+            self.start,
+            self.page_size,
+            self.frames[..len].to_vec(),
+        ))
+    }
+
     /// Verifies the frames' checksum chain, continuing from `checksum`.
     pub(crate) fn check_chain(
         &self,
@@ -257,6 +301,29 @@ impl fmt::Debug for Batch {
             .field("frame_count", &self.frame_count())
             .finish()
     }
+}
+
+/// An error from cutting a [`Batch`] at a position ([`Batch::up_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CutError {
+    /// The position isn't inside the batch.
+    #[error("position {position} is outside the batch from {start} to {end}")]
+    OutsideBatch {
+        /// The position asked for.
+        position: Position,
+        /// The batch's start.
+        start: Position,
+        /// The batch's end.
+        end: Position,
+    },
+
+    /// The position isn't just past a commit frame.
+    #[error("position {position} is not a commit boundary")]
+    NotCommitBoundary {
+        /// The position asked for.
+        position: Position,
+    },
 }
 
 /// An error from decoding a [`Batch`] payload.

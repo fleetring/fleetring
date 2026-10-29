@@ -8,6 +8,7 @@ use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Live
 use fleetring_proto::v1::{self as proto, value::Value as Kind};
 use tonic::Status;
 
+use crate::changes::SinkStatus;
 use crate::data::client::{Location, NodeStatus, ReplicaInfo, ServedDatabase};
 use crate::engine::{Position, Rows, Statement, Value};
 
@@ -229,11 +230,29 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
+    let held = |bytes: Vec<u8>| (!bytes.is_empty()).then(|| Position::from(bytes));
+    let sinks = response
+        .sinks
+        .into_iter()
+        .map(|status| {
+            Ok(SinkStatus {
+                sink: status.sink,
+                database: parse_reply("database name", &status.database)?,
+                position: held(status.position),
+                acknowledged: held(status.acknowledged),
+                backlog: status.backlog,
+                failures: status.failures,
+                resets: status.resets,
+                last_error: (!status.last_error.is_empty()).then_some(status.last_error),
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
     Ok(NodeStatus {
         node: parse_reply("node id", &response.node_id)?,
         membership_epoch: Epoch::new(response.membership_epoch),
         fingerprint: response.ring_fingerprint.map(Fingerprint::new),
         databases,
+        sinks,
     })
 }
 

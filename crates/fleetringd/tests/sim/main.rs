@@ -3,6 +3,7 @@
 //! Each test runs its scenario over the fixed seeds in `fleetringd::sim::seeds::FIXED`. Set
 //! `FLEETRING_SIM_SEED` to run one seed; a failing test prints the command that does that.
 
+mod changes;
 mod cluster;
 mod control;
 mod database;

@@ -5,8 +5,8 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::{
-    CheckpointMarker, Executed, FrameBatch, PinnedSnapshot, Position, ReplicaPosition, Rows,
-    Snapshot, Statement, Transaction,
+    CheckpointMarker, Executed, FrameBatch, LogicalSupport, PinnedSnapshot, Position,
+    ReplicaPosition, RowChange, Rows, Snapshot, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -22,6 +22,13 @@ pub trait DatabaseEngine: fmt::Debug + Send + Sync + 'static {
 
     /// How the engine's databases replicate.
     fn capability(&self) -> EngineCapability<'_>;
+
+    /// Whether the engine's databases can record and decode row changes for a logical change
+    /// stream (FR-039). An engine that can't still feeds physical streams if it is a frame
+    /// source. The default is [`LogicalSupport::Unsupported`].
+    fn logical_support(&self) -> LogicalSupport {
+        LogicalSupport::Unsupported
+    }
 
     /// Opens or creates the database stored at `location`, a directory the engine owns.
     ///
@@ -62,6 +69,12 @@ pub trait Database: fmt::Debug + Send {
 
     /// How this database replicates, with access to the matching operations.
     fn capability(&mut self) -> DatabaseCapability<'_>;
+
+    /// The database's row-change recorder, if its engine supports logical change streams
+    /// ([`DatabaseEngine::logical_support`]). The default is `None`.
+    fn logical_changes(&mut self) -> Option<&mut dyn LogicalChanges> {
+        None
+    }
 
     /// Closes the database. It doesn't checkpoint: the log stays as it is for the next open.
     ///
@@ -156,6 +169,23 @@ pub trait FrameSource: fmt::Debug + Send {
         after: Option<&Position>,
     ) -> Result<Option<FrameBatch>, EngineError>;
 
+    /// Every committed transaction after `after` up to `until`, as one batch, or `None` if
+    /// there is none.
+    ///
+    /// `until` is a position this engine handed out as a batch end, at or before the log's end.
+    /// A change stream reads this way, so that it never hands out a transaction past the write
+    /// quorum's acknowledgements (FR-039).
+    ///
+    /// # Errors
+    ///
+    /// As [`committed_since`](Self::committed_since), and [`EngineError::InvalidPosition`] if
+    /// `until` isn't a commit boundary of the log after `after`.
+    fn committed_between(
+        &mut self,
+        after: Option<&Position>,
+        until: &Position,
+    ) -> Result<Option<FrameBatch>, EngineError>;
+
     /// Checkpoints the log into the database, and returns the marker followers checkpoint at.
     ///
     /// Engines never checkpoint on their own: this is the only way the log restarts.
@@ -237,6 +267,43 @@ pub trait FrameFollower: fmt::Debug + Send {
     /// current log, for example because it is in an older generation, and
     /// [`EngineError::Storage`] if the copy can't be written.
     fn truncate_to(&mut self, position: &Position) -> Result<(), EngineError>;
+}
+
+/// Row-change recording on an open database, for logical change streams (FR-039).
+///
+/// Once recording starts, the engine keeps the row changes of every later write transaction as
+/// durably as the transaction itself, keyed by the log position the transaction started from,
+/// until [`release`](Self::release) lets it forget them. A change stream then decodes the
+/// changes of any batch it reads from the log, after a restart too.
+pub trait LogicalChanges: fmt::Debug + Send {
+    /// Starts recording row changes of every later write transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if the recorder can't be set up.
+    fn start_recording(&mut self) -> Result<(), EngineError>;
+
+    /// The row changes of the transactions after `after` up to `until`, in commit order, and in
+    /// statement order within a transaction.
+    ///
+    /// `after` is `None` for the current log's beginning, as a reader with no position reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if the recorded changes can't be read.
+    fn changes_between(
+        &mut self,
+        after: Option<&Position>,
+        until: &Position,
+    ) -> Result<Vec<RowChange>, EngineError>;
+
+    /// Lets the engine forget the recorded changes of transactions that ended at or before
+    /// `before`, which every change stream has delivered.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if the engine can't record the release.
+    fn release(&mut self, before: &Position) -> Result<(), EngineError>;
 }
 
 /// The operations on an open database whose engine replicates itself.

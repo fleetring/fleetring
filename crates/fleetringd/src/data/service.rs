@@ -3,14 +3,14 @@
 use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
 use fleetring_proto::v1::{
-    CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse, NodeStatusRequest,
-    NodeStatusResponse, QueryRequest, QueryResponse,
+    ChangeSinkStatus, CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse,
+    NodeStatusRequest, NodeStatusResponse, QueryRequest, QueryResponse,
 };
 use tonic::{Request, Response, Status};
 
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::node::DataNode;
-use crate::engine::{EngineError, Transaction};
+use crate::engine::{EngineError, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
@@ -142,11 +142,34 @@ impl Database for DatabaseService {
     ) -> Result<Response<NodeStatusResponse>, Status> {
         let replication = self.node.replication();
         let view = replication.membership_view();
+        let sinks = self
+            .node
+            .change_streams()
+            .status()
+            .into_iter()
+            .map(|status| ChangeSinkStatus {
+                sink: status.sink,
+                database: status.database.to_string(),
+                position: status
+                    .position
+                    .map(Position::into_bytes)
+                    .unwrap_or_default(),
+                acknowledged: status
+                    .acknowledged
+                    .map(Position::into_bytes)
+                    .unwrap_or_default(),
+                backlog: status.backlog,
+                failures: status.failures,
+                resets: status.resets,
+                last_error: status.last_error.unwrap_or_default(),
+            })
+            .collect();
         Ok(Response::new(NodeStatusResponse {
             node_id: self.node.id().to_string(),
             membership_epoch: view.epoch().get(),
             ring_fingerprint: view.fingerprint().map(|fingerprint| fingerprint.get()),
             databases: replication.statuses(),
+            sinks,
         }))
     }
 }

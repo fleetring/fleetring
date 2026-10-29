@@ -1,7 +1,14 @@
 //! Statements, transactions, and their results, in a form every engine accepts.
 
+use serde::{Deserialize, Serialize};
+
 /// A value bound to a statement parameter or read from a result row.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// As JSON, a value is `"null"`, or an object with one key naming its type: `{"integer": 7}`,
+/// `{"real": 1.5}`, `{"text": "hi"}`, or `{"blob": [1, 2, 3]}`, so that integers and reals
+/// stay distinct and bytes round-trip exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Value {
     /// No value.
     Null,

@@ -18,7 +18,9 @@ fleetring = { path = "../fleetring", features = ["serde"] }
 fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
 fleetring-proto = { version = "0.0.0", path = "../fleetring-proto" }
 fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -37,7 +39,7 @@ twox-hash = { workspace = true, features = ["alloc", "xxhash3_128"] }
 [features]
 # The simulation harness (`fleetringd::sim`): the daemon over turmoil's simulated network and
 # clock (ADR-0020).
-simulation = ["dep:turmoil", "dep:hyper-util", "dep:tower", "dep:tempfile"]
+simulation = ["dep:turmoil", "dep:tower", "dep:tempfile"]
 
 [lints]
 workspace = true
@@ -47,6 +49,7 @@ name = "sim"
 required-features = ["simulation"]
 
 [dev-dependencies]
+hyper = { version = "1", features = ["server", "http1"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
 tokio-stream = "0.1"

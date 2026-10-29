@@ -14,6 +14,7 @@ use fleetring_control::{DatabaseName, State};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
+use crate::changes::{ChangeRecord, ChangesConfig, SinkKind, database_file};
 use crate::control::ControlHandle;
 use crate::daemon::{CONTROL_DB, DATABASES_DIR};
 use crate::engine::{EngineConfig, Execution};
@@ -355,6 +356,7 @@ fn host_config(
             ..MembershipSettings::default()
         },
         replication: ReplicationConfig::default(),
+        changes: ChangesConfig::default(),
     })
 }
 
@@ -364,6 +366,7 @@ struct HostInfo {
     name: String,
     role: Role,
     data_dir: PathBuf,
+    config: Config,
 }
 
 /// A running cluster of simulated hosts, each running the real [`Daemon`](crate::Daemon).
@@ -424,13 +427,15 @@ impl Cluster {
         self.shared.lock().stops.insert(name.to_owned(), stop);
         let shared = self.shared.clone();
         let host = name.to_owned();
+        let started = config.clone();
         self.sim.host(name, move || {
-            run_host(host.clone(), config.clone(), shared.clone())
+            run_host(host.clone(), started.clone(), shared.clone())
         });
         self.hosts.push(HostInfo {
             name: name.to_owned(),
             role,
             data_dir,
+            config,
         });
     }
 
@@ -811,6 +816,40 @@ impl Cluster {
         Ok(())
     }
 
+    /// Checks every file sink the data hosts are configured with
+    /// ([`check::change_stream_consistent`]): for each database created through the data plane,
+    /// the lines each host's sink wrote are an in-order, gapless stream of writes the history
+    /// knows, with duplicates allowed and nothing refused or invented. Returns how many records
+    /// were checked.
+    ///
+    /// # Errors
+    ///
+    /// A [`Violation`], or [`SimError::Simulation`] if a sink's file can't be read.
+    pub fn check_change_streams(&self) -> Result<usize, SimError> {
+        let history = self.history();
+        let mut checked = 0;
+        for host in self.hosts.iter().filter(|host| host.role.hosts_data()) {
+            for sink in &host.config.changes.sink {
+                let (SinkKind::File, Some(dir)) = (sink.kind, &sink.path) else {
+                    continue;
+                };
+                for (database, _) in created(&history) {
+                    let path = database_file(dir, &database);
+                    let records = read_records(&path).map_err(|error| {
+                        SimError::Simulation(format!(
+                            "can't read {}'s sink file {}: {error}",
+                            host.name,
+                            path.display()
+                        ))
+                    })?;
+                    check::change_stream_consistent(&history, &database, &host.name, &records)?;
+                    checked += records.len();
+                }
+            }
+        }
+        Ok(checked)
+    }
+
     /// Steps until the followers of every database created through the data plane have
     /// acknowledged everything its primary committed, then checks that every replica holds the
     /// same rows and runs the history checker ([`Cluster::check_history`]).
@@ -1070,6 +1109,7 @@ impl Cluster {
         }
         stopped?;
         self.check_history()?;
+        let _records = self.check_change_streams()?;
         let log = self.check_control_log()?;
         if let Some(control) = control
             && *control.state() != *log.state()
@@ -1123,6 +1163,19 @@ fn created(history: &History) -> Vec<(DatabaseName, Guarantee)> {
         })
         .collect();
     databases.into_iter().collect()
+}
+
+/// Reads the records a file sink wrote to `path`, or none if there is no file.
+fn read_records(path: &Path) -> Result<Vec<ChangeRecord>, Box<dyn std::error::Error>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| Ok(serde_json::from_str(line)?))
+        .collect()
 }
 
 /// Reads the values in the [`WRITES_TABLE`] of the SQLite copy in `dir`, from a scratch copy of

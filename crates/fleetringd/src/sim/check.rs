@@ -12,7 +12,9 @@
 //!   [`acknowledged_writes_replicated`], whenever the test asks
 //!   ([`Cluster::check_history`](crate::sim::Cluster::check_history)), once replicas converge,
 //!   and at the end, and [`replicas_converged`] once the network heals
-//!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged)).
+//!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged));
+//! - [`change_stream_consistent`] at the end, for every file sink a host is configured with
+//!   ([`Cluster::check_change_streams`](crate::sim::Cluster::check_change_streams)).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -22,8 +24,10 @@ use fleetring::NodeId;
 use fleetring_control::{Command, ControlConfig, DatabaseName, LeaseEpoch, State, apply};
 
 use crate::MembershipView;
+use crate::changes::{ChangeRecord, RecordContent, unhex};
 use crate::control::CommandLog;
-use crate::sim::workload::{Ack, History, Operation, Record};
+use crate::engine::{Position, Value};
+use crate::sim::workload::{Ack, History, Operation, OutcomeClass, Record, WRITES_TABLE};
 
 /// An invariant the checker enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,6 +53,9 @@ pub enum Invariant {
     MonotonicReads,
     /// Once the network heals, every replica of a database holds the same rows.
     ReplicasConverged,
+    /// A change sink's file holds the database's writes in commit order, with no gap and no
+    /// write that was refused or never made (FR-039).
+    ChangeStreamConsistent,
 }
 
 impl fmt::Display for Invariant {
@@ -64,6 +71,7 @@ impl fmt::Display for Invariant {
             Self::ReadYourWrites => "read your writes",
             Self::MonotonicReads => "monotonic reads",
             Self::ReplicasConverged => "replicas converged",
+            Self::ChangeStreamConsistent => "change stream consistent",
         })
     }
 }
@@ -473,6 +481,131 @@ pub fn replicas_converged(
                     other.len()
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks the lines a file sink on `host` wrote for `database`, in file order, against
+/// `history`: the records' positions never go backwards, each record continues the one before
+/// it or repeats delivered positions (a duplicate, which at-least-once allows), and a record may
+/// start from the log's beginning only when the pump started or restarted there. Every row is an
+/// insert into the writes table of a value some write in the history made, and never one the
+/// history says was refused.
+///
+/// # Errors
+///
+/// [`Invariant::ChangeStreamConsistent`] naming the first record that breaks it.
+pub fn change_stream_consistent(
+    history: &History,
+    database: &DatabaseName,
+    host: &str,
+    records: &[ChangeRecord],
+) -> Result<(), Violation> {
+    let violation = |detail: String| {
+        Violation::new(
+            Invariant::ChangeStreamConsistent,
+            format!("{host}'s stream of {database}: {detail}"),
+        )
+    };
+    // Whether some attempt at each value may have taken effect: `false` only if every attempt
+    // was refused.
+    let mut written: BTreeMap<i64, bool> = BTreeMap::new();
+    for record in history.records() {
+        if let Operation::Write {
+            database: target,
+            value,
+        } = record.operation()
+            && target == database
+        {
+            let made = record.class() != OutcomeClass::Fail;
+            let entry = written.entry(*value).or_insert(made);
+            *entry |= made;
+        }
+    }
+    let mut delivered: Option<Position> = None;
+    let mut epoch = 0;
+    for (index, record) in records.iter().enumerate() {
+        let position = unhex(&record.position)
+            .map(Position::from)
+            .map_err(|_| violation(format!("record {index} has a position that isn't hex")))?;
+        let start = record
+            .start
+            .as_deref()
+            .map(unhex)
+            .transpose()
+            .map_err(|_| violation(format!("record {index} has a start that isn't hex")))?
+            .map(Position::from);
+        if record.database != database.as_str() {
+            return Err(violation(format!(
+                "record {index} is for {}",
+                record.database
+            )));
+        }
+        if record.epoch < epoch {
+            return Err(violation(format!(
+                "record {index} is from epoch {}, after epoch {epoch}",
+                record.epoch
+            )));
+        }
+        epoch = record.epoch;
+        match (&delivered, &start) {
+            // The first record, or a restart from the log's beginning.
+            (_, None) => {}
+            // A duplicate of what was delivered already.
+            (Some(delivered), Some(_)) if position <= *delivered => {}
+            (Some(delivered), Some(start)) if start > delivered => {
+                return Err(violation(format!(
+                    "record {index} starts at {start}, past the last delivered position {delivered}: a gap"
+                )));
+            }
+            (None, Some(start)) => {
+                return Err(violation(format!(
+                    "record {index}, the first, starts at {start} instead of the log's beginning"
+                )));
+            }
+            (Some(_), Some(_)) => {}
+        }
+        if delivered.as_ref() > Some(&position) {
+            return Err(violation(format!(
+                "record {index} ends at {position}, before the last delivered position"
+            )));
+        }
+        delivered = Some(position.clone());
+        let RecordContent::Logical { rows } = &record.content else {
+            return Err(violation(format!("record {index} isn't a logical change")));
+        };
+        for row in rows {
+            if row.table != WRITES_TABLE {
+                continue;
+            }
+            let value = row
+                .values
+                .iter()
+                .find(|column| column.name == "value")
+                .and_then(|column| match column.value {
+                    Value::Integer(value) => Some(value),
+                    _ => None,
+                });
+            let Some(value) = value else {
+                return Err(violation(format!(
+                    "record {index} has a {} row without an integer value: {row:?}",
+                    row.operation
+                )));
+            };
+            match written.get(&value) {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(violation(format!(
+                        "record {index} delivers write {value}, which was refused"
+                    )));
+                }
+                None => {
+                    return Err(violation(format!(
+                        "record {index} delivers write {value}, which no client made"
+                    )));
+                }
+            }
         }
     }
     Ok(())

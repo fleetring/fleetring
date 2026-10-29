@@ -682,6 +682,28 @@ fn format_node_status(status: &NodeStatus) -> String {
             database.epoch.get(),
         );
     }
+    if !status.sinks.is_empty() {
+        output.push_str("change sinks:\n");
+    }
+    for sink in &status.sinks {
+        let position = sink
+            .position
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), ToString::to_string);
+        let acknowledged = sink
+            .acknowledged
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), ToString::to_string);
+        let _ = write!(
+            output,
+            "  {} {} position={position} acknowledged={acknowledged} backlog={} failures={} resets={}",
+            sink.sink, sink.database, sink.backlog, sink.failures, sink.resets
+        );
+        if let Some(error) = &sink.last_error {
+            let _ = write!(output, " last_error={error:?}");
+        }
+        output.push('\n');
+    }
     output
 }
 
