@@ -280,7 +280,7 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
     let dir = tempfile::tempdir()?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
-         [control]\nlease_duration_ms = 300\nfailover_margin_ms = 0\ntick_interval_ms = 20\n",
+         [control]\nlease_duration_ms = 2000\nfailover_margin_ms = 0\ntick_interval_ms = 20\n",
         dir.path().join("data")
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
@@ -302,7 +302,8 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
             node_id: "a".into(),
         })
         .await?;
-    // "a" stops renewing; "b" holds the longer log, from epoch 1's primary.
+    // "a" stops renewing; "b" holds the longer log, from epoch 1's primary. The lease is long
+    // enough that the timer doesn't supersede the promotion while the test drives it under load.
     let report = |node: &str, position: u8| HeartbeatRequest {
         node_id: node.into(),
         databases: vec![DatabaseStatus {
