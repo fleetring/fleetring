@@ -31,7 +31,7 @@ pub(crate) fn inserted(records: &[ChangeRecord]) -> Vec<i64> {
         })
         .filter(|row| row.table == "t" && row.operation == RowOperation::Insert)
         .filter_map(
-            |row| match row.values.iter().find(|column| column.name == "value") {
+            |row| match row.values().iter().find(|column| column.name == "value") {
                 Some(column) => match column.value {
                     Value::Integer(value) => Some(value),
                     _ => None,
@@ -101,7 +101,7 @@ impl ChangeSink for StickySink {
     fn publish(&self, change: Change) -> Published {
         let stick = match &change.kind {
             ChangeKind::Logical(rows) => rows.iter().any(|row| {
-                row.values
+                row.values()
                     .iter()
                     .any(|column| column.value == Value::Integer(self.stick_at))
             }),

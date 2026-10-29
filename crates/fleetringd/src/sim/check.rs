@@ -580,7 +580,7 @@ pub fn change_stream_consistent(
                 continue;
             }
             let value = row
-                .values
+                .values()
                 .iter()
                 .find(|column| column.name == "value")
                 .and_then(|column| match column.value {

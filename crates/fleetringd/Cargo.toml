@@ -21,7 +21,7 @@ fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["functions", "hooks"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile = { version = "3.27.0", optional = true }
@@ -48,7 +48,12 @@ workspace = true
 name = "sim"
 required-features = ["simulation"]
 
+[[bench]]
+name = "capture"
+harness = false
+
 [dev-dependencies]
+divan.workspace = true
 hyper = { version = "1", features = ["server", "http1"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }

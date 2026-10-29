@@ -201,6 +201,19 @@ impl<'wal> Frames<'wal> {
             checksum: header.checksum(),
         }
     }
+
+    /// Starts at the first byte of `frames`, a tail of `header`'s WAL that follows a frame whose
+    /// cumulative checksum is `checksum`. Offsets in the frames found are relative to `frames`.
+    pub(crate) fn resume(frames: &'wal [u8], header: &WalHeader, checksum: Checksum) -> Self {
+        Self {
+            wal: frames,
+            frame_len: header.frame_len(),
+            order: header.checksum_order(),
+            salts: header.salts(),
+            offset: 0,
+            checksum,
+        }
+    }
 }
 
 impl Iterator for Frames<'_> {

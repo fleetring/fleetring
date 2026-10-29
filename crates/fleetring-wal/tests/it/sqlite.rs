@@ -44,6 +44,81 @@ fn commit_ends(wal: &[u8]) -> Vec<u64> {
     ends
 }
 
+#[test]
+fn reading_a_file_from_a_position_matches_reading_it_whole() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("p.db");
+    let conn = open_primary(&db, 512);
+    checkpoint(&conn, Checkpoint::Truncate);
+    insert(&conn, 1, 40, 1);
+    insert(&conn, 3, 100, 2);
+    insert(&conn, 2, 700, 3);
+    insert(&conn, 1, 10, 4);
+    let path = wal_path(&db);
+    let wal = fs::read(&path).expect("read wal");
+    let header = WalHeader::parse(&wal).expect("header");
+    let generation = header.generation();
+
+    let ends = commit_ends(&wal);
+    assert_eq!(ends.len(), 4);
+    for (index, end) in ends.iter().enumerate() {
+        let position = Position::new(generation, *end);
+        let from_file = read_committed_file(&path, Some(position)).expect("read file");
+        let whole = read_committed(&wal, Some(position)).expect("read whole");
+        assert_eq!(
+            from_file.as_ref().map(Batch::to_bytes),
+            whole.as_ref().map(Batch::to_bytes),
+            "after commit {index}"
+        );
+        assert_eq!(from_file.is_none(), index + 1 == ends.len());
+    }
+    let start = Position::new(generation, 32);
+    assert_eq!(
+        read_committed_file(&path, Some(start))
+            .expect("read file")
+            .map(|batch| batch.to_bytes()),
+        read_committed(&wal, Some(start))
+            .expect("read whole")
+            .map(|batch| batch.to_bytes()),
+        "from the generation's start"
+    );
+
+    let frame = 24 + 512;
+    assert!(
+        ends[2] - ends[1] > frame,
+        "the third transaction spans several frames"
+    );
+    let inside = Position::new(generation, ends[2] - frame);
+    assert!(matches!(
+        read_committed_file(&path, Some(inside)),
+        Err(fleetring_wal::ReadFileError::Read(
+            ReadError::NotCommitBoundary { .. }
+        ))
+    ));
+    let unaligned = Position::new(generation, ends[0] + 1);
+    assert!(matches!(
+        read_committed_file(&path, Some(unaligned)),
+        Err(fleetring_wal::ReadFileError::Read(
+            ReadError::NotCommitBoundary { .. }
+        ))
+    ));
+    let past = Position::new(generation, ends[3] + 10 * (24 + 512));
+    assert!(matches!(
+        read_committed_file(&path, Some(past)),
+        Err(fleetring_wal::ReadFileError::Read(
+            ReadError::PastEnd { .. }
+        ))
+    ));
+
+    // Once the WAL restarts, an older position gets the new generation with its header.
+    checkpoint(&conn, Checkpoint::Passive);
+    insert(&conn, 1, 10, 5);
+    let batch = read_committed_file(&path, Some(Position::new(generation, ends[3])))
+        .expect("read file")
+        .expect("a new generation");
+    assert!(batch.header().is_some());
+}
+
 /// A primary in a temporary directory with three small transactions in its WAL.
 fn small_primary() -> (tempfile::TempDir, Vec<u8>) {
     let dir = tempfile::tempdir().expect("temp dir");

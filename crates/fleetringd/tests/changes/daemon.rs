@@ -7,7 +7,7 @@ use fleetring::ReplicationFactor;
 use fleetring_control::Liveness;
 use fleetringd::changes::{Format, SinkKind, database_file};
 use fleetringd::data::Client;
-use fleetringd::engine::Statement;
+use fleetringd::engine::{CaptureMode, Statement};
 use fleetringd::{Config, ConfigError, Daemon, Network};
 
 use crate::common::{TestResult, eventually, guarded, name};
@@ -53,10 +53,11 @@ retries = 2
         (SinkKind::Webhook, Format::Logical)
     );
     assert_eq!((sinks[1].timeout_ms, sinks[1].retries), (1000, 2));
-    let recorded = config.changes.recorded_databases();
-    assert!(
-        recorded.matches(&name("anything")),
-        "the logical sink records every database"
+    let rules = config.changes.capture_rules();
+    assert_eq!(
+        rules.mode_for(&name("anything")),
+        Some(CaptureMode::After),
+        "the logical sink records every database, in the default mode"
     );
     assert!(sinks[0].matchers().matches(&name("tenant:acme")));
     assert!(!sinks[0].matchers().matches(&name("agent:acme")));

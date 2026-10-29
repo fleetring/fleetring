@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::changes::{DatabaseMatcher, DatabaseMatchers};
+use crate::changes::{CaptureRules, DatabaseMatcher, DatabaseMatchers};
 use crate::config::ConfigError;
+use crate::engine::CaptureMode;
 
 /// The longest sink name, so that it always fits a path component.
 const NAME_LEN: usize = 64;
@@ -17,6 +18,7 @@ const NAME_LEN: usize = 64;
 /// name = "archive"
 /// kind = "file"
 /// format = "logical"              # or "physical"
+/// capture = "after"               # or "id", or "full"
 /// databases = ["tenant:*", "ledger"]
 /// path = "/var/lib/fleetring/changes"
 ///
@@ -54,14 +56,16 @@ impl ChangesConfig {
         Ok(())
     }
 
-    /// The databases some logical sink streams, which record their row changes.
+    /// The databases some logical sink streams, which record their row changes, each in the
+    /// strongest mode a sink naming it asks for.
     #[must_use]
-    pub fn recorded_databases(&self) -> DatabaseMatchers {
-        self.sink
-            .iter()
-            .filter(|sink| sink.format == Format::Logical)
-            .flat_map(|sink| sink.databases.iter().cloned())
-            .collect()
+    pub fn capture_rules(&self) -> CaptureRules {
+        CaptureRules::new(
+            self.sink
+                .iter()
+                .filter(|sink| sink.format == Format::Logical)
+                .map(|sink| (sink.matchers(), sink.capture)),
+        )
     }
 }
 
@@ -77,6 +81,10 @@ pub struct SinkConfig {
     /// Whether it receives row changes or opaque batches.
     #[serde(default)]
     pub format: Format,
+    /// For a logical sink: how much of each changed row the databases it names record. A
+    /// database named by several sinks records in the strongest mode among them.
+    #[serde(default)]
+    pub capture: CaptureMode,
     /// The databases it streams: exact names or prefixes ending in `*`.
     pub databases: Vec<DatabaseMatcher>,
     /// For a file sink: the directory that holds one `.ndjson` file per database.

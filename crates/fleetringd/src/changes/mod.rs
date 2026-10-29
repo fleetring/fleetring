@@ -6,6 +6,13 @@
 //! in its acknowledgement path: a batch reaches a sink only after the write quorum holds it, and
 //! a sink that is slow or failing delays no write.
 //!
+//! A logical sink names a [`CaptureMode`](crate::engine::CaptureMode): `id` records each changed
+//! row's key alone, `after` (the default) adds the new values of inserted and updated rows, and
+//! `full` adds the old values of updated and deleted rows and the names of the updated columns.
+//! The databases a sink names record from the moment they open, in the strongest mode any sink
+//! naming them asks for ([`CaptureRules`]), inside the database itself, so that the record
+//! replicates with the data and a promoted follower continues the stream (ADR-0024).
+//!
 //! # Feeding
 //!
 //! [`ChangeStreams`] starts one pump per sink and database this node is primary for. A pump
@@ -60,7 +67,7 @@ use crate::replication::Replication;
 
 pub use self::config::{ChangesConfig, Format, SinkConfig, SinkKind};
 pub use self::file::{FileSink, database_file};
-pub use self::matcher::{DatabaseMatcher, DatabaseMatchers, ParseMatcherError};
+pub use self::matcher::{CaptureRules, DatabaseMatcher, DatabaseMatchers, ParseMatcherError};
 pub use self::memory::MemorySink;
 pub use self::record::{ChangeRecord, NotHex, ParseRecordError, RecordContent, hex, unhex};
 pub use self::webhook::{InvalidUrlError, WebhookSettings, WebhookSink};
@@ -523,6 +530,7 @@ pub enum BuildSinkError {
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
     assert_debug_send_sync::<BuildSinkError>();
+    assert_debug_send_sync::<CaptureRules>();
     assert_debug_send_sync::<Change>();
     assert_debug_send_sync::<ChangeKind>();
     assert_debug_send_sync::<ChangeParts>();
