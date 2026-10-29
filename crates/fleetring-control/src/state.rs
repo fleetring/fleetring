@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::apply::plan_promotion;
 use crate::{
-    ControlConfig, Database, DatabaseName, Liveness, Member, Quorums, Rejection, Report, Timestamp,
+    Acks, ControlConfig, Database, DatabaseName, Liveness, Member, Quorums, Rejection, Report,
+    Timestamp,
 };
 
 /// Everything the control plane knows: members, their liveness, and databases with their leases.
@@ -162,8 +163,9 @@ impl State {
     ///
     /// Fails as [`State::replica_set`] does.
     pub fn quorums(&self, database: &DatabaseName) -> Result<Quorums, Rejection> {
+        let acks = self.database_or_reject(database)?.durability().acks();
         let replicas = self.replica_set(database)?;
-        Ok(quorums_for(replicas.len()))
+        Ok(quorums_for(replicas.len(), acks))
     }
 
     /// Returns every database a `StartPromotion` stamped `at` would start a promotion for, in
@@ -195,6 +197,7 @@ impl State {
     ///     name: db()?,
     ///     replication_factor: ReplicationFactor::new(2).ok_or("zero")?,
     ///     engine: Engine::Sqlite,
+    ///     durability: None,
     /// })?;
     /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
     /// // "b" keeps reporting its copy; "a" goes quiet.
@@ -286,12 +289,12 @@ pub(crate) fn build_ring(
     Ring::builder().epoch(epoch).nodes(nodes).build()
 }
 
-/// Returns the quorums for a replica set of `len` members, which is at least 1 and at most 255
-/// because it is bounded by a [`ReplicationFactor`].
-pub(crate) fn quorums_for(len: usize) -> Quorums {
+/// Returns the quorums for a replica set of `len` members in `acks`. `len` is at least 1 and at
+/// most 255 because it is bounded by a [`ReplicationFactor`].
+pub(crate) fn quorums_for(len: usize, acks: Acks) -> Quorums {
     let size = u8::try_from(len)
         .ok()
         .and_then(ReplicationFactor::new)
         .unwrap_or(ReplicationFactor::ONE);
-    Quorums::new(size)
+    Quorums::with_acks(size, acks)
 }

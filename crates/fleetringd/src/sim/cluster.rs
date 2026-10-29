@@ -792,7 +792,8 @@ impl Cluster {
     /// anywhere, one primary per epoch, and each client reads its writes and never loses one it
     /// read. It holds at any moment.
     ///
-    /// Every database is held to [`Guarantee::quorum`], as every database is created today.
+    /// Every database is held to the [`Guarantee`] its creation reported: its replication
+    /// factor and the durability mode the control plane placed it with.
     ///
     /// # Errors
     ///
@@ -801,9 +802,9 @@ impl Cluster {
     pub fn check_history(&self) -> Result<(), SimError> {
         let history = self.history();
         let mut databases = BTreeMap::new();
-        for (database, factor) in created(&history) {
+        for (database, guarantee) in created(&history) {
             let rows = self.replica_rows(&database)?;
-            databases.insert(database, Replicated::new(Guarantee::quorum(factor), rows));
+            databases.insert(database, Replicated::new(guarantee, rows));
         }
         history::check(&history, &databases)?;
         Ok(())
@@ -1082,22 +1083,24 @@ impl Drop for Cluster {
     }
 }
 
-/// Every database an acknowledged [`Operation::Create`] created, with its replication factor.
-fn created(history: &History) -> Vec<(DatabaseName, ReplicationFactor)> {
-    let databases: BTreeMap<DatabaseName, ReplicationFactor> = history
+/// Every database an acknowledged [`Operation::Create`] created, with the guarantee its
+/// creation reported.
+fn created(history: &History) -> Vec<(DatabaseName, Guarantee)> {
+    let databases: BTreeMap<DatabaseName, Guarantee> = history
         .acknowledged()
         .filter_map(|(operation, ack)| match (operation, ack) {
             (
                 Operation::Create {
                     database,
                     replication_factor,
+                    ..
                 },
-                Ack::Opened { .. },
+                Ack::Opened { durability, .. },
             ) => {
                 let factor = u8::try_from(*replication_factor)
                     .ok()
                     .and_then(ReplicationFactor::new)?;
-                Some((database.clone(), factor))
+                Some((database.clone(), Guarantee::new(factor, *durability)))
             }
             _ => None,
         })

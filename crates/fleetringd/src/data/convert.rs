@@ -3,8 +3,8 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
-use fleetring::{Epoch, Fingerprint, NodeId};
-use fleetring_control::{DatabaseName, Engine, LeaseEpoch, Liveness, Role};
+use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
+use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Role};
 use fleetring_proto::v1::{self as proto, value::Value as Kind};
 use tonic::Status;
 
@@ -108,6 +108,42 @@ pub(crate) fn rows_from_proto(response: proto::QueryResponse) -> Result<Rows, St
     })
 }
 
+/// The acknowledgement mode `acks` names, or `None` if it is unspecified.
+pub(crate) fn acks_from_proto(acks: i32) -> Option<Acks> {
+    match proto::Acks::try_from(acks) {
+        Ok(proto::Acks::Quorum) => Some(Acks::Quorum),
+        Ok(proto::Acks::All) => Some(Acks::All),
+        Ok(proto::Acks::Local) => Some(Acks::Local),
+        Ok(proto::Acks::Unspecified) | Err(_) => None,
+    }
+}
+
+pub(crate) fn acks_to_proto(acks: Acks) -> proto::Acks {
+    match acks {
+        Acks::Quorum => proto::Acks::Quorum,
+        Acks::All => proto::Acks::All,
+        Acks::Local => proto::Acks::Local,
+        _ => proto::Acks::Unspecified,
+    }
+}
+
+/// The durability settings `placement` carries for a database with `replication_factor`
+/// replicas: [`Acks::Quorum`] with the floor at W from a control node that predates the fields,
+/// and the mode's W for a floor the control node left at 0.
+pub(crate) fn durability_of(
+    placement: &proto::Placement,
+    replication_factor: ReplicationFactor,
+) -> Durability {
+    let acks = acks_from_proto(placement.acks).unwrap_or_default();
+    u8::try_from(placement.min_replicas)
+        .ok()
+        .filter(|min_replicas| *min_replicas > 0)
+        .and_then(|min_replicas| {
+            Durability::with_min_replicas(acks, min_replicas, replication_factor).ok()
+        })
+        .unwrap_or_else(|| Durability::new(acks, replication_factor))
+}
+
 /// The location a placement describes.
 pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> {
     let engine = match proto::Engine::try_from(placement.engine) {
@@ -125,6 +161,16 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         .as_deref()
         .map(|primary| parse_reply("primary", primary))
         .transpose()?;
+    let replication_factor = u8::try_from(placement.replication_factor)
+        .ok()
+        .and_then(ReplicationFactor::new)
+        .or_else(|| {
+            u8::try_from(placement.replicas.len())
+                .ok()
+                .and_then(ReplicationFactor::new)
+        })
+        .unwrap_or(ReplicationFactor::ONE);
+    let durability = durability_of(&placement, replication_factor);
     let replicas = placement
         .replicas
         .into_iter()
@@ -153,6 +199,8 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         epoch: LeaseEpoch::new(placement.epoch),
         primary,
         replicas,
+        replication_factor,
+        durability,
     })
 }
 

@@ -18,11 +18,13 @@
 //!   of the replica set. That node takes the first lease and creates the database file through
 //!   its registry, then serves it as primary through [`Replication`](crate::replication::Replication),
 //!   which streams it to its followers; each fetches its first copy from the primary.
-//! - **Acknowledgements:** a write is acknowledged once a write quorum of W replicas holds it
-//!   (ADR-0018). Its reply says how many replicas held it then (W or more), the replica set's
-//!   size R, and whether the database is under-replicated: fewer than R replicas reachable. A
-//!   write that committed on the primary without reaching its quorum fails with `ABORTED`, since
-//!   it may still replicate later.
+//! - **Acknowledgements:** a write is acknowledged once a write quorum of W replicas holds it,
+//!   where W comes from the database's `acks` mode (ADR-0018, ADR-0023). Its reply says how
+//!   many replicas held it then (W or more), the replica set's size R, and whether the database
+//!   is under-replicated: fewer than R replicas reachable. A write that arrives while fewer than
+//!   the database's `min_replicas` are reachable is refused with `UNAVAILABLE` before it runs,
+//!   so nothing commits. One that committed on the primary without reaching its quorum fails
+//!   with `ABORTED`, since it may still replicate later.
 //! - **Dropping** is a control command: `Control.DropDatabase` removes the database from the
 //!   control plane at its current epoch. The primary learns of it when its next lease renewal is
 //!   refused as an unknown database, within one renewal interval, and stops serving it; its
@@ -33,13 +35,16 @@
 //!   (`[node] advertise`), and placements carry it for each replica.
 
 mod client;
-mod convert;
+pub(crate) mod convert;
 mod lease;
 mod node;
 mod redirect;
 mod service;
 
-pub use client::{Client, Location, NodeStatus, ReplicaInfo, ServedDatabase, Written};
+pub use client::{
+    Client, DatabaseSpec, DurabilityChange, Location, NodeStatus, ReplicaInfo, ServedDatabase,
+    Written,
+};
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};

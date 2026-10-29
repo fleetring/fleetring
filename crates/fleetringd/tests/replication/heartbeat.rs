@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use fleetring_control::{Member, Role};
-use fleetring_proto::v1::{self as proto, CreateDatabaseRequest, DatabaseStatus, Engine};
+use fleetring_proto::v1::{self as proto, Acks, CreateDatabaseRequest, DatabaseStatus, Engine};
 use fleetringd::{Config, Daemon, DatabaseStatuses, Membership, MembershipSettings, Network};
 
 use crate::common::{TestResult, eventually, id, name};
@@ -62,6 +62,8 @@ async fn heartbeats_report_databases_and_leave_out_unknown_ones() -> TestResult 
             database: "known".to_owned(),
             replication_factor: 1,
             engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await?;
     let known = name("known");

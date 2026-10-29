@@ -7,17 +7,18 @@ use std::sync::Arc;
 
 use fleetring::{ReplicationFactor, Weight};
 use fleetring_control::{
-    Action, Applied, DatabaseName, Engine, HostedReplica, Lease, LeaseEpoch, Liveness, Member,
-    Position, Rejection, Role, State,
+    Acks, Action, Applied, DatabaseName, Durability, Engine, HostedReplica, Lease, LeaseEpoch,
+    Liveness, Member, Position, Rejection, Role, State,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    self as proto, AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
+    self as proto, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate,
+    Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
+    StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -26,22 +27,100 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::control::node::{ControlHandle, SubmitError};
+use crate::data::convert::{acks_from_proto, acks_to_proto};
 
 /// The stream `WatchMembership` returns.
 pub type MembershipStream = Pin<Box<dyn Stream<Item = Result<MembershipUpdate, Status>> + Send>>;
+
+/// The durability a database is created with when its creation names none: the control node's
+/// `[replication] acks` and `min_replicas` (ADR-0023).
+///
+/// A default floor that doesn't fit a database's replication factor is clamped into W ≤ floor
+/// ≤ R, since it was set for the cluster rather than for that database; an explicit floor in a
+/// creation is rejected instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct DurabilityDefaults {
+    /// The acknowledgement mode.
+    pub acks: Acks,
+    /// The floor on reachable replicas, or `None` for the mode's W.
+    pub min_replicas: Option<u8>,
+}
+
+impl DurabilityDefaults {
+    /// [`Acks::Quorum`] with the floor at W.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            acks: Acks::Quorum,
+            min_replicas: None,
+        }
+    }
+
+    /// The defaults for a database with `replication_factor` replicas.
+    #[must_use]
+    pub fn for_factor(self, replication_factor: ReplicationFactor) -> Durability {
+        let write = Durability::new(self.acks, replication_factor).min_replicas();
+        let floor = self
+            .min_replicas
+            .unwrap_or(write)
+            .clamp(write, replication_factor.get());
+        Durability::with_min_replicas(self.acks, floor, replication_factor)
+            .unwrap_or_else(|_| Durability::new(self.acks, replication_factor))
+    }
+}
 
 /// The `Control` service: every mutation goes through the control node's single writer, and
 /// reads come from its published state.
 #[derive(Debug, Clone)]
 pub struct ControlService {
     node: ControlHandle,
+    defaults: DurabilityDefaults,
 }
 
 impl ControlService {
-    /// Serves the control node behind `node`.
+    /// Serves the control node behind `node`, creating databases with the default durability
+    /// unless a creation says otherwise.
     #[must_use]
     pub fn new(node: ControlHandle) -> Self {
-        Self { node }
+        Self {
+            node,
+            defaults: DurabilityDefaults::new(),
+        }
+    }
+
+    /// Creates databases whose creation names no durability with `defaults`.
+    #[must_use]
+    pub fn with_durability_defaults(mut self, defaults: DurabilityDefaults) -> Self {
+        self.defaults = defaults;
+        self
+    }
+
+    /// The durability a creation asks for: `acks` and `min_replicas` as the request carries
+    /// them, with the cluster's defaults for what it leaves unset.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` if an explicit floor doesn't fit `replication_factor`.
+    fn durability(
+        &self,
+        acks: i32,
+        min_replicas: u32,
+        replication_factor: ReplicationFactor,
+    ) -> Result<Durability, Status> {
+        let acks = acks_from_proto(acks).unwrap_or(self.defaults.acks);
+        let min_replicas = u8::try_from(min_replicas).map_err(|_| {
+            Status::invalid_argument(format!("invalid min_replicas {min_replicas}"))
+        })?;
+        if min_replicas == 0 {
+            let defaults = DurabilityDefaults {
+                acks,
+                ..self.defaults
+            };
+            return Ok(defaults.for_factor(replication_factor));
+        }
+        Durability::with_min_replicas(acks, min_replicas, replication_factor)
+            .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
     async fn submit(&self, action: Action) -> Result<(Applied, Arc<State>), Status> {
@@ -60,8 +139,8 @@ impl ControlService {
 ///   [`MISSING_DATABASE_KEY`] metadata, so that a caller can tell the two apart
 ///   ([`missing_database`]).
 /// - `ALREADY_EXISTS`: the database exists, or the member is already fenced.
-/// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, or a join that
-///   would make an invalid ring.
+/// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, a join that
+///   would make an invalid ring, or durability settings that don't fit the replication factor.
 /// - `FAILED_PRECONDITION`: anything that depends on the current state: liveness, leases, epochs,
 ///   promotions, and exhausted counters.
 #[must_use]
@@ -79,9 +158,9 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
         Rejection::DatabaseExists { .. } | Rejection::AlreadyFenced { .. } => {
             Status::already_exists(message)
         }
-        Rejection::InvalidTopology { .. } | Rejection::DuplicateReport { .. } => {
-            Status::invalid_argument(message)
-        }
+        Rejection::InvalidTopology { .. }
+        | Rejection::DuplicateReport { .. }
+        | Rejection::InvalidDurability { .. } => Status::invalid_argument(message),
         _ => Status::failed_precondition(message),
     }
 }
@@ -242,6 +321,7 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
             }
         })
         .collect();
+    let durability = database.durability();
     Ok(Placement {
         database: name.to_string(),
         engine: engine_to_proto(database.engine()).into(),
@@ -250,6 +330,8 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
         followers,
         replicas,
         replication_factor: u32::from(database.replication_factor().get()),
+        acks: acks_to_proto(durability.acks()).into(),
+        min_replicas: u32::from(durability.min_replicas()),
     })
 }
 
@@ -374,10 +456,12 @@ impl Control for ControlService {
                 ))
             })?;
         let engine = engine_from(request.engine)?;
+        let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
         let action = Action::CreateDatabase {
             name: name.clone(),
             replication_factor,
             engine,
+            durability: Some(durability),
         };
         match self.submit(action).await? {
             (Applied::DatabaseCreated { .. }, state) => Ok(Response::new(CreateDatabaseResponse {
@@ -396,6 +480,55 @@ impl Control for ControlService {
             (Applied::DatabaseDropped { epoch, .. }, _) => {
                 Ok(Response::new(DropDatabaseResponse { epoch: epoch.get() }))
             }
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn change_durability(
+        &self,
+        request: Request<ChangeDurabilityRequest>,
+    ) -> Result<Response<ChangeDurabilityResponse>, Status> {
+        let request = request.into_inner();
+        let database: DatabaseName = parse("database name", &request.database)?;
+        let replication_factor = self
+            .node
+            .state()
+            .database(&database)
+            .ok_or_else(|| {
+                rejection_status(&Rejection::UnknownDatabase {
+                    database: database.clone(),
+                })
+            })?
+            .replication_factor();
+        let acks = acks_from_proto(request.acks)
+            .ok_or_else(|| Status::invalid_argument("an acks mode is required"))?;
+        let min_replicas = u8::try_from(request.min_replicas).map_err(|_| {
+            Status::invalid_argument(format!("invalid min_replicas {}", request.min_replicas))
+        })?;
+        let durability = if min_replicas == 0 {
+            Durability::new(acks, replication_factor)
+        } else {
+            Durability::with_min_replicas(acks, min_replicas, replication_factor)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?
+        };
+        let action = Action::ChangeDurability {
+            database,
+            durability,
+        };
+        match self.submit(action).await? {
+            (
+                Applied::DurabilityChanged {
+                    durability,
+                    current,
+                    ..
+                },
+                _,
+            ) => Ok(Response::new(ChangeDurabilityResponse {
+                acks: acks_to_proto(durability.acks()).into(),
+                min_replicas: u32::from(durability.min_replicas()),
+                current_acks: acks_to_proto(current.acks()).into(),
+                current_min_replicas: u32::from(current.min_replicas()),
+            })),
             (other, _) => Err(unexpected(&other)),
         }
     }

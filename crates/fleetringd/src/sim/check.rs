@@ -391,6 +391,7 @@ pub(crate) fn conflicting_primaries(history: &History) -> Option<PrimaryConflict
                 Ack::Opened {
                     primary: node,
                     epoch,
+                    ..
                 },
             ) => (database, node, *epoch),
             _ => continue,
@@ -525,6 +526,7 @@ mod tests {
                 name: "db".parse().expect("name"),
                 replication_factor: ReplicationFactor::new(1).expect("one"),
                 engine: fleetring_control::Engine::Sqlite,
+                durability: None,
             },
             Action::AcquireLease {
                 database: "db".parse().expect("name"),

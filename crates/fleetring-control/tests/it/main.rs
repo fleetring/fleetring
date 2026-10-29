@@ -2,6 +2,7 @@
 //! the command generator.
 
 mod common;
+mod durability;
 mod properties;
 mod replay;
 mod scenarios;

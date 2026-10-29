@@ -6,6 +6,7 @@
 mod cluster;
 mod control;
 mod database;
+mod durability;
 mod failover;
 mod history;
 mod membership;

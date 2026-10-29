@@ -20,7 +20,7 @@ Every simulation run checked against the guarantees each database promises, and 
 - Fuzzing of the daemon's protocol inputs (batches, snapshots, control RPCs), next to the existing spec fuzzing.
 
 ### E2. Durability and operations
-- FR-035 configurable durability: `acks`, `min_replicas`, per database (ADR-0023, proposed).
+- FR-035 configurable durability: `acks`, `min_replicas`, per database (ADR-0023; done).
 - FR-037 `db list`, `db drop`, per-node status (in progress).
 - FR-038 graceful departure: drain primaries before a planned stop.
 - Backups: S3-compatible snapshots plus WAL archiving for point-in-time restore (MVP step 5), as a durability sink separate from replicas (ADR-0016, point 3).

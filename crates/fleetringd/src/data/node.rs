@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, LeaseEpoch};
+use fleetring_control::{DatabaseName, Durability, LeaseEpoch};
 use fleetring_proto::v1::{AcquireLeaseRequest, LocateRequest, Placement};
 use tokio::sync::watch;
 use tonic::Status;
 
 use crate::control::ControlClient;
+use crate::data::convert::durability_of;
 use crate::data::redirect::not_primary;
 use crate::data::service::database_status;
 use crate::engine::EngineError;
@@ -25,11 +26,16 @@ pub(crate) struct HeldLease {
     pub(crate) epoch: LeaseEpoch,
     /// The database's replication factor, R.
     pub(crate) replication_factor: ReplicationFactor,
+    /// The durability settings the lease was granted under, once known. A lease built without
+    /// them, as a promotion's is, learns them from the control plane before it is served
+    /// ([`DataNode::start_serving`]).
+    pub(crate) durability: Option<Durability>,
 }
 
 impl HeldLease {
     /// The lease `placement` names, with the database's replication factor: the placement's,
-    /// or the size of its replica set from a control node that doesn't send one.
+    /// or the size of its replica set from a control node that doesn't send one; and its
+    /// durability settings.
     pub(super) fn of(placement: &Placement) -> Self {
         let size = if placement.replicas.is_empty() {
             placement.followers.len() + 1
@@ -41,20 +47,24 @@ impl HeldLease {
         } else {
             placement.replication_factor
         };
+        let replication_factor = u8::try_from(factor)
+            .ok()
+            .and_then(ReplicationFactor::new)
+            .unwrap_or(ReplicationFactor::ONE);
         Self {
             epoch: LeaseEpoch::new(placement.epoch),
-            replication_factor: u8::try_from(factor)
-                .ok()
-                .and_then(ReplicationFactor::new)
-                .unwrap_or(ReplicationFactor::ONE),
+            replication_factor,
+            durability: Some(durability_of(placement, replication_factor)),
         }
     }
 
-    /// The lease at `epoch` on a database with `replication_factor` replicas.
+    /// The lease at `epoch` on a database with `replication_factor` replicas, whose durability
+    /// settings are learned from the control plane when it is served.
     pub(super) fn new(epoch: LeaseEpoch, replication_factor: ReplicationFactor) -> Self {
         Self {
             epoch,
             replication_factor,
+            durability: None,
         }
     }
 
@@ -298,33 +308,55 @@ impl DataNode {
     }
 
     /// Leads `name` under `lease` if this node doesn't already, records the lease, and waits
-    /// until every live follower, and at least a write quorum, is connected or `writable_wait`
-    /// passes.
+    /// until every live follower, and at least enough for a write to be admitted and reach its
+    /// quorum, is connected or `writable_wait` passes.
     ///
     /// Waiting for every live follower, not just a write quorum, means the first write isn't
     /// reported under-replicated while all of its replicas are up. The lease is recorded first,
     /// so that renewals go on during the wait, and [`DataNode::route`] holds a request back
-    /// until the wait ends.
+    /// until the wait ends. If the wait runs out before the database's `min_replicas` are
+    /// connected, the database is served but every write is refused until they are
+    /// (ADR-0023).
+    ///
+    /// A lease that doesn't carry the database's durability settings learns them from the
+    /// control plane first, so that a promoted primary serves under the settings the new lease
+    /// was granted with.
     ///
     /// # Errors
     ///
-    /// `UNAVAILABLE` if this node has seen a newer epoch, or can't record the lease.
+    /// `UNAVAILABLE` if this node has seen a newer epoch, can't record the lease, or can't learn
+    /// the durability settings.
     pub(super) async fn start_serving(
         &self,
         name: &DatabaseName,
         lease: HeldLease,
         start: Option<crate::engine::Position>,
     ) -> Result<(), Status> {
-        let role = PrimaryRole {
-            replication_factor: lease.replication_factor,
-            epoch: lease.epoch,
+        let durability = match lease.durability {
+            Some(durability) => durability,
+            None => {
+                let placement = self.locate(name).await.map_err(|status| {
+                    Status::unavailable(format!(
+                        "can't learn the durability settings of {name}: {status}"
+                    ))
+                })?;
+                durability_of(&placement, lease.replication_factor)
+            }
         };
+        let lease = HeldLease {
+            durability: Some(durability),
+            ..lease
+        };
+        let role =
+            PrimaryRole::new(lease.replication_factor, lease.epoch).with_durability(durability);
         let serving = self.inner.replication.serving(name) == Some(role);
         if !serving || start.is_some() {
             tracing::info!(
                 database = %name,
                 epoch = lease.epoch.get(),
                 replication_factor = lease.replication_factor.get(),
+                acks = %durability.acks(),
+                min_replicas = durability.min_replicas(),
                 "serving as primary",
             );
             match self.inner.replication.lead(name, role, start).await {
@@ -351,8 +383,8 @@ impl DataNode {
         Ok(lease)
     }
 
-    /// Waits until every follower the membership view counts live, and at least a write quorum,
-    /// is connected, or `writable_wait` passes.
+    /// Waits until every follower the membership view counts live, and at least enough for a
+    /// write to be admitted and reach its quorum, is connected, or `writable_wait` passes.
     async fn await_replicas(&self, name: &DatabaseName) {
         let replication = &self.inner.replication;
         let wait = self.inner.writable_wait;
@@ -369,7 +401,7 @@ impl DataNode {
             tracing::warn!(
                 database = %name,
                 ?wait,
-                "too few followers are connected for writes to reach their quorum",
+                "too few followers are connected; writes are refused until enough are",
             );
         }
     }

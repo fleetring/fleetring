@@ -14,8 +14,8 @@ use tonic::transport::server::TcpIncoming;
 
 use crate::config::reachable;
 use crate::control::{
-    ControlHandle, ControlNode, ControlOptions, ControlService, Failover, FailoverSettings,
-    NoControl, OpenError,
+    ControlHandle, ControlNode, ControlOptions, ControlService, DurabilityDefaults, Failover,
+    FailoverSettings, NoControl, OpenError,
 };
 use crate::data::{DataNode, DatabaseService, LeaseKeeper, LeaseSettings};
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
@@ -181,6 +181,7 @@ impl Daemon {
             control.as_ref().map(|role| &role.node),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
+            config.replication.durability_defaults(),
         );
         let data = data.map(|(role, _)| role);
         tracing::info!(
@@ -451,6 +452,7 @@ fn serve(
     control: Option<&ControlNode>,
     data: Option<&DataNode>,
     control_address: SocketAddr,
+    durability: DurabilityDefaults,
 ) -> RunningServer {
     let (stop, stopped) = oneshot::channel::<()>();
     // A dropped sender also means stop.
@@ -458,9 +460,9 @@ fn serve(
         let _stop = stopped.await;
     };
     let router = Server::builder()
-        .add_optional_service(
-            control.map(|node| control_server(ControlService::new(node.handle()))),
-        )
+        .add_optional_service(control.map(|node| {
+            control_server(ControlService::new(node.handle()).with_durability_defaults(durability))
+        }))
         .add_optional_service(
             control
                 .is_none()

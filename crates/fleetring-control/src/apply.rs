@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::command::UnknownReports;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
-    Action, Command, Database, DatabaseName, Engine, HostedReplica, Lease, LeaseEpoch, Member,
-    Position, Promotion, Quorums, State, Timestamp,
+    Action, Command, Database, DatabaseName, Durability, DurabilityError, Engine, HostedReplica,
+    Lease, LeaseEpoch, Member, Position, Promotion, Quorums, State, Timestamp,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -50,6 +50,7 @@ pub type Outcome = Result<Applied, Rejection>;
 ///     name: db,
 ///     replication_factor: ReplicationFactor::ONE,
 ///     engine: Engine::Sqlite,
+///     durability: None,
 /// }))?;
 /// let granted = apply(&mut state, Command::new(at, Action::AcquireLease {
 ///     database: "tenant:acme".parse()?,
@@ -73,7 +74,12 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             name,
             replication_factor,
             engine,
-        } => create_database(state, name, replication_factor, engine),
+            durability,
+        } => create_database(state, name, replication_factor, engine, durability),
+        Action::ChangeDurability {
+            database,
+            durability,
+        } => change_durability(state, database, durability),
         Action::DropDatabase { name } => drop_database(state, name),
         Action::AcquireLease { database, node } => acquire_lease(state, now, database, node),
         Action::RenewLease {
@@ -132,6 +138,16 @@ pub enum Applied {
     DatabaseCreated {
         /// The database's name.
         database: DatabaseName,
+    },
+
+    /// New durability settings were recorded for a database, to take effect at its next lease.
+    DurabilityChanged {
+        /// The database's name.
+        database: DatabaseName,
+        /// The settings that take effect at the next lease.
+        durability: Durability,
+        /// The settings in effect until then.
+        current: Durability,
     },
 
     /// A database was dropped, with its lease and any promotion.
@@ -247,6 +263,15 @@ pub enum Rejection {
     /// The cluster has no members, so no database has a replica set.
     #[error("the cluster has no members")]
     NoMembers,
+
+    /// The durability settings don't fit the database's replication factor.
+    #[error("invalid durability for database '{database}': {source}")]
+    InvalidDurability {
+        /// The database.
+        database: DatabaseName,
+        /// What is wrong with the settings.
+        source: DurabilityError,
+    },
 
     /// The join would make a ring that can't be built, such as a host in two zones.
     #[error("join would make an invalid ring: {reason}")]
@@ -490,15 +515,41 @@ fn create_database(
     name: DatabaseName,
     replication_factor: ReplicationFactor,
     engine: Engine,
+    durability: Option<Durability>,
 ) -> Outcome {
     if state.databases.contains_key(&name) {
         return Err(Rejection::DatabaseExists { database: name });
     }
+    let durability = durability.unwrap_or_else(|| Durability::quorum(replication_factor));
+    durability
+        .check(replication_factor)
+        .map_err(|source| Rejection::InvalidDurability {
+            database: name.clone(),
+            source,
+        })?;
     state.databases.insert(
         name.clone(),
-        Database::new(name.clone(), replication_factor, engine),
+        Database::new(name.clone(), replication_factor, engine, durability),
     );
     Ok(Applied::DatabaseCreated { database: name })
+}
+
+fn change_durability(state: &mut State, database: DatabaseName, durability: Durability) -> Outcome {
+    let db = state.database_or_reject(&database)?;
+    durability
+        .check(db.replication_factor())
+        .map_err(|source| Rejection::InvalidDurability {
+            database: database.clone(),
+            source,
+        })?;
+    let current = db.durability();
+    let db = database_mut(state, &database)?;
+    db.set_pending_durability(durability);
+    Ok(Applied::DurabilityChanged {
+        database,
+        durability,
+        current,
+    })
 }
 
 /// Removes the database with every member's report of it, so that no stale report outlives it.
@@ -548,6 +599,7 @@ fn acquire_lease(
 
     let db = database_mut(state, &database)?;
     db.set_epoch(epoch);
+    db.apply_pending_durability();
     db.set_lease(lease.clone());
     Ok(Applied::LeaseGranted { database, lease })
 }
@@ -713,7 +765,7 @@ fn record_fenced(
         .count()
         .saturating_add(1);
     let fenced = u8::try_from(fenced).unwrap_or(u8::MAX);
-    let needed = quorums_for(replicas.len()).promotion();
+    let needed = quorums_for(replicas.len(), db.durability().acks()).promotion();
 
     let db = database_mut(state, &database)?;
     let Some(promotion) = db.promotion_mut() else {
@@ -750,7 +802,10 @@ fn complete_promotion(
     if promotion.fenced_position(&candidate).is_none() {
         return Err(Rejection::CandidateNotFenced { id: candidate });
     }
-    let quorums = quorums_for(replicas.len());
+    // The promotion fences under the settings the old epoch's writes were acknowledged with, so
+    // every write it acknowledged reaches a fenced member; the new settings apply from the new
+    // lease on.
+    let quorums = quorums_for(replicas.len(), db.durability().acks());
     let fenced: Vec<&Position> = promotion
         .fenced()
         .filter(|(id, _)| replicas.contains(id))
@@ -771,6 +826,7 @@ fn complete_promotion(
     );
 
     let db = database_mut(state, &database)?;
+    db.apply_pending_durability();
     db.set_lease(lease.clone());
     db.set_promotion(None);
     Ok(Applied::PromotionCompleted {

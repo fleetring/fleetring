@@ -10,8 +10,8 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, Liveness, Role as DatabaseRole};
-use fleetringd::data::{Client, Location, NodeStatus, ReplicaInfo};
+use fleetring_control::{Acks, DatabaseName, Liveness, Role as DatabaseRole};
+use fleetringd::data::{Client, DatabaseSpec, Location, NodeStatus, ReplicaInfo};
 use fleetringd::engine::{Rows, Statement, Value};
 use fleetringd::{Config, Daemon, MembershipView, Network, Role};
 use tracing_subscriber::EnvFilter;
@@ -84,6 +84,31 @@ enum DbCommand {
         /// How many replicas it has, the primary included.
         #[arg(long, default_value_t = 3)]
         replication_factor: u8,
+        /// How many replicas must store a write before it is acknowledged: `quorum` (a
+        /// majority), `all` (every replica), or `local` (the primary alone; a failover may lose
+        /// acknowledged writes). The cluster's default if unset.
+        #[arg(long)]
+        acks: Option<Acks>,
+        /// How many replicas, the primary included, must be reachable for a write to run;
+        /// below it, writes are refused before anything commits. Between the write quorum and
+        /// the replication factor; the cluster's default if unset, which is the write quorum
+        /// unless the control node's configuration says otherwise.
+        #[arg(long)]
+        min_replicas: Option<u8>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Changes a database's durability settings, which take effect at its next epoch: the
+    /// current primary keeps the settings it holds the lease under.
+    SetDurability {
+        /// The database's name.
+        name: DatabaseName,
+        /// The acknowledgement mode: `quorum`, `all`, or `local`.
+        #[arg(long)]
+        acks: Acks,
+        /// The floor on reachable replicas; the mode's write quorum if unset.
+        #[arg(long)]
+        min_replicas: Option<u8>,
         #[command(flatten)]
         target: Target,
     },
@@ -91,14 +116,16 @@ enum DbCommand {
     Exec(SqlArgs),
     /// Runs one read-only query on the database's primary.
     Query(SqlArgs),
-    /// Shows the database's primary, followers, epoch, and replica positions.
+    /// Shows the database's primary, followers, epoch, durability settings, and replica
+    /// positions.
     Locate {
         /// The database's name.
         name: DatabaseName,
         #[command(flatten)]
         target: Target,
     },
-    /// Lists every database with its engine, epoch, replication factor, primary, and replicas.
+    /// Lists every database with its engine, epoch, replication factor, durability settings,
+    /// primary, and replicas.
     List {
         /// Lists only the databases this node is primary for.
         #[arg(long)]
@@ -306,16 +333,42 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Db(DbCommand::Create {
             name,
             replication_factor,
+            acks,
+            min_replicas,
             target,
         }) => {
             let replication_factor = ReplicationFactor::new(replication_factor)
                 .ok_or("the replication factor must be at least 1")?;
+            let mut spec = DatabaseSpec::new(replication_factor);
+            if let Some(acks) = acks {
+                spec = spec.with_acks(acks);
+            }
+            if let Some(min_replicas) = min_replicas {
+                spec = spec.with_min_replicas(min_replicas);
+            }
             let location = target
                 .client()?
-                .create_database(&name, replication_factor)
+                .create_database_with(&name, spec)
                 .await
                 .map_err(failed)?;
             format!("created {name}\n{}", format_location(&location))
+        }
+        Command::Db(DbCommand::SetDurability {
+            name,
+            acks,
+            min_replicas,
+            target,
+        }) => {
+            let change = target
+                .client()?
+                .change_durability(&name, acks, min_replicas)
+                .await
+                .map_err(failed)?;
+            format!(
+                "durability of {name} changes to acks={} min_replicas={} at its next epoch; \
+                 now acks={} min_replicas={}\n",
+                change.acks, change.min_replicas, change.current_acks, change.current_min_replicas
+            )
         }
         Command::Db(DbCommand::Exec(args)) => {
             let (client, name, statement) = args.into_parts()?;
@@ -450,10 +503,14 @@ fn format_location(location: &Location) -> String {
         .unwrap_or_else(|| "none".to_owned());
     let followers: Vec<String> = location.followers().map(format_replica).collect();
     let mut output = format!(
-        "database: {}\nengine: {}\nepoch: {}\nprimary: {primary}\nfollowers: {}\npositions:\n",
+        "database: {}\nengine: {}\nepoch: {}\nreplication factor: {}\nacks: {}\n\
+         min replicas: {}\nprimary: {primary}\nfollowers: {}\npositions:\n",
         location.database,
         location.engine,
         location.epoch.get(),
+        location.replication_factor.get(),
+        location.durability.acks(),
+        location.durability.min_replicas(),
         if followers.is_empty() {
             "none".to_owned()
         } else {
@@ -477,7 +534,7 @@ fn format_location(location: &Location) -> String {
 
 /// The databases as a table sorted by name, then how many each node is primary for.
 fn format_databases(databases: &[Location]) -> String {
-    let mut rows: Vec<[String; 6]> = databases
+    let mut rows: Vec<[String; 8]> = databases
         .iter()
         .map(|location| {
             let replicas: Vec<String> = location
@@ -490,6 +547,8 @@ fn format_databases(databases: &[Location]) -> String {
                 location.engine.to_string(),
                 location.epoch.get().to_string(),
                 location.replicas.len().to_string(),
+                location.durability.acks().to_string(),
+                location.durability.min_replicas().to_string(),
                 location
                     .primary
                     .as_ref()
@@ -499,7 +558,9 @@ fn format_databases(databases: &[Location]) -> String {
         })
         .collect();
     rows.sort();
-    let header = ["NAME", "ENGINE", "EPOCH", "RF", "PRIMARY", "REPLICAS"];
+    let header = [
+        "NAME", "ENGINE", "EPOCH", "RF", "ACKS", "MIN", "PRIMARY", "REPLICAS",
+    ];
     let mut widths: Vec<usize> = header.iter().map(|title| title.len()).collect();
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {

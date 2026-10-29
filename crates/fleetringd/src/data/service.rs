@@ -30,7 +30,9 @@ impl DatabaseService {
 ///
 /// - `INVALID_ARGUMENT`: the statement failed, or tried to control transactions; nothing
 ///   committed.
-/// - `UNAVAILABLE`: the database closed before it took the request, which never ran; retry.
+/// - `UNAVAILABLE`: the database closed before it took the request, or replication refused the
+///   write because fewer than its `min_replicas` were reachable (ADR-0023); either way it never
+///   ran; retry.
 /// - `ABORTED`: the request may or may not have taken effect: the database stopped after taking
 ///   it, or the write committed on the primary but replication couldn't store it on a write
 ///   quorum, because too few replicas are reachable (under-replicated) or they didn't acknowledge
@@ -41,7 +43,9 @@ impl DatabaseService {
 pub(crate) fn database_status(error: &DatabaseError) -> Status {
     let message = error.to_string();
     match error {
-        DatabaseError::Closed { .. } => Status::unavailable(message),
+        DatabaseError::Closed { .. } | DatabaseError::Refused { .. } => {
+            Status::unavailable(message)
+        }
         DatabaseError::Interrupted { .. } | DatabaseError::Replication(_) => {
             Status::aborted(message)
         }

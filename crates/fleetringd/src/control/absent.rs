@@ -3,12 +3,13 @@
 
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
-    StartPromotionRequest, WatchMembershipRequest,
+    AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse, PromotionResponse,
+    RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, StartPromotionRequest,
+    WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -71,6 +72,13 @@ impl Control for NoControl {
         &self,
         _: Request<DropDatabaseRequest>,
     ) -> Result<Response<DropDatabaseResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn change_durability(
+        &self,
+        _: Request<ChangeDurabilityRequest>,
+    ) -> Result<Response<ChangeDurabilityResponse>, Status> {
         self.refuse()
     }
 

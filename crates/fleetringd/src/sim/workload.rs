@@ -21,6 +21,7 @@ use fleetring_control::{DatabaseName, LeaseEpoch};
 use tonic::Code;
 
 use crate::sim::SimRng;
+use crate::sim::history::DurabilityMode;
 
 /// One operation a client sends to the cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,9 @@ pub enum Operation {
         database: DatabaseName,
         /// How many replicas it should have.
         replication_factor: u32,
+        /// How its writes are acknowledged (ADR-0023), with the floor at the mode's write
+        /// quorum.
+        durability: DurabilityMode,
     },
     /// Inserts `value` into the database's [`WRITES_TABLE`] on its primary, through the data
     /// plane, and waits for the write quorum to hold it.
@@ -139,7 +143,11 @@ impl fmt::Display for Operation {
             Self::Create {
                 database,
                 replication_factor,
-            } => write!(f, "open {database} rf {replication_factor}"),
+                durability,
+            } => write!(
+                f,
+                "open {database} rf {replication_factor} acks {durability}"
+            ),
             Self::Write { database, value } => write!(f, "write {value} to {database}"),
             Self::Read {
                 database,
@@ -281,6 +289,9 @@ pub enum Ack {
         primary: NodeId,
         /// The primary's lease epoch.
         epoch: LeaseEpoch,
+        /// The durability mode the control plane reports for it, which the history checker
+        /// holds it to.
+        durability: DurabilityMode,
     },
     /// A write committed and a write quorum stored it: it must never be lost.
     Written {
@@ -319,9 +330,15 @@ impl fmt::Display for Ack {
                 epoch,
                 expires_at_ms,
             } => write!(f, "lease epoch {} until {expires_at_ms}", epoch.get()),
-            Self::Opened { primary, epoch } => {
-                write!(f, "opened on {primary} at epoch {}", epoch.get())
-            }
+            Self::Opened {
+                primary,
+                epoch,
+                durability,
+            } => write!(
+                f,
+                "opened on {primary} at epoch {} acks {durability}",
+                epoch.get()
+            ),
             Self::Written {
                 acknowledged_by,
                 replicas,
@@ -1010,10 +1027,17 @@ const MAX_WRITE_PAUSE_MS: u64 = 30;
 /// [`Operation::Read`] instead: of a random database's every value, or of the last value the
 /// workload saw acknowledged, so the history has the reads the checkers want. After the last
 /// write it reads every database once more, then finishes.
+///
+/// Every database is created in [`DurabilityMode::Quorum`] unless [`with_durability`] or
+/// [`with_durability_for`] says otherwise.
+///
+/// [`with_durability`]: CreateAndWrite::with_durability
+/// [`with_durability_for`]: CreateAndWrite::with_durability_for
 #[derive(Debug, Clone)]
 pub struct CreateAndWrite {
     replication_factor: u32,
     databases: Vec<(DatabaseName, bool)>,
+    durability: Vec<DurabilityMode>,
     writes: u32,
     next_value: i64,
     last_acknowledged: Option<(DatabaseName, i64)>,
@@ -1046,12 +1070,37 @@ impl CreateAndWrite {
                 .rev()
                 .map(|(name, _)| name.clone())
                 .collect(),
+            durability: vec![DurabilityMode::Quorum; databases.len()],
             databases,
             writes,
             next_value: 0,
             last_acknowledged: None,
             pause: false,
         }
+    }
+
+    /// Creates every database in `durability`.
+    #[must_use]
+    pub fn with_durability(mut self, durability: DurabilityMode) -> Self {
+        self.durability = vec![durability; self.databases.len()];
+        self
+    }
+
+    /// Creates `db-{index}` in `durability`. An index past the last database changes nothing.
+    #[must_use]
+    pub fn with_durability_for(mut self, index: usize, durability: DurabilityMode) -> Self {
+        if let Some(mode) = self.durability.get_mut(index) {
+            *mode = durability;
+        }
+        self
+    }
+
+    /// Returns the durability each database is created in, in name order.
+    pub fn durabilities(&self) -> impl Iterator<Item = (&DatabaseName, DurabilityMode)> {
+        self.databases
+            .iter()
+            .zip(&self.durability)
+            .map(|((name, _), mode)| (name, *mode))
     }
 
     fn read(&self, rng: &mut SimRng) -> Operation {
@@ -1078,10 +1127,16 @@ impl Workload for CreateAndWrite {
             return Step::Sleep(Duration::from_millis(1 + rng.below(MAX_WRITE_PAUSE_MS)));
         }
         self.pause = true;
-        if let Some((database, _)) = self.databases.iter().find(|(_, created)| !created) {
+        let pending = self
+            .databases
+            .iter()
+            .zip(&self.durability)
+            .find(|((_, created), _)| !created);
+        if let Some(((database, _), durability)) = pending {
             return Step::Run(Operation::Create {
                 database: database.clone(),
                 replication_factor: self.replication_factor,
+                durability: *durability,
             });
         }
         if self.databases.is_empty() {

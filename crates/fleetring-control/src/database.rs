@@ -134,6 +134,217 @@ impl fmt::Display for Engine {
     }
 }
 
+/// How many replicas must store a write before it is acknowledged (ADR-0023).
+///
+/// The mode fixes W, the write quorum, and Q, the promotion quorum, for a replica set of R
+/// members; see [`Quorums::with_acks`].
+///
+/// # Examples
+///
+/// ```
+/// use fleetring_control::Acks;
+///
+/// let acks: Acks = "all".parse()?;
+/// assert_eq!(acks, Acks::All);
+/// assert_eq!(acks.to_string(), "all");
+/// assert_eq!(Acks::default(), Acks::Quorum);
+/// # Ok::<(), fleetring_control::ParseAcksError>(())
+/// ```
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Acks {
+    /// A majority: W = ⌊R/2⌋ + 1 and Q = R − W + 1. No acknowledged write is lost while a
+    /// majority survives (ADR-0018).
+    #[default]
+    Quorum,
+    /// Every replica: W = R and Q = 1. Any one replica down blocks writes.
+    All,
+    /// The primary alone: W = 1, acknowledged after its own fsync. A promotion fences a majority
+    /// and adopts the most advanced log among them, so a failover may lose acknowledged writes.
+    Local,
+}
+
+impl Acks {
+    /// Returns whether a write acknowledged in this mode survives any failover that ADR-0018
+    /// tolerates: `false` only for [`Acks::Local`].
+    #[must_use]
+    pub const fn acknowledged_writes_survive(self) -> bool {
+        !matches!(self, Self::Local)
+    }
+
+    /// Returns the mode's name, as [`Display`](fmt::Display) and [`FromStr`] use it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quorum => "quorum",
+            Self::All => "all",
+            Self::Local => "local",
+        }
+    }
+}
+
+impl fmt::Display for Acks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Acks {
+    type Err = ParseAcksError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "quorum" => Ok(Self::Quorum),
+            "all" => Ok(Self::All),
+            "local" => Ok(Self::Local),
+            other => Err(ParseAcksError {
+                text: other.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Why a string is not an [`Acks`] mode.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown acks mode '{text}': expected quorum, all, or local")]
+pub struct ParseAcksError {
+    text: String,
+}
+
+/// A database's durability settings: its [`Acks`] mode and its floor on live replicas
+/// (ADR-0023).
+///
+/// `min_replicas` counts the primary. A write that arrives while fewer replicas are reachable is
+/// refused before anything commits. It must satisfy W ≤ `min_replicas` ≤ R, where W is the
+/// mode's write quorum for R replicas; the default is W.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring::ReplicationFactor;
+/// use fleetring_control::{Acks, Durability};
+///
+/// let three = ReplicationFactor::new(3).ok_or("zero")?;
+/// let quorum = Durability::new(Acks::Quorum, three);
+/// assert_eq!(quorum.min_replicas(), 2);
+/// let strict = Durability::with_min_replicas(Acks::Quorum, 3, three)?;
+/// assert_eq!(strict.min_replicas(), 3);
+/// assert!(Durability::with_min_replicas(Acks::All, 2, three).is_err());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Durability {
+    acks: Acks,
+    min_replicas: u8,
+}
+
+impl Durability {
+    /// The settings for `acks` on a database with `replication_factor` replicas, with the floor
+    /// at W.
+    #[must_use]
+    pub const fn new(acks: Acks, replication_factor: ReplicationFactor) -> Self {
+        Self {
+            acks,
+            min_replicas: Quorums::with_acks(replication_factor, acks).write(),
+        }
+    }
+
+    /// The default settings: [`Acks::Quorum`] with the floor at W.
+    #[must_use]
+    pub const fn quorum(replication_factor: ReplicationFactor) -> Self {
+        Self::new(Acks::Quorum, replication_factor)
+    }
+
+    /// The settings for `acks` with the floor at `min_replicas`.
+    ///
+    /// # Errors
+    ///
+    /// [`DurabilityError`] if `min_replicas` is below W or above `replication_factor`.
+    pub fn with_min_replicas(
+        acks: Acks,
+        min_replicas: u8,
+        replication_factor: ReplicationFactor,
+    ) -> Result<Self, DurabilityError> {
+        let durability = Self { acks, min_replicas };
+        durability.check(replication_factor)?;
+        Ok(durability)
+    }
+
+    /// Returns the acknowledgement mode.
+    #[must_use]
+    pub const fn acks(&self) -> Acks {
+        self.acks
+    }
+
+    /// Returns how many replicas, the primary included, must be reachable for a write to be
+    /// accepted.
+    #[must_use]
+    pub const fn min_replicas(&self) -> u8 {
+        self.min_replicas
+    }
+
+    /// Returns the quorums for a replica set of `size` members in this mode.
+    #[must_use]
+    pub const fn quorums(&self, size: ReplicationFactor) -> Quorums {
+        Quorums::with_acks(size, self.acks)
+    }
+
+    /// Checks that the floor fits a database with `replication_factor` replicas.
+    ///
+    /// # Errors
+    ///
+    /// [`DurabilityError`] if `min_replicas` is below W or above `replication_factor`.
+    pub fn check(&self, replication_factor: ReplicationFactor) -> Result<(), DurabilityError> {
+        let write = self.quorums(replication_factor).write();
+        if self.min_replicas < write {
+            return Err(DurabilityError::BelowWriteQuorum {
+                min_replicas: self.min_replicas,
+                write,
+            });
+        }
+        if self.min_replicas > replication_factor.get() {
+            return Err(DurabilityError::AboveReplicationFactor {
+                min_replicas: self.min_replicas,
+                replication_factor: replication_factor.get(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Durability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "acks={} min_replicas={}", self.acks, self.min_replicas)
+    }
+}
+
+/// Why a [`Durability`] doesn't fit a database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DurabilityError {
+    /// The floor is below the write quorum, so a write could be acknowledged by replicas it was
+    /// not allowed to wait for.
+    #[error("min_replicas {min_replicas} is below the write quorum {write}")]
+    BelowWriteQuorum {
+        /// The floor asked for.
+        min_replicas: u8,
+        /// W for the mode and the replication factor.
+        write: u8,
+    },
+    /// The floor is above the replication factor, so no write could ever be accepted.
+    #[error("min_replicas {min_replicas} is above the replication factor {replication_factor}")]
+    AboveReplicationFactor {
+        /// The floor asked for.
+        min_replicas: u8,
+        /// R.
+        replication_factor: u8,
+    },
+}
+
 /// A log position, as opaque bytes defined by the database's engine (ADR-0016).
 ///
 /// Engines encode positions so that comparing the bytes lexicographically gives log order, for
@@ -321,14 +532,76 @@ impl Promotion {
 ///
 /// Where the database should live is not stored: the ring computes it from the membership
 /// (ADR-0017, point 6).
+///
+/// The durability settings are fixed at creation and change only through a `ChangeDurability`
+/// command, which takes effect when the next lease is granted (ADR-0023). Records written before
+/// the settings existed load as [`Acks::Quorum`] with the floor at W.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "DatabaseRecord", into = "DatabaseRecord")]
 pub struct Database {
     name: DatabaseName,
     replication_factor: ReplicationFactor,
     engine: Engine,
+    durability: Durability,
+    pending_durability: Option<Durability>,
     epoch: LeaseEpoch,
     lease: Option<Lease>,
     promotion: Option<Promotion>,
+}
+
+/// A database as it is stored: the durability fields are optional, so records written before
+/// they existed load with the defaults.
+#[derive(Serialize, Deserialize)]
+struct DatabaseRecord {
+    name: DatabaseName,
+    replication_factor: ReplicationFactor,
+    engine: Engine,
+    #[serde(default)]
+    acks: Acks,
+    #[serde(default)]
+    min_replicas: Option<u8>,
+    #[serde(default)]
+    pending_durability: Option<Durability>,
+    epoch: LeaseEpoch,
+    lease: Option<Lease>,
+    promotion: Option<Promotion>,
+}
+
+impl From<DatabaseRecord> for Database {
+    fn from(record: DatabaseRecord) -> Self {
+        let min_replicas = record.min_replicas.unwrap_or_else(|| {
+            Durability::new(record.acks, record.replication_factor).min_replicas
+        });
+        Self {
+            name: record.name,
+            replication_factor: record.replication_factor,
+            engine: record.engine,
+            durability: Durability {
+                acks: record.acks,
+                min_replicas,
+            },
+            pending_durability: record.pending_durability,
+            epoch: record.epoch,
+            lease: record.lease,
+            promotion: record.promotion,
+        }
+    }
+}
+
+impl From<Database> for DatabaseRecord {
+    fn from(database: Database) -> Self {
+        Self {
+            name: database.name,
+            replication_factor: database.replication_factor,
+            engine: database.engine,
+            acks: database.durability.acks,
+            min_replicas: Some(database.durability.min_replicas),
+            pending_durability: database.pending_durability,
+            epoch: database.epoch,
+            lease: database.lease,
+            promotion: database.promotion,
+        }
+    }
 }
 
 impl Database {
@@ -336,11 +609,14 @@ impl Database {
         name: DatabaseName,
         replication_factor: ReplicationFactor,
         engine: Engine,
+        durability: Durability,
     ) -> Self {
         Self {
             name,
             replication_factor,
             engine,
+            durability,
+            pending_durability: None,
             epoch: LeaseEpoch::ZERO,
             lease: None,
             promotion: None,
@@ -363,6 +639,30 @@ impl Database {
     #[must_use]
     pub fn engine(&self) -> Engine {
         self.engine
+    }
+
+    /// Returns the durability settings in effect: those the current lease was granted under.
+    #[must_use]
+    pub fn durability(&self) -> Durability {
+        self.durability
+    }
+
+    /// Returns the durability settings a `ChangeDurability` command recorded, which take effect
+    /// when the next lease is granted, if any are pending.
+    #[must_use]
+    pub fn pending_durability(&self) -> Option<Durability> {
+        self.pending_durability
+    }
+
+    pub(crate) fn set_pending_durability(&mut self, durability: Durability) {
+        self.pending_durability = Some(durability);
+    }
+
+    /// Makes any pending durability settings the ones in effect, as a lease grant does.
+    pub(crate) fn apply_pending_durability(&mut self) {
+        if let Some(durability) = self.pending_durability.take() {
+            self.durability = durability;
+        }
     }
 
     /// Returns the highest epoch issued for the database, by a lease or a started promotion.
@@ -407,21 +707,27 @@ impl Database {
     }
 }
 
-/// A replica set's size and its write and promotion quorums (ADR-0018).
+/// A replica set's size and its write and promotion quorums (ADR-0018, ADR-0023).
 ///
-/// R is the replica set's size, W = ⌊R/2⌋ + 1, and Q = R − W + 1, so W + Q > R: every write
-/// acknowledged by W members reaches at least one of any Q fenced members.
+/// R is the replica set's size. In [`Acks::Quorum`], W = ⌊R/2⌋ + 1 and Q = R − W + 1; in
+/// [`Acks::All`], W = R and Q = 1. Either way W + Q > R: every write acknowledged by W members
+/// reaches at least one of any Q fenced members. [`Acks::Local`] gives that up: W = 1 and Q is
+/// a majority, so a failover may lose acknowledged writes.
 ///
 /// # Examples
 ///
 /// ```
 /// use fleetring::ReplicationFactor;
-/// use fleetring_control::Quorums;
+/// use fleetring_control::{Acks, Quorums};
 ///
 /// let three = Quorums::new(ReplicationFactor::new(3).expect("3 is nonzero"));
 /// assert_eq!((three.replicas(), three.write(), three.promotion()), (3, 2, 2));
 /// let two = Quorums::new(ReplicationFactor::new(2).expect("2 is nonzero"));
 /// assert_eq!((two.write(), two.promotion()), (2, 1));
+/// let all = Quorums::with_acks(ReplicationFactor::new(3).expect("3 is nonzero"), Acks::All);
+/// assert_eq!((all.write(), all.promotion()), (3, 1));
+/// let local = Quorums::with_acks(ReplicationFactor::new(3).expect("3 is nonzero"), Acks::Local);
+/// assert_eq!((local.write(), local.promotion()), (1, 2));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quorums {
@@ -431,15 +737,26 @@ pub struct Quorums {
 }
 
 impl Quorums {
-    /// Returns the quorums for a replica set of `size` members.
+    /// Returns the quorums for a replica set of `size` members in [`Acks::Quorum`].
     #[must_use]
     pub const fn new(size: ReplicationFactor) -> Self {
+        Self::with_acks(size, Acks::Quorum)
+    }
+
+    /// Returns the quorums for a replica set of `size` members in `acks`.
+    #[must_use]
+    pub const fn with_acks(size: ReplicationFactor, acks: Acks) -> Self {
         let replicas = size.get();
-        let write = replicas / 2 + 1;
+        let majority = replicas / 2 + 1;
+        let (write, promotion) = match acks {
+            Acks::Quorum => (majority, replicas - majority + 1),
+            Acks::All => (replicas, 1),
+            Acks::Local => (1, majority),
+        };
         Self {
             replicas,
             write,
-            promotion: replicas - write + 1,
+            promotion,
         }
     }
 

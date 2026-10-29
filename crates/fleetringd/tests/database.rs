@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::ReplicationFactor;
-use fleetring_control::{DatabaseName, Liveness, Role};
+use fleetring_control::{Acks, DatabaseName, Durability, Liveness, Role};
 use fleetring_proto::v1::ExecuteRequest;
-use fleetringd::data::{Client, Location, primary_hint};
+use fleetringd::data::{Client, DatabaseSpec, Location, primary_hint};
 use fleetringd::engine::{Statement, Value};
 use fleetringd::transport::database_client;
 use fleetringd::{Config, Daemon, Network};
@@ -50,8 +50,18 @@ impl Cluster {
 
     /// Starts the cluster with `control_settings` appended to every daemon's `[control]` table.
     async fn start_with(dir: &Path, control_settings: &str) -> Result<Self, Box<dyn Error>> {
+        Self::start_configured(dir, control_settings, "").await
+    }
+
+    /// Starts the cluster with `control_settings` appended to every daemon's `[control]` table
+    /// and `control_tables` appended to the control daemon's configuration.
+    async fn start_configured(
+        dir: &Path,
+        control_settings: &str,
+        control_tables: &str,
+    ) -> Result<Self, Box<dyn Error>> {
         let control_text = format!(
-            "{}\n[control]\n{control_settings}",
+            "{}\n[control]\n{control_settings}\n{control_tables}",
             config(dir, "control", "control", None)
         );
         let control = Daemon::start(Config::from_toml(&control_text)?).await?;
@@ -853,6 +863,174 @@ async fn dropping_a_database_removes_it_from_every_node() -> TestResult {
     Ok(())
 }
 
+/// The bytes of `database`'s files in data daemon `id`'s directory: the main file and its log.
+fn database_bytes(dir: &Path, id: &str, database: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let file = database_file(dir, id, database);
+    let mut bytes = std::fs::read(&file)?;
+    let wal = file.with_file_name("data.db-wal");
+    if wal.try_exists()? {
+        bytes.extend(std::fs::read(wal)?);
+    }
+    Ok(bytes)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_below_the_replica_floor_are_refused_with_unavailable() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let Cluster { control, mut data } = Cluster::start(dir.path()).await?;
+    let client = Client::new(
+        control
+            .control_address()
+            .ok_or("no control address")?
+            .to_string(),
+        network(),
+    );
+    let strict = name("strict")?;
+    let spec = DatabaseSpec::new(three()?).with_min_replicas(3);
+    let created = client.create_database_with(&strict, spec).await?;
+    assert_eq!(
+        created.durability,
+        Durability::with_min_replicas(Acks::Quorum, 3, three()?)?
+    );
+    assert_eq!(client.locate(&strict).await?.durability, created.durability);
+    let primary = created.primary.clone().ok_or("no primary")?;
+    client
+        .execute(&strict, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    let written = client
+        .execute(&strict, Statement::new("INSERT INTO t VALUES (1)"))
+        .await?;
+    assert!(!written.under_replicated, "{written:?}");
+
+    // One follower stops: a majority is still up, but the floor of 3 isn't met, so the primary
+    // refuses writes before running them, and its files don't change.
+    let follower = created
+        .followers()
+        .next()
+        .map(|replica| replica.node.clone())
+        .ok_or("no follower")?;
+    let index = data
+        .iter()
+        .position(|daemon| daemon.config().node.id == follower)
+        .ok_or("follower isn't a data daemon")?;
+    data.remove(index).run_until(async {}).await;
+    let refused = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client
+                .execute(&strict, Statement::new("INSERT INTO t VALUES (2)"))
+                .await
+            {
+                Err(status) if status.code() == Code::Unavailable => return status,
+                // A write that slipped in before the primary noticed the stop.
+                Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await?;
+    assert!(refused.message().contains("nothing committed"), "{refused}");
+    let before = database_bytes(dir.path(), primary.as_str(), "strict")?;
+    for _ in 0..3 {
+        let again = client
+            .execute(&strict, Statement::new("INSERT INTO t VALUES (3)"))
+            .await
+            .expect_err("still below the floor");
+        assert_eq!(again.code(), Code::Unavailable, "{again}");
+    }
+    assert_eq!(
+        database_bytes(dir.path(), primary.as_str(), "strict")?,
+        before,
+        "refused writes changed the primary's files"
+    );
+    let rows = client
+        .query(
+            &strict,
+            Statement::new("SELECT count(*) FROM t WHERE x > 1"),
+        )
+        .await?;
+    assert_eq!(rows.rows, vec![vec![Value::Integer(0)]]);
+    Cluster { control, data }.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn databases_take_the_cluster_default_durability_unless_told_otherwise() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start_configured(
+        dir.path(),
+        "",
+        "[replication]\nacks = \"all\"\nmin_replicas = 9\n",
+    )
+    .await?;
+    let client = cluster.client()?;
+    // The default mode applies, and a default floor past R is clamped to R.
+    let everyone = name("everyone")?;
+    let created = client.create_database(&everyone, three()?).await?;
+    assert_eq!(created.durability, Durability::new(Acks::All, three()?));
+    assert_eq!(created.durability.min_replicas(), 3);
+    let written = client
+        .execute(&everyone, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    assert_eq!(written.acknowledged_by, 3, "{written:?}");
+    // An explicit mode wins, the default floor still applies, and an explicit floor that
+    // doesn't fit is refused.
+    let alone = name("alone")?;
+    let spec = DatabaseSpec::new(three()?).with_acks(Acks::Local);
+    let created = client.create_database_with(&alone, spec).await?;
+    assert_eq!(
+        created.durability,
+        Durability::with_min_replicas(Acks::Local, 3, three()?)?
+    );
+    let spec = DatabaseSpec::new(three()?)
+        .with_acks(Acks::Local)
+        .with_min_replicas(1);
+    let created = client.create_database_with(&name("lax")?, spec).await?;
+    assert_eq!(created.durability, Durability::new(Acks::Local, three()?));
+    let bad = DatabaseSpec::new(three()?)
+        .with_acks(Acks::All)
+        .with_min_replicas(2);
+    let refused = client
+        .create_database_with(&name("bad")?, bad)
+        .await
+        .expect_err("a floor below W");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+    assert!(client.locate(&name("bad")?).await.is_err());
+    let listed: Vec<(String, Acks, u8)> = client
+        .list_databases()
+        .await?
+        .iter()
+        .map(|location| {
+            (
+                location.database.to_string(),
+                location.durability.acks(),
+                location.durability.min_replicas(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("alone".to_owned(), Acks::Local, 3),
+            ("everyone".to_owned(), Acks::All, 3),
+            ("lax".to_owned(), Acks::Local, 1)
+        ]
+    );
+    // A change is recorded for the next epoch; the current primary keeps its settings.
+    let change = client
+        .change_durability(&everyone, Acks::Quorum, None)
+        .await?;
+    assert_eq!((change.acks, change.min_replicas), (Acks::Quorum, 2));
+    assert_eq!(
+        (change.current_acks, change.current_min_replicas),
+        (Acks::All, 3)
+    );
+    assert_eq!(
+        client.locate(&everyone).await?.durability,
+        Durability::new(Acks::All, three()?)
+    );
+    cluster.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_node_shows_what_each_data_node_knows() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -1063,6 +1241,10 @@ mod binary {
             "{located}"
         );
         assert!(located.contains("engine: sqlite\n"), "{located}");
+        assert!(
+            located.contains("acks: quorum\nmin replicas: 2\n"),
+            "{located}"
+        );
         assert!(located.contains("positions:\n"), "{located}");
 
         let status = stdout(&fleetringd(args(&["status"], &control)).await?)?;
@@ -1148,6 +1330,8 @@ mod binary {
                     "sqlite",
                     "1",
                     "3",
+                    "quorum",
+                    "2",
                     primary.as_str(),
                     &replicas.join(",")
                 ],
@@ -1197,6 +1381,60 @@ mod binary {
                 "{status}"
             );
         }
+
+        // Durability settings are set at creation, shown by locate and list, and changed for
+        // the next epoch.
+        let created = stdout(
+            &fleetringd(args(
+                &[
+                    "db",
+                    "create",
+                    "everyone",
+                    "--acks",
+                    "all",
+                    "--min-replicas",
+                    "3",
+                ],
+                &control,
+            ))
+            .await?,
+        )?;
+        assert!(
+            created.contains("acks: all\nmin replicas: 3\n"),
+            "{created}"
+        );
+        let located = stdout(&fleetringd(args(&["db", "locate", "everyone"], &control)).await?)?;
+        assert!(
+            located.contains("replication factor: 3\nacks: all\nmin replicas: 3\n"),
+            "{located}"
+        );
+        let listed = stdout(&fleetringd(args(&["db", "list"], &control)).await?)?;
+        let line = listed
+            .lines()
+            .find(|line| line.starts_with("everyone"))
+            .ok_or("everyone not listed")?;
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(&cells[1..6], ["sqlite", "1", "3", "all", "3"], "{line}");
+        let bad = fleetringd(args(
+            &["db", "create", "bad", "--acks", "sometimes"],
+            &control,
+        ))
+        .await?;
+        assert!(!bad.status.success());
+        let changed = stdout(
+            &fleetringd(args(
+                &["db", "set-durability", "everyone", "--acks", "local"],
+                &control,
+            ))
+            .await?,
+        )?;
+        assert_eq!(
+            changed,
+            "durability of everyone changes to acks=local min_replicas=1 at its next epoch; \
+             now acks=all min_replicas=3\n"
+        );
+        let located = stdout(&fleetringd(args(&["db", "locate", "everyone"], &control)).await?)?;
+        assert!(located.contains("acks: all\n"), "{located}");
 
         // A control call aimed at a data node names the control node.
         let wrong = fleetringd(args(

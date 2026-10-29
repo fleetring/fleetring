@@ -89,6 +89,10 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
                 let len = usize::try_from(1 + (i * 37) % 3_000).expect("small");
                 if tolerate(registry.execute(&db, put(k, len)).await)? {
                     acknowledged += 1;
+                } else {
+                    // Refused or unacknowledged while the streams reopen: retry later, as a
+                    // client would.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 if i % 10 == 0 {
                     let delete = Transaction::from(Statement::with_params(
@@ -152,11 +156,12 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
 }
 
 /// Whether a write was acknowledged. A write that committed on the primary but wasn't
-/// acknowledged, as happens while streams reopen, isn't an error here.
+/// acknowledged, or that was refused before it ran, as happens while streams reopen, isn't an
+/// error here.
 fn tolerate<T>(written: Result<T, DatabaseError>) -> Result<bool, DatabaseError> {
     match written {
         Ok(_) => Ok(true),
-        Err(DatabaseError::Replication(_)) => Ok(false),
+        Err(DatabaseError::Replication(_) | DatabaseError::Refused { .. }) => Ok(false),
         Err(error) => Err(error),
     }
 }

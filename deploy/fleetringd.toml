@@ -36,3 +36,20 @@ id = "node-1"
 # [control]
 # The control node's address. Required when `role = "data"`.
 # address = "192.0.2.1:7400"
+
+# [replication]
+# The durability a database gets when `db create` names none (ADR-0023). Each database keeps the
+# settings it was created with; `db set-durability` changes them from its next epoch on.
+#
+# `acks` says how many replicas must hold a write before it is acknowledged:
+#   "quorum"  a majority (the default): no acknowledged write is lost while a majority survives
+#   "all"     every replica: one replica down blocks writes
+#   "local"   the primary alone, after its own fsync: fastest, but a failover may lose
+#             acknowledged writes
+# acks = "quorum"
+#
+# `min_replicas` is the floor on reachable replicas, the primary included: a write that arrives
+# while fewer are reachable is refused with UNAVAILABLE before anything commits, so a client can
+# retry it cleanly. It lies between the write quorum and the replication factor, and defaults to
+# the write quorum; a default outside that range for a database is clamped into it.
+# min_replicas = 2
