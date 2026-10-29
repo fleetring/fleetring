@@ -207,23 +207,30 @@ mod binary {
     }
 
     /// Creates a one-replica database on the daemon at `control`, so the node is a primary.
+    ///
+    /// The daemon logs its start before its node has joined, and a create before the join is
+    /// refused because the cluster has no members, so the create is retried until the join lands.
     fn create_database(control: &str) -> TestResult {
-        let created = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
-            .args([
-                "db",
-                "create",
-                "notes",
-                "--replication-factor",
-                "1",
-                "--control",
-            ])
-            .arg(control)
-            .output()?;
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
-        );
+        for attempt in 0..600 {
+            let created = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+                .args([
+                    "db",
+                    "create",
+                    "notes",
+                    "--replication-factor",
+                    "1",
+                    "--control",
+                ])
+                .arg(control)
+                .output()?;
+            if created.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&created.stderr);
+            assert!(stderr.contains("no members"), "{stderr}");
+            assert!(attempt < 599, "the node never joined: {stderr}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         Ok(())
     }
 
