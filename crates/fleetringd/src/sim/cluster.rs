@@ -44,8 +44,9 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
 /// The longest random delay of a message, by default.
 const MAX_LATENCY: Duration = Duration::from_millis(20);
 
-/// How long a graceful stop may take, in simulated time.
-const STOP_LIMIT: Duration = Duration::from_secs(10);
+/// How long a graceful stop may take, in simulated time: a drain of every lease the host holds,
+/// then the leave and the shutdown.
+const STOP_LIMIT: Duration = Duration::from_secs(30);
 
 /// Mixed into the seed for the workload generator, so it doesn't mirror turmoil's.
 const WORKLOAD_SALT: u64 = 0x5EED_F1EE_7219_0024;
@@ -1012,6 +1013,22 @@ impl Cluster {
         self.inject(Fault::Stop {
             host: name.to_owned(),
         })
+    }
+
+    /// Tells host `name`'s daemon to shut down gracefully, as a signal would, without waiting
+    /// for it: the daemon drains and leaves while the test goes on, and may be crashed meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Invalid`] if there is no such host.
+    pub fn begin_stop(&mut self, name: &str) -> Result<(), SimError> {
+        if self.host(name).is_none() {
+            return Err(SimError::Invalid(format!("no host named '{name}'")));
+        }
+        self.record(EventKind::Note(format!("stopping {name}")));
+        self.down.insert(name.to_owned());
+        self.shared.signal_stop(name);
+        Ok(())
     }
 
     /// Starts host `name`'s daemon again on the same data directory.

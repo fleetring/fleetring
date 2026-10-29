@@ -481,6 +481,9 @@ pub struct Promotion {
     candidate: NodeId,
     started_at: Timestamp,
     fenced: BTreeMap<NodeId, Position>,
+    // Absent from states and logs written before leases could be transferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handed_over_by: Option<NodeId>,
 }
 
 impl Promotion {
@@ -490,7 +493,22 @@ impl Promotion {
             candidate,
             started_at,
             fenced: BTreeMap::new(),
+            handed_over_by: None,
         }
+    }
+
+    /// Records that the promotion is a transfer from `holder`, which is draining.
+    #[must_use]
+    pub(crate) fn handed_over_by(mut self, holder: NodeId) -> Self {
+        self.handed_over_by = Some(holder);
+        self
+    }
+
+    /// Returns the draining holder that handed the lease over, if the promotion is a transfer
+    /// rather than a failover after an expiry.
+    #[must_use]
+    pub fn transferred_from(&self) -> Option<&NodeId> {
+        self.handed_over_by.as_ref()
     }
 
     /// Returns the epoch the candidate will hold the lease at.

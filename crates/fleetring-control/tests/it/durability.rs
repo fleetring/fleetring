@@ -3,8 +3,8 @@
 
 use fleetring::NodeId;
 use fleetring_control::{
-    Acks, Action, Applied, Database, Durability, DurabilityError, LeaseEpoch, Member, Position,
-    Quorums, Rejection, State,
+    Acks, Action, Applied, Database, Durability, DurabilityError, HostedReplica, LeaseEpoch,
+    Member, Position, Quorums, Rejection, Role, State, UnknownReports,
 };
 
 use crate::common::{config, create, create_with, db, factor, heartbeat, id, run, zone};
@@ -361,4 +361,63 @@ fn old_logs_and_snapshots_load_as_quorum_with_the_floor_at_w() {
     );
     let back: Action = serde_json::from_str(&logged).expect("loads");
     assert_eq!(back, change("solo", Durability::new(Acks::All, factor(1))));
+}
+
+fn report_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> Action {
+    Action::Heartbeat {
+        id: id(node),
+        replicas: vec![
+            HostedReplica::new(db(database), Role::Follower, Position::new(position))
+                .with_log_epoch(LeaseEpoch::new(log_epoch)),
+        ],
+        unknown_reports: UnknownReports::Skip,
+    }
+}
+
+/// A `local` primary acknowledges on its own, so its followers may hold logs from different
+/// epochs. A transfer that names no target goes to the follower with the newest log epoch, even
+/// if another has a longer log from an older epoch; one that names a follower goes there.
+#[test]
+fn a_transfer_without_a_target_ranks_local_followers_by_log_epoch_first() {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create_with("acme", 3, Acks::Local)).expect("create");
+    let rs = state.replica_set(&db("acme")).expect("replica set");
+    run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
+    // The second replica has the longer log, but from before the current epoch; the third
+    // follows the current primary.
+    run(
+        &mut state,
+        1_000,
+        report_at(rs[1].as_str(), "acme", 0, &[20]),
+    )
+    .expect("report");
+    run(
+        &mut state,
+        1_000,
+        report_at(rs[2].as_str(), "acme", 1, &[3]),
+    )
+    .expect("report");
+    run(&mut state, 1_010, Action::Drain { id: rs[0].clone() }).expect("drain");
+
+    let started = run(
+        &mut state,
+        1_020,
+        Action::TransferLease {
+            database: db("acme"),
+            target: None,
+        },
+    )
+    .expect("transfer");
+    assert_eq!(
+        started,
+        Applied::PromotionStarted {
+            database: db("acme"),
+            epoch: LeaseEpoch::new(2),
+            candidate: rs[2].clone(),
+            position: Position::new([3]),
+        }
+    );
+    // The promotion fences under `local`'s Q: a majority, so the handed-over log is adopted
+    // only once two members, the candidate among them, have fenced.
+    assert_eq!(state.quorums(&db("acme")).expect("quorums").promotion(), 2);
 }

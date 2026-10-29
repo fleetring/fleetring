@@ -93,6 +93,7 @@ fn the_generated_log_exercises_every_kind_of_change() {
             Ok(Applied::PromotionStarted { .. }) => "started",
             Ok(Applied::FenceRecorded { .. }) => "fenced",
             Ok(Applied::PromotionCompleted { .. }) => "completed",
+            Ok(Applied::MemberDraining { .. }) => "draining",
             Ok(_) => "other",
             Err(_) => "rejected",
         };
@@ -109,6 +110,7 @@ fn the_generated_log_exercises_every_kind_of_change() {
         "started",
         "fenced",
         "completed",
+        "draining",
         "rejected",
     ] {
         assert!(

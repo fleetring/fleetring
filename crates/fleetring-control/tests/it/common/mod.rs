@@ -148,6 +148,11 @@ fn action(state: &State, op: Op) -> Action {
         1 if b % 3 == 1 => Action::Tick,
         // Drops are rare, so that databases live long enough to reach promotions.
         8 if b.is_multiple_of(10) => Action::DropDatabase { name: database },
+        8 if b % 10 == 5 => Action::Drain { id: id(node) },
+        8 if b % 10 == 7 => Action::TransferLease {
+            database,
+            target: (b % 4 == 3).then(|| id(NODES[(a + 1) % NODES.len()])),
+        },
         1 | 8 if b % 5 == 4 => Action::ChangeDurability {
             database,
             durability: Durability::new(acks_for(b), factor(1 + op.b % 3)),

@@ -43,6 +43,12 @@ pub enum Operation {
         /// The node.
         node: NodeId,
     },
+    /// Marks `node` as draining, as `fleetringd node drain` does: the node hands every lease it
+    /// holds to a follower and gets no new one. Submitted to the control node in process.
+    Drain {
+        /// The node.
+        node: NodeId,
+    },
     /// Creates a SQLite database.
     CreateDatabase {
         /// The database.
@@ -114,7 +120,10 @@ impl Operation {
             | Self::Locate { database }
             | Self::AcquireLease { database, .. }
             | Self::RenewLease { database, .. } => Some(database),
-            Self::Join { .. } | Self::Heartbeat { .. } | Self::Leave { .. } => None,
+            Self::Join { .. }
+            | Self::Heartbeat { .. }
+            | Self::Leave { .. }
+            | Self::Drain { .. } => None,
         }
     }
 }
@@ -129,6 +138,7 @@ impl fmt::Display for Operation {
             Self::Join { node } => write!(f, "join {node}"),
             Self::Heartbeat { node } => write!(f, "heartbeat {node}"),
             Self::Leave { node } => write!(f, "leave {node}"),
+            Self::Drain { node } => write!(f, "drain {node}"),
             Self::CreateDatabase {
                 database,
                 replication_factor,
@@ -267,6 +277,8 @@ pub enum Ack {
     HeartbeatRecorded,
     /// The node was removed.
     Left,
+    /// The node is draining.
+    Draining,
     /// The database was created.
     Created,
     /// Where the database lives.
@@ -321,6 +333,7 @@ impl fmt::Display for Ack {
             Self::Joined { membership_epoch } => write!(f, "joined at epoch {membership_epoch}"),
             Self::HeartbeatRecorded => f.write_str("recorded"),
             Self::Left => f.write_str("left"),
+            Self::Draining => f.write_str("draining"),
             Self::Created => f.write_str("created"),
             Self::Located { epoch, primary } => match primary {
                 Some(primary) => write!(f, "epoch {} primary {primary}", epoch.get()),

@@ -2,7 +2,7 @@
 
 use fleetring::{BuildRingError, Host, NodeId, Weight};
 use fleetring_control::{
-    Action, Applied, JoinKind, LeaseEpoch, Liveness, Member, Position, Rejection, State,
+    Action, Applied, JoinKind, LeaseEpoch, Liveness, Member, Position, Promotion, Rejection, State,
 };
 
 use crate::common::{at, config, create, db, heartbeat, id, run, zone};
@@ -731,4 +731,237 @@ fn a_drop_survives_the_log_and_old_logs_load_without_it() {
     let encoded = serde_json::to_string(&applied).expect("serializes");
     let back: Applied = serde_json::from_str(&encoded).expect("an outcome loads");
     assert_eq!(back, applied);
+}
+
+fn drain(node: &str) -> Action {
+    Action::Drain { id: id(node) }
+}
+
+fn transfer(database: &str, target: Option<&NodeId>) -> Action {
+    Action::TransferLease {
+        database: db(database),
+        target: target.cloned(),
+    }
+}
+
+/// A three-member cluster with `acme` leased to its first replica, every replica reporting at
+/// 1 000 ms: the first at [5], the second at [9], and the third at [7].
+fn leased_cluster() -> (State, Vec<NodeId>) {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create("acme", 3)).expect("create");
+    let rs = state.replica_set(&db("acme")).expect("replica set");
+    run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
+    for (node, position) in [(&rs[0], [5]), (&rs[1], [9]), (&rs[2], [7])] {
+        run(
+            &mut state,
+            1_000,
+            heartbeat(node.as_str(), &[("acme", &position)]),
+        )
+        .expect("heartbeat");
+    }
+    (state, rs)
+}
+
+#[test]
+fn a_transfer_hands_the_lease_to_the_most_advanced_live_follower_without_waiting() {
+    let (mut state, rs) = leased_cluster();
+    // The lease is nowhere near expiry, and the holder isn't draining: no transfer.
+    assert_eq!(
+        reject(&mut state, 1_010, transfer("acme", None)),
+        Rejection::HolderNotDraining {
+            id: rs[0].clone(),
+            database: db("acme"),
+        }
+    );
+    assert!(matches!(
+        reject(&mut state, 1_010, start("acme")),
+        Rejection::LeaseNotExpired { .. }
+    ));
+
+    assert_eq!(
+        run(&mut state, 1_020, drain(rs[0].as_str())).expect("drain"),
+        Applied::MemberDraining { id: rs[0].clone() }
+    );
+    assert!(state.is_draining(&rs[0]));
+    assert!(!state.is_draining(&rs[1]));
+    assert!(!state.is_draining(&id("ghost")));
+
+    // The most advanced follower is the candidate, at the next epoch, at once.
+    let started = run(&mut state, 1_030, transfer("acme", None)).expect("transfer");
+    assert_eq!(
+        started,
+        Applied::PromotionStarted {
+            database: db("acme"),
+            epoch: LeaseEpoch::new(2),
+            candidate: rs[1].clone(),
+            position: Position::new([9]),
+        }
+    );
+    let promotion = state
+        .database(&db("acme"))
+        .and_then(|d| d.promotion())
+        .expect("promotion in progress");
+    assert_eq!(promotion.transferred_from(), Some(&rs[0]));
+    assert_eq!(promotion.started_at(), at(1_030));
+    // The old holder can't renew at the old epoch any more.
+    assert!(matches!(
+        reject(&mut state, 1_040, renew("acme", &rs[0], 1)),
+        Rejection::StaleEpoch { .. }
+    ));
+    // A second transfer meanwhile is a promotion in progress.
+    assert!(matches!(
+        reject(&mut state, 1_050, transfer("acme", None)),
+        Rejection::PromotionInProgress { .. }
+    ));
+
+    // The candidate completes it through the usual fencing path.
+    run(&mut state, 1_060, fence("acme", &rs[1], 2, &[9])).expect("fence");
+    run(&mut state, 1_060, fence("acme", &rs[0], 2, &[9])).expect("fence the old holder");
+    let Applied::PromotionCompleted { lease, adopted, .. } =
+        run(&mut state, 1_070, complete("acme", 2)).expect("complete")
+    else {
+        panic!("promotion completed");
+    };
+    assert_eq!(lease.holder(), &rs[1]);
+    assert_eq!(lease.epoch(), LeaseEpoch::new(2));
+    assert_eq!(adopted, Position::new([9]));
+    assert!(
+        state
+            .database(&db("acme"))
+            .is_some_and(|d| d.promotion().is_none())
+    );
+}
+
+#[test]
+fn a_transfer_honors_a_valid_target_and_refuses_an_unusable_one() {
+    let (mut state, rs) = leased_cluster();
+    run(&mut state, 1_020, drain(rs[0].as_str())).expect("drain");
+
+    // The holder names the follower it shipped its tail to, even if another reported further.
+    assert!(matches!(
+        reject(&mut state, 1_030, transfer("acme", Some(&id("ghost")))),
+        Rejection::UnknownMember { .. }
+    ));
+    assert_eq!(
+        reject(&mut state, 1_030, transfer("acme", Some(&rs[0]))),
+        Rejection::MemberDraining { id: rs[0].clone() }
+    );
+    run(&mut state, 1_030, drain(rs[2].as_str())).expect("drain another");
+    assert_eq!(
+        reject(&mut state, 1_030, transfer("acme", Some(&rs[2]))),
+        Rejection::MemberDraining { id: rs[2].clone() }
+    );
+    // Past the 3 s heartbeat timeout rs[1] is down, so it can't be the target either.
+    assert_eq!(
+        reject(&mut state, 4_100, transfer("acme", Some(&rs[1]))),
+        Rejection::MemberDown { id: rs[1].clone() }
+    );
+    assert!(matches!(
+        reject(&mut state, 4_100, transfer("acme", None)),
+        Rejection::NoCandidate { .. }
+    ));
+    run(
+        &mut state,
+        4_200,
+        heartbeat(rs[1].as_str(), &[("acme", &[9])]),
+    )
+    .expect("heartbeat");
+    let Ok(Applied::PromotionStarted { candidate, .. }) =
+        run(&mut state, 4_210, transfer("acme", Some(&rs[1])))
+    else {
+        panic!("transfer started");
+    };
+    assert_eq!(candidate, rs[1]);
+}
+
+#[test]
+fn a_draining_member_gets_no_new_lease_and_is_never_a_candidate() {
+    let mut state = cluster(&["a", "b", "c"]);
+    run(&mut state, 0, create("acme", 3)).expect("create");
+    run(&mut state, 0, create("other", 3)).expect("create another");
+    let rs = state.replica_set(&db("acme")).expect("replica set");
+    run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
+    run(&mut state, 10, drain(rs[1].as_str())).expect("drain");
+
+    // No first lease for a draining member, even in its replica set.
+    let other = state.replica_set(&db("other")).expect("replica set");
+    let draining_in_other = other.contains(&rs[1]);
+    let acquired = run(&mut state, 20, acquire("other", &rs[1]));
+    if draining_in_other {
+        assert_eq!(
+            acquired.expect_err("refused"),
+            Rejection::MemberDraining { id: rs[1].clone() }
+        );
+    } else {
+        assert!(matches!(acquired, Err(Rejection::NotInReplicaSet { .. })));
+    }
+
+    // After an expiry the draining member is skipped, even with the most advanced log.
+    for (node, position) in [(&rs[1], [9]), (&rs[2], [7])] {
+        run(
+            &mut state,
+            1_000,
+            heartbeat(node.as_str(), &[("acme", &position)]),
+        )
+        .expect("heartbeat");
+    }
+    let Ok(Applied::PromotionStarted { candidate, .. }) = run(&mut state, 1_201, start("acme"))
+    else {
+        panic!("promotion started");
+    };
+    assert_eq!(candidate, rs[2]);
+
+    // Joining again clears it; leaving removes the member.
+    let member = state.member(&rs[1]).cloned().expect("member");
+    run(&mut state, 1_300, Action::Join { member }).expect("rejoin");
+    assert!(!state.is_draining(&rs[1]));
+    run(&mut state, 1_310, drain(rs[1].as_str())).expect("drain again");
+    run(&mut state, 1_320, Action::Leave { id: rs[1].clone() }).expect("leave");
+    assert!(!state.is_draining(&rs[1]));
+    assert!(matches!(
+        reject(&mut state, 1_330, drain("ghost")),
+        Rejection::UnknownMember { .. }
+    ));
+}
+
+#[test]
+fn drains_and_transfers_survive_the_log_and_old_states_load_without_them() {
+    let drained = serde_json::to_string(&drain("a")).expect("serializes");
+    assert_eq!(drained, r#"{"drain":{"id":"a"}}"#);
+    let back: Action = serde_json::from_str(&drained).expect("a drain loads");
+    assert_eq!(back, drain("a"));
+    let transferred = serde_json::to_string(&transfer("acme", Some(&id("b")))).expect("serializes");
+    assert_eq!(
+        transferred,
+        r#"{"transfer_lease":{"database":"acme","target":"b"}}"#
+    );
+    let back: Action = serde_json::from_str(&transferred).expect("a transfer loads");
+    assert_eq!(back, transfer("acme", Some(&id("b"))));
+
+    // A state snapshot from before members could drain or leases be transferred: no
+    // `draining` on members, no `handed_over_by` on promotions.
+    let (mut state, rs) = leased_cluster();
+    run(&mut state, 1_201, start("acme")).expect("promotion");
+    let snapshot = serde_json::to_string(&state).expect("serializes");
+    assert!(!snapshot.contains("draining"), "{snapshot}");
+    assert!(!snapshot.contains("handed_over_by"), "{snapshot}");
+    let restored: State = serde_json::from_str(&snapshot).expect("restores");
+    assert_eq!(restored, state);
+    assert!(!restored.is_draining(&rs[0]));
+    assert_eq!(
+        restored
+            .database(&db("acme"))
+            .and_then(|d| d.promotion())
+            .and_then(Promotion::transferred_from),
+        None
+    );
+
+    // One with a draining member and a transfer round-trips too.
+    let (mut state, rs) = leased_cluster();
+    run(&mut state, 1_020, drain(rs[0].as_str())).expect("drain");
+    run(&mut state, 1_030, transfer("acme", None)).expect("transfer");
+    let snapshot = serde_json::to_string(&state).expect("serializes");
+    let restored: State = serde_json::from_str(&snapshot).expect("restores");
+    assert_eq!(restored, state);
+    assert!(restored.is_draining(&rs[0]));
 }

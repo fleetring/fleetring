@@ -74,6 +74,14 @@ service Control {
   rpc StartPromotion(StartPromotionRequest) returns (PromotionResponse);
   rpc RecordFenced(RecordFencedRequest) returns (RecordFencedResponse);
   rpc CompletePromotion(CompletePromotionRequest) returns (CompletePromotionResponse);
+  // Marks a member as draining: it gets no new lease and is never a promotion's candidate. The
+  // member sees the mark in its membership updates and hands its leases over with
+  // TransferLease, then leaves if it is shutting down.
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  // Hands a database's lease from its draining holder to a follower without waiting for the
+  // lease to expire: starts a promotion at the next epoch whose candidate is the named target,
+  // or the most advanced live follower. The candidate completes it as after an expiry.
+  rpc TransferLease(TransferLeaseRequest) returns (PromotionResponse);
 }
 
 message JoinRequest {
@@ -114,6 +122,8 @@ message WatchMembershipRequest {
 message Member {
   Node node = 1;
   bool live = 2;
+  // Set while the member is draining: handing its leases over before it leaves.
+  bool draining = 3;
 }
 
 message MembershipUpdate {
@@ -263,6 +273,22 @@ message CompletePromotionResponse {
   LeaseResponse lease = 1;
   // The most advanced position among the fenced members, as the control plane compares them.
   bytes adopted = 2;
+}
+
+message DrainRequest {
+  string node_id = 1;
+}
+
+message DrainResponse {
+  // The databases the member holds the lease on, in name order: what it has to hand over.
+  repeated string primaries = 1;
+}
+
+message TransferLeaseRequest {
+  string database = 1;
+  // The replica to hand the lease to, or empty to let the control plane pick the most advanced
+  // live follower.
+  string target = 2;
 }
 
 // ---- Replication ------------------------------------------------------------------------------

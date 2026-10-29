@@ -26,6 +26,9 @@
 //!   3. calls `CompletePromotion`, and then leads the database at the new epoch. The position
 //!      it adopted is where the epoch's log begins: followers whose logs came from earlier epochs
 //!      and run past it truncate back to it.
+//! - **Draining.** When the membership says this node is draining, as after
+//!   `fleetringd node drain`, the keeper hands its leases over (the `drain`
+//!   module). A shutdown that leaves does the same before it leaves.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -40,6 +43,7 @@ use tokio::time::MissedTickBehavior;
 use tonic::{Code, Status};
 
 use crate::control::missing_database;
+use crate::data::drain::DrainSettings;
 use crate::data::node::{DataNode, HeldLease};
 use crate::engine::Position;
 use crate::replication::{Fenced, PromotionRequest, Replication};
@@ -54,6 +58,8 @@ pub(crate) struct LeaseSettings {
     pub(crate) fence_timeout: Duration,
     /// How long a candidate waits for the frames it lacks.
     pub(crate) transfer_timeout: Duration,
+    /// How a drain hands the node's leases over.
+    pub(crate) drain: DrainSettings,
 }
 
 /// Aborts a task when dropped.
@@ -91,10 +97,31 @@ async fn run(node: DataNode, settings: LeaseSettings) {
     // Databases this node serves again after a restart, each waiting for its followers.
     let mut restarting = JoinSet::new();
     let mut recovered = false;
+    let mut membership = node.replication().membership();
+    let mut membership_ended = false;
+    // The drain this node runs because the membership says it is draining, until the membership
+    // says otherwise, as after it joins again.
+    let mut draining: Option<AbortOnDrop> = None;
     let mut ticks = tokio::time::interval(settings.renew_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            view = membership.changed(), if !membership_ended => {
+                let Some(view) = view else {
+                    membership_ended = true;
+                    continue;
+                };
+                if !view.is_draining(node.id()) {
+                    draining = None;
+                } else if draining.is_none() {
+                    tracing::info!(node = %node.id(), "the control plane says this node is draining");
+                    let node = node.clone();
+                    draining = Some(AbortOnDrop(tokio::spawn(async move {
+                        let report = node.drain(settings.drain).await;
+                        tracing::info!(moved = report.moved.len(), stuck = report.stuck.len(), "drained");
+                    })));
+                }
+            }
             _ = ticks.tick() => {
                 if !recovered {
                     recovered = recover(&node, &mut restarting).await;

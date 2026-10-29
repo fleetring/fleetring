@@ -5,11 +5,11 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
-    ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse, PromotionResponse,
-    RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, StartPromotionRequest,
-    WatchMembershipRequest,
+    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
+    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
+    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
+    StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -129,6 +129,17 @@ impl Control for NoControl {
         &self,
         _: Request<CompletePromotionRequest>,
     ) -> Result<Response<CompletePromotionResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn drain(&self, _: Request<DrainRequest>) -> Result<Response<DrainResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn transfer_lease(
+        &self,
+        _: Request<TransferLeaseRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
         self.refuse()
     }
 }

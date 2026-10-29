@@ -1,7 +1,7 @@
 //! A data node's side of the `Database` service: which databases it is primary for, and where
 //! to send requests for the others.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -104,6 +104,22 @@ pub(super) struct Inner {
     /// The databases this node has started serving and still waits for the followers of, each
     /// with the number of starts waiting.
     settling: watch::Sender<BTreeMap<DatabaseName, usize>>,
+    /// The databases whose requests are refused while their leases are handed over.
+    refusing: Mutex<BTreeSet<DatabaseName>>,
+    /// Held while a drain runs, so that two never hand the same lease over.
+    pub(super) draining: tokio::sync::Mutex<()>,
+}
+
+/// Refuses requests for one database until it is dropped.
+pub(super) struct Refusing<'node> {
+    node: &'node DataNode,
+    name: DatabaseName,
+}
+
+impl Drop for Refusing<'_> {
+    fn drop(&mut self) {
+        self.node.refusing().remove(&self.name);
+    }
 }
 
 /// Counts one start of `name` as settling until it is dropped, even if the start is cancelled.
@@ -155,6 +171,8 @@ impl DataNode {
                 writable_wait,
                 leases: Mutex::new(BTreeMap::new()),
                 settling: watch::Sender::new(BTreeMap::new()),
+                refusing: Mutex::new(BTreeSet::new()),
+                draining: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -177,10 +195,16 @@ impl DataNode {
     /// # Errors
     ///
     /// A redirect ([`not_primary`]) if another node holds the lease; `FAILED_PRECONDITION` if no
-    /// node does yet; `UNAVAILABLE` if the control plane can't be reached or the primary has no
-    /// known address; and the control plane's status otherwise, such as `NOT_FOUND`.
+    /// node does yet; `UNAVAILABLE` if the control plane can't be reached, the primary has no
+    /// known address, or this node is handing the lease over; and the control plane's status
+    /// otherwise, such as `NOT_FOUND`.
     pub(crate) async fn route(&self, name: &DatabaseName) -> Result<HeldLease, Status> {
         if let Some(lease) = self.held(name) {
+            if self.refusing().contains(name) {
+                return Err(Status::unavailable(format!(
+                    "database {name} is moving to a new primary; retry"
+                )));
+            }
             self.await_settled(name).await;
             return Ok(lease);
         }
@@ -415,8 +439,25 @@ impl DataNode {
         let _ = tokio::time::timeout(self.inner.writable_wait, settled).await;
     }
 
+    /// Refuses requests for `name` with `UNAVAILABLE` until the guard is dropped, while its lease
+    /// is handed over. Once the lease is gone, requests are redirected as usual.
+    pub(super) fn refuse_requests(&self, name: &DatabaseName) -> Refusing<'_> {
+        self.refusing().insert(name.clone());
+        Refusing {
+            node: self,
+            name: name.clone(),
+        }
+    }
+
     fn leases(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, HeldLease>> {
         self.inner.leases.lock().expect("lease table lock poisoned")
+    }
+
+    fn refusing(&self) -> MutexGuard<'_, BTreeSet<DatabaseName>> {
+        self.inner
+            .refusing
+            .lock()
+            .expect("refusal set lock poisoned")
     }
 }
 

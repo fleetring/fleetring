@@ -14,11 +14,12 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     Acks, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DatabaseStatus, DropDatabaseRequest, DropDatabaseResponse, Engine,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    MembershipUpdate, Node, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, Role, StartPromotionRequest, WatchMembershipRequest,
+    CreateDatabaseResponse, DatabaseStatus, DrainRequest, DrainResponse, DropDatabaseRequest,
+    DropDatabaseResponse, Engine, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    LocateRequest, LocateResponse, MembershipUpdate, Node, PromotionResponse, RecordFencedRequest,
+    RecordFencedResponse, RenewLeaseRequest, Role, StartPromotionRequest, TransferLeaseRequest,
+    WatchMembershipRequest,
 };
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
@@ -514,6 +515,17 @@ impl Control for Redirecting {
         &self,
         _: Request<CompletePromotionRequest>,
     ) -> Result<Response<CompletePromotionResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn drain(&self, _: Request<DrainRequest>) -> Result<Response<DrainResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn transfer_lease(
+        &self,
+        _: Request<TransferLeaseRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
         self.redirect()
     }
 }

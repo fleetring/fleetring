@@ -11,13 +11,13 @@ use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, Batch, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, FenceRequest, FenceResponse,
-    FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
-    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
-    LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest, PromoteResponse,
-    PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
+    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
+    FenceRequest, FenceResponse, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest,
+    PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
     RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen, SnapshotChunk,
-    SnapshotRequest, StartPromotionRequest, WatchMembershipRequest,
+    SnapshotRequest, StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use fleetringd::transport::{
@@ -139,6 +139,20 @@ impl Control for StubControl {
         &self,
         _request: Request<CompletePromotionRequest>,
     ) -> Result<Response<CompletePromotionResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn drain(
+        &self,
+        _request: Request<DrainRequest>,
+    ) -> Result<Response<DrainResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn transfer_lease(
+        &self,
+        _request: Request<TransferLeaseRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }

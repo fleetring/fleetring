@@ -65,6 +65,8 @@ pub struct MembershipView {
     ring: Option<Arc<Ring>>,
     fingerprint: Option<Fingerprint>,
     members: Vec<(Member, Liveness)>,
+    /// The members that are draining, in ID order.
+    draining: Vec<NodeId>,
 }
 
 impl MembershipView {
@@ -100,6 +102,13 @@ impl MembershipView {
             .iter()
             .find(|(member, _)| member.id() == id)
             .map(|(_, liveness)| *liveness)
+    }
+
+    /// Returns whether the member with `id` is draining: handing its leases over before it
+    /// leaves. A node that isn't a member isn't draining.
+    #[must_use]
+    pub fn is_draining(&self, id: &NodeId) -> bool {
+        self.draining.binary_search(id).is_ok()
     }
 
     fn live_count(&self) -> usize {
@@ -346,7 +355,7 @@ impl Publisher {
     /// Publishes the membership in `update`, rebuilding the ring only if the epoch changed.
     fn apply(&self, update: MembershipUpdate) {
         let epoch = Epoch::new(update.membership_epoch);
-        let members = match members_from(update) {
+        let (members, draining) = match members_from(update) {
             Ok(members) => members,
             Err(status) => {
                 tracing::error!(%status, epoch = epoch.get(), "ignoring an invalid membership update");
@@ -365,10 +374,11 @@ impl Publisher {
         let view = if same_members {
             MembershipView {
                 members,
+                draining,
                 ..MembershipView::clone(&previous)
             }
         } else {
-            match rebuild(epoch, members) {
+            match rebuild(epoch, members, draining) {
                 Some(view) => view,
                 None => return,
             }
@@ -393,15 +403,22 @@ impl MembershipView {
     /// `INTERNAL` if the update names an invalid member or its members can't form a ring.
     pub(crate) fn from_update(update: MembershipUpdate) -> Result<Self, tonic::Status> {
         let epoch = Epoch::new(update.membership_epoch);
-        let members = members_from(update)
+        let (members, draining) = members_from(update)
             .map_err(|status| tonic::Status::internal(format!("invalid membership: {status}")))?;
-        rebuild(epoch, members)
+        rebuild(epoch, members, draining)
             .ok_or_else(|| tonic::Status::internal("the membership can't form a ring"))
     }
 }
 
-/// The members an update carries, with their liveness, in ID order.
-fn members_from(update: MembershipUpdate) -> Result<Vec<(Member, Liveness)>, tonic::Status> {
+/// The members an update carries, with their liveness, in ID order, and the draining ones.
+#[expect(
+    clippy::type_complexity,
+    reason = "the members and the draining IDs are consumed together by the view builders"
+)]
+fn members_from(
+    update: MembershipUpdate,
+) -> Result<(Vec<(Member, Liveness)>, Vec<NodeId>), tonic::Status> {
+    let mut draining = Vec::new();
     let mut members = update
         .members
         .into_iter()
@@ -411,15 +428,25 @@ fn members_from(update: MembershipUpdate) -> Result<Vec<(Member, Liveness)>, ton
             } else {
                 Liveness::Down
             };
-            member_from(member.node).map(|member| (member, liveness))
+            let is_draining = member.draining;
+            let member = member_from(member.node)?;
+            if is_draining {
+                draining.push(member.id().clone());
+            }
+            Ok((member, liveness))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, tonic::Status>>()?;
     members.sort_by(|(a, _), (b, _)| a.id().cmp(b.id()));
-    Ok(members)
+    draining.sort();
+    Ok((members, draining))
 }
 
 /// Builds the view for a new membership epoch, or `None` if its members can't form a ring.
-fn rebuild(epoch: Epoch, members: Vec<(Member, Liveness)>) -> Option<MembershipView> {
+fn rebuild(
+    epoch: Epoch,
+    members: Vec<(Member, Liveness)>,
+    draining: Vec<NodeId>,
+) -> Option<MembershipView> {
     if members.is_empty() {
         return Some(MembershipView {
             epoch,
@@ -436,6 +463,7 @@ fn rebuild(epoch: Epoch, members: Vec<(Member, Liveness)>) -> Option<MembershipV
                 fingerprint: Some(ring.fingerprint()),
                 ring: Some(Arc::new(ring)),
                 members,
+                draining,
             })
         }
         Err(error) => {
@@ -682,6 +710,7 @@ mod tests {
                         address: None,
                     }),
                     live,
+                    draining: false,
                 })
                 .collect(),
         }

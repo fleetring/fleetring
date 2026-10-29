@@ -45,6 +45,10 @@ pub(crate) struct MemberEntry {
     pub(crate) member: Member,
     pub(crate) last_heartbeat: Timestamp,
     pub(crate) reports: BTreeMap<DatabaseName, Report>,
+    /// Whether the member is handing its leases over before it leaves. Absent from states
+    /// written before members could drain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) draining: bool,
 }
 
 impl State {
@@ -107,6 +111,14 @@ impl State {
         self.members
             .get(id)
             .map(|entry| self.liveness_of(entry, at))
+    }
+
+    /// Returns whether the member with `id` is draining: handing its leases over before it
+    /// leaves. A draining member gets no new lease and is never a promotion's candidate. A node
+    /// that isn't a member isn't draining.
+    #[must_use]
+    pub fn is_draining(&self, id: &NodeId) -> bool {
+        self.members.get(id).is_some_and(|entry| entry.draining)
     }
 
     /// Returns what the member with `id` last reported about `database`.

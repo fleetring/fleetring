@@ -9,7 +9,7 @@ use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Role};
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::{
-    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest,
+    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest, DrainRequest,
     DropDatabaseRequest, ExecuteRequest, ListDatabasesRequest, LocateRequest, NodeStatusRequest,
     QueryRequest, WatchMembershipRequest,
 };
@@ -360,6 +360,34 @@ impl Client {
             })
             .await?;
         Ok(LeaseEpoch::new(response.epoch))
+    }
+
+    /// Marks `node` as draining, and returns the databases it holds the lease on, in name order.
+    ///
+    /// The node sees the mark in its next membership update and hands each of those leases to
+    /// a follower, without waiting for it to expire; it gets no new lease meanwhile, and stays a
+    /// member and a follower until it leaves or restarts. Retried: draining twice changes
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if there is no such member, or the status of the last attempt.
+    pub async fn drain_node(&self, node: &NodeId) -> Result<Vec<DatabaseName>, Status> {
+        let response = self
+            .control
+            .drain(DrainRequest {
+                node_id: node.to_string(),
+            })
+            .await?;
+        response
+            .primaries
+            .iter()
+            .map(|name| {
+                name.parse().map_err(|error| {
+                    Status::internal(format!("the reply has an invalid database name: {error}"))
+                })
+            })
+            .collect()
     }
 
     /// Records new durability settings for a database, which take effect at its next lease

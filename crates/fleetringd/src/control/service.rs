@@ -14,11 +14,11 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     self as proto, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest,
-    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
-    ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate,
-    Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
-    StartPromotionRequest, WatchMembershipRequest,
+    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
+    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
+    MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    RenewLeaseRequest, StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -335,28 +335,52 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     })
 }
 
-/// Whether each member is live as of the state's time, in ID order.
-fn live_flags(state: &State) -> Vec<bool> {
+/// What a membership update says about a member besides its attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemberFlags {
+    live: bool,
+    draining: bool,
+}
+
+/// Whether each member is live as of the state's time, and whether it is draining, in ID order.
+fn member_flags(state: &State) -> Vec<MemberFlags> {
     let now = state.now();
     state
         .members()
-        .map(|member| state.liveness(member.id(), now) == Some(Liveness::Live))
+        .map(|member| MemberFlags {
+            live: state.liveness(member.id(), now) == Some(Liveness::Live),
+            draining: state.is_draining(member.id()),
+        })
         .collect()
 }
 
 /// The membership as of the state's time.
-fn membership_update(state: &State, live: &[bool]) -> MembershipUpdate {
+fn membership_update(state: &State, flags: &[MemberFlags]) -> MembershipUpdate {
     MembershipUpdate {
         membership_epoch: state.membership_epoch().get(),
         members: state
             .members()
-            .zip(live)
-            .map(|(member, &live)| proto::Member {
+            .zip(flags)
+            .map(|(member, flags)| proto::Member {
                 node: Some(node_to_proto(member)),
-                live,
+                live: flags.live,
+                draining: flags.draining,
             })
             .collect(),
     }
+}
+
+/// The databases `id` holds the lease on, in name order.
+fn leases_held_by(state: &State, id: &fleetring::NodeId) -> Vec<String> {
+    state
+        .databases()
+        .filter(|database| {
+            database
+                .lease()
+                .is_some_and(|lease| lease.holder() == id && lease.epoch() == database.epoch())
+        })
+        .map(|database| database.name().to_string())
+        .collect()
 }
 
 #[tonic::async_trait]
@@ -413,28 +437,29 @@ impl Control for ControlService {
     }
 
     /// Sends the membership once its epoch passes `after_epoch`, then again whenever the epoch
-    /// grows or a member's liveness changes. Liveness is judged at the time of the last applied
-    /// command, so it changes only as commands, such as other members' heartbeats, arrive.
+    /// grows or a member's liveness or draining changes. Liveness is judged at the time of the
+    /// last applied command, so it changes only as commands, such as other members' heartbeats,
+    /// arrive.
     async fn watch_membership(
         &self,
         request: Request<WatchMembershipRequest>,
     ) -> Result<Response<Self::WatchMembershipStream>, Status> {
         let after_epoch = request.into_inner().after_epoch;
-        // The epoch and liveness the watcher holds: none until the first state is seen.
-        let mut held: Option<(u64, Vec<bool>)> = None;
+        // The epoch and flags the watcher holds: none until the first state is seen.
+        let mut held: Option<(u64, Vec<MemberFlags>)> = None;
         let updates = WatchStream::new(self.node.watch()).filter_map(move |state| {
             let epoch = state.membership_epoch().get();
-            let live = live_flags(&state);
+            let flags = member_flags(&state);
             // Epochs only grow, and members change only with the epoch, so a higher epoch or new
-            // liveness flags are a change the watcher hasn't seen.
+            // flags are a change the watcher hasn't seen.
             let send = match &held {
                 None => epoch > after_epoch,
-                Some((held_epoch, held_live)) => {
-                    epoch > (*held_epoch).max(after_epoch) || live != *held_live
+                Some((held_epoch, held_flags)) => {
+                    epoch > (*held_epoch).max(after_epoch) || flags != *held_flags
                 }
             };
-            let update = send.then(|| Ok(membership_update(&state, &live)));
-            held = Some((epoch, live));
+            let update = send.then(|| Ok(membership_update(&state, &flags)));
+            held = Some((epoch, flags));
             update
         });
         Ok(Response::new(Box::pin(updates)))
@@ -676,6 +701,51 @@ impl Control for ControlService {
             ) => Ok(Response::new(CompletePromotionResponse {
                 lease: Some(lease_response(&database, &lease)),
                 adopted: adopted.as_bytes().to_vec(),
+            })),
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn drain(
+        &self,
+        request: Request<DrainRequest>,
+    ) -> Result<Response<DrainResponse>, Status> {
+        let id = parse("node id", &request.get_ref().node_id)?;
+        match self.submit(Action::Drain { id }).await? {
+            (Applied::MemberDraining { id }, state) => Ok(Response::new(DrainResponse {
+                primaries: leases_held_by(&state, &id),
+            })),
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn transfer_lease(
+        &self,
+        request: Request<TransferLeaseRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
+        let request = request.into_inner();
+        let database = parse("database name", &request.database)?;
+        let target = if request.target.is_empty() {
+            None
+        } else {
+            Some(parse("target node id", &request.target)?)
+        };
+        match self
+            .submit(Action::TransferLease { database, target })
+            .await?
+        {
+            (
+                Applied::PromotionStarted {
+                    database,
+                    epoch,
+                    candidate,
+                    ..
+                },
+                _,
+            ) => Ok(Response::new(PromotionResponse {
+                database: database.to_string(),
+                epoch: epoch.get(),
+                candidate: candidate.to_string(),
             })),
             (other, _) => Err(unexpected(&other)),
         }

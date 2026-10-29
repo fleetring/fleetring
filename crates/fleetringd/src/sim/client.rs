@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use fleetring::{NodeId, ReplicationFactor};
+use fleetring::ReplicationFactor;
 use fleetring_control::{Action, DatabaseName, LeaseEpoch};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
@@ -123,7 +123,12 @@ async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outco
             })
             .await
             .map(|_| Ack::HeartbeatRecorded),
-        Operation::Leave { node } => return leave(shared, node).await,
+        Operation::Leave { node } => {
+            return submit(shared, Action::Leave { id: node.clone() }, Ack::Left).await;
+        }
+        Operation::Drain { node } => {
+            return submit(shared, Action::Drain { id: node.clone() }, Ack::Draining).await;
+        }
         Operation::CreateDatabase {
             database,
             replication_factor,
@@ -277,16 +282,17 @@ fn lease_ack(response: LeaseResponse) -> Ack {
     }
 }
 
-/// Submits a leave to the control node in process, as an operator on its host would.
-async fn leave(shared: &Shared, node: &NodeId) -> Outcome {
+/// Submits `action` to the control node in process, as an operator on its host would, and
+/// acknowledges it with `ack`.
+async fn submit(shared: &Shared, action: Action, ack: Ack) -> Outcome {
     let Some(control) = shared.control_handle() else {
         return Outcome::Indeterminate {
             code: Some(tonic::Code::Unavailable),
         };
     };
-    match control.submit(Action::Leave { id: node.clone() }).await {
+    match control.submit(action).await {
         Ok(committed) => match committed.into_outcome() {
-            Ok(_) => Outcome::Acknowledged(Ack::Left),
+            Ok(_) => Outcome::Acknowledged(ack),
             Err(rejection) => Outcome::from_status(&rejection_status(&rejection)),
         },
         Err(_) => Outcome::Indeterminate {

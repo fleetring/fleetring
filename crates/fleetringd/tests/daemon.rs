@@ -128,13 +128,173 @@ mod binary {
     use super::TestResult;
 
     fn write_config(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        write_config_with(dir, "")
+    }
+
+    /// Writes a one-node configuration with `membership` appended to its `[membership]` table.
+    fn write_config_with(
+        dir: &std::path::Path,
+        membership: &str,
+    ) -> std::io::Result<std::path::PathBuf> {
         let config = dir.join("node.toml");
         let text = format!(
-            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"node-1\"\n",
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"node-1\"\n\n\
+             [membership]\nheartbeat_interval_ms = 100\n{membership}",
             dir.join("data")
         );
         std::fs::write(&config, text)?;
         Ok(config)
+    }
+
+    /// A running daemon with its stderr lines, and the address it listens on. Dropping it kills
+    /// the daemon, so a failed test leaves no process behind.
+    struct Started {
+        daemon: std::process::Child,
+        lines: std::io::Lines<BufReader<std::process::ChildStderr>>,
+        listen: String,
+    }
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            // Already exited, or killed: either way the process is gone.
+            let _ = self.daemon.kill();
+        }
+    }
+
+    /// The line without its terminal colour codes, which the daemon's logs carry.
+    fn plain(line: &str) -> String {
+        let mut plain = String::with_capacity(line.len());
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    }
+
+    fn start(config: &std::path::Path) -> Result<Started, Box<dyn std::error::Error>> {
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            .arg("--config")
+            .arg(config)
+            .env("RUST_LOG", "info")
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut lines = BufReader::new(daemon.stderr.take().ok_or("no stderr")?).lines();
+        let started = lines
+            .by_ref()
+            .map_while(Result::ok)
+            .map(|line| plain(&line))
+            .find(|line| line.contains("fleetringd started"));
+        let mut started_daemon = Started {
+            daemon,
+            lines,
+            listen: String::new(),
+        };
+        let started = started.ok_or("daemon never logged its start")?;
+        started_daemon.listen = started
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("listen="))
+            .ok_or_else(|| format!("no listen address in {started}"))?
+            .to_owned();
+        Ok(started_daemon)
+    }
+
+    /// Creates a one-replica database on the daemon at `control`, so the node is a primary.
+    fn create_database(control: &str) -> TestResult {
+        let created = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            .args([
+                "db",
+                "create",
+                "notes",
+                "--replication-factor",
+                "1",
+                "--control",
+            ])
+            .arg(control)
+            .output()?;
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        Ok(())
+    }
+
+    /// Sends SIGINT, waits for the exit, and returns every line logged after the start.
+    fn interrupt(mut started: Started) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let killed = Command::new("kill")
+            .arg("-INT")
+            .arg(started.daemon.id().to_string())
+            .status()?;
+        assert!(killed.success());
+        let status = started.daemon.wait()?;
+        assert!(status.success(), "exit status {status}");
+        Ok(started
+            .lines
+            .by_ref()
+            .map_while(Result::ok)
+            .map(|line| plain(&line))
+            .collect())
+    }
+
+    /// `Ctrl-C` on a primary that leaves on shutdown drains first: with one replica there is
+    /// nowhere to hand the lease to, so the drain reports it and the node leaves anyway.
+    #[test]
+    fn sigint_drains_a_primary_before_it_leaves() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(dir.path())?;
+        let started = start(&config)?;
+        create_database(&started.listen)?;
+        let rest = interrupt(started)?;
+        assert!(
+            rest.iter()
+                .any(|line| line.contains("draining: handing leases over")),
+            "{rest:?}"
+        );
+        assert!(
+            rest.iter()
+                .any(|line| line.contains("can't hand the lease over")),
+            "{rest:?}"
+        );
+        assert!(
+            rest.iter().any(|line| line.contains("left the cluster")),
+            "{rest:?}"
+        );
+        assert!(
+            rest.iter().any(|line| line.contains("fleetringd stopped")),
+            "{rest:?}"
+        );
+        Ok(())
+    }
+
+    /// With `on_shutdown = "stay"`, `Ctrl-C` neither drains nor leaves.
+    #[test]
+    fn sigint_on_a_node_that_stays_neither_drains_nor_leaves() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = write_config_with(dir.path(), "on_shutdown = \"stay\"\n")?;
+        let started = start(&config)?;
+        create_database(&started.listen)?;
+        let rest = interrupt(started)?;
+        assert!(
+            !rest.iter().any(|line| line.contains("draining")),
+            "{rest:?}"
+        );
+        assert!(
+            !rest.iter().any(|line| line.contains("left the cluster")),
+            "{rest:?}"
+        );
+        assert!(
+            rest.iter().any(|line| line.contains("fleetringd stopped")),
+            "{rest:?}"
+        );
+        Ok(())
     }
 
     #[test]
