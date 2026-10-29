@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use fleetring_control::{Action, ControlConfig, Member, Millis, State, Timestamp, apply};
+use fleetring_control::{Action, Command, ControlConfig, Member, Millis, State, Timestamp, apply};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
@@ -23,7 +23,8 @@ use fleetring_proto::v1::{
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
     CommandLog, Committed, ControlClient, ControlHandle, ControlNode, ControlOptions,
-    ControlService, LEADER_METADATA_KEY, LogError, OpenError, leader_hint, not_leader,
+    ControlService, LEADER_METADATA_KEY, LogError, LogIndex, OpenError, StorageIo, leader_hint,
+    not_leader,
 };
 use fleetringd::transport::{TransportConfig, control_server};
 use fleetringd::{Config, ConfigError, Daemon, Role as DaemonRole};
@@ -663,6 +664,89 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
     assert_eq!(recovered.state, replayed);
     assert_eq!(recovered.snapshot.map(|index| index.get()), Some(160));
     assert_eq!(recovered.replayed, 0);
+    Ok(())
+}
+
+/// How many transactions the SQLite log at `path` has committed to its write-ahead log since
+/// it was created: one commit frame ends each.
+fn commits(path: &Path) -> Result<usize, Box<dyn Error>> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    Ok(
+        fleetring_wal::read_committed_file(wal, None)?.map_or(0, |batch| {
+            batch
+                .frame_headers()
+                .filter(|frame| frame.is_commit())
+                .count()
+        }),
+    )
+}
+
+/// Every command that waits for the writer when it picks the next one up is logged with it in
+/// one transaction, so a burst costs one sync, not one per command. The commands still get
+/// their own indexes and stamps, in order.
+///
+/// The writer runs inline on this single-threaded runtime, so it can't pick anything up until
+/// every submission below has been queued.
+#[tokio::test]
+async fn commands_queued_together_are_logged_in_one_transaction() -> TestResult {
+    const QUEUED: u64 = 40;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("control.db");
+    let options = ControlOptions::default().with_storage_io(StorageIo::Inline);
+    let node = ControlNode::open(&path, options, TickClock::default()).await?;
+    let before = commits(&path)?;
+
+    let mut submits = tokio::task::JoinSet::new();
+    for _ in 0..QUEUED {
+        let handle = node.handle();
+        submits.spawn(async move { handle.submit(Action::Tick).await });
+    }
+    let mut committed = Vec::new();
+    while let Some(joined) = submits.join_next().await {
+        committed.push(joined??);
+    }
+    committed.sort_by_key(Committed::index);
+    let indexes: Vec<u64> = committed
+        .iter()
+        .map(|record| record.index().get())
+        .collect();
+    assert_eq!(indexes, (1..=QUEUED).collect::<Vec<_>>());
+    let stamps: Vec<Timestamp> = committed.iter().map(|record| record.command().at).collect();
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] < pair[1]),
+        "{stamps:?}"
+    );
+    assert_eq!(commits(&path)? - before, 1, "one transaction for the group");
+    node.shutdown().await;
+
+    let log = CommandLog::open(&path, ControlConfig::new())?;
+    let logged = log.commands()?;
+    assert_eq!(logged.len(), usize::try_from(QUEUED)?);
+    for (record, (index, command)) in committed.iter().zip(&logged) {
+        assert_eq!(record.index(), *index);
+        assert_eq!(record.command(), command);
+    }
+    Ok(())
+}
+
+/// A group is logged whole or not at all: an index already taken fails the group, and the
+/// commands before it in the group aren't logged either.
+#[test]
+fn a_group_with_a_taken_index_logs_nothing() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut log = CommandLog::open(dir.path().join("control.db"), ControlConfig::new())?;
+    let tick = |at: u64| Command::new(Timestamp::from_millis(at), Action::Tick);
+    log.append(LogIndex::new(1), &tick(1))?;
+    let group = [tick(2), tick(3)];
+    let refused = log
+        .append_all([(LogIndex::new(2), &group[0]), (LogIndex::new(1), &group[1])])
+        .expect_err("index 1 is taken");
+    assert!(matches!(refused, LogError::Sqlite { .. }), "{refused}");
+    let logged = log.commands()?;
+    assert_eq!(logged, vec![(LogIndex::new(1), tick(1))]);
+    log.append_all([(LogIndex::new(2), &group[0]), (LogIndex::new(3), &group[1])])?;
+    assert_eq!(log.commands()?.len(), 3);
     Ok(())
 }
 
