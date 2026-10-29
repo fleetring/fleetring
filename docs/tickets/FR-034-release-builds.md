@@ -1,7 +1,7 @@
 ---
 id: FR-034
 title: Release builds, ARM CI, and container images for fleetringd
-status: in-progress
+status: done
 priority: P1
 size: M
 milestone: M6 Replication and failover
@@ -41,10 +41,10 @@ Make `fleetringd` installable without a Rust toolchain: prebuilt binaries for th
 ## Acceptance criteria
 
 - [x] CI runs the workspace tests and the simulation's fixed seeds natively on `ubuntu-24.04-arm`.
-- [ ] Pushing a `fleetringd-v*` tag publishes a GitHub release with five archives, their checksums, and `install.sh`.
-- [ ] A manual run of the release workflow builds and uploads every archive as a workflow artifact without publishing anything.
+- [x] Pushing a `fleetringd-v*` tag publishes a GitHub release with five archives, their checksums, and `install.sh`.
+- [x] A manual run of the release workflow builds and uploads every archive as a workflow artifact without publishing anything.
 - [x] `scripts/install.sh` installs a verified binary on Linux and macOS, on x86_64 and ARM64, and refuses an archive whose checksum doesn't match. *(Checked locally against a mirror directory; the GitHub download path needs a real release.)*
-- [ ] `docker run ghcr.io/fleetring/fleetringd:<version> --version` works on `linux/amd64` and `linux/arm64`, as a non-root user.
+- [x] `docker run ghcr.io/fleetring/fleetringd:<version> --version` works on `linux/amd64` and `linux/arm64`, as a non-root user.
 - [x] The README, `RELEASING.md`, and the archive README describe installation and the release process.
 - [x] Every workflow passes `actionlint`, and `scripts/install.sh` passes `shellcheck`.
 
@@ -66,3 +66,4 @@ Make `fleetringd` installable without a Rust toolchain: prebuilt binaries for th
     - The install script, run under `sh` and `dash` against a local mirror, installs a good archive and refuses one whose checksum doesn't match.
     - The archive README's walkthrough (`status`, `db create`, `db exec`, `db query`, `db locate`) runs against a local daemon, and the daemon starts from `deploy/fleetringd.toml` and stops cleanly on SIGTERM.
   - Not yet checked: the Docker daemon wasn't available, so the image hasn't been built. The workflows themselves run only on GitHub.
+- 2026-10-29: Done. `fleetringd-v0.1.0` released from tag: both workflows passed on their first real run, all five archives plus `SHA256SUMS` and `install.sh` are attached, and `install.sh --version 0.1.0` installs a binary that prints `fleetringd 0.1.0`. The container workflow pushed `ghcr.io/fleetring/fleetringd:0.1.0` for amd64 and arm64. Left for the maintainer: make the package public in the organization's package settings (first time only). Checked 3 remaining boxes.
