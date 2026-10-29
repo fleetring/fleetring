@@ -11,7 +11,7 @@ use fleetring::ReplicationFactor;
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetringd::sim::check::{Invariant, ReplicaRows, Violation};
 use fleetringd::sim::history::{self, Guarantee, Replicated};
-use fleetringd::sim::{Ack, History, Operation, OperationId, Outcome};
+use fleetringd::sim::{Ack, DurabilityMode, History, Operation, OperationId, Outcome};
 use tonic::Code;
 
 use crate::TestResult;
@@ -387,5 +387,74 @@ fn an_operation_still_in_flight_counts_as_unknown() -> TestResult {
     history::check(&run.history, &databases(replicas([1]))?)?;
     history::check(&run.history, &databases(replicas([1, 2]))?)?;
     assert_eq!(run.history.pending().count(), 1);
+    Ok(())
+}
+
+/// The planted bugs, held to `mode` instead of `quorum`.
+fn databases_in(
+    rows: ReplicaRows,
+    mode: DurabilityMode,
+) -> Result<BTreeMap<DatabaseName, Replicated>, Box<dyn std::error::Error>> {
+    let three = ReplicationFactor::new(3).ok_or("three replicas")?;
+    Ok(BTreeMap::from([(
+        db()?,
+        Replicated::new(Guarantee::new(three, mode), rows),
+    )]))
+}
+
+#[test]
+fn a_local_database_is_held_only_to_single_writer_and_phantom_invariants() -> TestResult {
+    // A lost acknowledged write and a stale read: violations for `quorum` and `all`, allowed
+    // for `local`, which may lose acknowledged writes across a failover.
+    let (run, mut rows) = correct()?;
+    for host in ["node-1", "node-2"] {
+        rows.get_mut(host).ok_or(host)?.remove(&2);
+    }
+    for mode in [DurabilityMode::Quorum, DurabilityMode::All] {
+        let violation = history::check(&run.history, &databases_in(rows.clone(), mode)?)
+            .expect_err("a lost write under a mode that promises durability");
+        assert_eq!(
+            violation.invariant(),
+            Invariant::AcknowledgedWritesReplicated,
+            "{mode}: {violation}"
+        );
+    }
+    history::check(&run.history, &databases_in(rows, DurabilityMode::Local)?)?;
+    let mut run = Builder::new();
+    run.write(WRITER, 1, written_by("node-1", 1)?)?;
+    run.write(WRITER, 5, written_by("node-1", 1)?)?;
+    run.read_all(READER, read([1]))?;
+    assert!(history::check(&run.history, &databases(replicas([1, 5]))?).is_err());
+    history::check(
+        &run.history,
+        &databases_in(replicas([1, 5]), DurabilityMode::Local)?,
+    )?;
+
+    // `all` wants every replica: a write on two of three is a violation there alone.
+    let (run, mut rows) = correct()?;
+    rows.get_mut("node-3").ok_or("node-3")?.remove(&2);
+    history::check(&run.history, &databases(rows.clone())?)?;
+    let violation = history::check(&run.history, &databases_in(rows, DurabilityMode::All)?)
+        .expect_err("a write on two replicas isn't on all");
+    assert_eq!(
+        violation.invariant(),
+        Invariant::AcknowledgedWritesReplicated
+    );
+    assert!(violation.detail().contains("fewer than 3"), "{violation}");
+
+    // A phantom write and two primaries in one epoch are caught whatever the mode.
+    let (run, mut rows) = correct()?;
+    rows.get_mut("node-1").ok_or("node-1")?.insert(3);
+    let violation = history::check(&run.history, &databases_in(rows, DurabilityMode::Local)?)
+        .expect_err("a refused write on a replica");
+    assert_eq!(violation.invariant(), Invariant::NoPhantomWrites);
+    let (mut run, mut rows) = correct()?;
+    run.write(WRITER, 6, written_by("node-1", 2)?)?;
+    for held in rows.values_mut() {
+        held.insert(6);
+    }
+    let violation = history::check(&run.history, &databases_in(rows, DurabilityMode::Local)?)
+        .expect_err("two primaries in one epoch");
+    assert_eq!(violation.invariant(), Invariant::OnePrimaryPerEpoch);
     Ok(())
 }

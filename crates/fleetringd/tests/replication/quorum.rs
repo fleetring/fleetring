@@ -102,7 +102,7 @@ async fn no_write_is_acknowledged_before_the_write_quorum_has_fsynced_it() -> Te
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn writes_fail_as_under_replicated_without_a_reachable_quorum() -> TestResult {
+async fn writes_are_refused_without_a_reachable_quorum() -> TestResult {
     let (cluster, b, c, _log) = proxied().await?;
     let db = name("under");
     cluster.create("a", &db, 3).await?;
@@ -119,28 +119,39 @@ async fn writes_fail_as_under_replicated_without_a_reachable_quorum() -> TestRes
     })
     .await?;
 
+    // With the floor at W, a write that arrives once the primary has seen the stream close is
+    // refused before it runs; one that slips in just before commits unacknowledged.
     b.cut.send_replace(true);
-    let error = guarded("a write failing as under-replicated", async {
+    let error = guarded("a write refused without a quorum", async {
         loop {
             match registry.execute(&db, put(2, 10)).await {
                 Err(DatabaseError::Replication(
                     error @ ReplicationError::UnderReplicated { .. },
                 )) => {
-                    return error;
+                    assert_eq!(
+                        error,
+                        ReplicationError::UnderReplicated {
+                            required: 2,
+                            reachable: 1
+                        }
+                    );
+                    assert!(error.to_string().contains("under-replicated"), "{error}");
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                Err(DatabaseError::Refused { source, .. }) => return source,
+                _ => {}
             }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await?;
     assert_eq!(
         error,
-        ReplicationError::UnderReplicated {
-            required: 2,
+        ReplicationError::BelowFloor {
+            min_replicas: 2,
             reachable: 1
         }
     );
-    assert!(error.to_string().contains("under-replicated"), "{error}");
+    assert!(error.to_string().contains("nothing committed"), "{error}");
 
     // Once the followers are back, the unacknowledged write replicates too.
     b.cut.send_replace(false);

@@ -6,18 +6,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, Engine, LeaseEpoch, Liveness, Role};
+use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Role};
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::{
-    self as proto, CreateDatabaseRequest, CreateRequest, DropDatabaseRequest, ExecuteRequest,
-    ListDatabasesRequest, LocateRequest, NodeStatusRequest, QueryRequest, WatchMembershipRequest,
+    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest,
+    DropDatabaseRequest, ExecuteRequest, ListDatabasesRequest, LocateRequest, NodeStatusRequest,
+    QueryRequest, WatchMembershipRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status};
 
 use crate::MembershipView;
 use crate::control::ControlClient;
-use crate::data::convert::{location, node_status, params_to_proto, rows_from_proto};
+use crate::data::convert::{
+    acks_from_proto, acks_to_proto, location, node_status, params_to_proto, rows_from_proto,
+};
 use crate::data::redirect::primary_hint;
 use crate::engine::{Position, Rows, Statement};
 use crate::environment::Network;
@@ -44,6 +47,66 @@ pub struct Location {
     pub primary: Option<NodeId>,
     /// Its replica set in the ring's preference order, the primary included.
     pub replicas: Vec<ReplicaInfo>,
+    /// How many replicas it should have, R.
+    pub replication_factor: ReplicationFactor,
+    /// The durability settings in effect: its acknowledgement mode and its floor on reachable
+    /// replicas (ADR-0023).
+    pub durability: Durability,
+}
+
+/// What to create a database with: its replication factor and, optionally, its durability
+/// settings. Settings left unset take the cluster's defaults (`[replication] acks` and
+/// `min_replicas` on the control node).
+///
+/// # Examples
+///
+/// ```
+/// use fleetring::ReplicationFactor;
+/// use fleetring_control::Acks;
+/// use fleetringd::data::DatabaseSpec;
+///
+/// let spec = DatabaseSpec::new(ReplicationFactor::new(3).ok_or("zero")?)
+///     .with_acks(Acks::All)
+///     .with_min_replicas(3);
+/// assert_eq!(spec.acks, Some(Acks::All));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatabaseSpec {
+    /// How many replicas the database should have.
+    pub replication_factor: ReplicationFactor,
+    /// The acknowledgement mode, or `None` for the cluster's default.
+    pub acks: Option<Acks>,
+    /// The floor on reachable replicas, or `None` for the cluster's default: the mode's W.
+    pub min_replicas: Option<u8>,
+}
+
+impl DatabaseSpec {
+    /// A database with `replication_factor` replicas and the cluster's default durability.
+    #[must_use]
+    pub const fn new(replication_factor: ReplicationFactor) -> Self {
+        Self {
+            replication_factor,
+            acks: None,
+            min_replicas: None,
+        }
+    }
+
+    /// Acknowledges writes in `acks`.
+    #[must_use]
+    pub const fn with_acks(mut self, acks: Acks) -> Self {
+        self.acks = Some(acks);
+        self
+    }
+
+    /// Refuses writes while fewer than `min_replicas` replicas, the primary included, are
+    /// reachable.
+    #[must_use]
+    pub const fn with_min_replicas(mut self, min_replicas: u8) -> Self {
+        self.min_replicas = Some(min_replicas);
+        self
+    }
 }
 
 impl Location {
@@ -107,6 +170,20 @@ pub struct ServedDatabase {
     pub epoch: LeaseEpoch,
     /// Where its copy is, if it knows.
     pub position: Option<Position>,
+}
+
+/// A recorded durability change, as [`Client::change_durability`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DurabilityChange {
+    /// The mode that takes effect at the next lease.
+    pub acks: Acks,
+    /// The floor that takes effect at the next lease.
+    pub min_replicas: u8,
+    /// The mode in effect until then.
+    pub current_acks: Acks,
+    /// The floor in effect until then.
+    pub current_min_replicas: u8,
 }
 
 /// The result of a write.
@@ -198,8 +275,8 @@ impl Client {
             .clear();
     }
 
-    /// Creates a SQLite database with `replication_factor` replicas, and opens it on its
-    /// primary.
+    /// Creates a SQLite database with `replication_factor` replicas and the cluster's default
+    /// durability, and opens it on its primary.
     ///
     /// If the control plane already has the database but no primary, because an earlier
     /// creation stopped halfway, this finishes it.
@@ -213,10 +290,31 @@ impl Client {
         name: &DatabaseName,
         replication_factor: ReplicationFactor,
     ) -> Result<Location, Status> {
+        self.create_database_with(name, DatabaseSpec::new(replication_factor))
+            .await
+    }
+
+    /// Creates a SQLite database as `spec` says, and opens it on its primary; see
+    /// [`Client::create_database`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::create_database`], and `INVALID_ARGUMENT` if the durability settings don't
+    /// fit the replication factor.
+    pub async fn create_database_with(
+        &self,
+        name: &DatabaseName,
+        spec: DatabaseSpec,
+    ) -> Result<Location, Status> {
         let request = CreateDatabaseRequest {
             database: name.to_string(),
-            replication_factor: u32::from(replication_factor.get()),
+            replication_factor: u32::from(spec.replication_factor.get()),
             engine: proto::Engine::Sqlite.into(),
+            acks: spec
+                .acks
+                .map_or(proto::Acks::Unspecified, acks_to_proto)
+                .into(),
+            min_replicas: u32::from(spec.min_replicas.unwrap_or(0)),
         };
         let placement = match self.control.create_database(request).await {
             Ok(response) => placement_of(response.placement)?,
@@ -262,6 +360,45 @@ impl Client {
             })
             .await?;
         Ok(LeaseEpoch::new(response.epoch))
+    }
+
+    /// Records new durability settings for a database, which take effect at its next lease
+    /// (ADR-0023), and returns the settings in effect until then.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if there is no such database, `INVALID_ARGUMENT` if the settings don't fit
+    /// its replication factor, or the status of the failed control call.
+    pub async fn change_durability(
+        &self,
+        name: &DatabaseName,
+        acks: Acks,
+        min_replicas: Option<u8>,
+    ) -> Result<DurabilityChange, Status> {
+        let response = self
+            .control
+            .change_durability(ChangeDurabilityRequest {
+                database: name.to_string(),
+                acks: acks_to_proto(acks).into(),
+                min_replicas: u32::from(min_replicas.unwrap_or(0)),
+            })
+            .await?;
+        let settings = |acks: i32, min_replicas: u32| {
+            let acks = acks_from_proto(acks)
+                .ok_or_else(|| Status::internal("the reply names no acks mode"))?;
+            let min_replicas = u8::try_from(min_replicas)
+                .map_err(|_| Status::internal("the reply has an invalid min_replicas"))?;
+            Ok::<_, Status>((acks, min_replicas))
+        };
+        let (pending_acks, pending_min_replicas) = settings(response.acks, response.min_replicas)?;
+        let (current_acks, current_min_replicas) =
+            settings(response.current_acks, response.current_min_replicas)?;
+        Ok(DurabilityChange {
+            acks: pending_acks,
+            min_replicas: pending_min_replicas,
+            current_acks,
+            current_min_replicas,
+        })
     }
 
     /// Finds where a database lives. Retried.

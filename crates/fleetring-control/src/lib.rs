@@ -8,8 +8,8 @@
 //! - [`State`] holds the members with their placement attributes and liveness, the membership
 //!   epoch, and every database with its engine, epoch, lease, and any promotion in progress.
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create or drop a database,
-//!   acquire or renew a lease, start a promotion, record a fenced member, complete a promotion,
-//!   or tick.
+//!   change its durability, acquire or renew a lease, start a promotion, record a fenced member,
+//!   complete a promotion, or tick.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -21,7 +21,12 @@
 //!   timeout. Down members stay in the ring; liveness only filters lease and promotion candidates.
 //! - **Membership epoch** grows on every change to the members or their placement attributes.
 //! - **Replica sets** are the ring's replica sets over all members. With R the replica set's size,
-//!   W = ⌊R/2⌋ + 1 and Q = R − W + 1.
+//!   W and Q come from the database's [`Acks`] mode (ADR-0023): a majority by default, W = R and
+//!   Q = 1 for `all`, and W = 1 with a majority Q for `local`, which may lose acknowledged writes
+//!   on failover. A database also records `min_replicas`, the floor on reachable replicas its
+//!   primary refuses writes below.
+//! - **Durability changes** are recorded and take effect when the next lease is granted, so a
+//!   primary's guarantee never changes under it.
 //! - **Epochs** only grow. A database's first lease is granted at epoch 1; every later holder
 //!   comes from a promotion, which may start only after the current lease has expired plus the
 //!   failover margin, issues the next epoch, and completes only once Q replica-set members, the
@@ -54,6 +59,7 @@
 //!     name: db,
 //!     replication_factor: ReplicationFactor::new(3).ok_or("zero")?,
 //!     engine: Engine::Sqlite,
+//!     durability: None,
 //! }))?;
 //! let quorums = state.quorums(&"tenant:acme".parse()?)?;
 //! assert_eq!((quorums.write(), quorums.promotion()), (2, 2));
@@ -79,8 +85,8 @@ pub use apply::{Applied, JoinKind, Outcome, Rejection, apply};
 pub use command::{Action, Command, UnknownReports};
 pub use config::ControlConfig;
 pub use database::{
-    Database, DatabaseName, Engine, Lease, LeaseEpoch, ParseDatabaseNameError, Position, Promotion,
-    Quorums,
+    Acks, Database, DatabaseName, Durability, DurabilityError, Engine, Lease, LeaseEpoch,
+    ParseAcksError, ParseDatabaseNameError, Position, Promotion, Quorums,
 };
 pub use member::{HostedReplica, Liveness, Member, Report, Role};
 pub use state::{State, membership_ring};
@@ -89,12 +95,15 @@ pub use time::{Millis, Timestamp};
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
+    assert_debug_send_sync::<Acks>();
     assert_debug_send_sync::<Action>();
     assert_debug_send_sync::<Applied>();
     assert_debug_send_sync::<Command>();
     assert_debug_send_sync::<ControlConfig>();
     assert_debug_send_sync::<Database>();
     assert_debug_send_sync::<DatabaseName>();
+    assert_debug_send_sync::<Durability>();
+    assert_debug_send_sync::<DurabilityError>();
     assert_debug_send_sync::<Engine>();
     assert_debug_send_sync::<HostedReplica>();
     assert_debug_send_sync::<JoinKind>();
@@ -104,6 +113,7 @@ const _: () = {
     assert_debug_send_sync::<Member>();
     assert_debug_send_sync::<Millis>();
     assert_debug_send_sync::<Outcome>();
+    assert_debug_send_sync::<ParseAcksError>();
     assert_debug_send_sync::<ParseDatabaseNameError>();
     assert_debug_send_sync::<Position>();
     assert_debug_send_sync::<Promotion>();

@@ -444,17 +444,18 @@ pub(super) fn publish(
     maybe_checkpoint(inner, primary, &quorum);
     let reachable = primary.reachable(inner, &quorum.followers);
     let counts = Counts {
-        reachable: count(reachable + quorum.required - quorum.needed),
+        reachable: count(reachable + quorum.own),
         replicas: u32::from(primary.role().replication_factor.get()),
     };
     if quorum.needed == 0 {
+        // The primary alone is the write quorum: R = 1, or `local` acknowledgements.
         let acknowledged_by = count(1 + primary.acknowledged_by(&quorum.followers, &end));
         return Acknowledgement::new(std::future::ready(Ok(counts.acknowledged(acknowledged_by))));
     }
     if reachable < quorum.needed {
         return refused(ReplicationError::UnderReplicated {
             required: quorum.required,
-            reachable: reachable + quorum.required - quorum.needed,
+            reachable: reachable + quorum.own,
         });
     }
     Acknowledgement::new(wait_for_quorum(
@@ -503,7 +504,7 @@ async fn wait_for_quorum(
     .await;
     let holders = primary.acknowledged_by(&quorum.followers, &end);
     if waited.is_ok() && holders >= quorum.needed {
-        Ok(counts.acknowledged(count(holders + quorum.required - quorum.needed)))
+        Ok(counts.acknowledged(count(holders + quorum.own)))
     } else {
         Err(failed(format!(
             "{} of the {} followers a write needs did not acknowledge it within {limit:?}",

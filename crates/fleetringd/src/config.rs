@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::{Host, NodeId, Weight, Zone};
-use fleetring_control::{ControlConfig, Member, Millis};
+use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
+use crate::control::DurabilityDefaults;
 use crate::engine::EngineConfig;
 use crate::replication::ReplicationSettings;
 
@@ -171,12 +172,16 @@ impl Default for MembershipSettings {
     }
 }
 
-/// The `[replication]` table: how a data node paces and bounds replication.
+/// The `[replication]` table: how a data node paces and bounds replication, and the durability
+/// the control node gives databases created without explicit settings (ADR-0023).
 ///
-/// Every field is optional; the defaults are those of [`ReplicationSettings::new`].
+/// Every field is optional; the pacing defaults are those of [`ReplicationSettings::new`], and
+/// the durability defaults are `quorum` with `min_replicas` at the write quorum W.
 ///
 /// ```toml
 /// [replication]
+/// acks = "quorum"                    # or "all", or "local"; the default for new databases
+/// min_replicas = 2                   # the default floor on reachable replicas; W if unset
 /// max_in_flight = 8                  # batches in flight to one follower
 /// ack_timeout_ms = 5000              # how long a write waits for its quorum
 /// stall_timeout_ms = 2000            # how long a stream may go without an acknowledgement
@@ -189,6 +194,12 @@ impl Default for MembershipSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReplicationConfig {
+    /// The acknowledgement mode a database is created with unless its creation names one.
+    pub acks: Acks,
+    /// The floor on reachable replicas a database is created with unless its creation names
+    /// one; the mode's write quorum W if unset. A value outside W ≤ `min_replicas` ≤ R for a
+    /// database is clamped into that range.
+    pub min_replicas: Option<u8>,
     /// How many batches may be in flight to one follower.
     pub max_in_flight: NonZeroUsize,
     /// How long a write waits for its quorum before it fails unacknowledged, in milliseconds.
@@ -209,6 +220,15 @@ pub struct ReplicationConfig {
 }
 
 impl ReplicationConfig {
+    /// Returns the durability the control node gives databases created without settings.
+    #[must_use]
+    pub fn durability_defaults(&self) -> DurabilityDefaults {
+        DurabilityDefaults {
+            acks: self.acks,
+            min_replicas: self.min_replicas,
+        }
+    }
+
     /// Returns the settings replication runs with.
     #[must_use]
     pub fn settings(&self) -> ReplicationSettings {
@@ -229,6 +249,8 @@ impl From<&ReplicationSettings> for ReplicationConfig {
     fn from(settings: &ReplicationSettings) -> Self {
         let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         Self {
+            acks: Acks::Quorum,
+            min_replicas: None,
             max_in_flight: settings.max_in_flight,
             ack_timeout_ms: millis(settings.ack_timeout),
             stall_timeout_ms: millis(settings.stall_timeout),

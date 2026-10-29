@@ -7,12 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, StartPromotionRequest, WatchMembershipRequest,
+    AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate,
+    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
+    StartPromotionRequest, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
@@ -179,6 +180,22 @@ impl ControlClient {
         self.following(&|mut client: GrpcControlClient<Channel>| {
             let request = request.clone();
             async move { client.create_database(request).await }
+        })
+        .await
+    }
+
+    /// Records new durability settings for a database. Sent once per leader, not retried.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn change_durability(
+        &self,
+        request: ChangeDurabilityRequest,
+    ) -> Result<ChangeDurabilityResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<Channel>| {
+            let request = request.clone();
+            async move { client.change_durability(request).await }
         })
         .await
     }

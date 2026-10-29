@@ -31,7 +31,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Accepted |
 | [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Accepted |
 | [0022](0022-failover-protocol.md) | Failover: the candidate drives the promotion, and logs are ranked by log epoch | Accepted |
-| [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Proposed |
+| [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Accepted |
 
 ## Template
 

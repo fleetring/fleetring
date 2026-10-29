@@ -2,6 +2,7 @@
 //! catch-up, over real TCP and real SQLite.
 
 mod common;
+mod durability;
 mod heartbeat;
 mod mirror;
 mod perf;

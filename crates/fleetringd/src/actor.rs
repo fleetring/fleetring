@@ -139,6 +139,15 @@ pub enum DatabaseError {
     /// The write committed locally, but replication couldn't store it.
     #[error(transparent)]
     Replication(#[from] ReplicationError),
+    /// Replication refused the write before it ran, so nothing committed (ADR-0023). Retry it
+    /// once the reason has passed.
+    #[error("database {name} refused the write: {source}")]
+    Refused {
+        /// The database.
+        name: DatabaseName,
+        /// Why.
+        source: ReplicationError,
+    },
 }
 
 impl DatabaseError {
@@ -201,8 +210,9 @@ impl DatabaseHandle {
     ///
     /// # Errors
     ///
-    /// [`DatabaseError`] if the database is closed, a statement fails (nothing commits), or
-    /// replication fails (the write committed locally).
+    /// [`DatabaseError`] if the database is closed, replication refuses the write before it
+    /// runs or a statement fails (nothing commits), or replication fails afterwards (the write
+    /// committed locally).
     pub async fn execute(&self, transaction: Transaction) -> Result<Stored, DatabaseError> {
         let permit = self.reserve().await.ok_or_else(|| self.closed())?;
         self.execute_reserved(permit, transaction).await
@@ -585,6 +595,13 @@ impl Actor {
                 source: Arc::clone(source),
             });
         }
+        // Refused here, nothing runs: the engine never sees the transaction.
+        self.sink
+            .admit(&self.name)
+            .map_err(|source| DatabaseError::Refused {
+                name: self.name.clone(),
+                source,
+            })?;
         let last = self.last.clone();
         let outcome = self
             .executor

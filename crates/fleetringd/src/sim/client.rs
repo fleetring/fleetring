@@ -11,10 +11,11 @@ use fleetring_proto::v1::{
 };
 
 use crate::control::rejection_status;
-use crate::data::Client;
+use crate::data::{Client, DatabaseSpec};
 use crate::engine::{Statement, Value};
 use crate::environment::Network;
 use crate::sim::SimRng;
+use crate::sim::history::DurabilityMode;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
 use crate::sim::workload::{Ack, Operation, Outcome, Step, WRITES_TABLE, Workload};
@@ -131,6 +132,8 @@ async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outco
                 database: database.to_string(),
                 replication_factor: *replication_factor,
                 engine: Engine::Sqlite.into(),
+                acks: fleetring_proto::v1::Acks::Unspecified.into(),
+                min_replicas: 0,
             })
             .await
             .map(|_| Ack::Created),
@@ -162,7 +165,8 @@ async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outco
         Operation::Create {
             database,
             replication_factor,
-        } => create(data, database, *replication_factor).await,
+            durability,
+        } => create(data, database, *replication_factor, *durability).await,
         Operation::Write { database, value } => data
             .execute(
                 database,
@@ -187,17 +191,19 @@ async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outco
     )
 }
 
-/// Creates `database` if it doesn't exist yet, then its writes table.
+/// Creates `database` in `durability` if it doesn't exist yet, then its writes table.
 async fn create(
     client: &Client,
     database: &DatabaseName,
     replication_factor: u32,
+    durability: DurabilityMode,
 ) -> Result<Ack, tonic::Status> {
     let replication_factor = u8::try_from(replication_factor)
         .ok()
         .and_then(ReplicationFactor::new)
         .ok_or_else(|| tonic::Status::invalid_argument("invalid replication factor"))?;
-    let location = match client.create_database(database, replication_factor).await {
+    let spec = DatabaseSpec::new(replication_factor).with_acks(durability.acks());
+    let location = match client.create_database_with(database, spec).await {
         Ok(location) => location,
         Err(status) if status.code() == tonic::Code::AlreadyExists => {
             client.locate(database).await?
@@ -218,6 +224,7 @@ async fn create(
     Ok(Ack::Opened {
         primary,
         epoch: location.epoch,
+        durability: DurabilityMode::from(location.durability.acks()),
     })
 }
 

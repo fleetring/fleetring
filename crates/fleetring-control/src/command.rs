@@ -3,7 +3,9 @@
 use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
-use crate::{DatabaseName, Engine, HostedReplica, LeaseEpoch, Member, Position, Timestamp};
+use crate::{
+    DatabaseName, Durability, Engine, HostedReplica, LeaseEpoch, Member, Position, Timestamp,
+};
 
 /// One change to control state, stamped with the control node's time.
 ///
@@ -80,6 +82,24 @@ pub enum Action {
         replication_factor: ReplicationFactor,
         /// The engine it runs on.
         engine: Engine,
+        /// Its durability settings, or `None` for [`Acks::Quorum`](crate::Acks::Quorum) with the
+        /// floor at W. Creations logged before the field existed carry none.
+        #[serde(default)]
+        durability: Option<Durability>,
+    },
+
+    /// Records new durability settings for a database, which take effect when its next lease is
+    /// granted: at the end of the next promotion, or at its first lease if none has been
+    /// granted yet (ADR-0023).
+    ///
+    /// Until then the current primary keeps the settings it was granted the lease under, so its
+    /// guarantee never changes under it. The promotion that moves to the next epoch fences under
+    /// the current settings' Q, which keeps every write the current epoch acknowledged.
+    ChangeDurability {
+        /// The database.
+        database: DatabaseName,
+        /// The settings to take effect at the next epoch.
+        durability: Durability,
     },
 
     /// Removes a database for good: its record, its lease, any promotion in progress, and every

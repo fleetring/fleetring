@@ -25,16 +25,17 @@
 //! before and after each, and [`seeds::run`](crate::sim::seeds::run) prints the command that
 //! reruns the seed.
 //!
-//! Each database carries a [`Guarantee`]: its replication factor and its [`DurabilityMode`].
-//! Today every database is in [`DurabilityMode::Quorum`] (ADR-0018). ADR-0023 adds `all` and
-//! `local` per database; `local` gives up durability across failover, and the checker will then
-//! hold such a database only to the invariants that still apply.
+//! Each database carries a [`Guarantee`]: its replication factor and its [`DurabilityMode`],
+//! which the run learns from the placement its creation reported (ADR-0023). `quorum` and `all`
+//! promise that acknowledged writes survive; `local` gives that up across failover, and the
+//! checker holds such a database only to the invariants that still apply: one primary per
+//! epoch, and no phantom writes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use fleetring::ReplicationFactor;
-use fleetring_control::{DatabaseName, Quorums};
+use fleetring_control::{Acks, DatabaseName, Quorums};
 
 use crate::sim::check::{self, Invariant, ReplicaRows, Violation};
 use crate::sim::workload::{
@@ -44,10 +45,9 @@ use crate::sim::workload::{
 /// How many events before and after each operation involved in a violation the excerpt shows.
 pub const CONTEXT: usize = 3;
 
-/// What a database promises about acknowledged writes (ADR-0023).
+/// What a database promises about acknowledged writes: its `acks` mode (ADR-0023).
 ///
-/// Only [`DurabilityMode::Quorum`] exists today. The variants ADR-0023 proposes extend this enum,
-/// and the checker asks it, not the variant, what to hold a database to.
+/// The checker asks the mode, not the variant, what to hold a database to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[non_exhaustive]
 pub enum DurabilityMode {
@@ -55,6 +55,12 @@ pub enum DurabilityMode {
     /// acknowledged write is lost while a majority survives (ADR-0018).
     #[default]
     Quorum,
+    /// A write is acknowledged once every replica holds it: W = R.
+    All,
+    /// A write is acknowledged once the primary alone holds it: W = 1. A failover may lose
+    /// acknowledged writes, so the checker holds the database only to single-writer and
+    /// no-phantom-write invariants.
+    Local,
 }
 
 impl DurabilityMode {
@@ -62,26 +68,40 @@ impl DurabilityMode {
     /// acknowledged, for a database with `replicas` replicas.
     #[must_use]
     pub fn write_quorum(self, replicas: ReplicationFactor) -> usize {
-        match self {
-            Self::Quorum => usize::from(Quorums::new(replicas).write()),
-        }
+        usize::from(Quorums::with_acks(replicas, self.acks()).write())
     }
 
     /// Returns whether an acknowledged write must survive every fault the harness injects: on
     /// a write quorum, in every later read, and for every later read by a client that saw it.
     #[must_use]
     pub fn acknowledged_writes_survive(self) -> bool {
+        self.acks().acknowledged_writes_survive()
+    }
+
+    /// Returns the control plane's [`Acks`] for this mode.
+    #[must_use]
+    pub fn acks(self) -> Acks {
         match self {
-            Self::Quorum => true,
+            Self::Quorum => Acks::Quorum,
+            Self::All => Acks::All,
+            Self::Local => Acks::Local,
+        }
+    }
+}
+
+impl From<Acks> for DurabilityMode {
+    fn from(acks: Acks) -> Self {
+        match acks {
+            Acks::All => Self::All,
+            Acks::Local => Self::Local,
+            _ => Self::Quorum,
         }
     }
 }
 
 impl fmt::Display for DurabilityMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Quorum => "quorum",
-        })
+        f.write_str(self.acks().as_str())
     }
 }
 
@@ -99,8 +119,7 @@ impl Guarantee {
         Self { replicas, mode }
     }
 
-    /// A database with `replicas` replicas in [`DurabilityMode::Quorum`], as every database is
-    /// created today.
+    /// A database with `replicas` replicas in [`DurabilityMode::Quorum`], the default.
     #[must_use]
     pub fn quorum(replicas: ReplicationFactor) -> Self {
         Self::new(replicas, DurabilityMode::Quorum)
@@ -504,6 +523,14 @@ mod tests {
                 written(),
             );
         }
+        assert_eq!(
+            DurabilityMode::Local.write_quorum(ReplicationFactor::ONE),
+            1
+        );
+        assert_eq!(
+            DurabilityMode::from(Acks::All).write_quorum(ReplicationFactor::new(3).expect("3")),
+            3
+        );
         let lost = history
             .records()
             .iter()

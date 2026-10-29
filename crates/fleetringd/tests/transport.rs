@@ -9,12 +9,13 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::replicate_message::Message;
 use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, Batch, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
-    FenceRequest, FenceResponse, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
-    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest,
-    PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
+    AcquireLeaseRequest, Batch, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    CreateDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, FenceRequest, FenceResponse,
+    FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest, PromoteResponse,
+    PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
     RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen, SnapshotChunk,
     SnapshotRequest, StartPromotionRequest, WatchMembershipRequest,
 };
@@ -75,6 +76,13 @@ impl Control for StubControl {
         &self,
         _request: Request<DropDatabaseRequest>,
     ) -> Result<Response<DropDatabaseResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn change_durability(
+        &self,
+        _request: Request<ChangeDurabilityRequest>,
+    ) -> Result<Response<ChangeDurabilityResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 

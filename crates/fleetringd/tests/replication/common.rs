@@ -51,10 +51,10 @@ pub(crate) fn id(text: &str) -> NodeId {
 }
 
 pub(crate) fn role(replicas: u8) -> PrimaryRole {
-    PrimaryRole {
-        replication_factor: ReplicationFactor::new(replicas).expect("nonzero"),
-        epoch: LeaseEpoch::new(1),
-    }
+    PrimaryRole::new(
+        ReplicationFactor::new(replicas).expect("nonzero"),
+        LeaseEpoch::new(1),
+    )
 }
 
 /// Settings that reopen a broken stream quickly. The tests break links only with errors, which end
@@ -268,10 +268,20 @@ impl Cluster {
         database: &DatabaseName,
         replicas: u8,
     ) -> TestResult {
+        self.create_as(primary, database, role(replicas)).await
+    }
+
+    /// Creates `database` on `primary` with a table, serves it there as `role`, and waits until
+    /// every follower holds the table.
+    pub(crate) async fn create_as(
+        &self,
+        primary: &str,
+        database: &DatabaseName,
+        role: PrimaryRole,
+    ) -> TestResult {
         let node = self.node(primary);
         guarded("creating the database", node.registry().create(database)).await??;
-        node.replication
-            .serve_primary(database.clone(), role(replicas))?;
+        node.replication.serve_primary(database.clone(), role)?;
         let created = Transaction::from(Statement::new(
             "CREATE TABLE kv (k INTEGER PRIMARY KEY, v BLOB)",
         ));

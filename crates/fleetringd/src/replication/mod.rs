@@ -30,15 +30,21 @@
 //! published while the pipeline is full joins the next batch: the stream reads every commit
 //! since its last batch with one `committed_since` call (ADR-0016, point 11).
 //!
-//! # Write quorum
+//! # Write quorum and the replica floor
 //!
-//! A write's [`Acknowledgement`] completes once W − 1 followers have
-//! acknowledged a position at or past the write's batch, where W comes from
-//! [`Quorums`] over the replica set's size R. If fewer followers
-//! than that are connected and live when the batch is published, the acknowledgement fails at
-//! once with [`ReplicationError::UnderReplicated`]. One that doesn't complete within
-//! [`ReplicationSettings::ack_timeout`] fails too. Either way, the write has committed on the
-//! primary and may still replicate later; it just isn't acknowledged.
+//! A write's [`Acknowledgement`] completes once W − 1 followers have acknowledged a position at
+//! or past the write's batch, where W comes from [`Quorums`](fleetring_control::Quorums) over
+//! the replica set's size R in the database's [`Acks`](fleetring_control::Acks) mode
+//! (ADR-0023): a majority for `quorum`, every replica for `all`, and the primary alone for
+//! `local`.
+//!
+//! Before a write runs, the actor asks the sink ([`ReplicationSink::admit`]) whether at least
+//! the database's `min_replicas` replicas, the primary included, are connected and live. If
+//! not, the write is refused with [`ReplicationError::BelowFloor`] and nothing commits. A write
+//! that passed the floor but finds fewer than W reachable when its batch is published fails at
+//! once with [`ReplicationError::UnderReplicated`], and one whose quorum doesn't complete within
+//! [`ReplicationSettings::ack_timeout`] fails too. In those two cases the write has committed on
+//! the primary and may still replicate later; it just isn't acknowledged.
 //!
 //! # Checkpoints
 //!
@@ -86,7 +92,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, LeaseEpoch, Quorums};
+use fleetring_control::{DatabaseName, Durability, LeaseEpoch};
 use fleetring_proto::v1::replication_server::ReplicationServer;
 use fleetring_proto::v1::{DatabaseStatus, Role};
 use tokio::sync::watch;
@@ -226,6 +232,30 @@ pub struct PrimaryRole {
     pub replication_factor: ReplicationFactor,
     /// The epoch every batch carries (ADR-0018).
     pub epoch: LeaseEpoch,
+    /// The durability settings the lease was granted under: the
+    /// [`Acks`](fleetring_control::Acks) mode that fixes W, and
+    /// the floor on reachable replicas below which writes are refused (ADR-0023).
+    pub durability: Durability,
+}
+
+impl PrimaryRole {
+    /// The role for a database with `replication_factor` replicas at `epoch`, in
+    /// [`Acks::Quorum`](fleetring_control::Acks::Quorum) with the floor at W.
+    #[must_use]
+    pub const fn new(replication_factor: ReplicationFactor, epoch: LeaseEpoch) -> Self {
+        Self {
+            replication_factor,
+            epoch,
+            durability: Durability::quorum(replication_factor),
+        }
+    }
+
+    /// The same role under `durability`.
+    #[must_use]
+    pub const fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
+    }
 }
 
 /// The error returned when [`Replication::seed`] can't seed a copy.
@@ -517,23 +547,24 @@ impl Replication {
     }
 
     /// Waits until `database`'s primary has enough followers connected, live, and reporting for
-    /// a write to reach its quorum, or until `limit` passes. Returns whether it has.
+    /// a write to be admitted and reach its quorum, or until `limit` passes. Returns whether it
+    /// has.
     ///
     /// A primary that has just started serving has no streams open yet, so its first writes
-    /// would fail as under-replicated; waiting here first spares them that.
+    /// would be refused; waiting here first spares them that.
     pub async fn await_writable(&self, database: &DatabaseName, limit: Duration) -> bool {
         self.await_followers(database, limit, |inner, primary, quorum| {
-            primary.reachable(inner, &quorum.followers) >= quorum.needed
+            quorum.admits(primary.reachable(inner, &quorum.followers))
         })
         .await
     }
 
     /// Waits until every follower of `database` that the membership view counts as live, and at
-    /// least enough for a write to reach its quorum, has its stream connected and reporting, or
-    /// until `limit` passes. Returns whether they have.
+    /// least enough for a write to be admitted and reach its quorum, has its stream connected
+    /// and reporting, or until `limit` passes. Returns whether they have.
     ///
     /// Once they have, a write isn't under-replicated unless a follower goes down or its stream
-    /// drops. A follower that is down isn't waited for, unless the quorum needs it.
+    /// drops. A follower that is down isn't waited for, unless the quorum or the floor needs it.
     pub async fn await_replicas(&self, database: &DatabaseName, limit: Duration) -> bool {
         self.await_followers(database, limit, |inner, primary, quorum| {
             let live = quorum
@@ -541,17 +572,18 @@ impl Replication {
                 .iter()
                 .filter(|node| inner.is_live(node))
                 .count();
-            primary.reachable(inner, &quorum.followers) >= live.max(quorum.needed)
+            let reachable = primary.reachable(inner, &quorum.followers);
+            quorum.admits(reachable) && reachable >= live
         })
         .await
     }
 
     /// Whether `database`'s primary has enough followers connected, live, and reporting for a
-    /// write to reach its quorum now.
+    /// write to be admitted and reach its quorum now.
     pub(crate) fn is_writable(&self, database: &DatabaseName) -> bool {
         self.inner.primary(database).is_some_and(|primary| {
             let quorum = self.inner.followers_of(&primary);
-            primary.reachable(&self.inner, &quorum.followers) >= quorum.needed
+            quorum.admits(primary.reachable(&self.inner, &quorum.followers))
         })
     }
 
@@ -584,7 +616,7 @@ impl Replication {
         let primary = self.inner.primary(database)?;
         let quorum = self.inner.followers_of(&primary);
         let status = primary.status(&quorum);
-        let own = quorum.required - quorum.needed;
+        let own = quorum.own;
         let caught_up = status
             .followers
             .iter()
@@ -703,15 +735,37 @@ impl DatabaseStatuses for Replication {
     }
 }
 
-/// The [`ReplicationSink`] that [`Replication::start`] hands the registry: it gives each
-/// committed batch to the database's primary streams and acknowledges it once the write quorum
-/// holds it.
+/// The [`ReplicationSink`] that [`Replication::start`] hands the registry: it refuses a write
+/// while fewer than the database's `min_replicas` are reachable, gives each committed batch to
+/// the database's primary streams, and acknowledges it once the write quorum holds it.
 #[derive(Debug, Clone)]
 pub struct ReplicatedSink {
     inner: Weak<Inner>,
 }
 
 impl ReplicationSink for ReplicatedSink {
+    /// Refuses the write if this node is the database's primary and fewer than its
+    /// `min_replicas` replicas, this node included, are connected and live. A database this node
+    /// doesn't serve is admitted here and refused when its batch is published, as before.
+    fn admit(&self, database: &DatabaseName) -> Result<(), ReplicationError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(failed("replication has stopped".to_owned()));
+        };
+        let Some(primary) = inner.primary(database) else {
+            return Ok(());
+        };
+        let quorum = inner.followers_of(&primary);
+        let reachable = primary.reachable(&inner, &quorum.followers);
+        if quorum.admits(reachable) {
+            Ok(())
+        } else {
+            Err(ReplicationError::BelowFloor {
+                min_replicas: quorum.floor,
+                reachable: reachable + quorum.own,
+            })
+        }
+    }
+
     fn publish(&self, batch: CommittedBatch) -> Acknowledgement {
         let Some(inner) = self.inner.upgrade() else {
             return refused(failed("replication has stopped".to_owned()));
@@ -726,7 +780,8 @@ impl ReplicationSink for ReplicatedSink {
     }
 }
 
-/// The replica set's followers as this node sees them, and how many must acknowledge a write.
+/// The replica set's followers as this node sees them, how many must acknowledge a write, and
+/// how many must be reachable for one to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Quorum {
     /// Every member of the replica set but this node.
@@ -735,6 +790,18 @@ struct Quorum {
     required: usize,
     /// How many of `followers` must acknowledge a write.
     needed: usize,
+    /// How many replicas this node counts for: 1 when it is in the replica set, else 0.
+    own: usize,
+    /// The database's `min_replicas`: how many replicas, this node included, must be reachable
+    /// for a write to be admitted (ADR-0023).
+    floor: usize,
+}
+
+impl Quorum {
+    /// Whether a write may run with `reachable` followers connected and live.
+    fn admits(&self, reachable: usize) -> bool {
+        reachable + self.own >= self.floor
+    }
 }
 
 impl Inner {
@@ -775,7 +842,8 @@ impl Inner {
 
     /// The replica set of `primary`'s database in the current membership view.
     fn followers_of(&self, primary: &Primary) -> Quorum {
-        let factor = primary.role().replication_factor;
+        let role = primary.role();
+        let factor = role.replication_factor;
         let view = self.membership.view();
         let members: Vec<NodeId> = view.ring().map_or_else(Vec::new, |ring| {
             ring.replicas_n(primary.name().as_str(), factor).to_ids()
@@ -785,18 +853,17 @@ impl Inner {
             .ok()
             .and_then(ReplicationFactor::new)
             .unwrap_or(factor);
-        let required = usize::from(Quorums::new(size).write());
+        let required = usize::from(role.durability.quorums(size).write());
         let followers: Vec<NodeId> = members.into_iter().filter(|id| *id != self.node).collect();
         // Without a ring, the node can't know its followers, so a write needs them all.
-        let needed = if includes_self {
-            required.saturating_sub(1)
-        } else {
-            required
-        };
+        let own = usize::from(includes_self);
+        let needed = required - own;
         Quorum {
             followers,
             required,
             needed,
+            own,
+            floor: usize::from(role.durability.min_replicas()),
         }
     }
 

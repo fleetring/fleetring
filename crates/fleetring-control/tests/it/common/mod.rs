@@ -3,8 +3,8 @@
 
 use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
-    Action, Command, ControlConfig, DatabaseName, Engine, HostedReplica, LeaseEpoch, Member,
-    Millis, Outcome, Position, Role, State, Timestamp, apply,
+    Acks, Action, Command, ControlConfig, DatabaseName, Durability, Engine, HostedReplica,
+    LeaseEpoch, Member, Millis, Outcome, Position, Role, State, Timestamp, apply,
 };
 use proptest::prelude::*;
 
@@ -55,6 +55,17 @@ pub(crate) fn create(name: &str, replication_factor: u8) -> Action {
         name: db(name),
         replication_factor: factor(replication_factor),
         engine: Engine::Sqlite,
+        durability: None,
+    }
+}
+
+/// Creates `name` with `replication_factor` replicas in `acks`, with the floor at W.
+pub(crate) fn create_with(name: &str, replication_factor: u8, acks: Acks) -> Action {
+    Action::CreateDatabase {
+        name: db(name),
+        replication_factor: factor(replication_factor),
+        engine: Engine::Sqlite,
+        durability: Some(Durability::new(acks, factor(replication_factor))),
     }
 }
 
@@ -137,7 +148,18 @@ fn action(state: &State, op: Op) -> Action {
         1 if b % 3 == 1 => Action::Tick,
         // Drops are rare, so that databases live long enough to reach promotions.
         8 if b.is_multiple_of(10) => Action::DropDatabase { name: database },
-        1 | 8 => create(DATABASES[a % DATABASES.len()], 1 + op.b % 3),
+        1 | 8 if b % 5 == 4 => Action::ChangeDurability {
+            database,
+            durability: Durability::new(acks_for(b), factor(1 + op.b % 3)),
+        },
+        1 | 8 => {
+            let factor = 1 + op.b % 3;
+            if b.is_multiple_of(4) {
+                create(DATABASES[a % DATABASES.len()], factor)
+            } else {
+                create_with(DATABASES[a % DATABASES.len()], factor, acks_for(b))
+            }
+        }
         2..=7 => {
             let mut replicas: Vec<HostedReplica> = DATABASES
                 .iter()
@@ -202,6 +224,15 @@ fn action(state: &State, op: Op) -> Action {
 }
 
 /// A member of the database's replica set, or any generator node if it has none.
+/// Every mode in turn, so generated logs cover each one's quorums.
+fn acks_for(b: usize) -> Acks {
+    match b % 3 {
+        0 => Acks::Quorum,
+        1 => Acks::All,
+        _ => Acks::Local,
+    }
+}
+
 fn pick_replica(state: &State, database: &DatabaseName, b: usize) -> NodeId {
     match state.replica_set(database) {
         Ok(replicas) if !replicas.is_empty() && !b.is_multiple_of(9) => {

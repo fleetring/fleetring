@@ -29,6 +29,18 @@ enum Engine {
   ENGINE_SQLITE = 1;
 }
 
+// How many replicas must store a write before it is acknowledged (ADR-0023). Unspecified means
+// the cluster's default in a request, and `quorum` from a control node that predates the field.
+enum Acks {
+  ACKS_UNSPECIFIED = 0;
+  // A majority: W = floor(R/2) + 1.
+  ACKS_QUORUM = 1;
+  // Every replica: W = R. One replica down blocks writes.
+  ACKS_ALL = 2;
+  // The primary alone: W = 1. A failover may lose acknowledged writes.
+  ACKS_LOCAL = 3;
+}
+
 // A database's role on the node that reports it.
 enum Role {
   ROLE_UNSPECIFIED = 0;
@@ -46,6 +58,9 @@ service Control {
   // Removes a database for good: its record, lease, and any promotion. Its replicas close and
   // delete their copies once they learn of it; `Locate` answers NOT_FOUND from then on.
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
+  // Records new durability settings for a database, which take effect at its next lease
+  // (ADR-0023).
+  rpc ChangeDurability(ChangeDurabilityRequest) returns (ChangeDurabilityResponse);
   rpc Locate(LocateRequest) returns (LocateResponse);
   // Every database's placement, in name order.
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
@@ -110,6 +125,27 @@ message CreateDatabaseRequest {
   string database = 1;
   uint32 replication_factor = 2;
   Engine engine = 3;
+  // The acknowledgement mode; unspecified for the cluster's default.
+  Acks acks = 4;
+  // The floor on reachable replicas, the primary included, below which writes are refused;
+  // 0 for the default, the mode's write quorum W.
+  uint32 min_replicas = 5;
+}
+
+message ChangeDurabilityRequest {
+  string database = 1;
+  Acks acks = 2;
+  // 0 for the mode's write quorum W.
+  uint32 min_replicas = 3;
+}
+
+message ChangeDurabilityResponse {
+  // The settings that take effect at the next lease.
+  Acks acks = 1;
+  uint32 min_replicas = 2;
+  // The settings in effect until then.
+  Acks current_acks = 3;
+  uint32 current_min_replicas = 4;
 }
 
 message CreateDatabaseResponse {
@@ -152,6 +188,10 @@ message Placement {
   // How many replicas the database should have. The replica set is smaller while there are
   // fewer members. 0 from a control node that predates the field.
   uint32 replication_factor = 7;
+  // The durability settings in effect (ADR-0023). Unspecified and 0 from a control node that
+  // predates the fields, which means `quorum` with the floor at W.
+  Acks acks = 8;
+  uint32 min_replicas = 9;
 }
 
 // One member of a database's replica set, as the control plane knows it.

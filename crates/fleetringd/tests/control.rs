@@ -12,12 +12,13 @@ use fleetring_control::{Action, ControlConfig, Member, Millis, State, Timestamp,
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CompletePromotionRequest, CompletePromotionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, DatabaseStatus, DropDatabaseRequest,
-    DropDatabaseResponse, Engine, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
-    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
-    LocateRequest, LocateResponse, MembershipUpdate, Node, PromotionResponse, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, Role, StartPromotionRequest, WatchMembershipRequest,
+    Acks, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
+    CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
+    CreateDatabaseResponse, DatabaseStatus, DropDatabaseRequest, DropDatabaseResponse, Engine,
+    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
+    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
+    MembershipUpdate, Node, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    RenewLeaseRequest, Role, StartPromotionRequest, WatchMembershipRequest,
 };
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
@@ -155,6 +156,8 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
             database: "tenant:acme".into(),
             replication_factor: 3,
             engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await?;
     let placement = created.placement.ok_or("no placement")?;
@@ -210,6 +213,8 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
             database: "tenant:acme".into(),
             replication_factor: 3,
             engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await
         .expect_err("duplicate database");
@@ -241,6 +246,8 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
             database: "tenant:zero".into(),
             replication_factor: 0,
             engine: Engine::Unspecified.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await
         .expect_err("zero replicas");
@@ -295,6 +302,8 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
             database: database.clone(),
             replication_factor: 3,
             engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await?;
     control
@@ -450,6 +459,13 @@ impl Control for Redirecting {
         self.redirect()
     }
 
+    async fn change_durability(
+        &self,
+        _: Request<ChangeDurabilityRequest>,
+    ) -> Result<Response<ChangeDurabilityResponse>, Status> {
+        self.redirect()
+    }
+
     async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
         self.redirect()
     }
@@ -552,6 +568,8 @@ async fn the_client_follows_leader_redirects_without_the_caller_noticing() -> Te
             database: "tenant:acme".into(),
             replication_factor: 1,
             engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await?;
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
@@ -777,6 +795,109 @@ async fn an_existing_log_keeps_its_genesis_timings() -> TestResult {
 }
 
 #[tokio::test]
+async fn durability_settings_travel_through_the_control_service() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
+         [replication]\nacks = \"local\"\n",
+        dir.path().join("data")
+    );
+    let config = Config::from_toml(&text)?;
+    assert_eq!(config.replication.acks, fleetring_control::Acks::Local);
+    assert_eq!(config.replication.min_replicas, None);
+    let daemon = Daemon::start(config).await?;
+    let control = client(daemon.control_address().ok_or("no control address")?);
+    for id in ["a", "b", "c"] {
+        control.join(join_request(id)).await?;
+    }
+    let create = |database: &str, acks: Acks, min_replicas: u32| CreateDatabaseRequest {
+        database: database.into(),
+        replication_factor: 3,
+        engine: Engine::Sqlite.into(),
+        acks: acks.into(),
+        min_replicas,
+    };
+    // Unspecified settings take the control node's defaults; explicit ones are kept.
+    let placement = control
+        .create_database(create("defaulted", Acks::Unspecified, 0))
+        .await?
+        .placement
+        .ok_or("no placement")?;
+    assert_eq!(
+        (placement.acks, placement.min_replicas),
+        (i32::from(Acks::Local), 1)
+    );
+    let placement = control
+        .create_database(create("strict", Acks::Quorum, 3))
+        .await?
+        .placement
+        .ok_or("no placement")?;
+    assert_eq!(
+        (placement.acks, placement.min_replicas),
+        (i32::from(Acks::Quorum), 3)
+    );
+    let refused = control
+        .create_database(create("bad", Acks::All, 2))
+        .await
+        .expect_err("a floor below W");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+    assert_eq!(
+        refused.message(),
+        "min_replicas 2 is below the write quorum 3"
+    );
+    let located = control
+        .locate(LocateRequest {
+            database: "strict".into(),
+        })
+        .await?
+        .placement
+        .ok_or("no placement")?;
+    assert_eq!(
+        (located.acks, located.min_replicas),
+        (i32::from(Acks::Quorum), 3)
+    );
+
+    // A change is recorded and answered with what is in effect until the next lease.
+    let changed = control
+        .change_durability(ChangeDurabilityRequest {
+            database: "strict".into(),
+            acks: Acks::All.into(),
+            min_replicas: 0,
+        })
+        .await?;
+    assert_eq!(
+        (changed.acks, changed.min_replicas),
+        (i32::from(Acks::All), 3)
+    );
+    assert_eq!(
+        (changed.current_acks, changed.current_min_replicas),
+        (i32::from(Acks::Quorum), 3)
+    );
+    let unknown = control
+        .change_durability(ChangeDurabilityRequest {
+            database: "nope".into(),
+            acks: Acks::All.into(),
+            min_replicas: 0,
+        })
+        .await
+        .expect_err("unknown database");
+    assert_eq!(unknown.code(), Code::NotFound, "{unknown}");
+    let state = daemon.control().ok_or("no control handle")?.state();
+    let strict: fleetring_control::DatabaseName = "strict".parse()?;
+    let database = state.database(&strict).ok_or("strict exists")?;
+    assert_eq!(
+        database.durability().acks(),
+        fleetring_control::Acks::Quorum
+    );
+    assert_eq!(
+        database.pending_durability().map(|d| d.acks()),
+        Some(fleetring_control::Acks::All)
+    );
+    daemon.run_until(std::future::ready(())).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
     let dir = tempfile::tempdir()?;
     let text = format!(
@@ -791,6 +912,8 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
             database: "known".into(),
             replication_factor: 1,
             engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
         })
         .await?;
     let status = |database: &str| DatabaseStatus {

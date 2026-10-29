@@ -20,11 +20,26 @@ pub struct CommittedBatch {
 
 /// Receives every batch that frame-source databases commit, in commit order per database.
 ///
-/// The actor calls [`publish`](Self::publish) right after each commit, before it starts the next
-/// write, so the call must not block. The writer that committed the batch then waits for the
-/// returned [`Acknowledgement`] before its write counts as done, while the actor moves on, so
-/// several batches can be in flight at once (ADR-0016, point 11).
+/// The actor asks [`admit`](Self::admit) before it runs each write transaction, and calls
+/// [`publish`](Self::publish) right after each commit, before it starts the next write, so
+/// neither call may block. The writer that committed the batch then waits for the returned
+/// [`Acknowledgement`] before its write counts as done, while the actor moves on, so several
+/// batches can be in flight at once (ADR-0016, point 11).
 pub trait ReplicationSink: fmt::Debug + Send + Sync + 'static {
+    /// Decides whether a write to `database` may run now, before anything commits.
+    ///
+    /// A refusal is the clean failure ADR-0023 asks for when fewer than the database's
+    /// `min_replicas` are reachable: the write is never applied, so the client can retry it
+    /// without an unknown outcome. The default admits every write.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicationError`] if the write must not run.
+    fn admit(&self, database: &DatabaseName) -> Result<(), ReplicationError> {
+        let _ = database;
+        Ok(())
+    }
+
     /// Takes one committed batch.
     fn publish(&self, batch: CommittedBatch) -> Acknowledgement;
 }
@@ -127,6 +142,17 @@ pub enum ReplicationError {
     UnderReplicated {
         /// W, the replicas a write needs, the primary included.
         required: usize,
+        /// The replicas reachable now, the primary included.
+        reachable: usize,
+    },
+    /// Fewer replicas are reachable than the database's `min_replicas` floor, so the write was
+    /// refused before it ran (ADR-0023). Nothing committed; retry once more replicas are back.
+    #[error(
+        "too few replicas are reachable: {reachable} of the {min_replicas} a write needs; nothing committed"
+    )]
+    BelowFloor {
+        /// The database's `min_replicas`, the primary included.
+        min_replicas: usize,
         /// The replicas reachable now, the primary included.
         reachable: usize,
     },
