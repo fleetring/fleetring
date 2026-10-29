@@ -28,9 +28,9 @@ Every simulation run checked against the guarantees each database promises, and 
 - Metrics (Prometheus), health and readiness endpoints, structured logs, and a tracing span per request.
 
 ### E3. Security
-- TLS between nodes with a per-cluster certificate bootstrap (`fleetring up` issues them); mutual TLS between nodes.
-- An authenticated data plane: API keys scoped to name prefixes for applications, with Authem-style delegated tokens later.
-- A threat model in `SECURITY.md` (what a compromised node, client, or network can and can't do), a dependency audit in CI (`cargo deny` advisories already run), and signed, provenance-attested release artifacts.
+- FR-046 mutual TLS between nodes and clients, with a built-in certificate authority (`fleetringd cert`), certificates reloaded without a restart (ADR-0025).
+- FR-047 principals and scopes: prefix rules with four actions and default deny, client certificates and signed expiring tokens, enforced at every RPC (ADR-0025).
+- FR-048 a threat model in `SECURITY.md`, a dependency audit that fails releases, and keyless-signed, attested release artifacts.
 - An external review of the replication and failover protocol and of the auth design.
 
 ### E4. Scale
@@ -70,4 +70,4 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 
 ## Order
 
-E1 and E2's first three tickets are in progress or next. E6's live migration and E7's router come before E3, because the router is where auth attaches. E4 and E5 can start as soon as the ADRs for node-level leases and Raft are written, in parallel with E7. E8 and E9 run alongside everything and gate the "safe" label.
+E1 and E2's first three tickets are in progress or next. E3 moved ahead of E6 and E7: nothing on the wire is authenticated, node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round. E4 and E5 can start as soon as the ADRs for node-level leases and Raft are written, in parallel with E7. E8 and E9 run alongside everything and gate the "safe" label.
