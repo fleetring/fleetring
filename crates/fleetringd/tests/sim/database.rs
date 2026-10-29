@@ -3,8 +3,10 @@
 //! One control host and three data hosts. A client creates databases with three replicas through
 //! the `Database` service and then writes to them, while the test partitions a data node from
 //! the control node, cuts the client off from a data node, and crashes and restarts a primary.
-//! Every acknowledged write must be on a write quorum of its database's replicas, which
-//! [`Cluster::finish`] checks against each host's copy on disk (FR-030).
+//! Every acknowledged write must be on a write quorum of its database's replicas and in every
+//! later read, which the history checker in [`Cluster::finish`] checks against the history and
+//! each host's copy on disk (FR-030, FR-036). The assertions here cover what the checker
+//! doesn't: what each acknowledgement claimed, and that the restarted primary served again.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -77,8 +79,12 @@ fn writes_under_faults(seed: u64) -> TestResult {
             written += 1;
         }
     }
-    assert_eq!(history.acknowledged_writes().count(), written);
     assert!(written > 0, "no write was acknowledged");
+    let reads = history
+        .acknowledged()
+        .filter(|(_, ack)| matches!(ack, Ack::Read { .. }))
+        .count();
+    assert!(reads > 0, "no read was acknowledged");
     let writes_sent = history
         .records()
         .iter()

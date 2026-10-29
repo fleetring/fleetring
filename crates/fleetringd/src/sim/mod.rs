@@ -12,9 +12,11 @@
 //!   temporary directory that survives crashes; its memory doesn't.
 //! - [`Fault`]s partition and repair links, add latency or loss, and crash, stop, or restart
 //!   hosts.
-//! - [`Workload`]s run on client hosts and record every operation and its [`Outcome`] in a
-//!   [`History`].
-//! - [`check`] holds the invariants; the cluster runs them during and after a run.
+//! - [`Workload`]s run on client hosts and record every operation, as it is sent and as its
+//!   [`Outcome`] arrives, in a [`History`].
+//! - [`check`] holds the invariants; the cluster runs them during and after a run. [`history`]
+//!   checks the whole history against what each database promises, Jepsen-style, and
+//!   [`Cluster::finish`] runs it for every scenario.
 //! - The [`Trace`] records faults, publications, and operations in order, so two runs of a seed
 //!   can be compared with [`Trace::compare`].
 //! - [`seeds`] runs a scenario over the fixed CI seeds, or the one in `FLEETRING_SIM_SEED`, and
@@ -61,6 +63,7 @@ pub mod check;
 mod client;
 mod cluster;
 mod fault;
+pub mod history;
 mod host;
 mod rng;
 pub mod seeds;
@@ -70,9 +73,10 @@ mod workload;
 pub use check::{ControlLog, Invariant, ReplicaRows, Violation};
 pub use cluster::{Cluster, ClusterBuilder, PORT, Report, SimError, TRACE_VAR, Timings};
 pub use fault::{Fault, LossRate};
+pub use history::{DurabilityMode, Guarantee, Replicated};
 pub use rng::SimRng;
 pub use trace::{DRIVER, Divergence, Event, EventKind, Replay, Trace};
 pub use workload::{
-    Ack, CreateAndAcquire, CreateAndWrite, History, Operation, Operator, Outcome, Record, Script,
-    Step, WRITES_TABLE, Workload,
+    Ack, CreateAndAcquire, CreateAndWrite, History, HistoryEvent, Operation, OperationId, Operator,
+    Outcome, OutcomeClass, Pending, Phase, Record, Script, Step, WRITES_TABLE, Workload,
 };

@@ -5,10 +5,11 @@
 //! locates the primary and is sent once. The tests crash, isolate, and flap primaries and the
 //! control node, then check what ADR-0018 promises, all in simulated time:
 //!
-//! - no acknowledged write is ever lost: every one is on a write quorum, and the replicas
-//!   converge ([`Cluster::finish`] and [`Cluster::await_replicas_converged`]);
-//! - at most one node acknowledges writes for a database in any epoch
-//!   ([`Cluster::check`], from the primary and epoch each acknowledgement names);
+//! - no acknowledged write is ever lost: every one is on a write quorum and in every later
+//!   read, and the replicas converge (the history checker in [`Cluster::finish`] and
+//!   [`Cluster::await_replicas_converged`]);
+//! - at most one node acknowledges writes for a database in any epoch (the history checker,
+//!   from the primary and epoch each acknowledgement names);
 //! - a failover moves writes within the lease duration plus the failover margin plus one second;
 //! - while the control node is down, the primary keeps acknowledging writes.
 
@@ -115,13 +116,12 @@ fn await_new_primary(
     Ok(at - since)
 }
 
-/// Heals everything, lets the writer finish, and runs the final checks: every acknowledged
-/// write is on a write quorum, the replicas converge, and one primary per epoch.
+/// Heals everything, lets the writer finish, and runs the final checks: the replicas converge,
+/// and the history checker passes over the whole run.
 fn heal_and_finish(mut cluster: Cluster) -> Result<fleetringd::sim::Report, Box<dyn Error>> {
     cluster.await_workloads(Duration::from_secs(300))?;
     cluster.await_ring(Duration::from_secs(60))?;
     cluster.await_replicas_converged(Duration::from_secs(60))?;
-    cluster.check()?;
     Ok(cluster.finish()?)
 }
 
@@ -195,7 +195,7 @@ fn no_acknowledged_write_lost(seed: u64) -> TestResult {
         cluster.repair(&isolated, other)?;
     }
     cluster.run_for(Duration::from_secs(1))?;
-    cluster.check_writes()?;
+    cluster.check_history()?;
 
     // A control node outage longer than a lease: the primary keeps serving.
     cluster.crash(CONTROL)?;
@@ -212,7 +212,7 @@ fn no_acknowledged_write_lost(seed: u64) -> TestResult {
         cluster.restart(node)?;
         let up = Duration::from_millis(300 + cluster.rng().below(400));
         cluster.run_for(up)?;
-        cluster.check_writes()?;
+        cluster.check_history()?;
     }
 
     let epochs = epoch(&cluster).ok_or("no epoch")?;
@@ -341,7 +341,6 @@ fn divergent_tail(seed: u64) -> TestResult {
             "divergent rows survived on {node}: {survivors:?}"
         );
     }
-    cluster.check()?;
     cluster.finish()?;
     Ok(())
 }

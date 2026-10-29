@@ -3,7 +3,9 @@
 //! after the primary checkpointed past it catches up through a snapshot.
 //!
 //! A client creates one database with three replicas through the data plane, then writes to it
-//! through the `Database` service, as the command line does. The daemons replicate it themselves.
+//! and reads it back through the `Database` service, as the command line does. The daemons
+//! replicate it themselves. [`Cluster::finish`] runs the history checker over the whole run; the
+//! assertions here are about what the faults did to the run, not about what survived.
 
 use std::error::Error;
 use std::time::Duration;
@@ -89,13 +91,13 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
 
     cluster.partition(&primary, first)?;
     cluster.run_for(Duration::from_millis(1_500))?;
-    cluster.check_writes()?;
+    cluster.check_history()?;
     cluster.repair(&primary, first)?;
     cluster.run_for(Duration::from_millis(500))?;
 
     cluster.crash(second)?;
     cluster.run_for(Duration::from_secs(1))?;
-    cluster.check_writes()?;
+    cluster.check_history()?;
     cluster.restart(second)?;
     cluster.run_for(Duration::from_millis(500))?;
 
@@ -104,7 +106,7 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
     cluster.partition(&primary, first)?;
     cluster.crash(second)?;
     cluster.run_for(Duration::from_secs(2))?;
-    cluster.check_writes()?;
+    cluster.check_history()?;
     cluster.repair(&primary, first)?;
     cluster.restart(second)?;
 
@@ -126,7 +128,6 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
             .iter()
             .all(|follower| !follower.needs_snapshot)
     );
-    cluster.check()?;
     Ok(cluster.finish()?)
 }
 
@@ -226,7 +227,7 @@ fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
     cluster.run_until(Duration::from_secs(30), "a second checkpoint", |cluster| {
         checkpointed(cluster) != past
     })?;
-    cluster.check_writes()?;
+    cluster.check_history()?;
     cluster.restart(lagging)?;
 
     cluster.await_workloads(Duration::from_secs(120))?;
@@ -251,7 +252,6 @@ fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
             .all(|follower| !follower.needs_snapshot),
         "{status:?}"
     );
-    cluster.check()?;
     Ok(cluster.finish()?)
 }
 
