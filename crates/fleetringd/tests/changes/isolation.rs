@@ -87,10 +87,12 @@ async fn a_stuck_sink_delays_no_acknowledgement() -> TestResult {
             fleetringd::changes::ChangeKind::Physical(_) => Vec::new(),
         })
         .filter(|row| row.table == "t")
-        .filter_map(|row| match row.values.first().map(|column| &column.value) {
-            Some(fleetringd::engine::Value::Integer(value)) => Some(*value),
-            _ => None,
-        })
+        .filter_map(
+            |row| match row.values().first().map(|column| &column.value) {
+                Some(fleetringd::engine::Value::Integer(value)) => Some(*value),
+                _ => None,
+            },
+        )
         .collect();
     assert_eq!(delivered, (1..=40).collect::<Vec<_>>());
     assert!(

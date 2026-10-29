@@ -1,11 +1,12 @@
 //! Reading committed transactions out of a WAL.
 
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::{fs, io};
 
 use crate::batch::Batch;
 use crate::checksum::Checksum;
-use crate::frame::Frames;
+use crate::frame::{FRAME_HEADER_LEN, FrameHeader, Frames};
 use crate::header::{HeaderError, WAL_HEADER_LEN, WalHeader};
 use crate::position::{Generation, Position};
 
@@ -64,8 +65,12 @@ pub fn read_committed(wal: &[u8], after: Option<Position>) -> Result<Option<Batc
 
 /// Reads the WAL file at `path` and returns every complete transaction after `after`.
 ///
-/// This is [`read_committed`] over the file's content. A missing file holds nothing yet, so it
-/// gives `Ok(None)`.
+/// This gives what [`read_committed`] gives over the file's content, but reads only the file's
+/// tail when `after` is a commit boundary of the file's current generation: the header, the
+/// previous frame's header, and the frames from `after` on. The frames before `after` were
+/// validated when they were read; the previous frame's salts and cumulative checksum link the
+/// tail to them. Any position that doesn't fit that way is settled by reading the whole file.
+/// A missing file holds nothing yet, so it gives `Ok(None)`.
 ///
 /// # Errors
 ///
@@ -75,12 +80,87 @@ pub fn read_committed_file(
     path: impl AsRef<Path>,
     after: Option<Position>,
 ) -> Result<Option<Batch>, ReadFileError> {
+    let path = path.as_ref();
+    if let Some(position) = after
+        && let Some(batch) = read_tail(path, position)?
+    {
+        return Ok(batch);
+    }
     let wal = match fs::read(path) {
         Ok(wal) => wal,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(ReadFileError::Io(err)),
     };
     Ok(read_committed(&wal, after)?)
+}
+
+/// Reads the frames after `after` alone, if `after` is frame-aligned in the file's current
+/// generation and follows a commit frame of it. `None` means the file has to be read whole to
+/// decide; `Some(None)` that there is nothing new.
+fn read_tail(path: &Path, after: Position) -> Result<Option<Option<Batch>>, ReadFileError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Some(None)),
+        Err(err) => return Err(ReadFileError::Io(err)),
+    };
+    let mut head = [0; WAL_HEADER_LEN];
+    match file.read_exact(&mut head) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(Some(None)),
+        Err(err) => return Err(ReadFileError::Io(err)),
+    }
+    let Ok(header) = WalHeader::parse(&head) else {
+        return Ok(None);
+    };
+    if after.generation() != header.generation() {
+        return Ok(None);
+    }
+    let frame_len = header.frame_len();
+    let Some(frames_before) = usize::try_from(after.offset())
+        .ok()
+        .and_then(|offset| offset.checked_sub(WAL_HEADER_LEN))
+    else {
+        return Ok(None);
+    };
+    if !frames_before.is_multiple_of(frame_len) {
+        return Ok(None);
+    }
+    let checksum = if frames_before == 0 {
+        header.checksum()
+    } else {
+        let previous = after.offset() - frame_len as u64;
+        file.seek(SeekFrom::Start(previous))
+            .map_err(ReadFileError::Io)?;
+        let mut bytes = [0; FRAME_HEADER_LEN];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(ReadFileError::Io(err)),
+        }
+        let previous = FrameHeader::from_bytes(&bytes);
+        if previous.salts() != header.salts() || !previous.is_commit() {
+            return Ok(None);
+        }
+        Checksum(previous.checksum())
+    };
+    file.seek(SeekFrom::Start(after.offset()))
+        .map_err(ReadFileError::Io)?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).map_err(ReadFileError::Io)?;
+    let end = Frames::resume(&tail, &header, checksum)
+        .filter(|frame| frame.is_commit)
+        .last()
+        .map_or(0, |frame| frame.end);
+    if end == 0 {
+        return Ok(Some(None));
+    }
+    tail.truncate(end);
+    Ok(Some(Some(Batch::from_valid_frames(
+        None,
+        after,
+        header.page_size(),
+        tail,
+    ))))
 }
 
 /// The committed span of a WAL from a commit boundary to the last commit frame.

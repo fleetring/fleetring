@@ -22,7 +22,9 @@ pub use adapter::{
     FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, OpenMode, SelfReplicating,
     Shape,
 };
-pub use changes::{Column, LogicalSupport, RowChange, RowOperation};
+pub use changes::{
+    CaptureMode, Column, LogicalSupport, ParseCaptureModeError, RowChange, RowOperation,
+};
 pub use config::{EngineConfig, Execution};
 pub use memory::MemoryEngine;
 pub use pinned::{PinnedSnapshot, SnapshotFile, SnapshotGuard};
@@ -34,6 +36,7 @@ const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     const fn assert_debug_send<T: std::fmt::Debug + Send + ?Sized>() {}
     assert_debug_send_sync::<CheckpointMarker>();
+    assert_debug_send_sync::<CaptureMode>();
     assert_debug_send_sync::<Column>();
     assert_debug_send_sync::<LogicalSupport>();
     assert_debug_send_sync::<RowChange>();
@@ -47,6 +50,7 @@ const _: () = {
     assert_debug_send_sync::<InvalidPageSizeError>();
     assert_debug_send_sync::<MemoryEngine>();
     assert_debug_send_sync::<OpenMode>();
+    assert_debug_send_sync::<ParseCaptureModeError>();
     assert_debug_send_sync::<Payload>();
     assert_debug_send_sync::<PinnedSnapshot>();
     assert_debug_send_sync::<Position>();

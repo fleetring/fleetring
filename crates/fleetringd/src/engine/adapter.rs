@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::{
-    CheckpointMarker, Executed, FrameBatch, LogicalSupport, PinnedSnapshot, Position,
+    CaptureMode, CheckpointMarker, Executed, FrameBatch, LogicalSupport, PinnedSnapshot, Position,
     ReplicaPosition, RowChange, Rows, Snapshot, Statement, Transaction,
 };
 
@@ -269,19 +269,22 @@ pub trait FrameFollower: fmt::Debug + Send {
     fn truncate_to(&mut self, position: &Position) -> Result<(), EngineError>;
 }
 
-/// Row-change recording on an open database, for logical change streams (FR-039).
+/// Row-change recording on an open database, for logical change streams (FR-039, ADR-0024).
 ///
 /// Once recording starts, the engine keeps the row changes of every later write transaction as
 /// durably as the transaction itself, keyed by the log position the transaction started from,
 /// until [`release`](Self::release) lets it forget them. A change stream then decodes the
-/// changes of any batch it reads from the log, after a restart too.
+/// changes of any batch it reads from the log, after a restart and on a promoted follower too.
+/// How much of each row is kept is the [`CaptureMode`] recording started in.
 pub trait LogicalChanges: fmt::Debug + Send {
-    /// Starts recording row changes of every later write transaction.
+    /// Starts recording row changes of every later write transaction, in `mode`.
+    ///
+    /// Recording that has already started keeps its mode.
     ///
     /// # Errors
     ///
     /// [`EngineError::Storage`] if the recorder can't be set up.
-    fn start_recording(&mut self) -> Result<(), EngineError>;
+    fn start_recording(&mut self, mode: CaptureMode) -> Result<(), EngineError>;
 
     /// The row changes of the transactions after `after` up to `until`, in commit order, and in
     /// statement order within a transaction.

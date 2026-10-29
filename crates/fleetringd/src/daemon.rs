@@ -388,7 +388,7 @@ fn start_data(
     let settings = config.replication.settings();
     let databases = data_dir.path().join(DATABASES_DIR);
     let engine_config = config.engine.clone();
-    let recorded = config.changes.recorded_databases();
+    let recorded = config.changes.capture_rules();
     let replication = Replication::start(
         ReplicationParts {
             node: config.node.id.clone(),

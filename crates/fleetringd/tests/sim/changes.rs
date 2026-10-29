@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use fleetring_control::DatabaseName;
 use fleetringd::changes::{Format, SinkConfig, SinkKind, database_file};
+use fleetringd::engine::CaptureMode;
 use fleetringd::sim::{Ack, Cluster, CreateAndWrite, Operation, Outcome, Timings, seeds};
 
 use crate::{BINARY, TestResult};
@@ -37,6 +38,7 @@ fn cluster(seed: u64, timings: Timings) -> Result<Cluster, Box<dyn Error>> {
                 name: SINK.to_owned(),
                 kind: SinkKind::File,
                 format: Format::Logical,
+                capture: CaptureMode::default(),
                 databases: vec!["*".parse().expect("a star")],
                 path: Some(config.data_dir.join(SINK)),
                 url: None,
@@ -103,7 +105,7 @@ fn delivered(cluster: &Cluster) -> Result<BTreeSet<i64>, Box<dyn Error>> {
             let record: fleetringd::changes::ChangeRecord = serde_json::from_str(line)?;
             if let fleetringd::changes::RecordContent::Logical { rows } = record.content {
                 for row in rows {
-                    if let Some(column) = row.values.iter().find(|column| column.name == "value")
+                    if let Some(column) = row.values().iter().find(|column| column.name == "value")
                         && let fleetringd::engine::Value::Integer(value) = column.value
                     {
                         values.insert(value);

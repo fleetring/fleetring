@@ -430,6 +430,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "clap",
+ "divan",
  "fleetring",
  "fleetring-control",
  "fleetring-proto",

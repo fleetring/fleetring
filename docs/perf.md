@@ -82,6 +82,23 @@ FR-030's replicated writes, from `cargo test -p fleetringd --release --test repl
 
 - **The primary's own commit dominates.** With no followers a commit already takes about 6 ms, nearly all of it SQLite's fsync. Replication adds about 3 ms: one loopback round trip plus the follower's fsync.
 - **One database doesn't scale with writers**, as ADR-0016 predicts: the actor commits one transaction at a time, each with its own fsync, so more writers mostly queue. Batching on the replication side (commits that arrive while 8 batches are in flight join one batch) lifts 64 writers to about 1.7 times one writer's throughput. Fleet throughput comes from many databases, each with its own actor.
-- **Checkpoint threshold:** at this size it barely matters. Capture rereads the whole WAL after every commit (FR-026), which a 4 MiB threshold keeps cheap from the page cache; an incremental reader in `fleetring-wal` would remove that cost for larger thresholds.
+- **Checkpoint threshold:** at this size it barely matters. When these numbers were taken, capture reread the whole WAL after every commit (FR-026), which a 4 MiB threshold kept cheap from the page cache; `fleetring-wal` now reads only the tail after the actor's position (FR-039), so the threshold no longer bears on the write path.
 - Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
 
+
+## Change capture
+
+FR-039's logical change capture (ADR-0024), from `cargo bench -p fleetringd --bench capture`, measured 2026-10-29 on an Apple M1 Max laptop (macOS, APFS, Rust 1.99.1, release profile).
+
+- **Setup:** one SQLite database opened as the daemon opens it (`synchronous = FULL`, 4 KiB pages, WAL), with the write path run directly on the engine adapter: one transaction, the read of the log's new frames the actor does after every commit, and a checkpoint whenever the WAL passes the daemon's default 4 MiB threshold. A recorded database releases each batch at once, as a caught-up sink would, so pruning the change table is part of the cost. No replication.
+- **Workload:** inserts of a 4-column row (integer key, text, real, 16-byte blob) in transactions of 1 and 100 rows, with capture off and in each mode. 40 samples of 5 iterations; medians below, with the ratio to capture off.
+
+| Transaction | Capture off | `id` | `after` | `full` |
+|---|---|---|---|---|
+| 1 row | 82 µs | 92 µs (1.13×) | 92 µs (1.12×) | 97 µs (1.19×) |
+| 100 rows | 179 µs | 294 µs (1.64×) | 435 µs (2.4×) | 424 µs (2.4×) |
+
+- **The fixed cost per transaction is one extra page.** A captured transaction dirties the change table's leaf page, which is one more 4 KiB frame in the WAL and in the fsync; the recorder's own statements (one cached `max(change_id)` read at begin and at commit, one cached insert for the commit record, a prune every 64 transactions) cost a few microseconds. A trigger that inserts one tiny row into any second table costs the same 10–30 µs on this machine, so this is the floor for capture into a table.
+- **The per-row cost is the trigger, not the JSON.** `id` adds about 1.2 µs per row, which is SQLite firing a trigger and inserting a short row; `after` and `full` add about 1.3 µs more per row for building and storing the row's JSON (about 150 bytes here, so the change table also takes more pages). Building the JSON in a Rust scalar function instead of SQL's `json_array`, `typeof`, and `hex` measured the same, so SQL builds it. Inserts record only the new row in either mode, so `full` costs what `after` does; updates in `full` write two rows and the updated-column list, so expect them closer to twice `after`.
+- **What changed from the first measurement.** The first numbers (2.2× on one row, 3.7× on 100 rows) were dominated by the actor re-reading and re-checksumming the whole WAL after every commit, which capture tripled in size; `fleetring-wal` now reads only the tail after the position it already has, which cut the capture-off write from 142 µs to 82 µs as well. The change table also lost its index: `change_id`s are contiguous and `start` never decreases along them, so range bounds are a binary search of point lookups, and a captured transaction dirties one page, not two.
+- The slowest samples (several milliseconds) are the checkpoints. Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.

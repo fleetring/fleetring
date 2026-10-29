@@ -19,9 +19,9 @@ use tokio::time;
 
 use self::executor::{Executor, OpenRequest};
 use crate::engine::{
-    CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineError, Executed,
-    Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode, PinnedSnapshot, Position,
-    ReplicaPosition, RowChange, Rows, Shape, Snapshot, Statement, Transaction,
+    CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineError,
+    Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode, PinnedSnapshot,
+    Position, ReplicaPosition, RowChange, Rows, Shape, Snapshot, Statement, Transaction,
 };
 use crate::sink::{
     Acknowledged, Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink,
@@ -434,14 +434,15 @@ pub(crate) struct ActorConfig {
     pub(crate) changes: ChangeRecording,
 }
 
-/// Whether a database records its row changes from the moment it opens (FR-039).
+/// Whether a database records its row changes from the moment it opens, and how much of each
+/// row (FR-039).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ChangeRecording {
     /// No logical change stream reads the database.
     #[default]
     Off,
-    /// A logical change stream reads it, so every write records its row changes.
-    On,
+    /// A logical change stream reads it, so every write records its row changes in this mode.
+    On(CaptureMode),
 }
 
 /// A started actor, as the registry holds it.
@@ -557,9 +558,9 @@ impl Actor {
         let position = self
             .executor
             .run(move |database| {
-                if changes == ChangeRecording::On {
+                if let ChangeRecording::On(mode) = changes {
                     match database.logical_changes() {
-                        Some(logical) => logical.start_recording()?,
+                        Some(logical) => logical.start_recording(mode)?,
                         None => tracing::warn!(
                             database = %name,
                             "a logical change stream reads this database, but its engine can't record row changes"

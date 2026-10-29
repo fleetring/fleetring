@@ -8,8 +8,11 @@
 //! that after a restart the adapter still knows which earlier-generation position the current
 //! generation continues from, and refuses every other one (FR-032).
 //!
-//! Row changes for logical change streams are recorded by the `changes` module, in a side table
-//! inside the database (FR-039).
+//! Row changes for logical change streams are recorded by the `changes` module, in a change
+//! table inside the database (FR-039, ADR-0024). Names beginning with `_fleetring_` are reserved
+//! for it: a user statement that reads, writes, calls, creates, alters, or drops anything so named is
+//! refused as a statement error, on both connections, so that neither the table nor the
+//! recorder's triggers can be read, forged, or broken from outside.
 
 mod changes;
 mod follower;
@@ -21,19 +24,21 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fleetring_wal::{Batch, ReadError, ReadFileError, read_committed_file};
 use rusqlite::config::DbConfig;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{Connection, ErrorCode, OpenFlags, ToSql};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, params};
 
 pub use follower::SqliteFollower;
 
-use self::changes::Recorder;
+use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX};
 use self::pins::Pins;
 use crate::engine::{
-    CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError,
-    EngineKind, Executed, FrameBatch, FrameFollower, FrameSource, FrameSourceEngine,
+    CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineCapability,
+    EngineError, EngineKind, Executed, FrameBatch, FrameFollower, FrameSource, FrameSourceEngine,
     LogicalChanges, LogicalSupport, OpenMode, PinnedSnapshot, Position, RowChange, Rows, Snapshot,
     SnapshotFile, Statement, Transaction, Value,
 };
@@ -162,6 +167,9 @@ struct SqliteDatabase {
     path: PathBuf,
     writer: Connection,
     reader: Connection,
+    /// The reservation of `_fleetring_` names on each connection.
+    writing: Arc<Reservation>,
+    reading: Arc<Reservation>,
     /// The engine's pinned snapshots, which hold off checkpoints.
     pins: Arc<Pins>,
     /// Where the last checkpoint ended: the only earlier-generation position the current
@@ -201,14 +209,18 @@ impl SqliteDatabase {
             ))));
         }
         // `journal_size_limit = 0` trims the WAL file to the new generation's frames on the first
-        // commit after a checkpoint, without ever deleting its header.
+        // commit after a checkpoint, without ever deleting its header. Recursive triggers make
+        // SQLite fire delete triggers for the rows an `INSERT OR REPLACE` replaces, so the change
+        // recorder sees them.
         writer
             .execute_batch(
                 "PRAGMA wal_autocheckpoint = 0;
                  PRAGMA synchronous = FULL;
-                 PRAGMA journal_size_limit = 0;",
+                 PRAGMA journal_size_limit = 0;
+                 PRAGMA recursive_triggers = ON;",
             )
             .map_err(storage)?;
+        let writing = reserve_names(&writer);
         let reader = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -218,11 +230,14 @@ impl SqliteDatabase {
         reader
             .execute_batch("PRAGMA query_only = 1; PRAGMA wal_autocheckpoint = 0;")
             .map_err(storage)?;
+        let reading = reserve_names(&reader);
         let checkpointed = read_marker(&path)?;
         Ok(Self {
             path,
             writer,
             reader,
+            writing,
+            reading,
             pins,
             checkpointed,
             end: None,
@@ -236,12 +251,18 @@ impl SqliteDatabase {
 
     fn run_statements(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
         for statement in transaction.statements() {
-            run(&self.writer, statement)?;
+            {
+                let _user = UserStatement::enter(&self.writing);
+                run(&self.writer, statement)?;
+            }
+            if self.writing.defines_program.swap(false, Ordering::Relaxed) {
+                refuse_programs_on_reserved_names(&self.writer)?;
+            }
             if self.writer.is_autocommit() {
                 return Err(EngineError::TransactionControl);
             }
             if let Some(recorder) = &mut self.recorder {
-                recorder.after_statement(&self.writer)?;
+                recorder.after_statement(&self.writer, statement.sql())?;
             }
         }
         Ok(())
@@ -335,7 +356,7 @@ impl Database for SqliteDatabase {
         }
         // The recorder's own rows aren't the transaction's.
         let recorded = match &self.recorder {
-            Some(recorder) => match recorder.recorded(&self.writer, start) {
+            Some(recorder) => match recorder.commit(&self.writer) {
                 Ok(recorded) => recorded,
                 Err(error) => {
                     self.roll_back();
@@ -358,10 +379,12 @@ impl Database for SqliteDatabase {
     }
 
     fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError> {
-        let mut prepared = self
-            .reader
-            .prepare_cached(statement.sql())
-            .map_err(classify)?;
+        let mut prepared = {
+            let _user = UserStatement::enter(&self.reading);
+            self.reader
+                .prepare_cached(statement.sql())
+                .map_err(classify)?
+        };
         let columns: Vec<String> = prepared
             .column_names()
             .into_iter()
@@ -503,13 +526,16 @@ impl FrameSource for SqliteDatabase {
 }
 
 impl LogicalChanges for SqliteDatabase {
-    fn start_recording(&mut self) -> Result<(), EngineError> {
-        if self.recorder.is_some() {
+    fn start_recording(&mut self, mode: CaptureMode) -> Result<(), EngineError> {
+        if let Some(recorder) = &self.recorder {
+            if recorder.mode() != mode {
+                tracing::debug!(path = %self.path.display(), recording = %recorder.mode(), asked = %mode, "row changes are already being recorded in another mode");
+            }
             return Ok(());
         }
         // The first recorded transaction starts where the log ends now.
         let _primed = self.read_wal(None)?;
-        self.recorder = Some(Recorder::install(&self.writer)?);
+        self.recorder = Some(Recorder::install(&self.writer, mode)?);
         Ok(())
     }
 
@@ -559,6 +585,154 @@ fn checkpoint(conn: &Connection, mode: Checkpoint) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// The reservation of `_fleetring_` names on one connection.
+#[derive(Debug, Default)]
+struct Reservation {
+    /// Whether the connection is preparing a user statement, which the reservation applies to.
+    user: AtomicBool,
+    /// Whether the user statement being prepared defines a trigger or a view, whose body SQLite
+    /// authorizes only when it runs, so the adapter checks it afterwards.
+    defines_program: AtomicBool,
+}
+
+/// Installs the reservation of `_fleetring_` names on `conn`: while a user statement is being
+/// prepared, one that names a reserved table, index, trigger, or view is refused, unless the
+/// access comes from one of the recorder's own triggers.
+///
+/// SQLite authorizes a statement when it is prepared, so the reservation applies only around
+/// preparing user statements; the adapter's own statements prepare with it clear.
+fn reserve_names(conn: &Connection) -> Arc<Reservation> {
+    let reservation = Arc::new(Reservation::default());
+    let seen = Arc::clone(&reservation);
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if !seen.user.load(Ordering::Relaxed) {
+            return Authorization::Allow;
+        }
+        if context
+            .accessor
+            .is_some_and(|accessor| accessor.starts_with(TRIGGER_PREFIX))
+        {
+            return Authorization::Allow;
+        }
+        if matches!(
+            context.action,
+            AuthAction::CreateTrigger { .. }
+                | AuthAction::CreateTempTrigger { .. }
+                | AuthAction::CreateView { .. }
+                | AuthAction::CreateTempView { .. }
+        ) {
+            seen.defines_program.store(true, Ordering::Relaxed);
+        }
+        if names_reserved(&context.action) {
+            Authorization::Deny
+        } else {
+            Authorization::Allow
+        }
+    }));
+    reservation
+}
+
+/// Fails if a trigger or view in the schema names something reserved, after a user statement
+/// defined one. SQLite authorizes a trigger's or a view's body only when it runs, which would
+/// then fail every statement that fires it; refusing the definition is clearer.
+fn refuse_programs_on_reserved_names(conn: &Connection) -> Result<(), EngineError> {
+    let pattern = format!("%{}%", RESERVED_PREFIX.replace('_', "\\_"));
+    let offending: Option<String> = conn
+        .query_row(
+            "SELECT name FROM (
+                SELECT name, sql FROM main.sqlite_master UNION ALL
+                SELECT name, sql FROM temp.sqlite_master)
+             WHERE sql LIKE ?1 ESCAPE '\\' AND name NOT LIKE ?2 ESCAPE '\\' LIMIT 1",
+            params![pattern, format!("{}%", TRIGGER_PREFIX.replace('_', "\\_"))],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    match offending {
+        Some(name) => Err(EngineError::Statement {
+            message: format!(
+                "`{name}` refers to a name beginning with `{RESERVED_PREFIX}`, which is reserved for fleetringd"
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Whether `action` names something the adapter reserves.
+fn names_reserved(action: &AuthAction<'_>) -> bool {
+    let reserved = |name: &str| name.starts_with(RESERVED_PREFIX);
+    match *action {
+        AuthAction::CreateIndex {
+            index_name,
+            table_name,
+        }
+        | AuthAction::CreateTempIndex {
+            index_name,
+            table_name,
+        }
+        | AuthAction::DropIndex {
+            index_name,
+            table_name,
+        }
+        | AuthAction::DropTempIndex {
+            index_name,
+            table_name,
+        } => reserved(index_name) || reserved(table_name),
+        AuthAction::CreateTrigger {
+            trigger_name,
+            table_name,
+        }
+        | AuthAction::CreateTempTrigger {
+            trigger_name,
+            table_name,
+        }
+        | AuthAction::DropTrigger {
+            trigger_name,
+            table_name,
+        }
+        | AuthAction::DropTempTrigger {
+            trigger_name,
+            table_name,
+        } => reserved(trigger_name) || reserved(table_name),
+        AuthAction::CreateView { view_name }
+        | AuthAction::CreateTempView { view_name }
+        | AuthAction::DropView { view_name }
+        | AuthAction::DropTempView { view_name } => reserved(view_name),
+        AuthAction::CreateTable { table_name }
+        | AuthAction::CreateTempTable { table_name }
+        | AuthAction::DropTable { table_name }
+        | AuthAction::DropTempTable { table_name }
+        | AuthAction::Delete { table_name }
+        | AuthAction::Insert { table_name }
+        | AuthAction::Read { table_name, .. }
+        | AuthAction::Update { table_name, .. }
+        | AuthAction::AlterTable { table_name, .. }
+        | AuthAction::Analyze { table_name }
+        | AuthAction::CreateVtable { table_name, .. }
+        | AuthAction::DropVtable { table_name, .. } => reserved(table_name),
+        AuthAction::Reindex { index_name } => reserved(index_name),
+        AuthAction::Function { function_name } => reserved(function_name),
+        _ => false,
+    }
+}
+
+/// Marks a connection as preparing a user statement while it lives.
+struct UserStatement<'c>(&'c Reservation);
+
+impl<'c> UserStatement<'c> {
+    fn enter(reservation: &'c Reservation) -> Self {
+        reservation.user.store(true, Ordering::Relaxed);
+        reservation.defines_program.store(false, Ordering::Relaxed);
+        Self(reservation)
+    }
+}
+
+impl Drop for UserStatement<'_> {
+    fn drop(&mut self) {
+        self.0.user.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Stops the last connection to close from checkpointing and deleting the WAL.
 fn keep_wal_on_close(conn: &Connection) -> Result<(), EngineError> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
@@ -605,6 +779,13 @@ fn value_from_sql(value: ValueRef<'_>) -> Value {
 
 /// Sorts an error from running SQL into a statement error or a storage failure.
 fn classify(error: rusqlite::Error) -> EngineError {
+    if error.sqlite_error_code() == Some(ErrorCode::AuthorizationForStatementDenied) {
+        return EngineError::Statement {
+            message: format!(
+                "names beginning with `{RESERVED_PREFIX}` are reserved for fleetringd"
+            ),
+        };
+    }
     let storage_failure = matches!(
         error.sqlite_error_code(),
         Some(

@@ -152,7 +152,7 @@ async fn the_webhook_sink_posts_logical_changes_and_retries_on_5xx() -> TestResu
                 (row.table.as_str(), row.operation),
                 ("t", RowOperation::Insert)
             );
-            values.push(row.values[0].value.clone());
+            values.push(row.values()[0].value.clone());
         }
     }
     assert_eq!(

@@ -13,10 +13,12 @@ use std::time::Duration;
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{DatabaseName, LeaseEpoch, Member};
 use fleetringd::changes::{
-    ChangeParts, ChangeSettings, ChangeStreams, ConfiguredSink, DatabaseMatchers,
+    CaptureRules, ChangeParts, ChangeSettings, ChangeStreams, ConfiguredSink, DatabaseMatchers,
 };
 use fleetringd::clock::SystemClock;
-use fleetringd::engine::{EngineConfig, Execution, SqliteEngine, Statement, Transaction};
+use fleetringd::engine::{
+    CaptureMode, EngineConfig, Execution, SqliteEngine, Statement, Transaction,
+};
 use fleetringd::replication::{PrimaryRole, Replication, ReplicationParts, ReplicationSettings};
 use fleetringd::transport::Peers;
 use fleetringd::{
@@ -88,8 +90,17 @@ impl Harness {
     }
 
     /// Starts the one data node with `sinks`, over the root directory, which it reuses if a
-    /// node ran there before.
+    /// node ran there before. Every database records row changes in the default mode.
     pub(crate) async fn node(&self, sinks: Vec<ConfiguredSink>) -> Result<Node, Box<dyn Error>> {
+        self.node_capturing(sinks, CaptureMode::default()).await
+    }
+
+    /// As [`node`](Self::node), with every database recording row changes in `mode`.
+    pub(crate) async fn node_capturing(
+        &self,
+        sinks: Vec<ConfiguredSink>,
+        mode: CaptureMode,
+    ) -> Result<Node, Box<dyn Error>> {
         let control_address = self.control.control_address().ok_or("no control address")?;
         let id: NodeId = "node".parse()?;
         let network = Network::default();
@@ -102,7 +113,7 @@ impl Harness {
             },
         );
         let root = self.root();
-        let replication = start_replication(id, &root, membership.clone());
+        let replication = start_replication(id, &root, membership.clone(), mode);
         let streams = ChangeStreams::start(ChangeParts {
             sinks,
             replication: replication.clone(),
@@ -182,7 +193,12 @@ impl Node {
     }
 }
 
-fn start_replication(node: NodeId, root: &Path, membership: Membership) -> Replication {
+fn start_replication(
+    node: NodeId,
+    root: &Path,
+    membership: Membership,
+    mode: CaptureMode,
+) -> Replication {
     let config = EngineConfig {
         execution: Execution::Threads,
         max_open: NonZeroUsize::new(64).expect("nonzero"),
@@ -209,7 +225,7 @@ fn start_replication(node: NodeId, root: &Path, membership: Membership) -> Repli
         },
         move |sink| {
             Registry::new(registry_engine, sink, databases, config)
-                .with_recorded_changes(every_database())
+                .with_recorded_changes(CaptureRules::every(every_database(), mode))
         },
     )
 }

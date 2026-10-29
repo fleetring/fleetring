@@ -72,14 +72,24 @@ id = "node-1"
 # `name`       1 to 64 lowercase letters, digits, `-`, or `_`; unique
 # `kind`       "file"     appends one JSON line per batch to `<path>/<database>.ndjson`
 #              "webhook"  POSTs each batch as JSON to `url`, retrying 5xx with backoff
-# `format`     "logical"  (the default) the rows each transaction inserted, updated, or deleted,
-#                         with their keys and values; schema changes aren't included
+# `format`     "logical"  (the default) the rows each transaction inserted, updated, or deleted;
+#                         schema changes aren't included
 #              "physical" the opaque batch, for a mirror or an archive the same engine applies
+# `capture`    for a logical sink, how much of each changed row it receives:
+#              "id"       the row's key alone
+#              "after"    (the default) the key, and the new values of an inserted or updated row
+#              "full"     also the old values of an updated or deleted row, and the names of the
+#                         columns an update changed
+#              A database named by several logical sinks records in the strongest mode asked for.
+#              Row changes are recorded in the database itself, in the reserved table
+#              `_fleetring_cdc`, which replicates with the data; statements that name anything
+#              beginning with `_fleetring_` are refused.
 # `databases`  exact names or prefixes ending in `*`; `["*"]` streams every database
 #
 # name = "archive"
 # kind = "file"
 # format = "logical"
+# capture = "after"
 # databases = ["tenant:*", "ledger"]
 # path = "/data/changes"
 #

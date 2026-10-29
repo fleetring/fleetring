@@ -37,7 +37,8 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
 | M7 Durability and operations | FR-035 – FR-038 | Configurable durability per database, and a history checker for every simulation run |
-| M8 Access and integration | FR-039 | Change streams, then the router, the client, and the MCP server |
+| M8 Access and integration | FR-039 – FR-043 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
+| M9 Durability sinks and verification | FR-044, FR-045 | A hash-chained log and Merkle anti-entropy, so replicas and archives can prove what they hold |
 
 ## Index
 
@@ -82,6 +83,12 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-037](FR-037-cli-polish.md) | CLI polish: `db list`, `db drop`, `status --node`, clear answers from data-only nodes | P1 | M | FR-033 | done |
 | [FR-038](FR-038-graceful-departure.md) | Graceful departure: drain a node's primaries before it leaves | P1 | M | FR-031 | done |
 | [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | done |
+| [FR-040](FR-040-turso-adapter.md) | Turso adapter: a self-replicating engine whose change stream reads `turso_cdc` | P2 | L | FR-039 | todo |
+| [FR-041](FR-041-replicated-sink-positions.md) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | todo |
+| [FR-042](FR-042-lease-watch.md) | `WatchLeases`: a stream of the leases this node gains and loses | P2 | M | FR-031, FR-037 | todo |
+| [FR-043](FR-043-keyed-leases.md) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029 | todo |
+| [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | todo |
+| [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032 | todo |
 
 ## Dependency graph
 
@@ -145,6 +152,16 @@ flowchart LR
   FR033 --> FR037[FR-037 CLI polish]
   FR031 --> FR038[FR-038 graceful departure]
   FR030 --> FR039[FR-039 change streams]
+  FR039 --> FR040[FR-040 Turso adapter]
+  FR039 --> FR041[FR-041 replicated sink positions]
+  FR031 --> FR042[FR-042 lease watch]
+  FR037 --> FR042
+  FR042 --> FR043[FR-043 keyed leases]
+  FR029 --> FR043
+  FR030 --> FR044[FR-044 hash-chained log]
+  FR032 --> FR044
+  FR044 --> FR045[FR-045 Merkle anti-entropy]
+  FR032 --> FR045
 ```
 
 ## Critical path and estimate
