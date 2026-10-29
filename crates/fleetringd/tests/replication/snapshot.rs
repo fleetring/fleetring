@@ -155,6 +155,25 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
     Ok(())
 }
 
+/// Runs `write` until the primary admits and acknowledges it. While a copy is re-seeded its
+/// streams reopen, and a write in that window is refused or unacknowledged; a client retries.
+async fn write_when_admitted<F, T>(write: impl Fn() -> F) -> TestResult
+where
+    F: std::future::Future<Output = Result<T, DatabaseError>>,
+{
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            if tolerate(write().await)? {
+                return Ok::<(), DatabaseError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "the write was never admitted")??;
+    Ok(())
+}
+
 /// Whether a write was acknowledged. A write that committed on the primary but wasn't
 /// acknowledged, or that was refused before it ran, as happens while streams reopen, isn't an
 /// error here.
@@ -533,7 +552,7 @@ async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> Te
     };
     primary.lead(&db, epoch, start).await?;
     assert!(primary.await_writable(&db, HANG_GUARD).await);
-    registry.execute(&db, put(4, 1_000)).await?;
+    write_when_admitted(|| registry.execute(&db, put(4, 1_000))).await?;
     cluster.await_caught_up("a", &db).await?;
     let status = follower.follower_status(&db).ok_or("follows")?;
     assert_eq!(status.snapshots, before + 1, "re-seeded once: {status:?}");
@@ -543,7 +562,7 @@ async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> Te
     // the same start, neither cut it back nor re-seed it.
     primary.serve_primary(db.clone(), epoch)?;
     assert!(primary.await_writable(&db, HANG_GUARD).await);
-    registry.execute(&db, put(5, 1_000)).await?;
+    write_when_admitted(|| registry.execute(&db, put(5, 1_000))).await?;
     cluster.await_caught_up("a", &db).await?;
     let status = follower.follower_status(&db).ok_or("follows")?;
     assert_eq!(
