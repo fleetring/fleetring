@@ -593,7 +593,7 @@ async fn watch_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
     use std::thread;
 
     use fleetring_proto::v1::{self as proto};
@@ -646,15 +646,18 @@ mod tests {
 
     #[test]
     fn readers_see_whole_views_while_updates_publish() {
+        const LAST: u64 = 40;
         let (membership, publisher) = Membership::unstarted();
-        let stop = Arc::new(AtomicBool::new(false));
+        // Readers and the publisher start together, and each reader reads until it sees the last
+        // view, so every reader overlaps the publications however the threads are scheduled.
+        let start = Arc::new(Barrier::new(3));
         let readers: Vec<_> = (0..2)
             .map(|_| {
                 let membership = membership.clone();
-                let stop = Arc::clone(&stop);
+                let start = Arc::clone(&start);
                 thread::spawn(move || {
-                    let mut reads = 0_u64;
-                    while !stop.load(Ordering::Relaxed) {
+                    start.wait();
+                    loop {
                         let view = membership.view();
                         // A view's ring always belongs to the view's epoch and members.
                         if let Some(ring) = view.ring() {
@@ -662,23 +665,24 @@ mod tests {
                             assert_eq!(ring.node_count(), view.members().len());
                             assert_eq!(Some(ring.fingerprint()), view.fingerprint());
                         }
-                        reads += 1;
+                        if view.epoch().get() == LAST {
+                            return;
+                        }
                     }
-                    reads
                 })
             })
             .collect();
         let ids = ["a", "b", "c", "d"];
-        for epoch in 1..=40_u64 {
+        start.wait();
+        for epoch in 1..=LAST {
             let count = usize::try_from(epoch % 4).expect("small") + 1;
             let members: Vec<(&str, bool)> = ids[..count].iter().map(|id| (*id, true)).collect();
             publisher.apply(update(epoch, &members));
         }
-        stop.store(true, Ordering::Relaxed);
         for reader in readers {
-            assert!(reader.join().expect("reader panicked") > 0);
+            reader.join().expect("reader panicked");
         }
-        assert_eq!(membership.epoch().get(), 40);
+        assert_eq!(membership.epoch().get(), LAST);
     }
 
     #[tokio::test]

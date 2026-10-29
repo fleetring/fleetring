@@ -22,8 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::common::{
-    Cluster, HANG_GUARD, TestResult, Wrap, eventually, guarded, id, name, put, routes, settings,
-    sqlite,
+    Cluster, HANG_GUARD, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put, routes,
+    settings, sqlite, unhurried,
 };
 
 /// The size the CI run loads before adding a follower.
@@ -52,7 +52,7 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
     let settings = ReplicationSettings {
         // Generous, so a large transfer in a slow build isn't cut short.
         open_timeout: Duration::from_secs(600),
-        ..settings()
+        ..unhurried()
     };
     let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("grown");
@@ -123,7 +123,7 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
     }
     cluster.await_caught_up(primary, &db).await?;
 
-    let marker = replication.checkpoint(&db).await?;
+    let marker = checkpoint(replication, &db).await?;
     for follower in [first.as_str(), added] {
         let follower = &cluster.node(follower).replication;
         eventually("the follower checkpointing at the marker", || {

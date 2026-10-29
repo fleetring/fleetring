@@ -120,6 +120,10 @@ fn a_locked_data_directory_refuses_a_second_daemon() -> TestResult {
 mod binary {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use fleetringd::DataDir;
 
     use super::TestResult;
 
@@ -172,5 +176,40 @@ mod binary {
             "{rest:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_dropped_lock_frees_the_directory_while_children_spawn() -> TestResult {
+        const CHILDREN: usize = 50;
+        let dir = tempfile::tempdir()?;
+        let spawned = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            // Each child shares this process's open files, the lock's included, from fork to exec.
+            let spawner = scope.spawn(|| {
+                while spawned.load(Ordering::Relaxed) < CHILDREN {
+                    Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+                        .arg("--version")
+                        .stdout(Stdio::null())
+                        .status()?;
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok::<_, std::io::Error>(())
+            });
+            let mut relocked = Ok(());
+            while relocked.is_ok() && spawned.load(Ordering::Relaxed) < CHILDREN {
+                relocked = DataDir::lock(dir.path())
+                    .and_then(|held| {
+                        drop(held);
+                        DataDir::lock(dir.path())
+                    })
+                    .map(drop);
+            }
+            // Let the spawner finish even if relocking failed early.
+            spawned.store(CHILDREN, Ordering::Relaxed);
+            let children = spawner.join().expect("spawner panicked");
+            relocked?;
+            children?;
+            Ok(())
+        })
     }
 }

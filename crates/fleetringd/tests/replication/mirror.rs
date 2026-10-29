@@ -7,7 +7,7 @@ use fleetringd::engine::{Statement, Transaction, Value};
 use fleetringd::replication::ReplicationSettings;
 use tokio::task::JoinSet;
 
-use crate::common::{Cluster, TestResult, eventually, name, put, settings, sqlite};
+use crate::common::{Cluster, TestResult, checkpoint, eventually, name, put, sqlite, unhurried};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpoint() -> TestResult
@@ -15,7 +15,7 @@ async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpo
     // A small threshold, so the workload crosses several automatic checkpoints.
     let settings = ReplicationSettings {
         checkpoint_threshold: 16 * 1024,
-        ..settings()
+        ..unhurried()
     };
     let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("mirrored");
@@ -59,7 +59,7 @@ async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpo
         "the workload crossed automatic checkpoints"
     );
 
-    let marker = primary.checkpoint(&db).await?;
+    let marker = checkpoint(primary, &db).await?;
     for follower in ["b", "c"] {
         let replication = &cluster.node(follower).replication;
         eventually("the follower checkpointing at the marker", || {
