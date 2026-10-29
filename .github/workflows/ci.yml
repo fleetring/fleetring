@@ -25,6 +25,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +36,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -46,6 +48,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +58,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: all features
+        if: runner.os == 'Linux'
         run: cargo test --workspace --all-features --no-fail-fast
+      # The simulation tests are deterministic and OS-independent, and Linux already runs them in
+      # three jobs, so macOS and Windows run every feature except `simulation` (ADR-0014).
+      - name: all features except simulation
+        if: runner.os != 'Linux'
+        run: cargo test --workspace --features fleetring/serde,fleetring/test-util --no-fail-fast
       # Feature combinations and the release profile don't depend on the OS, so only Linux runs
       # them; macOS and Windows run the suite once (ADR-0014).
       - name: default features
@@ -79,6 +88,7 @@ jobs:
   statistics:
     name: statistical suite (release)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -103,6 +113,7 @@ jobs:
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -119,6 +130,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -130,6 +142,7 @@ jobs:
   i686:
     name: test (i686, 32-bit)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -144,6 +157,7 @@ jobs:
   s390x:
     name: test (s390x, big-endian)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       PROPTEST_CASES: "32"
     steps:
@@ -163,6 +177,7 @@ jobs:
   wasm:
     name: test (wasm32-wasip1)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
       PROPTEST_CASES: "32"
@@ -183,6 +198,7 @@ jobs:
   spec-reference:
     name: spec reference (Python)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -196,6 +212,7 @@ jobs:
   semver:
     name: semver-checks
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -207,6 +224,7 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@v2

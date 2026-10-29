@@ -15,6 +15,7 @@ Feature flags and the release profile change which code is compiled, not how it 
 
 - Linux runs the full matrix: default features, `--all-features`, `--no-default-features`, and `--all-features --release`, plus every example.
 - macOS and Windows run the suite once, with `--all-features` in debug.
+- *Amended 2026-10-29:* macOS and Windows run every feature except `simulation`. The turmoil simulations are deterministic and OS-independent, Linux runs them in three jobs, and on Windows they took five minutes of a job that hit 24.
 
 ## Alternatives considered
 
