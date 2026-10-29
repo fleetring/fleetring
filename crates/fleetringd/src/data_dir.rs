@@ -13,7 +13,7 @@ const LOCK_FILE: &str = "fleetringd.lock";
 #[derive(Debug)]
 pub struct DataDir {
     path: PathBuf,
-    _lock: File,
+    lock: File,
 }
 
 /// The error returned when a data directory can't be locked.
@@ -57,7 +57,7 @@ impl DataDir {
             .open(path.join(LOCK_FILE))
             .map_err(io_error)?;
         match lock.try_lock() {
-            Ok(()) => Ok(Self { path, _lock: lock }),
+            Ok(()) => Ok(Self { path, lock }),
             Err(TryLockError::WouldBlock) => Err(DataDirError::InUse { path }),
             Err(TryLockError::Error(source)) => Err(io_error(source)),
         }
@@ -67,5 +67,16 @@ impl DataDir {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for DataDir {
+    /// Unlocks before the file closes. A child process that another thread spawns shares the open
+    /// file, and with it the lock, until the child execs; closing alone would leave the directory
+    /// locked until then, so a daemon restarted in the same process could find it in use.
+    fn drop(&mut self) {
+        if let Err(error) = self.lock.unlock() {
+            tracing::warn!(path = %self.path.display(), %error, "can't unlock the data directory");
+        }
     }
 }

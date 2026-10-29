@@ -18,12 +18,14 @@ use fleetring_control::{DatabaseName, LeaseEpoch, Liveness, Member};
 use fleetring_proto::v1::replication_server::Replication as ReplicationRpc;
 use fleetringd::clock::SystemClock;
 use fleetringd::engine::{
-    DatabaseEngine, EngineConfig, Execution, SqliteEngine, Statement, Transaction, Value,
+    CheckpointMarker, DatabaseEngine, EngineConfig, Execution, SqliteEngine, Statement,
+    Transaction, Value,
 };
 use fleetringd::replication::{PrimaryRole, Replication, ReplicationParts, ReplicationSettings};
 use fleetringd::transport::{Peers, replication_server};
 use fleetringd::{
     Config, Daemon, Membership, MembershipSettings, MembershipTasks, Network, Registry,
+    ReplicationError,
 };
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -62,6 +64,15 @@ pub(crate) fn settings() -> ReplicationSettings {
         retry_interval: Duration::from_millis(50),
         ack_timeout: Duration::from_secs(10),
         ..ReplicationSettings::new()
+    }
+}
+
+/// Settings for a test that breaks no links: no follower counts as stalled before the hang guard,
+/// however long a loaded runner takes it to apply a batch or checkpoint.
+pub(crate) fn unhurried() -> ReplicationSettings {
+    ReplicationSettings {
+        stall_timeout: HANG_GUARD,
+        ..settings()
     }
 }
 
@@ -305,6 +316,28 @@ impl Cluster {
         caught_up
             .map_err(|error| format!("{error}: {:?}", replication.primary_status(database)).into())
     }
+}
+
+/// Checkpoints `database` on its primary `replication`, once any automatic checkpoint, which the
+/// last acknowledgement may have started, has ended.
+pub(crate) async fn checkpoint(
+    replication: &Replication,
+    database: &DatabaseName,
+) -> Result<CheckpointMarker, Box<dyn Error>> {
+    let marker = guarded("the checkpoint", async {
+        loop {
+            match replication.checkpoint(database).await {
+                Err(ReplicationError::Failed { reason, .. })
+                    if reason.contains("already running") =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await??;
+    Ok(marker)
 }
 
 /// Builds one node's registry and replication.
