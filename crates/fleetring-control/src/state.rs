@@ -180,7 +180,7 @@ impl State {
     /// use fleetring::ReplicationFactor;
     /// use fleetring_control::{
     ///     apply, Action, Command, ControlConfig, Engine, HostedReplica, Member, Position, Role,
-    ///     State, Timestamp,
+    ///     State, Timestamp, UnknownReports,
     /// };
     ///
     /// let mut state = State::new(ControlConfig::new());
@@ -199,7 +199,12 @@ impl State {
     /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
     /// // "b" keeps reporting its copy; "a" goes quiet.
     /// let report = HostedReplica::new(db()?, Role::Follower, Position::new([1]));
-    /// run(&mut state, 12_000, Action::Heartbeat { id: "b".parse()?, replicas: vec![report] })?;
+    /// let heartbeat = Action::Heartbeat {
+    ///     id: "b".parse()?,
+    ///     replicas: vec![report],
+    ///     unknown_reports: UnknownReports::Skip,
+    /// };
+    /// run(&mut state, 12_000, heartbeat)?;
     /// assert!(state.promotions_due(Timestamp::from_millis(11_000)).is_empty());
     /// assert_eq!(state.promotions_due(Timestamp::from_millis(12_001)), vec![db()?]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())

@@ -64,6 +64,12 @@ pub enum Action {
         id: NodeId,
         /// Every database the member hosts, with its role and log position.
         replicas: Vec<HostedReplica>,
+        /// What to do with a report for a database the control plane doesn't know.
+        ///
+        /// Heartbeats logged before this field existed carry none and replay as
+        /// [`UnknownReports::Reject`], the rule they were applied with.
+        #[serde(default = "UnknownReports::before_the_field")]
+        unknown_reports: UnknownReports,
     },
 
     /// Records a new database.
@@ -128,4 +134,26 @@ pub enum Action {
     /// liveness and lease expiry, which are judged at the time of the last command, move on
     /// without traffic.
     Tick,
+}
+
+/// What a heartbeat does with a report for a database the control plane doesn't know.
+///
+/// A node reports every database it hosts. One the control plane doesn't know, such as a
+/// database dropped while the node was away, mustn't fail the whole heartbeat: the node would
+/// read as down, and its other reports would be lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownReports {
+    /// Reject the whole heartbeat. This was the only rule before the choice existed, and it stays
+    /// so that logs written then replay the same way. New heartbeats never use it.
+    Reject,
+    /// Record the heartbeat and the known reports, and name the unknown databases in the outcome.
+    Skip,
+}
+
+impl UnknownReports {
+    /// The rule for a logged heartbeat that predates the field.
+    fn before_the_field() -> Self {
+        Self::Reject
+    }
 }

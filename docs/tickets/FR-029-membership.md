@@ -70,3 +70,9 @@ Data nodes join the cluster and report liveness, and every node holds the same `
 ## Follow-up from FR-024
 
 - **At 100 ms network latency, about 1 seed in 200 misses the two-heartbeat-interval bound after a node restart (seed 111).** The cause: `watch_loop` gives opening the stream 200 ms, then sleeps a full interval after a timeout. The harness uses 0–20 ms latency by default. Retrying the stream open sooner would make the bound hold at higher latency.
+
+## Heartbeats with unknown databases (2026-10-29)
+
+- **The bug.** The control plane rejected a whole heartbeat when it named a database it didn't know, so the node got no liveness credit and its other reports were lost. The node worked around it by dropping the database and resending, but each call had only one heartbeat interval to complete. On a loaded CI runner (Windows, with fsync-heavy tests alongside) replies took longer than that, so the node never learned which name to drop and sent the same rejected heartbeat until the test's guard fired. In production, a node hosting one database the control plane had forgotten would have read as down, and its databases would have failed over.
+- **The rule now.** `Action::Heartbeat` carries `unknown_reports`. Nodes send `Skip`: the heartbeat counts, the known reports are recorded, and the unknown names come back in `HeartbeatResponse.unknown_databases` (an additive proto field), which the node logs once. Heartbeats logged before the field replay as `Reject`, the rule they were applied with, so old logs replay unchanged; the replay generator emits both.
+- **Joins.** A join whose reply times out is now assumed to have landed; the next heartbeat confirms it, or answers `NOT_FOUND` and the join is sent again. Joining again blindly cleared the reports of a join that had landed, which under load could go on forever.

@@ -82,6 +82,9 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   uint64 membership_epoch = 1;
+  // Reported databases the control plane doesn't know. Their reports were left out; the rest of
+  // the heartbeat counted.
+  repeated string unknown_databases = 2;
 }
 
 message WatchMembershipRequest {
