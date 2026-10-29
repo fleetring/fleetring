@@ -1,6 +1,6 @@
 # FleetRing tickets
 
-Local tickets for FleetRing: the `fleetring` placement crate (MVP step 1 in [`docs/mvp.md`](../mvp.md), released as 0.1.0) and the `fleetringd` daemon (MVP step 2). Design decisions are recorded in [`docs/adr/`](../adr/README.md), and tickets link to the ADRs they implement.
+Local tickets for FleetRing: the `fleetring` placement crate (MVP step 1 in [`docs/mvp.md`](../mvp.md), released as 0.1.0) and the `fleetringd` daemon (MVP step 2). Design decisions are recorded in [`docs/adr/`](../adr/README.md), and tickets link to the ADRs they implement. The epics that lead to a release safe to depend on are in [`docs/roadmap.md`](../roadmap.md), and [`docs/review.md`](../review.md) records the known bottlenecks and the standards the design follows or departs from.
 
 ## Conventions
 
@@ -36,7 +36,8 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
-| M7 Durability and operations | FR-035 – FR-037 | Configurable durability per database, and a history checker for every simulation run |
+| M7 Durability and operations | FR-035 – FR-038 | Configurable durability per database, and a history checker for every simulation run |
+| M8 Access and integration | FR-039 | Change streams, then the router, the client, and the MCP server |
 
 ## Index
 
@@ -79,6 +80,8 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-035](FR-035-configurable-durability.md) | Configurable durability (`acks`, `min_replicas`, per database) | P1 | L | FR-030, FR-031 | todo |
 | [FR-036](FR-036-history-checker.md) | History checker for simulation runs | P1 | M | FR-024, FR-031 | todo |
 | [FR-037](FR-037-cli-polish.md) | CLI: list databases, per-node status, and clear answers from data-only nodes | P2 | S | FR-033 | todo |
+| [FR-038](FR-038-graceful-departure.md) | Graceful departure: drain a node's primaries before it leaves | P1 | M | FR-031 | todo |
+| [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | todo |
 
 ## Dependency graph
 
@@ -140,6 +143,8 @@ flowchart LR
   FR024 --> FR036[FR-036 history checker]
   FR031 --> FR036
   FR033 --> FR037[FR-037 CLI polish]
+  FR031 --> FR038[FR-038 graceful departure]
+  FR030 --> FR039[FR-039 change streams]
 ```
 
 ## Critical path and estimate
