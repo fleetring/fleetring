@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
-use fleetring_control::{DatabaseName, Quorums, State};
+use fleetring_control::{DatabaseName, State};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -23,6 +23,7 @@ use crate::sim::SimRng;
 use crate::sim::check::{self, ControlLog, ReplicaRows, Violation};
 use crate::sim::client::{Session, run_client};
 use crate::sim::fault::{Fault, LossRate};
+use crate::sim::history::{self, Guarantee, Replicated};
 use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
@@ -785,40 +786,45 @@ impl Cluster {
         Ok(rows)
     }
 
-    /// Checks that every acknowledged write is on at least W replicas of its database, reading
-    /// each host's copy from disk. It holds at any moment.
+    /// Runs the history checker ([`history::check`]) over every operation so far and each
+    /// host's copy of every database created through the data plane, read from disk: every
+    /// acknowledged write is on a write quorum and in every later read, no refused write is
+    /// anywhere, one primary per epoch, and each client reads its writes and never loses one it
+    /// read. It holds at any moment.
+    ///
+    /// Every database is held to [`Guarantee::quorum`], as every database is created today.
     ///
     /// # Errors
     ///
-    /// A [`Violation`] of
-    /// [`Invariant::AcknowledgedWritesReplicated`](check::Invariant::AcknowledgedWritesReplicated),
-    /// or [`SimError::Simulation`] if a copy can't be read.
-    pub fn check_writes(&self) -> Result<(), SimError> {
+    /// A [`Violation`] with the history around it, or [`SimError::Simulation`] if a copy can't
+    /// be read.
+    pub fn check_history(&self) -> Result<(), SimError> {
         let history = self.history();
+        let mut databases = BTreeMap::new();
         for (database, factor) in created(&history) {
             let rows = self.replica_rows(&database)?;
-            let required = usize::from(Quorums::new(factor).write());
-            check::acknowledged_writes_replicated(&history, &database, &rows, required)?;
+            databases.insert(database, Replicated::new(Guarantee::quorum(factor), rows));
         }
+        history::check(&history, &databases)?;
         Ok(())
     }
 
     /// Steps until the followers of every database created through the data plane have
     /// acknowledged everything its primary committed, then checks that every replica holds the
-    /// same rows and that every acknowledged write survived.
+    /// same rows and runs the history checker ([`Cluster::check_history`]).
     ///
     /// # Errors
     ///
     /// [`SimError::Timeout`] if the followers don't catch up within `limit`, or a [`Violation`]
-    /// of [`Invariant::ReplicasConverged`](check::Invariant::ReplicasConverged) or
-    /// [`Invariant::AcknowledgedWritesReplicated`](check::Invariant::AcknowledgedWritesReplicated).
+    /// of [`Invariant::ReplicasConverged`](check::Invariant::ReplicasConverged) or from the
+    /// history checker.
     pub fn await_replicas_converged(&mut self, limit: Duration) -> Result<Duration, SimError> {
         let took = self.run_until(limit, "replicas catching up", Self::replicas_caught_up)?;
         for (database, _) in created(&self.history()) {
             let rows = self.replica_rows(&database)?;
             check::replicas_converged(&database, &rows)?;
         }
-        self.check_writes()?;
+        self.check_history()?;
         Ok(took)
     }
 
@@ -1018,9 +1024,10 @@ impl Cluster {
         })
     }
 
-    /// Stops every host gracefully and runs the final checks: the control log replays to the
-    /// state the control node last published, and that state holds every acknowledged control
-    /// operation, with one primary per epoch.
+    /// Stops every host gracefully and runs the final checks: the history checker
+    /// ([`Cluster::check_history`]) over the whole history and every host's copy on disk, and
+    /// the control log replays to the state the control node last published, which holds every
+    /// acknowledged control operation.
     ///
     /// # Errors
     ///
@@ -1044,7 +1051,7 @@ impl Cluster {
             });
         }
         stopped?;
-        self.check_writes()?;
+        self.check_history()?;
         let log = self.check_control_log()?;
         if let Some(control) = control
             && *control.state() != *log.state()

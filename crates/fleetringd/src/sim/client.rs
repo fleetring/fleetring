@@ -17,7 +17,7 @@ use crate::environment::Network;
 use crate::sim::SimRng;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
-use crate::sim::workload::{Ack, Operation, Outcome, Record, Step, WRITES_TABLE, Workload};
+use crate::sim::workload::{Ack, Operation, Outcome, Step, WRITES_TABLE, Workload};
 use crate::transport::Backoff;
 
 /// Retries for simulated clients: quick, because simulated calls fail fast.
@@ -59,6 +59,10 @@ pub(super) async fn run_client(
         match workload.next(&mut rng) {
             Step::Run(operation) => {
                 let invoked_at = turmoil::sim_elapsed().unwrap_or_default();
+                let id = shared
+                    .lock()
+                    .history
+                    .begin(name.as_str(), invoked_at, operation.clone());
                 let outcome = match tokio::time::timeout(
                     timeout,
                     execute(&client, &shared, &operation),
@@ -81,13 +85,7 @@ pub(super) async fn run_client(
                         outcome: outcome.clone(),
                     },
                 );
-                shared.lock().history.push(Record::new(
-                    name.as_str(),
-                    invoked_at,
-                    completed_at,
-                    operation,
-                    outcome,
-                ));
+                shared.lock().history.complete(id, completed_at, outcome);
             }
             Step::Sleep(duration) => tokio::time::sleep(duration).await,
             Step::Done => break,
@@ -181,6 +179,7 @@ async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outco
                 primary: written.primary,
                 epoch: written.epoch,
             }),
+        Operation::Read { database, value } => read(data, database, *value).await,
     };
     result.map_or_else(
         |status| Outcome::from_status(&status),
@@ -220,6 +219,33 @@ async fn create(
         primary,
         epoch: location.epoch,
     })
+}
+
+/// Reads `database`'s writes table: every value, or whether `value` is there.
+async fn read(
+    client: &Client,
+    database: &DatabaseName,
+    value: Option<i64>,
+) -> Result<Ack, tonic::Status> {
+    let statement = match value {
+        Some(value) => Statement::with_params(
+            format!("SELECT value FROM {WRITES_TABLE} WHERE value = ?"),
+            [Value::Integer(value)],
+        ),
+        None => Statement::new(format!("SELECT value FROM {WRITES_TABLE}")),
+    };
+    let rows = client.query(database, statement).await?;
+    let values = rows
+        .rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Integer(value)) => Ok(*value),
+            other => Err(tonic::Status::internal(format!(
+                "the writes table holds {other:?}, not an integer"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Ack::Read { values })
 }
 
 fn located(response: LocateResponse) -> Result<Ack, tonic::Status> {

@@ -8,11 +8,11 @@
 //! - [`control_log_replays`] and [`acknowledged_control_survives`] whenever the control host is
 //!   crashed or stopped, and at the end of a run;
 //! - [`one_primary_per_epoch`] at every check and at the end;
-//! - [`acknowledged_writes_replicated`] whenever the test asks
-//!   ([`Cluster::check_writes`](crate::sim::Cluster::check_writes)), once replicas converge, and
-//!   at the end, and [`replicas_converged`] once the network heals
+//! - the history checker ([`history::check`](crate::sim::history::check)), which includes
+//!   [`acknowledged_writes_replicated`], whenever the test asks
+//!   ([`Cluster::check_history`](crate::sim::Cluster::check_history)), once replicas converge,
+//!   and at the end, and [`replicas_converged`] once the network heals
 //!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged)).
-//!
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,7 +23,7 @@ use fleetring_control::{Command, ControlConfig, DatabaseName, LeaseEpoch, State,
 
 use crate::MembershipView;
 use crate::control::CommandLog;
-use crate::sim::workload::{Ack, History, Operation};
+use crate::sim::workload::{Ack, History, Operation, Record};
 
 /// An invariant the checker enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,6 +39,14 @@ pub enum Invariant {
     OnePrimaryPerEpoch,
     /// Every acknowledged write is on at least W of its database's replicas.
     AcknowledgedWritesReplicated,
+    /// Every acknowledged write is in every read that began after it was acknowledged.
+    AcknowledgedWritesRead,
+    /// A refused write is on no replica and in no read.
+    NoPhantomWrites,
+    /// A read sees every write its own client had acknowledged when the read began.
+    ReadYourWrites,
+    /// A client never sees an acknowledged write disappear that one of its earlier reads saw.
+    MonotonicReads,
     /// Once the network heals, every replica of a database holds the same rows.
     ReplicasConverged,
 }
@@ -51,25 +59,62 @@ impl fmt::Display for Invariant {
             Self::AcknowledgedControlSurvives => "acknowledged control operations survive",
             Self::OnePrimaryPerEpoch => "one primary per epoch",
             Self::AcknowledgedWritesReplicated => "acknowledged writes are on a write quorum",
+            Self::AcknowledgedWritesRead => "acknowledged writes are in every later read",
+            Self::NoPhantomWrites => "no phantom writes",
+            Self::ReadYourWrites => "read your writes",
+            Self::MonotonicReads => "monotonic reads",
             Self::ReplicasConverged => "replicas converged",
         })
     }
 }
 
-/// A broken invariant, and what broke it.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invariant violated ({invariant}): {detail}")]
+/// A broken invariant, what broke it, and, from the history checker, the history around it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     invariant: Invariant,
     detail: String,
+    excerpt: Vec<String>,
 }
+
+impl fmt::Display for Violation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invariant violated ({}): {}",
+            self.invariant, self.detail
+        )?;
+        if !self.excerpt.is_empty() {
+            f.write_str("\n  history around it (> marks the operations involved):")?;
+            for line in &self.excerpt {
+                write!(f, "\n  {line}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Violation {}
 
 impl Violation {
     pub(crate) fn new(invariant: Invariant, detail: impl Into<String>) -> Self {
         Self {
             invariant,
             detail: detail.into(),
+            excerpt: Vec::new(),
         }
+    }
+
+    /// Attaches the lines of history around the violation.
+    #[must_use]
+    pub(crate) fn with_excerpt(mut self, excerpt: Vec<String>) -> Self {
+        self.excerpt = excerpt;
+        self
+    }
+
+    /// Returns the history around the violation, one event per line, if the check had one.
+    #[must_use]
+    pub fn excerpt(&self) -> &[String] {
+        &self.excerpt
     }
 
     /// Returns the invariant that broke.
@@ -288,9 +333,46 @@ fn check_lease(
 ///
 /// [`Invariant::OnePrimaryPerEpoch`] naming the database, the epoch, and both holders.
 pub fn one_primary_per_epoch(history: &History) -> Result<(), Violation> {
-    let mut holders: BTreeMap<(&DatabaseName, LeaseEpoch), &NodeId> = BTreeMap::new();
-    for (operation, ack) in history.acknowledged() {
-        let (database, node, epoch) = match (operation, ack) {
+    match conflicting_primaries(history) {
+        Some(conflict) => Err(conflict.violation()),
+        None => Ok(()),
+    }
+}
+
+/// Two acknowledgements that name different nodes as a database's primary at one epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrimaryConflict<'h> {
+    pub(crate) database: &'h DatabaseName,
+    pub(crate) epoch: LeaseEpoch,
+    pub(crate) first: &'h Record,
+    pub(crate) second: &'h Record,
+    pub(crate) first_node: &'h NodeId,
+    pub(crate) second_node: &'h NodeId,
+}
+
+impl PrimaryConflict<'_> {
+    pub(crate) fn violation(&self) -> Violation {
+        Violation::new(
+            Invariant::OnePrimaryPerEpoch,
+            format!(
+                "{} has two primaries at epoch {}: {} and {}",
+                self.database,
+                self.epoch.get(),
+                self.first_node,
+                self.second_node
+            ),
+        )
+    }
+}
+
+/// Finds the first pair of acknowledgements that name different primaries at one epoch.
+pub(crate) fn conflicting_primaries(history: &History) -> Option<PrimaryConflict<'_>> {
+    let mut holders: BTreeMap<(&DatabaseName, LeaseEpoch), (&NodeId, &Record)> = BTreeMap::new();
+    for record in history.records() {
+        let Some(ack) = record.outcome().ack() else {
+            continue;
+        };
+        let (database, node, epoch) = match (record.operation(), ack) {
             (
                 Operation::Write { database, .. },
                 Ack::Written {
@@ -313,18 +395,19 @@ pub fn one_primary_per_epoch(history: &History) -> Result<(), Violation> {
             ) => (database, node, *epoch),
             _ => continue,
         };
-        let holder = *holders.entry((database, epoch)).or_insert(node);
+        let (holder, first) = *holders.entry((database, epoch)).or_insert((node, record));
         if holder != node {
-            return Err(Violation::new(
-                Invariant::OnePrimaryPerEpoch,
-                format!(
-                    "{database} has two primaries at epoch {}: {holder} and {node}",
-                    epoch.get()
-                ),
-            ));
+            return Some(PrimaryConflict {
+                database,
+                epoch,
+                first,
+                second: record,
+                first_node: holder,
+                second_node: node,
+            });
         }
     }
-    Ok(())
+    None
 }
 
 /// The rows each replica of a database holds, by host.
@@ -402,19 +485,23 @@ mod tests {
     use fleetring_control::{Action, Command, Member, Millis, Timestamp};
 
     use super::*;
-    use crate::sim::workload::{Outcome, Record};
+    use crate::sim::workload::Outcome;
 
-    fn acknowledged(operation: Operation, ack: Ack) -> Record {
-        Record::new(
-            "client",
-            Duration::ZERO,
-            Duration::ZERO,
-            operation,
-            Outcome::Acknowledged(ack),
-        )
+    fn acknowledged(operation: Operation, ack: Ack) -> (Operation, Outcome) {
+        (operation, Outcome::Acknowledged(ack))
     }
 
-    fn lease(database: &str, node: &str, epoch: u64, expires_at_ms: u64) -> Record {
+    trait Push {
+        fn push(&mut self, record: (Operation, Outcome));
+    }
+
+    impl Push for History {
+        fn push(&mut self, (operation, outcome): (Operation, Outcome)) {
+            self.record("client", Duration::ZERO, Duration::ZERO, operation, outcome);
+        }
+    }
+
+    fn lease(database: &str, node: &str, epoch: u64, expires_at_ms: u64) -> (Operation, Outcome) {
         acknowledged(
             Operation::AcquireLease {
                 database: database.parse().expect("name"),
@@ -476,7 +563,7 @@ mod tests {
         assert!(acknowledged_control_survives(&state, &history).is_err());
     }
 
-    fn written(value: i64) -> Record {
+    fn written(value: i64) -> (Operation, Outcome) {
         acknowledged(
             Operation::Write {
                 database: "db".parse().expect("name"),
@@ -492,7 +579,7 @@ mod tests {
         )
     }
 
-    fn written_by(value: i64, primary: &str, epoch: u64) -> Record {
+    fn written_by(value: i64, primary: &str, epoch: u64) -> (Operation, Outcome) {
         acknowledged(
             Operation::Write {
                 database: "db".parse().expect("name"),

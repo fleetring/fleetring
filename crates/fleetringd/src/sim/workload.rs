@@ -2,10 +2,16 @@
 //!
 //! A [`Workload`] decides what a client does next; the harness runs the operation, records it in
 //! the [`History`] and the trace, and tells the workload how it ended. Control operations go to
-//! the control plane; [`Operation::Create`] and [`Operation::Write`] go through the data plane's
-//! `Database` service, as the command line's do.
+//! the control plane; [`Operation::Create`], [`Operation::Write`], and [`Operation::Read`] go
+//! through the data plane's `Database` service, as the command line's do.
+//!
+//! The history records each operation twice, as the Jepsen-style checkers in
+//! [`history`](crate::sim::history) need it: once when the client sends it and once when the
+//! outcome arrives. An outcome is `ok` ([`Outcome::Acknowledged`]: the effect is durable),
+//! `fail` ([`Outcome::Rejected`]: definitely not applied), or `info` ([`Outcome::Indeterminate`]
+//! or never completed: unknown).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,6 +88,31 @@ pub enum Operation {
         /// The value, unique within the run.
         value: i64,
     },
+    /// Reads the database's [`WRITES_TABLE`] on its primary, through the data plane's `Query`:
+    /// every value, or whether one value is there.
+    Read {
+        /// The database.
+        database: DatabaseName,
+        /// The one value to look for, or `None` to read every value.
+        value: Option<i64>,
+    },
+}
+
+impl Operation {
+    /// Returns the database a data-plane operation acts on, or `None` for a control operation.
+    #[must_use]
+    pub fn database(&self) -> Option<&DatabaseName> {
+        match self {
+            Self::Create { database, .. }
+            | Self::Write { database, .. }
+            | Self::Read { database, .. }
+            | Self::CreateDatabase { database, .. }
+            | Self::Locate { database }
+            | Self::AcquireLease { database, .. }
+            | Self::RenewLease { database, .. } => Some(database),
+            Self::Join { .. } | Self::Heartbeat { .. } | Self::Leave { .. } => None,
+        }
+    }
 }
 
 /// The table [`Operation::Create`] makes and [`Operation::Write`] inserts into: one `value`
@@ -110,6 +141,14 @@ impl fmt::Display for Operation {
                 replication_factor,
             } => write!(f, "open {database} rf {replication_factor}"),
             Self::Write { database, value } => write!(f, "write {value} to {database}"),
+            Self::Read {
+                database,
+                value: Some(value),
+            } => write!(f, "read {value} from {database}"),
+            Self::Read {
+                database,
+                value: None,
+            } => write!(f, "read {database}"),
         }
     }
 }
@@ -144,6 +183,16 @@ impl Outcome {
         }
     }
 
+    /// Returns the outcome's class: what the checkers may assume about the operation's effect.
+    #[must_use]
+    pub fn class(&self) -> OutcomeClass {
+        match self {
+            Self::Acknowledged(_) => OutcomeClass::Ok,
+            Self::Rejected { .. } => OutcomeClass::Fail,
+            Self::Indeterminate { .. } => OutcomeClass::Info,
+        }
+    }
+
     pub(crate) fn from_status(status: &tonic::Status) -> Self {
         match status.code() {
             Code::Unavailable
@@ -171,6 +220,29 @@ impl fmt::Display for Outcome {
             Self::Indeterminate { code: Some(code) } => write!(f, "indeterminate {code:?}"),
             Self::Indeterminate { code: None } => f.write_str("indeterminate timeout"),
         }
+    }
+}
+
+/// What a checker may assume about an operation's effect, from how it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OutcomeClass {
+    /// The operation was acknowledged: its effect is durable and must never be lost.
+    Ok,
+    /// The operation was refused: it definitely had no effect.
+    Fail,
+    /// The operation got no answer, or an answer that leaves its effect unknown: it may or may
+    /// not have taken effect. An operation still in flight is `info` too.
+    Info,
+}
+
+impl fmt::Display for OutcomeClass {
+    /// Honors a width, so excerpt columns line up.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Ok => "ok",
+            Self::Fail => "fail",
+            Self::Info => "info",
+        })
     }
 }
 
@@ -224,6 +296,12 @@ pub enum Ack {
         /// The epoch it acknowledged it at, or 0 if it didn't say.
         epoch: LeaseEpoch,
     },
+    /// What a read found in the database's [`WRITES_TABLE`]: every value it holds, or, for a
+    /// read of one value, that value if it is there.
+    Read {
+        /// The values found, in order.
+        values: BTreeSet<i64>,
+    },
 }
 
 impl fmt::Display for Ack {
@@ -260,13 +338,42 @@ impl fmt::Display for Ack {
                 }
                 Ok(())
             }
+            Self::Read { values } => {
+                const SHOWN: usize = 6;
+                write!(f, "read {} values", values.len())?;
+                if values.len() <= SHOWN {
+                    write!(f, " {values:?}")
+                } else {
+                    let first: Vec<&i64> = values.iter().take(SHOWN).collect();
+                    write!(f, " {first:?}…")
+                }
+            }
         }
+    }
+}
+
+/// Identifies one operation in a [`History`]: the order its client sent it in, across clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperationId(u64);
+
+impl OperationId {
+    /// Returns the operation's number, counted from 1 in the order operations were sent.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
     }
 }
 
 /// One finished operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    id: OperationId,
     client: String,
     invoked_at: Duration,
     completed_at: Duration,
@@ -275,20 +382,10 @@ pub struct Record {
 }
 
 impl Record {
-    pub(crate) fn new(
-        client: impl Into<String>,
-        invoked_at: Duration,
-        completed_at: Duration,
-        operation: Operation,
-        outcome: Outcome,
-    ) -> Self {
-        Self {
-            client: client.into(),
-            invoked_at,
-            completed_at,
-            operation,
-            outcome,
-        }
+    /// Returns the operation's ID.
+    #[must_use]
+    pub fn id(&self) -> OperationId {
+        self.id
     }
 
     /// Returns the client that sent the operation.
@@ -320,23 +417,234 @@ impl Record {
     pub fn outcome(&self) -> &Outcome {
         &self.outcome
     }
+
+    /// Returns what the checkers may assume about the operation's effect.
+    #[must_use]
+    pub fn class(&self) -> OutcomeClass {
+        self.outcome.class()
+    }
 }
 
-/// Every operation clients finished, in completion order.
+/// An operation a client sent and hasn't heard back about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    client: String,
+    invoked_at: Duration,
+    operation: Operation,
+}
+
+impl Pending {
+    /// Returns the client that sent the operation.
+    #[must_use]
+    pub fn client(&self) -> &str {
+        &self.client
+    }
+
+    /// Returns the simulated time the operation was sent.
+    #[must_use]
+    pub fn invoked_at(&self) -> Duration {
+        self.invoked_at
+    }
+
+    /// Returns the operation.
+    #[must_use]
+    pub fn operation(&self) -> &Operation {
+        &self.operation
+    }
+}
+
+/// Which end of an operation a [`HistoryEvent`] marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase<'h> {
+    /// The client sent the operation.
+    Invoke,
+    /// The outcome arrived.
+    Complete(&'h Outcome),
+}
+
+/// One end of an operation, as [`History::events`] lists them: Jepsen's `:invoke` and `:ok`,
+/// `:fail`, or `:info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryEvent<'h> {
+    at: Duration,
+    client: &'h str,
+    id: OperationId,
+    operation: &'h Operation,
+    phase: Phase<'h>,
+}
+
+impl<'h> HistoryEvent<'h> {
+    /// Returns the simulated time of the event.
+    #[must_use]
+    pub fn at(&self) -> Duration {
+        self.at
+    }
+
+    /// Returns the client that sent the operation.
+    #[must_use]
+    pub fn client(&self) -> &'h str {
+        self.client
+    }
+
+    /// Returns the operation's ID.
+    #[must_use]
+    pub fn id(&self) -> OperationId {
+        self.id
+    }
+
+    /// Returns the operation.
+    #[must_use]
+    pub fn operation(&self) -> &'h Operation {
+        self.operation
+    }
+
+    /// Returns which end of the operation this is.
+    #[must_use]
+    pub fn phase(&self) -> Phase<'h> {
+        self.phase
+    }
+}
+
+impl fmt::Display for HistoryEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:>8}ms {} {:>6} ",
+            self.at.as_millis(),
+            self.id,
+            self.client
+        )?;
+        match self.phase {
+            Phase::Invoke => write!(f, "invoke {}", self.operation),
+            Phase::Complete(outcome) => {
+                write!(f, "{:<6} {} -> {outcome}", outcome.class(), self.operation)
+            }
+        }
+    }
+}
+
+/// Every operation clients sent: the finished ones in completion order, and the ones still in
+/// flight.
+///
+/// The harness fills it as clients run; a test builds one by hand with [`History::begin`] and
+/// [`History::complete`], or [`History::record`], to exercise the checkers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct History {
+    next_id: u64,
     records: Vec<Record>,
+    pending: BTreeMap<OperationId, Pending>,
 }
 
 impl History {
-    pub(crate) fn push(&mut self, record: Record) {
-        self.records.push(record);
+    /// Records that `client` sent `operation` at `at`, and returns the ID to complete it with.
+    pub fn begin(
+        &mut self,
+        client: impl Into<String>,
+        at: Duration,
+        operation: Operation,
+    ) -> OperationId {
+        self.next_id += 1;
+        let id = OperationId(self.next_id);
+        self.pending.insert(
+            id,
+            Pending {
+                client: client.into(),
+                invoked_at: at,
+                operation,
+            },
+        );
+        id
     }
 
-    /// Returns every record, in completion order.
+    /// Records that the operation `id` ended with `outcome` at `at`.
+    ///
+    /// # Panics
+    ///
+    /// If `id` isn't in flight: it was never begun, or it was completed already.
+    pub fn complete(&mut self, id: OperationId, at: Duration, outcome: Outcome) {
+        let pending = self
+            .pending
+            .remove(&id)
+            .unwrap_or_else(|| panic!("operation {id} isn't in flight"));
+        self.records.push(Record {
+            id,
+            client: pending.client,
+            invoked_at: pending.invoked_at,
+            completed_at: at,
+            operation: pending.operation,
+            outcome,
+        });
+    }
+
+    /// Records a finished operation in one step, and returns its ID.
+    pub fn record(
+        &mut self,
+        client: impl Into<String>,
+        invoked_at: Duration,
+        completed_at: Duration,
+        operation: Operation,
+        outcome: Outcome,
+    ) -> OperationId {
+        let id = self.begin(client, invoked_at, operation);
+        self.complete(id, completed_at, outcome);
+        id
+    }
+
+    /// Returns every finished operation, in completion order.
     #[must_use]
     pub fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    /// Returns the finished operation with ID `id`, if it has finished.
+    #[must_use]
+    pub fn record_by_id(&self, id: OperationId) -> Option<&Record> {
+        self.records.iter().find(|record| record.id == id)
+    }
+
+    /// Returns every operation still in flight, with its ID, in the order they were sent.
+    pub fn pending(&self) -> impl Iterator<Item = (OperationId, &Pending)> {
+        self.pending.iter().map(|(id, pending)| (*id, pending))
+    }
+
+    /// Returns both ends of every operation, in time order. At one time, invocations come
+    /// before completions, and earlier operations first.
+    #[must_use]
+    pub fn events(&self) -> Vec<HistoryEvent<'_>> {
+        let mut events: Vec<HistoryEvent<'_>> = Vec::with_capacity(2 * self.records.len());
+        for record in &self.records {
+            events.push(HistoryEvent {
+                at: record.invoked_at,
+                client: &record.client,
+                id: record.id,
+                operation: &record.operation,
+                phase: Phase::Invoke,
+            });
+            events.push(HistoryEvent {
+                at: record.completed_at,
+                client: &record.client,
+                id: record.id,
+                operation: &record.operation,
+                phase: Phase::Complete(&record.outcome),
+            });
+        }
+        for (id, pending) in &self.pending {
+            events.push(HistoryEvent {
+                at: pending.invoked_at,
+                client: &pending.client,
+                id: *id,
+                operation: &pending.operation,
+                phase: Phase::Invoke,
+            });
+        }
+        events.sort_by_key(|event| {
+            (
+                event.at,
+                matches!(event.phase, Phase::Complete(_)),
+                event.id,
+            )
+        });
+        events
     }
 
     /// Returns the acknowledged operations with their acknowledgements, in completion order.
@@ -693,44 +1001,72 @@ impl Workload for CreateAndAcquire {
 /// The longest pause between two operations of [`CreateAndWrite`], in milliseconds.
 const MAX_WRITE_PAUSE_MS: u64 = 30;
 
-/// Creates databases through the data plane, then writes to them.
+/// Creates databases through the data plane, then writes to them and reads them back.
 ///
 /// It creates every database first, repeating each [`Operation::Create`] until it is
 /// acknowledged, then sends the given number of [`Operation::Write`]s, each to a random database
 /// and with the next value: 0, 1, 2, …. A write is sent once, whatever its outcome, so the
-/// history tells which values must survive. The workload finishes after its last write.
+/// history tells which values must survive. One operation in four between the writes is an
+/// [`Operation::Read`] instead: of a random database's every value, or of the last value the
+/// workload saw acknowledged, so the history has the reads the checkers want. After the last
+/// write it reads every database once more, then finishes.
 #[derive(Debug, Clone)]
 pub struct CreateAndWrite {
     replication_factor: u32,
     databases: Vec<(DatabaseName, bool)>,
     writes: u32,
     next_value: i64,
+    last_acknowledged: Option<(DatabaseName, i64)>,
+    final_reads: Vec<DatabaseName>,
     pause: bool,
 }
 
 impl CreateAndWrite {
     /// Creates `databases` databases named `db-0`, `db-1`, …, with `replication_factor`
-    /// replicas, then sends `writes` writes.
+    /// replicas, then sends `writes` writes, with reads between them.
     ///
     /// # Panics
     ///
     /// If `db-N` isn't a valid database name, which it always is.
     #[must_use]
     pub fn new(databases: u32, replication_factor: u32, writes: u32) -> Self {
+        let databases: Vec<(DatabaseName, bool)> = (0..databases)
+            .map(|k| {
+                let name = format!("db-{k}");
+                let name = name
+                    .parse()
+                    .unwrap_or_else(|error| panic!("'{name}' is a valid name: {error}"));
+                (name, false)
+            })
+            .collect();
         Self {
             replication_factor,
-            databases: (0..databases)
-                .map(|k| {
-                    let name = format!("db-{k}");
-                    let name = name
-                        .parse()
-                        .unwrap_or_else(|error| panic!("'{name}' is a valid name: {error}"));
-                    (name, false)
-                })
+            final_reads: databases
+                .iter()
+                .rev()
+                .map(|(name, _)| name.clone())
                 .collect(),
+            databases,
             writes,
             next_value: 0,
+            last_acknowledged: None,
             pause: false,
+        }
+    }
+
+    fn read(&self, rng: &mut SimRng) -> Operation {
+        match &self.last_acknowledged {
+            Some((database, value)) if rng.chance(1, 3) => Operation::Read {
+                database: database.clone(),
+                value: Some(*value),
+            },
+            _ => {
+                let (database, _) = &self.databases[rng.index(self.databases.len())];
+                Operation::Read {
+                    database: database.clone(),
+                    value: None,
+                }
+            }
         }
     }
 }
@@ -748,8 +1084,20 @@ impl Workload for CreateAndWrite {
                 replication_factor: self.replication_factor,
             });
         }
-        if self.writes == 0 || self.databases.is_empty() {
+        if self.databases.is_empty() {
             return Step::Done;
+        }
+        if self.writes == 0 {
+            return match self.final_reads.pop() {
+                Some(database) => Step::Run(Operation::Read {
+                    database,
+                    value: None,
+                }),
+                None => Step::Done,
+            };
+        }
+        if self.next_value > 0 && rng.chance(1, 4) {
+            return Step::Run(self.read(rng));
         }
         self.writes -= 1;
         let (database, _) = &self.databases[rng.index(self.databases.len())];
@@ -762,10 +1110,18 @@ impl Workload for CreateAndWrite {
     }
 
     fn observe(&mut self, operation: &Operation, outcome: &Outcome) {
-        if let (Operation::Create { database, .. }, Outcome::Acknowledged(_)) = (operation, outcome)
-            && let Some((_, created)) = self.databases.iter_mut().find(|(name, _)| name == database)
-        {
-            *created = true;
+        match (operation, outcome) {
+            (Operation::Create { database, .. }, Outcome::Acknowledged(_)) => {
+                if let Some((_, created)) =
+                    self.databases.iter_mut().find(|(name, _)| name == database)
+                {
+                    *created = true;
+                }
+            }
+            (Operation::Write { database, value }, Outcome::Acknowledged(_)) => {
+                self.last_acknowledged = Some((database.clone(), *value));
+            }
+            _ => {}
         }
     }
 }
