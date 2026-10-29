@@ -634,7 +634,9 @@ async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> Tes
     .await??;
     let new = written.primary.clone().ok_or("no primary named")?;
     assert_ne!(new, old);
-    assert_eq!(written.epoch.get(), 2);
+    // Usually 2. A promotion that stalls past the lease and the margin, as one can on a loaded
+    // machine, is replaced by another at the next epoch.
+    assert!(written.epoch.get() >= 2, "epoch {}", written.epoch.get());
     let rows = client
         .query(&acme, Statement::new("SELECT DISTINCT x FROM t ORDER BY x"))
         .await?;

@@ -59,6 +59,8 @@ pub(super) struct FollowerSlot {
     /// Held by whatever changes the copy: the stream applying batches or re-seeding it, a fence,
     /// a fetch, or a seed. A newer stream waits for an older one.
     applying: Arc<tokio::sync::Mutex<()>>,
+    /// Held by a caller taking the copy over, so that two never keep superseding each other.
+    taking_over: tokio::sync::Mutex<()>,
     positions: Mutex<Positions>,
     /// How many snapshots have replaced the copy since this node started.
     snapshots: AtomicU64,
@@ -84,6 +86,27 @@ impl FollowerSlot {
             session = *current;
         });
         session
+    }
+
+    /// Ends every stream applying to the copy and returns the lock they held, for a caller that
+    /// replaces the copy itself.
+    ///
+    /// Whatever begins a session while this waits goes ahead of it: a stream then finds itself
+    /// superseded and ends, and a fence runs to completion first. A stream that began while this
+    /// waits would otherwise take the lock and keep it, so this begins a session again whenever
+    /// another one begins. Callers taking the copy over queue for their turn, so that two never
+    /// supersede each other in turn forever.
+    pub(super) async fn take_over(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let _contending = self.taking_over.lock().await;
+        let mut sessions = self.sessions.subscribe();
+        loop {
+            let session = self.begin();
+            tokio::select! {
+                biased;
+                applying = self.applying.lock() => return applying,
+                _ = sessions.wait_for(|current| *current != session) => {}
+            }
+        }
     }
 
     fn is_current(&self, session: u64) -> bool {
@@ -249,6 +272,9 @@ impl Follow {
         acks: &Acks,
     ) -> Result<(), Status> {
         let inner = &self.inner;
+        // Subscribed before the session check, so that a session begun at any point after the
+        // check ends this stream once it starts reading batches.
+        let mut sessions = self.slot.sessions.subscribe();
         let _applying = self.slot.applying().lock().await;
         if !self.slot.is_current(self.session) {
             return Err(Status::aborted("a newer stream replaced this one"));
@@ -297,9 +323,9 @@ impl Follow {
             return Ok(());
         }
         let mut noted = false;
-        let mut sessions = self.slot.sessions.subscribe();
         loop {
             let message = tokio::select! {
+                biased;
                 _ = sessions.changed() => return Err(Status::aborted("a newer stream replaced this one")),
                 message = inbound.message() => message?,
             };

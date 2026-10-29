@@ -504,16 +504,54 @@ impl Replication {
     /// A primary that has just started serving has no streams open yet, so its first writes
     /// would fail as under-replicated; waiting here first spares them that.
     pub async fn await_writable(&self, database: &DatabaseName, limit: Duration) -> bool {
+        self.await_followers(database, limit, |inner, primary, quorum| {
+            primary.reachable(inner, &quorum.followers) >= quorum.needed
+        })
+        .await
+    }
+
+    /// Waits until every follower of `database` that the membership view counts as live, and at
+    /// least enough for a write to reach its quorum, has its stream connected and reporting, or
+    /// until `limit` passes. Returns whether they have.
+    ///
+    /// Once they have, a write isn't under-replicated unless a follower goes down or its stream
+    /// drops. A follower that is down isn't waited for, unless the quorum needs it.
+    pub async fn await_replicas(&self, database: &DatabaseName, limit: Duration) -> bool {
+        self.await_followers(database, limit, |inner, primary, quorum| {
+            let live = quorum
+                .followers
+                .iter()
+                .filter(|node| inner.is_live(node))
+                .count();
+            primary.reachable(inner, &quorum.followers) >= live.max(quorum.needed)
+        })
+        .await
+    }
+
+    /// Whether `database`'s primary has enough followers connected, live, and reporting for a
+    /// write to reach its quorum now.
+    pub(crate) fn is_writable(&self, database: &DatabaseName) -> bool {
+        self.inner.primary(database).is_some_and(|primary| {
+            let quorum = self.inner.followers_of(&primary);
+            primary.reachable(&self.inner, &quorum.followers) >= quorum.needed
+        })
+    }
+
+    /// Waits until `ready` holds for `database`'s primary and its replica set, or until `limit`
+    /// passes. Returns whether it does, and `false` if this node isn't the primary.
+    async fn await_followers(
+        &self,
+        database: &DatabaseName,
+        limit: Duration,
+        ready: impl Fn(&Inner, &Primary, &Quorum) -> bool,
+    ) -> bool {
         let Some(primary) = self.inner.primary(database) else {
             return false;
         };
         let poll = self.inner.settings.retry_interval;
-        let writable = || {
-            let quorum = self.inner.followers_of(&primary);
-            primary.reachable(&self.inner, &quorum.followers) >= quorum.needed
-        };
+        let holds = || ready(&self.inner, &primary, &self.inner.followers_of(&primary));
         tokio::time::timeout(limit, async {
-            while !writable() {
+            while !holds() {
                 tokio::time::sleep(poll).await;
             }
         })

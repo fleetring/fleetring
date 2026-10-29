@@ -8,6 +8,7 @@ use std::time::Duration;
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::{AcquireLeaseRequest, LocateRequest, Placement};
+use tokio::sync::watch;
 use tonic::Status;
 
 use crate::control::ControlClient;
@@ -89,12 +90,46 @@ pub(super) struct Inner {
     /// it takes writes.
     pub(super) writable_wait: Duration,
     leases: Mutex<BTreeMap<DatabaseName, HeldLease>>,
+    /// The databases this node has started serving and still waits for the followers of, each
+    /// with the number of starts waiting.
+    settling: watch::Sender<BTreeMap<DatabaseName, usize>>,
+}
+
+/// Counts one start of `name` as settling until it is dropped, even if the start is cancelled.
+struct Settling<'node> {
+    node: &'node DataNode,
+    name: DatabaseName,
+}
+
+impl<'node> Settling<'node> {
+    fn begin(node: &'node DataNode, name: &DatabaseName) -> Self {
+        node.inner.settling.send_modify(|settling| {
+            *settling.entry(name.clone()).or_default() += 1;
+        });
+        Self {
+            node,
+            name: name.clone(),
+        }
+    }
+}
+
+impl Drop for Settling<'_> {
+    fn drop(&mut self) {
+        self.node.inner.settling.send_modify(|settling| {
+            if let Some(count) = settling.get_mut(&self.name) {
+                *count -= 1;
+                if *count == 0 {
+                    settling.remove(&self.name);
+                }
+            }
+        });
+    }
 }
 
 impl DataNode {
     /// A node with ID `id` that keeps its databases in `replication`'s registry, and asks the
     /// control plane through `control`. A database it starts serving waits up to `writable_wait`
-    /// for enough followers to take writes.
+    /// for every live follower, and at least a write quorum, to connect.
     pub(crate) fn new(
         id: NodeId,
         replication: Replication,
@@ -108,6 +143,7 @@ impl DataNode {
                 control,
                 writable_wait,
                 leases: Mutex::new(BTreeMap::new()),
+                settling: watch::Sender::new(BTreeMap::new()),
             }),
         }
     }
@@ -134,6 +170,7 @@ impl DataNode {
     /// known address; and the control plane's status otherwise, such as `NOT_FOUND`.
     pub(crate) async fn route(&self, name: &DatabaseName) -> Result<HeldLease, Status> {
         if let Some(lease) = self.held(name) {
+            self.await_settled(name).await;
             return Ok(lease);
         }
         let placement = self.locate(name).await?;
@@ -254,7 +291,14 @@ impl DataNode {
         }
     }
 
-    /// Leads `name` under `lease` if this node doesn't already, and records the lease.
+    /// Leads `name` under `lease` if this node doesn't already, records the lease, and waits
+    /// until every live follower, and at least a write quorum, is connected or `writable_wait`
+    /// passes.
+    ///
+    /// Waiting for every live follower, not just a write quorum, means the first write isn't
+    /// reported under-replicated while all of its replicas are up. The lease is recorded first,
+    /// so that renewals go on during the wait, and [`DataNode::route`] holds a request back
+    /// until the wait ends.
     ///
     /// # Errors
     ///
@@ -287,35 +331,50 @@ impl DataNode {
                 }
             }
         }
+        let _settling = Settling::begin(self, name);
         self.leases().insert(name.clone(), lease);
+        self.await_replicas(name).await;
         Ok(())
     }
 
-    /// Records the lease `placement` names, serves the database as its primary at the lease's
-    /// epoch if this node didn't already, and waits until enough followers are connected for a
-    /// write to reach its quorum, or `writable_wait` passes.
+    /// Records the lease `placement` names and serves the database as its primary at the lease's
+    /// epoch, as [`DataNode::start_serving`] does.
     async fn serve(&self, name: &DatabaseName, placement: &Placement) -> Result<HeldLease, Status> {
         let lease = HeldLease::of(placement);
         self.start_serving(name, lease, None).await?;
-        self.await_writable(name).await;
         Ok(lease)
     }
 
-    /// Waits until enough followers are connected for a write to reach its quorum, or
-    /// `writable_wait` passes.
-    pub(super) async fn await_writable(&self, name: &DatabaseName) {
-        if !self
-            .inner
-            .replication
-            .await_writable(name, self.inner.writable_wait)
-            .await
-        {
+    /// Waits until every follower the membership view counts live, and at least a write quorum,
+    /// is connected, or `writable_wait` passes.
+    async fn await_replicas(&self, name: &DatabaseName) {
+        let replication = &self.inner.replication;
+        let wait = self.inner.writable_wait;
+        if replication.await_replicas(name, wait).await {
+            return;
+        }
+        if replication.is_writable(name) {
+            tracing::info!(
+                database = %name,
+                ?wait,
+                "some live followers aren't connected yet, so writes report under-replicated",
+            );
+        } else {
             tracing::warn!(
                 database = %name,
-                wait = ?self.inner.writable_wait,
+                ?wait,
                 "too few followers are connected for writes to reach their quorum",
             );
         }
+    }
+
+    /// Waits until no start of `name` is waiting for its followers any more, or `writable_wait`
+    /// passes.
+    async fn await_settled(&self, name: &DatabaseName) {
+        let mut settling = self.inner.settling.subscribe();
+        let settled = settling.wait_for(|settling| !settling.contains_key(name));
+        // The sender lives as long as the node, and the wait is bounded like the start's own.
+        let _ = tokio::time::timeout(self.inner.writable_wait, settled).await;
     }
 
     fn leases(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, HeldLease>> {

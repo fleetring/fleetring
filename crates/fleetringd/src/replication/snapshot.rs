@@ -343,11 +343,11 @@ pub(super) async fn seed(
         reason: status.message().to_owned(),
     };
     admit(inner, database, epoch).await.map_err(failed)?;
-    // A newer session ends every stream applying to the copy, and the lock waits until they
-    // have stopped.
     let slot = inner.slot(database);
-    slot.begin();
-    let _applying = slot.applying().lock().await;
+    let _applying = slot.take_over().await;
+    // A fence that went first may have recorded a newer epoch, and the copy it reported on must
+    // not change under an older one.
+    admit(inner, database, epoch).await.map_err(failed)?;
     let location = inner.registry().location(database);
     let position = time::timeout(
         inner.settings.open_timeout,
