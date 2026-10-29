@@ -6,6 +6,7 @@ use std::iter;
 use fleetring::{Epoch, NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
+use crate::command::UnknownReports;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
     Action, Command, Database, DatabaseName, Engine, HostedReplica, Lease, LeaseEpoch, Member,
@@ -63,7 +64,11 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
     let applied = match command.action {
         Action::Join { member } => join(state, now, member),
         Action::Leave { id } => leave(state, id),
-        Action::Heartbeat { id, replicas } => heartbeat(state, now, id, replicas),
+        Action::Heartbeat {
+            id,
+            replicas,
+            unknown_reports,
+        } => heartbeat(state, now, id, replicas, unknown_reports),
         Action::CreateDatabase {
             name,
             replication_factor,
@@ -118,6 +123,8 @@ pub enum Applied {
     HeartbeatRecorded {
         /// The member's ID.
         id: NodeId,
+        /// The reported databases the control plane doesn't know, left out of the reports.
+        unknown: Vec<DatabaseName>,
     },
 
     /// A database was created.
@@ -429,21 +436,34 @@ fn heartbeat(
     now: Timestamp,
     id: NodeId,
     replicas: Vec<HostedReplica>,
+    unknown_reports: UnknownReports,
 ) -> Outcome {
     if !state.members.contains_key(&id) {
         return Err(Rejection::UnknownMember { id });
     }
     let mut seen = BTreeSet::new();
+    let mut unknown = Vec::new();
     for replica in &replicas {
-        state.database_or_reject(replica.database())?;
         if !seen.insert(replica.database()) {
             return Err(Rejection::DuplicateReport {
                 database: replica.database().clone(),
             });
         }
+        if state.database(replica.database()).is_some() {
+            continue;
+        }
+        match unknown_reports {
+            UnknownReports::Skip => unknown.push(replica.database().clone()),
+            UnknownReports::Reject => {
+                return Err(Rejection::UnknownDatabase {
+                    database: replica.database().clone(),
+                });
+            }
+        }
     }
     let reports = replicas
         .into_iter()
+        .filter(|replica| !unknown.contains(replica.database()))
         .map(|replica| replica.into_report(now))
         .collect();
 
@@ -452,7 +472,7 @@ fn heartbeat(
     };
     entry.last_heartbeat = now;
     entry.reports = reports;
-    Ok(Applied::HeartbeatRecorded { id })
+    Ok(Applied::HeartbeatRecorded { id, unknown })
 }
 
 fn create_database(

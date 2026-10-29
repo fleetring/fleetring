@@ -52,6 +52,7 @@ impl Control for StubControl {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         Ok(Response::new(HeartbeatResponse {
             membership_epoch: MEMBERSHIP_EPOCH,
+            unknown_databases: Vec::new(),
         }))
     }
 

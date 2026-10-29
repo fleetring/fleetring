@@ -67,6 +67,7 @@ pub(crate) fn heartbeat(node: &str, reports: &[(&str, &[u8])]) -> Action {
                 HostedReplica::new(db(name), Role::Follower, Position::new(*position))
             })
             .collect(),
+        unknown_reports: fleetring_control::UnknownReports::Skip,
     }
 }
 
@@ -155,9 +156,16 @@ fn action(state: &State, op: Op) -> Action {
                     Position::default(),
                 ));
             }
+            // Both rules replay: logs written before the field have `Reject` heartbeats.
+            let unknown_reports = if b.is_multiple_of(3) {
+                fleetring_control::UnknownReports::Reject
+            } else {
+                fleetring_control::UnknownReports::Skip
+            };
             Action::Heartbeat {
                 id: id(node),
                 replicas,
+                unknown_reports,
             }
         }
         9 => Action::AcquireLease {

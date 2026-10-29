@@ -590,6 +590,7 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
                 let action = Action::Heartbeat {
                     id: id.clone(),
                     replicas: Vec::new(),
+                    unknown_reports: fleetring_control::UnknownReports::Skip,
                 };
                 committed.push(handle.submit(action).await?);
             }
@@ -757,5 +758,47 @@ async fn an_existing_log_keeps_its_genesis_timings() -> TestResult {
     assert_eq!(node.recovered().snapshot.map(|index| index.get()), Some(3));
     assert_eq!(node.recovered().replayed, 1);
     node.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n",
+        dir.path().join("data")
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let control = client(daemon.control_address().ok_or("no control address")?);
+    control.join(join_request("a")).await?;
+    control
+        .create_database(CreateDatabaseRequest {
+            database: "known".into(),
+            replication_factor: 1,
+            engine: Engine::Sqlite.into(),
+        })
+        .await?;
+    let status = |database: &str| DatabaseStatus {
+        database: database.into(),
+        role: Role::Primary.into(),
+        epoch: 1,
+        position: vec![0, 7],
+    };
+    // The known report lands, the unknown one is named, and the node stays live.
+    let beat = control
+        .heartbeat(HeartbeatRequest {
+            node_id: "a".into(),
+            databases: vec![status("ghost"), status("known")],
+        })
+        .await?;
+    assert_eq!(beat.unknown_databases, vec!["ghost".to_owned()]);
+    let state = daemon.control().ok_or("no control handle")?.state();
+    let node: fleetring::NodeId = "a".parse()?;
+    let known: fleetring_control::DatabaseName = "known".parse()?;
+    let ghost: fleetring_control::DatabaseName = "ghost".parse()?;
+    assert!(state.report(&node, &known).is_some());
+    assert!(state.report(&node, &ghost).is_none());
+    assert_eq!(state.last_heartbeat(&node), Some(state.now()));
+    daemon.run_until(std::future::ready(())).await;
     Ok(())
 }

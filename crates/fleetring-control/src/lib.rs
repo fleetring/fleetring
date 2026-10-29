@@ -72,7 +72,7 @@ mod state;
 mod time;
 
 pub use apply::{Applied, JoinKind, Outcome, Rejection, apply};
-pub use command::{Action, Command};
+pub use command::{Action, Command, UnknownReports};
 pub use config::ControlConfig;
 pub use database::{
     Database, DatabaseName, Engine, Lease, LeaseEpoch, ParseDatabaseNameError, Position, Promotion,

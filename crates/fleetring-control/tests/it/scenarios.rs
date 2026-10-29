@@ -456,13 +456,26 @@ fn a_join_that_would_break_the_ring_is_rejected() {
 }
 
 #[test]
-fn heartbeats_must_name_known_databases_once() {
+fn heartbeats_skip_unknown_databases_and_name_them() {
     let mut state = cluster(&["a"]);
     run(&mut state, 0, create("acme", 1)).expect("create");
+    // A database the control plane doesn't know costs the node nothing: the heartbeat counts,
+    // the known report is recorded, and the unknown name comes back.
+    let applied = run(
+        &mut state,
+        10,
+        heartbeat("a", &[("nope", &[1]), ("acme", &[1])]),
+    )
+    .expect("heartbeat");
     assert!(matches!(
-        reject(&mut state, 10, heartbeat("a", &[("nope", &[1])])),
-        Rejection::UnknownDatabase { .. }
+        &applied,
+        Applied::HeartbeatRecorded { unknown, .. } if unknown == &[db("nope")]
     ));
+    assert_eq!(state.last_heartbeat(&id("a")), Some(at(10)));
+    let report = state.report(&id("a"), &db("acme")).expect("report");
+    assert_eq!(report.position(), &Position::new([1]));
+    assert_eq!(report.at(), at(10));
+    assert!(state.report(&id("a"), &db("nope")).is_none());
     assert!(matches!(
         reject(
             &mut state,
@@ -475,10 +488,26 @@ fn heartbeats_must_name_known_databases_once() {
         reject(&mut state, 10, heartbeat("ghost", &[])),
         Rejection::UnknownMember { .. }
     ));
-    run(&mut state, 10, heartbeat("a", &[("acme", &[1])])).expect("heartbeat");
-    let report = state.report(&id("a"), &db("acme")).expect("report");
-    assert_eq!(report.position(), &Position::new([1]));
-    assert_eq!(report.at(), at(10));
+}
+
+#[test]
+fn heartbeats_from_old_logs_keep_rejecting_unknown_databases() {
+    // A heartbeat logged before `unknown_reports` existed carries no such field.
+    let old = r#"{"heartbeat":{"id":"a","replicas":[{"database":"nope","role":"follower","position":[1]}]}}"#;
+    let action: Action = serde_json::from_str(old).expect("an old heartbeat loads");
+    assert!(matches!(
+        action,
+        Action::Heartbeat {
+            unknown_reports: fleetring_control::UnknownReports::Reject,
+            ..
+        }
+    ));
+    let mut state = cluster(&["a"]);
+    assert!(matches!(
+        reject(&mut state, 10, action),
+        Rejection::UnknownDatabase { .. }
+    ));
+    assert_eq!(state.last_heartbeat(&id("a")), Some(at(0)));
 }
 
 #[test]
@@ -513,6 +542,7 @@ fn heartbeat_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> 
             )
             .with_log_epoch(LeaseEpoch::new(log_epoch)),
         ],
+        unknown_reports: fleetring_control::UnknownReports::Skip,
     }
 }
 

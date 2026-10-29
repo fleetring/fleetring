@@ -9,8 +9,10 @@ use std::error::Error;
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{Liveness, State, Timestamp};
-use fleetringd::sim::{Cluster, Operation, Operator, Replay, Report, Timings, seeds};
+use fleetring_control::{DatabaseName, Liveness, Role, State, Timestamp};
+use fleetringd::sim::{
+    Ack, Cluster, CreateAndWrite, Operation, Operator, Replay, Report, Timings, seeds,
+};
 
 use crate::{BINARY, TestResult};
 
@@ -152,6 +154,76 @@ fn every_live_node_publishes_the_same_ring_within_two_heartbeats() {
         let first = scenario(seed)?;
         let second = scenario(seed)?;
         first.trace().compare(second.trace(), Replay::supported())?;
+        Ok(())
+    });
+}
+
+/// The primary that the acknowledged creation of `database` reported, if any.
+fn opened_primary(cluster: &Cluster, database: &DatabaseName) -> Option<String> {
+    cluster
+        .history()
+        .acknowledged()
+        .find_map(|(operation, ack)| match (operation, ack) {
+            (
+                Operation::Create {
+                    database: created, ..
+                },
+                Ack::Opened { primary, .. },
+            ) if created == database => Some(primary.to_string()),
+            _ => None,
+        })
+}
+
+/// Replies slower than the heartbeat interval don't cost a node its liveness or its reports: the
+/// control node records a heartbeat whether or not the reply gets back in time, and a join whose
+/// reply is late is confirmed by the heartbeats after it rather than sent again.
+#[test]
+fn slow_replies_keep_nodes_live_and_their_reports_current() {
+    seeds::run(BINARY, &seeds::FIXED, |seed| -> TestResult {
+        let timings = Timings {
+            heartbeat_interval: INTERVAL,
+            heartbeat_timeout: TIMEOUT,
+            ..Timings::default()
+        };
+        // Each message takes up to one interval, so most round trips outlast the time a node
+        // gives a join or heartbeat.
+        let mut cluster = Cluster::builder(seed)
+            .control(CONTROL)
+            .data(DATA[0])
+            .data(DATA[1])
+            .data(DATA[2])
+            .timings(timings)
+            .max_latency(INTERVAL)
+            .operation_timeout(Duration::from_secs(5))
+            .build()?;
+        cluster.run_until(Duration::from_secs(10), "three members", |cluster| {
+            cluster
+                .control_state()
+                .is_some_and(|state| state.membership_epoch().get() == 3)
+        })?;
+        cluster.client("writer", CreateAndWrite::new(1, 3, 3));
+        cluster.await_workloads(Duration::from_secs(90))?;
+        let database: DatabaseName = "db-0".parse()?;
+        let primary: NodeId = opened_primary(&cluster, &database)
+            .ok_or("db-0 was never opened")?
+            .parse()?;
+        cluster.run_until(Duration::from_secs(20), "the primary's report", |cluster| {
+            cluster.control_state().is_some_and(|state| {
+                state
+                    .report(&primary, &database)
+                    .is_some_and(|report| report.role() == Role::Primary)
+            })
+        })?;
+        let state = cluster.control_state().ok_or("no control state")?;
+        for node in DATA {
+            assert_eq!(
+                liveness(&state, node),
+                Some(Liveness::Live),
+                "{node} on seed {seed}"
+            );
+        }
+        cluster.await_ring(Duration::from_secs(20))?;
+        cluster.finish()?;
         Ok(())
     });
 }

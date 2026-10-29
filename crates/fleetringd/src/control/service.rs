@@ -309,9 +309,23 @@ impl Control for ControlService {
             .into_iter()
             .map(replica_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let (_, state) = self.submit(Action::Heartbeat { id, replicas }).await?;
+        let (applied, state) = self
+            .submit(Action::Heartbeat {
+                id,
+                replicas,
+                unknown_reports: fleetring_control::UnknownReports::Skip,
+            })
+            .await?;
+        let unknown_databases = match applied {
+            Applied::HeartbeatRecorded { unknown, .. } => unknown
+                .into_iter()
+                .map(|database| database.as_str().to_owned())
+                .collect(),
+            _ => Vec::new(),
+        };
         Ok(Response::new(HeartbeatResponse {
             membership_epoch: state.membership_epoch().get(),
+            unknown_databases,
         }))
     }
 

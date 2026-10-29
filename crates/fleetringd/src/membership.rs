@@ -43,7 +43,7 @@ use tokio::time::error::Elapsed;
 use tokio::time::{MissedTickBehavior, timeout};
 use tonic::{Code, Status};
 
-use crate::control::{ControlClient, member_from, missing_database, node_to_proto};
+use crate::control::{ControlClient, member_from, node_to_proto};
 use crate::{MembershipSettings, OnShutdown};
 
 /// How many heartbeat replies in a row may report a later membership epoch than the published one
@@ -142,9 +142,9 @@ impl Membership {
     /// Starts membership as [`Membership::start`] does, with every heartbeat reporting the
     /// databases `databases` lists at that moment: each one's role, epoch, and position.
     ///
-    /// The control plane refuses a heartbeat that names a database it doesn't know. The
-    /// heartbeat is then sent again at once without that database, so the node stays live and
-    /// doesn't rejoin; only an unknown node makes it rejoin.
+    /// A database the control plane doesn't know costs nothing: the heartbeat still counts, the
+    /// control plane names the database in its reply, and the node logs it once. Only an
+    /// unknown node makes it rejoin.
     ///
     /// # Panics
     ///
@@ -166,6 +166,7 @@ impl Membership {
                 client: client.clone(),
                 interval,
                 databases: Box::new(databases),
+                unknown: std::collections::BTreeSet::new(),
             },
             Arc::clone(&resubscribe),
             membership.updates.clone(),
@@ -487,50 +488,43 @@ struct Heartbeats {
     client: ControlClient,
     interval: Duration,
     databases: Box<dyn DatabaseStatuses>,
+    /// The reported databases the control plane said it doesn't know, as of the last reply.
+    unknown: std::collections::BTreeSet<String>,
 }
 
 impl Heartbeats {
-    /// Sends one heartbeat. A database the control plane doesn't know is dropped from the
-    /// report and the heartbeat sent again, so that it never reads as an unknown node.
-    async fn send(&self, id: &str) -> Result<Result<HeartbeatResponse, Status>, Elapsed> {
-        let mut databases = self.databases.statuses();
-        loop {
-            let request = HeartbeatRequest {
-                node_id: id.to_owned(),
-                databases: databases.clone(),
-            };
-            let result = timeout(self.interval, self.client.heartbeat(request)).await;
-            if let Ok(Err(status)) = &result
-                && let Some(missing) = missing_database(status)
-                && databases.iter().any(|status| status.database == missing)
-            {
-                tracing::debug!(node = %id, database = missing, "the control plane doesn't know this database; leaving it out");
-                databases.retain(|status| status.database != missing);
-                continue;
+    /// Sends one heartbeat. The control plane records what it knows and names the databases
+    /// it doesn't, which are logged when they first appear; they don't fail the heartbeat.
+    async fn send(&mut self, id: &str) -> Result<Result<HeartbeatResponse, Status>, Elapsed> {
+        let request = HeartbeatRequest {
+            node_id: id.to_owned(),
+            databases: self.databases.statuses(),
+        };
+        let result = timeout(self.interval, self.client.heartbeat(request)).await;
+        if let Ok(Ok(response)) = &result {
+            let unknown: std::collections::BTreeSet<String> =
+                response.unknown_databases.iter().cloned().collect();
+            for database in unknown.difference(&self.unknown) {
+                tracing::warn!(node = %id, database, "the control plane doesn't know this database; its reports are ignored");
             }
-            return result;
+            self.unknown = unknown;
         }
+        result
     }
 }
 
 /// Joins, then sends a heartbeat every `interval`, forever. Never fails: every error is logged and
 /// the step is tried again at the next interval.
 async fn heartbeat_loop(
-    heartbeats: Heartbeats,
+    mut heartbeats: Heartbeats,
     resubscribe: Arc<Notify>,
     published: watch::Receiver<Arc<MembershipView>>,
 ) {
-    let Heartbeats {
-        member,
-        client,
-        interval,
-        ..
-    } = &heartbeats;
-    let interval = *interval;
-    let id = member.id().to_string();
+    let interval = heartbeats.interval;
+    let id = heartbeats.member.id().to_string();
     let join = JoinRequest {
         protocol: Some(PROTOCOL_VERSION),
-        node: Some(node_to_proto(member)),
+        node: Some(node_to_proto(&heartbeats.member)),
     };
     let mut joined = false;
     let mut failing = false;
@@ -542,7 +536,7 @@ async fn heartbeat_loop(
     loop {
         ticks.tick().await;
         if !joined {
-            match timeout(interval, client.join(join.clone())).await {
+            match timeout(interval, heartbeats.client.join(join.clone())).await {
                 Ok(Ok(response)) => {
                     tracing::info!(node = %id, epoch = response.membership_epoch, "joined the cluster");
                     joined = true;
@@ -558,11 +552,15 @@ async fn heartbeat_loop(
                     timeouts += 1;
                     if timeouts >= STALLED_HEARTBEATS {
                         tracing::warn!(node = %id, "joining the cluster keeps timing out; will retry on a new connection");
-                        client.reconnect();
+                        heartbeats.client.reconnect();
                         timeouts = 0;
                     } else {
-                        tracing::debug!(node = %id, "joining the cluster timed out; will retry");
+                        tracing::debug!(node = %id, "joining the cluster timed out; the next heartbeat shows whether it landed");
                     }
+                    // The control node may have recorded the join and only its reply was late.
+                    // Heartbeats tell: `NOT_FOUND` means it wasn't, and the join is sent again.
+                    // Joining again instead would clear the reports of a join that did land.
+                    joined = true;
                     failing = true;
                     continue;
                 }
@@ -605,7 +603,7 @@ async fn heartbeat_loop(
                 timeouts += 1;
                 if timeouts >= STALLED_HEARTBEATS {
                     tracing::warn!(node = %id, "heartbeats keep timing out; will retry on a new connection");
-                    client.reconnect();
+                    heartbeats.client.reconnect();
                     timeouts = 0;
                 } else {
                     tracing::debug!(node = %id, "heartbeat timed out; will retry");
