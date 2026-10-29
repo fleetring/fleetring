@@ -36,6 +36,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
+| M7 Durability and operations | FR-035 – FR-036 | Configurable durability per database, and a history checker for every simulation run |
 
 ## Index
 
@@ -75,6 +76,8 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-032](FR-032-snapshot-catch-up.md) | Snapshot catch-up | P1 | M | FR-030 | done |
 | [FR-033](FR-033-database-api-cli.md) | Database API and CLI for `fleetringd` v0.1 | P1 | M | FR-026, FR-028 | in-progress |
 | [FR-034](FR-034-release-builds.md) | Release builds, ARM CI, and container images for `fleetringd` | P1 | M | FR-022 | in-progress |
+| [FR-035](FR-035-configurable-durability.md) | Configurable durability (`acks`, `min_replicas`, per database) | P1 | L | FR-030, FR-031 | todo |
+| [FR-036](FR-036-history-checker.md) | History checker for simulation runs | P1 | M | FR-024, FR-031 | todo |
 
 ## Dependency graph
 
@@ -131,6 +134,10 @@ flowchart LR
   FR026 --> FR033[FR-033 database API + CLI]
   FR028 --> FR033
   FR022 --> FR034[FR-034 release builds]
+  FR030 --> FR035[FR-035 configurable durability]
+  FR031 --> FR035
+  FR024 --> FR036[FR-036 history checker]
+  FR031 --> FR036
 ```
 
 ## Critical path and estimate
