@@ -78,6 +78,8 @@ async fn run(node: DataNode, settings: LeaseSettings) {
     let mut promotions = node.replication().promotions();
     let mut running: BTreeMap<DatabaseName, (LeaseEpoch, AbortOnDrop)> = BTreeMap::new();
     let mut renewing: Option<AbortOnDrop> = None;
+    // Databases this node serves again after a restart, each waiting for its followers.
+    let mut restarting = JoinSet::new();
     let mut recovered = false;
     let mut ticks = tokio::time::interval(settings.renew_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -85,7 +87,7 @@ async fn run(node: DataNode, settings: LeaseSettings) {
         tokio::select! {
             _ = ticks.tick() => {
                 if !recovered {
-                    recovered = recover(&node).await;
+                    recovered = recover(&node, &mut restarting).await;
                 }
                 // Renewals run beside promotions, so that a slow control plane never holds up a
                 // failover.
@@ -96,6 +98,7 @@ async fn run(node: DataNode, settings: LeaseSettings) {
                     })));
                 }
             }
+            Some(_) = restarting.join_next() => {}
             changed = promotions.changed() => {
                 if changed.is_err() {
                     return;
@@ -139,7 +142,10 @@ fn is_settled(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) -> bo
 /// Learns which of the databases this node has records of it holds the lease on, and leads
 /// them; reads its copies' positions for its heartbeats. Returns `false` if the control plane
 /// couldn't be reached, so the pass runs again.
-async fn recover(node: &DataNode) -> bool {
+///
+/// Each database starts serving in a task of its own on `restarting`, since it waits for its
+/// followers first, and the lease keeper goes on renewing and promoting meanwhile.
+async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
     let replication = node.replication();
     let databases = replication.recorded_databases().await;
     replication.recover_positions(&databases).await;
@@ -160,12 +166,16 @@ async fn recover(node: &DataNode) -> bool {
             continue;
         }
         tracing::info!(database = %name, epoch = placement.epoch, "holds the lease after a restart");
-        if let Err(status) = node
-            .start_serving(name, HeldLease::of(&placement), None)
-            .await
-        {
-            tracing::warn!(database = %name, %status, "can't serve after a restart");
-        }
+        let node = node.clone();
+        let name = name.clone();
+        restarting.spawn(async move {
+            if let Err(status) = node
+                .start_serving(&name, HeldLease::of(&placement), None)
+                .await
+            {
+                tracing::warn!(database = %name, %status, "can't serve after a restart");
+            }
+        });
     }
     true
 }
@@ -325,7 +335,6 @@ async fn promote(
     let lease = HeldLease::new(epoch, request.replication_factor);
     node.start_serving(database, lease, position).await?;
     tracing::info!(database = %database, epoch = epoch.get(), "promoted to primary");
-    node.await_writable(database).await;
     Ok(())
 }
 

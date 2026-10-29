@@ -57,22 +57,16 @@ pub(crate) fn role(replicas: u8) -> PrimaryRole {
     }
 }
 
-/// Settings that fail fast, so tests that break links don't wait long.
+/// Settings that reopen a broken stream quickly. The tests break links only with errors, which end
+/// a stream at once, so none relies on stall detection: no follower counts as stalled before the
+/// hang guard, however long a loaded runner takes it to apply a batch or checkpoint, or however
+/// long a test holds its acknowledgements back.
 pub(crate) fn settings() -> ReplicationSettings {
     ReplicationSettings {
-        stall_timeout: Duration::from_millis(500),
+        stall_timeout: HANG_GUARD,
         retry_interval: Duration::from_millis(50),
         ack_timeout: Duration::from_secs(10),
         ..ReplicationSettings::new()
-    }
-}
-
-/// Settings for a test that breaks no links: no follower counts as stalled before the hang guard,
-/// however long a loaded runner takes it to apply a batch or checkpoint.
-pub(crate) fn unhurried() -> ReplicationSettings {
-    ReplicationSettings {
-        stall_timeout: HANG_GUARD,
-        ..settings()
     }
 }
 
@@ -275,7 +269,7 @@ impl Cluster {
         replicas: u8,
     ) -> TestResult {
         let node = self.node(primary);
-        node.registry().create(database).await?;
+        guarded("creating the database", node.registry().create(database)).await??;
         node.replication
             .serve_primary(database.clone(), role(replicas))?;
         let created = Transaction::from(Statement::new(

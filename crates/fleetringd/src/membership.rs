@@ -50,6 +50,12 @@ use crate::{MembershipSettings, OnShutdown};
 /// before the membership stream counts as stalled and is reopened.
 const STALE_REPLIES: u32 = 2;
 
+/// How many joins or heartbeats in a row may time out before the connection counts as stalled and
+/// the next call dials a new connection. One slow reply, on a loaded machine, doesn't make it stalled:
+/// dialing again on every timeout would open a connection per heartbeat for as long as the load
+/// lasts.
+const STALLED_HEARTBEATS: u32 = 3;
+
 /// The membership one node knows: the epoch, the members with their liveness, and the ring.
 ///
 /// Views are immutable; a change publishes a new one.
@@ -529,6 +535,7 @@ async fn heartbeat_loop(
     let mut joined = false;
     let mut failing = false;
     let mut stale_replies = 0;
+    let mut timeouts = 0;
     let mut ticks = tokio::time::interval(interval);
     // A node that slept, or fell behind, sends one heartbeat on waking rather than a burst.
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -539,21 +546,33 @@ async fn heartbeat_loop(
                 Ok(Ok(response)) => {
                     tracing::info!(node = %id, epoch = response.membership_epoch, "joined the cluster");
                     joined = true;
+                    timeouts = 0;
                 }
                 Ok(Err(status)) => {
                     tracing::warn!(node = %id, %status, "can't join the cluster; will retry");
+                    timeouts = 0;
                     failing = true;
                     continue;
                 }
                 Err(_) => {
-                    tracing::warn!(node = %id, "joining the cluster timed out; will retry");
-                    client.reconnect();
+                    timeouts += 1;
+                    if timeouts >= STALLED_HEARTBEATS {
+                        tracing::warn!(node = %id, "joining the cluster keeps timing out; will retry on a new connection");
+                        client.reconnect();
+                        timeouts = 0;
+                    } else {
+                        tracing::debug!(node = %id, "joining the cluster timed out; will retry");
+                    }
                     failing = true;
                     continue;
                 }
             }
         }
-        match heartbeats.send(&id).await {
+        let sent = heartbeats.send(&id).await;
+        if sent.is_ok() {
+            timeouts = 0;
+        }
+        match sent {
             Ok(Ok(response)) => {
                 if failing {
                     tracing::info!(node = %id, "heartbeats are reaching the control plane again");
@@ -583,8 +602,14 @@ async fn heartbeat_loop(
                 failing = true;
             }
             Err(_) => {
-                tracing::warn!(node = %id, "heartbeat timed out; will retry on a new connection");
-                client.reconnect();
+                timeouts += 1;
+                if timeouts >= STALLED_HEARTBEATS {
+                    tracing::warn!(node = %id, "heartbeats keep timing out; will retry on a new connection");
+                    client.reconnect();
+                    timeouts = 0;
+                } else {
+                    tracing::debug!(node = %id, "heartbeat timed out; will retry");
+                }
                 failing = true;
             }
         }

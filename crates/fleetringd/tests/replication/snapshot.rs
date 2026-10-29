@@ -23,8 +23,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::common::{
-    Cluster, HANG_GUARD, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put, routes,
-    settings, sqlite, unhurried,
+    Cluster, HANG_GUARD, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put, role,
+    routes, settings, sqlite,
 };
 
 /// The size the CI run loads before adding a follower.
@@ -53,7 +53,7 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
     let settings = ReplicationSettings {
         // Generous, so a large transfer in a slow build isn't cut short.
         open_timeout: Duration::from_secs(600),
-        ..unhurried()
+        ..settings()
     };
     let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("grown");
@@ -331,11 +331,11 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
     assert!(staged(&databases).is_empty(), "{:?}", staged(&databases));
 
     // Seeding the copy again through a corrupted transfer fails and keeps the old copy.
-    cluster
-        .node("a")
-        .registry()
-        .execute(&db, put(1, 4_000))
-        .await?;
+    guarded(
+        "the write before seeding",
+        cluster.node("a").registry().execute(&db, put(1, 4_000)),
+    )
+    .await??;
     cluster.await_caught_up("a", &db).await?;
     let before = fs::read(follower.database_dir("tampered").join("data.db"))?;
     let wal_before = fs::read(follower.database_dir("tampered").join("data.db-wal"))?;
@@ -343,10 +343,11 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
         .lock()
         .expect("faults lock")
         .push_back(Fault::Corrupt);
-    let refused = follower
-        .replication
-        .seed(&db, &id("a"), LeaseEpoch::new(1))
-        .await;
+    let refused = guarded(
+        "the corrupted seed",
+        follower.replication.seed(&db, &id("a"), LeaseEpoch::new(1)),
+    )
+    .await?;
     assert!(
         matches!(&refused, Err(SeedError::Failed { reason, .. }) if reason.contains("checksum")),
         "{refused:?}"
@@ -362,10 +363,11 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
     assert!(staged(&databases).is_empty(), "{:?}", staged(&databases));
 
     // A clean transfer seeds it, and replication carries on from the snapshot's position.
-    let seeded = follower
-        .replication
-        .seed(&db, &id("a"), LeaseEpoch::new(1))
-        .await?;
+    let seeded = guarded(
+        "the clean seed",
+        follower.replication.seed(&db, &id("a"), LeaseEpoch::new(1)),
+    )
+    .await??;
     let primary = &cluster.node("a").replication;
     assert_eq!(
         seeded,
@@ -373,12 +375,125 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
     );
     // Seeding ended the follower's stream; the primary reopens it from the new copy.
     assert!(primary.await_writable(&db, HANG_GUARD).await);
-    cluster
-        .node("a")
-        .registry()
-        .execute(&db, put(2, 4_000))
-        .await?;
+    guarded(
+        "the write after seeding",
+        cluster.node("a").registry().execute(&db, put(2, 4_000)),
+    )
+    .await??;
     cluster.await_caught_up("a", &db).await?;
+    Ok(())
+}
+
+/// A seed that begins while a stream is still fetching its first copy ends that stream once the
+/// copy is in place, rather than waiting behind it for as long as the primary keeps it open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_during_a_streams_first_transfer_takes_over_the_copy() -> TestResult {
+    let faults = Arc::new(Mutex::new(VecDeque::from([Fault::Hold])));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (release, released) = watch::channel(false);
+    let wraps = BTreeMap::from([(
+        "a".to_owned(),
+        Tamper::wrap(Arc::clone(&faults), Arc::clone(&calls), released),
+    )]);
+    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), wraps).await?;
+    let db = name("contended");
+    let follower = cluster.node("b");
+
+    let created = cluster.create("a", &db, 2);
+    let seeded = async {
+        // The stream has admitted the epoch and holds the copy while its transfer is held.
+        eventually("the stream's transfer", || {
+            calls.load(Ordering::SeqCst) >= 1
+        })
+        .await?;
+        let primary = id("a");
+        let seeding = follower.replication.seed(&db, &primary, LeaseEpoch::new(1));
+        tokio::pin!(seeding);
+        // One poll begins the seed's session; it then waits for the stream to let go.
+        tokio::select! {
+            biased;
+            done = &mut seeding => return Err(format!("the seed ended early: {done:?}").into()),
+            () = std::future::ready(()) => {}
+        }
+        release.send_replace(true);
+        guarded("the seed", seeding).await??;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (created, seeded) = tokio::join!(created, seeded);
+    seeded?;
+    created?;
+    cluster.await_caught_up("a", &db).await?;
+    let status = follower.replication.follower_status(&db).ok_or("follows")?;
+    assert_eq!(
+        status.snapshots, 2,
+        "the stream's copy, then the seed's: {status:?}"
+    );
+    Ok(())
+}
+
+/// A fence that arrives while a seed waits for the copy goes first, and the seed, now at a stale
+/// epoch, then fails rather than change the copy the fence reported on. Neither waits for the
+/// other's turn forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_during_a_seeds_wait_goes_first_and_the_seed_then_fails() -> TestResult {
+    let faults = Arc::new(Mutex::new(VecDeque::from([Fault::Hold])));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (release, released) = watch::channel(false);
+    let wraps = BTreeMap::from([(
+        "a".to_owned(),
+        Tamper::wrap(Arc::clone(&faults), Arc::clone(&calls), released),
+    )]);
+    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), wraps).await?;
+    let db = name("fenced");
+    let primary = cluster.node("a");
+    let follower = cluster.node("b");
+    guarded("creating the database", primary.registry().create(&db)).await??;
+    primary.replication.serve_primary(db.clone(), role(2))?;
+
+    // The stream has admitted epoch 1 and holds the copy while its first transfer is held.
+    eventually("the stream's transfer", || {
+        calls.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+    let from = id("a");
+    let seeding = follower.replication.seed(&db, &from, LeaseEpoch::new(1));
+    tokio::pin!(seeding);
+    let service = follower.replication.service();
+    let fencing = service.fence(Request::new(FenceRequest {
+        database: db.to_string(),
+        epoch: 2,
+        ..FenceRequest::default()
+    }));
+    tokio::pin!(fencing);
+    // The seed's session begins, then the fence's, and the seed begins another behind the fence.
+    for _ in 0..2 {
+        tokio::select! {
+            biased;
+            done = &mut seeding => return Err(format!("the seed ended early: {done:?}").into()),
+            done = &mut fencing => return Err(format!("the fence ended early: {done:?}").into()),
+            () = std::future::ready(()) => {}
+        }
+    }
+    release.send_replace(true);
+    let (fenced, seeded) = guarded("the fence and the seed", async {
+        tokio::join!(fencing, seeding)
+    })
+    .await?;
+    let fenced = fenced?.into_inner();
+    assert!(
+        matches!(&seeded, Err(SeedError::Failed { reason, .. }) if reason.contains("older than epoch 2")),
+        "{seeded:?}"
+    );
+    let status = follower.replication.follower_status(&db).ok_or("follows")?;
+    assert_eq!(status.snapshots, 1, "only the stream's copy: {status:?}");
+    assert_eq!(
+        status
+            .position
+            .map(fleetringd::engine::Position::into_bytes)
+            .unwrap_or_default(),
+        fenced.position,
+        "the copy is where the fence reported it"
+    );
     Ok(())
 }
 
