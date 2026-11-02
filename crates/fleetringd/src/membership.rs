@@ -187,7 +187,7 @@ impl Membership {
             leave: Leave {
                 client,
                 id,
-                limit: interval,
+                limit: interval.max(LEAVE_FLOOR),
                 on_shutdown: settings.on_shutdown,
             },
         };
@@ -280,6 +280,12 @@ pub struct MembershipTasks {
     leave: Leave,
 }
 
+/// The least time a planned leave waits for the control plane's answer, however short the
+/// heartbeat interval is. A leave is one logged command plus a reply; on a loaded machine that
+/// takes longer than a test-sized heartbeat interval, and giving up early only costs a spurious
+/// warning after the control plane has already removed the member.
+const LEAVE_FLOOR: Duration = Duration::from_secs(2);
+
 /// How a node leaves the cluster when it shuts down gracefully.
 #[derive(Debug)]
 struct Leave {
@@ -296,9 +302,10 @@ impl MembershipTasks {
     ///
     /// Leaving tells the control plane that this is a planned departure rather than a failure:
     /// the member is removed at once, and the ring is rebuilt without it. If the control plane
-    /// doesn't answer within one heartbeat interval, the node stops anyway and is marked down
-    /// once its heartbeats are missed, as a node that stays is. Dropping the tasks instead stops
-    /// them without leaving.
+    /// doesn't answer within one heartbeat interval, or two seconds if that is longer, the node stops
+    /// anyway and is marked down once its heartbeats are missed, as a node that stays is. A
+    /// control plane that no longer knows the member has already removed it, which counts as
+    /// having left. Dropping the tasks instead stops them without leaving.
     pub async fn stop(mut self) {
         self.heartbeat.abort();
         let Leave {
@@ -314,6 +321,9 @@ impl MembershipTasks {
             match timeout(*limit, client.leave(request)).await {
                 Ok(Ok(response)) => {
                     tracing::info!(node = %id, epoch = response.membership_epoch, "left the cluster");
+                }
+                Ok(Err(status)) if status.code() == Code::NotFound => {
+                    tracing::info!(node = %id, "left the cluster; the control plane had already removed the member");
                 }
                 Ok(Err(status)) => tracing::warn!(node = %id, %status, "can't leave the cluster"),
                 Err(_) => tracing::warn!(node = %id, "leaving the cluster timed out"),
