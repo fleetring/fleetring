@@ -24,6 +24,9 @@ type TestResult = Result<(), Box<dyn Error>>;
 /// Guards against a hang only; nothing here asserts how long anything takes.
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
+/// The acknowledgement window the data daemons in these tests run with; see [`config_with`].
+const DATA_ACK_TIMEOUT_MS: u64 = 20_000;
+
 const DATA: [&str; 3] = ["data-1", "data-2", "data-3"];
 
 fn config(dir: &Path, id: &str, role: &str, control: Option<SocketAddr>) -> String {
@@ -41,9 +44,18 @@ fn config_with(
     let control = control.map_or_else(String::new, |address| {
         format!("\n[control]\naddress = \"{address}\"\n")
     });
+    // Data daemons wait longer than the production default for a follower's acknowledgement,
+    // which also bounds how long a new database waits for its followers to connect. Every test
+    // here runs four daemons, the tests run in parallel, and on a slow CI disk a follower can
+    // take more than five seconds to open a new database and acknowledge its first write.
+    let replication = if role == "data" {
+        format!("\n[replication]\nack_timeout_ms = {DATA_ACK_TIMEOUT_MS}\n")
+    } else {
+        String::new()
+    };
     format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
-         \n[membership]\nheartbeat_interval_ms = 100\n{membership_settings}{control}",
+         {replication}\n[membership]\nheartbeat_interval_ms = 100\n{membership_settings}{control}",
         dir.join(id)
     )
 }
