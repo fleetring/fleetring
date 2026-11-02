@@ -11,14 +11,18 @@
 //! - at most one node acknowledges writes for a database in any epoch (the history checker,
 //!   from the primary and epoch each acknowledgement names);
 //! - a failover moves writes within the lease duration plus the failover margin plus one second;
-//! - while the control node is down, the primary keeps acknowledging writes.
+//! - while the control node is down, the primary keeps acknowledging writes;
+//! - the lease watchers on every node saw each lease gained by the node control granted it to,
+//!   and nothing else ([`Cluster::finish`] checks it for every run; FR-042).
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::time::Duration;
 
 use fleetring_control::DatabaseName;
-use fleetringd::sim::{Ack, Cluster, CreateAndWrite, Operation, Outcome, Script, Timings, seeds};
+use fleetringd::sim::{
+    Ack, Cluster, CreateAndWrite, LeaseSeen, Operation, Outcome, Script, Timings, seeds,
+};
 
 use crate::{BINARY, TestResult};
 
@@ -233,6 +237,17 @@ fn no_acknowledged_write_lost(seed: u64) -> TestResult {
     assert!(
         primaries.len() >= 3,
         "writes were acknowledged by three primaries: {primaries:?}"
+    );
+    let gained: BTreeSet<(String, u64)> = report
+        .history()
+        .lease_observations()
+        .iter()
+        .filter(|observation| observation.seen() == LeaseSeen::Gained)
+        .map(|observation| (observation.node().to_owned(), observation.epoch().get()))
+        .collect();
+    assert!(
+        gained.len() >= 3,
+        "the lease watchers saw each failover's new primary gain its lease: {gained:?}"
     );
     Ok(())
 }

@@ -85,7 +85,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | done |
 | [FR-040](FR-040-turso-adapter.md) | Turso adapter: a self-replicating engine whose change stream reads `turso_cdc` | P2 | L | FR-039 | todo |
 | [FR-041](FR-041-replicated-sink-positions.md) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | todo |
-| [FR-042](FR-042-lease-watch.md) | `WatchLeases`: a stream of the leases this node gains and loses | P2 | M | FR-031, FR-037 | todo |
+| [FR-042](FR-042-lease-watch.md) | `WatchLeases`: a stream of the leases this node gains and loses | P2 | M | FR-031, FR-037 | done |
 | [FR-043](FR-043-keyed-leases.md) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029 | todo |
 | [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | todo |
 | [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032 | todo |

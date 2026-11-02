@@ -35,18 +35,24 @@
 //!   A write to a dropped database fails with `NOT_FOUND`.
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
+//! - **Lease watching:** `WatchLeases` streams the leases one node holds, from the node's own
+//!   view (FR-042): a snapshot, then a `Gained` or `Lost` event per change, each with its epoch.
+//!   A worker beside the node acts on the databases the node is primary for and stops when a
+//!   lease moves, without polling the control plane. [`Client::watch_leases`] opens the stream,
+//!   and `fleetringd watch-leases --node` prints it.
 
 mod client;
 pub(crate) mod convert;
 mod drain;
 mod lease;
+mod leases;
 mod node;
 mod redirect;
 mod service;
 
 pub use client::{
-    Client, DatabaseSpec, DurabilityChange, Location, NodeStatus, ReplicaInfo, ServedDatabase,
-    Written,
+    Client, DatabaseSpec, DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus,
+    ReplicaInfo, ServedDatabase, Written,
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};

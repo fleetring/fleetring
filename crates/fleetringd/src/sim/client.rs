@@ -11,15 +11,26 @@ use fleetring_proto::v1::{
 };
 
 use crate::control::rejection_status;
-use crate::data::{Client, DatabaseSpec};
+use crate::data::{Client, DatabaseSpec, LeaseUpdate};
 use crate::engine::{Statement, Value};
 use crate::environment::Network;
+use crate::replication::LeaseChange;
 use crate::sim::SimRng;
 use crate::sim::history::DurabilityMode;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
-use crate::sim::workload::{Ack, Operation, Outcome, Step, WRITES_TABLE, Workload};
+use crate::sim::workload::{
+    Ack, LeaseObservation, LeaseSeen, Operation, Outcome, Step, WRITES_TABLE, Workload,
+};
 use crate::transport::Backoff;
+
+/// How long a lease watcher waits before it tries a node again after a stream failed to open or
+/// ended.
+const WATCH_RETRY: Duration = Duration::from_millis(50);
+
+/// How long a lease watcher lets a stream stay silent before it opens a replacement: a crashed
+/// host's stream stalls rather than ends, and the replacement's snapshot catches the watcher up.
+const WATCH_IDLE: Duration = Duration::from_secs(1);
 
 /// Retries for simulated clients: quick, because simulated calls fail fast.
 const CLIENT_BACKOFF: Backoff = Backoff {
@@ -298,5 +309,93 @@ async fn submit(shared: &Shared, action: Action, ack: Ack) -> Outcome {
         Err(_) => Outcome::Indeterminate {
             code: Some(tonic::Code::Unavailable),
         },
+    }
+}
+
+/// What a lease watcher needs: the host it follows and where to record what it learns.
+pub(super) struct WatcherSession {
+    pub(super) name: String,
+    pub(super) node: String,
+    pub(super) address: String,
+    pub(super) timeout: Duration,
+    pub(super) shared: Shared,
+}
+
+/// A lease watcher: follows one data host's `WatchLeases` stream for the whole run, as a worker
+/// beside the node would, and records every snapshot entry and event in the history (FR-042).
+///
+/// It opens the stream again whenever it ends or fails, and replaces a stream that has been
+/// silent for [`WATCH_IDLE`] with a fresh one, swapping only once the replacement's snapshot has
+/// arrived, so that no change falls between two streams.
+pub(super) async fn run_lease_watcher(session: WatcherSession) -> turmoil::Result {
+    let WatcherSession {
+        name,
+        node,
+        address,
+        timeout,
+        shared,
+    } = session;
+    let open = || async {
+        // A fresh client each time: a connection to a crashed host stalls rather than fails.
+        let client = Client::new(address.clone(), Network::Simulated);
+        let mut updates = tokio::time::timeout(timeout, client.watch_leases(&address))
+            .await
+            .ok()?
+            .ok()?;
+        let first = tokio::time::timeout(timeout, updates.next()).await.ok()?;
+        match first {
+            Ok(Some(update)) => {
+                record_lease_update(&shared, &name, &node, &update);
+                Some(updates)
+            }
+            _ => None,
+        }
+    };
+    loop {
+        let Some(mut updates) = open().await else {
+            tokio::time::sleep(WATCH_RETRY).await;
+            continue;
+        };
+        loop {
+            match tokio::time::timeout(WATCH_IDLE, updates.next()).await {
+                Ok(Ok(Some(update))) => record_lease_update(&shared, &name, &node, &update),
+                Ok(Ok(None) | Err(_)) => break,
+                Err(_) => {
+                    if let Some(replacement) = open().await {
+                        updates = replacement;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(WATCH_RETRY).await;
+    }
+}
+
+fn record_lease_update(shared: &Shared, watcher: &str, node: &str, update: &LeaseUpdate) {
+    let at = turmoil::sim_elapsed().unwrap_or_default();
+    let observations: Vec<LeaseObservation> = match update {
+        LeaseUpdate::Snapshot { leases, .. } => leases
+            .iter()
+            .map(|(database, epoch)| {
+                LeaseObservation::new(node, at, database.clone(), *epoch, LeaseSeen::Held)
+            })
+            .collect(),
+        LeaseUpdate::Event(event) => {
+            let seen = match event.change {
+                LeaseChange::Gained => LeaseSeen::Gained,
+                LeaseChange::Lost => LeaseSeen::Lost,
+            };
+            vec![LeaseObservation::new(
+                node,
+                at,
+                event.database.clone(),
+                event.epoch,
+                seen,
+            )]
+        }
+    };
+    for observation in observations {
+        shared.record(watcher, EventKind::Lease(observation.clone()));
+        shared.lock().history.observe_lease(observation);
     }
 }

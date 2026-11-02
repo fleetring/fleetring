@@ -22,7 +22,7 @@ use crate::layout;
 use crate::replication::{Replication, ReplicationSettings};
 use crate::sim::SimRng;
 use crate::sim::check::{self, ControlLog, ReplicaRows, Violation};
-use crate::sim::client::{Session, run_client};
+use crate::sim::client::{Session, WatcherSession, run_client, run_lease_watcher};
 use crate::sim::fault::{Fault, LossRate};
 use crate::sim::history::{self, Guarantee, Replicated};
 use crate::sim::host::{Shared, WorkloadState, run_host};
@@ -266,6 +266,7 @@ impl ClusterBuilder {
             control,
             down: BTreeSet::new(),
             clients: Vec::new(),
+            watchers: Vec::new(),
             partitions: BTreeSet::new(),
             root,
         };
@@ -284,6 +285,10 @@ impl ClusterBuilder {
                 configure(&mut config);
             }
             cluster.add_host(name, *role, config, data_dir);
+        }
+        let data_hosts: Vec<String> = cluster.data_hosts().map(str::to_owned).collect();
+        for name in data_hosts {
+            cluster.add_lease_watcher(&name);
         }
         Ok(cluster)
     }
@@ -389,6 +394,8 @@ pub struct Cluster {
     down: BTreeSet<String>,
     /// Client hosts, in the order they were added.
     clients: Vec<String>,
+    /// The lease watcher hosts, one per data host.
+    watchers: Vec<String>,
     /// Links the test has partitioned and not repaired, each as an ordered pair.
     partitions: BTreeSet<(String, String)>,
     root: TempDir,
@@ -437,6 +444,21 @@ impl Cluster {
             data_dir,
             config,
         });
+    }
+
+    /// Adds the lease watcher that follows data host `node`'s `WatchLeases` stream for the
+    /// whole run (FR-042), on a client host of its own named [`lease_watcher`].
+    fn add_lease_watcher(&mut self, node: &str) {
+        let name = lease_watcher(node);
+        self.watchers.push(name.clone());
+        let session = WatcherSession {
+            name: name.clone(),
+            node: node.to_owned(),
+            address: format!("{node}:{PORT}"),
+            timeout: self.operation_timeout,
+            shared: self.shared.clone(),
+        };
+        self.sim.client(name, run_lease_watcher(session));
     }
 
     /// Returns the seed.
@@ -969,6 +991,7 @@ impl Cluster {
             .iter()
             .map(|other| other.name.clone())
             .chain(self.clients.iter().cloned())
+            .chain(self.watchers.iter().cloned())
             .filter(|other| other != host)
             .collect();
         for other in &others {
@@ -1082,9 +1105,10 @@ impl Cluster {
     }
 
     /// Stops every host gracefully and runs the final checks: the history checker
-    /// ([`Cluster::check_history`]) over the whole history and every host's copy on disk, and
-    /// the control log replays to the state the control node last published, which holds every
-    /// acknowledged control operation.
+    /// ([`Cluster::check_history`]) over the whole history and every host's copy on disk, the
+    /// control log replays to the state the control node last published, which holds every
+    /// acknowledged control operation, and what the lease watchers learned matches the leases
+    /// the log granted ([`check::lease_events_match_control`]).
     ///
     /// # Errors
     ///
@@ -1122,12 +1146,19 @@ impl Cluster {
         }
         let trace = self.trace();
         let history = self.history();
+        check::lease_events_match_control(&history, log.lease_holders())?;
         Ok(Report {
             trace,
             history,
             log,
         })
     }
+}
+
+/// The name of the client host that watches data host `node`'s leases.
+#[must_use]
+pub fn lease_watcher(node: &str) -> String {
+    format!("{node}-leases")
 }
 
 impl Drop for Cluster {

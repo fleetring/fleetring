@@ -553,8 +553,110 @@ impl fmt::Display for HistoryEvent<'_> {
     }
 }
 
+/// How a lease watcher learned that a node holds, or held, a lease (FR-042).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeaseSeen {
+    /// The lease was in the snapshot a `WatchLeases` stream opened with.
+    Held,
+    /// The stream reported the lease gained.
+    Gained,
+    /// The stream reported the lease lost; the epoch is the one that ended.
+    Lost,
+}
+
+impl fmt::Display for LeaseSeen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Held => "held",
+            Self::Gained => "gained",
+            Self::Lost => "lost",
+        })
+    }
+}
+
+/// One thing a `WatchLeases` subscriber learned about the leases a node holds (FR-042).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseObservation {
+    node: String,
+    at: Duration,
+    database: DatabaseName,
+    epoch: LeaseEpoch,
+    seen: LeaseSeen,
+}
+
+impl LeaseObservation {
+    /// What the watcher of `node` learned at `at`.
+    #[must_use]
+    pub fn new(
+        node: impl Into<String>,
+        at: Duration,
+        database: DatabaseName,
+        epoch: LeaseEpoch,
+        seen: LeaseSeen,
+    ) -> Self {
+        Self {
+            node: node.into(),
+            at,
+            database,
+            epoch,
+            seen,
+        }
+    }
+
+    /// Returns the host whose leases were watched.
+    #[must_use]
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// Returns the simulated time the watcher learned it.
+    #[must_use]
+    pub fn at(&self) -> Duration {
+        self.at
+    }
+
+    /// Returns the database.
+    #[must_use]
+    pub fn database(&self) -> &DatabaseName {
+        &self.database
+    }
+
+    /// Returns the lease's epoch.
+    #[must_use]
+    pub fn epoch(&self) -> LeaseEpoch {
+        self.epoch
+    }
+
+    /// Returns how the watcher learned it.
+    #[must_use]
+    pub fn seen(&self) -> LeaseSeen {
+        self.seen
+    }
+
+    /// Whether the observation says the node holds, or held, the lease: a snapshot entry or a
+    /// gain, as opposed to a loss.
+    #[must_use]
+    pub fn is_holding(&self) -> bool {
+        matches!(self.seen, LeaseSeen::Held | LeaseSeen::Gained)
+    }
+}
+
+impl fmt::Display for LeaseObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:>8}ms {} {} {} epoch {}",
+            self.at.as_millis(),
+            self.node,
+            self.seen,
+            self.database,
+            self.epoch.get()
+        )
+    }
+}
+
 /// Every operation clients sent: the finished ones in completion order, and the ones still in
-/// flight.
+/// flight; and everything the lease watchers learned, in the order they learned it.
 ///
 /// The harness fills it as clients run; a test builds one by hand with [`History::begin`] and
 /// [`History::complete`], or [`History::record`], to exercise the checkers.
@@ -563,6 +665,7 @@ pub struct History {
     next_id: u64,
     records: Vec<Record>,
     pending: BTreeMap<OperationId, Pending>,
+    leases: Vec<LeaseObservation>,
 }
 
 impl History {
@@ -694,6 +797,17 @@ impl History {
                 }
                 _ => None,
             })
+    }
+
+    /// Records what a lease watcher learned.
+    pub fn observe_lease(&mut self, observation: LeaseObservation) {
+        self.leases.push(observation);
+    }
+
+    /// Returns everything the lease watchers learned, in the order they learned it.
+    #[must_use]
+    pub fn lease_observations(&self) -> &[LeaseObservation] {
+        &self.leases
     }
 
     /// Returns how many operations finished.

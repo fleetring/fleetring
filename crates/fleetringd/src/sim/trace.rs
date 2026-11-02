@@ -7,7 +7,7 @@ use std::time::Duration;
 use fleetring::Fingerprint;
 
 use crate::sim::fault::Fault;
-use crate::sim::workload::{Operation, Outcome};
+use crate::sim::workload::{LeaseObservation, Operation, Outcome};
 
 /// The source of the events the test itself records: faults and notes.
 pub const DRIVER: &str = "sim";
@@ -88,6 +88,8 @@ pub enum EventKind {
     },
     /// A client's workload finished.
     WorkloadDone,
+    /// A lease watcher learned that a node holds, gained, or lost a lease (FR-042).
+    Lease(LeaseObservation),
     /// A free-form note from the test.
     Note(String),
 }
@@ -112,6 +114,14 @@ impl fmt::Display for EventKind {
             }
             Self::Operation { operation, outcome } => write!(f, "{operation} -> {outcome}"),
             Self::WorkloadDone => f.write_str("workload done"),
+            Self::Lease(observation) => write!(
+                f,
+                "lease {} {} {} epoch {}",
+                observation.node(),
+                observation.seen(),
+                observation.database(),
+                observation.epoch().get()
+            ),
             Self::Note(note) => write!(f, "note {note}"),
         }
     }

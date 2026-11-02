@@ -75,6 +75,14 @@
 //! corrupt transfer is removed and restarts from the beginning; the database's place only ever
 //! holds a complete copy, or none. Staging directories a crash left behind are removed when
 //! replication starts.
+//!
+//! # Leases
+//!
+//! [`Replication::leases`] watches the databases this node serves as primary, each with its
+//! epoch, for the `WatchLeases` stream (FR-042). A database joins the set before its primary can
+//! take a batch, and leaves it before the primary is removed, so [`LeaseChange::Gained`] is
+//! visible before the first write under the epoch is acknowledged and [`LeaseChange::Lost`]
+//! before the node stops answering for the database.
 
 mod archive;
 mod epochs;
@@ -385,7 +393,12 @@ struct Inner {
     /// [`ended_streams`]: Replication::ended_streams
     ended: watch::Sender<BTreeMap<DatabaseName, u64>>,
     /// The databases this node serves as primary, each with its epoch, for the change streams
-    /// that follow them (FR-039).
+    /// that follow them (FR-039) and the lease watch (FR-042).
+    ///
+    /// It changes under the `primaries` lock, and before `primaries` does: a database is in
+    /// here before its primary can take a batch, and gone from here before its primary is
+    /// removed, so a watcher learns of a lease before the first write under it is acknowledged
+    /// and of its loss before the node stops answering.
     served: watch::Sender<BTreeMap<DatabaseName, LeaseEpoch>>,
     registry: OnceLock<Registry>,
     primaries: Mutex<BTreeMap<DatabaseName, Served>>,
@@ -532,14 +545,14 @@ impl Replication {
             Arc::clone(&self.inner),
             Arc::clone(&primary),
         ));
-        let previous = self
-            .inner
-            .lock_primaries()
-            .insert(database.clone(), Served { primary, driver });
+        let previous = {
+            let mut primaries = self.inner.lock_primaries();
+            self.inner.served.send_modify(|served| {
+                served.insert(database.clone(), role.epoch);
+            });
+            primaries.insert(database, Served { primary, driver })
+        };
         drop(previous);
-        self.inner.served.send_modify(|served| {
-            served.insert(database, role.epoch);
-        });
         Ok(())
     }
 
@@ -550,11 +563,8 @@ impl Replication {
     ///
     /// If the replication state's lock was poisoned by a panic in another thread.
     pub fn stop_primary(&self, database: &DatabaseName) {
-        let removed = self.inner.lock_primaries().remove(database);
+        let removed = self.inner.withdraw_primary(database);
         drop(removed);
-        self.inner.served.send_modify(|served| {
-            served.remove(database);
-        });
     }
 
     /// Stops every primary's streams.
@@ -563,15 +573,36 @@ impl Replication {
     ///
     /// If the replication state's lock was poisoned by a panic in another thread.
     pub fn stop(&self) {
-        let primaries = std::mem::take(&mut *self.inner.lock_primaries());
+        let primaries = {
+            let mut primaries = self.inner.lock_primaries();
+            self.inner.served.send_modify(BTreeMap::clear);
+            std::mem::take(&mut *primaries)
+        };
         drop(primaries);
-        self.inner.served.send_modify(BTreeMap::clear);
+    }
+
+    /// Takes `database` out of the leases this node reports holding, ahead of the step down
+    /// that follows, so that a lease watcher hears of the loss before the node stops answering
+    /// for the database. The primary keeps running until [`demote`](Self::demote) or
+    /// [`stop_primary`](Self::stop_primary) removes it.
+    pub(crate) fn withdraw(&self, database: &DatabaseName) {
+        self.inner.served.send_modify(|served| {
+            served.remove(database);
+        });
     }
 
     /// The databases this node serves as primary, each with its epoch, as they change. A change
     /// stream starts a pump for each one it is configured for (FR-039).
     pub(crate) fn served(&self) -> watch::Receiver<BTreeMap<DatabaseName, LeaseEpoch>> {
         self.inner.served.subscribe()
+    }
+
+    /// A watch over the leases this node holds, for a `WatchLeases` stream (FR-042).
+    #[must_use]
+    pub fn leases(&self) -> LeaseWatch {
+        LeaseWatch {
+            served: self.inner.served.subscribe(),
+        }
     }
 
     /// A feed of `database`'s acknowledged positions, if this node is its primary.
@@ -797,6 +828,110 @@ impl DatabaseStatuses for Replication {
     }
 }
 
+/// Whether a lease event says a lease was gained or lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeaseChange {
+    /// The node started serving the database at the event's epoch.
+    Gained,
+    /// The node stopped serving the database; the event's epoch is the one that ended.
+    Lost,
+}
+
+impl fmt::Display for LeaseChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Gained => "gained",
+            Self::Lost => "lost",
+        })
+    }
+}
+
+/// One change in the leases a node holds, as a `WatchLeases` stream reports it (FR-042).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct LeaseEvent {
+    /// The database.
+    pub database: DatabaseName,
+    /// The epoch gained, or the one that ended.
+    pub epoch: LeaseEpoch,
+    /// Gained or lost.
+    pub change: LeaseChange,
+}
+
+impl LeaseEvent {
+    /// The event that `database` was gained or lost at `epoch`.
+    #[must_use]
+    pub fn new(database: DatabaseName, epoch: LeaseEpoch, change: LeaseChange) -> Self {
+        Self {
+            database,
+            epoch,
+            change,
+        }
+    }
+}
+
+impl fmt::Display for LeaseEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} epoch {}",
+            self.change,
+            self.database,
+            self.epoch.get()
+        )
+    }
+}
+
+/// The events that take the leases a node holds from `before` to `after`: for each database, a
+/// `Lost` for an epoch that ended and a `Gained` for one that began, in database name order.
+#[must_use]
+pub fn lease_events(
+    before: &BTreeMap<DatabaseName, LeaseEpoch>,
+    after: &BTreeMap<DatabaseName, LeaseEpoch>,
+) -> Vec<LeaseEvent> {
+    let mut events = Vec::new();
+    for (database, epoch) in before {
+        if after.get(database) != Some(epoch) {
+            events.push(LeaseEvent::new(database.clone(), *epoch, LeaseChange::Lost));
+        }
+    }
+    for (database, epoch) in after {
+        if before.get(database) != Some(epoch) {
+            events.push(LeaseEvent::new(
+                database.clone(),
+                *epoch,
+                LeaseChange::Gained,
+            ));
+        }
+    }
+    events
+}
+
+/// A watch over the leases one node holds, as [`Replication::leases`] hands it out: the
+/// databases it serves as primary, each with its epoch, and the events that change them.
+///
+/// Changes between two reads are folded together: a watcher that reads late sees the net
+/// change, never an event out of epoch order.
+#[derive(Debug)]
+pub struct LeaseWatch {
+    served: watch::Receiver<BTreeMap<DatabaseName, LeaseEpoch>>,
+}
+
+impl LeaseWatch {
+    /// The leases the node holds now, and marks them as seen, so that the next
+    /// [`changed`](Self::changed) waits for a later change.
+    #[must_use]
+    pub fn held(&mut self) -> BTreeMap<DatabaseName, LeaseEpoch> {
+        self.served.borrow_and_update().clone()
+    }
+
+    /// Waits until the leases change after the last [`held`](Self::held). Returns `false` once
+    /// replication has stopped, after which nothing changes.
+    pub async fn changed(&mut self) -> bool {
+        self.served.changed().await.is_ok()
+    }
+}
+
 /// What a change stream's pump reads from a database's primary: how far the write quorum has
 /// got, so that the pump never hands out a batch the quorum doesn't hold (FR-039).
 ///
@@ -938,6 +1073,16 @@ impl Inner {
             .map(|served| Arc::clone(&served.primary))
     }
 
+    /// Removes `database`'s primary, after taking the database out of `served`, both under the
+    /// primaries lock. The caller drops what is returned outside the lock.
+    fn withdraw_primary(&self, database: &DatabaseName) -> Option<Served> {
+        let mut primaries = self.lock_primaries();
+        self.served.send_modify(|served| {
+            served.remove(database);
+        });
+        primaries.remove(database)
+    }
+
     fn slot(&self, database: &DatabaseName) -> Arc<FollowerSlot> {
         Arc::clone(self.lock_followers().entry(database.clone()).or_default())
     }
@@ -1007,6 +1152,9 @@ const _: () = {
     assert_debug_send_sync::<FollowerProgress>();
     assert_debug_send_sync::<PromotionRequest>();
     assert_debug_send_sync::<FollowerStatus>();
+    assert_debug_send_sync::<LeaseChange>();
+    assert_debug_send_sync::<LeaseEvent>();
+    assert_debug_send_sync::<LeaseWatch>();
     assert_debug_send_sync::<PrimaryFeed>();
     assert_debug_send_sync::<PrimaryRole>();
     assert_debug_send_sync::<PrimaryStatus>();

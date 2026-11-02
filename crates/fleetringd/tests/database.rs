@@ -4,16 +4,18 @@
 //! operating system picks. Writes replicate to their followers through the daemons' own
 //! `Replication` services (FR-030).
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::ReplicationFactor;
-use fleetring_control::{Acks, DatabaseName, Durability, Liveness, Role};
+use fleetring_control::{Acks, DatabaseName, Durability, LeaseEpoch, Liveness, Role};
 use fleetring_proto::v1::ExecuteRequest;
-use fleetringd::data::{Client, DatabaseSpec, Location, primary_hint};
+use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, LeaseUpdates, Location, primary_hint};
 use fleetringd::engine::{Statement, Value};
+use fleetringd::replication::{LeaseChange, LeaseEvent};
 use fleetringd::transport::database_client;
 use fleetringd::{Config, Daemon, Network};
 use tonic::Code;
@@ -1705,5 +1707,130 @@ async fn draining_a_node_moves_its_primaries_while_a_client_keeps_writing() -> T
         );
     }
     Cluster { control, data }.stop().await;
+    Ok(())
+}
+
+/// The next event on `updates`, failing instead of hanging.
+async fn next_lease_event(updates: &mut LeaseUpdates) -> Result<LeaseEvent, Box<dyn Error>> {
+    match tokio::time::timeout(HANG_GUARD, updates.next()).await?? {
+        Some(LeaseUpdate::Event(event)) => Ok(event),
+        other => Err(format!("expected a lease event, got {other:?}").into()),
+    }
+}
+
+/// The snapshot a fresh stream on `address` starts with.
+async fn lease_snapshot(
+    client: &Client,
+    address: &str,
+) -> Result<(LeaseUpdates, BTreeMap<DatabaseName, LeaseEpoch>), Box<dyn Error>> {
+    let mut updates = client.watch_leases(address).await?;
+    match tokio::time::timeout(HANG_GUARD, updates.next()).await?? {
+        Some(LeaseUpdate::Snapshot { leases, .. }) => Ok((updates, leases)),
+        other => Err(format!("expected a snapshot first, got {other:?}").into()),
+    }
+}
+
+/// `WatchLeases` on every data node (FR-042): each stream starts with a snapshot, the node that
+/// takes a database's first lease reports it gained at epoch 1, a drain reports it lost at epoch
+/// 1 on the old primary and gained at epoch 2 on the new one, and a stream opened afterwards
+/// starts from the current leases with no stale event. The control node, which hosts no data,
+/// answers `UNIMPLEMENTED` as it does every database call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_leases_streams_the_leases_each_node_gains_and_loses() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let client = cluster.client()?;
+    let addresses: BTreeMap<String, String> = cluster
+        .data
+        .iter()
+        .map(|daemon| {
+            (
+                daemon.config().node.id.to_string(),
+                daemon.listen_address().to_string(),
+            )
+        })
+        .collect();
+    let mut watchers = BTreeMap::new();
+    for (id, address) in &addresses {
+        let mut updates = client.watch_leases(address).await?;
+        match tokio::time::timeout(HANG_GUARD, updates.next()).await?? {
+            Some(LeaseUpdate::Snapshot { node, leases }) => {
+                assert_eq!(node.as_str(), id);
+                assert!(leases.is_empty(), "{id} holds nothing yet: {leases:?}");
+            }
+            other => return Err(format!("expected a snapshot first, got {other:?}").into()),
+        }
+        watchers.insert(id.clone(), updates);
+    }
+    let refused = client
+        .watch_leases(&cluster.control_address()?)
+        .await
+        .expect_err("the control node hosts no data");
+    assert_eq!(refused.code(), Code::Unimplemented, "{refused}");
+
+    let notes = name("notes")?;
+    let created = client.create_database(&notes, three()?).await?;
+    let primary = created.primary.ok_or("no primary")?.to_string();
+    client
+        .execute(&notes, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    let gained = next_lease_event(watchers.get_mut(&primary).ok_or("no watcher")?).await?;
+    assert_eq!(
+        gained,
+        LeaseEvent::new(notes.clone(), LeaseEpoch::new(1), LeaseChange::Gained)
+    );
+
+    let drained: fleetring::NodeId = primary.parse()?;
+    client.drain_node(&drained).await?;
+    let lost = next_lease_event(watchers.get_mut(&primary).ok_or("no watcher")?).await?;
+    assert_eq!(
+        lost,
+        LeaseEvent::new(notes.clone(), LeaseEpoch::new(1), LeaseChange::Lost)
+    );
+    wait_until("the lease has moved", async || {
+        client
+            .locate(&notes)
+            .await
+            .is_ok_and(|location| location.epoch.get() == 2 && location.primary.is_some())
+    })
+    .await?;
+    let moved_to = client
+        .locate(&notes)
+        .await?
+        .primary
+        .ok_or("no new primary")?
+        .to_string();
+    assert_ne!(moved_to, primary);
+    let gained = next_lease_event(watchers.get_mut(&moved_to).ok_or("no watcher")?).await?;
+    assert_eq!(
+        gained,
+        LeaseEvent::new(notes.clone(), LeaseEpoch::new(2), LeaseChange::Gained)
+    );
+    // The node that answers for the database at epoch 2 reported it before it took a write.
+    let written = client
+        .execute(
+            &notes,
+            Statement::with_params("INSERT INTO t VALUES (?)", [Value::Integer(1)]),
+        )
+        .await?;
+    assert_eq!(written.epoch.get(), 2);
+    assert_eq!(
+        written.primary.map(|id| id.to_string()),
+        Some(moved_to.clone())
+    );
+
+    // A stream opened now starts from the current leases, with no stale event before them.
+    let (mut fresh, held) = lease_snapshot(&client, &addresses[&moved_to]).await?;
+    assert_eq!(held, BTreeMap::from([(notes.clone(), LeaseEpoch::new(2))]));
+    let (mut old, held) = lease_snapshot(&client, &addresses[&primary]).await?;
+    assert!(held.is_empty(), "the drained node holds nothing: {held:?}");
+    let quiet = Duration::from_millis(300);
+    for stream in [&mut fresh, &mut old] {
+        assert!(
+            tokio::time::timeout(quiet, stream.next()).await.is_err(),
+            "a fresh stream replays nothing"
+        );
+    }
+    cluster.stop().await;
     Ok(())
 }

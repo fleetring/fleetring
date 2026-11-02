@@ -14,7 +14,9 @@
 //!   and at the end, and [`replicas_converged`] once the network heals
 //!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged));
 //! - [`change_stream_consistent`] at the end, for every file sink a host is configured with
-//!   ([`Cluster::check_change_streams`](crate::sim::Cluster::check_change_streams)).
+//!   ([`Cluster::check_change_streams`](crate::sim::Cluster::check_change_streams));
+//! - [`lease_events_match_control`] at the end, over what the lease watchers learned and the
+//!   leases the control log granted (FR-042).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -56,6 +58,11 @@ pub enum Invariant {
     /// A change sink's file holds the database's writes in commit order, with no gap and no
     /// write that was refused or never made (FR-039).
     ChangeStreamConsistent,
+    /// What the lease watchers learned matches the leases control granted (FR-042): a node
+    /// reports holding a database only at an epoch control leased to it, no two nodes report
+    /// holding one epoch, each node's events for a database arrive in epoch order, and every
+    /// epoch a node acknowledged writes under was reported by that node.
+    LeaseEventsMatchControl,
 }
 
 impl fmt::Display for Invariant {
@@ -72,6 +79,7 @@ impl fmt::Display for Invariant {
             Self::MonotonicReads => "monotonic reads",
             Self::ReplicasConverged => "replicas converged",
             Self::ChangeStreamConsistent => "change stream consistent",
+            Self::LeaseEventsMatchControl => "lease events match control",
         })
     }
 }
@@ -183,11 +191,15 @@ pub fn ring_converged<'a>(
     Ok(())
 }
 
+/// Who held each database's lease at each epoch: what control granted, by database and epoch.
+pub type LeaseHolders = BTreeMap<(DatabaseName, LeaseEpoch), NodeId>;
+
 /// What [`control_log_replays`] read from a control log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlLog {
     state: State,
     commands: Vec<Command>,
+    holders: LeaseHolders,
 }
 
 impl ControlLog {
@@ -201,6 +213,12 @@ impl ControlLog {
     #[must_use]
     pub fn commands(&self) -> &[Command] {
         &self.commands
+    }
+
+    /// Returns the holder of each database's lease at each epoch the log ever granted one at.
+    #[must_use]
+    pub fn lease_holders(&self) -> &LeaseHolders {
+        &self.holders
     }
 
     /// Returns the recovered state, consuming the record.
@@ -235,9 +253,11 @@ pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
         .map(|(_, command)| command)
         .collect();
     let mut replayed = State::new(log.genesis());
+    let mut holders = LeaseHolders::new();
     for command in &commands {
         // A rejected command changes nothing, in recovery as in the replay.
         let _outcome = apply(&mut replayed, command.clone());
+        record_holders(&replayed, &mut holders);
     }
     if recovered.state != replayed {
         return Err(violation(format!(
@@ -248,7 +268,20 @@ pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
     Ok(ControlLog {
         state: recovered.state,
         commands,
+        holders,
     })
+}
+
+/// Records every lease `state` holds now in `holders`. A lease's epoch names one holder for good,
+/// so a holder already recorded for an epoch stays.
+fn record_holders(state: &State, holders: &mut LeaseHolders) {
+    for database in state.databases() {
+        if let Some(lease) = database.lease() {
+            holders
+                .entry((database.name().clone(), lease.epoch()))
+                .or_insert_with(|| lease.holder().clone());
+        }
+    }
 }
 
 /// Checks that `state` holds everything `history` says was acknowledged: every joined member
@@ -417,6 +450,95 @@ pub(crate) fn conflicting_primaries(history: &History) -> Option<PrimaryConflict
         }
     }
     None
+}
+
+/// Checks what the lease watchers learned ([`History::lease_observations`]) against the leases
+/// control granted, `holders` (FR-042):
+///
+/// - a node reports holding a database, in a snapshot or as gained, only at an epoch control
+///   leased to that node;
+/// - no two nodes report holding a database at one epoch;
+/// - each node's events for a database arrive in epoch order;
+/// - every epoch a node acknowledged writes under, as the history records them, was reported
+///   held or gained by that node, since a node reports a lease before it acknowledges a write
+///   under it.
+///
+/// # Errors
+///
+/// [`Invariant::LeaseEventsMatchControl`] naming the first observation that breaks it.
+pub fn lease_events_match_control(
+    history: &History,
+    holders: &LeaseHolders,
+) -> Result<(), Violation> {
+    let violation = |detail: String| Violation::new(Invariant::LeaseEventsMatchControl, detail);
+    let observations = history.lease_observations();
+    let mut reported: BTreeMap<(&DatabaseName, LeaseEpoch), &str> = BTreeMap::new();
+    let mut last_epoch: BTreeMap<(&str, &DatabaseName), LeaseEpoch> = BTreeMap::new();
+    for observation in observations {
+        let key = (observation.database(), observation.epoch());
+        if observation.is_holding() {
+            match holders.get(&(observation.database().clone(), observation.epoch())) {
+                Some(holder) if holder.as_str() == observation.node() => {}
+                Some(holder) => {
+                    return Err(violation(format!(
+                        "{observation}: control leased that epoch to {holder}"
+                    )));
+                }
+                None => {
+                    return Err(violation(format!(
+                        "{observation}: control never leased that epoch"
+                    )));
+                }
+            }
+            match reported.get(&key) {
+                Some(other) if *other != observation.node() => {
+                    return Err(violation(format!(
+                        "{observation}: {other} reported holding it too"
+                    )));
+                }
+                _ => {
+                    reported.insert(key, observation.node());
+                }
+            }
+        }
+        let order = (observation.node(), observation.database());
+        if let Some(last) = last_epoch.get(&order)
+            && observation.epoch() < *last
+        {
+            return Err(violation(format!(
+                "{observation}: after epoch {} on the same stream",
+                last.get()
+            )));
+        }
+        last_epoch.insert(order, observation.epoch());
+    }
+    for record in history.records() {
+        let (
+            Operation::Write { database, .. },
+            Some(Ack::Written {
+                primary: Some(primary),
+                epoch,
+                ..
+            }),
+        ) = (record.operation(), record.outcome().ack())
+        else {
+            continue;
+        };
+        let covered = observations.iter().any(|observation| {
+            observation.is_holding()
+                && observation.node() == primary.as_str()
+                && observation.database() == database
+                && observation.epoch() == *epoch
+        });
+        if !covered {
+            return Err(violation(format!(
+                "{primary} acknowledged write {} to {database} at epoch {}, but its watcher never saw it hold that lease",
+                record.id(),
+                epoch.get()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The rows each replica of a database holds, by host.
@@ -619,7 +741,7 @@ mod tests {
     use fleetring_control::{Action, Command, Member, Millis, Timestamp};
 
     use super::*;
-    use crate::sim::workload::Outcome;
+    use crate::sim::workload::{LeaseObservation, LeaseSeen, Outcome};
 
     fn acknowledged(operation: Operation, ack: Ack) -> (Operation, Outcome) {
         (operation, Outcome::Acknowledged(ack))
@@ -773,6 +895,64 @@ mod tests {
         assert!(violation.detail().contains("write 2"), "{violation}");
         let violation = replicas_converged(&db, &replicas).expect_err("they differ");
         assert_eq!(violation.invariant(), Invariant::ReplicasConverged);
+    }
+
+    fn seen(node: &str, at: u64, epoch: u64, seen: LeaseSeen) -> LeaseObservation {
+        LeaseObservation::new(
+            node,
+            Duration::from_millis(at),
+            "db".parse().expect("name"),
+            LeaseEpoch::new(epoch),
+            seen,
+        )
+    }
+
+    #[test]
+    fn lease_observations_are_held_to_the_leases_control_granted() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let holders = LeaseHolders::from([
+            ((db.clone(), LeaseEpoch::new(1)), "a".parse().expect("id")),
+            ((db.clone(), LeaseEpoch::new(2)), "b".parse().expect("id")),
+        ]);
+        let mut history = History::default();
+        history.observe_lease(seen("a", 1, 1, LeaseSeen::Held));
+        history.observe_lease(seen("a", 5, 1, LeaseSeen::Lost));
+        history.observe_lease(seen("b", 6, 2, LeaseSeen::Gained));
+        history.push(written_by(1, "a", 1));
+        history.push(written_by(2, "b", 2));
+        assert_eq!(lease_events_match_control(&history, &holders), Ok(()));
+
+        let mut wrong_holder = history.clone();
+        wrong_holder.observe_lease(seen("c", 7, 2, LeaseSeen::Gained));
+        let violation =
+            lease_events_match_control(&wrong_holder, &holders).expect_err("c never held it");
+        assert_eq!(violation.invariant(), Invariant::LeaseEventsMatchControl);
+        assert!(
+            violation.detail().contains("leased that epoch to b"),
+            "{violation}"
+        );
+
+        let mut unknown_epoch = history.clone();
+        unknown_epoch.observe_lease(seen("b", 8, 3, LeaseSeen::Gained));
+        let violation =
+            lease_events_match_control(&unknown_epoch, &holders).expect_err("no epoch 3");
+        assert!(violation.detail().contains("never leased"), "{violation}");
+
+        let mut out_of_order = history.clone();
+        out_of_order.observe_lease(seen("b", 9, 1, LeaseSeen::Lost));
+        let violation =
+            lease_events_match_control(&out_of_order, &holders).expect_err("epoch 1 after 2");
+        assert!(violation.detail().contains("after epoch 2"), "{violation}");
+
+        let mut unseen_write = History::default();
+        unseen_write.observe_lease(seen("a", 1, 1, LeaseSeen::Held));
+        unseen_write.push(written_by(3, "b", 2));
+        let violation = lease_events_match_control(&unseen_write, &holders)
+            .expect_err("b's watcher saw nothing");
+        assert!(
+            violation.detail().contains("never saw it hold"),
+            "{violation}"
+        );
     }
 
     #[test]
