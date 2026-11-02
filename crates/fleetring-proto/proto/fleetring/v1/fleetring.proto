@@ -418,6 +418,47 @@ service Database {
   // What this node knows on its own, without asking the control plane: its membership epoch and
   // ring fingerprint, and the databases it serves with their roles.
   rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
+  // The leases this node holds, as the node itself sees them (FR-042): first a snapshot of every
+  // database it serves with its epoch, then one event per lease gained or lost, in the order the
+  // node records them. A lease is gained before the node acknowledges a write under its epoch,
+  // and lost before the node stops answering for the database. A subscriber that falls behind
+  // gets RESOURCE_EXHAUSTED and opens the stream again for a fresh snapshot.
+  rpc WatchLeases(WatchLeasesRequest) returns (stream LeaseUpdate);
+}
+
+message WatchLeasesRequest {}
+
+// One message of a `WatchLeases` stream: the snapshot it starts with, or a change since.
+message LeaseUpdate {
+  oneof update {
+    LeaseSnapshot snapshot = 1;
+    LeaseEvent event = 2;
+  }
+}
+
+// Every lease the node holds when the stream opens, in database name order.
+message LeaseSnapshot {
+  string node_id = 1;
+  repeated HeldLease leases = 2;
+}
+
+message HeldLease {
+  string database = 1;
+  uint64 epoch = 2;
+}
+
+enum LeaseEventKind {
+  LEASE_EVENT_KIND_UNSPECIFIED = 0;
+  // The node started serving the database at `epoch`.
+  LEASE_EVENT_KIND_GAINED = 1;
+  // The node stopped serving the database; `epoch` is the epoch that ended.
+  LEASE_EVENT_KIND_LOST = 2;
+}
+
+message LeaseEvent {
+  string database = 1;
+  uint64 epoch = 2;
+  LeaseEventKind kind = 3;
 }
 
 message NodeStatusRequest {}

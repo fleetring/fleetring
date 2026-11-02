@@ -195,6 +195,15 @@ impl Membership {
     }
 
     /// A membership with an empty view, and the publisher that updates it.
+    /// A membership with an empty view that never changes, for unit tests of code that only
+    /// needs one to exist. Its publisher is never dropped, so watchers wait rather than end.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (membership, publisher) = Self::unstarted();
+        std::mem::forget(publisher);
+        membership
+    }
+
     fn unstarted() -> (Self, Publisher) {
         let empty = Arc::new(MembershipView::default());
         let current = Arc::new(ArcSwap::new(Arc::clone(&empty)));

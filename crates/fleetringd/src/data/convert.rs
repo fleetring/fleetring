@@ -3,14 +3,17 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
+use std::collections::BTreeMap;
+
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Role};
-use fleetring_proto::v1::{self as proto, value::Value as Kind};
+use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
 
 use crate::changes::SinkStatus;
-use crate::data::client::{Location, NodeStatus, ReplicaInfo, ServedDatabase};
+use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
 use crate::engine::{Position, Rows, Statement, Value};
+use crate::replication::{LeaseChange, LeaseEvent};
 
 /// Parses `text` as `field`, or answers `INVALID_ARGUMENT`.
 pub(crate) fn parse<T>(field: &str, text: &str) -> Result<T, Status>
@@ -256,9 +259,118 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
     })
 }
 
+/// The first message of a `WatchLeases` stream: every lease `node` holds, in name order.
+pub(crate) fn lease_snapshot_to_proto(
+    node: &NodeId,
+    held: &BTreeMap<DatabaseName, LeaseEpoch>,
+) -> proto::LeaseUpdate {
+    let leases = held
+        .iter()
+        .map(|(database, epoch)| proto::HeldLease {
+            database: database.to_string(),
+            epoch: epoch.get(),
+        })
+        .collect();
+    proto::LeaseUpdate {
+        update: Some(Update::Snapshot(proto::LeaseSnapshot {
+            node_id: node.to_string(),
+            leases,
+        })),
+    }
+}
+
+pub(crate) fn lease_event_to_proto(event: &LeaseEvent) -> proto::LeaseUpdate {
+    let kind = match event.change {
+        LeaseChange::Gained => proto::LeaseEventKind::Gained,
+        LeaseChange::Lost => proto::LeaseEventKind::Lost,
+    };
+    proto::LeaseUpdate {
+        update: Some(Update::Event(proto::LeaseEvent {
+            database: event.database.to_string(),
+            epoch: event.epoch.get(),
+            kind: kind.into(),
+        })),
+    }
+}
+
+/// The update a `WatchLeases` message carries, or `INTERNAL` if it carries none or names an
+/// unknown kind of event.
+pub(crate) fn lease_update_from_proto(update: proto::LeaseUpdate) -> Result<LeaseUpdate, Status> {
+    match update.update {
+        Some(Update::Snapshot(snapshot)) => {
+            let leases = snapshot
+                .leases
+                .into_iter()
+                .map(|lease| {
+                    let database: DatabaseName = parse_reply("database name", &lease.database)?;
+                    Ok((database, LeaseEpoch::new(lease.epoch)))
+                })
+                .collect::<Result<BTreeMap<_, _>, Status>>()?;
+            Ok(LeaseUpdate::Snapshot {
+                node: parse_reply("node id", &snapshot.node_id)?,
+                leases,
+            })
+        }
+        Some(Update::Event(event)) => {
+            let change = match proto::LeaseEventKind::try_from(event.kind) {
+                Ok(proto::LeaseEventKind::Gained) => LeaseChange::Gained,
+                Ok(proto::LeaseEventKind::Lost) => LeaseChange::Lost,
+                Ok(proto::LeaseEventKind::Unspecified) | Err(_) => {
+                    return Err(Status::internal(format!(
+                        "the reply has a lease event of unknown kind {}",
+                        event.kind
+                    )));
+                }
+            };
+            Ok(LeaseUpdate::Event(LeaseEvent::new(
+                parse_reply("database name", &event.database)?,
+                LeaseEpoch::new(event.epoch),
+                change,
+            )))
+        }
+        None => Err(Status::internal(
+            "the reply has a lease update without a kind",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_updates_round_trip_and_an_unknown_kind_is_refused() {
+        let node: NodeId = "a".parse().expect("id");
+        let database: DatabaseName = "db".parse().expect("name");
+        let held = BTreeMap::from([(database.clone(), LeaseEpoch::new(3))]);
+        let snapshot = lease_update_from_proto(lease_snapshot_to_proto(&node, &held))
+            .expect("a valid snapshot");
+        assert_eq!(snapshot, LeaseUpdate::Snapshot { node, leases: held });
+        let event = LeaseEvent::new(database, LeaseEpoch::new(4), LeaseChange::Lost);
+        assert_eq!(
+            lease_update_from_proto(lease_event_to_proto(&event)).expect("a valid event"),
+            LeaseUpdate::Event(event)
+        );
+        let unknown = proto::LeaseUpdate {
+            update: Some(Update::Event(proto::LeaseEvent {
+                database: "db".into(),
+                epoch: 1,
+                kind: 7,
+            })),
+        };
+        assert_eq!(
+            lease_update_from_proto(unknown)
+                .expect_err("unknown kind")
+                .code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            lease_update_from_proto(proto::LeaseUpdate { update: None })
+                .expect_err("no kind")
+                .code(),
+            tonic::Code::Internal
+        );
+    }
 
     #[test]
     fn values_round_trip_and_a_missing_value_is_refused() {

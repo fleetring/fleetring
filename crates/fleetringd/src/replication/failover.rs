@@ -90,7 +90,7 @@ pub(super) async fn step_down(inner: &Inner, database: &DatabaseName, epoch: u64
         .is_some_and(|primary| primary.role().epoch.get() < epoch);
     if serving {
         tracing::info!(database = %database, epoch, "a newer epoch exists; stepping down as primary");
-        let removed = inner.lock_primaries().remove(database);
+        let removed = inner.withdraw_primary(database);
         drop(removed);
         inner.registry().close(database).await;
     }
@@ -505,7 +505,7 @@ impl Replication {
     /// Stops serving `database` as its primary, if it does, and closes it, so that its copy can
     /// follow the new primary. Its writes are no longer acknowledged.
     pub async fn demote(&self, database: &DatabaseName) {
-        let removed = self.inner.lock_primaries().remove(database);
+        let removed = self.inner.withdraw_primary(database);
         if removed.is_some() {
             tracing::info!(database = %database, "no longer the primary");
         }
@@ -685,7 +685,7 @@ impl Replication {
     /// either way; the next check deletes again.
     pub async fn discard(&self, database: &DatabaseName) -> io::Result<()> {
         let inner = &self.inner;
-        let removed = inner.lock_primaries().remove(database);
+        let removed = inner.withdraw_primary(database);
         drop(removed);
         let slot = inner.slot(database);
         // The stream, fence, or fetch holding the copy finishes first; a stream that begins later

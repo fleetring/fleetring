@@ -324,9 +324,13 @@ impl DataNode {
     }
 
     /// Forgets the lease on `name` at `epoch`, if that is the one it holds.
+    ///
+    /// The lease watch reports the loss first, so that a watcher hears of it before requests for
+    /// the database are redirected (FR-042).
     pub(super) fn forget(&self, name: &DatabaseName, epoch: LeaseEpoch) -> bool {
         let mut leases = self.leases();
         if leases.get(name).is_some_and(|lease| lease.epoch == epoch) {
+            self.inner.replication.withdraw(name);
             leases.remove(name);
             true
         } else {
@@ -336,7 +340,11 @@ impl DataNode {
 
     /// Forgets whatever lease this node holds on `name`, as when the database is dropped.
     pub(super) fn forget_any(&self, name: &DatabaseName) {
-        self.leases().remove(name);
+        let mut leases = self.leases();
+        if leases.contains_key(name) {
+            self.inner.replication.withdraw(name);
+        }
+        leases.remove(name);
     }
 
     /// Leads `name` under `lease` if this node doesn't already, records the lease, and waits

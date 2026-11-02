@@ -4,11 +4,12 @@ use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
 use fleetring_proto::v1::{
     ChangeSinkStatus, CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse,
-    NodeStatusRequest, NodeStatusResponse, QueryRequest, QueryResponse,
+    NodeStatusRequest, NodeStatusResponse, QueryRequest, QueryResponse, WatchLeasesRequest,
 };
 use tonic::{Request, Response, Status};
 
 use crate::data::convert::{parse, rows_to_proto, statement};
+use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::DataNode;
 use crate::engine::{EngineError, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
@@ -76,6 +77,8 @@ fn engine_status(error: &EngineError) -> Status {
 
 #[tonic::async_trait]
 impl Database for DatabaseService {
+    type WatchLeasesStream = LeaseStream;
+
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
@@ -171,5 +174,20 @@ impl Database for DatabaseService {
             databases: replication.statuses(),
             sinks,
         }))
+    }
+
+    /// Streams the leases this node holds, from its replication's own view (FR-042): a snapshot
+    /// first, then one event per lease gained or lost. A subscriber more than
+    /// [`STREAM_BUFFER`] updates behind is cut off with `RESOURCE_EXHAUSTED`.
+    async fn watch_leases(
+        &self,
+        _request: Request<WatchLeasesRequest>,
+    ) -> Result<Response<Self::WatchLeasesStream>, Status> {
+        let watch = self.node.replication().leases();
+        Ok(Response::new(lease_stream(
+            self.node.id().clone(),
+            watch,
+            STREAM_BUFFER,
+        )))
     }
 }

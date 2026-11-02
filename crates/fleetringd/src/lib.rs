@@ -61,6 +61,8 @@ const _: () = {
     assert_debug_send_sync::<data::Client>();
     assert_debug_send_sync::<data::DatabaseSpec>();
     assert_debug_send_sync::<data::DurabilityChange>();
+    assert_debug_send_sync::<data::LeaseUpdate>();
+    assert_debug_send_sync::<data::LeaseUpdates>();
     assert_debug_send_sync::<data::Location>();
     assert_debug_send_sync::<data::NodeStatus>();
     assert_debug_send_sync::<data::ReplicaInfo>();

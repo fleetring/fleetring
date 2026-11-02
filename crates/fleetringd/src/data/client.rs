@@ -11,20 +11,22 @@ use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest, DrainRequest,
     DropDatabaseRequest, ExecuteRequest, ListDatabasesRequest, LocateRequest, NodeStatusRequest,
-    QueryRequest, WatchMembershipRequest,
+    QueryRequest, WatchLeasesRequest, WatchMembershipRequest,
 };
 use tonic::transport::Channel;
-use tonic::{Code, Response, Status};
+use tonic::{Code, Response, Status, Streaming};
 
 use crate::MembershipView;
 use crate::changes::SinkStatus;
 use crate::control::ControlClient;
 use crate::data::convert::{
-    acks_from_proto, acks_to_proto, location, node_status, params_to_proto, rows_from_proto,
+    acks_from_proto, acks_to_proto, lease_update_from_proto, location, node_status,
+    params_to_proto, rows_from_proto,
 };
 use crate::data::redirect::primary_hint;
 use crate::engine::{Position, Rows, Statement};
 use crate::environment::Network;
+use crate::replication::LeaseEvent;
 use crate::transport::{Backoff, database_client};
 
 /// How many redirects one request follows before it gives up.
@@ -187,6 +189,44 @@ pub struct DurabilityChange {
     pub current_acks: Acks,
     /// The floor in effect until then.
     pub current_min_replicas: u8,
+}
+
+/// One message of a `WatchLeases` stream, as [`Client::watch_leases`] delivers it (FR-042).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeaseUpdate {
+    /// The first message: every lease the node held when the stream opened.
+    Snapshot {
+        /// The node that answers.
+        node: NodeId,
+        /// The databases it serves as primary, each with its epoch.
+        leases: BTreeMap<DatabaseName, LeaseEpoch>,
+    },
+    /// A lease the node gained or lost since.
+    Event(LeaseEvent),
+}
+
+/// The stream [`Client::watch_leases`] returns.
+#[derive(Debug)]
+pub struct LeaseUpdates {
+    inner: Streaming<proto::LeaseUpdate>,
+}
+
+impl LeaseUpdates {
+    /// Waits for the next update, or `None` once the node has closed the stream.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_EXHAUSTED` if this subscriber fell too far behind, after which the stream is
+    /// over and a new one starts from a fresh snapshot; `UNAVAILABLE` if the node went away;
+    /// and `INTERNAL` if an update is invalid.
+    pub async fn next(&mut self) -> Result<Option<LeaseUpdate>, Status> {
+        self.inner
+            .message()
+            .await?
+            .map(lease_update_from_proto)
+            .transpose()
+    }
 }
 
 /// The result of a write.
@@ -471,6 +511,26 @@ impl Client {
             .await?
             .into_inner();
         node_status(response)
+    }
+
+    /// Follows the leases the data node at `address` (`host:port`) holds: the first update is a
+    /// snapshot of every database it serves with its epoch, and each later one a lease it gained
+    /// or lost, in the order the node records them (FR-042). The node reports a gained lease
+    /// before it acknowledges a write under that epoch, and a lost one before it stops answering
+    /// for the database.
+    ///
+    /// A node that hosts no data answers `UNIMPLEMENTED`, as it does every database call.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` if the node can't be reached, or `UNIMPLEMENTED` if it hosts no data.
+    pub async fn watch_leases(&self, address: &str) -> Result<LeaseUpdates, Status> {
+        let inner = self
+            .database(address)?
+            .watch_leases(WatchLeasesRequest {})
+            .await?
+            .into_inner();
+        Ok(LeaseUpdates { inner })
     }
 
     /// Runs one write statement on the database's primary, and waits until a write quorum of its

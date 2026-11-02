@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Liveness, Role as DatabaseRole};
-use fleetringd::data::{Client, DatabaseSpec, Location, NodeStatus, ReplicaInfo};
+use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo};
 use fleetringd::engine::{Rows, Statement, Value};
 use fleetringd::{Config, Daemon, MembershipView, Network, Role};
 use tracing_subscriber::EnvFilter;
@@ -75,6 +75,13 @@ enum Command {
         node: Option<String>,
         #[command(flatten)]
         target: Target,
+    },
+    /// Follows the leases one data node holds: first `held <database> epoch <n>` for each
+    /// database it serves, then `gained` or `lost` lines as leases move, until the stream ends.
+    WatchLeases {
+        /// The data node to follow, `host:port`. Nothing else is needed.
+        #[arg(long)]
+        node: String,
     },
 }
 
@@ -432,9 +439,32 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
             format_drain(&id, &primaries)
         }
+        Command::WatchLeases { node } => {
+            // The node answers on its own; the client never asks the control plane here.
+            let client = Client::new(node.clone(), Network::default());
+            let mut updates = client.watch_leases(&node).await.map_err(failed)?;
+            while let Some(update) = updates.next().await.map_err(failed)? {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(format_lease_update(&update).as_bytes())?;
+                stdout.flush()?;
+            }
+            String::new()
+        }
     };
     print!("{output}");
     Ok(())
+}
+
+/// One line per lease the snapshot holds, or one line for an event.
+fn format_lease_update(update: &LeaseUpdate) -> String {
+    match update {
+        LeaseUpdate::Snapshot { leases, .. } => leases
+            .iter()
+            .map(|(database, epoch)| format!("held {database} epoch {}\n", epoch.get()))
+            .collect(),
+        LeaseUpdate::Event(event) => format!("{event}\n"),
+        _ => String::new(),
+    }
 }
 
 impl SqlArgs {
@@ -821,5 +851,24 @@ mod tests {
         assert_eq!(format_value(&Value::Null), "NULL");
         assert_eq!(format_value(&Value::Blob(vec![1, 171])), "x'01ab'");
         assert_eq!(format_value(&Value::Real(0.5)), "0.5");
+    }
+
+    #[test]
+    fn lease_updates_print_one_line_per_lease_or_event() {
+        use fleetring_control::LeaseEpoch;
+        use fleetringd::replication::{LeaseChange, LeaseEvent};
+
+        let notes: DatabaseName = "notes".parse().expect("name");
+        let snapshot = LeaseUpdate::Snapshot {
+            node: "a".parse().expect("id"),
+            leases: BTreeMap::from([(notes.clone(), LeaseEpoch::new(2))]),
+        };
+        assert_eq!(format_lease_update(&snapshot), "held notes epoch 2\n");
+        let lost = LeaseUpdate::Event(LeaseEvent::new(
+            notes,
+            LeaseEpoch::new(2),
+            LeaseChange::Lost,
+        ));
+        assert_eq!(format_lease_update(&lost), "lost notes epoch 2\n");
     }
 }
