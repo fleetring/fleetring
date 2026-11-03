@@ -1,16 +1,15 @@
-# FleetRing tickets
+# FleetRing tickets: the archive
 
-Local tickets for FleetRing: the `fleetring` placement crate (MVP step 1 in [`docs/mvp.md`](../mvp.md), released as 0.1.0) and the `fleetringd` daemon (MVP step 2). Design decisions are recorded in [`docs/adr/`](../adr/README.md), and tickets link to the ADRs they implement. The epics that lead to a release safe to depend on are in [`docs/roadmap.md`](../roadmap.md), and [`docs/review.md`](../review.md) records the known bottlenecks and the standards the design follows or departs from.
+**New and open work is tracked in [GitHub Issues](https://github.com/fleetring/fleetring/issues) and the FleetRing roadmap project** (an organization project, linked from the repository's Projects tab). This directory is the archive of the tickets that were done before work moved there. Its files stay, so links from accepted ADRs keep working. The rows below that link to an issue were still open at the move; the ticket's text now lives in the issue, and the implementation plans of the larger ones are in [`docs/plans/`](../plans/).
+
+The `fleetring` placement crate (MVP step 1 in [`docs/mvp.md`](../mvp.md), released as 0.1.0) and the `fleetringd` daemon (MVP step 2) were planned here. Design decisions are recorded in [`docs/adr/`](../adr/README.md). The epics that lead to a release safe to depend on are in [`docs/roadmap.md`](../roadmap.md), and [`docs/review.md`](../review.md) records the known bottlenecks and the standards the design follows or departs from.
 
 ## Conventions
 
-- **One file per ticket**, named `FR-NNN-short-slug.md`. Each file starts with YAML front matter:
-  - `status`: `todo`, `in-progress`, `blocked`, or `done`
+- **Issues keep the `FR-NNN` number in their title** (`FR-049: An S3 durability sink …`), with the priority, size, and milestone as labels and a milestone. The archived files here start with YAML front matter (`status`, `priority`, `size`, `depends_on`, `adrs`), described by:
   - `priority`: `P0` blocks `fleetringd` work, `P1` is required for 0.1.0, `P2` may slip past 0.1.0. For daemon tickets (FR-022 on), `P0` is required for `fleetringd` v0.1, `P1` should ship with it, and `P2` may slip.
   - `size`: `S` is half a day or less, `M` is 1–2 days, `L` is 3–4 days
-  - `depends_on`: the IDs of prerequisite tickets
-  - `adrs`: the ADRs the ticket implements
-- **Commits** follow Conventional Commits, using the crate area as the scope (`feat(ring): …`) and a `Refs: FR-NNN` trailer.
+- **Commits** follow Conventional Commits, using the crate area as the scope (`feat(ring): …`) and a `Refs: FR-NNN` or `Refs: #N` trailer. A pull request body says `Fixes #N` to close its issue.
 - **Done** means every acceptance criterion is checked, CI is green, and the definition of done below holds.
 
 ## Definition of done
@@ -26,6 +25,8 @@ These items follow the Rust API Guidelines and common Rust best practices.
 - New placement behavior is covered by property tests and, from FR-014 on, by golden vectors.
 
 ## Milestones
+
+M7 to M12 are also GitHub milestones, with the outcome as the description.
 
 | Milestone | Tickets | Outcome |
 |---|---|---|
@@ -86,126 +87,29 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-037](FR-037-cli-polish.md) | CLI polish: `db list`, `db drop`, `status --node`, clear answers from data-only nodes | P1 | M | FR-033 | done |
 | [FR-038](FR-038-graceful-departure.md) | Graceful departure: drain a node's primaries before it leaves | P1 | M | FR-031 | done |
 | [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | done |
-| [FR-040](FR-040-turso-adapter.md) | Turso adapter: a self-replicating engine whose change stream reads `turso_cdc` | P2 | L | FR-039 | todo |
-| [FR-041](FR-041-replicated-sink-positions.md) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | todo |
+| [FR-040](https://github.com/fleetring/fleetring/issues/53) | Turso adapter: a self-replicating engine whose change stream reads `turso_cdc` | P2 | L | FR-039 | todo |
+| [FR-041](https://github.com/fleetring/fleetring/issues/49) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | todo |
 | [FR-042](FR-042-lease-watch.md) | `WatchLeases`: a stream of the leases this node gains and loses | P2 | M | FR-031, FR-037 | done |
-| [FR-043](FR-043-keyed-leases.md) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029, FR-047 | todo |
+| [FR-043](https://github.com/fleetring/fleetring/issues/50) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029, FR-047 | todo |
 | [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | done |
-| [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032, FR-047 | todo |
+| [FR-045](https://github.com/fleetring/fleetring/issues/51) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032, FR-047 | todo |
 | [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | done |
 | [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | done |
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | done |
-| [FR-049](FR-049-s3-durability-sink.md) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
-| [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | done |
-| [FR-051](FR-051-flaky-replication-tests.md) | Find and fix the replication tests that fail intermittently in CI | P1 | M | — | in-progress |
-| [FR-052](FR-052-archive-acknowledged-durability.md) | A durability mode that acknowledges a write only once it is archived | P2 | M | FR-049, FR-035 | todo |
-| [FR-053](FR-053-object-store-workload-identity.md) | Object-store credentials from workload identity, not only static keys | P2 | S | FR-049 | todo |
-| [FR-054](FR-054-upgrade-and-rolling-upgrades.md) | `fleetringd upgrade` and a tested rolling upgrade | P1 | L | FR-038, FR-048 | todo |
-| [FR-055](FR-055-cli-identity-ergonomics.md) | Pick a client identity without repeating `--cert` and `--key` | P2 | S | FR-047 | todo |
-| [FR-056](FR-056-cli-contexts-json-completions.md) | CLI contexts, `--json` on every read command, shell completions, and man pages | P1 | L | FR-055, FR-059 | todo |
-| [FR-057](FR-057-tui.md) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
-| [FR-058](FR-058-desktop-app.md) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
+| [FR-049](https://github.com/fleetring/fleetring/issues/52) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
+| [FR-050](../plans/FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | done |
+| [FR-051](https://github.com/fleetring/fleetring/issues/54) | Find and fix the replication tests that fail intermittently in CI | P1 | M | — | in-progress |
+| [FR-052](https://github.com/fleetring/fleetring/issues/55) | A durability mode that acknowledges a write only once it is archived | P2 | M | FR-049, FR-035 | todo |
+| [FR-053](https://github.com/fleetring/fleetring/issues/56) | Object-store credentials from workload identity, not only static keys | P2 | S | FR-049 | todo |
+| [FR-054](https://github.com/fleetring/fleetring/issues/57) | `fleetringd upgrade` and a tested rolling upgrade | P1 | L | FR-038, FR-048 | todo |
+| [FR-055](https://github.com/fleetring/fleetring/issues/58) | Pick a client identity without repeating `--cert` and `--key` | P2 | S | FR-047 | todo |
+| [FR-056](https://github.com/fleetring/fleetring/issues/59) | CLI contexts, `--json` on every read command, shell completions, and man pages | P1 | L | FR-055, FR-059 | todo |
+| [FR-057](https://github.com/fleetring/fleetring/issues/60) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
+| [FR-058](https://github.com/fleetring/fleetring/issues/61) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
 | [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, as a clean break in 0.3.0 | P1 | M | FR-047 | done |
-| [FR-060](FR-060-distribution-packages.md) | Distribution packages for apt, yum, the AUR, and Homebrew | P2 | L | FR-034, FR-048 | todo |
-| [FR-061](FR-061-rails-integration.md) | A `fleetring` Ruby gem and an ActiveRecord adapter that place each tenant's database | P2 | L | FR-047, the router (no ticket yet) | todo |
+| [FR-060](https://github.com/fleetring/fleetring/issues/62) | Distribution packages for apt, yum, the AUR, and Homebrew | P2 | L | FR-034, FR-048 | todo |
+| [FR-061](https://github.com/fleetring/fleetring/issues/63) | A `fleetring` Ruby gem and an ActiveRecord adapter that place each tenant's database | P2 | L | FR-047, the router (no ticket yet) | todo |
 | [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | done |
-
-## Dependency graph
-
-```mermaid
-flowchart LR
-  FR001[FR-001 workspace] --> FR002[FR-002 CI]
-  FR001 --> FR003[FR-003 hasher]
-  FR001 --> FR004[FR-004 domain types]
-  FR001 --> FR005[FR-005 fixed-point math]
-  FR004 --> FR006[FR-006 test harness]
-  FR003 --> FR007[FR-007 ring + builder]
-  FR004 --> FR007
-  FR005 --> FR008[FR-008 rendezvous]
-  FR006 --> FR008
-  FR007 --> FR008
-  FR008 --> FR009[FR-009 replica selection]
-  FR009 --> FR010[FR-010 vnode ring]
-  FR009 --> FR011[FR-011 bounded loads]
-  FR009 --> FR012[FR-012 diff]
-  FR009 --> FR013[FR-013 RingSpec + fingerprint]
-  FR009 --> FR015[FR-015 diagnostics]
-  FR002 --> FR014[FR-014 spec v1 + vectors]
-  FR010 --> FR014
-  FR011 --> FR014
-  FR013 --> FR014
-  FR010 --> FR016[FR-016 benchmarks]
-  FR012 --> FR016
-  FR013 --> FR017[FR-017 fuzzing]
-  FR011 --> FR018[FR-018 docs + examples]
-  FR012 --> FR018
-  FR013 --> FR018
-  FR014 --> FR019[FR-019 release 0.1.0]
-  FR016 --> FR019
-  FR018 --> FR019
-  FR012 --> FR020[FR-020 cells]
-  FR013 --> FR020
-  FR013 --> FR021[FR-021 cells spec]
-  FR020 --> FR021
-  FR022[FR-022 daemon skeleton] --> FR023[FR-023 gRPC transport]
-  FR022 --> FR024[FR-024 simulation harness]
-  FR023 --> FR024
-  FR022 --> FR025[FR-025 WAL format]
-  FR022 --> FR026[FR-026 database actor]
-  FR025 --> FR026
-  FR022 --> FR027[FR-027 control state machine]
-  FR023 --> FR028[FR-028 control node]
-  FR027 --> FR028
-  FR028 --> FR029[FR-029 membership + ring]
-  FR023 --> FR030[FR-030 replication stream]
-  FR026 --> FR030
-  FR029 --> FR030
-  FR030 --> FR031[FR-031 leases + failover]
-  FR030 --> FR032[FR-032 snapshot catch-up]
-  FR026 --> FR033[FR-033 database API + CLI]
-  FR028 --> FR033
-  FR022 --> FR034[FR-034 release builds]
-  FR030 --> FR035[FR-035 configurable durability]
-  FR031 --> FR035
-  FR024 --> FR036[FR-036 history checker]
-  FR031 --> FR036
-  FR033 --> FR037[FR-037 CLI polish]
-  FR031 --> FR038[FR-038 graceful departure]
-  FR030 --> FR039[FR-039 change streams]
-  FR039 --> FR040[FR-040 Turso adapter]
-  FR039 --> FR041[FR-041 replicated sink positions]
-  FR031 --> FR042[FR-042 lease watch]
-  FR037 --> FR042
-  FR042 --> FR043[FR-043 keyed leases]
-  FR029 --> FR043
-  FR030 --> FR044[FR-044 hash-chained log]
-  FR032 --> FR044
-  FR044 --> FR045[FR-045 Merkle anti-entropy]
-  FR032 --> FR045
-  FR029 --> FR046[FR-046 mutual TLS]
-  FR037 --> FR046
-  FR046 --> FR047[FR-047 principals and scopes]
-  FR034 --> FR048[FR-048 threat model and signed releases]
-  FR047 --> FR048
-  FR039 --> FR049[FR-049 S3 durability sink]
-  FR041 --> FR049
-  FR044 --> FR049
-  FR047 --> FR049
-  FR047 --> FR043
-  FR047 --> FR045
-  FR047 --> FR050[FR-050 node calls bound to placement]
-  FR047 --> FR055[FR-055 client identity]
-  FR047 --> FR059[FR-059 cluster to fleet]
-  FR055 --> FR056[FR-056 CLI contexts + JSON]
-  FR059 --> FR056
-  FR056 --> FR057[FR-057 TUI]
-  FR042 --> FR057
-  FR056 --> FR058[FR-058 desktop app]
-  FR034 --> FR060[FR-060 distribution packages]
-  FR048 --> FR060
-  FR047 --> FR061[FR-061 Rails integration]
-  FR059 --> FR062[FR-062 one word per thing]
-```
 
 ## Critical path and estimate
 

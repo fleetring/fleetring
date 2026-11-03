@@ -7,7 +7,7 @@ Thanks for helping. This page says how a change gets from your branch onto `main
 - **[`docs/lexicon.md`](docs/lexicon.md)**: the names for everything. Code, docs, CLI output, and tickets use its words. A new concept gets an entry there before it gets a type or a flag.
 - **[`docs/cli.md`](docs/cli.md)**: the CLI style guide, for any change to a `fleetringd` command, flag, or output.
 - **[`docs/adr/`](docs/adr/README.md)**: the decisions behind the code you are changing. Read the ones the index lists for your area.
-- **[`docs/tickets/`](docs/tickets/README.md)**: planned work, its acceptance criteria, and the definition of done.
+- **[GitHub Issues](https://github.com/fleetring/fleetring/issues) and the FleetRing roadmap project**: planned work and its acceptance criteria. [`docs/tickets/`](docs/tickets/README.md) archives the finished tickets and holds the definition of done, and [`docs/plans/`](docs/plans/) holds implementation plans.
 
 ## Setup
 
@@ -43,8 +43,8 @@ For workflow changes, run [`actionlint`](https://github.com/rhysd/actionlint) to
 
 ## When CI fails
 
-- **Re-run only the failed jobs, and only for a known flake** that has a ticket. Otherwise, find the cause: a failure you don't understand is a bug until shown otherwise.
-- **A flaky test gets a ticket, never just a re-run.** Record the job, the seed or the log, and how often it fails, as [FR-051](docs/tickets/FR-051-flaky-replication-tests.md) does. Statistical and simulation tests run on fixed corpora and seeds so they can't flake; one that does has a real cause.
+- **Re-run only the failed jobs, and only for a known flake** that has an issue. Otherwise, find the cause: a failure you don't understand is a bug until shown otherwise.
+- **A flaky test gets an issue, never just a re-run.** Record the job, the seed or the log, and how often it fails, as [FR-051](https://github.com/fleetring/fleetring/issues/54) does. Label it `flaky-test`. Statistical and simulation tests run on fixed corpora and seeds so they can't flake; one that does has a real cause.
 
 ## Dependabot
 
@@ -74,9 +74,10 @@ Changes to authentication and authorization (`crates/fleetringd/src/auth`, `crat
 
 ## Commits
 
-Use [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): summary`, for example `feat(ring): add bounded loads`. The hook and CI check the first line. End the message with a `Refs: FR-NNN` trailer naming the ticket, or several, comma-separated.
+Use [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): summary`, for example `feat(ring): add bounded loads`. The hook and CI check the first line. End the message with a trailer naming the issue: `Refs: FR-NNN` (the number in the issue's title; archived tickets keep theirs) or `Refs: #N`, or several, comma-separated. The hook and CI accept both forms. Put `Fixes #N` in the pull request body to close the issue when it merges.
 
-## Design changes and tickets
+## Design changes and issues
 
 - **Decisions are ADRs** in [`docs/adr/`](docs/adr/README.md). Propose a change as a new ADR, with status `Proposed`, and add it to the index. Never rewrite an accepted decision; supersede or amend it with a new one.
-- **Work is tickets** in [`docs/tickets/`](docs/tickets/README.md). Update a ticket's `status` and its Progress section as you work, and its row in the index. A ticket is done when the definition of done in the tickets README holds.
+- **Work is tracked in [GitHub Issues](https://github.com/fleetring/fleetring/issues) and the FleetRing roadmap project.** Each issue carries a priority label (`P0`, `P1`, `P2`), a size label (`size:S`, `size:M`, `size:L`), and a milestone, and its title keeps its `FR-NNN` number. Record progress as a comment on the issue, and move it on the project board. An issue is done when its acceptance criteria are checked and the [definition of done](docs/tickets/README.md#definition-of-done) holds. A larger issue links an implementation plan in [`docs/plans/`](docs/plans/).
+- **Dependencies** between issues are GitHub's "blocked by" relations, so the project shows what is ready.
