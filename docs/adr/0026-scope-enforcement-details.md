@@ -1,0 +1,41 @@
+# ADR-0026: How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire
+
+- **Status:** Proposed (2026-11-02)
+- **Date:** 2026-11-02
+- **Related:** amends ADR-0025; ADR-0017 (control state), ADR-0020 (simulation); ticket FR-047
+
+## Context
+
+ADR-0025 decides principals, scopes, bearer tokens, and enforcement at the request boundary. Implementing it in FR-047 raised questions it leaves open:
+
+- Every connection carries a client certificate (ADR-0025, point 1), yet FR-047 requires that "a client certificate and a token on the same request must name the same principal" and also that a router can forward its caller's token unchanged. Both can't hold for a router whose certificate names the router.
+- ADR-0025 reserves key-less control operations for nodes and for principals with `cluster`, but doesn't say which calls are node-only. Several control calls (`Heartbeat`, `AcquireLease`, `RenewLease`, the promotion calls) assert facts only a node can know.
+- What a request with both a certificate and a token is allowed to do; whether a token's scopes add to the certificate's.
+- How listings over many keys (`ListDatabases`, `NodeStatus`, `WatchLeases`) are authorized, and whether `Execute` may run with `read`.
+- How long a node may act on a stale denylist, and what happens to a stream opened with a token that later expires or is revoked.
+- What scopes over keys assume of the engine underneath them.
+
+## Decision
+
+1. **Every RPC has one requirement in one table** (`fleetringd::auth::RPCS`): `node`, `cluster`, an action on the request's key, the action on the key or `cluster` (`Locate`, `Verify`), or a listing filtered to the keys the caller may take the listing's actions on (everything for `cluster`): `read` for `ListDatabases` and `WatchLeases`, and `read` for databases or `stream` for change sinks in `NodeStatus`, so a principal that may only stream can follow its sinks' progress. A tower layer in front of every service refuses a path the table doesn't list, so a new RPC is denied until it has a requirement; tests hold the proto's `Scope:` comments and the daemon README's table to the same list.
+2. **Node calls are node-only.** `Join`, `Heartbeat`, `AcquireLease`, `RenewLease`, `StartPromotion`, `RecordFenced`, `CompletePromotion`, and all of `Replication` need a node certificate; no scope grants them. `Leave`, `Drain`, `WatchMembership`, and `RevokeToken` need `cluster`. This is stricter than ADR-0025's "nodes and principals with `cluster`" for `Join`: an operator has no reason to join on a node's behalf, and a principal that can join can claim any node ID.
+3. **A token replaces, never adds to, the certificate's scopes.** A request with a token acts as the token's principal with the token's scopes alone; without one, it acts with the scopes `[[principal]]` gives the certificate's principal (none if unlisted). The token must name the certificate's principal, unless that principal's entry sets `forward_tokens = true`: a router or another relay may carry its callers' tokens, and each such request acts as the caller. A token on a node's connection is refused, and so is a token on a plaintext connection, which has no authority to verify it against.
+4. **`Execute` needs `write`.** The read path is `Query`, which already refuses writes; classifying statements to let `Execute` run with `read` would make the engine adapter part of the authorization decision for no gain.
+5. **Tokens are a small, strict JWS.** Only `EdDSA`, from a key ID derived from a trusted authority's Ed25519 key (any Ed25519 certificate in the `ca` bundle, so rotations overlap); unknown header fields and claims are refused rather than ignored; `exp` is strict and `nbf` allows 30 seconds of clock skew; a token may last at most 30 days from `nbf` to `exp`, which signers enforce and nodes check whatever minted the token, and `token issue` defaults to one hour. The control node keeps a token's revocation at most 30 days and 30 seconds from when it records it, so a revocation outlives every token issued before it, and the denylist stays bounded; a key's revocation may last forever. A token whose `nbf` its issuer set far in the future is the exception: it could become valid after its revocation was forgotten, so revoke its key instead. Verification is written on `ring` and `base64`, already in the dependency tree, rather than a JWT library.
+6. **Revocations travel with joins and heartbeats, and a stale list fails closed.** `RevokeToken` is an additive control command; the denylist is control state, holding identifiers only, and each entry is forgotten once its time passes. Every join and heartbeat reply carries the whole list, so a live node refuses a revoked token within one heartbeat interval; the control node reads its own state. A data node refuses every token with `UNAVAILABLE` until its first list arrives, and whenever its last one is more than three heartbeat intervals old, measured with `tokio::time` since the last successful reply; client certificates keep working, since their scopes are configuration, not control state. So a token is trusted at most three heartbeat intervals after a revocation the node didn't hear about.
+7. **Streams end when their token does.** A server stream opened with a token (`WatchLeases`, `WatchMembership`) is checked before each message and every second between them, and ends with `UNAUTHENTICATED` once the token expires or is revoked, or with `UNAVAILABLE` once the node's denylist goes stale. A stream therefore outlives its token by at most a second plus the time the revocation takes to reach the node. Node-to-node streams carry certificates only, which this doesn't change.
+8. **Scopes assume the engine confines a statement to the database it names.** A scope allows an action on a key; `Execute` and `Query` run a statement against the database the request names. That is only the database the statement touches if the engine adapter confines it: a SQLite statement that could `ATTACH` another database's file, or reach the filesystem through an extension or a pragma, would read or write a database the caller has no scope on. Confinement is therefore a precondition of this model, which each engine adapter must provide and test; the SQLite adapter's fix is the `confine-statements` change, and `tests/scopes.rs` gains an `ATTACH` case once it lands.
+
+## Alternatives considered
+
+- **Tokens without client certificates.** Would make forwarding trivial but contradicts ADR-0025's mutual TLS on every connection. Rejected.
+- **Intersecting a token's scopes with the certificate's.** Safe, but a certificate would then need `[[principal]]` scopes for every token it carries, which defeats tokens as the application credential. Rejected.
+- **Refusing listings to principals without `cluster`.** Simpler, but a tenant couldn't list its own databases or watch the leases of what it may read. Rejected in favor of filtering.
+- **Pushing only changes to the denylist.** Smaller replies, but needs an epoch and resynchronization; whole lists stay small because tokens are short-lived. Deferred.
+
+## Consequences
+
+- A router is configured as a principal with `forward_tokens = true` and, usually, no scopes of its own.
+- Tests and the simulation act as nodes through node certificates; the simulation's clients share one principal, `workload`, with full principal scopes.
+- A partitioned node honors a token revoked during the partition for at most three heartbeat intervals, then refuses all tokens until it hears from the control plane again; a restarted node refuses tokens until its first join reply.
+- Clients holding tokens must treat `UNAVAILABLE` from a data node as retryable, as they already do for a moving primary.

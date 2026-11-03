@@ -4,6 +4,10 @@
 
 FleetRing is in early development. Security fixes go into the latest release of the `fleetring` crate.
 
+## Authentication and authorization
+
+Every `fleetringd` connection is mutual TLS with certificates from the cluster's authority, and every request is authorized against the caller's scopes before it touches any state (ADR-0025). What each RPC needs, and how principals get scopes from `[[principal]]` entries or bearer tokens, is in the daemon README's [scope table](crates/fleetringd/README.md#principals-and-scopes).
+
 ## Reporting a vulnerability
 
 Report vulnerabilities privately through GitHub: open the repository's **Security** tab and choose **Report a vulnerability**. Please don't open a public issue.

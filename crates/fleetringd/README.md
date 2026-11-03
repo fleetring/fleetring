@@ -31,7 +31,13 @@ id = "node-1"
 ca = "/etc/fleetring/tls/ca.crt"
 cert = "/etc/fleetring/tls/node.node-1.crt"
 key = "/etc/fleetring/tls/node.node-1.key"
+
+[[principal]]
+name = "admin"
+scopes = ["admin:*", "stream:*", "cluster"]
 ```
+
+The `[[principal]]` entry lets the `admin` certificate administer, write, read, and stream every database and run cluster operations such as draining; a principal the file doesn't list may do nothing with its certificate alone (see [Principals and scopes](#principals-and-scopes)).
 
 Then start the daemon, and talk to it from another terminal:
 
@@ -46,6 +52,16 @@ fleetringd db query notes "SELECT body FROM note" --config fleetringd.toml
 fleetringd db locate notes --config fleetringd.toml
 fleetringd db list --config fleetringd.toml
 fleetringd status --node 127.0.0.1:7400
+```
+
+An application gets its own certificate and a short-lived token that carries its scopes, so it can write `notes` and nothing else. Issue the token where `ca.key` is; the node verifies it with `ca.crt` alone:
+
+```sh
+fleetringd cert client notes-app --dir /etc/fleetring/tls
+export FLEETRING_TOKEN=$(fleetringd token issue --principal notes-app --scope write:notes --ttl 1h --dir /etc/fleetring/tls)
+fleetringd db exec notes "INSERT INTO note VALUES (?)" "from the app" --config fleetringd.toml \
+  --cert /etc/fleetring/tls/client.notes-app.crt --key /etc/fleetring/tls/client.notes-app.key
+unset FLEETRING_TOKEN
 fleetringd db drop notes --yes --config fleetringd.toml
 ```
 
@@ -65,9 +81,59 @@ Each database chooses its durability when it is created (ADR-0023). `--acks quor
 
 The subcommands take `--control <host:port>`, the address of the node that runs the control role, or `--config <file>` to read it from a daemon's configuration. A control call sent to a data-only node answers with the control node's address.
 
-**Plaintext.** A daemon without a `[tls]` table refuses to start. `--insecure-plaintext` (or `insecure_plaintext = true` in the file) lets it run without one, warning at every start, and the subcommands take the same flag to connect to it; nothing on the wire is then authenticated or encrypted, so it is for local experiments only. A node whose certificate names another ID is refused on `Join` and `Heartbeat` with `PERMISSION_DENIED`, and only nodes may make node-to-node calls such as replication.
+**Plaintext.** A daemon without a `[tls]` table refuses to start. `--insecure-plaintext` (or `insecure_plaintext = true` in the file) lets it run without one, warning at every start, and the subcommands take the same flag to connect to it; nothing on the wire is then authenticated or encrypted, so it is for local experiments only. A node whose certificate names another ID is refused on `Join` and `Heartbeat` with `PERMISSION_DENIED`, and only nodes may make node-to-node calls such as replication. In plaintext no certificate names the caller, so a request without a token may do anything, and a token is refused, since there is no authority to verify it against.
 
 `fleetringd --help` lists every flag and subcommand. [`deploy/fleetringd.toml`](https://github.com/fleetring/fleetring/blob/main/deploy/fleetringd.toml) documents the main settings, including a multi-node cluster's.
+
+## Principals and scopes
+
+Every request comes from a node or a principal (ADR-0025). Nodes, named by their certificates, act with full scope towards each other. A principal may do what its scopes allow and nothing else: a request no scope allows is refused with `PERMISSION_DENIED`, before it touches any state, with a message that names the action and the database it needed, never the caller's scopes.
+
+A scope is `<action>:<pattern>`: the action is `read`, `write`, `admin`, or `stream`, and the pattern an exact database name or a prefix ending in `*` (`read:tenant:acme/*`, `write:notes`, `admin:*`). `write` implies `read`, and `admin` (create, drop, change durability, hand a lease over) implies both; `stream` stands alone, so a change consumer can't read tables. The word `cluster` is the scope for operations that name no database: membership, draining, revoking tokens.
+
+A principal gets its scopes in one of two ways:
+
+- **Client certificate.** `[[principal]]` entries in the configuration, identical on every node, list each principal with its `scopes`; the daemon checks them when it starts.
+- **Bearer token.** `fleetringd token issue --principal <name> --scope <scope>… --ttl <duration> --dir <authority dir>` signs a token (an Ed25519 JWT with the claims `iss`, `sub`, `jti`, `nbf`, `exp`, `kid`, and `fleetring.scopes`) with the authority's key, valid one hour by default and 30 days at most; nodes refuse a token that lasts longer from `nbf` to `exp`, whatever minted it. A client sends it as `authorization: Bearer <token>` (`--token` or `FLEETRING_TOKEN` on the command line), and the request then acts with the token's scopes alone. Nodes verify it with the trusted `ca.crt`, with no call to the control plane, and refuse an expired, tampered, or revoked token with `UNAUTHENTICATED`. The certificate on the same connection must name the same principal, unless its `[[principal]]` entry sets `forward_tokens = true`, as a router that relays its callers' tokens does.
+
+`fleetringd token revoke --token-id <id>` (the ID `token issue` prints) or `--key-id <kid>` adds a token, or every token a signing key issued, to a denylist the control plane keeps; data nodes receive it with every heartbeat reply, so each refuses the token within one heartbeat interval. A revoked token's entry is forgotten once the token would have expired anyway.
+
+Each request a principal makes is logged at debug on the `fleetringd::audit` target, and each refusal as a warning, with the principal, the credential (`certificate`, or `token:<id>`), the action, the database, and the RPC; never the token itself.
+
+What each RPC needs: `node` is a node certificate, and principals are refused; `cluster` is a node or the `cluster` scope; a listing shows each database the caller may read, and everything to `cluster`, except that `NodeStatus` shows a change sink's progress to a principal that may `stream` its database. A request for an RPC this table doesn't list is refused.
+
+A token is checked when a request arrives, and a stream opened with one (`WatchLeases`, `WatchMembership`) is checked again before each message and every second between them, so it ends with `UNAUTHENTICATED` within about a second of the token's expiry, or of its revocation reaching the node. A data node checks tokens against the denylist from its last join or heartbeat reply; until the first one arrives, and whenever the last is more than three heartbeat intervals old, it refuses every token with `UNAVAILABLE`, which a client retries, and keeps serving client certificates.
+
+| RPC | Needs |
+|---|---|
+| `Control.Join` | node |
+| `Control.Heartbeat` | node |
+| `Control.WatchMembership` | cluster |
+| `Control.CreateDatabase` | admin on the key |
+| `Control.DropDatabase` | admin on the key |
+| `Control.ChangeDurability` | admin on the key |
+| `Control.Locate` | read on the key, or cluster |
+| `Control.ListDatabases` | read per key listed, or cluster |
+| `Control.AcquireLease` | node |
+| `Control.RenewLease` | node |
+| `Control.Leave` | cluster |
+| `Control.StartPromotion` | node |
+| `Control.RecordFenced` | node |
+| `Control.CompletePromotion` | node |
+| `Control.Drain` | cluster |
+| `Control.TransferLease` | admin on the key |
+| `Control.RevokeToken` | cluster |
+| `Replication.Replicate` | node |
+| `Replication.Fence` | node |
+| `Replication.Snapshot` | node |
+| `Replication.Fetch` | node |
+| `Replication.Promote` | node |
+| `Database.Execute` | write on the key |
+| `Database.Query` | read on the key |
+| `Database.Create` | admin on the key |
+| `Database.NodeStatus` | read or stream per key listed, or cluster |
+| `Database.WatchLeases` | read per key listed, or cluster |
+| `Database.Verify` | read on the key, or cluster |
 
 ## Install
 
