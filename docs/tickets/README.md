@@ -90,7 +90,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-043](FR-043-keyed-leases.md) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029 | todo |
 | [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | todo |
 | [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032 | todo |
-| [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | todo |
+| [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | in-progress |
 | [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | todo |
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | todo |
 

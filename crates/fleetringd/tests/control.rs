@@ -30,6 +30,10 @@ use fleetringd::control::{
 use fleetringd::transport::{TransportConfig, control_server};
 use fleetringd::{Config, ConfigError, Daemon, Role as DaemonRole};
 use tokio_stream::Stream;
+
+use crate::support::Tls;
+
+mod support;
 use tonic::{Code, Request, Response, Status};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -47,8 +51,16 @@ fn join_request(id: &str) -> JoinRequest {
     }
 }
 
+/// A plaintext client, for the stub servers the tests serve themselves.
 fn client(address: SocketAddr) -> ControlClient {
     ControlClient::new(address.to_string(), TransportConfig::default())
+}
+
+/// A client that reaches a daemon as the principal `tester`.
+fn secure_client(address: SocketAddr, tls: &Tls) -> Result<ControlClient, Box<dyn Error>> {
+    Ok(tls
+        .client_network("tester")?
+        .control_client(address.to_string()))
 }
 
 /// Serves `node` on a random local port.
@@ -133,13 +145,15 @@ heartbeat_interval_ms = 500
 #[tokio::test]
 async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let text = format!(
-        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n",
-        dir.path().join("data")
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
     let address = daemon.control_address().ok_or("no control address")?;
-    let control = client(address);
+    let control = secure_client(address, &tls)?;
 
     for id in ["a", "b", "c"] {
         let joined = control.join(join_request(id)).await?;
@@ -271,7 +285,7 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         *daemon.control().ok_or("no control handle")?.state(),
         *before
     );
-    let located = client(daemon.control_address().ok_or("no control address")?)
+    let located = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?
         .locate(LocateRequest {
             database: "tenant:acme".into(),
         })
@@ -288,13 +302,15 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
 async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_leaves() -> TestResult
 {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
-         [control]\nlease_duration_ms = 2000\nfailover_margin_ms = 0\ntick_interval_ms = 20\n",
-        dir.path().join("data")
+         [control]\nlease_duration_ms = 2000\nfailover_margin_ms = 0\ntick_interval_ms = 20\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
-    let control = client(daemon.control_address().ok_or("no control address")?);
+    let control = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?;
     for id in ["a", "b", "c"] {
         control.join(join_request(id)).await?;
     }
@@ -893,16 +909,18 @@ async fn an_existing_log_keeps_its_genesis_timings() -> TestResult {
 #[tokio::test]
 async fn durability_settings_travel_through_the_control_service() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
-         [replication]\nacks = \"local\"\n",
-        dir.path().join("data")
+         [replication]\nacks = \"local\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
     );
     let config = Config::from_toml(&text)?;
     assert_eq!(config.replication.acks, fleetring_control::Acks::Local);
     assert_eq!(config.replication.min_replicas, None);
     let daemon = Daemon::start(config).await?;
-    let control = client(daemon.control_address().ok_or("no control address")?);
+    let control = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?;
     for id in ["a", "b", "c"] {
         control.join(join_request(id)).await?;
     }
@@ -996,12 +1014,14 @@ async fn durability_settings_travel_through_the_control_service() -> TestResult 
 #[tokio::test]
 async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let text = format!(
-        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n",
-        dir.path().join("data")
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
-    let control = client(daemon.control_address().ok_or("no control address")?);
+    let control = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?;
     control.join(join_request("a")).await?;
     control
         .create_database(CreateDatabaseRequest {

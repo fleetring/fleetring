@@ -24,12 +24,13 @@ pub mod replication;
 #[cfg(feature = "simulation")]
 pub mod sim;
 mod sink;
+pub mod tls;
 pub mod transport;
 
 pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
     Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION,
-    MembershipSettings, NodeConfig, OnShutdown, ReplicationConfig, Role,
+    MembershipSettings, NodeConfig, OnShutdown, Plaintext, ReplicationConfig, Role, TlsConfig,
 };
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
@@ -76,8 +77,27 @@ const _: () = {
     assert_debug_send_sync::<MembershipView>();
     assert_debug_send_sync::<OnShutdown>();
     assert_debug_send_sync::<ReplicationConfig>();
+    assert_debug_send_sync::<Plaintext>();
     assert_debug_send_sync::<StartError>();
     assert_debug_send_sync::<Stored>();
+    assert_debug_send_sync::<TlsConfig>();
+    assert_debug_send_sync::<tls::Accepted>();
+    assert_debug_send_sync::<tls::Authority>();
+    assert_debug_send_sync::<tls::AuthorityError>();
+    assert_debug_send_sync::<tls::ClusterName>();
+    assert_debug_send_sync::<tls::Conn>();
+    assert_debug_send_sync::<tls::HandshakeError>();
+    assert_debug_send_sync::<tls::Identity>();
+    assert_debug_send_sync::<tls::IdentityError>();
+    assert_debug_send_sync::<tls::Issued>();
+    assert_debug_send_sync::<tls::NameError>();
+    assert_debug_send_sync::<tls::Peer>();
+    assert_debug_send_sync::<tls::Principal>();
+    assert_debug_send_sync::<tls::Raw>();
+    assert_debug_send_sync::<tls::Security>();
+    assert_debug_send_sync::<tls::SubjectUri>();
+    assert_debug_send_sync::<tls::Validity>();
+    assert_debug_send_sync::<transport::Listener>();
 
     // The log owns a SQLite connection, which moves between threads but isn't shared.
     const fn assert_debug_send<T: std::fmt::Debug + Send>() {}

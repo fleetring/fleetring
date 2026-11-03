@@ -26,6 +26,8 @@ use fleetringd::{
 };
 use tempfile::TempDir;
 
+use crate::support::Tls;
+
 pub(crate) type TestResult = Result<(), Box<dyn Error>>;
 
 /// Guards against a hang only; nothing here asserts how long anything takes.
@@ -67,6 +69,7 @@ pub(crate) async fn eventually(what: &str, mut condition: impl FnMut() -> bool) 
 pub(crate) struct Harness {
     control: Daemon,
     dir: TempDir,
+    tls: Tls,
 }
 
 impl Harness {
@@ -76,12 +79,14 @@ impl Harness {
             .with_test_writer()
             .try_init();
         let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
         let control = Daemon::start(Config::from_toml(&format!(
-            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control\"\n",
-            dir.path().join("control")
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control\"\n{}",
+            dir.path().join("control"),
+            tls.node_table("control")?
         ))?)
         .await?;
-        Ok(Self { control, dir })
+        Ok(Self { control, dir, tls })
     }
 
     /// The node's root directory: its databases, replication state, and change positions.
@@ -103,7 +108,7 @@ impl Harness {
     ) -> Result<Node, Box<dyn Error>> {
         let control_address = self.control.control_address().ok_or("no control address")?;
         let id: NodeId = "node".parse()?;
-        let network = Network::default();
+        let network = self.tls.node_network("node")?;
         let (membership, tasks) = Membership::start(
             Member::new(id.clone()),
             network.control_client(control_address.to_string()),
@@ -113,7 +118,7 @@ impl Harness {
             },
         );
         let root = self.root();
-        let replication = start_replication(id, &root, membership.clone(), mode);
+        let replication = start_replication(id, &root, membership.clone(), network, mode);
         let streams = ChangeStreams::start(ChangeParts {
             sinks,
             replication: replication.clone(),
@@ -197,6 +202,7 @@ fn start_replication(
     node: NodeId,
     root: &Path,
     membership: Membership,
+    network: Network,
     mode: CaptureMode,
 ) -> Replication {
     let config = EngineConfig {
@@ -213,7 +219,7 @@ fn start_replication(
             node,
             engine: Arc::new(engine),
             membership,
-            peers: Arc::new(Peers::with_network(Network::default())),
+            peers: Arc::new(Peers::with_network(network)),
             addresses: Arc::new(BTreeMap::<NodeId, String>::new()),
             clock: Arc::new(SystemClock),
             execution: Execution::Threads,

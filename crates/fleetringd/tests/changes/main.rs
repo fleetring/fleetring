@@ -6,4 +6,6 @@ mod daemon;
 mod file;
 mod isolation;
 mod logical;
+#[path = "../support/mod.rs"]
+mod support;
 mod webhook;

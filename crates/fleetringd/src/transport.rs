@@ -5,7 +5,9 @@
 //! with `tokio::time`, so they stay deterministic under simulation (ADR-0020).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,10 +19,12 @@ use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::database_server::{Database, DatabaseServer};
 use fleetring_proto::v1::replication_client::ReplicationClient;
 use fleetring_proto::v1::replication_server::{Replication, ReplicationServer};
-use tonic::transport::{Channel, Endpoint};
+use tokio_stream::Stream;
+use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::environment::Network;
+use crate::tls::{Accepted, Raw, Security};
 
 /// Timeouts for connections to peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,43 +50,26 @@ impl Default for TransportConfig {
 /// pool only has to remember which channel belongs to which address.
 #[derive(Debug)]
 pub struct Peers {
-    config: TransportConfig,
     network: Network,
     channels: Mutex<BTreeMap<SocketAddr, Channel>>,
     named: Mutex<BTreeMap<String, Channel>>,
 }
 
 impl Peers {
-    /// An empty pool over real TCP.
+    /// An empty pool over real TCP, in plaintext.
     #[must_use]
     pub fn new(config: TransportConfig) -> Self {
-        Self {
-            config,
-            network: Network::Tcp(config),
-            channels: Mutex::new(BTreeMap::new()),
-            named: Mutex::new(BTreeMap::new()),
-        }
+        Self::with_network(Network::tcp(config))
     }
 
-    /// An empty pool whose [`channel_to`](Self::channel_to) dials over `network`, so that the
-    /// same code runs over real TCP and under simulation (ADR-0020).
+    /// An empty pool that dials over `network`, so that the same code runs over real TCP and
+    /// under simulation (ADR-0020), with the identity the network carries.
     #[must_use]
     pub fn with_network(network: Network) -> Self {
-        #[cfg_attr(
-            not(feature = "simulation"),
-            expect(
-                clippy::infallible_destructuring_match,
-                reason = "the simulated network adds a second variant"
-            )
-        )]
-        let config = match network {
-            Network::Tcp(config) => config,
-            #[cfg(feature = "simulation")]
-            Network::Simulated => TransportConfig::default(),
-        };
         Self {
             network,
-            ..Self::new(config)
+            channels: Mutex::new(BTreeMap::new()),
+            named: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -125,17 +112,19 @@ impl Peers {
     ///
     /// # Panics
     ///
-    /// If the pool's lock was poisoned by a panic in another thread.
+    /// If the pool's lock was poisoned by a panic in another thread, or if `peer` doesn't form
+    /// a valid endpoint, which no socket address fails.
     #[must_use]
     pub fn channel(&self, peer: SocketAddr) -> Channel {
         let mut channels = self.channels.lock().expect("peer pool lock poisoned");
         channels
             .entry(peer)
             .or_insert_with(|| {
-                Endpoint::from(http_uri(peer))
-                    .connect_timeout(self.config.connect_timeout)
-                    .timeout(self.config.request_timeout)
-                    .connect_lazy()
+                self.network
+                    .channel(&peer.to_string())
+                    .unwrap_or_else(|error| {
+                        panic!("'{peer}' is a valid endpoint for any socket address: {error}")
+                    })
             })
             .clone()
     }
@@ -157,12 +146,6 @@ impl Peers {
     pub fn database(&self, peer: SocketAddr) -> DatabaseClient<Channel> {
         database_client(self.channel(peer))
     }
-}
-
-fn http_uri(peer: SocketAddr) -> tonic::codegen::http::Uri {
-    let uri = format!("http://{peer}");
-    uri.parse()
-        .unwrap_or_else(|error| panic!("'{uri}' is a valid URI for any socket address: {error}"))
 }
 
 /// A `Control` client over `channel`, with FleetRing's message limits.
@@ -268,118 +251,99 @@ fn is_retryable(status: &Status) -> bool {
     )
 }
 
-/// The transport over turmoil's simulated network (ADR-0020).
-#[cfg(feature = "simulation")]
-pub mod sim {
-    use std::io;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
+/// The listener a daemon serves on: bound before any service starts, so its address is known.
+pub enum Listener {
+    /// A real TCP listener.
+    Tcp(tokio::net::TcpListener),
+    /// A listener on turmoil's simulated network.
+    #[cfg(feature = "simulation")]
+    Simulated(turmoil::net::TcpListener),
+}
 
-    use hyper_util::rt::TokioIo;
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-    use tokio_stream::Stream;
-    use tonic::transport::server::Connected;
-    use tonic::transport::{Channel, Endpoint};
-
-    /// A simulated TCP connection that tonic's server accepts.
-    #[derive(Debug)]
-    pub struct SimStream(turmoil::net::TcpStream);
-
-    impl Connected for SimStream {
-        type ConnectInfo = ();
-
-        fn connect_info(&self) -> Self::ConnectInfo {}
+impl fmt::Debug for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kind, address) = match self {
+            Self::Tcp(listener) => ("Tcp", listener.local_addr().ok()),
+            #[cfg(feature = "simulation")]
+            Self::Simulated(listener) => ("Simulated", listener.local_addr().ok()),
+        };
+        f.debug_struct("Listener")
+            .field("kind", &kind)
+            .field("address", &address)
+            .finish()
     }
+}
 
-    impl AsyncRead for SimStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_read(cx, buf)
+impl Listener {
+    /// Returns the address the listener is bound to.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error if the socket can't report its address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Tcp(listener) => listener.local_addr(),
+            #[cfg(feature = "simulation")]
+            Self::Simulated(listener) => listener.local_addr(),
         }
     }
 
-    impl AsyncWrite for SimStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.0).poll_write(cx, buf)
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_flush(cx)
-        }
-
-        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_shutdown(cx)
-        }
-    }
-
-    /// The connections accepted by a simulated listener, for `serve_with_incoming`.
-    pub fn incoming(
-        listener: turmoil::net::TcpListener,
-    ) -> impl Stream<Item = io::Result<SimStream>> {
-        tokio_stream::StreamExt::map(
-            accept_loop(listener),
-            |accepted: io::Result<turmoil::net::TcpStream>| accepted.map(SimStream),
-        )
-    }
-
-    fn accept_loop(
-        listener: turmoil::net::TcpListener,
-    ) -> impl Stream<Item = io::Result<turmoil::net::TcpStream>> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            loop {
-                let accepted = listener.accept().await.map(|(stream, _peer)| stream);
-                if sender.send(accepted).await.is_err() {
-                    break;
-                }
+    async fn accept(&self) -> io::Result<Raw> {
+        match self {
+            Self::Tcp(listener) => {
+                let (stream, _peer) = listener.accept().await?;
+                // Consistent with tonic's own listener: a failure to set the option isn't fatal.
+                let _ = stream.set_nodelay(true);
+                Ok(Raw::Tcp(stream))
             }
-        });
-        tokio_stream::wrappers::ReceiverStream::new(receiver)
+            #[cfg(feature = "simulation")]
+            Self::Simulated(listener) => {
+                let (stream, _peer) = listener.accept().await?;
+                Ok(Raw::Simulated(stream))
+            }
+        }
     }
+}
 
-    /// A channel to `host:port` on the simulated network.
-    ///
-    /// # Errors
-    ///
-    /// The transport error if the endpoint can't be built.
-    pub fn channel(host: &'static str, port: u16) -> Result<Channel, tonic::transport::Error> {
-        Ok(
-            Endpoint::try_from("http://simulated")?.connect_with_connector_lazy(tower::service_fn(
-                move |_uri| async move {
-                    let stream = turmoil::net::TcpStream::connect((host, port)).await?;
-                    Ok::<_, io::Error>(TokioIo::new(stream))
-                },
-            )),
-        )
-    }
-
-    /// A channel to `address`, given as `host:port`, on the simulated network.
-    ///
-    /// Its signature fits [`ControlClient::with_connector`](crate::control::ControlClient::with_connector),
-    /// so a control client can follow redirects between simulated hosts.
-    ///
-    /// # Errors
-    ///
-    /// The transport error if the endpoint can't be built.
-    pub fn channel_to(address: &str) -> Result<Channel, tonic::transport::Error> {
-        let address = address.to_owned();
-        Ok(
-            Endpoint::try_from("http://simulated")?.connect_with_connector_lazy(tower::service_fn(
-                move |_uri| {
-                    let address = address.clone();
-                    async move {
-                        let stream = turmoil::net::TcpStream::connect(address.as_str()).await?;
-                        Ok::<_, io::Error>(TokioIo::new(stream))
+/// The connections accepted on `listener`, each after its handshake under `security`, for
+/// `serve_with_incoming`.
+///
+/// Handshakes run concurrently and never hold up the accept loop; one that fails is logged
+/// and its connection dropped, so the server only ever sees peers that authenticated. An
+/// error from the listener itself is passed on, as tonic's own listener does.
+///
+/// # Panics
+///
+/// If called outside a Tokio runtime.
+pub fn incoming(
+    listener: Listener,
+    security: Security,
+) -> impl Stream<Item = io::Result<Accepted>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        loop {
+            let raw = match listener.accept().await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    if sender.send(Err(error)).await.is_err() {
+                        break;
                     }
-                },
-            )),
-        )
-    }
+                    continue;
+                }
+            };
+            let sender = sender.clone();
+            let security = security.clone();
+            tokio::spawn(async move {
+                match security.accept(raw).await {
+                    Ok(accepted) => {
+                        tracing::debug!(peer = ?accepted.peer(), "connection accepted");
+                        // The server went away, so the connection goes with it.
+                        let _gone = sender.send(Ok(accepted)).await;
+                    }
+                    Err(error) => tracing::warn!(%error, "connection refused"),
+                }
+            });
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(receiver)
 }

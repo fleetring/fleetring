@@ -28,6 +28,7 @@ use tonic::{Request, Response, Status};
 
 use crate::control::node::{ControlHandle, SubmitError};
 use crate::data::convert::{acks_from_proto, acks_to_proto};
+use crate::tls::Peer;
 
 /// The stream `WatchMembership` returns.
 pub type MembershipStream = Pin<Box<dyn Stream<Item = Result<MembershipUpdate, Status>> + Send>>;
@@ -388,9 +389,11 @@ impl Control for ControlService {
     type WatchMembershipStream = MembershipStream;
 
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
+        let peer = Peer::of(&request);
         let request = request.into_inner();
         check_protocol(request.protocol.as_ref())?;
         let member = member_from(request.node)?;
+        peer.check_node(member.id(), "Join")?;
         match self.submit(Action::Join { member }).await? {
             (
                 Applied::MemberJoined {
@@ -409,8 +412,10 @@ impl Control for ControlService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let peer = Peer::of(&request);
         let request = request.into_inner();
         let id = parse("node id", &request.node_id)?;
+        peer.check_node(&id, "Heartbeat")?;
         let replicas = request
             .databases
             .into_iter()
@@ -585,9 +590,11 @@ impl Control for ControlService {
         &self,
         request: Request<AcquireLeaseRequest>,
     ) -> Result<Response<LeaseResponse>, Status> {
+        let peer = Peer::of(&request);
         let request = request.into_inner();
         let database = parse("database name", &request.database)?;
         let node = parse("node id", &request.node_id)?;
+        peer.check_node(&node, "AcquireLease")?;
         match self.submit(Action::AcquireLease { database, node }).await? {
             (Applied::LeaseGranted { database, lease }, _) => {
                 Ok(Response::new(lease_response(&database, &lease)))
@@ -600,9 +607,11 @@ impl Control for ControlService {
         &self,
         request: Request<RenewLeaseRequest>,
     ) -> Result<Response<LeaseResponse>, Status> {
+        let peer = Peer::of(&request);
         let request = request.into_inner();
         let database = parse("database name", &request.database)?;
         let node = parse("node id", &request.node_id)?;
+        peer.check_node(&node, "RenewLease")?;
         let epoch = LeaseEpoch::new(request.epoch);
         let action = Action::RenewLease {
             database,
@@ -622,6 +631,7 @@ impl Control for ControlService {
         request: Request<LeaveRequest>,
     ) -> Result<Response<LeaveResponse>, Status> {
         let id = parse("node id", &request.get_ref().node_id)?;
+        Peer::of(&request).check_node(&id, "Leave")?;
         match self.submit(Action::Leave { id }).await? {
             (
                 Applied::MemberLeft {
@@ -662,6 +672,8 @@ impl Control for ControlService {
         &self,
         request: Request<RecordFencedRequest>,
     ) -> Result<Response<RecordFencedResponse>, Status> {
+        // The node named here is the fenced replica, reported by the candidate that fenced it,
+        // so it is no claim about the caller's own identity.
         let request = request.into_inner();
         let action = Action::RecordFenced {
             database: parse("database name", &request.database)?,
@@ -711,6 +723,7 @@ impl Control for ControlService {
         request: Request<DrainRequest>,
     ) -> Result<Response<DrainResponse>, Status> {
         let id = parse("node id", &request.get_ref().node_id)?;
+        Peer::of(&request).check_node(&id, "Drain")?;
         match self.submit(Action::Drain { id }).await? {
             (Applied::MemberDraining { id }, state) => Ok(Response::new(DrainResponse {
                 primaries: leases_held_by(&state, &id),

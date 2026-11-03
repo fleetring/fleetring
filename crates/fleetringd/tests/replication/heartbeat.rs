@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use fleetring_control::{Member, Role};
 use fleetring_proto::v1::{self as proto, Acks, CreateDatabaseRequest, DatabaseStatus, Engine};
-use fleetringd::{Config, Daemon, DatabaseStatuses, Membership, MembershipSettings, Network};
+use fleetringd::{Config, Daemon, DatabaseStatuses, Membership, MembershipSettings};
 
 use crate::common::{TestResult, eventually, id, name};
+use crate::support::Tls;
 
 /// Reports one database the control plane knows and one it doesn't.
 #[derive(Debug)]
@@ -30,9 +31,11 @@ impl DatabaseStatuses for Hosted {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeats_report_databases_and_leave_out_unknown_ones() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let control = Daemon::start(Config::from_toml(&format!(
-        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control\"\n",
-        dir.path().join("control")
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control\"\n{}",
+        dir.path().join("control"),
+        tls.node_table("control")?
     ))?)
     .await?;
     let address = control
@@ -40,7 +43,7 @@ async fn heartbeats_report_databases_and_leave_out_unknown_ones() -> TestResult 
         .ok_or("no control address")?
         .to_string();
     let handle = control.control().ok_or("no control handle")?;
-    let network = Network::default();
+    let network = tls.node_network("a")?;
     let settings = MembershipSettings {
         heartbeat_interval_ms: std::num::NonZeroU64::new(50).ok_or("nonzero")?,
         ..MembershipSettings::default()

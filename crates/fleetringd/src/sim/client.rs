@@ -22,6 +22,7 @@ use crate::sim::trace::EventKind;
 use crate::sim::workload::{
     Ack, LeaseObservation, LeaseSeen, Operation, Outcome, Step, WRITES_TABLE, Workload,
 };
+use crate::tls::{Identity, Security};
 use crate::transport::Backoff;
 
 /// How long a lease watcher waits before it tries a node again after a stream failed to open or
@@ -47,6 +48,8 @@ pub(super) struct Session {
     pub(super) entry: Option<String>,
     pub(super) timeout: Duration,
     pub(super) shared: Shared,
+    /// The principal the client acts as, issued by the cluster's test authority.
+    pub(super) identity: Identity,
 }
 
 /// A client: runs `workload`, records each operation, and finishes when the workload does.
@@ -61,8 +64,10 @@ pub(super) async fn run_client(
         entry,
         timeout,
         shared,
+        identity,
     } = session;
-    let client = Client::new(control, Network::Simulated).with_backoff(CLIENT_BACKOFF);
+    let network = Network::simulated().with_security(Security::Tls(identity));
+    let client = Client::new(control, network).with_backoff(CLIENT_BACKOFF);
     let client = match entry {
         Some(entry) => client.with_entry(entry),
         None => client,
@@ -319,6 +324,8 @@ pub(super) struct WatcherSession {
     pub(super) address: String,
     pub(super) timeout: Duration,
     pub(super) shared: Shared,
+    /// The principal the watcher acts as, issued by the cluster's test authority.
+    pub(super) identity: Identity,
 }
 
 /// A lease watcher: follows one data host's `WatchLeases` stream for the whole run, as a worker
@@ -334,10 +341,12 @@ pub(super) async fn run_lease_watcher(session: WatcherSession) -> turmoil::Resul
         address,
         timeout,
         shared,
+        identity,
     } = session;
+    let network = Network::simulated().with_security(Security::Tls(identity));
     let open = || async {
         // A fresh client each time: a connection to a crashed host stalls rather than fails.
-        let client = Client::new(address.clone(), Network::Simulated);
+        let client = Client::new(address.clone(), network.clone());
         let mut updates = tokio::time::timeout(timeout, client.watch_leases(&address))
             .await
             .ok()?

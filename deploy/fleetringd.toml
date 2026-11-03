@@ -2,7 +2,8 @@
 #
 # It runs a one-node cluster: the control role and the data role in one process. To change it,
 # mount your own file over /etc/fleetring/fleetringd.toml, or override single fields with flags:
-# `--node-id`, `--data-dir`, `--listen`, `--advertise`, `--control`, and `--role`.
+# `--node-id`, `--data-dir`, `--listen`, `--advertise`, `--control`, `--role`, and
+# `--insecure-plaintext`.
 
 # Where the node keeps its databases. The daemon locks it, so one directory serves one daemon.
 # The container image declares /data as a volume.
@@ -15,6 +16,29 @@ listen = "0.0.0.0:7400"
 # `both` runs the control plane and hosts databases in one process. In a larger cluster, one node
 # runs `both` (or `control`), and every other node runs `data` and sets `control.address`.
 role = "both"
+
+# Without a [tls] table the daemon refuses to start, unless this is set (or `--insecure-plaintext`
+# is passed): it then serves and dials in plaintext, warning at every start. Nothing on the wire is
+# authenticated or encrypted, so this is for local experiments only.
+# insecure_plaintext = true
+
+[tls]
+# Every connection is mutual TLS (ADR-0025). The node presents the certificate `cert` with its key,
+# and trusts the authority certificates in `ca`; clients and other nodes must present certificates
+# from the same authority. Create them with the built-in authority, on a machine that keeps ca.key:
+#
+#   fleetringd cert init --cluster home --dir ./tls
+#   fleetringd cert node node-1 --hosts 192.0.2.10,node-1.example --dir ./tls
+#   fleetringd cert client admin --dir ./tls
+#
+# then copy ca.crt, node.node-1.crt, and node.node-1.key to the node (for the container image,
+# mount them under /etc/fleetring/tls). Keep ca.key off every node. The files are re-read when they
+# change, so renewing a certificate needs no restart; `ca` may hold two authority certificates while
+# a rotation overlaps. Certificates from another authority (Vault, cert-manager, SPIRE) work the
+# same way.
+ca = "/etc/fleetring/tls/ca.crt"
+cert = "/etc/fleetring/tls/node.crt"
+key = "/etc/fleetring/tls/node.key"
 
 [node]
 # The node's stable ID: 1 to 64 lowercase letters, digits, `-`, `_`, `.`, or `:`. Placement

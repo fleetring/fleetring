@@ -1,0 +1,115 @@
+//! Mutual TLS between nodes and clients, with the cluster's own certificate authority
+//! (ADR-0025).
+//!
+//! Every connection is TLS 1.3 through `rustls`. A node presents a certificate the cluster's
+//! [`Authority`] issued, whose URI subject alternative name `fleetring://<cluster>/node/<id>`
+//! names it; a client's names its principal, `fleetring://<cluster>/principal/<name>`. Both ends
+//! verify the other's certificate against the trusted authority certificates. The server side
+//! learns who connected as a [`Peer`], which tonic places in the extensions of every request on
+//! the connection, so each service can check the caller before it does anything.
+//!
+//! An [`Identity`] is the material one process presents; loaded from files, it reloads them
+//! when they change, so rotation needs no restart. [`Security`] is the choice between an
+//! identity and plaintext, which exists for the simulation harness and local experiments
+//! only.
+
+mod authority;
+mod conn;
+mod identity;
+mod names;
+
+use fleetring::NodeId;
+use tonic::{Request, Status};
+
+pub use authority::{
+    AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE, Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME,
+    DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME, Issued, Validity,
+};
+pub use conn::{Accepted, Conn, HandshakeError, Raw};
+pub use identity::{Identity, IdentityError};
+pub use names::{ClusterName, NameError, Principal, SubjectUri};
+
+/// Who a connection authenticated as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Peer {
+    /// A node of this cluster, by the ID in its certificate.
+    Node(NodeId),
+    /// A client acting as a principal, by the name in its certificate.
+    Principal(Principal),
+    /// Nobody: the connection is plaintext, which only `insecure_plaintext` allows.
+    Plaintext,
+}
+
+impl Peer {
+    /// The peer that sent `request`: what its connection authenticated as, or
+    /// [`Peer::Plaintext`] on a connection that carried no identity.
+    #[must_use]
+    pub fn of<T>(request: &Request<T>) -> Self {
+        request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or(Self::Plaintext)
+    }
+
+    /// Checks that a call made on behalf of the node `claimed` comes from that node: a node
+    /// certificate for another ID is refused, and a principal or a plaintext connection
+    /// passes, because tokens and scopes decide for those (FR-047).
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED`, naming both IDs, if the peer is a node other than `claimed`.
+    pub fn check_node(&self, claimed: &NodeId, call: &'static str) -> Result<(), Status> {
+        match self {
+            Self::Node(id) if id != claimed => {
+                tracing::warn!(
+                    call,
+                    claimed = %claimed,
+                    certificate = %id,
+                    "refused: the node id differs from the certificate's",
+                );
+                Err(Status::permission_denied(format!(
+                    "node id '{claimed}' differs from the certificate's '{id}'"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks that a node-to-node call comes from a node: a principal is refused, and a
+    /// plaintext connection passes.
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED` if the peer is a principal.
+    pub fn require_node(&self, call: &'static str) -> Result<(), Status> {
+        match self {
+            Self::Principal(name) => {
+                tracing::warn!(call, principal = %name, "refused: nodes only");
+                Err(Status::permission_denied(format!(
+                    "{call} is for nodes; '{name}' is a principal"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether connections carry an identity, or run in plaintext.
+#[derive(Debug, Clone)]
+pub enum Security {
+    /// No TLS. Every peer is [`Peer::Plaintext`]. For the simulation harness and local
+    /// experiments only; the daemon needs `insecure_plaintext` to run this way.
+    Plaintext,
+    /// Mutual TLS with this identity.
+    Tls(Identity),
+}
+
+impl Security {
+    /// Returns whether connections run in plaintext.
+    #[must_use]
+    pub fn is_plaintext(&self) -> bool {
+        matches!(self, Self::Plaintext)
+    }
+}

@@ -19,7 +19,10 @@ use fleetringd::replication::{LeaseChange, LeaseEvent};
 use fleetringd::transport::database_client;
 use fleetringd::{Config, Daemon, Network};
 use tonic::Code;
-use tonic::transport::Endpoint;
+
+use crate::support::Tls;
+
+mod support;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -31,18 +34,25 @@ const DATA_ACK_TIMEOUT_MS: u64 = 20_000;
 
 const DATA: [&str; 3] = ["data-1", "data-2", "data-3"];
 
-fn config(dir: &Path, id: &str, role: &str, control: Option<SocketAddr>) -> String {
-    config_with(dir, id, role, control, "")
+fn config(
+    dir: &Path,
+    tls: &Tls,
+    id: &str,
+    role: &str,
+    control: Option<SocketAddr>,
+) -> Result<String, Box<dyn Error>> {
+    config_with(dir, tls, id, role, control, "")
 }
 
 /// A configuration with `membership_settings` appended to its `[membership]` table.
 fn config_with(
     dir: &Path,
+    tls: &Tls,
     id: &str,
     role: &str,
     control: Option<SocketAddr>,
     membership_settings: &str,
-) -> String {
+) -> Result<String, Box<dyn Error>> {
     let control = control.map_or_else(String::new, |address| {
         format!("\n[control]\naddress = \"{address}\"\n")
     });
@@ -55,17 +65,19 @@ fn config_with(
     } else {
         String::new()
     };
-    format!(
+    let tls = tls.node_table(id)?;
+    Ok(format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
-         {replication}\n[membership]\nheartbeat_interval_ms = 100\n{membership_settings}{control}",
+         {replication}\n[membership]\nheartbeat_interval_ms = 100\n{membership_settings}{tls}{control}",
         dir.join(id)
-    )
+    ))
 }
 
 /// A control daemon and three data daemons that have all joined and published one ring.
 struct Cluster {
     control: Daemon,
     data: Vec<Daemon>,
+    tls: Tls,
 }
 
 impl Cluster {
@@ -87,9 +99,10 @@ impl Cluster {
         control_tables: &str,
         membership_settings: &str,
     ) -> Result<Self, Box<dyn Error>> {
+        let tls = Tls::create(dir)?;
         let control_text = format!(
             "{}\n[control]\n{control_settings}\n{control_tables}",
-            config(dir, "control", "control", None)
+            config(dir, &tls, "control", "control", None)?
         );
         let control = Daemon::start(Config::from_toml(&control_text)?).await?;
         let address = control.control_address().ok_or("no control address")?;
@@ -97,11 +110,11 @@ impl Cluster {
         for id in DATA {
             let text = format!(
                 "{}{control_settings}",
-                config_with(dir, id, "data", Some(address), membership_settings)
+                config_with(dir, &tls, id, "data", Some(address), membership_settings)?
             );
             data.push(Daemon::start(Config::from_toml(&text)?).await?);
         }
-        let cluster = Self { control, data };
+        let cluster = Self { control, data, tls };
         cluster.converge().await?;
         Ok(cluster)
     }
@@ -148,7 +161,7 @@ impl Cluster {
     }
 
     fn client(&self) -> Result<Client, Box<dyn Error>> {
-        Ok(Client::new(self.control_address()?, network()))
+        Ok(Client::new(self.control_address()?, network(&self.tls)?))
     }
 
     fn data_daemon(&self, id: &str) -> Result<&Daemon, Box<dyn Error>> {
@@ -166,14 +179,18 @@ impl Cluster {
     }
 }
 
-/// The network the tests' clients use: real TCP, with a request timeout that outlasts a slow
-/// runner. Creating a database waits for every follower to connect and bootstrap, which can take
-/// several seconds on a loaded machine, and the tests have their own hang guards.
-fn network() -> Network {
-    Network::Tcp(fleetringd::transport::TransportConfig {
-        request_timeout: Duration::from_secs(60),
-        ..fleetringd::transport::TransportConfig::default()
-    })
+/// The network the tests' clients use: real TCP as the principal `tester`, with a request
+/// timeout that outlasts a slow runner. Creating a database waits for every follower to connect
+/// and bootstrap, which can take several seconds on a loaded machine, and the tests have their
+/// own hang guards.
+fn network(tls: &Tls) -> Result<Network, Box<dyn Error>> {
+    tls.client_network_with(
+        "tester",
+        fleetringd::transport::TransportConfig {
+            request_timeout: Duration::from_secs(60),
+            ..fleetringd::transport::TransportConfig::default()
+        },
+    )
 }
 
 fn name(text: &str) -> Result<DatabaseName, Box<dyn Error>> {
@@ -457,11 +474,7 @@ async fn a_request_to_a_follower_is_redirected_to_the_primary() -> TestResult {
     let follower = follower_address(&location)?;
 
     // Sent straight to a follower, a write is answered with the primary's address.
-    let mut raw = database_client(
-        Endpoint::from_shared(format!("http://{follower}"))?
-            .connect()
-            .await?,
-    );
+    let mut raw = database_client(network(&cluster.tls)?.channel(&follower)?);
     let redirect = raw
         .execute(ExecuteRequest {
             database: acme.to_string(),
@@ -578,10 +591,13 @@ async fn status_shows_the_ring_every_node_publishes() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_primary_serves_its_database_again() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let Cluster { control, mut data } =
-        Cluster::start_configured(dir.path(), "", "", "on_shutdown = \"stay\"\n").await?;
+    let Cluster {
+        control,
+        mut data,
+        tls,
+    } = Cluster::start_configured(dir.path(), "", "", "on_shutdown = \"stay\"\n").await?;
     let cluster_control = control.control_address().ok_or("no control address")?;
-    let client = Client::new(cluster_control.to_string(), network());
+    let client = Client::new(cluster_control.to_string(), network(&tls)?);
     let acme = name("acme")?;
     let location = client.create_database(&acme, three()?).await?;
     let primary = location.primary.clone().ok_or("no primary")?;
@@ -603,7 +619,7 @@ async fn a_restarted_primary_serves_its_database_again() -> TestResult {
     let restarted = Daemon::start(config).await?;
     let new_address = restarted.listen_address().to_string();
     data.push(restarted);
-    let cluster = Cluster { control, data };
+    let cluster = Cluster { control, data, tls };
     cluster.converge().await?;
     tokio::time::timeout(HANG_GUARD, async {
         loop {
@@ -657,7 +673,11 @@ async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> Tes
 
     // The primary goes away; the next write fails until a follower takes over, then succeeds
     // when retried, as `fleetringd db exec` would be.
-    let Cluster { control, mut data } = cluster;
+    let Cluster {
+        control,
+        mut data,
+        tls,
+    } = cluster;
     let index = data
         .iter()
         .position(|daemon| daemon.config().node.id == old)
@@ -690,7 +710,7 @@ async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> Tes
         rows.rows,
         vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
     );
-    Cluster { control, data }.stop().await;
+    Cluster { control, data, tls }.stop().await;
     Ok(())
 }
 
@@ -907,13 +927,17 @@ fn database_bytes(dir: &Path, id: &str, database: &str) -> Result<Vec<u8>, Box<d
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writes_below_the_replica_floor_are_refused_with_unavailable() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let Cluster { control, mut data } = Cluster::start(dir.path()).await?;
+    let Cluster {
+        control,
+        mut data,
+        tls,
+    } = Cluster::start(dir.path()).await?;
     let client = Client::new(
         control
             .control_address()
             .ok_or("no control address")?
             .to_string(),
-        network(),
+        network(&tls)?,
     );
     let strict = name("strict")?;
     let spec = DatabaseSpec::new(three()?).with_min_replicas(3);
@@ -978,7 +1002,7 @@ async fn writes_below_the_replica_floor_are_refused_with_unavailable() -> TestRe
         )
         .await?;
     assert_eq!(rows.rows, vec![vec![Value::Integer(0)]]);
-    Cluster { control, data }.stop().await;
+    Cluster { control, data, tls }.stop().await;
     Ok(())
 }
 
@@ -1129,7 +1153,7 @@ async fn a_control_call_to_a_data_node_names_the_control_node() -> TestResult {
     let control = cluster.control_address()?;
     for daemon in &cluster.data {
         let data_node = daemon.listen_address().to_string();
-        let wrong = Client::new(data_node, network());
+        let wrong = Client::new(data_node, network(&cluster.tls)?);
         let refused = wrong
             .locate(&name("acme")?)
             .await
@@ -1148,6 +1172,7 @@ async fn a_control_call_to_a_data_node_names_the_control_node() -> TestResult {
 
 #[cfg(unix)]
 mod binary {
+    use std::path::Path;
     use std::process::{Command, Output};
 
     use super::{
@@ -1157,9 +1182,16 @@ mod binary {
 
     /// Runs `fleetringd` with `args` on a blocking thread, so the daemons in this process keep
     /// serving.
-    async fn fleetringd(args: Vec<String>) -> Result<Output, Box<dyn std::error::Error>> {
+    /// Runs the binary with the client certificate under `tls_dir`, as `FLEETRING_TLS_DIR`
+    /// names it.
+    async fn fleetringd(
+        tls_dir: &Path,
+        args: Vec<String>,
+    ) -> Result<Output, Box<dyn std::error::Error>> {
+        let tls_dir = tls_dir.to_owned();
         Ok(tokio::task::spawn_blocking(move || {
             Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+                .env("FLEETRING_TLS_DIR", &tls_dir)
                 .args(&args)
                 .output()
         })
@@ -1192,25 +1224,31 @@ mod binary {
         let control = cluster.control_address()?;
 
         let created = stdout(
-            &fleetringd(args(
-                &["db", "create", "tenant:acme", "--replication-factor", "3"],
-                &control,
-            ))
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &["db", "create", "tenant:acme", "--replication-factor", "3"],
+                    &control,
+                ),
+            )
             .await?,
         )?;
         assert!(created.starts_with("created tenant:acme\n"), "{created}");
         assert!(created.contains("epoch: 1\n"), "{created}");
 
         let table = stdout(
-            &fleetringd(args(
-                &[
-                    "db",
-                    "exec",
-                    "tenant:acme",
-                    "CREATE TABLE t (n INTEGER, s TEXT, r REAL, b BLOB, z)",
-                ],
-                &control,
-            ))
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &[
+                        "db",
+                        "exec",
+                        "tenant:acme",
+                        "CREATE TABLE t (n INTEGER, s TEXT, r REAL, b BLOB, z)",
+                    ],
+                    &control,
+                ),
+            )
             .await?,
         )?;
         assert!(
@@ -1219,20 +1257,23 @@ mod binary {
             "{table}"
         );
         let insert = stdout(
-            &fleetringd(args(
-                &[
-                    "db",
-                    "exec",
-                    "tenant:acme",
-                    "INSERT INTO t VALUES (?, ?, ?, ?, ?)",
-                    "-4",
-                    "text:42",
-                    "2.5",
-                    "blob:00ff",
-                    "null",
-                ],
-                &control,
-            ))
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &[
+                        "db",
+                        "exec",
+                        "tenant:acme",
+                        "INSERT INTO t VALUES (?, ?, ?, ?, ?)",
+                        "-4",
+                        "text:42",
+                        "2.5",
+                        "blob:00ff",
+                        "null",
+                    ],
+                    &control,
+                ),
+            )
             .await?,
         )?;
         assert!(
@@ -1242,10 +1283,13 @@ mod binary {
         );
 
         let rows = stdout(
-            &fleetringd(args(
-                &["db", "query", "tenant:acme", "SELECT n, s, r, b, z FROM t"],
-                &control,
-            ))
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &["db", "query", "tenant:acme", "SELECT n, s, r, b, z FROM t"],
+                    &control,
+                ),
+            )
             .await?,
         )?;
         assert_eq!(rows, "n\ts\tr\tb\tz\n-4\t42\t2.5\tx'00ff'\tNULL\n");
@@ -1263,9 +1307,18 @@ mod binary {
             &control,
         );
         via_follower.extend(["--node".to_owned(), follower]);
-        assert_eq!(stdout(&fleetringd(via_follower).await?)?, "rows\n1\n");
+        assert_eq!(
+            stdout(&fleetringd(cluster.tls.dir(), via_follower).await?)?,
+            "rows\n1\n"
+        );
 
-        let located = stdout(&fleetringd(args(&["db", "locate", "tenant:acme"], &control)).await?)?;
+        let located = stdout(
+            &fleetringd(
+                cluster.tls.dir(),
+                args(&["db", "locate", "tenant:acme"], &control),
+            )
+            .await?,
+        )?;
         let primary = location.primary.ok_or("no primary")?;
         assert!(
             located.contains(&format!("primary: {primary} (")),
@@ -1278,7 +1331,7 @@ mod binary {
         );
         assert!(located.contains("positions:\n"), "{located}");
 
-        let status = stdout(&fleetringd(args(&["status"], &control)).await?)?;
+        let status = stdout(&fleetringd(cluster.tls.dir(), args(&["status"], &control)).await?)?;
         let fingerprint = cluster
             .control
             .control()
@@ -1305,16 +1358,26 @@ mod binary {
             .control
             .control_address()
             .ok_or("no control address")?;
-        std::fs::write(&file, config(dir.path(), "data-9", "data", Some(address)))?;
-        let by_config = fleetringd(vec![
-            "status".to_owned(),
-            "--config".to_owned(),
-            file.display().to_string(),
-        ])
+        std::fs::write(
+            &file,
+            config(dir.path(), &cluster.tls, "data-9", "data", Some(address))?,
+        )?;
+        let by_config = fleetringd(
+            cluster.tls.dir(),
+            vec![
+                "status".to_owned(),
+                "--config".to_owned(),
+                file.display().to_string(),
+            ],
+        )
         .await?;
         assert_eq!(stdout(&by_config)?, status);
 
-        let failed = fleetringd(args(&["db", "exec", "tenant:acme", "NOT SQL"], &control)).await?;
+        let failed = fleetringd(
+            cluster.tls.dir(),
+            args(&["db", "exec", "tenant:acme", "NOT SQL"], &control),
+        )
+        .await?;
         assert!(!failed.status.success());
         let stderr = String::from_utf8_lossy(&failed.stderr);
         assert!(
@@ -1337,7 +1400,8 @@ mod binary {
             locations.push(client.create_database(&name(text)?, three()?).await?);
         }
 
-        let listed = stdout(&fleetringd(args(&["db", "list"], &control)).await?)?;
+        let listed =
+            stdout(&fleetringd(cluster.tls.dir(), args(&["db", "list"], &control)).await?)?;
         let lines: Vec<&str> = listed.lines().collect();
         assert!(lines[0].starts_with("NAME  "), "{listed}");
         assert!(lines[1].starts_with("acme  "), "sorted by name: {listed}");
@@ -1379,7 +1443,11 @@ mod binary {
 
         let primary = locations[0].primary.clone().ok_or("no primary")?;
         let filtered = stdout(
-            &fleetringd(args(&["db", "list", "--node", primary.as_str()], &control)).await?,
+            &fleetringd(
+                cluster.tls.dir(),
+                args(&["db", "list", "--node", primary.as_str()], &control),
+            )
+            .await?,
         )?;
         let expected: Vec<&Location> = locations
             .iter()
@@ -1401,7 +1469,11 @@ mod binary {
         for daemon in &cluster.data {
             let address = daemon.listen_address().to_string();
             let status = stdout(
-                &fleetringd(vec!["status".to_owned(), "--node".to_owned(), address]).await?,
+                &fleetringd(
+                    cluster.tls.dir(),
+                    vec!["status".to_owned(), "--node".to_owned(), address],
+                )
+                .await?,
             )?;
             assert!(
                 status.starts_with(&format!("node: {}\n", daemon.config().node.id)),
@@ -1416,47 +1488,60 @@ mod binary {
         // Durability settings are set at creation, shown by locate and list, and changed for
         // the next epoch.
         let created = stdout(
-            &fleetringd(args(
-                &[
-                    "db",
-                    "create",
-                    "everyone",
-                    "--acks",
-                    "all",
-                    "--min-replicas",
-                    "3",
-                ],
-                &control,
-            ))
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &[
+                        "db",
+                        "create",
+                        "everyone",
+                        "--acks",
+                        "all",
+                        "--min-replicas",
+                        "3",
+                    ],
+                    &control,
+                ),
+            )
             .await?,
         )?;
         assert!(
             created.contains("acks: all\nmin replicas: 3\n"),
             "{created}"
         );
-        let located = stdout(&fleetringd(args(&["db", "locate", "everyone"], &control)).await?)?;
+        let located = stdout(
+            &fleetringd(
+                cluster.tls.dir(),
+                args(&["db", "locate", "everyone"], &control),
+            )
+            .await?,
+        )?;
         assert!(
             located.contains("replication factor: 3\nacks: all\nmin replicas: 3\n"),
             "{located}"
         );
-        let listed = stdout(&fleetringd(args(&["db", "list"], &control)).await?)?;
+        let listed =
+            stdout(&fleetringd(cluster.tls.dir(), args(&["db", "list"], &control)).await?)?;
         let line = listed
             .lines()
             .find(|line| line.starts_with("everyone"))
             .ok_or("everyone not listed")?;
         let cells: Vec<&str> = line.split_whitespace().collect();
         assert_eq!(&cells[1..6], ["sqlite", "1", "3", "all", "3"], "{line}");
-        let bad = fleetringd(args(
-            &["db", "create", "bad", "--acks", "sometimes"],
-            &control,
-        ))
+        let bad = fleetringd(
+            cluster.tls.dir(),
+            args(&["db", "create", "bad", "--acks", "sometimes"], &control),
+        )
         .await?;
         assert!(!bad.status.success());
         let changed = stdout(
-            &fleetringd(args(
-                &["db", "set-durability", "everyone", "--acks", "local"],
-                &control,
-            ))
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &["db", "set-durability", "everyone", "--acks", "local"],
+                    &control,
+                ),
+            )
             .await?,
         )?;
         assert_eq!(
@@ -1464,14 +1549,23 @@ mod binary {
             "durability of everyone changes to acks=local min_replicas=1 at its next epoch; \
              now acks=all min_replicas=3\n"
         );
-        let located = stdout(&fleetringd(args(&["db", "locate", "everyone"], &control)).await?)?;
+        let located = stdout(
+            &fleetringd(
+                cluster.tls.dir(),
+                args(&["db", "locate", "everyone"], &control),
+            )
+            .await?,
+        )?;
         assert!(located.contains("acks: all\n"), "{located}");
 
         // A control call aimed at a data node names the control node.
-        let wrong = fleetringd(args(
-            &["db", "list"],
-            &cluster.data[0].listen_address().to_string(),
-        ))
+        let wrong = fleetringd(
+            cluster.tls.dir(),
+            args(
+                &["db", "list"],
+                &cluster.data[0].listen_address().to_string(),
+            ),
+        )
         .await?;
         assert!(!wrong.status.success());
         let stderr = String::from_utf8_lossy(&wrong.stderr);
@@ -1487,7 +1581,8 @@ mod binary {
             every_node_has(dir.path(), "orders")
         })
         .await?;
-        let asked = fleetringd(args(&["db", "drop", "orders"], &control)).await?;
+        let asked =
+            fleetringd(cluster.tls.dir(), args(&["db", "drop", "orders"], &control)).await?;
         assert!(!asked.status.success());
         assert!(
             String::from_utf8_lossy(&asked.stderr).contains("pass --yes"),
@@ -1495,16 +1590,26 @@ mod binary {
             String::from_utf8_lossy(&asked.stderr)
         );
         assert!(client.locate(&name("orders")?).await.is_ok());
-        let dropped =
-            stdout(&fleetringd(args(&["db", "drop", "orders", "--yes"], &control)).await?)?;
+        let dropped = stdout(
+            &fleetringd(
+                cluster.tls.dir(),
+                args(&["db", "drop", "orders", "--yes"], &control),
+            )
+            .await?,
+        )?;
         assert_eq!(dropped, "dropped orders at epoch 1\n");
-        let gone = fleetringd(args(&["db", "locate", "orders"], &control)).await?;
+        let gone = fleetringd(
+            cluster.tls.dir(),
+            args(&["db", "locate", "orders"], &control),
+        )
+        .await?;
         assert!(!gone.status.success());
         wait_until("every node deleted its copy of orders", async || {
             no_node_has(dir.path(), "orders")
         })
         .await?;
-        let listed = stdout(&fleetringd(args(&["db", "list"], &control)).await?)?;
+        let listed =
+            stdout(&fleetringd(cluster.tls.dir(), args(&["db", "list"], &control)).await?)?;
         assert!(!listed.contains("orders"), "{listed}");
 
         cluster.stop().await;
@@ -1684,7 +1789,11 @@ async fn draining_a_node_moves_its_primaries_while_a_client_keeps_writing() -> T
     }
 
     // Stopping the drained node now leaves nothing to hand over; it leaves the cluster.
-    let Cluster { control, mut data } = cluster;
+    let Cluster {
+        control,
+        mut data,
+        tls,
+    } = cluster;
     let index = data
         .iter()
         .position(|daemon| daemon.config().node.id == drained_id)
@@ -1706,7 +1815,7 @@ async fn draining_a_node_moves_its_primaries_while_a_client_keeps_writing() -> T
             "{database}: a stop after a drain costs no epoch"
         );
     }
-    Cluster { control, data }.stop().await;
+    Cluster { control, data, tls }.stop().await;
     Ok(())
 }
 

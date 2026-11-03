@@ -27,6 +27,7 @@ use crate::engine::{
     CheckpointMarker, EngineCapability, EngineError, Execution, FrameBatch, FrameFollower, Payload,
     Position,
 };
+use crate::tls::Peer;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -161,11 +162,16 @@ impl Replication for ReplicationService {
         &self,
         request: Request<Streaming<ReplicateMessage>>,
     ) -> Result<Response<Self::ReplicateStream>, Status> {
+        let peer = Peer::of(&request);
+        peer.require_node("Replicate")?;
         let primary: Option<NodeId> = request
             .metadata()
             .get(PRIMARY_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
+        if let Some(primary) = &primary {
+            peer.check_node(primary, "Replicate")?;
+        }
         let mut inbound = request.into_inner();
         let open = match inbound.message().await? {
             Some(ReplicateMessage {
@@ -226,6 +232,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<FenceRequest>,
     ) -> Result<Response<FenceResponse>, Status> {
+        Peer::of(&request).require_node("Fence")?;
         failover::fence_rpc(&self.inner, request.into_inner())
             .await
             .map(Response::new)
@@ -235,6 +242,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<FetchRequest>,
     ) -> Result<Response<FetchResponse>, Status> {
+        Peer::of(&request).require_node("Fetch")?;
         failover::fetch_rpc(&self.inner, request.into_inner())
             .await
             .map(Response::new)
@@ -244,6 +252,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
+        Peer::of(&request).require_node("Promote")?;
         failover::promote_rpc(&self.inner, request.into_inner())?;
         Ok(Response::new(PromoteResponse {}))
     }
@@ -252,6 +261,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
+        Peer::of(&request).require_node("Snapshot")?;
         snapshot::serve(&self.inner, request.into_inner())
             .await
             .map(Response::new)

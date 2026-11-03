@@ -11,3 +11,5 @@ mod protocol;
 mod proxy;
 mod quorum;
 mod snapshot;
+#[path = "../support/mod.rs"]
+mod support;
