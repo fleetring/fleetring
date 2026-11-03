@@ -100,40 +100,40 @@ A principal gets its scopes in one of two ways:
 
 Each request a principal makes is logged at debug on the `fleetringd::audit` target, and each refusal as a warning, with the principal, the credential (`certificate`, or `token:<id>`), the action, the database, and the RPC; never the token itself.
 
-What each RPC needs: `node` is a node certificate, and principals are refused; `cluster` is a node or the `cluster` scope; a listing shows each database the caller may read, and everything to `cluster`, except that `NodeStatus` shows a change sink's progress to a principal that may `stream` its database. A request for an RPC this table doesn't list is refused.
+What each RPC needs: `node` is a node certificate, and principals are refused; `cluster` is a node or the `cluster` scope; a listing shows each database the caller may read, and everything to `cluster`, except that `NodeStatus` shows a change sink's progress to a principal that may `stream` its database. A request for an RPC this table doesn't list is refused. The binding is what a node making the call must be for the database or node the request names (ADR-0031): `self` (the request names the caller), `replica` (in the database's replica set), `holder` (it holds the database's lease), `candidate` (the candidate of the promotion to the request's epoch), `holder or candidate` (either, at the stream's epoch), or `follower` (one the primary streams the database to).
 
 A token is checked when a request arrives, and a stream opened with one (`WatchLeases`, `WatchMembership`) is checked again before each message and every second between them, so it ends with `UNAUTHENTICATED` within about a second of the token's expiry, or of its revocation reaching the node. A data node checks tokens against the denylist from its last join or heartbeat reply; until the first one arrives, and whenever the last is more than three heartbeat intervals old, it refuses every token with `UNAVAILABLE`, which a client retries, and keeps serving client certificates.
 
-| RPC | Needs |
-|---|---|
-| `Control.Join` | node |
-| `Control.Heartbeat` | node |
-| `Control.WatchMembership` | cluster |
-| `Control.CreateDatabase` | admin on the key |
-| `Control.DropDatabase` | admin on the key |
-| `Control.ChangeDurability` | admin on the key |
-| `Control.Locate` | read on the key, or cluster |
-| `Control.ListDatabases` | read per key listed, or cluster |
-| `Control.AcquireLease` | node |
-| `Control.RenewLease` | node |
-| `Control.Leave` | cluster |
-| `Control.StartPromotion` | node |
-| `Control.RecordFenced` | node |
-| `Control.CompletePromotion` | node |
-| `Control.Drain` | cluster |
-| `Control.TransferLease` | admin on the key |
-| `Control.RevokeToken` | cluster |
-| `Replication.Replicate` | node |
-| `Replication.Fence` | node |
-| `Replication.Snapshot` | node |
-| `Replication.Fetch` | node |
-| `Replication.Promote` | node |
-| `Database.Execute` | write on the key |
-| `Database.Query` | read on the key |
-| `Database.Create` | admin on the key |
-| `Database.NodeStatus` | read or stream per key listed, or cluster |
-| `Database.WatchLeases` | read per key listed, or cluster |
-| `Database.Verify` | read on the key, or cluster |
+| RPC | Needs | Binding |
+|---|---|---|
+| `Control.Join` | node | self |
+| `Control.Heartbeat` | node | self |
+| `Control.WatchMembership` | cluster | — |
+| `Control.CreateDatabase` | admin on the key | — |
+| `Control.DropDatabase` | admin on the key | — |
+| `Control.ChangeDurability` | admin on the key | — |
+| `Control.Locate` | read on the key, or cluster | — |
+| `Control.ListDatabases` | read per key listed, or cluster | — |
+| `Control.AcquireLease` | node | self |
+| `Control.RenewLease` | node | self |
+| `Control.Leave` | cluster | self |
+| `Control.StartPromotion` | node | replica |
+| `Control.RecordFenced` | node | candidate |
+| `Control.CompletePromotion` | node | candidate |
+| `Control.Drain` | cluster | self |
+| `Control.TransferLease` | admin on the key | holder |
+| `Control.RevokeToken` | cluster | — |
+| `Replication.Replicate` | node | holder or candidate |
+| `Replication.Fence` | node | candidate |
+| `Replication.Snapshot` | node | follower |
+| `Replication.Fetch` | node | candidate |
+| `Replication.Promote` | node | candidate |
+| `Database.Execute` | write on the key | — |
+| `Database.Query` | read on the key | — |
+| `Database.Create` | admin on the key | — |
+| `Database.NodeStatus` | read or stream per key listed, or cluster | — |
+| `Database.WatchLeases` | read per key listed, or cluster | — |
+| `Database.Verify` | read on the key, or cluster | — |
 
 ## Install
 

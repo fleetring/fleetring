@@ -9,7 +9,7 @@ use std::fmt;
 use fleetring::NodeId;
 use fleetring_control::{DatabaseName, KeyId, Timestamp, TokenId};
 
-use crate::auth::{Action, Scopes, Target};
+use crate::auth::{Action, Binding, Scopes, Target};
 use crate::tls::Principal;
 
 /// What an RPC needs from its caller.
@@ -76,6 +76,9 @@ pub struct Rpc {
     pub requirement: Requirement,
     /// Whether a node certificate may make it.
     pub nodes: ForNodes,
+    /// What a node making it must be for the database or node it names (ADR-0031);
+    /// [`Binding::None`] for a call no node makes, or one with nothing to bind.
+    pub binding: Binding,
 }
 
 impl Rpc {
@@ -93,8 +96,9 @@ impl Rpc {
     }
 }
 
-/// An RPC whose callers need `requirement`; nodes may make it only if it is a `node` RPC.
-const fn rpc(path: &'static str, requirement: Requirement) -> Rpc {
+/// An RPC whose callers need `requirement`, and a node making it `binding`; nodes may make it
+/// only if it is a `node` RPC.
+const fn rpc(path: &'static str, requirement: Requirement, binding: Binding) -> Rpc {
     let nodes = match requirement {
         Requirement::Node => ForNodes::Allowed,
         _ => ForNodes::Refused,
@@ -103,15 +107,17 @@ const fn rpc(path: &'static str, requirement: Requirement) -> Rpc {
         path,
         requirement,
         nodes,
+        binding,
     }
 }
 
-/// A client RPC that a daemon also makes with its own node certificate.
-const fn node_too(path: &'static str, requirement: Requirement) -> Rpc {
+/// A client RPC that a daemon also makes with its own node certificate, bound by `binding`.
+const fn node_too(path: &'static str, requirement: Requirement, binding: Binding) -> Rpc {
     Rpc {
         path,
         requirement,
         nodes: ForNodes::Allowed,
+        binding,
     }
 }
 
@@ -119,80 +125,153 @@ const fn node_too(path: &'static str, requirement: Requirement) -> Rpc {
 /// and the proto comments state the same, and tests hold all three to the proto.
 pub const RPCS: &[Rpc] = &[
     // Control.
-    rpc("/fleetring.v1.Control/Join", Requirement::Node),
-    rpc("/fleetring.v1.Control/Heartbeat", Requirement::Node),
+    rpc(
+        "/fleetring.v1.Control/Join",
+        Requirement::Node,
+        Binding::SelfNode,
+    ),
+    rpc(
+        "/fleetring.v1.Control/Heartbeat",
+        Requirement::Node,
+        Binding::SelfNode,
+    ),
     // Every data node follows the membership.
     node_too(
         "/fleetring.v1.Control/WatchMembership",
         Requirement::Cluster,
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Control/CreateDatabase",
         Requirement::Key(Action::Admin),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Control/DropDatabase",
         Requirement::Key(Action::Admin),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Control/ChangeDurability",
         Requirement::Key(Action::Admin),
+        Binding::None,
     ),
     // A data node locates the databases it creates, serves, and drains; it computes the same
     // placement from the membership anyway.
     node_too(
         "/fleetring.v1.Control/Locate",
         Requirement::KeyOrCluster(Action::Read),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Control/ListDatabases",
         Requirement::Listing(&[Action::Read]),
+        Binding::None,
     ),
-    rpc("/fleetring.v1.Control/AcquireLease", Requirement::Node),
-    rpc("/fleetring.v1.Control/RenewLease", Requirement::Node),
+    rpc(
+        "/fleetring.v1.Control/AcquireLease",
+        Requirement::Node,
+        Binding::SelfNode,
+    ),
+    rpc(
+        "/fleetring.v1.Control/RenewLease",
+        Requirement::Node,
+        Binding::SelfNode,
+    ),
     // A node leaves, and drains, itself when it shuts down; the handler refuses another node's
     // ID from a node certificate.
-    node_too("/fleetring.v1.Control/Leave", Requirement::Cluster),
-    rpc("/fleetring.v1.Control/StartPromotion", Requirement::Node),
-    rpc("/fleetring.v1.Control/RecordFenced", Requirement::Node),
-    rpc("/fleetring.v1.Control/CompletePromotion", Requirement::Node),
-    node_too("/fleetring.v1.Control/Drain", Requirement::Cluster),
+    node_too(
+        "/fleetring.v1.Control/Leave",
+        Requirement::Cluster,
+        Binding::SelfNode,
+    ),
+    rpc(
+        "/fleetring.v1.Control/StartPromotion",
+        Requirement::Node,
+        Binding::Replica,
+    ),
+    rpc(
+        "/fleetring.v1.Control/RecordFenced",
+        Requirement::Node,
+        Binding::Candidate,
+    ),
+    rpc(
+        "/fleetring.v1.Control/CompletePromotion",
+        Requirement::Node,
+        Binding::Candidate,
+    ),
+    node_too(
+        "/fleetring.v1.Control/Drain",
+        Requirement::Cluster,
+        Binding::SelfNode,
+    ),
     // A draining node hands its own leases over; the handler refuses a lease it doesn't hold.
     node_too(
         "/fleetring.v1.Control/TransferLease",
         Requirement::Key(Action::Admin),
+        Binding::Holder,
     ),
-    rpc("/fleetring.v1.Control/RevokeToken", Requirement::Cluster),
+    rpc(
+        "/fleetring.v1.Control/RevokeToken",
+        Requirement::Cluster,
+        Binding::None,
+    ),
     // Replication: nodes only.
-    rpc("/fleetring.v1.Replication/Replicate", Requirement::Node),
-    rpc("/fleetring.v1.Replication/Fence", Requirement::Node),
-    rpc("/fleetring.v1.Replication/Snapshot", Requirement::Node),
-    rpc("/fleetring.v1.Replication/Fetch", Requirement::Node),
-    rpc("/fleetring.v1.Replication/Promote", Requirement::Node),
+    rpc(
+        "/fleetring.v1.Replication/Replicate",
+        Requirement::Node,
+        Binding::HolderOrCandidate,
+    ),
+    rpc(
+        "/fleetring.v1.Replication/Fence",
+        Requirement::Node,
+        Binding::Candidate,
+    ),
+    rpc(
+        "/fleetring.v1.Replication/Snapshot",
+        Requirement::Node,
+        Binding::Follower,
+    ),
+    rpc(
+        "/fleetring.v1.Replication/Fetch",
+        Requirement::Node,
+        Binding::Candidate,
+    ),
+    rpc(
+        "/fleetring.v1.Replication/Promote",
+        Requirement::Node,
+        Binding::Candidate,
+    ),
     // Database.
     rpc(
         "/fleetring.v1.Database/Execute",
         Requirement::Key(Action::Write),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/Query",
         Requirement::Key(Action::Read),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/Create",
         Requirement::Key(Action::Admin),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/NodeStatus",
         Requirement::Listing(&[Action::Read, Action::Stream]),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/WatchLeases",
         Requirement::Listing(&[Action::Read]),
+        Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/Verify",
         Requirement::KeyOrCluster(Action::Read),
+        Binding::None,
     ),
 ];
 
@@ -423,6 +502,92 @@ mod tests {
         for rpc in RPCS {
             let service = rpc.service().trim_start_matches("fleetring.v1.");
             let row = format!("| `{service}.{}` | {} |", rpc.method(), rpc.requirement);
+            assert!(
+                README.contains(&row),
+                "the daemon README lacks the row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_node_rpc_names_a_binding() {
+        let unbound: Vec<&str> = RPCS
+            .iter()
+            .filter(|rpc| rpc.requirement == Requirement::Node && rpc.binding == Binding::None)
+            .map(|rpc| rpc.path)
+            .collect();
+        assert!(
+            unbound.is_empty(),
+            "node rpcs without a binding: {unbound:?}"
+        );
+        // A binding only means something on a call a node makes.
+        let refused: Vec<&str> = RPCS
+            .iter()
+            .filter(|rpc| rpc.nodes == ForNodes::Refused && rpc.binding != Binding::None)
+            .map(|rpc| rpc.path)
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "bindings on rpcs nodes may not make: {refused:?}"
+        );
+        // The client calls a daemon makes as itself that change nothing bound to a database or
+        // a node are the only node calls with nothing to bind.
+        let free: BTreeSet<&str> = RPCS
+            .iter()
+            .filter(|rpc| rpc.nodes == ForNodes::Allowed && rpc.binding == Binding::None)
+            .map(|rpc| rpc.path)
+            .collect();
+        let reads: BTreeSet<&str> = [
+            "/fleetring.v1.Control/WatchMembership",
+            "/fleetring.v1.Control/Locate",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(free, reads);
+    }
+
+    #[test]
+    fn the_proto_comments_state_each_node_rpcs_binding() {
+        let mut service = None;
+        let mut binding = None;
+        let mut checked = 0;
+        for line in PROTO.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("service ") {
+                service = rest.split_whitespace().next();
+            } else if let Some(stated) = line.strip_prefix("// Binding: ") {
+                binding = Some(stated.trim_end_matches('.'));
+            } else if let (Some(service), Some(rest)) = (service, line.strip_prefix("rpc ")) {
+                let method = rest.split('(').next().unwrap_or(rest).trim();
+                let path = format!("/fleetring.v1.{service}/{method}");
+                let rpc = rpc_at(&path).unwrap_or_else(|| panic!("{path} isn't in RPCS"));
+                let expected = (rpc.binding != Binding::None).then(|| rpc.binding.as_str());
+                assert_eq!(
+                    binding.take(),
+                    expected,
+                    "the `// Binding:` line above {path}"
+                );
+                checked += 1;
+            } else if !line.starts_with("//") {
+                binding = None;
+            }
+        }
+        assert_eq!(checked, RPCS.len());
+    }
+
+    #[test]
+    fn the_daemon_readme_lists_each_rpcs_binding() {
+        const README: &str = include_str!("../../README.md");
+        for rpc in RPCS {
+            let service = rpc.service().trim_start_matches("fleetring.v1.");
+            let binding = match rpc.binding {
+                Binding::None => "—",
+                binding => binding.as_str(),
+            };
+            let row = format!(
+                "| `{service}.{}` | {} | {binding} |",
+                rpc.method(),
+                rpc.requirement
+            );
             assert!(
                 README.contains(&row),
                 "the daemon README lacks the row {row}"
