@@ -1,7 +1,7 @@
 ---
 id: FR-046
 title: Mutual TLS between nodes and clients, with a built-in certificate authority
-status: in-progress
+status: done
 priority: P0
 size: L
 milestone: M10 Security
@@ -30,12 +30,12 @@ Every gRPC connection in `fleetringd` is plaintext, and a node is whoever says i
 - [x] A cluster started with `cert init`, three `cert node` certificates, and a `cert client` certificate runs the README walkthrough end to end with no plaintext listener, and a plaintext client is refused.
 - [x] A node presenting a certificate for a different ID cannot join, heartbeat, or replicate, and the refusal names the mismatch in the server log without printing key material.
 - [x] Certificate rotation needs no restart, and the test proves an in-flight replication stream survives it.
-- [ ] The fixed-seed simulation runs under TLS and stays under its time budget; the ARM, macOS, and Windows jobs pass, including the s390x and wasm emulation jobs where the daemon is built.
+- [x] The fixed-seed simulation runs under TLS and stays under its time budget; the ARM, macOS, and Windows jobs pass, including the s390x and wasm emulation jobs where the daemon is built.
 - [x] `deploy/fleetringd.toml`, the daemon README, and `docs/review.md` describe the `[tls]` section, the `cert` commands, and the plaintext escape hatch.
 
 ## Progress
 
-- 2026-11-02: Implemented; waiting on CI. The fixed-seed simulation passes locally under TLS, but the ARM, macOS, Windows, s390x, and wasm jobs have not run yet, so that box stays open.
+- 2026-11-02: Done. The fixed-seed simulation passes under TLS, and PR #30 was green on all 17 CI jobs, including ARM, macOS, Windows, s390x, and wasm.
   - **Dependencies:** `rustls` 0.23 (`ring`, `std`; TLS 1.3 only), `tokio-rustls` 0.26, `rcgen` 0.14 (`ring`, `pem`) for issuance, `rustls-pki-types` for PEM loading, `x509-parser` 0.18 to read the URI subject alternative name, and `time` for certificate dates. tonic stays without its TLS feature: its server TLS takes one fixed configuration and offers no custom client verifier, and reload needs the handshake under our control. `ring` is the one crate with C in its build, through `cc`; no OpenSSL, no bindgen. Every licence in the closure is in `deny.toml`'s list (`ring` is `Apache-2.0 AND ISC`).
   - **`fleetringd::tls`:** `Authority` (create, load from `ca.crt` and `ca.key`, issue node and client certificates: Ed25519, URI SANs `fleetring://<cluster>/node/<id>` and `fleetring://<cluster>/principal/<name>`, node certificates also carry the hosts as IP or DNS SANs; serial numbers are hashed from the subject and validity so equally issued certificates are the same size, which keeps the simulation's traces deterministic). `Issued` and `Authority::write` write files with `create_new`, so nothing is overwritten, and keys with mode 0600. `Identity` holds the rustls server and client configurations behind an `ArcSwap`; when loaded from files it re-checks their modification time and size on a new connection, at most once per second, and rebuilds both configurations when they changed, keeping the old ones and warning if the new files don't load. The `ca` file is a bundle, so two authorities are trusted during a rotation. The server verifier is rustls's `WebPkiClientVerifier` over the trusted authorities, so a missing, untrusted, or expired client certificate fails the handshake; after it, the peer's certificate is parsed into a `Peer` and a certificate for another cluster is refused. `Security` is `Tls(Identity)` or `Plaintext`. `Debug` on every type that holds a key shows the subject and never the key; errors name files, never contents.
   - **Transport:** `Network` is now a struct of a link (TCP or turmoil) and a `Security`; every channel, the control client's and the peer pool's included, dials through one connector that opens the raw stream and runs the client handshake on it, verifying the server against the authorities and the host part of the address (an IP or DNS name). The server side accepts on `transport::Listener` (TCP or turmoil) and `transport::incoming` runs each handshake on its own task with a 10 s bound, so a silent peer holds nothing up, and hands tonic an `Accepted` whose `Connected::ConnectInfo` is the `Peer`; tonic then inserts it into every request's extensions, and `Peer::of(&request)` reads it (`Plaintext` when absent). The daemon loads `[tls]` at start, or takes the identity the environment's network already carries (the simulation), or refuses to start unless `insecure_plaintext` is set, in which case it warns.
