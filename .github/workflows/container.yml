@@ -51,6 +51,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +107,14 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT OR Apache-2.0
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      # Attests this architecture's image, so `gh attestation verify` also works on the digest
+      # that a platform-specific pull resolves to.
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        if: github.ref_type == 'tag'
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
       - name: record the digest
         if: github.ref_type == 'tag'
         env:
@@ -128,6 +138,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -167,3 +179,16 @@ jobs:
             "${sources[@]}"
       - name: inspect
         run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+      # The multi-arch manifest is what `docker pull $IMAGE:$VERSION` resolves, so it is attested
+      # too.
+      - id: index
+        name: read the manifest's digest
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          case "$digest" in sha256:*) ;; *) echo "::error::no digest for $IMAGE:$VERSION"; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
