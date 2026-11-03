@@ -70,11 +70,11 @@ pub enum AuthorityError {
     /// A name doesn't fit in a certificate.
     #[error("invalid name: {0}")]
     Name(#[from] crate::tls::names::NameError),
-    /// A host isn't an IP address or a DNS name a certificate can carry.
-    #[error("invalid host '{host}' for a certificate")]
-    Host {
-        /// The host.
-        host: String,
+    /// An address isn't an IP address or a DNS name a certificate can carry.
+    #[error("invalid address '{address}' for a certificate: expected an IP address or a DNS name")]
+    Address {
+        /// The address as given.
+        address: String,
     },
     /// The validity doesn't fit a certificate's dates.
     #[error("the validity's dates don't fit a certificate")]
@@ -337,24 +337,24 @@ impl Authority {
         TokenSigner::from_pkcs8(&self.key.serialize_der(), self.fleet.as_str())
     }
 
-    /// Issues a node certificate for `id`, reachable at `hosts` (IP addresses or DNS names),
+    /// Issues a node certificate for `id`, reachable at `addresses` (IP addresses or DNS names),
     /// with the URI `fleetring://<fleet>/node/<id>` as its subject alternative name.
     ///
     /// # Errors
     ///
-    /// [`AuthorityError`] if a host isn't a valid name, the dates don't fit, or generation
-    /// fails.
+    /// [`AuthorityError`] if an address isn't a valid IP address or DNS name, the dates don't
+    /// fit, or generation fails.
     pub fn issue_node(
         &self,
         id: &NodeId,
-        hosts: &[String],
+        addresses: &[String],
         validity: Validity,
     ) -> Result<Issued, AuthorityError> {
         let subject = SubjectUri::node(&self.fleet, id);
-        let mut names = Vec::with_capacity(hosts.len() + 1);
+        let mut names = Vec::with_capacity(addresses.len() + 1);
         names.push(SanType::URI(subject.to_string().try_into()?));
-        for host in hosts {
-            names.push(host_san(host)?);
+        for address in addresses {
+            names.push(address_san(address)?);
         }
         self.issue(subject, names, Purpose::Node, validity)
     }
@@ -453,23 +453,24 @@ fn distinguished_name(common_name: &str) -> DistinguishedName {
     name
 }
 
-fn host_san(host: &str) -> Result<SanType, AuthorityError> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+fn address_san(address: &str) -> Result<SanType, AuthorityError> {
+    if let Ok(ip) = address.parse::<IpAddr>() {
         return Ok(SanType::IpAddress(ip));
     }
-    let valid = !host.is_empty()
-        && host
+    let valid = !address.is_empty()
+        && address
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.');
     if !valid {
-        return Err(AuthorityError::Host {
-            host: host.to_owned(),
+        return Err(AuthorityError::Address {
+            address: address.to_owned(),
         });
     }
-    host.try_into()
+    address
+        .try_into()
         .map(SanType::DnsName)
-        .map_err(|_| AuthorityError::Host {
-            host: host.to_owned(),
+        .map_err(|_| AuthorityError::Address {
+            address: address.to_owned(),
         })
 }
 
@@ -578,6 +579,6 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("PRIVATE KEY"), "{debug}");
         let bad = authority.issue_node(&id, &["a b".to_owned()], validity());
-        assert!(matches!(bad, Err(AuthorityError::Host { .. })));
+        assert!(matches!(bad, Err(AuthorityError::Address { .. })));
     }
 }
