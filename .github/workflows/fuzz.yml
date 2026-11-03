@@ -19,9 +19,11 @@ jobs:
       matrix:
         target: [spec_json, builder, lookup]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-fuzz
       - name: fuzz for five minutes
@@ -32,7 +34,7 @@ jobs:
           # The prebuilt cargo-fuzz targets musl by default, which the address sanitizer rejects.
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
             "fuzz/corpus/${{ matrix.target }}" $extra -- -max_total_time=300
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
         with:
           name: fuzz-${{ matrix.target }}-artifacts
