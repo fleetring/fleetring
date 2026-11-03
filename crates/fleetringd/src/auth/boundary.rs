@@ -391,8 +391,9 @@ impl Authorized {
     /// Ends `stream` with `UNAUTHENTICATED` once the token the request carried expires or is
     /// revoked, and with `UNAVAILABLE` if this node's denylist goes stale meanwhile. The token
     /// is checked before each item and every [`STREAM_RECHECK`] between items. A stream opened
-    /// without a token is returned as it is: a certificate's revocation is the connection's
-    /// business.
+    /// without a token is returned as it is: certificates aren't revoked one by one (there is no
+    /// revocation list), so it lasts as long as its connection, and a certificate stops being
+    /// accepted only when it expires or the cluster stops trusting the authority that issued it.
     pub fn guard<T: Send + 'static>(&self, stream: BoxStream<T>) -> BoxStream<T> {
         let Caller::Principal {
             credential:
