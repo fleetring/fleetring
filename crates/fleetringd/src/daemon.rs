@@ -10,7 +10,6 @@ use fleetring_proto::v1::DatabaseStatus;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
-use tonic::transport::server::TcpIncoming;
 
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::reachable;
@@ -22,10 +21,11 @@ use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSe
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
 use crate::replication::{Replication, ReplicationParts};
-use crate::transport::{Peers, control_server, database_server};
+use crate::tls::{Identity, IdentityError, Security};
+use crate::transport::{Listener, Peers, control_server, database_server, incoming};
 use crate::{
     Config, ConfigError, DataDir, DataDirError, DatabaseStatuses, Membership, MembershipTasks,
-    OnShutdown, Registry,
+    OnShutdown, Plaintext, Registry,
 };
 
 /// How long shutdown waits for open connections to close before it drops them.
@@ -77,13 +77,6 @@ struct DataRole {
     drain: DrainSettings,
 }
 
-/// The gRPC listener, bound before any service starts so its address is known.
-enum Listener {
-    Tcp(tokio::net::TcpListener),
-    #[cfg(feature = "simulation")]
-    Simulated(turmoil::net::TcpListener),
-}
-
 /// The gRPC server on `listen`, which every role runs.
 #[derive(Debug)]
 struct RunningServer {
@@ -119,6 +112,9 @@ pub enum StartError {
     /// A `[[changes.sink]]` entry can't be built.
     #[error("invalid change sink configuration")]
     Sink(#[from] BuildSinkError),
+    /// The `[tls]` files can't be loaded.
+    #[error("can't load the [tls] identity")]
+    Identity(#[from] IdentityError),
 }
 
 impl Daemon {
@@ -149,32 +145,42 @@ impl Daemon {
     /// connections, replication's included, use the environment's network, the control node and
     /// replication read its clock, and blocking storage calls run as its execution says.
     ///
+    /// Every connection carries the identity the `[tls]` table names, loaded here and reloaded
+    /// when its files change. Without a `[tls]` table, the environment's network must carry an
+    /// identity, as the simulation harness's does, or `insecure_plaintext` must be set, in which
+    /// case the daemon warns and runs in plaintext.
+    ///
     /// With [`Execution::Inline`], the returned [`Daemon::config`] has `[engine] execution` set to
     /// inline as well.
     ///
     /// # Errors
     ///
-    /// [`StartError`] if the configuration is invalid, another daemon holds the directory, the
-    /// control log can't be recovered, `listen` can't be bound, or `[engine] page_size` isn't a
-    /// valid page size.
+    /// [`StartError`] if the configuration is invalid, there is no identity and plaintext isn't
+    /// allowed, the identity can't be loaded, another daemon holds the directory, the control
+    /// log can't be recovered, `listen` can't be bound, or `[engine] page_size` isn't a valid
+    /// page size.
     pub async fn start_with(
         mut config: Config,
         environment: Environment,
     ) -> Result<Self, StartError> {
         config.validate()?;
         let ack_timeout = config.replication.settings().ack_timeout;
-        let network = environment.network().outlasting(ack_timeout);
+        let network = environment.network().clone().outlasting(ack_timeout);
         let environment = environment.with_network(network);
         if environment.execution() == Execution::Inline {
             config.engine.execution = Execution::Inline;
         }
+        let security = security(&config, &environment)?;
+        let environment = environment
+            .clone()
+            .with_network(environment.network().clone().with_security(security));
         let data_dir = DataDir::lock(&config.data_dir)?;
         let control = if config.role.runs_control() {
             let node = open_control(&config, &data_dir, &environment).await?;
             let failover = Failover::start(
                 node.handle(),
                 environment.clock(),
-                environment.network(),
+                environment.network().clone(),
                 FailoverSettings::new().with_tick_interval(config.control.tick_interval()),
             );
             Some(ControlRole { node, failover })
@@ -195,6 +201,7 @@ impl Daemon {
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
             config.replication.durability_defaults(),
+            network.security().clone(),
         );
         let data = data.map(|(role, _)| role);
         tracing::info!(
@@ -208,6 +215,7 @@ impl Daemon {
             control = ?config.control.address,
             heartbeat_interval_ms = config.membership.heartbeat_interval_ms.get(),
             data_dir = %data_dir.path().display(),
+            tls = !network.security().is_plaintext(),
             "fleetringd started",
         );
         Ok(Self {
@@ -337,6 +345,40 @@ impl Daemon {
     }
 }
 
+/// The identity every connection carries: the `[tls]` files, or else the one the environment's
+/// network already has, or else plaintext if the configuration allows it.
+fn security(config: &Config, environment: &Environment) -> Result<Security, StartError> {
+    if let Some(tls) = &config.tls {
+        let identity = Identity::load(&tls.ca, &tls.cert, &tls.key)?;
+        tracing::info!(
+            subject = ?identity.peer(),
+            cluster = %identity.cluster(),
+            ca = %tls.ca.display(),
+            cert = %tls.cert.display(),
+            "loaded the node's identity",
+        );
+        return Ok(Security::Tls(identity));
+    }
+    if let Security::Tls(identity) = environment.network().security() {
+        return Ok(Security::Tls(identity.clone()));
+    }
+    match config.insecure_plaintext {
+        Plaintext::Allowed => {
+            tracing::warn!(
+                "insecure_plaintext is set: serving and dialing in plaintext, so nothing on the \
+                 wire is authenticated or encrypted; for local experiments only",
+            );
+            Ok(Security::Plaintext)
+        }
+        Plaintext::Refused => Err(StartError::Config(ConfigError::Missing {
+            field: "tls",
+            reason: "every connection carries a certificate; add a [tls] table with ca, cert, \
+                     and key (see `fleetringd cert`), or pass --insecure-plaintext to run \
+                     without one",
+        })),
+    }
+}
+
 async fn open_control(
     config: &Config,
     data_dir: &DataDir,
@@ -397,7 +439,7 @@ fn start_data(
             node: config.node.id.clone(),
             engine: Arc::new(engine.clone()),
             membership: membership.clone(),
-            peers: Arc::new(Peers::with_network(network)),
+            peers: Arc::new(Peers::with_network(network.clone())),
             addresses: Arc::new(membership.clone()),
             clock: environment.clock(),
             execution: config.engine.execution,
@@ -471,33 +513,39 @@ impl DatabaseStatuses for ReplicationStatuses {
 }
 
 /// Binds `listen` on `network`, and returns the listener with the address it bound.
-async fn bind(config: &Config, network: Network) -> Result<(Listener, SocketAddr), StartError> {
+async fn bind(config: &Config, network: &Network) -> Result<(Listener, SocketAddr), StartError> {
     let listen_error = |source| StartError::Listen {
         address: config.listen,
         source,
     };
-    match network {
-        Network::Tcp(_) => {
-            let listener = tokio::net::TcpListener::bind(config.listen)
+    let listener = if network.is_tcp() {
+        Listener::Tcp(
+            tokio::net::TcpListener::bind(config.listen)
                 .await
-                .map_err(listen_error)?;
-            let address = listener.local_addr().map_err(listen_error)?;
-            Ok((Listener::Tcp(listener), address))
-        }
+                .map_err(listen_error)?,
+        )
+    } else {
         #[cfg(feature = "simulation")]
-        Network::Simulated => {
-            let listener = turmoil::net::TcpListener::bind(config.listen)
-                .await
-                .map_err(listen_error)?;
-            let address = listener.local_addr().map_err(listen_error)?;
-            Ok((Listener::Simulated(listener), address))
+        {
+            Listener::Simulated(
+                turmoil::net::TcpListener::bind(config.listen)
+                    .await
+                    .map_err(listen_error)?,
+            )
         }
-    }
+        #[cfg(not(feature = "simulation"))]
+        {
+            unreachable!("every network is TCP without the simulation feature")
+        }
+    };
+    let address = listener.local_addr().map_err(listen_error)?;
+    Ok((listener, address))
 }
 
-/// Serves on `listener`: the `Control` service if `control` runs here, and the `Database` and
-/// `Replication` services if `data` does. A node without the control role answers control calls
-/// with [`NoControl`], which names the control node at `control_address`.
+/// Serves on `listener`, with every connection authenticated under `security`: the `Control`
+/// service if `control` runs here, and the `Database` and `Replication` services if `data`
+/// does. A node without the control role answers control calls with [`NoControl`], which names
+/// the control node at `control_address`.
 fn serve(
     listener: Listener,
     address: SocketAddr,
@@ -505,6 +553,7 @@ fn serve(
     data: Option<&DataNode>,
     control_address: SocketAddr,
     durability: DurabilityDefaults,
+    security: Security,
 ) -> RunningServer {
     let (stop, stopped) = oneshot::channel::<()>();
     // A dropped sender also means stop.
@@ -522,16 +571,8 @@ fn serve(
         )
         .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))))
         .add_optional_service(data.map(|node| node.replication().server()));
-    let task = match listener {
-        Listener::Tcp(listener) => {
-            tokio::spawn(router.serve_with_incoming_shutdown(TcpIncoming::from(listener), shutdown))
-        }
-        #[cfg(feature = "simulation")]
-        Listener::Simulated(listener) => {
-            let incoming = crate::transport::sim::incoming(listener);
-            tokio::spawn(router.serve_with_incoming_shutdown(incoming, shutdown))
-        }
-    };
+    let task =
+        tokio::spawn(router.serve_with_incoming_shutdown(incoming(listener, security), shutdown));
     RunningServer {
         address,
         stop,

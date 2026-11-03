@@ -12,7 +12,8 @@ use crate::replication::Replication;
 use crate::sim::seeds::millis;
 use crate::sim::trace::{Event, EventKind, Trace};
 use crate::sim::workload::History;
-use crate::{Config, Daemon, Environment, Membership};
+use crate::tls::{Identity, Security};
+use crate::{Config, Daemon, Environment, Membership, Network};
 
 /// Whether a workload is still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,15 +78,22 @@ impl Shared {
     }
 }
 
-/// One incarnation of a host: starts the daemon, publishes its handles, and serves until the
-/// test stops it or turmoil crashes it.
-pub(super) async fn run_host(name: String, config: Config, shared: Shared) -> turmoil::Result {
+/// One incarnation of a host: starts the daemon with `identity`, publishes its handles, and
+/// serves until the test stops it or turmoil crashes it.
+pub(super) async fn run_host(
+    name: String,
+    config: Config,
+    identity: Identity,
+    shared: Shared,
+) -> turmoil::Result {
     let mut stop = shared
         .stop_signal(&name)
         .ok_or_else(|| format!("no stop signal for {name}"))?;
     let elapsed = turmoil::sim_elapsed().unwrap_or_default();
     let clock = SimClock::new(Timestamp::from_millis(millis(elapsed)));
-    let daemon = Daemon::start_with(config, Environment::simulated(clock)).await?;
+    let environment = Environment::simulated(clock)
+        .with_network(Network::simulated().with_security(Security::Tls(identity)));
+    let daemon = Daemon::start_with(config, environment).await?;
     let membership = daemon.membership();
     shared.lock().running.insert(
         name.clone(),

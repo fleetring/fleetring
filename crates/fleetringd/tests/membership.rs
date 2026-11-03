@@ -12,22 +12,32 @@ use fleetring_proto::v1::{JoinRequest, Node};
 use fleetringd::transport::control_client;
 use fleetringd::{Config, ConfigError, Daemon, Membership};
 use tonic::Code;
-use tonic::transport::Endpoint;
+
+use crate::support::Tls;
+
+mod support;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 /// Guards against a hang only; nothing here asserts how long convergence takes.
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
-fn config(dir: &Path, id: &str, role: &str, control: Option<SocketAddr>) -> String {
+fn config(
+    dir: &Path,
+    tls: &Tls,
+    id: &str,
+    role: &str,
+    control: Option<SocketAddr>,
+) -> Result<String, Box<dyn Error>> {
     let control = control.map_or_else(String::new, |address| {
         format!("\n[control]\naddress = \"{address}\"\n")
     });
-    format!(
+    let tls = tls.node_table(id)?;
+    Ok(format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
-         \n[membership]\nheartbeat_interval_ms = 100\n{control}",
+         \n[membership]\nheartbeat_interval_ms = 100\n{tls}{control}",
         dir.join(id)
-    )
+    ))
 }
 
 /// Waits until `membership` publishes `epoch` with `fingerprint` and every member live.
@@ -98,12 +108,14 @@ fn the_heartbeat_interval_must_fit_the_heartbeat_timeout_three_times() -> TestRe
 #[tokio::test]
 async fn a_daemon_with_both_roles_joins_its_own_control_node() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let daemon = Daemon::start(Config::from_toml(&config(
         dir.path(),
+        &tls,
         "solo",
         "both",
         None,
-    ))?)
+    )?)?)
     .await?;
     let membership = daemon.membership().ok_or("no membership")?;
     let control = daemon.control().ok_or("no control")?;
@@ -122,18 +134,20 @@ async fn a_daemon_with_both_roles_joins_its_own_control_node() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_control_daemon_and_two_data_daemons_converge_on_one_ring() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let control = Daemon::start(Config::from_toml(&config(
         dir.path(),
+        &tls,
         "control-1",
         "control",
         None,
-    ))?)
+    )?)?)
     .await?;
     assert!(control.membership().is_none());
     let address = control.control_address().ok_or("no control address")?;
     let mut data = Vec::new();
     for id in ["data-1", "data-2"] {
-        let text = config(dir.path(), id, "data", Some(address));
+        let text = config(dir.path(), &tls, id, "data", Some(address))?;
         let daemon = Daemon::start(Config::from_toml(&text)?).await?;
         assert!(daemon.control().is_none() && daemon.control_address().is_none());
         data.push(daemon);
@@ -154,8 +168,8 @@ async fn a_control_daemon_and_two_data_daemons_converge_on_one_ring() -> TestRes
 
     // A data-only daemon runs no control plane, so a control call that reaches it is refused and
     // told where the control node is.
-    let peer = format!("http://{}", data[0].listen_address());
-    let mut client = control_client(Endpoint::from_shared(peer)?.connect().await?);
+    let peer = data[0].listen_address().to_string();
+    let mut client = control_client(tls.client_network("tester")?.channel(&peer)?);
     let refused = client
         .join(JoinRequest {
             protocol: Some(PROTOCOL_VERSION),

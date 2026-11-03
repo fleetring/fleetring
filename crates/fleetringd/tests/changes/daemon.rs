@@ -8,10 +8,11 @@ use fleetring_control::Liveness;
 use fleetringd::changes::{Format, SinkKind, database_file};
 use fleetringd::data::Client;
 use fleetringd::engine::{CaptureMode, Statement};
-use fleetringd::{Config, ConfigError, Daemon, Network};
+use fleetringd::{Config, ConfigError, Daemon};
 
 use crate::common::{TestResult, eventually, guarded, name};
 use crate::file::{inserted, records};
+use crate::support::Tls;
 
 const MINIMAL: &str = r#"
 data_dir = "/tmp/fleetring-test"
@@ -112,20 +113,25 @@ retries = 2
 #[tokio::test(flavor = "multi_thread")]
 async fn a_configured_file_sink_is_fed_and_reported_in_the_node_status() -> TestResult {
     let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
     let archive = dir.path().join("archive");
     let text = format!(
-        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"both\"\n\n[node]\nid = \"solo\"\n\n[membership]\nheartbeat_interval_ms = 100\n\n[[changes.sink]]\nname = \"archive\"\nkind = \"file\"\ndatabases = [\"ledger\"]\npath = {:?}\n",
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"both\"\n\n[node]\nid = \"solo\"\n\n[membership]\nheartbeat_interval_ms = 100\n\n[[changes.sink]]\nname = \"archive\"\nkind = \"file\"\ndatabases = [\"ledger\"]\npath = {:?}\n{}",
         dir.path().join("solo"),
-        archive
+        archive,
+        tls.node_table("solo")?
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
     let address = daemon.listen_address();
     let client = Client::new(
         address.to_string(),
-        Network::Tcp(fleetringd::transport::TransportConfig {
-            request_timeout: Duration::from_secs(60),
-            ..fleetringd::transport::TransportConfig::default()
-        }),
+        tls.client_network_with(
+            "tester",
+            fleetringd::transport::TransportConfig {
+                request_timeout: Duration::from_secs(60),
+                ..fleetringd::transport::TransportConfig::default()
+            },
+        )?,
     );
     let ledger = name("ledger");
     let other = name("other");

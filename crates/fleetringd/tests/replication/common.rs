@@ -34,6 +34,8 @@ use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
+use crate::support::Tls;
+
 pub(crate) type TestResult = Result<(), Box<dyn Error>>;
 
 /// Guards against a hang only; nothing here asserts how long anything takes.
@@ -139,6 +141,7 @@ pub(crate) struct Cluster {
     pub(crate) nodes: Vec<Node>,
     pub(crate) addresses: Arc<BTreeMap<NodeId, String>>,
     _control: Daemon,
+    _tls: Tls,
     _dir: TempDir,
 }
 
@@ -155,9 +158,11 @@ impl Cluster {
             .with_test_writer()
             .try_init();
         let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
         let control = Daemon::start(Config::from_toml(&format!(
-            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control\"\n",
-            dir.path().join("control")
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control\"\n{}",
+            dir.path().join("control"),
+            tls.node_table("control")?
         ))?)
         .await?;
         let control_address = control.control_address().ok_or("no control address")?;
@@ -174,10 +179,12 @@ impl Cluster {
             heartbeat_interval_ms: std::num::NonZeroU64::new(100).ok_or("nonzero")?,
             ..MembershipSettings::default()
         };
-        let network = Network::default();
         let mut nodes = Vec::new();
         for (name, listener) in ids.iter().zip(listeners) {
             let root = dir.path().join(name);
+            // Each node reaches the control plane as itself; the nodes' own servers here are
+            // plain tonic servers, so they dial each other in plaintext.
+            let network = tls.node_network(name)?;
             let (membership, tasks) = Membership::start(
                 Member::new(id(name)),
                 network.control_client(control_address.to_string()),
@@ -221,6 +228,7 @@ impl Cluster {
             nodes,
             addresses,
             _control: control,
+            _tls: tls,
             _dir: dir,
         };
         cluster.await_members(ids.len()).await?;

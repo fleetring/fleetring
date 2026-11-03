@@ -6,6 +6,8 @@ use std::time::Duration;
 use fleetringd::replication::ReplicationSettings;
 use fleetringd::{Config, ConfigError, DataDir, DataDirError, Role};
 
+mod support;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 const MINIMAL: &str = r#"
@@ -126,21 +128,27 @@ mod binary {
     use fleetringd::DataDir;
 
     use super::TestResult;
+    use crate::support::Tls;
 
-    fn write_config(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    fn write_config(
+        dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         write_config_with(dir, "")
     }
 
-    /// Writes a one-node configuration with `membership` appended to its `[membership]` table.
+    /// Writes a one-node configuration with `membership` appended to its `[membership]` table,
+    /// and the node's certificate beside it, under `dir/tls`.
     fn write_config_with(
         dir: &std::path::Path,
         membership: &str,
-    ) -> std::io::Result<std::path::PathBuf> {
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let tls = Tls::create(dir)?;
         let config = dir.join("node.toml");
         let text = format!(
             "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"node-1\"\n\n\
-             [membership]\nheartbeat_interval_ms = 100\n{membership}",
-            dir.join("data")
+             [membership]\nheartbeat_interval_ms = 100\n{membership}{}",
+            dir.join("data"),
+            tls.node_table("node-1")?
         );
         std::fs::write(&config, text)?;
         Ok(config)
@@ -210,9 +218,10 @@ mod binary {
     ///
     /// The daemon logs its start before its node has joined, and a create before the join is
     /// refused because the cluster has no members, so the create is retried until the join lands.
-    fn create_database(control: &str) -> TestResult {
+    fn create_database(dir: &std::path::Path, control: &str) -> TestResult {
         for attempt in 0..600 {
             let created = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+                .env("FLEETRING_TLS_DIR", dir.join("tls"))
                 .args([
                     "db",
                     "create",
@@ -258,7 +267,7 @@ mod binary {
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path())?;
         let started = start(&config)?;
-        create_database(&started.listen)?;
+        create_database(dir.path(), &started.listen)?;
         let rest = interrupt(started)?;
         assert!(
             rest.iter()
@@ -287,7 +296,7 @@ mod binary {
         let dir = tempfile::tempdir()?;
         let config = write_config_with(dir.path(), "on_shutdown = \"stay\"\n")?;
         let started = start(&config)?;
-        create_database(&started.listen)?;
+        create_database(dir.path(), &started.listen)?;
         let rest = interrupt(started)?;
         assert!(
             !rest.iter().any(|line| line.contains("draining")),

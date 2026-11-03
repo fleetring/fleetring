@@ -7,14 +7,24 @@ use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Liveness, Role as DatabaseRole};
+use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo};
 use fleetringd::engine::{Rows, Statement, Value};
-use fleetringd::{Config, Daemon, MembershipView, Network, Role};
+use fleetringd::tls::{
+    Authority, ClusterName, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
+    DEFAULT_NODE_LIFETIME, Identity, Principal, Security, Validity,
+};
+use fleetringd::{Config, Daemon, MembershipView, Network, Plaintext, Role};
 use tracing_subscriber::EnvFilter;
+
+/// The environment variable that names a directory with `ca.crt`, `client.crt`, and
+/// `client.key`, used when `--ca`, `--cert`, and `--key` aren't given.
+const TLS_DIR_VAR: &str = "FLEETRING_TLS_DIR";
 
 /// Places, replicates, and fails over SQLite databases across machines you own.
 ///
@@ -56,10 +66,17 @@ struct DaemonArgs {
     /// Overrides `role`: `both`, `data`, or `control`.
     #[arg(long, value_parser = parse_role)]
     role: Option<Role>,
+    /// Runs without a `[tls]` table, in plaintext: nothing on the wire is authenticated or
+    /// encrypted. For local experiments only.
+    #[arg(long)]
+    insecure_plaintext: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Creates the cluster's certificate authority and issues node and client certificates.
+    #[command(subcommand)]
+    Cert(CertCommand),
     /// Creates, lists, writes, reads, locates, and drops databases.
     #[command(subcommand)]
     Db(DbCommand),
@@ -82,6 +99,53 @@ enum Command {
         /// The data node to follow, `host:port`. Nothing else is needed.
         #[arg(long)]
         node: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CertCommand {
+    /// Creates the authority: `ca.crt` and `ca.key` in the directory. Keep `ca.key` off every
+    /// node; it is the one secret that issues certificates.
+    Init {
+        /// The cluster's name, which every certificate the authority issues names.
+        #[arg(long)]
+        cluster: ClusterName,
+        /// The directory to write into; created if missing.
+        #[arg(long)]
+        dir: PathBuf,
+        /// How long the authority's certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; ten
+        /// years by default.
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<Duration>,
+    },
+    /// Issues a node certificate: `node.<id>.crt` and `node.<id>.key` in the directory, naming
+    /// the node's ID and the addresses it is reached at.
+    Node {
+        /// The node's ID, as `[node] id` in its configuration.
+        id: NodeId,
+        /// The IP addresses and DNS names peers and clients dial the node at, comma-separated.
+        #[arg(long, value_delimiter = ',', required = true)]
+        hosts: Vec<String>,
+        /// The directory with `ca.crt` and `ca.key`, which the new files go into.
+        #[arg(long)]
+        dir: PathBuf,
+        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; 30 days by
+        /// default.
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<Duration>,
+    },
+    /// Issues a client certificate: `client.<principal>.crt` and `client.<principal>.key` in
+    /// the directory, naming the principal the client acts as.
+    Client {
+        /// The principal's name.
+        principal: Principal,
+        /// The directory with `ca.crt` and `ca.key`, which the new files go into.
+        #[arg(long)]
+        dir: PathBuf,
+        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; 7 days by
+        /// default.
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<Duration>,
     },
 }
 
@@ -198,6 +262,55 @@ struct Target {
     /// A daemon's configuration file, to take the control node's address from.
     #[arg(long)]
     config: Option<PathBuf>,
+    #[command(flatten)]
+    tls: TlsArgs,
+}
+
+/// The identity a command connects with: a client certificate from `cert client`.
+#[derive(Debug, Args)]
+struct TlsArgs {
+    /// The trusted authority certificates, PEM. Defaults to `ca.crt` under `FLEETRING_TLS_DIR`.
+    #[arg(long)]
+    ca: Option<PathBuf>,
+    /// The client certificate, PEM. Defaults to `client.crt` under `FLEETRING_TLS_DIR`.
+    #[arg(long)]
+    cert: Option<PathBuf>,
+    /// The client certificate's private key, PEM. Defaults to `client.key` under
+    /// `FLEETRING_TLS_DIR`.
+    #[arg(long)]
+    key: Option<PathBuf>,
+    /// Connects in plaintext, to a daemon started with `--insecure-plaintext`.
+    #[arg(long, conflicts_with_all = ["ca", "cert", "key"])]
+    insecure_plaintext: bool,
+}
+
+impl TlsArgs {
+    fn security(&self) -> Result<Security, Box<dyn Error>> {
+        if self.insecure_plaintext {
+            return Ok(Security::Plaintext);
+        }
+        let dir = std::env::var_os(TLS_DIR_VAR).map(PathBuf::from);
+        let path =
+            |given: &Option<PathBuf>, name: &str, flag: &str| -> Result<PathBuf, Box<dyn Error>> {
+                match (given, &dir) {
+                    (Some(path), _) => Ok(path.clone()),
+                    (None, Some(dir)) => Ok(dir.join(name)),
+                    (None, None) => Err(format!(
+                        "pass --{flag} (or set {TLS_DIR_VAR} to a directory with ca.crt, \
+                     client.crt, and client.key), or --insecure-plaintext"
+                    )
+                    .into()),
+                }
+            };
+        let ca = path(&self.ca, "ca.crt", "ca")?;
+        let cert = path(&self.cert, "client.crt", "cert")?;
+        let key = path(&self.key, "client.key", "key")?;
+        Ok(Security::Tls(Identity::load(&ca, &cert, &key)?))
+    }
+
+    fn network(&self) -> Result<Network, Box<dyn Error>> {
+        Ok(Network::default().with_security(self.security()?))
+    }
 }
 
 impl Target {
@@ -210,7 +323,7 @@ impl Target {
                 .to_string(),
             (None, None) => return Err("pass --control or --config".into()),
         };
-        Ok(Client::new(control, Network::default()))
+        Ok(Client::new(control, self.tls.network()?))
     }
 }
 
@@ -234,8 +347,35 @@ impl DaemonArgs {
         if let Some(role) = self.role {
             config.role = role;
         }
+        if self.insecure_plaintext {
+            config.insecure_plaintext = Plaintext::Allowed;
+        }
         config
     }
+}
+
+/// A lifetime as `<n>d`, `<n>h`, `<n>m`, or `<n>s`.
+fn parse_ttl(text: &str) -> Result<Duration, String> {
+    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| format!("'{text}' isn't a lifetime: expected <n>d, <n>h, <n>m, or <n>s"))?;
+    let seconds = match unit {
+        "d" => count.checked_mul(24 * 60 * 60),
+        "h" => count.checked_mul(60 * 60),
+        "m" => count.checked_mul(60),
+        "s" => Some(count),
+        _ => {
+            return Err(format!(
+                "'{text}' isn't a lifetime: expected <n>d, <n>h, <n>m, or <n>s"
+            ));
+        }
+    }
+    .ok_or_else(|| format!("'{text}' is too long a lifetime"))?;
+    if seconds == 0 {
+        return Err("a lifetime must be at least 1s".to_owned());
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_role(text: &str) -> Result<Role, String> {
@@ -342,12 +482,13 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn Error>> {
 
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     let output = match command {
+        Command::Cert(command) => run_cert(command)?,
         Command::Status {
             node: Some(node),
-            target: _,
+            target,
         } => {
             // The node answers on its own; the client never asks the control plane here.
-            let client = Client::new(node.clone(), Network::default());
+            let client = Client::new(node.clone(), target.tls.network()?);
             format_node_status(&client.node_status(&node).await.map_err(failed)?)
         }
         Command::Status { node: None, target } => {
@@ -464,6 +605,62 @@ fn format_lease_update(update: &LeaseUpdate) -> String {
             .collect(),
         LeaseUpdate::Event(event) => format!("{event}\n"),
         _ => String::new(),
+    }
+}
+
+/// Runs a `cert` command and returns what it wrote.
+fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
+    let validity = |ttl| Validity::new(SystemClock.now(), ttl);
+    match command {
+        CertCommand::Init { cluster, dir, ttl } => {
+            let authority = Authority::create(
+                cluster.clone(),
+                validity(ttl.unwrap_or(DEFAULT_AUTHORITY_LIFETIME)),
+            )?;
+            authority.write(&dir)?;
+            Ok(format!(
+                "created the authority for cluster {cluster} in {}: ca.crt and ca.key (keep \
+                 ca.key off every node)\n",
+                dir.display()
+            ))
+        }
+        CertCommand::Node {
+            id,
+            hosts,
+            dir,
+            ttl,
+        } => {
+            let authority = Authority::load(&dir)?;
+            let issued = authority.issue_node(
+                &id,
+                &hosts,
+                validity(ttl.unwrap_or(DEFAULT_NODE_LIFETIME)),
+            )?;
+            let stem = format!("node.{id}");
+            issued.write(&dir, &stem)?;
+            Ok(format!(
+                "issued {} for {} in {}: {stem}.crt and {stem}.key\n",
+                issued.subject(),
+                hosts.join(", "),
+                dir.display()
+            ))
+        }
+        CertCommand::Client {
+            principal,
+            dir,
+            ttl,
+        } => {
+            let authority = Authority::load(&dir)?;
+            let issued = authority
+                .issue_client(&principal, validity(ttl.unwrap_or(DEFAULT_CLIENT_LIFETIME)))?;
+            let stem = format!("client.{principal}");
+            issued.write(&dir, &stem)?;
+            Ok(format!(
+                "issued {} in {}: {stem}.crt and {stem}.key\n",
+                issued.subject(),
+                dir.display()
+            ))
+        }
     }
 }
 
@@ -843,6 +1040,17 @@ mod tests {
         }
         for bad in ["int:x", "real:", "blob:0", "blob:zz"] {
             assert!(parse_param(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn lifetimes_parse_in_days_hours_minutes_and_seconds() {
+        assert_eq!(parse_ttl("30d"), Ok(Duration::from_secs(30 * 24 * 60 * 60)));
+        assert_eq!(parse_ttl("2h"), Ok(Duration::from_secs(2 * 60 * 60)));
+        assert_eq!(parse_ttl("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(parse_ttl("45s"), Ok(Duration::from_secs(45)));
+        for bad in ["", "d", "30", "30x", "0d", "-1d"] {
+            assert!(parse_ttl(bad).is_err(), "{bad}");
         }
     }
 

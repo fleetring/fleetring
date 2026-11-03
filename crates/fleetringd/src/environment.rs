@@ -6,20 +6,22 @@
 //! [`Environment::simulated`] to [`Daemon::start_with`](crate::Daemon::start_with), so the same
 //! daemon code runs over turmoil's network and clock, on one deterministic thread.
 
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::clock::{Clock, SystemClock};
 use crate::control::{ControlClient, StorageIo};
 use crate::engine::Execution;
+use crate::tls::{Conn, Raw, Security};
 use crate::transport::TransportConfig;
 
-/// The network a daemon listens on and dials its peers over.
+/// How a daemon reaches its peers: real TCP, or turmoil's simulated network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Network {
+enum Link {
     /// Real TCP, with these timeouts for outgoing connections.
     Tcp(TransportConfig),
     /// turmoil's simulated network. The daemon must run inside a turmoil host.
@@ -31,7 +33,84 @@ pub enum Network {
 /// the callee answers before the caller gives up.
 const REQUEST_MARGIN: Duration = Duration::from_secs(5);
 
+impl Link {
+    async fn connect(self, address: &str) -> io::Result<Raw> {
+        match self {
+            Self::Tcp(_) => {
+                let stream = tokio::net::TcpStream::connect(address).await?;
+                stream.set_nodelay(true)?;
+                Ok(Raw::Tcp(stream))
+            }
+            #[cfg(feature = "simulation")]
+            Self::Simulated => Ok(Raw::Simulated(
+                turmoil::net::TcpStream::connect(address).await?,
+            )),
+        }
+    }
+}
+
+/// The network a daemon listens on and dials its peers over, and the identity its connections
+/// carry.
+///
+/// Cloning is cheap; clones share the identity, so they reload certificates together.
+#[derive(Debug, Clone)]
+pub struct Network {
+    link: Link,
+    security: Security,
+}
+
 impl Network {
+    /// Real TCP with `transport`'s timeouts, in plaintext until
+    /// [`with_security`](Self::with_security) gives it an identity.
+    #[must_use]
+    pub fn tcp(transport: TransportConfig) -> Self {
+        Self {
+            link: Link::Tcp(transport),
+            security: Security::Plaintext,
+        }
+    }
+
+    /// turmoil's simulated network, in plaintext until [`with_security`](Self::with_security)
+    /// gives it an identity. The daemon must run inside a turmoil host.
+    #[cfg(feature = "simulation")]
+    #[must_use]
+    pub fn simulated() -> Self {
+        Self {
+            link: Link::Simulated,
+            security: Security::Plaintext,
+        }
+    }
+
+    /// Carries `security` on every connection: an identity, or plaintext.
+    #[must_use]
+    pub fn with_security(mut self, security: Security) -> Self {
+        self.security = security;
+        self
+    }
+
+    /// Returns the identity connections carry, or plaintext.
+    #[must_use]
+    pub fn security(&self) -> &Security {
+        &self.security
+    }
+
+    /// Returns whether the network is real TCP.
+    #[must_use]
+    pub fn is_tcp(&self) -> bool {
+        matches!(self.link, Link::Tcp(_))
+    }
+
+    /// Returns the timeouts for outgoing connections over TCP; none under simulation, where
+    /// every caller bounds its own calls.
+    #[must_use]
+    pub fn transport(&self) -> Option<TransportConfig> {
+        match self.link {
+            Link::Tcp(transport) => Some(transport),
+            #[cfg(feature = "simulation")]
+            Link::Simulated => None,
+        }
+    }
+
     /// Returns this network with its request deadline raised, if needed, to outlast `wait` by a
     /// margin.
     ///
@@ -40,51 +119,59 @@ impl Network {
     /// connect. A deadline shorter than that window cancels the call midway, and the cancellation
     /// reaches the client as `Timeout expired`. The simulated network has no deadline.
     #[must_use]
-    pub fn outlasting(self, wait: Duration) -> Self {
-        match self {
-            Self::Tcp(mut transport) => {
+    pub fn outlasting(mut self, wait: Duration) -> Self {
+        match &mut self.link {
+            Link::Tcp(transport) => {
                 transport.request_timeout = transport
                     .request_timeout
                     .max(wait.saturating_add(REQUEST_MARGIN));
-                Self::Tcp(transport)
             }
             #[cfg(feature = "simulation")]
-            Self::Simulated => self,
+            Link::Simulated => {}
         }
+        self
     }
 
-    /// Opens a lazily connecting channel to `address`, given as `host:port`.
+    /// Opens a lazily connecting channel to `address`, given as `host:port`: a connection on
+    /// this network, with the TLS handshake on top when the network has an identity.
     ///
     /// # Errors
     ///
     /// The transport error if `address` doesn't form a valid endpoint.
     pub fn channel(&self, address: &str) -> Result<Channel, tonic::transport::Error> {
-        match *self {
-            Self::Tcp(transport) => Ok(Endpoint::from_shared(format!("http://{address}"))?
+        let mut endpoint = Endpoint::from_shared(format!("http://{address}"))?;
+        if let Some(transport) = self.transport() {
+            endpoint = endpoint
                 .connect_timeout(transport.connect_timeout)
-                .timeout(transport.request_timeout)
-                .connect_lazy()),
-            #[cfg(feature = "simulation")]
-            Self::Simulated => crate::transport::sim::channel_to(address),
+                .timeout(transport.request_timeout);
         }
+        let link = self.link;
+        let security = self.security.clone();
+        let address = address.to_owned();
+        let connector = tower::service_fn(move |_uri| {
+            let security = security.clone();
+            let address = address.clone();
+            async move {
+                let raw = link.connect(&address).await?;
+                let conn: Conn = security.connect(&address, raw).await?;
+                Ok::<_, io::Error>(TokioIo::new(conn))
+            }
+        });
+        Ok(endpoint.connect_with_connector_lazy(connector))
     }
 
     /// A control client that starts at `address` and dials every leader over this network.
     #[must_use]
     pub fn control_client(&self, address: impl Into<String>) -> ControlClient {
-        match *self {
-            Self::Tcp(transport) => ControlClient::new(address, transport),
-            #[cfg(feature = "simulation")]
-            Self::Simulated => {
-                ControlClient::with_connector(address, crate::transport::sim::channel_to)
-            }
-        }
+        let network = self.clone();
+        ControlClient::with_connector(address, move |address| network.channel(address))
     }
 }
 
 impl Default for Network {
+    /// Real TCP with default timeouts, in plaintext.
     fn default() -> Self {
-        Self::Tcp(TransportConfig::default())
+        Self::tcp(TransportConfig::default())
     }
 }
 
@@ -117,7 +204,7 @@ impl Environment {
     #[must_use]
     pub fn simulated(clock: impl Clock + 'static) -> Self {
         Self {
-            network: Network::Simulated,
+            network: Network::simulated(),
             clock: Arc::new(clock),
             execution: Execution::Inline,
         }
@@ -150,8 +237,8 @@ impl Environment {
 
     /// Returns the network.
     #[must_use]
-    pub fn network(&self) -> Network {
-        self.network
+    pub fn network(&self) -> &Network {
+        &self.network
     }
 
     /// Returns the clock.
@@ -185,24 +272,22 @@ impl Default for Environment {
 mod tests {
     use super::*;
 
-    fn deadline(network: Network) -> Duration {
-        match network {
-            Network::Tcp(transport) => transport.request_timeout,
-            #[cfg(feature = "simulation")]
-            Network::Simulated => Duration::ZERO,
-        }
+    fn deadline(network: &Network) -> Duration {
+        network
+            .transport()
+            .map_or(Duration::ZERO, |transport| transport.request_timeout)
     }
 
     #[test]
     fn the_request_deadline_outlasts_the_longest_wait_inside_a_call() {
         let network = Network::default();
-        let default = deadline(network);
+        let default = deadline(&network);
         assert_eq!(
-            deadline(network.outlasting(Duration::from_secs(1))),
+            deadline(&network.clone().outlasting(Duration::from_secs(1))),
             default
         );
         assert_eq!(
-            deadline(network.outlasting(Duration::from_secs(20))),
+            deadline(&network.outlasting(Duration::from_secs(20))),
             Duration::from_secs(25)
         );
     }

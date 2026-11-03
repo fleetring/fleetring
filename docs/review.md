@@ -13,6 +13,7 @@
 | Failover | leases, epochs, fencing, log adoption | simulation across crashes, partitions, control outages, flapping: no acknowledged write lost, one primary per epoch |
 | Catch-up | pinned, checksummed snapshots; re-seed | cut, corrupted, and held transfers never leave a partial copy |
 | CLI | create, exec, query, locate, status | a three-node cluster on one laptop, with a failover and a rejoin, by hand |
+| Transport security | mutual TLS 1.3 on every connection, built-in certificate authority, node ID and principal in the certificate | plaintext, foreign, expired, and wrong-ID peers refused in tests; certificates rotate under an open replication stream; the simulation runs under TLS |
 
 ## Known bottlenecks and gaps
 
@@ -33,7 +34,7 @@ Each item says where it bites, with the ticket or epic that addresses it.
 10. **Writes below the quorum commit locally, then fail with an unknown outcome.** Kafka refuses before appending (`NotEnoughReplicas`). FR-035's `min_replicas` fixes this. (E2)
 
 ### Across the network
-11. **No TLS and no authentication.** Fine on one machine or a private network, and nowhere else. (E3)
+11. **No authorization on clients.** Every connection is now mutual TLS with a node or principal identity (FR-046), but a principal may still touch any key until scopes land. (FR-047)
 12. **Reconnect churn under load** exhausted local ports once in stress runs; heartbeats now redial only after three consecutive timeouts, but every client loop should reuse connections and back off. (E4)
 13. **A planned stop still fails over the slow way:** the node announces its leave, but its leases expire before anyone else serves. Lease transfer on drain is the standard answer. (FR-038)
 
@@ -50,6 +51,7 @@ Each item says where it bites, with the ticket or epic that addresses it.
 | Verification | Jepsen-style history checking; deterministic simulation (FoundationDB) | simulation with invariant checks; the history checker in progress | **Adopt both**, plus a run on real processes. |
 | Control-plane HA | Raft (etcd, KRaft) | single node, Raft-ready | **Adopt** Raft when E5 starts. |
 | Membership for very large fleets | gossip plus a small consensus group | control node only | **Defer.** Fine to about a thousand nodes with in-memory liveness. |
+| Identity and transport security | mutual TLS from a cluster authority (`cockroach cert`, etcd peer certificates), client certificates or tokens naming a principal, prefix ACLs with default deny (Kafka, etcd roles) | mutual TLS always, a built-in authority, the node ID or principal in a URI SAN, reload without restart; scopes and tokens pending | **Adopt** (FR-046, ADR-0025). Scopes and tokens follow in FR-047, the threat model in FR-048. |
 
 ## 100 nodes or millions of databases: what changes, and where the seam is
 
@@ -70,7 +72,7 @@ The rule for new work: pick the simple answer for the near target, and put the c
 
 ## What "enterprise-grade" adds beyond scale
 
-- Security by default across machines (TLS, authenticated data plane, a threat model), and an outside review.
+- Security by default across machines (mutual TLS is in; the authorized data plane and a threat model follow), and an outside review.
 - Backups with point-in-time restore, tested rolling upgrades, and compatibility policies for the config, the protocol, and on-disk formats.
 - Observability: metrics, health endpoints, tracing, and documented failure signatures.
 - A verification story a customer can read: the spec, the simulation, the history checker, the sweeps, and the Jepsen-style run.

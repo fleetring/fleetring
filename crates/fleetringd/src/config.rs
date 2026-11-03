@@ -31,9 +31,15 @@ use crate::replication::ReplicationSettings;
 ///
 /// [control]
 /// address = "10.0.0.1:7400"
+///
+/// [tls]
+/// ca = "/etc/fleetring/tls/ca.crt"
+/// cert = "/etc/fleetring/tls/node.laptop-1.crt"
+/// key = "/etc/fleetring/tls/node.laptop-1.key"
 /// ```
 ///
-/// The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
+/// The `[tls]` table names the node's certificate, key, and trusted authorities; see
+/// [`TlsConfig`]. The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
 /// `[membership]` table sets how often a data node sends heartbeats; see [`MembershipSettings`].
 /// The `[replication]` table paces replication; see [`ReplicationConfig`]. The `[changes]`
 /// table lists the sinks that receive each database's changes; see [`ChangesConfig`].
@@ -64,6 +70,58 @@ pub struct Config {
     /// Where the data role streams its databases' changes (FR-039).
     #[serde(default)]
     pub changes: ChangesConfig,
+    /// The certificate, key, and trusted authorities every connection carries (ADR-0025).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// Whether the daemon may run without `[tls]`, in plaintext, which is for the simulation
+    /// harness and local experiments only. `--insecure-plaintext` sets it from the command
+    /// line.
+    #[serde(default)]
+    pub insecure_plaintext: Plaintext,
+}
+
+/// The `[tls]` table: the files the node's identity is loaded from, and reloaded from when they
+/// change (ADR-0025).
+///
+/// ```toml
+/// [tls]
+/// ca = "/etc/fleetring/tls/ca.crt"        # the trusted authority certificates; two during a rotation
+/// cert = "/etc/fleetring/tls/node.crt"    # this node's certificate, issued by `cert node`
+/// key = "/etc/fleetring/tls/node.key"     # its private key
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// The PEM file with the authority certificates to trust. It may hold two, so a rotation
+    /// can overlap.
+    pub ca: PathBuf,
+    /// The PEM file with this node's certificate chain.
+    pub cert: PathBuf,
+    /// The PEM file with this node's private key.
+    pub key: PathBuf,
+}
+
+/// Whether a daemon without a `[tls]` table may start in plaintext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "bool")]
+#[non_exhaustive]
+pub enum Plaintext {
+    /// The default: a daemon without `[tls]` refuses to start.
+    #[default]
+    Refused,
+    /// `insecure_plaintext = true`: the daemon serves and dials in plaintext, and warns at
+    /// every start. Nothing on the wire is authenticated or encrypted.
+    Allowed,
+}
+
+impl From<bool> for Plaintext {
+    fn from(allowed: bool) -> Self {
+        if allowed {
+            Self::Allowed
+        } else {
+            Self::Refused
+        }
+    }
 }
 
 /// A node's identity and the attributes placement uses.
@@ -466,6 +524,9 @@ impl Config {
     /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
     /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
     /// below the lease duration, or a `[[changes.sink]]` entry is invalid.
+    ///
+    /// Whether the daemon has an identity is checked when it starts, because the environment
+    /// may supply one; see [`Daemon::start_with`](crate::Daemon::start_with).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.role == Role::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {

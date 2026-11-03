@@ -359,8 +359,9 @@ async fn retry_repeats_only_retryable_failures() -> TestResult {
 
 #[cfg(feature = "simulation")]
 mod simulated {
-    use fleetringd::transport::sim;
-    use fleetringd::transport::{control_client, control_server};
+    use fleetringd::Network;
+    use fleetringd::tls::Security;
+    use fleetringd::transport::{Listener, control_client, control_server, incoming};
 
     use super::{HeartbeatRequest, MEMBERSHIP_EPOCH, StubControl, join_request};
 
@@ -371,12 +372,12 @@ mod simulated {
             let listener = turmoil::net::TcpListener::bind("0.0.0.0:7400").await?;
             tonic::transport::Server::builder()
                 .add_service(control_server(StubControl))
-                .serve_with_incoming(sim::incoming(listener))
+                .serve_with_incoming(incoming(Listener::Simulated(listener), Security::Plaintext))
                 .await?;
             Ok(())
         });
         simulation.client("node-1", async {
-            let mut control = control_client(sim::channel("control", 7400)?);
+            let mut control = control_client(Network::simulated().channel("control:7400")?);
             let joined = control.join(join_request(1)).await?;
             assert_eq!(joined.get_ref().membership_epoch, MEMBERSHIP_EPOCH);
             let beat = control

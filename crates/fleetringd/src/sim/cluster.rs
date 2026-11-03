@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
-use fleetring_control::{DatabaseName, State};
+use fleetring_control::{DatabaseName, State, Timestamp};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -29,6 +29,7 @@ use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
 use crate::sim::workload::{Ack, History, Operation, WRITES_TABLE, Workload};
+use crate::tls::{Authority, AuthorityError, ClusterName, Identity, IdentityError, Validity};
 use crate::{
     Config, ControlSettings, Membership, MembershipSettings, NodeConfig, ReplicationConfig, Role,
 };
@@ -52,6 +53,13 @@ const STOP_LIMIT: Duration = Duration::from_secs(30);
 /// Mixed into the seed for the workload generator, so it doesn't mirror turmoil's.
 const WORKLOAD_SALT: u64 = 0x5EED_F1EE_7219_0024;
 
+/// The cluster name the test authority issues for.
+const CLUSTER: &str = "sim";
+
+/// How long the test authority's certificates last. rustls checks validity against the wall
+/// clock, not simulated time, so they span from the epoch to well past any run.
+const CERTIFICATE_LIFETIME: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// The error returned when a simulation can't be built or run, or breaks an invariant.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -73,6 +81,12 @@ pub enum SimError {
         /// How long it waited, in simulated time.
         limit: Duration,
     },
+    /// The test authority can't issue a certificate.
+    #[error("can't issue a certificate")]
+    Authority(#[from] AuthorityError),
+    /// An issued certificate can't be used as an identity.
+    #[error("can't load an issued certificate")]
+    Identity(#[from] IdentityError),
     /// An invariant broke.
     #[error(transparent)]
     Violation(#[from] Violation),
@@ -256,8 +270,13 @@ impl ClusterBuilder {
             .max_message_latency(self.max_latency)
             .build();
         let control_address = SocketAddr::new(sim.lookup(control.as_str()), PORT);
+        let cluster_name: ClusterName = CLUSTER
+            .parse()
+            .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?;
+        let authority = Authority::create(cluster_name, certificate_validity())?;
         let mut cluster = Cluster {
             sim,
+            authority,
             seed: self.seed,
             operation_timeout: self.operation_timeout,
             rng: SimRng::new(self.seed ^ WORKLOAD_SALT),
@@ -284,7 +303,14 @@ impl ClusterBuilder {
             for (_, configure) in self.configure.iter().filter(|(host, _)| host == name) {
                 configure(&mut config);
             }
-            cluster.add_host(name, *role, config, data_dir);
+            let address = cluster.sim.lookup(name.as_str()).to_string();
+            let issued = cluster.authority.issue_node(
+                &config.node.id,
+                &[name.clone(), address],
+                certificate_validity(),
+            )?;
+            let identity = Identity::from_issued(cluster.authority.certificate_pem(), &issued)?;
+            cluster.add_host(name, *role, config, identity, data_dir);
         }
         let data_hosts: Vec<String> = cluster.data_hosts().map(str::to_owned).collect();
         for name in data_hosts {
@@ -317,6 +343,11 @@ impl ClusterBuilder {
             many => invalid(format!("several hosts run the control plane: {many:?}")),
         }
     }
+}
+
+/// The validity of every certificate the test authority issues; see [`CERTIFICATE_LIFETIME`].
+fn certificate_validity() -> Validity {
+    Validity::new(Timestamp::from_millis(0), CERTIFICATE_LIFETIME)
 }
 
 fn host_config(
@@ -362,6 +393,8 @@ fn host_config(
         },
         replication: ReplicationConfig::default(),
         changes: ChangesConfig::default(),
+        tls: None,
+        insecure_plaintext: crate::Plaintext::Refused,
     })
 }
 
@@ -384,6 +417,8 @@ struct HostInfo {
 pub struct Cluster {
     // Dropped first: hosts close their files before the data directories go.
     sim: turmoil::Sim<'static>,
+    /// The authority every host's and client's certificate chains to.
+    authority: Authority,
     seed: u64,
     operation_timeout: Duration,
     rng: SimRng,
@@ -429,14 +464,26 @@ impl Cluster {
         }
     }
 
-    fn add_host(&mut self, name: &str, role: Role, config: Config, data_dir: PathBuf) {
+    fn add_host(
+        &mut self,
+        name: &str,
+        role: Role,
+        config: Config,
+        identity: Identity,
+        data_dir: PathBuf,
+    ) {
         let (stop, _) = watch::channel(0_u64);
         self.shared.lock().stops.insert(name.to_owned(), stop);
         let shared = self.shared.clone();
         let host = name.to_owned();
         let started = config.clone();
         self.sim.host(name, move || {
-            run_host(host.clone(), started.clone(), shared.clone())
+            run_host(
+                host.clone(),
+                started.clone(),
+                identity.clone(),
+                shared.clone(),
+            )
         });
         self.hosts.push(HostInfo {
             name: name.to_owned(),
@@ -457,6 +504,7 @@ impl Cluster {
             address: format!("{node}:{PORT}"),
             timeout: self.operation_timeout,
             shared: self.shared.clone(),
+            identity: self.client_identity(&name),
         };
         self.sim.client(name, run_lease_watcher(session));
     }
@@ -576,7 +624,34 @@ impl Cluster {
         self.add_client(name, Some(format!("{entry}:{PORT}")), workload);
     }
 
+    /// Issues a client certificate for the principal `name` from the cluster's authority.
+    ///
+    /// # Panics
+    ///
+    /// If `name` isn't a valid principal name, or the authority can't issue for it.
+    fn client_identity(&self, name: &str) -> Identity {
+        let principal = name
+            .parse()
+            .unwrap_or_else(|error| panic!("client '{name}' is not a principal name: {error}"));
+        let issued = self
+            .authority
+            .issue_client(&principal, certificate_validity())
+            .unwrap_or_else(|error| {
+                panic!("can't issue a certificate for client '{name}': {error}")
+            });
+        Identity::from_issued(self.authority.certificate_pem(), &issued).unwrap_or_else(|error| {
+            panic!("can't load the certificate of client '{name}': {error}")
+        })
+    }
+
+    /// Adds a client acting as the principal `name`, with a certificate from the cluster's
+    /// authority.
+    ///
+    /// # Panics
+    ///
+    /// If `name` isn't a valid principal name, or the authority can't issue for it.
     fn add_client(&mut self, name: &str, entry: Option<String>, workload: impl Workload) {
+        let identity = self.client_identity(name);
         let rng = self.rng.fork();
         let shared = self.shared.clone();
         let control = format!("{}:{PORT}", self.control);
@@ -594,6 +669,7 @@ impl Cluster {
             entry,
             timeout: self.operation_timeout,
             shared,
+            identity,
         };
         self.sim
             .client(name, run_client(session, Box::new(workload), rng));

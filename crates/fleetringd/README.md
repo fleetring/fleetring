@@ -6,6 +6,17 @@ The FleetRing daemon. It places, replicates, and fails over SQLite databases acr
 
 ## Run it
 
+Every connection is mutual TLS (ADR-0025): nodes and clients present certificates issued by the cluster's own certificate authority. Create the authority once, then a certificate for the node and one for yourself:
+
+```sh
+fleetringd cert init --cluster home --dir /etc/fleetring/tls
+fleetringd cert node node-1 --hosts 127.0.0.1 --dir /etc/fleetring/tls
+fleetringd cert client admin --dir /etc/fleetring/tls
+export FLEETRING_TLS_DIR=/etc/fleetring/tls   # or pass --ca, --cert, and --key to each command
+```
+
+`cert init` writes `ca.crt` and `ca.key`; the key issues every certificate and belongs on no node. `cert node` writes `node.node-1.crt` and `node.node-1.key`, naming the node's ID and the hosts (IP addresses or DNS names) it is reached at; `cert client` writes `client.admin.crt` and `client.admin.key`, naming the principal the commands act as. The commands read `$FLEETRING_TLS_DIR/ca.crt`, `client.crt`, and `client.key`, so copy or link the client's files to those names, or pass `--ca`, `--cert`, and `--key`. Node certificates last 30 days and client certificates 7 by default (`--ttl 90d`); a node reloads its files when they change, so renewing one needs no restart, and `ca.crt` may hold two authority certificates while a rotation overlaps. Certificates from Vault, cert-manager, or SPIRE work the same way: the daemon only needs a certificate, its key, and the authority certificates to trust.
+
 Write a configuration file. This one runs a one-node cluster, with its databases in `/var/lib/fleetring`:
 
 ```toml
@@ -15,6 +26,11 @@ role = "both"
 
 [node]
 id = "node-1"
+
+[tls]
+ca = "/etc/fleetring/tls/ca.crt"
+cert = "/etc/fleetring/tls/node.node-1.crt"
+key = "/etc/fleetring/tls/node.node-1.key"
 ```
 
 Then start the daemon, and talk to it from another terminal:
@@ -44,6 +60,8 @@ Each database chooses its durability when it is created (ADR-0023). `--acks quor
 **Following leases.** `fleetringd watch-leases --node <host:port>` follows the leases one data node holds, from the node's own view: it prints `held <database> epoch <n>` for each database the node serves when the stream opens, then `gained <database> epoch <n>` and `lost <database> epoch <n>` lines as leases move, until the stream ends. The node reports a lease before it acknowledges a write under that epoch, and reports its loss before it stops answering for the database, so a worker beside the node (a queue consumer, a scheduler, a cache warmer) can act on exactly the databases the node is primary for and stop the moment one moves, without polling. Events for a database arrive in epoch order; a subscriber that falls behind is cut off with `RESOURCE_EXHAUSTED` and opens the stream again for a fresh snapshot. The stream is one node's; a client that wants every node subscribes to each.
 
 The subcommands take `--control <host:port>`, the address of the node that runs the control role, or `--config <file>` to read it from a daemon's configuration. A control call sent to a data-only node answers with the control node's address.
+
+**Plaintext.** A daemon without a `[tls]` table refuses to start. `--insecure-plaintext` (or `insecure_plaintext = true` in the file) lets it run without one, warning at every start, and the subcommands take the same flag to connect to it; nothing on the wire is then authenticated or encrypted, so it is for local experiments only. A node whose certificate names another ID is refused on `Join` and `Heartbeat` with `PERMISSION_DENIED`, and only nodes may make node-to-node calls such as replication.
 
 `fleetringd --help` lists every flag and subcommand. [`deploy/fleetringd.toml`](https://github.com/fleetring/fleetring/blob/main/deploy/fleetringd.toml) documents the main settings, including a multi-node cluster's.
 

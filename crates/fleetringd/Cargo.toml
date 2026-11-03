@@ -21,25 +21,31 @@ fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rusqlite = { workspace = true, features = ["functions", "hooks"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile = { version = "3.27.0", optional = true }
+time = "0.3"
 thiserror.workspace = true
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 toml = "1.1.8"
 tonic = "0.14"
-tower = { version = "0.5", features = ["util"], optional = true }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 turmoil = { version = "0.7", optional = true }
 twox-hash = { workspace = true, features = ["alloc", "xxhash3_128"] }
+x509-parser = "0.18"
 
 [features]
 # The simulation harness (`fleetringd::sim`): the daemon over turmoil's simulated network and
 # clock (ADR-0020).
-simulation = ["dep:turmoil", "dep:tower", "dep:tempfile"]
+simulation = ["dep:turmoil", "dep:tempfile"]
 
 [lints]
 workspace = true
