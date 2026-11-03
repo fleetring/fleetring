@@ -42,7 +42,7 @@ The `fleetringd` daemon ships as one binary. Each `fleetringd` release has three
     | sh -s -- --version 0.2.0 --prefix /opt/fleetring
   ```
 
-- **Docker**, for `linux/amd64` and `linux/arm64`. The image runs a one-node cluster from [`deploy/fleetringd.toml`](deploy/fleetringd.toml) as a non-root user, with its databases in the `/data` volume:
+- **Docker**, for `linux/amd64` and `linux/arm64`. The image runs a one-node fleet from [`deploy/fleetringd.toml`](deploy/fleetringd.toml) as a non-root user, with its databases in the `/data` volume:
 
   ```sh
   docker run -d --name fleetringd -p 7400:7400 -v fleetring-data:/data ghcr.io/fleetring/fleetringd

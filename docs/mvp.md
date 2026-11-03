@@ -19,10 +19,10 @@ An open-source Rust layer that places, routes, replicates, and moves **millions 
 - **Not for:** one app with one database, or under ~10k tenants on one box. Use SQLite or Postgres.
 
 ## Design decisions
-- **Leadership per database, not per cluster.** A database's first ring node is its primary; the next N-1 are followers pulling its WAL. Leases in a small control database pick the primary. Raft for the control database comes later.
+- **Leadership per database, not per fleet.** A database's first ring node is its primary; the next N-1 are followers pulling its WAL. Leases in a small control database pick the primary. Raft for the control database comes later.
 - **Borrowed traits:** consistent hashing, replication factor, hinted handoff, and repair (DynamoDB/Cassandra); per-object databases created on first use and routed by name (Durable Objects); S3-compatible snapshots; libSQL/Hrana wire compatibility (Turso).
 - **General-purpose placement core.** The `fleetring` crate knows nothing about SQLite. It is published as general-purpose placement infrastructure, and the SQLite product is built on top of it (ADR-0011).
-- **One daemon, two modes.** The crate stays a pure library. `fleetringd` is batteries included: `fleetring up` on a LAN uses mDNS to form a cluster, weights nodes by disk and RAM, and treats a sleeping laptop as a temporarily down node.
+- **One daemon, two modes.** The crate stays a pure library. `fleetringd` is batteries included: `fleetring up` on a LAN uses mDNS to form a fleet, weights nodes by disk and RAM, and treats a sleeping laptop as a temporarily down node.
 - **Agents connect by name:** `fleet.db("agent:sam-researcher")`. Local agents use the bundled MCP server (`memory.write`, `memory.search`, `db.query`, `db.fork`, `db.snapshot`). Cloud agents use the router over HTTPS with API keys scoped to a name prefix.
 - **Client:** the Rust client embeds the ring (no extra hop). Everything else goes through the libSQL-compatible router, so existing Turso/libSQL SDKs work on day one. The client caches the ring map, follows redirects when a database moves, writes to the primary, and can opt into replica reads.
 
