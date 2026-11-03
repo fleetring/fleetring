@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-FleetRing is in early development. Security fixes go into the latest release of the `fleetring` crate.
+FleetRing is in early development. Security fixes go into the next release of the `fleetring` crate and of `fleetringd`; older releases don't get backports during 0.x.
 
 ## Authentication and authorization
 
@@ -59,3 +59,54 @@ Report vulnerabilities privately through GitHub: open the repository's **Securit
 Include what you found, how to reproduce it, and the affected versions. We aim to acknowledge reports within a week.
 
 Input that reaches `fleetring` from outside, such as a ring spec decoded from JSON, must never cause a panic. A crash on such input counts as a security bug.
+
+## How we handle a report
+
+From report to published advisory, nothing about the flaw is public until the fix is released.
+
+1. **The report arrives as a draft advisory.** GitHub's private vulnerability reporting opens a draft security advisory, visible only to the reporter and the maintainers. Discussion stays in it.
+2. **Confirm and assess.** Reproduce the flaw, and settle the affected versions, the severity, and the CWE in the draft. If it isn't a vulnerability, say why in the draft and close it.
+3. **Fix privately.** Start the advisory's temporary private fork ("Start a temporary private fork") and open the fix as a pull request there, or work in a private fork. Don't push the fix, a test that reveals it, or a commit message that describes it to the public repository before the release.
+   - Actions don't run in a temporary private fork, so run the checks in [`CONTRIBUTING.md`](CONTRIBUTING.md#before-you-push) locally.
+   - A fix gets the same independent review as any security-sensitive change.
+4. **Release the fix.** Merge the fix and tag the patched release as [`RELEASING.md`](RELEASING.md) describes. During 0.x, fixes go into the next release; there are no backports to older minor versions. The release notes' Security section names the advisory.
+5. **Publish the advisory with the release,** as soon as the patched artifacts are verified (see [Publishing an advisory](#publishing-an-advisory)). Credit the reporter unless they ask not to be named.
+
+### Publishing an advisory
+
+The advisory is the record users act on, so it says what is wrong, who is affected, and what to do.
+
+- **The title names the flaw, not the fix,** and starts with the component:
+  - Right: "fleetringd: a SQL statement can read and write another database's file on the same node".
+  - Wrong: "fleetringd 0.2.0 confines statements to one database".
+- **The fields:**
+
+  | Field | What it holds |
+  |---|---|
+  | Package | Ecosystem `other` and name `fleetringd` for the daemon. Ecosystem `crates.io` and name `fleetring` for the crate. |
+  | Affected versions | The exact range, such as `= 0.1.0` or `>= 0.1.0, < 0.2.1`. |
+  | Patched versions | The first release with the fix, such as `0.2.0`. |
+  | Severity | Low, moderate, high, or critical, with the CVSS vector when one has been worked out. |
+  | CWE | The weakness, such as CWE-22 for a path or file reached outside its boundary. |
+
+- **The description has four sections, in this order:**
+  - **Impact:** what an attacker can do, with what access, and in which versions. Include what the flaw *doesn't* allow, when that matters to readers' risk.
+  - **Patches:** the release that fixes it, and what the fix does.
+  - **Workarounds:** what a user who can't upgrade yet can do, or "none".
+  - **After upgrading:** how to check whether the flaw was used, and anything to clean up.
+- **For the `fleetring` crate,** also file the advisory with [RustSec](https://github.com/rustsec/advisory-db), so `cargo audit` and `cargo deny` report it.
+
+**Example:** [GHSA-353r-2q3f-g5wc](https://github.com/fleetring/fleetring/security/advisories/GHSA-353r-2q3f-g5wc), published with `fleetringd` 0.2.0:
+
+| Field | Value |
+|---|---|
+| Title | fleetringd: a SQL statement can read and write another database's file on the same node |
+| Package | `other` / `fleetringd` |
+| Affected versions | `= 0.1.0` |
+| Patched versions | `0.2.0` |
+| Severity | High |
+| CWE | CWE-22 |
+| Impact | In 0.1.0, a statement sent through `db exec` or `db query` could attach another database's SQLite file on the same node, then read or write it, bypassing that database's lease and epoch fencing, replication, and change capture, so its replicas could silently diverge. |
+| Patches | 0.2.0 confines every statement to the database it names: `ATTACH`, `DETACH`, `VACUUM INTO`, and `load_extension` are refused, only read-only introspection pragmas are allowed, and SQLite's defensive mode is on. |
+| Workarounds | None in 0.1.0 short of restricting network access to the data plane to fully trusted clients. |
+| After upgrading | Run `fleetringd db verify` on each database to confirm its replicas agree. 0.1.0's logs have no hash chain, so this checks only from the upgrade onward. |
