@@ -65,6 +65,9 @@ const STALLED_HEARTBEATS: u32 = 3;
 pub struct MembershipView {
     epoch: Epoch,
     ring: Option<Arc<Ring>>,
+    /// The ring of the membership epoch this node published before this one, kept for one epoch
+    /// so that placement checks accept both while a change reaches every node (ADR-0031).
+    previous_ring: Option<Arc<Ring>>,
     fingerprint: Option<Fingerprint>,
     members: Vec<(Member, Liveness)>,
     /// The members that are draining, in ID order.
@@ -82,6 +85,15 @@ impl MembershipView {
     #[must_use]
     pub fn ring(&self) -> Option<&Arc<Ring>> {
         self.ring.as_ref()
+    }
+
+    /// Returns the ring this node published for the membership epoch before this one, or `None`
+    /// if it published none. Placement checks accept a replica under either ring, so that a
+    /// membership change, which each node publishes at its own moment, never refuses a legitimate
+    /// call (ADR-0031, point 4).
+    #[must_use]
+    pub fn previous_ring(&self) -> Option<&Arc<Ring>> {
+        self.previous_ring.as_ref()
     }
 
     /// Returns the ring's fingerprint, or `None` while there is no ring.
@@ -198,7 +210,14 @@ impl Membership {
         (membership, tasks)
     }
 
-    /// A membership with an empty view, and the publisher that updates it.
+    /// A membership whose views come from the returned [`ManualMembership`] rather than from a
+    /// control plane: for tests and tools that decide what each node sees, and when.
+    #[must_use]
+    pub fn manual() -> (Self, ManualMembership) {
+        let (membership, publisher) = Self::unstarted();
+        (membership, ManualMembership { publisher })
+    }
+
     /// A membership with an empty view that never changes, for unit tests of code that only
     /// needs one to exist. Its publisher is never dropped, so watchers wait rather than end.
     #[cfg(test)]
@@ -375,6 +394,21 @@ impl Drop for MembershipTasks {
     }
 }
 
+/// Publishes the views of a [`Membership::manual`], as the ring publication task does for a
+/// membership the control plane drives.
+#[derive(Debug)]
+pub struct ManualMembership {
+    publisher: Publisher,
+}
+
+impl ManualMembership {
+    /// Publishes the membership `update` describes, as if the control plane had sent it: a new
+    /// membership epoch rebuilds the ring and keeps the old one as the previous ring.
+    pub fn publish(&self, update: MembershipUpdate) {
+        self.publisher.apply(update);
+    }
+}
+
 /// Builds and publishes views. Only the ring publication task holds it.
 struct Publisher {
     current: Arc<ArcSwap<MembershipView>>,
@@ -417,7 +451,10 @@ impl Publisher {
             }
         } else {
             match rebuild(epoch, members, draining) {
-                Some(view) => view,
+                Some(view) => MembershipView {
+                    previous_ring: previous.ring.clone(),
+                    ..view
+                },
                 None => return,
             }
         };
@@ -500,6 +537,7 @@ fn rebuild(
                 epoch,
                 fingerprint: Some(ring.fingerprint()),
                 ring: Some(Arc::new(ring)),
+                previous_ring: None,
                 members,
                 draining,
             })
@@ -759,6 +797,36 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_new_epoch_keeps_the_ring_before_it_as_the_previous_ring() {
+        let (membership, manual) = Membership::manual();
+        manual.publish(update(1, &[("a", true), ("b", true)]));
+        let first = membership.ring().expect("a ring");
+        assert!(membership.view().previous_ring().is_none());
+
+        // A liveness change at the same epoch keeps both rings as they are.
+        manual.publish(update(1, &[("a", true), ("b", false)]));
+        assert!(membership.view().previous_ring().is_none());
+
+        manual.publish(update(2, &[("a", true), ("b", true), ("c", true)]));
+        let view = membership.view();
+        let previous = view.previous_ring().expect("the ring before");
+        assert!(Arc::ptr_eq(previous, &first));
+        let second = Arc::clone(view.ring().expect("a ring"));
+
+        manual.publish(update(2, &[("a", true), ("b", true), ("c", false)]));
+        let view = membership.view();
+        assert!(Arc::ptr_eq(view.previous_ring().expect("kept"), &first));
+
+        // Only one epoch back is kept.
+        manual.publish(update(3, &[("a", true), ("c", true)]));
+        let view = membership.view();
+        assert!(Arc::ptr_eq(
+            view.previous_ring().expect("the ring before"),
+            &second
+        ));
     }
 
     #[test]

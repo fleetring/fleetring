@@ -37,7 +37,9 @@ pub use config::{
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};
 pub use environment::{Environment, Network};
-pub use membership::{DatabaseStatuses, Membership, MembershipTasks, MembershipView};
+pub use membership::{
+    DatabaseStatuses, ManualMembership, Membership, MembershipTasks, MembershipView,
+};
 pub use registry::Registry;
 pub use sink::{
     Acknowledged, Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink,
@@ -97,6 +99,7 @@ const _: () = {
     assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<Environment>();
     assert_debug_send_sync::<Network>();
+    assert_debug_send_sync::<ManualMembership>();
     assert_debug_send_sync::<Membership>();
     assert_debug_send_sync::<MembershipSettings>();
     assert_debug_send_sync::<MembershipTasks>();
