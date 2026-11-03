@@ -4,7 +4,9 @@
 //!   in one step with reading its log's position, so that no batch from an older epoch lands
 //!   after the position it reports. A primary at an older epoch steps down first.
 //! - **Streams** ([`admit_stream`]): a follower accepts a stream only at the highest epoch it
-//!   has seen, and only from the node recorded as that epoch's holder.
+//!   has seen, and only from the node recorded as that epoch's holder. Before a stream or a
+//!   fence records a holder for a new epoch, the binding checks have confirmed it with control
+//!   state (ADR-0031; see `binding`).
 //! - **Divergent tails** ([`reconcile`]): a follower whose log came from an earlier epoch and runs
 //!   past the position the current epoch began at truncates it back there before it takes the
 //!   epoch's frames. One that can't be cut back there asks the primary to re-seed it from a
@@ -28,6 +30,7 @@ use fleetring_proto::v1::{
 use tokio::sync::{OwnedMutexGuard, watch};
 use tonic::{Code, Status};
 
+use super::binding;
 use super::chain::{ChainHash, Links};
 use super::epochs::EpochError;
 use super::follower::{
@@ -136,10 +139,11 @@ pub(super) async fn fence(
     })
 }
 
-/// The `Fence` RPC.
+/// The `Fence` RPC, from `caller` if a node certificate made it, whose binding it checks first.
 pub(super) async fn fence_rpc(
     inner: &Arc<Inner>,
     request: FenceRequest,
+    caller: Option<&NodeId>,
 ) -> Result<FenceResponse, Status> {
     let name = parse_name(&request.database)?;
     let candidate: Option<NodeId> = if request.candidate.is_empty() {
@@ -152,6 +156,9 @@ pub(super) async fn fence_rpc(
                 .map_err(|error| Status::invalid_argument(format!("invalid candidate: {error}")))?,
         )
     };
+    if let Some(caller) = caller {
+        binding::check_fence(inner, &name, request.epoch, candidate.as_ref(), caller).await?;
+    }
     let fenced = fence(inner, &name, request.epoch, candidate.as_ref()).await?;
     Ok(FenceResponse {
         epoch: request.epoch,

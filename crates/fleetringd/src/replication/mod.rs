@@ -84,6 +84,18 @@
 //! visible before the first write under the epoch is acknowledged and [`LeaseChange::Lost`]
 //! before the node stops answering for the database.
 
+//! # Bindings
+//!
+//! Every call a peer makes is bound to placement (ADR-0031), by the node its certificate names:
+//! a stream's sender must hold the stream's epoch or be promoting to it, and its receiver must be
+//! a replica; a fence must come from the promotion's candidate, a fetch from the candidate the
+//! replica was fenced for, and a snapshot request from a follower the primary streams the
+//! database to; and a node carries out a promotion only if control state names it the
+//! candidate. A replica asks control state who leads a new epoch once, through its
+//! [`EpochAuthority`], and then trusts its durable epoch record. A refusal is
+//! `PERMISSION_DENIED` with `fleetring-binding` metadata, and counts in
+//! [`Replication::binding_refusals`].
+//!
 //! # The hash chain
 //!
 //! Every replica keeps a BLAKE3 hash chain over the log (FR-044): one hash per
@@ -98,6 +110,7 @@
 //! across replicas.
 
 mod archive;
+mod binding;
 mod chain;
 mod epochs;
 mod failover;
@@ -135,6 +148,7 @@ use crate::sink::{
 use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
 
+pub use self::binding::{EpochAuthority, EpochHolders, HoldersFuture};
 pub use self::chain::{ChainHash, ParseChainHashError};
 pub use self::failover::{Fenced, PromotionRequest};
 pub use self::follower::ReplicationService;
@@ -238,6 +252,9 @@ pub struct ReplicationParts {
     pub peers: Arc<Peers>,
     /// Where each peer's `Replication` service listens.
     pub addresses: Arc<dyn PeerAddresses>,
+    /// Where the node asks who leads a database's epoch before it trusts a peer that claims to
+    /// (ADR-0031): the control plane, in the daemon.
+    pub authority: Arc<dyn EpochAuthority>,
     /// The clock that times followers' lag.
     pub clock: Arc<dyn Clock>,
     /// Where blocking follower calls run: [`Execution::Inline`] under simulation.
@@ -379,6 +396,9 @@ pub struct FollowerStatus {
     pub checkpointed: Option<Position>,
     /// How many snapshots have replaced the copy since this node started.
     pub snapshots: u64,
+    /// How many calls naming the database this node has refused, since it started, because
+    /// they failed their placement binding (ADR-0031).
+    pub binding_refusals: u64,
 }
 
 /// What a replica's log hashes to at a position, as [`Replication::verify`] reports it.
@@ -409,10 +429,13 @@ struct Inner {
     membership: Membership,
     peers: Arc<Peers>,
     addresses: Arc<dyn PeerAddresses>,
+    authority: Arc<dyn EpochAuthority>,
     clock: Arc<dyn Clock>,
     execution: Execution,
     settings: ReplicationSettings,
     epochs: Epochs,
+    /// The calls this node refused for failing their binding, by the database they named.
+    refusals: Mutex<BTreeMap<Option<DatabaseName>, u64>>,
     /// Each database's recorded chain anchor, next to its epoch record.
     chains: Chains,
     /// Promotions the control node asked this node to carry out.
@@ -469,6 +492,7 @@ impl Replication {
             membership,
             peers,
             addresses,
+            authority,
             clock,
             execution,
             state_dir,
@@ -480,9 +504,11 @@ impl Replication {
             membership,
             peers,
             addresses,
+            authority,
             clock,
             execution,
             settings,
+            refusals: Mutex::default(),
             epochs: Epochs::new(state_dir.join("epochs")),
             chains: Chains::new(state_dir.join("epochs")),
             promotions: watch::Sender::new(BTreeMap::new()),
@@ -763,12 +789,33 @@ impl Replication {
             .map(|primary| primary.status(&self.inner.followers_of(&primary)))
     }
 
+    /// How many peer calls this node has refused since it started because they failed their
+    /// placement binding (ADR-0031), over every database.
+    ///
+    /// # Panics
+    ///
+    /// If the replication state's lock was poisoned by a panic in another thread.
+    #[must_use]
+    pub fn binding_refusals(&self) -> u64 {
+        self.inner.lock_refusals().values().sum()
+    }
+
     /// Where this node's copy of `database` is, if it follows it.
+    ///
+    /// # Panics
+    ///
+    /// If the replication state's lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn follower_status(&self, database: &DatabaseName) -> Option<FollowerStatus> {
         let slot = self.inner.slot_if_any(database);
         let epoch = self.inner.epochs.highest(database);
-        if slot.is_none() && epoch.is_none() {
+        let binding_refusals = self
+            .inner
+            .lock_refusals()
+            .get(&Some(database.clone()))
+            .copied()
+            .unwrap_or(0);
+        if slot.is_none() && epoch.is_none() && binding_refusals == 0 {
             return None;
         }
         let snapshots = slot.as_ref().map_or(0, |slot| slot.snapshots());
@@ -778,6 +825,7 @@ impl Replication {
             position,
             checkpointed,
             snapshots,
+            binding_refusals,
         })
     }
 
@@ -1148,6 +1196,15 @@ impl Inner {
         self.followers.lock().expect("replication lock poisoned")
     }
 
+    fn lock_refusals(&self) -> MutexGuard<'_, BTreeMap<Option<DatabaseName>, u64>> {
+        self.refusals.lock().expect("replication lock poisoned")
+    }
+
+    /// Counts one more call refused for failing its binding, naming `database` if it named one.
+    fn binding_refused(&self, database: Option<&DatabaseName>) {
+        *self.lock_refusals().entry(database.cloned()).or_default() += 1;
+    }
+
     fn primary(&self, database: &DatabaseName) -> Option<Arc<Primary>> {
         self.lock_primaries()
             .get(database)
@@ -1230,6 +1287,7 @@ fn refused(error: ReplicationError) -> Acknowledgement {
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
     assert_debug_send_sync::<ChainHash>();
+    assert_debug_send_sync::<EpochHolders>();
     assert_debug_send_sync::<Fenced>();
     assert_debug_send_sync::<FollowerProgress>();
     assert_debug_send_sync::<PromotionRequest>();

@@ -101,7 +101,9 @@ mod tests {
 
     use super::*;
     use crate::engine::{EngineConfig, Execution, SqliteEngine};
-    use crate::replication::{PrimaryRole, Replication, ReplicationParts, ReplicationSettings};
+    use crate::replication::{
+        EpochHolders, PrimaryRole, Replication, ReplicationParts, ReplicationSettings,
+    };
     use crate::transport::Peers;
     use crate::{Membership, Registry};
 
@@ -113,6 +115,7 @@ mod tests {
             membership: Membership::detached(),
             peers: Arc::new(Peers::with_network(crate::Network::default())),
             addresses: Arc::new(BTreeMap::new()),
+            authority: Arc::new(BTreeMap::<DatabaseName, EpochHolders>::new()),
             clock: Arc::new(crate::clock::SystemClock),
             execution: Execution::Inline,
             state_dir: dir.join("state"),

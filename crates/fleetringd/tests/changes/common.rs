@@ -19,7 +19,9 @@ use fleetringd::clock::SystemClock;
 use fleetringd::engine::{
     CaptureMode, EngineConfig, Execution, SqliteEngine, Statement, Transaction,
 };
-use fleetringd::replication::{PrimaryRole, Replication, ReplicationParts, ReplicationSettings};
+use fleetringd::replication::{
+    EpochHolders, PrimaryRole, Replication, ReplicationParts, ReplicationSettings,
+};
 use fleetringd::transport::Peers;
 use fleetringd::{
     Config, Daemon, Membership, MembershipSettings, MembershipTasks, Network, Registry,
@@ -221,6 +223,7 @@ fn start_replication(
             membership,
             peers: Arc::new(Peers::with_network(network)),
             addresses: Arc::new(BTreeMap::<NodeId, String>::new()),
+            authority: Arc::new(BTreeMap::<DatabaseName, EpochHolders>::new()),
             clock: Arc::new(SystemClock),
             execution: Execution::Threads,
             state_dir: root.join("replication"),
