@@ -53,6 +53,25 @@ The `fleetringd` daemon ships as one binary. Each `fleetringd` release has three
 
 To build from source instead: `cargo install --locked --git https://github.com/fleetring/fleetring fleetringd`.
 
+### Verify a release
+
+The release workflow signs `SHA256SUMS` keylessly with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) and attaches build provenance to every archive, `install.sh`, and the container image. The install script runs the first check below when `cosign` is on your `PATH`, and says so when it isn't. To verify by hand, download `SHA256SUMS` and `SHA256SUMS.sigstore.json` from the release, then:
+
+```sh
+# The checksum file was signed by this repository's release workflow, from a fleetringd tag.
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/fleetring/fleetring/.github/workflows/release.yml@refs/tags/fleetringd-v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum --check --ignore-missing SHA256SUMS   # shasum -a 256 -c on macOS
+
+# A downloaded file was built by that workflow.
+gh attestation verify fleetringd-<version>-<target>.tar.gz --repo fleetring/fleetring
+
+# The container image was too.
+gh attestation verify oci://ghcr.io/fleetring/fleetringd:<version> --repo fleetring/fleetring
+```
+
 ## The placement crate
 
 The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-purpose: *deterministic, cross-language placement with zone-aware replicas*. FleetRing uses it to place SQLite databases, but it works for anything keyed: key-value shards, chat rooms, actors, queue partitions, and inference sessions.

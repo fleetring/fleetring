@@ -228,6 +228,16 @@ jobs:
           \`\`\`
 
           Or run the container image: \`docker run ghcr.io/fleetring/fleetringd:$VERSION\`.
+
+          \`SHA256SUMS\` is signed by this repository's release workflow, and every archive and
+          \`install.sh\` has build provenance. To verify a download:
+
+          \`\`\`sh
+          cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \\
+            --certificate-identity-regexp '^https://github.com/$GH_REPO/.github/workflows/release.yml@refs/tags/fleetringd-v' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh attestation verify <file> --repo $GH_REPO
+          \`\`\`
           EOF
           gh release create "$TAG" dist/* --verify-tag --title "fleetringd $VERSION" \
             --notes-file notes.md "${flags[@]}"

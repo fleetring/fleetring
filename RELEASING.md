@@ -67,7 +67,7 @@ Placement compatibility is separate from API compatibility. `cargo semver-checks
 
 The daemon is released separately from the crate (FR-034). It isn't published to crates.io (`publish = false`); a release is a set of prebuilt binaries and a container image, made by CI from a `fleetringd-vX.Y.Z` tag. Two workflows run on the tag:
 
-- `.github/workflows/release.yml` builds `fleetringd` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. It packages each with the licenses and `crates/fleetringd/README.md`, writes `SHA256SUMS` and a `.sha256` per file, and attaches the archives, the checksums, and `scripts/install.sh` to the tag's GitHub release, creating it if needed.
+- `.github/workflows/release.yml` builds `fleetringd` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. It packages each with the licenses and `crates/fleetringd/README.md`, writes `SHA256SUMS` and a `.sha256` per file, signs `SHA256SUMS` keylessly with cosign (`SHA256SUMS.sigstore.json`, `.sig`, and `.pem`), attests the archives and `scripts/install.sh`, and attaches everything to the tag's GitHub release, creating it if needed. It runs `cargo audit` first and fails on an unresolved advisory.
 - `.github/workflows/container.yml` builds the `Dockerfile` natively for `linux/amd64` and `linux/arm64` and pushes one manifest to `ghcr.io/fleetring/fleetringd`, tagged `X.Y.Z`. A final release also moves `X.Y` and `latest`; a prerelease (`X.Y.Z-rc.1`) gets its own tag only.
 
 ## 1. Pre-flight
@@ -92,7 +92,7 @@ git push origin main fleetringd-vX.Y.Z
 
 ## 4. After the workflows finish
 
-- [ ] The release lists five archives, `SHA256SUMS`, a `.sha256` for each file, and `install.sh`. Edit its notes to summarize the changes.
+- [ ] The release lists five archives, `SHA256SUMS` with its `.sigstore.json`, `.sig`, and `.pem`, a `.sha256` for each file, and `install.sh`, and the README's verify commands succeed against it. Edit its notes to summarize the changes.
 - [ ] `curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh -s -- --version X.Y.Z` installs a binary that prints `fleetringd X.Y.Z`.
 - [ ] `docker run --rm ghcr.io/fleetring/fleetringd:X.Y.Z --version` prints the same, on both architectures.
 - [ ] The first time only: make the `fleetringd` package public in the organization's GitHub package settings, and link it to this repository.
