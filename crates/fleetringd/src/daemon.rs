@@ -162,6 +162,9 @@ impl Daemon {
         environment: Environment,
     ) -> Result<Self, StartError> {
         config.validate()?;
+        let ack_timeout = config.replication.settings().ack_timeout;
+        let network = environment.network().outlasting(ack_timeout);
+        let environment = environment.with_network(network);
         if environment.execution() == Execution::Inline {
             config.engine.execution = Execution::Inline;
         }
