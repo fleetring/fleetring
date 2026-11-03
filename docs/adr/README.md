@@ -35,6 +35,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0024](0024-logical-change-capture.md) | Logical change capture through a replicated, Turso-shaped change table inside the database | Accepted |
 | [0025](0025-principals-and-scopes.md) | Principals and scopes: mutual TLS between nodes and prefix-scoped credentials for clients | Accepted |
 | [0026](0026-scope-enforcement-details.md) | How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire (amends 0025) | Proposed |
+| [0027](0027-keyed-leases.md) | Keyed leases: a fenced, renewable lease on any key, requested by a named holder and kept in control state | Proposed |
 
 ## Template
 
