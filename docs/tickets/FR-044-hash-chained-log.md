@@ -1,7 +1,7 @@
 ---
 id: FR-044
 title: A hash-chained replication log, so replicas can prove they share a prefix
-status: in-progress
+status: done
 priority: P2
 size: L
 milestone: M9 Durability sinks and verification
@@ -33,6 +33,6 @@ Each shipped batch is checked frame by frame with SQLite's cumulative checksum a
 
 ## Progress
 
-- 2026-10-29: Built. 2026-11-02: rebased onto main (after FR-042). All local gates pass; CI pending, so the status flips to done when it is green. `replication/chain.rs` holds the chain (`ChainHash`, `Chain`, anchors, recovery, the `chain` record file); `FrameSourceEngine::transactions` and `FrameFollower::committed_between`/`log_start` are the engine additions, implemented for SQLite. The primary's streams chain each published batch as they ship it, in `Batch.chain`; batches read back from the log, snapshots (`SnapshotChunk.chain`), and promotion catch-up (`FetchResponse.chain`) carry it too. A follower hashes before it applies and answers `needs_snapshot` on a mismatch, so the primary re-seeds it; a follower whose chain was derived (no record fit its log) adopts the primary's hash instead. `Database.Verify` and `db verify <database> [--at] [--expect]` recompute each replica's hash from its log on disk, held to the position it acknowledged, so a changed byte makes the log unreadable to that position and names the replica. The sim checker's `Invariant::ChainAgrees` compares every connected replica's chain at every common position when replicas converge and at the end of every run.
+- 2026-10-29: Built. 2026-11-02: rebased onto main (after FR-042). All local gates pass; CI green on PR #29. `replication/chain.rs` holds the chain (`ChainHash`, `Chain`, anchors, recovery, the `chain` record file); `FrameSourceEngine::transactions` and `FrameFollower::committed_between`/`log_start` are the engine additions, implemented for SQLite. The primary's streams chain each published batch as they ship it, in `Batch.chain`; batches read back from the log, snapshots (`SnapshotChunk.chain`), and promotion catch-up (`FetchResponse.chain`) carry it too. A follower hashes before it applies and answers `needs_snapshot` on a mismatch, so the primary re-seeds it; a follower whose chain was derived (no record fit its log) adopts the primary's hash instead. `Database.Verify` and `db verify <database> [--at] [--expect]` recompute each replica's hash from its log on disk, held to the position it acknowledged, so a changed byte makes the log unreadable to that position and names the replica. The sim checker's `Invariant::ChainAgrees` compares every connected replica's chain at every common position when replicas converge and at the end of every run.
 - Tests: `tests/replication/chain.rs` (agreement at every common position across a checkpoint and on recomputation; a byte flipped after apply caught by verify; a forged hash refused, then re-seeded and converging), `tests/database.rs` (`db verify` and `Client::verify`: agreement, `--expect`, a tampered follower named), unit tests for the chain and the checker, and every existing sim scenario under `ChainAgrees`.
 - Left out: signing; verifying pages already checkpointed into the database file (FR-045); the S3 sink. A promotion's candidate takes the fenced member's hash when its own chain disagrees, with a warning, rather than refuse to lead.
