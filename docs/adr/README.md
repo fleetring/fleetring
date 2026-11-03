@@ -39,6 +39,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0028](0028-replicated-sink-positions.md) | Replicated sink positions live in the database, written with the next write after a delivery | Proposed |
 | [0029](0029-s3-durability-sink.md) | Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore | Proposed |
 | [0030](0030-page-hash-trees.md) | Page hash trees over the checkpointed main file, kept by the engine adapter, for repair and page verification (supersedes 0010) | Proposed |
+| [0031](0031-node-calls-bound-to-placement.md) | Node-to-node calls are bound to placement: a node acts only on databases placed on it, at epochs control state gives it | Proposed |
 
 ## Template
 
