@@ -18,7 +18,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0007](0007-bounded-loads-policy.md) | Bounded loads as a deterministic policy applied at assignment time | Accepted |
 | [0008](0008-placement-spec-vectors-fingerprints.md) | Versioned placement spec, golden vectors, and ring fingerprints | Accepted |
 | [0009](0009-toolchain-lints-ci.md) | Toolchain, lint, dependency, and CI policy | Accepted (test matrix amended by 0014) |
-| [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred) |
+| [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred; superseded by 0030 once accepted) |
 | [0011](0011-generic-placement-core.md) | `fleetring` is general-purpose placement infrastructure; the product stays SQLite-focused | Accepted |
 | [0012](0012-cells-nested-placement.md) | Cells: nested placement by composing rings (directory or ring picks the cell, the cell's ring picks nodes) | Accepted |
 | [0013](0013-async-boundaries.md) | Async boundaries: synchronous placement, async I/O, engine-owned concurrency | Accepted |
@@ -38,6 +38,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0027](0027-keyed-leases.md) | Keyed leases: a fenced, renewable lease on any key, requested by a named holder and kept in control state | Proposed |
 | [0028](0028-replicated-sink-positions.md) | Replicated sink positions live in the database, written with the next write after a delivery | Proposed |
 | [0029](0029-s3-durability-sink.md) | Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore | Proposed |
+| [0030](0030-page-hash-trees.md) | Page hash trees over the checkpointed main file, kept by the engine adapter, for repair and page verification (supersedes 0010) | Proposed |
 
 ## Template
 
