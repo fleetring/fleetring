@@ -151,10 +151,17 @@ enum TokenCommand {
     /// within one heartbeat interval.
     Revoke {
         /// The token's ID, as `token issue` printed it (its `jti` claim).
-        #[arg(long, required_unless_present = "key_id", conflicts_with = "key_id")]
+        ///
+        /// IDs are base64url, so one may start with `-`; the value is taken as given.
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            required_unless_present = "key_id",
+            conflicts_with = "key_id"
+        )]
         token_id: Option<TokenId>,
         /// A signing key's ID (the `kid` header): every token it signed, for good.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         key_id: Option<KeyId>,
         /// How long to keep a token's revocation, at least what remains of its lifetime: 30 days
         /// (the longest a token lasts) by default.
@@ -1359,6 +1366,15 @@ mod tests {
         }
         for bad in ["int:x", "real:", "blob:0", "blob:zz"] {
             assert!(parse_param(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_token_or_key_id_may_start_with_a_hyphen() {
+        // IDs are base64url, so about one in 64 starts with `-`; clap would read it as a flag.
+        for (flag, id) in [("--token-id", "-0abc_"), ("--key-id", "-0abc_")] {
+            let parsed = Cli::try_parse_from(["fleetringd", "token", "revoke", flag, id]);
+            assert!(parsed.is_ok(), "{flag} {id}: {:?}", parsed.err());
         }
     }
 
