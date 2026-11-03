@@ -36,7 +36,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M4 Hardening and release | FR-016 – FR-019 | Benchmarks, fuzzing, docs, and the 0.1.0 release with the spec frozen |
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
-| M7 Durability and operations | FR-035 – FR-038 | Configurable durability per database, and a history checker for every simulation run |
+| M7 Durability and operations | FR-035 – FR-038, FR-051 | Configurable durability per database, and a history checker for every simulation run |
 | M8 Access and integration | FR-039 – FR-043 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
 | M9 Durability sinks and verification | FR-044, FR-045, FR-049 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
 | M10 Security | FR-046 – FR-048, FR-050 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases, and node calls bound to placement |
@@ -95,6 +95,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | in-progress |
 | [FR-049](FR-049-s3-durability-sink.md) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
 | [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | todo |
+| [FR-051](FR-051-flaky-replication-tests.md) | Find and fix the replication tests that fail intermittently in CI | P1 | M | — | todo |
 
 ## Dependency graph
 
