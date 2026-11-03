@@ -21,7 +21,9 @@ use fleetringd::engine::{
     CheckpointMarker, DatabaseEngine, EngineConfig, Execution, SqliteEngine, Statement,
     Transaction, Value,
 };
-use fleetringd::replication::{PrimaryRole, Replication, ReplicationParts, ReplicationSettings};
+use fleetringd::replication::{
+    EpochAuthority, EpochHolders, PrimaryRole, Replication, ReplicationParts, ReplicationSettings,
+};
 use fleetringd::transport::{Peers, replication_server};
 use fleetringd::{
     Config, Daemon, Membership, MembershipSettings, MembershipTasks, Network, Registry,
@@ -183,7 +185,8 @@ impl Cluster {
         for (name, listener) in ids.iter().zip(listeners) {
             let root = dir.path().join(name);
             // Each node reaches the control plane as itself; the nodes' own servers here are
-            // plain tonic servers, so they dial each other in plaintext.
+            // plain tonic servers, so they dial each other in plaintext, where no call carries
+            // an identity to check a binding against (see `binding.rs` for those).
             let network = tls.node_network(name)?;
             let (membership, tasks) = Membership::start(
                 Member::new(id(name)),
@@ -196,6 +199,7 @@ impl Cluster {
                 engine.clone(),
                 membership.clone(),
                 Arc::clone(&addresses),
+                Arc::new(BTreeMap::<DatabaseName, EpochHolders>::new()),
                 settings.clone(),
             );
             let router = match wraps.remove(*name) {
@@ -360,6 +364,7 @@ pub(crate) fn start_node(
     engine: impl DatabaseEngine + Clone,
     membership: Membership,
     addresses: Arc<BTreeMap<NodeId, String>>,
+    authority: Arc<dyn EpochAuthority>,
     settings: ReplicationSettings,
 ) -> Replication {
     let config = EngineConfig {
@@ -377,6 +382,7 @@ pub(crate) fn start_node(
             membership,
             peers: Arc::new(Peers::with_network(Network::default())),
             addresses,
+            authority,
             clock: Arc::new(SystemClock),
             execution: Execution::Threads,
             state_dir: root.join("replication"),

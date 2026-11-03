@@ -47,6 +47,17 @@ struct Led {
 }
 
 impl Record {
+    /// The highest epoch seen, 0 if none.
+    pub(super) fn highest(&self) -> u64 {
+        self.highest
+    }
+
+    /// The node recorded as the holder of [`highest`](Self::highest), once a fence or a stream
+    /// named it.
+    pub(super) fn holder(&self) -> Option<&str> {
+        self.holder.as_deref()
+    }
+
     /// The epoch of the primary that wrote the last frames of the log, 0 if unknown.
     pub(super) fn log_epoch(&self) -> u64 {
         self.log_epoch

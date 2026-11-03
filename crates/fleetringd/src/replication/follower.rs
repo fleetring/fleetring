@@ -20,6 +20,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use super::binding;
 use super::chain::{self, Anchor, Chain, ChainHash, Links, LogRead, Provenance};
 use super::failover::{self, Reconciled};
 use super::primary::{held, read_back_status, unreadable};
@@ -52,6 +53,22 @@ impl ReplicationService {
     pub(super) fn new(inner: Arc<Inner>) -> Self {
         Self { inner }
     }
+}
+
+/// The node whose certificate made a call, after refusing a principal: the binding checks judge
+/// that node (ADR-0031). `None` on a plaintext connection, which carries no identity to bind and
+/// which only `insecure_plaintext` allows.
+fn calling_node(peer: &Peer, call: &'static str) -> Result<Option<NodeId>, Status> {
+    peer.require_node(call)?;
+    Ok(match peer {
+        Peer::Node(id) => Some(id.clone()),
+        Peer::Principal(_) | Peer::Plaintext => None,
+    })
+}
+
+fn parse_database(text: &str) -> Result<DatabaseName, Status> {
+    text.parse()
+        .map_err(|error| Status::invalid_argument(format!("invalid database name: {error}")))
 }
 
 /// One database this node follows: which stream owns it, and where its copy is.
@@ -378,15 +395,17 @@ impl Replication for ReplicationService {
         request: Request<Streaming<ReplicateMessage>>,
     ) -> Result<Response<Self::ReplicateStream>, Status> {
         let peer = Peer::of(&request);
-        peer.require_node("Replicate")?;
-        let primary: Option<NodeId> = request
+        let caller = calling_node(&peer, "Replicate")?;
+        let named: Option<NodeId> = request
             .metadata()
             .get(PRIMARY_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
-        if let Some(primary) = &primary {
-            peer.check_node(primary, "Replicate")?;
+        if let Some(named) = &named {
+            peer.check_node(named, "Replicate")?;
         }
+        // The certificate names the sender; the metadata only says so for a plaintext peer.
+        let primary = caller.clone().or(named);
         let mut inbound = request.into_inner();
         let open = match inbound.message().await? {
             Some(ReplicateMessage {
@@ -398,16 +417,16 @@ impl Replication for ReplicationService {
                 ));
             }
         };
-        let name: DatabaseName = open
-            .database
-            .parse()
-            .map_err(|error| Status::invalid_argument(format!("invalid database name: {error}")))?;
+        let name = parse_database(&open.database)?;
         let inner = &self.inner;
         if let EngineCapability::SelfReplicating = inner.engine.capability() {
             return Err(Status::failed_precondition(format!(
                 "{} databases replicate themselves",
                 inner.engine.kind()
             )));
+        }
+        if let Some(caller) = &caller {
+            binding::check_stream(inner, &name, open.epoch, caller).await?;
         }
         failover::admit_stream(inner, &name, open.epoch, primary.as_ref()).await?;
         if inner.primary(&name).is_some() || inner.registry().is_open(&name) {
@@ -447,8 +466,8 @@ impl Replication for ReplicationService {
         &self,
         request: Request<FenceRequest>,
     ) -> Result<Response<FenceResponse>, Status> {
-        Peer::of(&request).require_node("Fence")?;
-        failover::fence_rpc(&self.inner, request.into_inner())
+        let caller = calling_node(&Peer::of(&request), "Fence")?;
+        failover::fence_rpc(&self.inner, request.into_inner(), caller.as_ref())
             .await
             .map(Response::new)
     }
@@ -457,8 +476,13 @@ impl Replication for ReplicationService {
         &self,
         request: Request<FetchRequest>,
     ) -> Result<Response<FetchResponse>, Status> {
-        Peer::of(&request).require_node("Fetch")?;
-        failover::fetch_rpc(&self.inner, request.into_inner())
+        let caller = calling_node(&Peer::of(&request), "Fetch")?;
+        let request = request.into_inner();
+        if let Some(caller) = &caller {
+            let name = parse_database(&request.database)?;
+            binding::check_fetch(&self.inner, &name, request.epoch, caller)?;
+        }
+        failover::fetch_rpc(&self.inner, request)
             .await
             .map(Response::new)
     }
@@ -467,8 +491,13 @@ impl Replication for ReplicationService {
         &self,
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
-        Peer::of(&request).require_node("Promote")?;
-        failover::promote_rpc(&self.inner, request.into_inner())?;
+        let caller = calling_node(&Peer::of(&request), "Promote")?;
+        let request = request.into_inner();
+        if caller.is_some() {
+            let name = parse_database(&request.database)?;
+            binding::check_promote(&self.inner, &name, request.epoch).await?;
+        }
+        failover::promote_rpc(&self.inner, request)?;
         Ok(Response::new(PromoteResponse {}))
     }
 
@@ -476,8 +505,13 @@ impl Replication for ReplicationService {
         &self,
         request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
-        Peer::of(&request).require_node("Snapshot")?;
-        snapshot::serve(&self.inner, request.into_inner())
+        let caller = calling_node(&Peer::of(&request), "Snapshot")?;
+        let request = request.into_inner();
+        if let Some(caller) = &caller {
+            let name = parse_database(&request.database)?;
+            binding::check_snapshot(&self.inner, &name, request.epoch, caller).await?;
+        }
+        snapshot::serve(&self.inner, request)
             .await
             .map(Response::new)
     }

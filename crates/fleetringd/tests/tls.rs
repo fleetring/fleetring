@@ -254,7 +254,8 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
     assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
     assert_eq!(refused.message(), "Fence needs a node certificate");
 
-    // A node may, and gets the real answer: the fence lands on an empty replica.
+    // A node passes the boundary and gets the real answer: its binding is checked against
+    // control state, which knows no such database (FR-050).
     let node = tls.node_network("peer")?;
     let mut replication = replication_client(node.channel(&address)?);
     let answered = replication
@@ -263,8 +264,9 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
             epoch: 1,
             candidate: "peer".into(),
         })
-        .await?;
-    assert_eq!(answered.get_ref().epoch, 1);
+        .await
+        .expect_err("control state knows no promotion of acme");
+    assert_eq!(answered.code(), Code::NotFound, "{answered}");
     daemon.run_until(async {}).await;
     Ok(())
 }

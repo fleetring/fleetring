@@ -2,6 +2,7 @@
 //! quorum, snapshot catch-up, the lease watch, and the log's hash chain, over real TCP and real
 //! SQLite.
 
+mod binding;
 mod chain;
 mod common;
 mod durability;

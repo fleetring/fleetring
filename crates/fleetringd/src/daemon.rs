@@ -463,6 +463,7 @@ fn start_data(
             membership: membership.clone(),
             peers: Arc::new(Peers::with_network(network.clone())),
             addresses: Arc::new(membership.clone()),
+            authority: Arc::new(control.clone()),
             clock: environment.clock(),
             execution: config.engine.execution,
             state_dir: data_dir.path().join(REPLICATION_DIR),
