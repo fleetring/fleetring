@@ -73,13 +73,25 @@ The daemon is released separately from the crate (FR-034). It isn't published to
 ## 1. Pre-flight
 
 - [ ] CI is green on `main`, including `test (ubuntu-24.04-arm)` and `simulation (fixed seeds)`.
-- [ ] A manual run of both workflows (Actions → Release, and Actions → Container → Run workflow) passes. It builds and smoke-tests every archive and both images, and publishes nothing. Download the `fleetringd-<version>-dist` artifact and try an archive.
 - [ ] `RUST_VERSION` agrees in `.github/workflows/release.yml` and the `Dockerfile`.
+- [ ] **A manual dry run, only if the release or container workflows changed since the last release.** Check with:
+
+  ```sh
+  git diff --stat fleetringd-v<previous>..main -- \
+    .github/workflows/release.yml .github/workflows/container.yml Dockerfile scripts/install.sh
+  ```
+
+  If that prints anything, run both workflows by hand on `main` (Actions → Release → Run workflow, and Actions → Container → Run workflow). A manual run builds and smoke-tests every archive and both images, and publishes nothing; download the `fleetringd-<version>-dist` artifact and try an archive.
+
+  If it prints nothing, skip the dry run. The workflows are the ones that last succeeded, so the tag run is the test, and a run that fails is re-run on the same tag (see [After the workflows finish](#4-after-the-workflows-finish)).
 
 ## 2. Version
 
-- [ ] Set `version` in `crates/fleetringd/Cargo.toml`; `fleetringd --version` prints it. Both workflows fail if the tag doesn't match it.
-- [ ] Commit: `chore(release): fleetringd X.Y.Z`.
+- [ ] Set `version` in `crates/fleetringd/Cargo.toml` to exactly the version the tag will name; `fleetringd --version` prints it. Both workflows fail unless the tag is `fleetringd-v` followed by that version, character for character.
+  - **A release candidate** sets it to `X.Y.Z-rc.N` first, and is tagged `fleetringd-vX.Y.Z-rc.N`. The release is marked a prerelease, and the image gets only its own tag.
+  - Tagging `-rc.N` while `Cargo.toml` still says `X.Y.Z` fails the `version` job. That is why 0.2.0's `rc.1` tag failed.
+  - The final release sets `X.Y.Z` in a commit of its own.
+- [ ] Commit: `chore(release): fleetringd X.Y.Z` (or `X.Y.Z-rc.N`).
 
 `CHANGELOG.md` documents the `fleetring` crate only; the daemon's notes go in its GitHub release.
 
@@ -92,9 +104,86 @@ git push origin main fleetringd-vX.Y.Z
 
 ## 4. After the workflows finish
 
-- [ ] The release lists five archives, `SHA256SUMS` with its `.sigstore.json` bundle, a `.sha256` for each file, and `install.sh`, and the README's verify commands succeed against it. Edit its notes to summarize the changes.
-- [ ] `curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh -s -- --version X.Y.Z` installs a binary that prints `fleetringd X.Y.Z`.
-- [ ] `docker run --rm ghcr.io/fleetring/fleetringd:X.Y.Z --version` prints the same, on both architectures.
-- [ ] The first time only: make the `fleetringd` package public in the organization's GitHub package settings, and link it to this repository.
+A failed workflow is re-run on the same tag, once its cause is fixed if it was more than a flake: the release workflow replaces the release's files, and the container workflow pushes the manifest again. Never move a published tag; release a new patch version instead.
 
-A failed workflow can be rerun on the same tag: the release workflow replaces the release's files, and the container workflow pushes the manifest again. Never move a published tag; release a new patch version instead.
+### Verify what was published
+
+Run these in an empty directory, against the published release, not a local build:
+
+```sh
+V=X.Y.Z
+gh release download fleetringd-v$V --repo fleetring/fleetring
+
+# 1. Checksums: the archives and install.sh match SHA256SUMS.
+sha256sum --check SHA256SUMS   # shasum -a 256 -c SHA256SUMS on macOS
+
+# 2. The signature: SHA256SUMS was signed by this repository's release workflow, from a fleetringd tag.
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/fleetring/fleetring/.github/workflows/release.yml@refs/tags/fleetringd-v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# 3. Provenance for every archive and the install script.
+for file in fleetringd-$V-*.tar.gz fleetringd-$V-*.zip install.sh; do
+  gh attestation verify "$file" --repo fleetring/fleetring
+done
+
+# 4. Provenance for the container image.
+gh attestation verify oci://ghcr.io/fleetring/fleetringd:$V --repo fleetring/fleetring
+
+# 5. The install script installs this version.
+curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
+  | sh -s -- --version $V --prefix "$PWD/prefix"
+"$PWD/prefix/bin/fleetringd" --version
+
+# 6. The image runs on both architectures.
+docker run --rm --platform linux/amd64 ghcr.io/fleetring/fleetringd:$V --version
+docker run --rm --platform linux/arm64 ghcr.io/fleetring/fleetringd:$V --version
+```
+
+- [ ] The release lists five archives, `SHA256SUMS` with its `.sigstore.json` bundle, a `.sha256` for each file, and `install.sh`.
+- [ ] Every checksum passes.
+- [ ] `cosign verify-blob` prints `Verified OK`.
+- [ ] `gh attestation verify` succeeds for every archive, `install.sh`, and the image.
+- [ ] The installed binary prints `fleetringd X.Y.Z`.
+- [ ] Both `docker run` commands print `fleetringd X.Y.Z`. On a machine of one architecture, the other runs under emulation (Docker Desktop has it; on Linux, `docker run --privileged --rm tonistiigi/binfmt --install all` adds it).
+- [ ] The first time only: make the `fleetringd` package public in the organization's GitHub package settings, and link it to this repository.
+- [ ] Replace the release's notes with the [template](#5-release-notes).
+- [ ] If the release fixes a vulnerability, publish its advisory now ([`SECURITY.md`](SECURITY.md#publishing-an-advisory)).
+
+## 5. Release notes
+
+The workflow creates the release with install and verify instructions. Replace its body with this template. Leave out any section with nothing in it, except Verify:
+
+````markdown
+## fleetringd X.Y.Z
+
+<One paragraph: what this release is for, and who should upgrade how soon.>
+
+### Breaking changes
+
+- <What changed, who it affects, and what to do: a renamed flag, a changed default, a configuration key, a protocol or on-disk format. Say whether nodes of the previous release can run beside this one.>
+
+### Security
+
+- <GHSA-xxxx-xxxx-xxxx: the advisory's title. Its severity, the affected versions, and what to do after upgrading, with a link to the advisory.>
+
+### Features
+
+- <What a user can now do, with the command or setting, and its ticket (FR-NNN).>
+
+### Fixes
+
+- <What was wrong, as a user saw it, and that it no longer happens.>
+
+### Verify
+
+```sh
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/fleetring/fleetring/.github/workflows/release.yml@refs/tags/fleetringd-v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify fleetringd-X.Y.Z-<target>.tar.gz --repo fleetring/fleetring
+gh attestation verify oci://ghcr.io/fleetring/fleetringd:X.Y.Z --repo fleetring/fleetring
+```
+````
