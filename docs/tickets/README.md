@@ -40,6 +40,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M8 Access and integration | FR-039 – FR-043 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
 | M9 Durability sinks and verification | FR-044, FR-045, FR-049, FR-052, FR-053 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
 | M10 Security | FR-046 – FR-048, FR-050, FR-055 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases, and node calls bound to placement |
+| M11 Operator experience | FR-056 – FR-059 | One vocabulary (fleet, not cluster), CLI contexts with stable JSON output, a k9s-style TUI, and a desktop viewer, all over one client crate |
 
 ## Index
 
@@ -100,6 +101,10 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-053](FR-053-object-store-workload-identity.md) | Object-store credentials from workload identity, not only static keys | P2 | S | FR-049 | todo |
 | [FR-054](FR-054-upgrade-and-rolling-upgrades.md) | `fleetringd upgrade` and a tested rolling upgrade | P1 | L | FR-038, FR-048 | todo |
 | [FR-055](FR-055-cli-identity-ergonomics.md) | Pick a client identity without repeating `--cert` and `--key` | P2 | S | FR-047 | todo |
+| [FR-056](FR-056-cli-contexts-json-completions.md) | CLI contexts, `--json` on every read command, shell completions, and man pages | P1 | L | FR-055, FR-059 | todo |
+| [FR-057](FR-057-tui.md) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
+| [FR-058](FR-058-desktop-app.md) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
+| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, keeping the old spellings as deprecated aliases | P1 | M | FR-047 | todo |
 
 ## Dependency graph
 
@@ -185,6 +190,13 @@ flowchart LR
   FR047 --> FR043
   FR047 --> FR045
   FR047 --> FR050[FR-050 node calls bound to placement]
+  FR047 --> FR055[FR-055 client identity]
+  FR047 --> FR059[FR-059 cluster to fleet]
+  FR055 --> FR056[FR-056 CLI contexts + JSON]
+  FR059 --> FR056
+  FR056 --> FR057[FR-057 TUI]
+  FR042 --> FR057
+  FR056 --> FR058[FR-058 desktop app]
 ```
 
 ## Critical path and estimate
