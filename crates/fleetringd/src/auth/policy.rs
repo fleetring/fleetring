@@ -347,6 +347,46 @@ mod tests {
     }
 
     #[test]
+    fn the_proto_comments_state_each_rpcs_requirement() {
+        let mut service = None;
+        let mut scope = None;
+        let mut checked = 0;
+        for line in PROTO.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("service ") {
+                service = rest.split_whitespace().next();
+            } else if let Some(stated) = line.strip_prefix("// Scope: ") {
+                scope = Some(stated.trim_end_matches('.'));
+            } else if let (Some(service), Some(rest)) = (service, line.strip_prefix("rpc ")) {
+                let method = rest.split('(').next().unwrap_or(rest).trim();
+                let path = format!("/fleetring.v1.{service}/{method}");
+                let rpc = rpc_at(&path).unwrap_or_else(|| panic!("{path} isn't in RPCS"));
+                assert_eq!(
+                    scope.take(),
+                    Some(rpc.requirement.to_string().as_str()),
+                    "the `// Scope:` line above {path}"
+                );
+                checked += 1;
+            } else if !line.starts_with("//") {
+                scope = None;
+            }
+        }
+        assert_eq!(checked, RPCS.len());
+    }
+
+    #[test]
+    fn the_daemon_readme_lists_each_rpcs_requirement() {
+        const README: &str = include_str!("../../README.md");
+        for rpc in RPCS {
+            let service = rpc.service().trim_start_matches("fleetring.v1.");
+            let row = format!("| `{service}.{}` | {} |", rpc.method(), rpc.requirement);
+            assert!(
+                README.contains(&row),
+                "the daemon README lacks the row {row}"
+            );
+        }
+    }
+
+    #[test]
     fn the_table_names_the_generated_services() {
         let services: BTreeSet<&str> = RPCS.iter().map(Rpc::service).collect();
         let generated: BTreeSet<&str> = [

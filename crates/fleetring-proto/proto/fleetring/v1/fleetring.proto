@@ -50,41 +50,64 @@ enum Role {
 
 // ---- Control ----------------------------------------------------------------------------------
 
+// Every RPC states, in a `Scope:` line, what its caller needs (ADR-0025): `node` (a node
+// certificate; principals are refused), `cluster` (a node, or a principal with the `cluster`
+// scope), an action on the database the request names, or, for a listing, the action on each
+// database it shows. `fleetringd::auth::RPCS` holds the same table, and a test keeps the two
+// equal; a request for an RPC the table doesn't list is refused.
+
 service Control {
+  // Scope: node.
   rpc Join(JoinRequest) returns (JoinResponse);
+  // Scope: node.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Scope: cluster.
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
+  // Scope: admin on the key.
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   // Removes a database for good: its record, lease, and any promotion. Its replicas close and
   // delete their copies once they learn of it; `Locate` answers NOT_FOUND from then on.
+  // Scope: admin on the key.
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
   // Records new durability settings for a database, which take effect at its next lease
   // (ADR-0023).
+  // Scope: admin on the key.
   rpc ChangeDurability(ChangeDurabilityRequest) returns (ChangeDurabilityResponse);
+  // Scope: read on the key, or cluster.
   rpc Locate(LocateRequest) returns (LocateResponse);
   // Every database's placement, in name order.
+  // Scope: read per key listed, or cluster.
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  // Scope: node.
   rpc AcquireLease(AcquireLeaseRequest) returns (LeaseResponse);
+  // Scope: node.
   rpc RenewLease(RenewLeaseRequest) returns (LeaseResponse);
   // Removes a member, as a node does when it shuts down gracefully.
+  // Scope: cluster.
   rpc Leave(LeaveRequest) returns (LeaveResponse);
   // The promotion calls (ADR-0018): the control node starts a promotion once a lease has
   // expired by the failover margin and tells the candidate, which fences replicas, records each
   // one, and completes the promotion.
+  // Scope: node.
   rpc StartPromotion(StartPromotionRequest) returns (PromotionResponse);
+  // Scope: node.
   rpc RecordFenced(RecordFencedRequest) returns (RecordFencedResponse);
+  // Scope: node.
   rpc CompletePromotion(CompletePromotionRequest) returns (CompletePromotionResponse);
   // Marks a member as draining: it gets no new lease and is never a promotion's candidate. The
   // member sees the mark in its membership updates and hands its leases over with
   // TransferLease, then leaves if it is shutting down.
+  // Scope: cluster.
   rpc Drain(DrainRequest) returns (DrainResponse);
   // Hands a database's lease from its draining holder to a follower without waiting for the
   // lease to expire: starts a promotion at the next epoch whose candidate is the named target,
   // or the most advanced live follower. The candidate completes it as after an expiry.
+  // Scope: admin on the key.
   rpc TransferLease(TransferLeaseRequest) returns (PromotionResponse);
   // Adds a bearer token, or every token a signing key issued, to the denylist every node checks
   // before it trusts a token (ADR-0025). Data nodes learn the list from their heartbeat replies,
   // so a revocation reaches every live node within one heartbeat interval.
+  // Scope: cluster.
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
 }
 
@@ -327,13 +350,18 @@ message TransferLeaseRequest {
 
 service Replication {
   // The primary opens one stream per follower and sends batches; the follower acknowledges.
+  // Scope: node.
   rpc Replicate(stream ReplicateMessage) returns (stream ReplicateAck);
   // A promotion fences a replica at a new epoch and learns its position (ADR-0018).
+  // Scope: node.
   rpc Fence(FenceRequest) returns (FenceResponse);
+  // Scope: node.
   rpc Snapshot(SnapshotRequest) returns (stream SnapshotChunk);
   // A candidate fetches the frames it lacks from the most advanced fenced member.
+  // Scope: node.
   rpc Fetch(FetchRequest) returns (FetchResponse);
   // The control node asks a promotion's candidate to carry it out.
+  // Scope: node.
   rpc Promote(PromoteRequest) returns (PromoteResponse);
 }
 
@@ -451,23 +479,29 @@ message SnapshotChunk {
 // Every data node serves it. A node that doesn't hold a database's lease answers UNAVAILABLE and
 // names the primary as `host:port` in the `fleetring-primary` metadata entry.
 service Database {
+  // Scope: write on the key.
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  // Scope: read on the key.
   rpc Query(QueryRequest) returns (QueryResponse);
   // Makes the receiving node the primary of a database the control plane has created but not
   // leased yet: it takes the first lease and creates the database. Repeating it on the primary
   // is harmless.
+  // Scope: admin on the key.
   rpc Create(CreateRequest) returns (CreateResponse);
   // What this node knows on its own, without asking the control plane: its membership epoch and
   // ring fingerprint, and the databases it serves with their roles.
+  // Scope: read or stream per key listed, or cluster.
   rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
   // The leases this node holds, as the node itself sees them (FR-042): first a snapshot of every
   // database it serves with its epoch, then one event per lease gained or lost, in the order the
   // node records them. A lease is gained before the node acknowledges a write under its epoch,
   // and lost before the node stops answering for the database. A subscriber that falls behind
   // gets RESOURCE_EXHAUSTED and opens the stream again for a fresh snapshot.
+  // Scope: read per key listed, or cluster.
   rpc WatchLeases(WatchLeasesRequest) returns (stream LeaseUpdate);
   // This node's hash chain over a database's replication log at a position (FR-044), read back
   // from its copy, so that an operator can compare every replica's. Any replica answers.
+  // Scope: read on the key, or cluster.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 

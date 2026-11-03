@@ -124,3 +124,30 @@ id = "node-1"
 # url = "http://127.0.0.1:8080/changes"
 # timeout_ms = 5000      # how long one request may take
 # retries = 5            # retries before the change is handed back and retried later
+
+# Principals: what each client certificate may do (ADR-0025). Every connection carries a
+# certificate, and a principal (`cert client <name>`) may do only what its scopes allow; one this
+# file doesn't list may do nothing with its certificate alone. Keep the list identical on every
+# node. A scope is `<action>:<pattern>`, the action `read`, `write`, `admin`, or `stream` over an
+# exact database name or a prefix ending in `*`; `write` implies `read`, `admin` implies both,
+# and `stream` stands alone. `cluster` allows the operations that name no database: membership,
+# draining, revoking tokens. The table of what each RPC needs is in the daemon README, under
+# "Principals and scopes".
+#
+# An application usually connects with its own certificate and a short-lived token instead:
+#
+#   fleetringd token issue --principal notes-app --scope write:notes --ttl 1h --dir ./tls
+#
+# The token carries its scopes, so `notes-app` needs no entry here. A request with a token acts
+# with the token's scopes alone; `fleetringd token revoke --token-id <id>` refuses it on every node
+# within one heartbeat interval.
+[[principal]]
+name = "admin"
+scopes = ["admin:*", "stream:*", "cluster"]
+
+# A router that relays its callers' tokens: its own certificate grants nothing, and a request
+# carrying a caller's token acts as that caller.
+# [[principal]]
+# name = "router"
+# scopes = []
+# forward_tokens = true
