@@ -122,6 +122,7 @@ pub const RPCS: &[Rpc] = &[
         "/fleetring.v1.Control/TransferLease",
         Requirement::Key(Action::Admin),
     ),
+    rpc("/fleetring.v1.Control/RevokeToken", Requirement::Cluster),
     // Replication: nodes only.
     rpc("/fleetring.v1.Replication/Replicate", Requirement::Node),
     rpc("/fleetring.v1.Replication/Fence", Requirement::Node),

@@ -16,8 +16,9 @@ use fleetring_proto::v1::{
     JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
     ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest,
     PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen, SnapshotChunk,
-    SnapshotRequest, StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
+    RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen, RevokeTokenRequest,
+    RevokeTokenResponse, SnapshotChunk, SnapshotRequest, StartPromotionRequest,
+    TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use fleetringd::transport::{
@@ -43,6 +44,7 @@ impl Control for StubControl {
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
         check_protocol(request.get_ref().protocol.as_ref())?;
         Ok(Response::new(JoinResponse {
+            revocations: Vec::new(),
             protocol: Some(PROTOCOL_VERSION),
             membership_epoch: MEMBERSHIP_EPOCH,
         }))
@@ -55,6 +57,7 @@ impl Control for StubControl {
         Ok(Response::new(HeartbeatResponse {
             membership_epoch: MEMBERSHIP_EPOCH,
             unknown_databases: Vec::new(),
+            revocations: Vec::new(),
         }))
     }
 
@@ -153,6 +156,13 @@ impl Control for StubControl {
         &self,
         _request: Request<TransferLeaseRequest>,
     ) -> Result<Response<PromotionResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn revoke_token(
+        &self,
+        _request: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }

@@ -6,7 +6,10 @@ use std::str::FromStr;
 use std::collections::BTreeMap;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
-use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Role};
+use fleetring_control::{
+    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Revocations, Revoked, Role,
+    Timestamp,
+};
 use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
 
@@ -257,6 +260,60 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
         databases,
         sinks,
     })
+}
+
+/// A denylist entry as the protocol carries it.
+pub(crate) fn revocation_to_proto(revoked: &Revoked, until: Timestamp) -> proto::Revocation {
+    let revoked = match revoked {
+        Revoked::Token(id) => proto::revocation::Revoked::TokenId(id.to_string()),
+        Revoked::Key(id) => proto::revocation::Revoked::KeyId(id.to_string()),
+    };
+    proto::Revocation {
+        revoked: Some(revoked),
+        until_ms: until.as_millis(),
+    }
+}
+
+/// A denylist entry from the protocol, or `INVALID_ARGUMENT` if it names nothing valid.
+pub(crate) fn revocation_from_proto(
+    revocation: proto::Revocation,
+) -> Result<(Revoked, Timestamp), Status> {
+    let revoked = match revocation.revoked {
+        Some(proto::revocation::Revoked::TokenId(id)) => Revoked::Token(parse("token id", &id)?),
+        Some(proto::revocation::Revoked::KeyId(id)) => Revoked::Key(parse("key id", &id)?),
+        None => {
+            return Err(Status::invalid_argument(
+                "a revocation names a token or a key",
+            ));
+        }
+    };
+    Ok((revoked, Timestamp::from_millis(revocation.until_ms)))
+}
+
+/// The denylist as the protocol carries it, in order.
+pub(crate) fn revocations_to_proto(revocations: &Revocations) -> Vec<proto::Revocation> {
+    revocations
+        .iter()
+        .map(|(revoked, until)| revocation_to_proto(revoked, until))
+        .collect()
+}
+
+/// The denylist a heartbeat reply carries. An entry the node can't read is skipped with a
+/// warning: the rest still apply, and a token whose ID can't be parsed is refused anyway.
+pub(crate) fn revocations_from_proto(revocations: Vec<proto::Revocation>) -> Revocations {
+    revocations
+        .into_iter()
+        .filter_map(|revocation| match revocation_from_proto(revocation) {
+            Ok(entry) => Some(entry),
+            Err(status) => {
+                tracing::warn!(
+                    reason = status.message(),
+                    "skipped an unreadable revocation"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// The first message of a `WatchLeases` stream: every lease `node` holds, in name order.

@@ -18,8 +18,8 @@ use fleetring_proto::v1::{
     DropDatabaseResponse, Engine, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
     LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
     LocateRequest, LocateResponse, MembershipUpdate, Node, PromotionResponse, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, Role, StartPromotionRequest, TransferLeaseRequest,
-    WatchMembershipRequest,
+    RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, Role,
+    StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
@@ -544,6 +544,13 @@ impl Control for Redirecting {
     ) -> Result<Response<PromotionResponse>, Status> {
         self.redirect()
     }
+
+    async fn revoke_token(
+        &self,
+        _: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
+        self.redirect()
+    }
 }
 
 async fn serve_redirect(
@@ -1053,6 +1060,82 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
     assert!(state.report(&node, &known).is_some());
     assert!(state.report(&node, &ghost).is_none());
     assert_eq!(state.last_heartbeat(&node), Some(state.now()));
+    daemon.run_until(std::future::ready(())).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResult {
+    use fleetring_proto::v1::{Revocation, RevokeTokenRequest, revocation::Revoked as Wire};
+    use fleetringd::{Membership, MembershipSettings};
+
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    let control = secure_client(address, &tls)?;
+    let revoke = |revoked: Wire, until_ms: u64| RevokeTokenRequest {
+        revocation: Some(Revocation {
+            revoked: Some(revoked),
+            until_ms,
+        }),
+    };
+    let far = u64::MAX;
+    // A token's entry is kept no longer than any token lasts; a key's as long as asked.
+    let kept = control
+        .revoke_token(revoke(Wire::TokenId("tok-1".into()), far))
+        .await?;
+    let longest = SystemClock.now().as_millis()
+        + u64::try_from(fleetringd::auth::MAX_TOKEN_LIFETIME.as_millis())?
+        + fleetringd::auth::NOT_BEFORE_LEEWAY_SECS * 1_000;
+    assert!(kept.until_ms <= longest, "{} > {longest}", kept.until_ms);
+    assert!(kept.until_ms + 60_000 > longest, "{}", kept.until_ms);
+    let kept = control
+        .revoke_token(revoke(Wire::KeyId("key-1".into()), far))
+        .await?;
+    assert_eq!(kept.until_ms, far);
+    let past = control
+        .revoke_token(revoke(Wire::TokenId("tok-2".into()), 1))
+        .await
+        .expect_err("a revocation that has passed is refused");
+    assert_eq!(past.code(), Code::FailedPrecondition);
+    let invalid = control
+        .revoke_token(revoke(Wire::TokenId("not an id".into()), far))
+        .await
+        .expect_err("an invalid id is refused");
+    assert_eq!(invalid.code(), Code::InvalidArgument);
+
+    let settings = MembershipSettings {
+        heartbeat_interval_ms: NonZeroU64::new(50).ok_or("zero")?,
+        ..MembershipSettings::default()
+    };
+    // A node that joins gets the list in the join reply, before its first heartbeat.
+    let joined = tls
+        .node_network("b")?
+        .control_client(address.to_string())
+        .join(join_request("b"))
+        .await?;
+    assert_eq!(joined.revocations.len(), 2);
+
+    let node = tls.node_network("a")?.control_client(address.to_string());
+    let (membership, tasks) = Membership::start(Member::new("a".parse()?), node, &settings);
+    let token = fleetring_control::Revoked::Token("tok-1".parse()?);
+    let key = fleetring_control::Revoked::Key("key-1".parse()?);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !membership.denylist().load().contains(&token) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let list = membership.denylist().load();
+    assert!(list.contains(&key));
+    assert_eq!(list.len(), 2);
+    tasks.stop().await;
     daemon.run_until(std::future::ready(())).await;
     Ok(())
 }

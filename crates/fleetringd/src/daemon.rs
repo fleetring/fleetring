@@ -14,8 +14,8 @@ use tonic::transport::Server;
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::reachable;
 use crate::control::{
-    ControlHandle, ControlNode, ControlOptions, ControlService, DurabilityDefaults, Failover,
-    FailoverSettings, NoControl, OpenError,
+    ControlHandle, ControlNode, ControlOptions, ControlService, Failover, FailoverSettings,
+    NoControl, OpenError,
 };
 use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSettings};
 use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
@@ -197,10 +197,13 @@ impl Daemon {
         let server = serve(
             listener,
             address,
-            control.as_ref().map(|role| &role.node),
+            control.as_ref().map(|role| {
+                ControlService::new(role.node.handle())
+                    .with_durability_defaults(config.replication.durability_defaults())
+                    .with_clock(environment.clock())
+            }),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
-            config.replication.durability_defaults(),
             network.security().clone(),
         );
         let data = data.map(|(role, _)| role);
@@ -549,10 +552,9 @@ async fn bind(config: &Config, network: &Network) -> Result<(Listener, SocketAdd
 fn serve(
     listener: Listener,
     address: SocketAddr,
-    control: Option<&ControlNode>,
+    control: Option<ControlService>,
     data: Option<&DataNode>,
     control_address: SocketAddr,
-    durability: DurabilityDefaults,
     security: Security,
 ) -> RunningServer {
     let (stop, stopped) = oneshot::channel::<()>();
@@ -560,14 +562,11 @@ fn serve(
     let shutdown = async {
         let _stop = stopped.await;
     };
+    let no_control = control.is_none();
     let router = Server::builder()
-        .add_optional_service(control.map(|node| {
-            control_server(ControlService::new(node.handle()).with_durability_defaults(durability))
-        }))
+        .add_optional_service(control.map(control_server))
         .add_optional_service(
-            control
-                .is_none()
-                .then(|| control_server(NoControl::new(control_address.to_string()))),
+            no_control.then(|| control_server(NoControl::new(control_address.to_string()))),
         )
         .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))))
         .add_optional_service(data.map(|node| node.replication().server()));

@@ -43,7 +43,9 @@ use tokio::time::error::Elapsed;
 use tokio::time::{MissedTickBehavior, timeout};
 use tonic::{Code, Status};
 
+use crate::auth::Denylist;
 use crate::control::{ControlClient, member_from, node_to_proto};
+use crate::data::convert::revocations_from_proto;
 use crate::{MembershipSettings, OnShutdown};
 
 /// How many heartbeat replies in a row may report a later membership epoch than the published one
@@ -127,6 +129,7 @@ impl MembershipView {
 pub struct Membership {
     current: Arc<ArcSwap<MembershipView>>,
     updates: watch::Receiver<Arc<MembershipView>>,
+    denylist: Denylist,
 }
 
 impl Membership {
@@ -176,6 +179,7 @@ impl Membership {
                 interval,
                 databases: Box::new(databases),
                 unknown: std::collections::BTreeSet::new(),
+                denylist: membership.denylist.clone(),
             },
             Arc::clone(&resubscribe),
             membership.updates.clone(),
@@ -212,7 +216,22 @@ impl Membership {
             current: Arc::clone(&current),
             updates: sender,
         };
-        (Self { current, updates }, publisher)
+        let denylist = Denylist::new();
+        (
+            Self {
+                current,
+                updates,
+                denylist,
+            },
+            publisher,
+        )
+    }
+
+    /// Returns the revoked tokens and signing keys, as the last heartbeat reply listed them
+    /// (ADR-0025). Each successful heartbeat replaces the list.
+    #[must_use]
+    pub fn denylist(&self) -> &Denylist {
+        &self.denylist
     }
 
     /// Returns the current ring, or `None` before the node has heard of any member.
@@ -537,6 +556,8 @@ struct Heartbeats {
     databases: Box<dyn DatabaseStatuses>,
     /// The reported databases the control plane said it doesn't know, as of the last reply.
     unknown: std::collections::BTreeSet<String>,
+    /// Where each reply's denylist goes.
+    denylist: Denylist,
 }
 
 impl Heartbeats {
@@ -555,6 +576,8 @@ impl Heartbeats {
                 tracing::warn!(node = %id, database, "the control plane doesn't know this database; its reports are ignored");
             }
             self.unknown = unknown;
+            self.denylist
+                .replace(revocations_from_proto(response.revocations.clone()));
         }
         result
     }
@@ -586,6 +609,9 @@ async fn heartbeat_loop(
             match timeout(interval, heartbeats.client.join(join.clone())).await {
                 Ok(Ok(response)) => {
                     tracing::info!(node = %id, epoch = response.membership_epoch, "joined the cluster");
+                    heartbeats
+                        .denylist
+                        .replace(revocations_from_proto(response.revocations));
                     joined = true;
                     timeouts = 0;
                 }
