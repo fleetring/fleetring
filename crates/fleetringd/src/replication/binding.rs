@@ -7,10 +7,11 @@
 //! checked against control state before the record names it; while control state can't be
 //! reached, it is answered `UNAVAILABLE` and retries.
 //!
-//! Membership changes publish the new ring on each node at a different moment, so a ring-based
-//! check accepts a node in the replica set under the receiver's current ring or the ring before
-//! it ([`replicas_of`]), and a stream's receiver also counts as a replica when control state's
-//! own replica set names it.
+//! Membership changes publish the new ring on each node at a different moment. A stream's
+//! receiver counts as a replica under its current ring, the ring before it ([`replicas_of`]), or
+//! the replica set control state names now. A snapshot goes only to a follower on the primary's
+//! current ring or in control state's replica set: the ring before lingers until the next
+//! change, and must not keep a node a follower that long (ADR-0031, amendment).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -350,13 +351,17 @@ pub(super) async fn check_promote(
 }
 
 /// Checks a `Snapshot` that `caller` asks this node for, of `database` at `epoch`: this node
-/// serves the database at `epoch`, and streams it to the caller, under its current ring or the
-/// one before it.
+/// serves the database at `epoch`, and the caller is a follower it streams the database to
+/// under its current ring, or a replica control state places the database on now, which a
+/// primary that hasn't published the newest ring yet will stream to next.
+///
+/// The ring before the current one doesn't count here, unlike for a stream's receiver: it stays
+/// in the view until the next membership change, so a node it named would stay a follower long
+/// after the change it was kept for, and could read the database whole.
 ///
 /// A node that doesn't serve the database at `epoch` refuses too, since nobody is its follower
-/// there, unless the caller is a replica, as control state or this node's rings say: then the
-/// snapshot is refused as stale, as before, because a legitimate follower may ask a primary that
-/// has just stepped down.
+/// there; a replica, by this node's ring or control state, is told so as a stale request, as
+/// before, since a legitimate follower may ask a primary that has just stepped down.
 ///
 /// # Errors
 ///
@@ -368,42 +373,54 @@ pub(super) async fn check_snapshot(
     epoch: u64,
     caller: &NodeId,
 ) -> Result<(), Status> {
-    let not_follower = || {
-        BindingDenied::new(
-            "Snapshot",
-            caller.clone(),
-            Unbound::NotFollower {
-                database: database.clone(),
-            },
-        )
-    };
-    let view = inner.membership.view();
-    let previous = view.previous_ring().map(|ring| &**ring);
-    if let Some(primary) = inner.primary(database) {
-        let role = primary.role();
-        if role.epoch.get() == epoch {
-            let followers = inner.followers_of(&primary).followers;
-            let streamed = followers.contains(caller)
-                || replicas_of(
-                    &MembershipView::default(),
-                    previous,
-                    database,
-                    role.replication_factor,
-                )
-                .contains(caller);
-            if streamed && *caller != inner.node {
-                return Ok(());
-            }
-            return Err(refuse(inner, Some(database), not_follower()));
-        }
+    if *caller == inner.node {
+        return Err(refuse(
+            inner,
+            Some(database),
+            not_follower(database, caller),
+        ));
+    }
+    let served = inner
+        .primary(database)
+        .filter(|primary| primary.role().epoch.get() == epoch);
+    if let Some(primary) = &served
+        && inner.followers_of(primary).followers.contains(caller)
+    {
+        return Ok(());
     }
     let holders = inner.authority.holders(database).await?;
-    let mut replicas = replicas_of(&view, previous, database, holders.replication_factor);
-    replicas.extend(holders.replicas);
-    if replicas.contains(caller) && *caller != inner.node {
-        return Err(Status::failed_precondition(format!(
-            "{database} has no primary at epoch {epoch} on this node"
-        )));
+    let placed = holders.replicas.contains(caller);
+    match served {
+        Some(_) if placed => Ok(()),
+        Some(_) => Err(refuse(
+            inner,
+            Some(database),
+            not_follower(database, caller),
+        )),
+        None => {
+            let view = inner.membership.view();
+            let ringed = replicas_of(&view, None, database, holders.replication_factor);
+            if placed || ringed.contains(caller) {
+                Err(Status::failed_precondition(format!(
+                    "{database} has no primary at epoch {epoch} on this node"
+                )))
+            } else {
+                Err(refuse(
+                    inner,
+                    Some(database),
+                    not_follower(database, caller),
+                ))
+            }
+        }
     }
-    Err(refuse(inner, Some(database), not_follower()))
+}
+
+fn not_follower(database: &DatabaseName, caller: &NodeId) -> BindingDenied {
+    BindingDenied::new(
+        "Snapshot",
+        caller.clone(),
+        Unbound::NotFollower {
+            database: database.clone(),
+        },
+    )
 }
