@@ -1,14 +1,24 @@
 # CI for the FleetRing workspace (ADR-0009). The cross-target jobs exist because placement must
 # be bit-identical on big-endian, 32-bit, and wasm targets as well as the three major OSes
 # (ADR-0008).
+#
+# Pull requests, merge groups, and manual runs run every job. A push to `main` runs only `cache`,
+# at the end of this file. The `main` ruleset merges a pull request only once every required
+# check has passed on a branch that is up to date with `main`, and merges by rebase, so the tree a
+# merge puts on `main` is the tree that pull request's CI already tested. Running the matrix again
+# on `main` would test the same tree twice. What `main` must still do is save the build cache that
+# new pull requests restore from.
 name: CI
 
 on:
   pull_request:
   # Runs for GitHub's merge queue, if it is turned on for `main`.
   merge_group:
+  # Runs only `cache`; every other job checks `github.event_name != 'push'`.
   push:
     branches: [main]
+  # Runs everything. Run it on `main` after a toolchain or Cargo.lock change to refresh every
+  # job's cache there, not only the one `cache` keeps warm.
   workflow_dispatch:
 
 permissions:
@@ -26,6 +36,7 @@ env:
 jobs:
   fmt:
     name: fmt
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -38,6 +49,7 @@ jobs:
 
   clippy:
     name: clippy
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -51,6 +63,7 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
@@ -95,6 +108,7 @@ jobs:
   # covered above: `macos-latest` is an Apple Silicon runner.
   test-arm64:
     name: test (ubuntu-24.04-arm)
+    if: github.event_name != 'push'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -112,6 +126,7 @@ jobs:
 
   statistics:
     name: statistical suite (release)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -127,6 +142,7 @@ jobs:
   # The test jobs above run the same tests without it, comparing event order only.
   simulation:
     name: simulation (fixed seeds)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -141,6 +157,7 @@ jobs:
 
   msrv:
     name: msrv (1.88)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -158,6 +175,7 @@ jobs:
 
   docs:
     name: docs
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -172,6 +190,7 @@ jobs:
 
   i686:
     name: test (i686, 32-bit)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -188,6 +207,7 @@ jobs:
   # still catch overflow, and every property runs at full strength there.
   s390x:
     name: test (s390x, big-endian)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -210,6 +230,7 @@ jobs:
 
   wasm:
     name: test (wasm32-wasip1)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -232,6 +253,7 @@ jobs:
   # vector, which shows the spec, not just the Rust crate, defines placement (FR-014).
   spec-reference:
     name: spec reference (Python)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -246,6 +268,7 @@ jobs:
   # ship without the version bump it needs (FR-019).
   semver:
     name: semver-checks
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -260,6 +283,7 @@ jobs:
 
   deny:
     name: cargo-deny
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -268,3 +292,33 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  # The only job a push to `main` runs (see the top of this file). A pull request can restore
+  # caches saved on its base branch, and Swatinem/rust-cache saves only when no cache has its
+  # exact key, so the caches saved on `main` are what every new pull request starts from.
+  #
+  # rust-cache's key is `v0-rust`, then `shared-key` or else the job ID, then the runner's OS and
+  # architecture, then a hash of `rustc -vV` and every CARGO*, RUST*, CC*, CFLAGS*, CXX*, and
+  # CMAKE* environment variable, then a hash of Cargo.lock and the manifests. With
+  # `shared-key: test`, this job's key is the one the `ubuntu-latest` leg of `test` uses, whose
+  # job ID is `test`; keep its toolchain and environment equal to that leg's, or the keys part.
+  # It builds the four feature and profile combinations that leg runs, without running them, so
+  # the cache holds the same dependencies. The other jobs' caches on `main` aren't refreshed by
+  # pushes; a manual run on `main` refreshes them.
+  cache:
+    name: cache (main)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test
+      - run: cargo test --workspace --all-features --no-run
+      - run: cargo test --workspace --no-run
+      - run: cargo test --workspace --no-default-features --no-run
+      - run: cargo test --workspace --all-features --release --no-run

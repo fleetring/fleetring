@@ -39,6 +39,7 @@ For workflow changes, run [`actionlint`](https://github.com/rhysd/actionlint) to
   - **Push once** when the branch is ready, not after every commit: each push runs the full matrix.
 - **Update an out-of-date branch with "Update with rebase"** (the arrow beside the button), never the default "Update branch", which adds a merge commit. Or rebase locally onto `origin/main` and force-push with `--force-with-lease`.
 - **Each commit stands on its own:** it builds, passes tests, and has its own Conventional Commit message, since it lands on `main` unchanged.
+- **`main` runs only the job that keeps the build cache warm.** Pull requests and merge groups run every check; a push to `main` doesn't run them again, because the tree a merge lands is the tree its pull request's CI already tested. The comment at the top of `.github/workflows/ci.yml` explains it. After a Rust toolchain or `Cargo.lock` change, run CI by hand on `main` (Actions → CI → Run workflow) to refresh every job's cache.
 
 ## When CI fails
 
