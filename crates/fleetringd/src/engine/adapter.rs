@@ -1,5 +1,6 @@
 //! The `DatabaseEngine` trait and its replication capabilities (ADR-0016).
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
@@ -74,6 +75,13 @@ pub trait Database: fmt::Debug + Send {
     /// The database's row-change recorder, if its engine supports logical change streams
     /// ([`DatabaseEngine::logical_support`]). The default is `None`.
     fn logical_changes(&mut self) -> Option<&mut dyn LogicalChanges> {
+        None
+    }
+
+    /// The database's recorder of sink marks, if its engine can keep them inside the database
+    /// (ADR-0028). The default is `None`: the engine's change streams then keep their positions
+    /// on this node only.
+    fn sink_marks(&mut self) -> Option<&mut dyn SinkMarks> {
         None
     }
 
@@ -354,6 +362,25 @@ pub trait LogicalChanges: fmt::Debug + Send {
     ///
     /// [`EngineError::Storage`] if the engine can't record the release.
     fn release(&mut self, before: &Position) -> Result<(), EngineError>;
+}
+
+/// Delivered positions of change sinks, kept inside the database so that they replicate,
+/// fence, and survive with it (ADR-0028).
+///
+/// A mark is staged after its sink has taken a batch, and recorded by the next write
+/// transaction, before the transaction's own statements; the engine never starts a
+/// transaction just to record one.
+pub trait SinkMarks: fmt::Debug + Send {
+    /// Every recorded mark, by sink name, as this copy holds them.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if the marks can't be read.
+    fn marks(&mut self) -> Result<BTreeMap<String, Position>, EngineError>;
+
+    /// Stages `delivered` as `sink`'s mark, replacing any mark staged for it before. The next
+    /// write transaction records it; one that rolls back leaves it staged.
+    fn stage(&mut self, sink: &str, delivered: &Position);
 }
 
 /// The operations on an open database whose engine replicates itself.
