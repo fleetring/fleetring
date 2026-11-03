@@ -38,7 +38,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
 | M7 Durability and operations | FR-035 – FR-038 | Configurable durability per database, and a history checker for every simulation run |
 | M8 Access and integration | FR-039 – FR-043 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
-| M9 Durability sinks and verification | FR-044, FR-045 | A hash-chained log and Merkle anti-entropy, so replicas and archives can prove what they hold |
+| M9 Durability sinks and verification | FR-044, FR-045, FR-049 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
 | M10 Security | FR-046 – FR-048 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases |
 
 ## Index
@@ -93,6 +93,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | done |
 | [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | in-progress |
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | in-progress |
+| [FR-049](FR-049-s3-durability-sink.md) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
 
 ## Dependency graph
 
@@ -171,6 +172,10 @@ flowchart LR
   FR046 --> FR047[FR-047 principals and scopes]
   FR034 --> FR048[FR-048 threat model and signed releases]
   FR047 --> FR048
+  FR039 --> FR049[FR-049 S3 durability sink]
+  FR041 --> FR049
+  FR044 --> FR049
+  FR047 --> FR049
 ```
 
 ## Critical path and estimate
@@ -195,7 +200,6 @@ For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-
 - **Turso MVCC adapter**, for concurrent writers within one database. MVCC lifts SQLite's one-write-transaction-at-a-time limit inside a node; it doesn't change FleetRing's one writer *node* per database, which leases and epochs keep (ADR-0013, point 5; ADR-0018).
 - **Postgres adapter**, self-replicating through streaming replication. `fleetringd` only places, leases, and fences.
 - **TLS between nodes** through rustls, deferred from FR-023, with a certificate story (generated per cluster, or supplied).
-- **Durability sinks:** S3 snapshots and log archiving for point-in-time restore, as a trait separate from replicas (MVP step 5).
 - **Engine-changing migrations**, such as SQLite to Postgres behind an `upgrade` command (ADR-0021), after live migration (MVP step 3).
 
 **Placement crate.**
