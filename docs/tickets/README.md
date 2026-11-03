@@ -37,10 +37,11 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M5 Daemon foundations | FR-022 – FR-029 | `fleetringd` crates, transport, simulation harness, WAL library, database actors, control plane, and membership |
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
 | M7 Durability and operations | FR-035 – FR-038, FR-051, FR-054 | Configurable durability per database, and a history checker for every simulation run |
-| M8 Access and integration | FR-039 – FR-043 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
+| M8 Access and integration | FR-039 – FR-043, FR-061 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
 | M9 Durability sinks and verification | FR-044, FR-045, FR-049, FR-052, FR-053 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
 | M10 Security | FR-046 – FR-048, FR-050, FR-055 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases, and node calls bound to placement |
-| M11 Operator experience | FR-056 – FR-059 | One vocabulary (fleet, not cluster), CLI contexts with stable JSON output, a k9s-style TUI, and a desktop viewer, all over one client crate |
+| M11 Operator experience | FR-056 – FR-059, FR-062 | One vocabulary (fleet, not cluster, and one word per thing), CLI contexts with stable JSON output, a k9s-style TUI, and a desktop viewer, all over one client crate |
+| M12 Distribution | FR-060 | Native packages: `.deb` and `.rpm` from the release workflow, the AUR, and a Homebrew tap, each traceable to a signed release |
 
 ## Index
 
@@ -105,6 +106,9 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-057](FR-057-tui.md) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
 | [FR-058](FR-058-desktop-app.md) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
 | [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, keeping the old spellings as deprecated aliases | P1 | M | FR-047 | todo |
+| [FR-060](FR-060-distribution-packages.md) | Distribution packages for apt, yum, the AUR, and Homebrew | P2 | L | FR-034, FR-048 | todo |
+| [FR-061](FR-061-rails-integration.md) | A `fleetring` Ruby gem and an ActiveRecord adapter that place each tenant's database | P2 | L | FR-047, the router (no ticket yet) | todo |
+| [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | todo |
 
 ## Dependency graph
 
@@ -197,6 +201,10 @@ flowchart LR
   FR056 --> FR057[FR-057 TUI]
   FR042 --> FR057
   FR056 --> FR058[FR-058 desktop app]
+  FR034 --> FR060[FR-060 distribution packages]
+  FR048 --> FR060
+  FR047 --> FR061[FR-061 Rails integration]
+  FR059 --> FR062[FR-062 one word per thing]
 ```
 
 ## Critical path and estimate
