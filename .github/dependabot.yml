@@ -5,5 +5,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # One weekly PR for every action bump, so CI runs once per week, not once per action.
+    groups:
+      actions:
+        patterns: ["*"]
     commit-message:
       prefix: "ci"
