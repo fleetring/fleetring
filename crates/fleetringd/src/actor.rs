@@ -2,7 +2,7 @@
 //!
 //! The actor serializes writes, sends reads to the engine's read path, and turns each committed
 //! write transaction of a frame-source engine into exactly one batch for the
-//! [`ReplicationSink`]. It closes the database when it has been idle for the configured time, or
+//! [`BatchPublisher`]. It closes the database when it has been idle for the configured time, or
 //! when the registry evicts it. A database that logical change streams read also records its row
 //! changes from the moment it opens (FR-039).
 
@@ -19,12 +19,12 @@ use tokio::time;
 
 use self::executor::{Executor, OpenRequest};
 use crate::engine::{
-    CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineError,
-    Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode, PinnedSnapshot,
-    Position, ReplicaPosition, RowChange, Rows, Shape, Snapshot, Statement, Transaction,
+    CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot,
+    EngineError, Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode,
+    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Shape, Statement, Transaction,
 };
-use crate::sink::{
-    Acknowledged, Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink,
+use crate::publisher::{
+    Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
 };
 
 type Reply<T> = oneshot::Sender<Result<T, DatabaseError>>;
@@ -40,7 +40,7 @@ pub(crate) enum Request {
     RowChanges(Option<Position>, Position, Reply<Vec<RowChange>>),
     ReleaseChanges(Position, Reply<()>),
     Checkpoint(Reply<CheckpointMarker>),
-    Snapshot(PathBuf, Reply<Snapshot>),
+    Snapshot(PathBuf, Reply<DatabaseSnapshot>),
     PinSnapshot(Reply<PinnedSnapshot>),
     ReplicaPositions(Reply<Vec<ReplicaPosition>>),
 }
@@ -330,7 +330,7 @@ impl DatabaseHandle {
     pub async fn snapshot(
         &self,
         destination: impl Into<PathBuf>,
-    ) -> Result<Snapshot, DatabaseError> {
+    ) -> Result<DatabaseSnapshot, DatabaseError> {
         let destination = destination.into();
         self.call(|reply| Request::Snapshot(destination, reply))
             .await
@@ -423,7 +423,7 @@ impl DatabaseHandle {
 pub(crate) struct ActorConfig {
     pub(crate) name: DatabaseName,
     pub(crate) engine: Arc<dyn DatabaseEngine>,
-    pub(crate) sink: Arc<dyn ReplicationSink>,
+    pub(crate) publisher: Arc<dyn BatchPublisher>,
     pub(crate) location: PathBuf,
     pub(crate) mode: OpenMode,
     pub(crate) execution: Execution,
@@ -486,7 +486,7 @@ async fn run(
     let ActorConfig {
         name,
         engine,
-        sink,
+        publisher,
         location,
         mode,
         execution,
@@ -521,7 +521,7 @@ async fn run(
     let mut actor = Actor {
         name,
         executor,
-        sink,
+        publisher,
         last: None,
         failed: None,
     };
@@ -543,7 +543,7 @@ async fn run(
 struct Actor {
     name: DatabaseName,
     executor: Executor,
-    sink: Arc<dyn ReplicationSink>,
+    publisher: Arc<dyn BatchPublisher>,
     /// The end of the last batch captured, for a frame source.
     last: Option<Position>,
     /// Why the database stopped taking writes, if it has.
@@ -708,7 +708,7 @@ impl Actor {
             });
         }
         // Refused here, nothing runs: the engine never sees the transaction.
-        self.sink
+        self.publisher
             .admit(&self.name)
             .map_err(|source| DatabaseError::Refused {
                 name: self.name.clone(),
@@ -743,7 +743,7 @@ impl Actor {
             None | Some(Ok(None)) => None,
             Some(Ok(Some(batch))) => {
                 self.last = Some(batch.end.clone());
-                Some(self.sink.publish(CommittedBatch {
+                Some(self.publisher.publish(CommittedBatch {
                     database: self.name.clone(),
                     batch,
                 }))

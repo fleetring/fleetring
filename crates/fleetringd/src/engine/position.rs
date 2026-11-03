@@ -149,7 +149,7 @@ pub struct CheckpointMarker {
 
 /// A consistent copy of a database, and where its log continues.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Snapshot {
+pub struct DatabaseSnapshot {
     /// The log position the copy holds everything up to, or `None` for an empty log.
     pub position: Option<Position>,
 }

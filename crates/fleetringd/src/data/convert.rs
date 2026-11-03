@@ -323,7 +323,7 @@ pub(crate) fn revocations_from_proto(revocations: Vec<proto::Revocation>) -> Rev
 }
 
 /// The first message of a `WatchLeases` stream: every lease `node` holds, in name order.
-pub(crate) fn lease_snapshot_to_proto(
+pub(crate) fn held_leases_to_proto(
     node: &NodeId,
     held: &BTreeMap<DatabaseName, LeaseEpoch>,
 ) -> proto::LeaseUpdate {
@@ -335,7 +335,7 @@ pub(crate) fn lease_snapshot_to_proto(
         })
         .collect();
     proto::LeaseUpdate {
-        update: Some(Update::Snapshot(proto::LeaseSnapshot {
+        update: Some(Update::Held(proto::HeldLeases {
             node_id: node.to_string(),
             leases,
         })),
@@ -360,7 +360,7 @@ pub(crate) fn lease_event_to_proto(event: &LeaseEvent) -> proto::LeaseUpdate {
 /// unknown kind of event.
 pub(crate) fn lease_update_from_proto(update: proto::LeaseUpdate) -> Result<LeaseUpdate, Status> {
     match update.update {
-        Some(Update::Snapshot(snapshot)) => {
+        Some(Update::Held(snapshot)) => {
             let leases = snapshot
                 .leases
                 .into_iter()
@@ -369,7 +369,7 @@ pub(crate) fn lease_update_from_proto(update: proto::LeaseUpdate) -> Result<Leas
                     Ok((database, LeaseEpoch::new(lease.epoch)))
                 })
                 .collect::<Result<BTreeMap<_, _>, Status>>()?;
-            Ok(LeaseUpdate::Snapshot {
+            Ok(LeaseUpdate::Held {
                 node: parse_reply("node id", &snapshot.node_id)?,
                 leases,
             })
@@ -406,9 +406,9 @@ mod tests {
         let node: NodeId = "a".parse().expect("id");
         let database: DatabaseName = "db".parse().expect("name");
         let held = BTreeMap::from([(database.clone(), LeaseEpoch::new(3))]);
-        let snapshot = lease_update_from_proto(lease_snapshot_to_proto(&node, &held))
-            .expect("a valid snapshot");
-        assert_eq!(snapshot, LeaseUpdate::Snapshot { node, leases: held });
+        let snapshot =
+            lease_update_from_proto(held_leases_to_proto(&node, &held)).expect("a valid snapshot");
+        assert_eq!(snapshot, LeaseUpdate::Held { node, leases: held });
         let event = LeaseEvent::new(database, LeaseEpoch::new(4), LeaseChange::Lost);
         assert_eq!(
             lease_update_from_proto(lease_event_to_proto(&event)).expect("a valid event"),

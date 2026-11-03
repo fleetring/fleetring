@@ -76,7 +76,7 @@ Each database chooses its durability when it is created (ADR-0023). `--acks quor
 
 **Change streams.** A `[[changes.sink]]` entry in a data node's configuration sends every acknowledged batch of the databases it names to a sink: a `file` sink appends one JSON line per batch to a file per database, and a `webhook` sink POSTs each batch as JSON. `format = "logical"` (the default) sends the rows each transaction inserted, updated, or deleted; `format = "physical"` sends the opaque batch for a mirror or an archive. A logical sink's `capture` says how much of each row it gets: `id` the key alone, `after` (the default) the key and the new values of inserted and updated rows, `full` also the old values of updated and deleted rows and the names of the updated columns; a database named by several sinks records in the strongest mode asked for. `databases` lists exact names or prefixes ending in `*`, such as `["tenant:*", "ledger"]`. Sinks run beside replication and only see batches the write quorum holds, so a slow or failing sink never delays a write; delivery is at least once, in commit order, resuming from a position kept under `<data_dir>/changes/`, and `status --node` (or `--address`) shows each sink's position and backlog. Row changes are recorded inside the database, in a table named `_fleetring_cdc` that replicates with the data so a promoted follower continues the stream; names beginning with `_fleetring_` are reserved, and `db exec` and `db query` refuse statements that touch them. Schema changes aren't streamed.
 
-**Following leases.** `fleetringd lease watch --node <id>` (or `--address <host:port>`) follows the leases one data node holds, from the node's own view: it prints `held <database> epoch <n>` for each database the node serves when the stream opens, then `gained <database> epoch <n>` and `lost <database> epoch <n>` lines as leases move, until the stream ends. The node reports a lease before it acknowledges a write under that epoch, and reports its loss before it stops answering for the database, so a worker beside the node (a queue consumer, a scheduler, a cache warmer) can act on exactly the databases the node is primary for and stop the moment one moves, without polling. Events for a database arrive in epoch order; a subscriber that falls behind is cut off with `RESOURCE_EXHAUSTED` and opens the stream again for a fresh snapshot. The stream is one node's; a client that wants every node subscribes to each.
+**Following leases.** `fleetringd lease watch --node <id>` (or `--address <host:port>`) follows the leases one data node holds, from the node's own view: it prints `held <database> epoch <n>` for each database the node serves when the stream opens, then `gained <database> epoch <n>` and `lost <database> epoch <n>` lines as leases move, until the stream ends. The node reports a lease before it acknowledges a write under that epoch, and reports its loss before it stops answering for the database, so a worker beside the node (a queue consumer, a scheduler, a cache warmer) can act on exactly the databases the node is primary for and stop the moment one moves, without polling. Events for a database arrive in epoch order; a subscriber that falls behind is cut off with `RESOURCE_EXHAUSTED` and opens the stream again, which starts with the leases held then. The stream is one node's; a client that wants every node subscribes to each.
 
 **Verifying replicas.** Every replica keeps a hash chain over the replication log: one BLAKE3 hash per transaction, each folding in the hash before it, so the hash at a position commits every byte of the log before it. The primary computes each batch's hash as it ships the batch, and a follower recomputes it before applying the batch; one that doesn't match is refused, and the follower re-seeds from a snapshot rather than apply a log that isn't the primary's. `fleetringd db verify <database>` asks every replica for its hash at the latest position they all hold, each recomputed from the replica's log on disk, and prints the one hash and `all 3 replicas agree`, or names the first replica whose hash differs or whose log can no longer be read back to that position. `--at <position>` picks a position `db locate` printed instead, and `--expect <hash>` reports `nothing changed since <position>` when the log still hashes to a hash recorded earlier. The chain covers the log, not pages already checkpointed into the database file (FR-045), and proves consistency, not provenance: it isn't signed.
 
@@ -112,11 +112,11 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Control.Join` | node | self |
 | `Control.Heartbeat` | node | self |
 | `Control.WatchMembership` | fleet | — |
-| `Control.CreateDatabase` | admin on the key | — |
-| `Control.DropDatabase` | admin on the key | — |
-| `Control.ChangeDurability` | admin on the key | — |
-| `Control.Locate` | read on the key, or fleet | — |
-| `Control.ListDatabases` | read per key listed, or fleet | — |
+| `Control.CreateDatabase` | admin on the database | — |
+| `Control.DropDatabase` | admin on the database | — |
+| `Control.ChangeDurability` | admin on the database | — |
+| `Control.Locate` | read on the database, or fleet | — |
+| `Control.ListDatabases` | read per database listed, or fleet | — |
 | `Control.AcquireLease` | node | self |
 | `Control.RenewLease` | node | self |
 | `Control.Leave` | fleet | self |
@@ -124,19 +124,19 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Control.RecordFenced` | node | candidate |
 | `Control.CompletePromotion` | node | candidate |
 | `Control.Drain` | fleet | self |
-| `Control.TransferLease` | admin on the key | holder |
+| `Control.TransferLease` | admin on the database | holder |
 | `Control.RevokeToken` | fleet | — |
 | `Replication.Replicate` | node | holder or candidate |
 | `Replication.Fence` | node | candidate |
 | `Replication.Snapshot` | node | follower |
 | `Replication.Fetch` | node | candidate |
 | `Replication.Promote` | node | candidate |
-| `Database.Execute` | write on the key | — |
-| `Database.Query` | read on the key | — |
-| `Database.Create` | admin on the key | — |
-| `Database.NodeStatus` | read or stream per key listed, or fleet | — |
-| `Database.WatchLeases` | read per key listed, or fleet | — |
-| `Database.Verify` | read on the key, or fleet | — |
+| `Database.Execute` | write on the database | — |
+| `Database.Query` | read on the database | — |
+| `Database.Create` | admin on the database | — |
+| `Database.NodeStatus` | read or stream per database listed, or fleet | — |
+| `Database.WatchLeases` | read per database listed, or fleet | — |
+| `Database.Verify` | read on the database, or fleet | — |
 
 ## Install
 

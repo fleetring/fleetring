@@ -71,20 +71,20 @@ service Control {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   // Scope: fleet.
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
-  // Scope: admin on the key.
+  // Scope: admin on the database.
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   // Removes a database for good: its record, lease, and any promotion. Its replicas close and
   // delete their copies once they learn of it; `Locate` answers NOT_FOUND from then on.
-  // Scope: admin on the key.
+  // Scope: admin on the database.
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
   // Records new durability settings for a database, which take effect at its next lease
   // (ADR-0023).
-  // Scope: admin on the key.
+  // Scope: admin on the database.
   rpc ChangeDurability(ChangeDurabilityRequest) returns (ChangeDurabilityResponse);
-  // Scope: read on the key, or fleet.
+  // Scope: read on the database, or fleet.
   rpc Locate(LocateRequest) returns (LocateResponse);
   // Every database's placement, in name order.
-  // Scope: read per key listed, or fleet.
+  // Scope: read per database listed, or fleet.
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   // Scope: node.
   // Binding: self.
@@ -117,7 +117,7 @@ service Control {
   // Hands a database's lease from its draining holder to a follower without waiting for the
   // lease to expire: starts a promotion at the next epoch whose candidate is the named target,
   // or the most advanced live follower. The candidate completes it as after an expiry.
-  // Scope: admin on the key.
+  // Scope: admin on the database.
   // Binding: holder.
   rpc TransferLease(TransferLeaseRequest) returns (PromotionResponse);
   // Adds a bearer token, or every token a signing key issued, to the denylist every node checks
@@ -503,44 +503,44 @@ message SnapshotChunk {
 // Every data node serves it. A node that doesn't hold a database's lease answers UNAVAILABLE and
 // names the primary as `host:port` in the `fleetring-primary` metadata entry.
 service Database {
-  // Scope: write on the key.
+  // Scope: write on the database.
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
-  // Scope: read on the key.
+  // Scope: read on the database.
   rpc Query(QueryRequest) returns (QueryResponse);
   // Makes the receiving node the primary of a database the control plane has created but not
   // leased yet: it takes the first lease and creates the database. Repeating it on the primary
   // is harmless.
-  // Scope: admin on the key.
+  // Scope: admin on the database.
   rpc Create(CreateRequest) returns (CreateResponse);
   // What this node knows on its own, without asking the control plane: its membership epoch and
   // ring fingerprint, and the databases it serves with their roles.
-  // Scope: read or stream per key listed, or fleet.
+  // Scope: read or stream per database listed, or fleet.
   rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
-  // The leases this node holds, as the node itself sees them (FR-042): first a snapshot of every
-  // database it serves with its epoch, then one event per lease gained or lost, in the order the
+  // The leases this node holds, as the node itself sees them (FR-042): first every database it
+  // serves with its epoch (`HeldLeases`), then one event per lease gained or lost, in the order the
   // node records them. A lease is gained before the node acknowledges a write under its epoch,
   // and lost before the node stops answering for the database. A subscriber that falls behind
-  // gets RESOURCE_EXHAUSTED and opens the stream again for a fresh snapshot.
-  // Scope: read per key listed, or fleet.
+  // gets RESOURCE_EXHAUSTED and opens the stream again, which starts with the leases held then.
+  // Scope: read per database listed, or fleet.
   rpc WatchLeases(WatchLeasesRequest) returns (stream LeaseUpdate);
   // This node's hash chain over a database's replication log at a position (FR-044), read back
   // from its copy, so that an operator can compare every replica's. Any replica answers.
-  // Scope: read on the key, or fleet.
+  // Scope: read on the database, or fleet.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 
 message WatchLeasesRequest {}
 
-// One message of a `WatchLeases` stream: the snapshot it starts with, or a change since.
+// One message of a `WatchLeases` stream: the leases held when it opens, or a change since.
 message LeaseUpdate {
   oneof update {
-    LeaseSnapshot snapshot = 1;
+    HeldLeases held = 1;
     LeaseEvent event = 2;
   }
 }
 
 // Every lease the node holds when the stream opens, in database name order.
-message LeaseSnapshot {
+message HeldLeases {
   string node_id = 1;
   repeated HeldLease leases = 2;
 }

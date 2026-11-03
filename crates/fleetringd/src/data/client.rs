@@ -214,7 +214,7 @@ pub struct DurabilityChange {
 #[non_exhaustive]
 pub enum LeaseUpdate {
     /// The first message: every lease the node held when the stream opened.
-    Snapshot {
+    Held {
         /// The node that answers.
         node: NodeId,
         /// The databases it serves as primary, each with its epoch.
@@ -236,7 +236,7 @@ impl LeaseUpdates {
     /// # Errors
     ///
     /// `RESOURCE_EXHAUSTED` if this subscriber fell too far behind, after which the stream is
-    /// over and a new one starts from a fresh snapshot; `UNAVAILABLE` if the node went away;
+    /// over and a new one starts from the leases held then; `UNAVAILABLE` if the node went away;
     /// and `INTERNAL` if an update is invalid.
     pub async fn next(&mut self) -> Result<Option<LeaseUpdate>, Status> {
         self.inner
@@ -531,8 +531,8 @@ impl Client {
         node_status(response)
     }
 
-    /// Follows the leases the data node at `address` (`host:port`) holds: the first update is a
-    /// snapshot of every database it serves with its epoch, and each later one a lease it gained
+    /// Follows the leases the data node at `address` (`host:port`) holds: the first update holds
+    /// every database it serves with its epoch, and each later one a lease it gained
     /// or lost, in the order the node records them (FR-042). The node reports a gained lease
     /// before it acknowledges a write under that epoch, and a lost one before it stops answering
     /// for the database.

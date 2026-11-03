@@ -6,7 +6,7 @@ use fleetring::NodeId;
 use fleetringd::engine::{
     EngineConfig, MemoryEngine, Position, ReplicaPosition, Statement, Transaction, Value,
 };
-use fleetringd::{DatabaseError, RecordingSink, Registry};
+use fleetringd::{DatabaseError, RecordingPublisher, Registry};
 
 use crate::common::{TestResult, name};
 
@@ -16,9 +16,9 @@ fn node(id: &str) -> NodeId {
 
 #[tokio::test]
 async fn a_self_replicating_engine_reports_replicas_and_publishes_no_batches() -> TestResult {
-    let sink = RecordingSink::new();
+    let publisher = RecordingPublisher::new();
     let engine = MemoryEngine::with_replicas([node("n1"), node("n2")]);
-    let registry = Registry::new(engine, sink.clone(), "unused", EngineConfig::default());
+    let registry = Registry::new(engine, publisher.clone(), "unused", EngineConfig::default());
     let db = name("tenant");
     let handle = registry.create(&db).await?;
     assert_eq!(handle.position().await?, None);
@@ -45,7 +45,10 @@ async fn a_self_replicating_engine_reports_replicas_and_publishes_no_batches() -
             },
         ]
     );
-    assert!(sink.batches().is_empty(), "the engine replicates itself");
+    assert!(
+        publisher.batches().is_empty(),
+        "the engine replicates itself"
+    );
 
     let unsupported = handle
         .checkpoint()
@@ -67,7 +70,7 @@ async fn snapshots_copy_the_state_and_its_position() -> TestResult {
         idle_timeout: Duration::from_secs(60),
         ..EngineConfig::default()
     };
-    let registry = Registry::new(engine, RecordingSink::new(), "root", config);
+    let registry = Registry::new(engine, RecordingPublisher::new(), "root", config);
     let db = name("source");
     let handle = registry.create(&db).await?;
     handle

@@ -36,7 +36,7 @@
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
 //! - **Lease watching:** `WatchLeases` streams the leases one node holds, from the node's own
-//!   view (FR-042): a snapshot, then a `Gained` or `Lost` event per change, each with its epoch.
+//!   view (FR-042): the leases held, then a `Gained` or `Lost` event per change, each with its epoch.
 //!   A worker beside the node acts on the databases the node is primary for and stops when a
 //!   lease moves, without polling the control plane. [`Client::watch_leases`] opens the stream,
 //!   and `fleetringd lease watch` prints it.

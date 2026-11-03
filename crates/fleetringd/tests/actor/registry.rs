@@ -7,15 +7,15 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use fleetringd::engine::{EngineConfig, Execution, SqliteEngine, Statement, Transaction, Value};
-use fleetringd::{Acknowledgement, CommittedBatch, Config, Registry, ReplicationSink};
+use fleetringd::{Acknowledgement, BatchPublisher, CommittedBatch, Config, Registry};
 
 use crate::common::{PAGE_SIZE, TestResult, config, name};
 
 /// Counts batches without keeping them.
 #[derive(Debug, Clone, Default)]
-struct CountingSink(Arc<AtomicUsize>);
+struct CountingPublisher(Arc<AtomicUsize>);
 
-impl ReplicationSink for CountingSink {
+impl BatchPublisher for CountingPublisher {
     fn publish(&self, _batch: CommittedBatch) -> Acknowledgement {
         self.0.fetch_add(1, Ordering::Relaxed);
         Acknowledgement::done()
@@ -40,10 +40,10 @@ async fn one_registry_creates_and_writes_many_more_databases_than_it_keeps_open(
 async fn fill(databases: usize, cap: usize) -> TestResult {
     const WORKERS: usize = 64;
     let dir = tempfile::tempdir()?;
-    let sink = CountingSink::default();
+    let publisher = CountingPublisher::default();
     let registry = Registry::new(
         SqliteEngine::new(PAGE_SIZE)?,
-        sink.clone(),
+        publisher.clone(),
         dir.path().join("databases"),
         config(Execution::Threads, cap, Duration::from_secs(3600)),
     );
@@ -82,7 +82,7 @@ async fn fill(databases: usize, cap: usize) -> TestResult {
     }
     let elapsed = started.elapsed();
     assert_eq!(
-        sink.0.load(Ordering::Relaxed),
+        publisher.0.load(Ordering::Relaxed),
         databases,
         "one batch per database"
     );

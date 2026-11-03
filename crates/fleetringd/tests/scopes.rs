@@ -325,7 +325,7 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
     let mut leases = app.watch_leases(&data_target).await?;
     assert!(matches!(
         leases.next().await?,
-        Some(LeaseUpdate::Snapshot { .. })
+        Some(LeaseUpdate::Held { .. })
     ));
 
     // A revoked token is refused by the control node at once, and by the data-only node within
@@ -523,11 +523,11 @@ async fn data_node_calls_are_scoped(tls: &Tls, control: &str, data: &str) -> Tes
     let admin = Client::new(control.to_owned(), network(tls, "tester")?);
     let reader = Client::new(control.to_owned(), network(tls, "reader")?);
 
-    // Leases: the snapshot lists only what the caller may read.
+    // Leases: the held leases list only what the caller may read.
     let held = |client: Client| async move {
         let mut updates = client.watch_leases(data).await?;
         match updates.next().await? {
-            Some(LeaseUpdate::Snapshot { leases, .. }) => {
+            Some(LeaseUpdate::Held { leases, .. }) => {
                 Ok::<_, Box<dyn Error>>(leases.keys().map(ToString::to_string).collect::<Vec<_>>())
             }
             other => Err(format!("expected a snapshot, got {other:?}").into()),

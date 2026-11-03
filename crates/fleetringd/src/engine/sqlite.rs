@@ -46,9 +46,9 @@ use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX};
 use self::pins::Pins;
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
-    EngineCapability, EngineError, EngineKind, Executed, FrameBatch, FrameFollower, FrameSource,
-    FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode, PinnedSnapshot, Position,
-    RowChange, Rows, Snapshot, SnapshotFile, Statement, Transaction, Value,
+    DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
+    FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode,
+    PinnedSnapshot, Position, RowChange, Rows, SnapshotFile, Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -453,7 +453,7 @@ impl Database for SqliteDatabase {
         Ok(Rows { columns, rows: out })
     }
 
-    fn snapshot(&mut self, destination: &Path) -> Result<Snapshot, EngineError> {
+    fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {
         // Writes and checkpoints run only on this database's thread, so between calls the
         // database file is stable and the WAL's committed prefix is complete.
         let position = self.read_wal(None)?.map(|batch| batch.end());
@@ -473,7 +473,7 @@ impl Database for SqliteDatabase {
             copy_prefix(&marker, &checkpoint_path(&target), None).map_err(storage)?;
         }
         sync_dir(destination).map_err(storage)?;
-        Ok(Snapshot {
+        Ok(DatabaseSnapshot {
             position: position.map(encode_position),
         })
     }

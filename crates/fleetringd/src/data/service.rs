@@ -9,7 +9,7 @@ use fleetring_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::auth::{Action, authorized, require_key};
+use crate::auth::{Action, authorized, require_database};
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::DataNode;
@@ -86,7 +86,7 @@ impl Database for DatabaseService {
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
-        require_key(&request, &name)?;
+        require_database(&request, &name)?;
         let request = request.into_inner();
         let statement = statement(request.sql, request.params)?;
         let lease = self.node.route(&name).await?;
@@ -117,7 +117,7 @@ impl Database for DatabaseService {
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
-        require_key(&request, &name)?;
+        require_database(&request, &name)?;
         let request = request.into_inner();
         let statement = statement(request.sql, request.params)?;
         self.node.route(&name).await?;
@@ -135,7 +135,7 @@ impl Database for DatabaseService {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
-        require_key(&request, &name)?;
+        require_database(&request, &name)?;
         let placement = self.node.create(&name).await?;
         Ok(Response::new(CreateResponse {
             placement: Some(placement),
@@ -218,7 +218,7 @@ impl Database for DatabaseService {
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
-        require_key(&request, &name)?;
+        require_database(&request, &name)?;
         let request = request.into_inner();
         let at = (!request.position.is_empty()).then(|| Position::from(request.position));
         let verified = self.node.replication().verify(&name, at).await?;

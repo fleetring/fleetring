@@ -5,13 +5,13 @@
 //! [`Caller`] from the connection's certificate and any `authorization: Bearer` token, and
 //! enforces the requirements that need no request body: node-only calls, `fleet`, and the
 //! floor for listings. It passes the decision on in an [`Authorized`] extension, from which each
-//! handler checks the key its request names before it touches any state, and with which a
+//! handler checks the database its request names before it touches any state, and with which a
 //! streaming handler ends its stream once the token behind it expires or is revoked.
 //!
 //! Refusals are `PERMISSION_DENIED`; a token that doesn't verify is `UNAUTHENTICATED`; and a
 //! token a data node can't check, because its denylist hasn't arrived or has gone stale, is
 //! `UNAVAILABLE`, which a client retries. Each refusal is logged once on the `fleetringd::audit`
-//! target with the principal, the credential, the action, the key, and the RPC; allowed requests
+//! target with the principal, the credential, the action, the database, and the RPC; allowed requests
 //! are logged at debug. Credentials are never logged.
 
 use std::collections::BTreeMap;
@@ -83,8 +83,8 @@ struct Entry {
     forward_tokens: TokenForwarding,
 }
 
-/// Decides who a request comes from: the principals and their scopes, the keys tokens are
-/// verified with, the denylist, and the clock token lifetimes are judged by.
+/// Decides who a request comes from: the principals and their scopes, the signing keys
+/// tokens are verified with, the denylist, and the clock token lifetimes are judged by.
 ///
 /// Cloning is cheap; clones share everything.
 #[derive(Debug, Clone)]
@@ -304,7 +304,7 @@ impl Authorizer {
                     principal,
                     credential = "token",
                     action = action_of(rpc),
-                    key = None::<&str>,
+                    database = None::<&str>,
                     rpc = rpc.method(),
                     code = ?status.code(),
                     reason = status.message(),
@@ -319,8 +319,8 @@ impl Authorizer {
             authorizer: self.clone(),
         };
         match rpc.requirement {
-            // The key is in the body; the handler checks it.
-            Requirement::Key(_) | Requirement::KeyOrFleet(_) => Ok(authorized),
+            // The database is in the body; the handler checks it.
+            Requirement::Database(_) | Requirement::DatabaseOrFleet(_) => Ok(authorized),
             _ => {
                 authorized.check(None)?;
                 Ok(authorized)
@@ -345,7 +345,7 @@ fn bearer_token(headers: &http::HeaderMap) -> Result<Option<BearerToken>, Status
 }
 
 /// The boundary's decision about a request: who sent it, and which RPC it is. Handlers read it
-/// from the request's extensions to check the key the request names, and to guard the streams
+/// from the request's extensions to check the database the request names, and to guard the streams
 /// they return.
 #[derive(Debug, Clone)]
 pub struct Authorized {
@@ -367,12 +367,12 @@ impl Authorized {
         self.rpc
     }
 
-    /// Checks the request against its RPC's requirement, with `key` the database it names,
-    /// and logs the decision.
-    fn check(&self, key: Option<&DatabaseName>) -> Result<(), Status> {
-        match self.caller.authorize(self.rpc, key) {
+    /// Checks the request against its RPC's requirement, with `database` the one it names, and
+    /// logs the decision.
+    fn check(&self, database: Option<&DatabaseName>) -> Result<(), Status> {
+        match self.caller.authorize(self.rpc, database) {
             Ok(()) => {
-                audit_allowed(&self.caller, self.rpc, key);
+                audit_allowed(&self.caller, self.rpc, database);
                 Ok(())
             }
             Err(denied) => {
@@ -382,10 +382,10 @@ impl Authorized {
         }
     }
 
-    /// Whether the caller may see `key` in a listing filtered by `action`.
+    /// Whether the caller may see `database` in a listing filtered by `action`.
     #[must_use]
-    pub fn sees(&self, action: Action, key: &DatabaseName) -> bool {
-        self.caller.sees(action, key)
+    pub fn sees(&self, action: Action, database: &DatabaseName) -> bool {
+        self.caller.sees(action, database)
     }
 
     /// Ends `stream` with `UNAUTHENTICATED` once the token the request carried expires or is
@@ -464,7 +464,9 @@ fn action_of(rpc: &Rpc) -> String {
     match rpc.requirement {
         Requirement::Node => "node".to_owned(),
         Requirement::Fleet => "fleet".to_owned(),
-        Requirement::Key(action) | Requirement::KeyOrFleet(action) => action.as_str().to_owned(),
+        Requirement::Database(action) | Requirement::DatabaseOrFleet(action) => {
+            action.as_str().to_owned()
+        }
         Requirement::Listing(actions) => actions
             .iter()
             .map(|action| action.as_str())
@@ -480,13 +482,13 @@ fn audit_denied(caller: &Caller, rpc: &Rpc, denied: &Denied) {
         principal,
         credential,
         action = action_of(rpc),
-        key = denied.key().map(DatabaseName::as_str),
+        database = denied.database().map(DatabaseName::as_str),
         rpc = rpc.method(),
         "denied",
     );
 }
 
-fn audit_allowed(caller: &Caller, rpc: &Rpc, key: Option<&DatabaseName>) {
+fn audit_allowed(caller: &Caller, rpc: &Rpc, database: Option<&DatabaseName>) {
     if !tracing::enabled!(target: AUDIT, tracing::Level::DEBUG) {
         return;
     }
@@ -496,7 +498,7 @@ fn audit_allowed(caller: &Caller, rpc: &Rpc, key: Option<&DatabaseName>) {
         principal,
         credential,
         action = action_of(rpc),
-        key = key.map(DatabaseName::as_str),
+        database = database.map(DatabaseName::as_str),
         rpc = rpc.method(),
         "allowed",
     );
@@ -515,14 +517,14 @@ pub fn authorized<T>(request: &Request<T>) -> Result<&Authorized, Status> {
     })
 }
 
-/// Checks that `request`'s caller may take its RPC's action on `key`, the database the request
+/// Checks that `request`'s caller may take its RPC's action on `database`, the one the request
 /// names, and logs the decision.
 ///
 /// # Errors
 ///
-/// `PERMISSION_DENIED` naming the action and the key, never the caller's scopes.
-pub fn require_key<T>(request: &Request<T>, key: &DatabaseName) -> Result<(), Status> {
-    authorized(request)?.check(Some(key))
+/// `PERMISSION_DENIED` naming the action and the database, never the caller's scopes.
+pub fn require_database<T>(request: &Request<T>, database: &DatabaseName) -> Result<(), Status> {
+    authorized(request)?.check(Some(database))
 }
 
 /// A tower layer that puts [`Authorizer`]'s checks in front of every service it wraps.

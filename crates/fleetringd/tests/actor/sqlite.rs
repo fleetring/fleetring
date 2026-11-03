@@ -43,7 +43,7 @@ async fn each_committed_transaction_publishes_exactly_its_frames() -> TestResult
     let db = name("orders");
     fx.create(&db).await?;
     let wal = wal_file(fx.dir.path(), "orders");
-    let created = fx.sink.take();
+    let created = fx.publisher.take();
     assert_eq!(created.len(), 1, "the CREATE TABLE commit");
     let mut previous = decode_one_transaction(&created[0]);
 
@@ -58,7 +58,7 @@ async fn each_committed_transaction_publishes_exactly_its_frames() -> TestResult
     ];
     for transaction in transactions {
         fx.registry.execute(&db, transaction).await?;
-        let published = fx.sink.take();
+        let published = fx.publisher.take();
         assert_eq!(published.len(), 1, "one batch per commit");
         assert_eq!(published[0].database, db);
         let batch = decode_one_transaction(&published[0]);
@@ -79,7 +79,7 @@ async fn each_committed_transaction_publishes_exactly_its_frames() -> TestResult
         .execute(&db, Transaction::from(fx.get("b")))
         .await?;
     assert!(
-        fx.sink.take().is_empty(),
+        fx.publisher.take().is_empty(),
         "a transaction that writes nothing commits no frames"
     );
     assert_eq!(fx.value(&db, "b").await?, Some(Value::from("text")));
@@ -96,7 +96,7 @@ async fn rollbacks_and_failed_statements_publish_nothing() -> TestResult {
         .await?;
     let handle = fx.registry.open(&db).await?;
     let before = handle.position().await?;
-    let _ = fx.sink.take();
+    let _ = fx.publisher.take();
 
     let failing = [
         // A later statement fails, so the earlier insert rolls back.
@@ -131,7 +131,7 @@ async fn rollbacks_and_failed_statements_publish_nothing() -> TestResult {
             ),
             "{error:?}"
         );
-        assert!(fx.sink.take().is_empty(), "no batch after {error}");
+        assert!(fx.publisher.take().is_empty(), "no batch after {error}");
         assert_eq!(handle.position().await?, before);
     }
     assert_eq!(fx.value(&db, "k").await?, Some(Value::Integer(1)));
@@ -139,7 +139,7 @@ async fn rollbacks_and_failed_statements_publish_nothing() -> TestResult {
     fx.registry
         .execute(&db, Transaction::from(fx.put("k", 5)))
         .await?;
-    let published = fx.sink.take();
+    let published = fx.publisher.take();
     assert_eq!(published.len(), 1);
     let batch = decode_one_transaction(&published[0]);
     assert_eq!(Some(Position::new(batch.start().to_bytes())), before);
@@ -159,7 +159,7 @@ async fn the_wal_grows_across_thousands_of_writes_until_a_checkpoint_is_requeste
             "CREATE TABLE log (v INTEGER)",
         )))
         .await?;
-    let _ = fx.sink.take();
+    let _ = fx.publisher.take();
     let wal = wal_file(fx.dir.path(), "growing");
     let mut len = fs::metadata(&wal)?.len();
     for i in 0..WRITES {
@@ -175,7 +175,7 @@ async fn the_wal_grows_across_thousands_of_writes_until_a_checkpoint_is_requeste
     }
     let frame_len = 24 + u64::from(PAGE_SIZE);
     assert!(len >= 32 + frame_len * WRITES as u64, "{len} bytes");
-    let batches = fx.sink.take();
+    let batches = fx.publisher.take();
     assert_eq!(batches.len(), WRITES);
     assert!(
         batches.iter().all(
@@ -196,7 +196,7 @@ async fn the_wal_grows_across_thousands_of_writes_until_a_checkpoint_is_requeste
     handle
         .execute(Transaction::from(fx.put("after", 1)))
         .await?;
-    let restarted = fx.sink.take();
+    let restarted = fx.publisher.take();
     assert_eq!(restarted.len(), 1);
     let batch = Batch::from_bytes(restarted[0].batch.payload.as_bytes())?;
     assert!(
@@ -227,7 +227,7 @@ async fn a_follower_mirrors_the_primary_across_checkpoints_and_reopens() -> Test
     let follower_dir = fx.path("follower");
     let snapshot = handle.snapshot(&follower_dir).await?;
     assert_eq!(snapshot.position, handle.position().await?);
-    let _ = fx.sink.take();
+    let _ = fx.publisher.take();
 
     let engine = SqliteEngine::new(PAGE_SIZE)?;
     let EngineCapability::FrameSource(frames) = engine.capability() else {
@@ -236,7 +236,7 @@ async fn a_follower_mirrors_the_primary_across_checkpoints_and_reopens() -> Test
     let mut follower = frames.open_follower(&follower_dir)?;
     assert_eq!(follower.position(), snapshot.position);
     let ship = |follower: &mut Box<dyn FrameFollower>| -> TestResult {
-        for published in fx.sink.take() {
+        for published in fx.publisher.take() {
             let end = follower.apply(&published.batch)?;
             assert_eq!(end, published.batch.end);
         }
@@ -296,13 +296,13 @@ async fn a_follower_rejects_a_batch_that_skips_ahead() -> TestResult {
     fx.create(&db).await?;
     let handle = fx.registry.open(&db).await?;
     handle.snapshot(fx.path("follower")).await?;
-    let _ = fx.sink.take();
+    let _ = fx.publisher.take();
     for i in 0..2 {
         handle
             .execute(Transaction::from(fx.put(&format!("k{i}"), i)))
             .await?;
     }
-    let batches = fx.sink.take();
+    let batches = fx.publisher.take();
     let engine = SqliteEngine::new(PAGE_SIZE)?;
     let EngineCapability::FrameSource(frames) = engine.capability() else {
         panic!("sqlite is a frame source");
@@ -343,13 +343,13 @@ async fn a_follower_truncates_a_divergent_tail_and_serves_its_frames() -> TestRe
     fx.create(&db).await?;
     let handle = fx.registry.open(&db).await?;
     handle.snapshot(fx.path("follower")).await?;
-    let _ = fx.sink.take();
+    let _ = fx.publisher.take();
     for i in 0..3 {
         handle
             .execute(Transaction::from(fx.put(&format!("k{i}"), i)))
             .await?;
     }
-    let batches = fx.sink.take();
+    let batches = fx.publisher.take();
     let engine = SqliteEngine::new(PAGE_SIZE)?;
     let EngineCapability::FrameSource(frames) = engine.capability() else {
         panic!("sqlite is a frame source");
@@ -496,7 +496,7 @@ async fn inline_execution_publishes_the_same_batches() -> TestResult {
             .execute(&db, Transaction::from(fx.put(&format!("k{i}"), i)))
             .await?;
     }
-    let batches = fx.sink.take();
+    let batches = fx.publisher.take();
     assert_eq!(batches.len(), 11);
     for published in &batches {
         decode_one_transaction(published);

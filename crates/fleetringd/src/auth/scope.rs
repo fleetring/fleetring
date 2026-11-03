@@ -1,10 +1,10 @@
-//! Scopes: what a principal may do, as prefix rules on keys (ADR-0025).
+//! Scopes: what a principal may do, as prefix rules on database names (ADR-0025).
 //!
 //! A scope is `<action>:<pattern>`, where the action is `read`, `write`, `admin`, or `stream` and
-//! the pattern is an exact key or a prefix ending in `*`, the matcher the change sinks use. The
-//! word `fleet` alone is the scope for control operations that name no key. `write` implies
-//! `read`, `admin` implies both, and `stream` implies nothing and is implied by nothing, so a
-//! change consumer can't read tables. Everything not allowed is denied.
+//! the pattern is an exact database name or a prefix ending in `*`, the matcher the change sinks
+//! use. The word `fleet` alone is the scope for control operations that name no database.
+//! `write` implies `read`, `admin` implies both, and `stream` implies nothing and is implied by
+//! nothing, so a change consumer can't read tables. Everything not allowed is denied.
 //!
 //! The policy is pure: [`Scopes::allows`] decides from the scopes and the request alone.
 
@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::changes::DatabaseMatcher;
 
-/// What a request does to a key.
+/// What a request does to a database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Action {
@@ -84,35 +84,36 @@ impl FromStr for Action {
     }
 }
 
-/// What a request touches: one key, or the fleet itself.
+/// What a request touches: one database, or the fleet itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target<'a> {
-    /// The request acts on this key with this action.
-    Key(Action, &'a DatabaseName),
-    /// The request is a control operation that names no key: membership, draining, revocation.
+    /// The request acts on this database with this action.
+    Database(Action, &'a DatabaseName),
+    /// The request is a control operation that names no database: membership, draining,
+    /// revocation.
     Fleet,
 }
 
 impl fmt::Display for Target<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Key(action, key) => write!(f, "{action} on '{key}'"),
+            Self::Database(action, database) => write!(f, "{action} on '{database}'"),
             Self::Fleet => f.write_str("fleet"),
         }
     }
 }
 
-/// One rule: an action over the keys a pattern names, or `fleet`.
+/// One rule: an action over the databases a pattern names, or `fleet`.
 ///
 /// ```
 /// use fleetringd::auth::{Action, Scope, Target};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let scope: Scope = "write:tenant:acme/*".parse()?;
-/// let key = "tenant:acme/orders".parse()?;
-/// assert!(scope.allows(Target::Key(Action::Read, &key)));
-/// assert!(scope.allows(Target::Key(Action::Write, &key)));
-/// assert!(!scope.allows(Target::Key(Action::Admin, &key)));
+/// let database = "tenant:acme/orders".parse()?;
+/// assert!(scope.allows(Target::Database(Action::Read, &database)));
+/// assert!(scope.allows(Target::Database(Action::Write, &database)));
+/// assert!(!scope.allows(Target::Database(Action::Admin, &database)));
 /// assert!(!scope.allows(Target::Fleet));
 /// assert_eq!(scope.to_string(), "write:tenant:acme/*");
 /// # Ok(())
@@ -125,7 +126,7 @@ pub struct Scope {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Rule {
-    Keys {
+    Databases {
         action: Action,
         pattern: DatabaseMatcher,
     },
@@ -136,15 +137,15 @@ enum Rule {
 const FLEET: &str = "fleet";
 
 impl Scope {
-    /// The scope for `action` over the keys `pattern` names.
+    /// The scope for `action` over the databases `pattern` names.
     #[must_use]
     pub fn new(action: Action, pattern: DatabaseMatcher) -> Self {
         Self {
-            rule: Rule::Keys { action, pattern },
+            rule: Rule::Databases { action, pattern },
         }
     }
 
-    /// The scope for control operations that name no key.
+    /// The scope for control operations that name no database.
     #[must_use]
     pub fn fleet() -> Self {
         Self { rule: Rule::Fleet }
@@ -154,19 +155,19 @@ impl Scope {
     #[must_use]
     pub fn allows(&self, target: Target<'_>) -> bool {
         match (&self.rule, target) {
-            (Rule::Keys { action, pattern }, Target::Key(wanted, key)) => {
-                action.covers(wanted) && pattern.matches(key)
+            (Rule::Databases { action, pattern }, Target::Database(wanted, database)) => {
+                action.covers(wanted) && pattern.matches(database)
             }
             (Rule::Fleet, Target::Fleet) => true,
-            (Rule::Keys { .. }, Target::Fleet) | (Rule::Fleet, Target::Key(..)) => false,
+            (Rule::Databases { .. }, Target::Fleet) | (Rule::Fleet, Target::Database(..)) => false,
         }
     }
 
-    /// Whether this scope covers `wanted` on at least one key.
+    /// Whether this scope covers `wanted` on at least one database.
     #[must_use]
     pub fn covers_some(&self, wanted: Action) -> bool {
         match &self.rule {
-            Rule::Keys { action, .. } => action.covers(wanted),
+            Rule::Databases { action, .. } => action.covers(wanted),
             Rule::Fleet => false,
         }
     }
@@ -175,7 +176,7 @@ impl Scope {
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.rule {
-            Rule::Keys { action, pattern } => write!(f, "{action}:{pattern}"),
+            Rule::Databases { action, pattern } => write!(f, "{action}:{pattern}"),
             Rule::Fleet => f.write_str(FLEET),
         }
     }
@@ -248,10 +249,10 @@ impl<'de> Deserialize<'de> for Scope {
 /// let scopes: Scopes = ["read:tenant:*", "stream:ledger"].iter().map(|s| s.parse()).collect::<Result<_, _>>()?;
 /// let acme = "tenant:acme".parse()?;
 /// let ledger = "ledger".parse()?;
-/// assert!(scopes.allows(Target::Key(Action::Read, &acme)));
-/// assert!(!scopes.allows(Target::Key(Action::Write, &acme)));
-/// assert!(!scopes.allows(Target::Key(Action::Read, &ledger)));
-/// assert!(scopes.allows(Target::Key(Action::Stream, &ledger)));
+/// assert!(scopes.allows(Target::Database(Action::Read, &acme)));
+/// assert!(!scopes.allows(Target::Database(Action::Write, &acme)));
+/// assert!(!scopes.allows(Target::Database(Action::Read, &ledger)));
+/// assert!(scopes.allows(Target::Database(Action::Stream, &ledger)));
 /// assert!(!scopes.allows(Target::Fleet));
 /// # Ok(())
 /// # }
@@ -283,7 +284,7 @@ impl Scopes {
         self.scopes.iter().any(|scope| scope.allows(target))
     }
 
-    /// Whether any scope covers `action` on at least one key, so that a listing filtered by
+    /// Whether any scope covers `action` on at least one database, so that a listing filtered by
     /// `action` may show the caller something.
     #[must_use]
     pub fn covers_some(&self, action: Action) -> bool {
@@ -325,7 +326,7 @@ impl Extend<Scope> for Scopes {
 mod tests {
     use super::*;
 
-    fn key(text: &str) -> DatabaseName {
+    fn database(text: &str) -> DatabaseName {
         text.parse().expect("a database name")
     }
 
@@ -361,35 +362,41 @@ mod tests {
     #[test]
     fn a_read_scope_on_a_prefix_reads_inside_it_and_nothing_else() {
         let reader = scopes(&["read:tenant:*"]);
-        let acme = key("tenant:acme");
-        assert!(reader.allows(Target::Key(Action::Read, &acme)));
-        assert!(!reader.allows(Target::Key(Action::Write, &acme)));
-        assert!(!reader.allows(Target::Key(Action::Admin, &acme)));
-        assert!(!reader.allows(Target::Key(Action::Stream, &acme)));
-        assert!(!reader.allows(Target::Key(Action::Read, &key("ledger"))));
+        let acme = database("tenant:acme");
+        assert!(reader.allows(Target::Database(Action::Read, &acme)));
+        assert!(!reader.allows(Target::Database(Action::Write, &acme)));
+        assert!(!reader.allows(Target::Database(Action::Admin, &acme)));
+        assert!(!reader.allows(Target::Database(Action::Stream, &acme)));
+        assert!(!reader.allows(Target::Database(Action::Read, &database("ledger"))));
         assert!(!reader.allows(Target::Fleet));
     }
 
     #[test]
     fn a_prefix_scope_is_a_string_prefix_and_an_exact_scope_names_one_key() {
         let acme = scopes(&["write:tenant:acme/*", "read:ledger"]);
-        assert!(acme.allows(Target::Key(Action::Write, &key("tenant:acme/orders"))));
-        assert!(acme.allows(Target::Key(Action::Write, &key("tenant:acme/"))));
-        assert!(!acme.allows(Target::Key(Action::Read, &key("tenant:acme"))));
-        assert!(!acme.allows(Target::Key(Action::Read, &key("tenant:acmeco/orders"))));
-        assert!(acme.allows(Target::Key(Action::Read, &key("ledger"))));
-        assert!(!acme.allows(Target::Key(Action::Read, &key("ledger-2"))));
-        assert!(!acme.allows(Target::Key(Action::Write, &key("ledger"))));
+        assert!(acme.allows(Target::Database(
+            Action::Write,
+            &database("tenant:acme/orders")
+        )));
+        assert!(acme.allows(Target::Database(Action::Write, &database("tenant:acme/"))));
+        assert!(!acme.allows(Target::Database(Action::Read, &database("tenant:acme"))));
+        assert!(!acme.allows(Target::Database(
+            Action::Read,
+            &database("tenant:acmeco/orders")
+        )));
+        assert!(acme.allows(Target::Database(Action::Read, &database("ledger"))));
+        assert!(!acme.allows(Target::Database(Action::Read, &database("ledger-2"))));
+        assert!(!acme.allows(Target::Database(Action::Write, &database("ledger"))));
     }
 
     #[test]
     fn admin_on_everything_still_lacks_stream_and_fleet() {
         let admin = scopes(&["admin:*"]);
-        let any = key("anything");
+        let any = database("anything");
         for action in [Action::Admin, Action::Write, Action::Read] {
-            assert!(admin.allows(Target::Key(action, &any)), "{action}");
+            assert!(admin.allows(Target::Database(action, &any)), "{action}");
         }
-        assert!(!admin.allows(Target::Key(Action::Stream, &any)));
+        assert!(!admin.allows(Target::Database(Action::Stream, &any)));
         assert!(!admin.allows(Target::Fleet));
     }
 
@@ -398,7 +405,7 @@ mod tests {
         let fleet = scopes(&["fleet"]);
         assert!(fleet.allows(Target::Fleet));
         for action in Action::ALL {
-            assert!(!fleet.allows(Target::Key(action, &key("tenant:acme"))));
+            assert!(!fleet.allows(Target::Database(action, &database("tenant:acme"))));
         }
         assert!(!fleet.covers_some(Action::Read));
     }
@@ -409,7 +416,7 @@ mod tests {
         assert!(none.is_empty());
         assert!(!none.allows(Target::Fleet));
         for action in Action::ALL {
-            assert!(!none.allows(Target::Key(action, &key("x"))));
+            assert!(!none.allows(Target::Database(action, &database("x"))));
             assert!(!none.covers_some(action));
         }
     }
