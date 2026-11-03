@@ -4,7 +4,8 @@ use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DatabaseName, Durability, Engine, HostedReplica, LeaseEpoch, Member, Position, Timestamp,
+    DatabaseName, Durability, Engine, HostedReplica, LeaseEpoch, Member, Position, Revoked,
+    Timestamp,
 };
 
 /// One change to control state, stamped with the control node's time.
@@ -189,6 +190,20 @@ pub enum Action {
         /// The replica to hand the lease to, if the holder has one in mind: usually the follower
         /// that has acknowledged everything it committed.
         target: Option<NodeId>,
+    },
+
+    /// Adds a bearer token, or every token a signing key issued, to the denylist nodes check
+    /// before they trust a token (ADR-0025).
+    ///
+    /// The entry is kept until `until`, then forgotten: a token's expiry, after which nodes
+    /// refuse it anyway, or [`Timestamp::MAX`] for a key. Revoking an entry again keeps the later
+    /// time. The state records identifiers only, never a token or a key. Logs written before this
+    /// action existed never contain it.
+    RevokeToken {
+        /// The token or key.
+        revoked: Revoked,
+        /// When the entry may be forgotten.
+        until: Timestamp,
     },
 }
 

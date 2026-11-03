@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::apply::plan_promotion;
 use crate::{
     Acks, ControlConfig, Database, DatabaseName, Liveness, Member, Quorums, Rejection, Report,
-    Timestamp,
+    Revocations, Timestamp,
 };
 
 /// Everything the control plane knows: members, their liveness, and databases with their leases.
@@ -37,6 +37,9 @@ pub struct State {
     pub(crate) membership_epoch: Epoch,
     pub(crate) members: BTreeMap<NodeId, MemberEntry>,
     pub(crate) databases: BTreeMap<DatabaseName, Database>,
+    /// Revoked bearer tokens and signing keys. Absent from states written before revocation.
+    #[serde(default, skip_serializing_if = "Revocations::is_empty")]
+    pub(crate) revocations: Revocations,
 }
 
 /// A member with its liveness and its latest reports.
@@ -61,6 +64,7 @@ impl State {
             membership_epoch: Epoch::default(),
             members: BTreeMap::new(),
             databases: BTreeMap::new(),
+            revocations: Revocations::new(),
         }
     }
 
@@ -77,6 +81,12 @@ impl State {
     #[must_use]
     pub fn now(&self) -> Timestamp {
         self.now
+    }
+
+    /// Returns the denylist of revoked bearer tokens and signing keys.
+    #[must_use]
+    pub fn revocations(&self) -> &Revocations {
+        &self.revocations
     }
 
     /// Returns the membership epoch, which grows with every change to the set of members or

@@ -9,7 +9,7 @@
 //!   epoch, and every database with its engine, epoch, lease, and any promotion in progress.
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create or drop a database,
 //!   change its durability, acquire or renew a lease, start a promotion, record a fenced member,
-//!   complete a promotion, tick, drain a member, or transfer a lease.
+//!   complete a promotion, tick, drain a member, transfer a lease, or revoke a bearer token.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -44,6 +44,8 @@
 //!   serves it stops once its next renewal is refused.
 //! - **Ticks** change only the time, so liveness and lease expiry advance without other traffic.
 //! - **Positions** are opaque bytes compared lexicographically (ADR-0016).
+//! - **Revocations** list token and key IDs, never credentials, each until a time after which it
+//!   is forgotten; ticks and revocations forget the entries the time has passed (ADR-0025).
 //!
 //! # Examples
 //!
@@ -82,6 +84,7 @@ mod command;
 mod config;
 mod database;
 mod member;
+mod revocation;
 mod state;
 mod time;
 
@@ -93,6 +96,7 @@ pub use database::{
     ParseAcksError, ParseDatabaseNameError, Position, Promotion, Quorums,
 };
 pub use member::{HostedReplica, Liveness, Member, Report, Role};
+pub use revocation::{KeyId, ParseCredentialIdError, Revocations, Revoked, TokenId};
 pub use state::{State, membership_ring};
 pub use time::{Millis, Timestamp};
 
@@ -111,6 +115,7 @@ const _: () = {
     assert_debug_send_sync::<Engine>();
     assert_debug_send_sync::<HostedReplica>();
     assert_debug_send_sync::<JoinKind>();
+    assert_debug_send_sync::<KeyId>();
     assert_debug_send_sync::<Lease>();
     assert_debug_send_sync::<LeaseEpoch>();
     assert_debug_send_sync::<Liveness>();
@@ -118,13 +123,17 @@ const _: () = {
     assert_debug_send_sync::<Millis>();
     assert_debug_send_sync::<Outcome>();
     assert_debug_send_sync::<ParseAcksError>();
+    assert_debug_send_sync::<ParseCredentialIdError>();
     assert_debug_send_sync::<ParseDatabaseNameError>();
     assert_debug_send_sync::<Position>();
     assert_debug_send_sync::<Promotion>();
     assert_debug_send_sync::<Quorums>();
     assert_debug_send_sync::<Rejection>();
     assert_debug_send_sync::<Report>();
+    assert_debug_send_sync::<Revocations>();
+    assert_debug_send_sync::<Revoked>();
     assert_debug_send_sync::<Role>();
     assert_debug_send_sync::<State>();
     assert_debug_send_sync::<Timestamp>();
+    assert_debug_send_sync::<TokenId>();
 };
