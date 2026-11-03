@@ -46,10 +46,18 @@ pub use sink::{
 const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     assert_debug_send_sync::<auth::Action>();
+    assert_debug_send_sync::<auth::BearerToken>();
+    assert_debug_send_sync::<auth::Grant>();
+    assert_debug_send_sync::<auth::IssueError>();
     assert_debug_send_sync::<auth::ParseScopeError>();
     assert_debug_send_sync::<auth::Scope>();
     assert_debug_send_sync::<auth::Scopes>();
     assert_debug_send_sync::<auth::Target<'static>>();
+    assert_debug_send_sync::<auth::TokenError>();
+    assert_debug_send_sync::<auth::TokenSigner>();
+    assert_debug_send_sync::<auth::TokenVerifier>();
+    assert_debug_send_sync::<auth::Verified>();
+    assert_debug_send_sync::<auth::VerifyingKey>();
     assert_debug_send_sync::<changes::ChangeStreams>();
     assert_debug_send_sync::<clock::SimClock>();
     assert_debug_send_sync::<clock::SystemClock>();
