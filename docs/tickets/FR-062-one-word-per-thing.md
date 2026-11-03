@@ -1,7 +1,7 @@
 ---
 id: FR-062
 title: One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs
-status: in-progress
+status: done
 priority: P1
 size: M
 milestone: M11 Operator experience
@@ -83,3 +83,4 @@ This list, with FR-059's, is the release notes' breaking-changes section. Nothin
   - **Persisted data:** unchanged. Before the first rename, a scratch test dumped the control state (serde JSON) of three seeded simulation runs; after the last, the same dump has the same set of JSON paths and enum strings, and `reports_without_a_log_epoch_load_from_old_logs` still round-trips a 0.2 heartbeat report with `"role":"follower"` byte for byte. The control log's format version stays 1.
   - **Docs:** the lexicon's open conflicts became entries (new: address, batch publisher, node role, replica role) and a "renamed in 0.3.0" table; the CLI guide's alias and deprecation rules became a clean-break rule; open tickets (FR-041, FR-043, FR-045, FR-049, FR-052, FR-053, FR-056, FR-057) follow the new names; milestone M9 is "Archives and verification".
   - **Not renamed:** `Replication.Snapshot`, `SnapshotRequest`, and `SnapshotChunk` (they only carry database snapshots, inside the replication service); `engine::PinnedSnapshot`, `SnapshotFile`, and `LogError::CorruptSnapshot` (each lives in a module that already says which snapshot; the error's message says "control snapshot"); the `--key` and `--key-id` flags, whose help now says private key and signing key; the `role` config key and `--role`; ticket titles (FR-038's "departure", FR-049's "durability sink"); accepted ADRs; the in-progress tickets FR-047, FR-050, and FR-051, whose text records work already done.
+- 2026-11-03: Merged in PR #48; status is done.

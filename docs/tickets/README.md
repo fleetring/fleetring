@@ -93,10 +93,10 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | done |
 | [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032, FR-047 | todo |
 | [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | done |
-| [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | in-progress |
+| [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | done |
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | done |
 | [FR-049](FR-049-s3-durability-sink.md) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
-| [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | in-progress |
+| [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | done |
 | [FR-051](FR-051-flaky-replication-tests.md) | Find and fix the replication tests that fail intermittently in CI | P1 | M | — | in-progress |
 | [FR-052](FR-052-archive-acknowledged-durability.md) | A durability mode that acknowledges a write only once it is archived | P2 | M | FR-049, FR-035 | todo |
 | [FR-053](FR-053-object-store-workload-identity.md) | Object-store credentials from workload identity, not only static keys | P2 | S | FR-049 | todo |
@@ -105,10 +105,10 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-056](FR-056-cli-contexts-json-completions.md) | CLI contexts, `--json` on every read command, shell completions, and man pages | P1 | L | FR-055, FR-059 | todo |
 | [FR-057](FR-057-tui.md) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
 | [FR-058](FR-058-desktop-app.md) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
-| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, as a clean break in 0.3.0 | P1 | M | FR-047 | in-progress |
+| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, as a clean break in 0.3.0 | P1 | M | FR-047 | done |
 | [FR-060](FR-060-distribution-packages.md) | Distribution packages for apt, yum, the AUR, and Homebrew | P2 | L | FR-034, FR-048 | todo |
 | [FR-061](FR-061-rails-integration.md) | A `fleetring` Ruby gem and an ActiveRecord adapter that place each tenant's database | P2 | L | FR-047, the router (no ticket yet) | todo |
-| [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | in-progress |
+| [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | done |
 
 ## Dependency graph
 

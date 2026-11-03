@@ -1,7 +1,7 @@
 ---
 id: FR-047
 title: Principals and scopes: tokens and prefix rules enforced at every RPC
-status: in-progress
+status: done
 priority: P0
 size: L
 milestone: M10 Security
@@ -62,3 +62,4 @@ With FR-046 every caller is identified: a node by its ID, a client by the princi
   - **Confinement (on top of `confine-statements`):** `tests/scopes.rs::statements_stay_in_their_database` has a `read:tenant:acme/*` and a `write:tenant:acme/*` principal try `ATTACH` (through `Query` and `Execute`), `VACUUM INTO`, and `DETACH` against another tenant's file on the same node: each is refused with `INVALID_ARGUMENT`, and the other tenant's rows are unchanged. ADR-0026 §8 records the adapter's rules.
   - **Node certificates (amends this ticket's "implicit full scope towards nodes and `cluster`", ADR-0026 §9):** `Rpc::nodes` (`ForNodes`) marks what a node certificate may make: every `node` RPC, plus `WatchMembership`, `Leave`, `Drain`, `Locate`, and `TransferLease`, the client calls daemons make themselves. Anything else judges a node as a principal with no scopes. `Leave` and `Drain` (with `Join`, `Heartbeat`, and the lease calls) refuse another node's ID from a node certificate, naming the call and the target, and `TransferLease` refuses a lease the node doesn't hold. `tests/control.rs::a_node_certificate_acts_on_its_own_node_only` covers a node draining or removing another member, revoking a token, creating a database, and transferring a lease it doesn't hold (all refused), a node draining and leaving itself (allowed), and a `cluster` principal doing all three to another member. Binding node-to-node calls to placement is FR-050.
   - **Not done:** delta-encoded denylists (the whole list rides every reply); per-table permissions and delegated issuance (out of scope).
+- 2026-11-03: Merged in PR #31; status is done.

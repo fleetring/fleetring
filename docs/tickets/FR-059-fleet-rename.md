@@ -1,7 +1,7 @@
 ---
 id: FR-059
 title: Rename cluster to fleet, as a clean break in 0.3.0
-status: in-progress
+status: done
 priority: P1
 size: M
 milestone: M11 Operator experience
@@ -51,3 +51,4 @@ ADR-0032 makes "fleet" the word for the nodes one control plane and one certific
   - **Code:** `FleetName`, `fleet()` accessors, `Scope::fleet()`, `Target::Fleet`, `Requirement::Fleet`, `Needed::Fleet`, `sim::Fleet` and `FleetBuilder` (`src/sim/fleet.rs`, `tests/sim/fleet.rs`, and the rerun commands they print), `cert init --fleet`, and "fleet" in help, logs, refusals, the protocol's comments, the daemon README, and `deploy/fleetringd.toml`.
   - **Tests:** `cert_init_names_the_fleet_and_refuses_the_old_flag` and `certificates_from_0_2_still_connect` (`tests/tls.rs`, with certificates the 0.2.0 binary issued in `tests/fixtures/tls-0.2.0/`, the authority's private key removed); `the_fleet_scope_is_written_and_read_as_fleet_and_cluster_is_refused` (`auth::token`); the `cluster` scope in `scopes_parse_and_print_back` and in `principals_are_parsed_and_validated_at_start`.
   - **Kept:** "cluster" where it names something else (other systems in `docs/review.md`), in accepted ADRs and finished tickets, and in the `fleetring` placement crate's docs, which use it in the general sense and change only in that crate's own release.
+- 2026-11-03: Merged in PR #48; status is done.
