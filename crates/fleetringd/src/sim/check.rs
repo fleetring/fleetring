@@ -70,6 +70,9 @@ pub enum Invariant {
     /// Every replica that follows a database's log holds the same hash chain at every position
     /// they have in common (FR-044).
     ChainAgrees,
+    /// Every node call an impostor makes on a database it doesn't host is refused for its
+    /// binding, or can't be checked and waits; none is served (FR-050).
+    NodeCallsBound,
 }
 
 impl fmt::Display for Invariant {
@@ -88,6 +91,7 @@ impl fmt::Display for Invariant {
             Self::ChangeStreamConsistent => "change stream consistent",
             Self::LeaseEventsMatchControl => "lease events match control",
             Self::ChainAgrees => "hash chains agree",
+            Self::NodeCallsBound => "node calls bound to placement",
         })
     }
 }
@@ -580,6 +584,57 @@ pub fn chains_agree(database: &DatabaseName, chains: &ReplicaChains) -> Result<(
                     ),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Checks that every impostor operation in `history` ([`Operation::ImpostorReplicate`],
+/// [`Operation::ImpostorFence`], [`Operation::ImpostorSnapshot`]) ended refused with
+/// `PERMISSION_DENIED` naming a binding, or with `UNAVAILABLE` because the check couldn't be
+/// made yet, and that none was served (FR-050).
+///
+/// # Errors
+///
+/// [`Invariant::NodeCallsBound`] naming the first impostor operation that ended otherwise.
+pub fn impostor_refused(history: &History) -> Result<(), Violation> {
+    for record in history.records() {
+        let impostor = matches!(
+            record.operation(),
+            Operation::ImpostorReplicate { .. }
+                | Operation::ImpostorFence { .. }
+                | Operation::ImpostorSnapshot { .. }
+        );
+        if !impostor {
+            continue;
+        }
+        let bound = match record.outcome().ack() {
+            Some(Ack::Refused {
+                code: tonic::Code::PermissionDenied,
+                binding: Some(_),
+            })
+            | Some(Ack::Refused {
+                code: tonic::Code::Unavailable,
+                ..
+            }) => true,
+            _ => matches!(
+                record.outcome(),
+                crate::sim::Outcome::Indeterminate {
+                    code: Some(tonic::Code::Unavailable)
+                }
+            ),
+        };
+        if !bound {
+            return Err(Violation::new(
+                Invariant::NodeCallsBound,
+                format!(
+                    "{} {} by {} ended {}",
+                    record.id(),
+                    record.operation(),
+                    record.client(),
+                    record.outcome()
+                ),
+            ));
         }
     }
     Ok(())

@@ -106,6 +106,38 @@ pub enum Operation {
         /// The one value to look for, or `None` to read every value.
         value: Option<i64>,
     },
+    /// Opens a `Replicate` stream to `target` for `database` at `epoch`, as an impostor holding
+    /// a node certificate would to take a database over (FR-050). The client's certificate must
+    /// be a node's ([`ClusterBuilder::impostor`](crate::sim::ClusterBuilder::impostor)).
+    ImpostorReplicate {
+        /// The database.
+        database: DatabaseName,
+        /// The node the stream goes to.
+        target: NodeId,
+        /// The epoch the stream claims.
+        epoch: LeaseEpoch,
+    },
+    /// Fences `target`'s replica of `database` at `epoch` for `candidate`.
+    ImpostorFence {
+        /// The database.
+        database: DatabaseName,
+        /// The node fenced.
+        target: NodeId,
+        /// The epoch the fence claims.
+        epoch: LeaseEpoch,
+        /// The candidate the fence names: the impostor's own node, as its certificate requires.
+        candidate: NodeId,
+    },
+    /// Asks `target` for a snapshot of `database` at the epoch `target` serves it at, as an
+    /// impostor reading a database it doesn't host would.
+    ImpostorSnapshot {
+        /// The database.
+        database: DatabaseName,
+        /// The node asked.
+        target: NodeId,
+        /// The epoch asked for.
+        epoch: LeaseEpoch,
+    },
 }
 
 impl Operation {
@@ -119,7 +151,10 @@ impl Operation {
             | Self::CreateDatabase { database, .. }
             | Self::Locate { database }
             | Self::AcquireLease { database, .. }
-            | Self::RenewLease { database, .. } => Some(database),
+            | Self::RenewLease { database, .. }
+            | Self::ImpostorReplicate { database, .. }
+            | Self::ImpostorFence { database, .. }
+            | Self::ImpostorSnapshot { database, .. } => Some(database),
             Self::Join { .. }
             | Self::Heartbeat { .. }
             | Self::Leave { .. }
@@ -167,6 +202,34 @@ impl fmt::Display for Operation {
                 database,
                 value: None,
             } => write!(f, "read {database}"),
+            Self::ImpostorReplicate {
+                database,
+                target,
+                epoch,
+            } => write!(
+                f,
+                "impostor stream of {database} to {target} at epoch {}",
+                epoch.get()
+            ),
+            Self::ImpostorFence {
+                database,
+                target,
+                epoch,
+                candidate,
+            } => write!(
+                f,
+                "impostor fence of {database} on {target} at epoch {} for {candidate}",
+                epoch.get()
+            ),
+            Self::ImpostorSnapshot {
+                database,
+                target,
+                epoch,
+            } => write!(
+                f,
+                "impostor snapshot of {database} from {target} at epoch {}",
+                epoch.get()
+            ),
         }
     }
 }
@@ -325,6 +388,15 @@ pub enum Ack {
         /// The values found, in order.
         values: BTreeSet<i64>,
     },
+    /// The node answered an impostor's node call by refusing it: the answer, not an effect.
+    Refused {
+        /// The status code.
+        code: Code,
+        /// The binding the refusal's `fleetring-binding` metadata names, if it names one.
+        binding: Option<String>,
+    },
+    /// The node served an impostor's node call, which a node bound to placement never does.
+    Served,
 }
 
 impl fmt::Display for Ack {
@@ -368,6 +440,15 @@ impl fmt::Display for Ack {
                 }
                 Ok(())
             }
+            Self::Refused {
+                code,
+                binding: Some(binding),
+            } => write!(f, "refused {code:?}, binding {binding}"),
+            Self::Refused {
+                code,
+                binding: None,
+            } => write!(f, "refused {code:?}"),
+            Self::Served => f.write_str("served"),
             Self::Read { values } => {
                 const SHOWN: usize = 6;
                 write!(f, "read {} values", values.len())?;
