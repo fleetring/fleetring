@@ -4,7 +4,7 @@ This is the checklist for publishing the `fleetring` crate (FR-019). A release f
 
 ## 1. Pre-flight
 
-- [ ] Every P0 and P1 ticket in `docs/tickets/README.md` is `done`.
+- [ ] Every issue labelled `P0` or `P1` in the release's [milestone](https://github.com/fleetring/fleetring/milestones) is closed.
 - [ ] CI is green on `main`, including the cross-target jobs (i686, s390x, wasm32-wasip1) and `spec-reference`.
 - [ ] The nightly `Fuzz` workflow has passed recently.
 - [ ] `docs/perf.md` reflects current numbers (`cargo bench -p fleetring --bench lookup`).
