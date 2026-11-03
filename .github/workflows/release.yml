@@ -32,7 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The tag names the version `fleetringd --version` prints, so they must agree.
       - id: version
         name: read the version and check it against the tag
@@ -76,7 +76,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Linux builds run in Debian 12, so the binaries need glibc 2.36, not the runner's 2.39,
       # and match the container image's runtime.
@@ -139,7 +139,7 @@ jobs:
           rm -r "$name"
           ls -l
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fleetringd-${{ matrix.target }}
           path: dist/*
@@ -156,7 +156,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Fails the release on any unresolved advisory, warnings included. A reviewed exception
       # goes in `.cargo/audit.toml` and `deny.toml`, with its reason.
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
@@ -164,7 +164,7 @@ jobs:
           tool: cargo-audit
       - name: audit the locked dependencies
         run: cargo audit --deny warnings
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: fleetringd-*
           path: dist
@@ -195,7 +195,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/install.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fleetringd-${{ env.VERSION }}-dist
           path: dist/*
