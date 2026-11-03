@@ -168,6 +168,11 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         .as_deref()
         .map(|primary| parse_reply("primary", primary))
         .transpose()?;
+    let candidate: Option<NodeId> = placement
+        .candidate
+        .as_deref()
+        .map(|candidate| parse_reply("candidate", candidate))
+        .transpose()?;
     let replication_factor = u8::try_from(placement.replication_factor)
         .ok()
         .and_then(ReplicationFactor::new)
@@ -205,6 +210,7 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         engine,
         epoch: LeaseEpoch::new(placement.epoch),
         primary,
+        candidate,
         replicas,
         replication_factor,
         durability,
