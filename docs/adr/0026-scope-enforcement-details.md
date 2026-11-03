@@ -1,6 +1,6 @@
 # ADR-0026: How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire
 
-- **Status:** Accepted (2026-11-03)
+- **Status:** Accepted (2026-11-03); point 6's bound amended (2026-11-03, FR-051)
 - **Date:** 2026-11-02
 - **Related:** amends ADR-0025 (§4); ADR-0017 (control state), ADR-0020 (simulation); tickets FR-047, FR-050
 
@@ -43,3 +43,17 @@ ADR-0025 decides principals, scopes, bearer tokens, and enforcement at the reque
 - A partitioned node honors a token revoked during the partition for at most three heartbeat intervals, then refuses all tokens until it hears from the control plane again; a restarted node refuses tokens until its first join reply.
 - Clients holding tokens must treat `UNAVAILABLE` from a data node as retryable, as they already do for a moving primary.
 - Operators drain or remove other members, and revoke tokens, with a principal holding `cluster`, never with a node's certificate. A compromised node can disrupt only itself and the databases it hosts until FR-050 binds the node-to-node calls to placement.
+
+## Amendment (FR-051): the stale-denylist bound
+
+Point 6 set the bound at three heartbeat intervals since the last successful reply. Three intervals is the right shape for a default deployment (3 s), but it is a poor bound in general: it shrinks with the interval, so a short interval, as the test suite and a tight deployment use, turns a scheduling stall of a few hundred milliseconds (a loaded host, a GC pause, a slow disk) into a node that refuses every token with `UNAVAILABLE`. With the tests' 100 ms interval the bound was 300 ms, and `scopes_hold_through_certificates_and_tokens` failed on loaded runners with a token stream ending `UNAVAILABLE` instead of `UNAUTHENTICATED`. The cost of a too-tight bound is availability only, since the node fails closed, but a healthy node should not refuse tokens for jitter.
+
+The bound is now **the control plane's heartbeat timeout** (`control.heartbeat_timeout_ms`, 5 s by default), or three heartbeat intervals if that is longer; configuration already requires three intervals to fit in the timeout, so it is the timeout in practice. The reasoning:
+
+- It is the moment the control plane itself stops counting the node as live, so the two views agree: a node the cluster still treats as a member in good standing always has a list at least that fresh, and a node cut off for longer is the one the control plane has marked down. A token is trusted only as long as the node is a live member.
+- It is still measured with `tokio::time` from the last successful reply, still fails closed, and still leaves certificates working.
+- It is expressed in a quantity the operator already sizes against the network's jitter, rather than as a multiple of an interval chosen for how quickly changes should propagate.
+
+The cost is a longer worst-case window: a node that misses a revocation while partitioned honors the revoked token for at most `heartbeat_timeout_ms` (5 s by default, up from 3 s) rather than three intervals. Revocations still reach a connected node within one heartbeat interval; tokens last minutes to days, so seconds of extra window on a partitioned node is not material. A data-only node reads the timeout from its own `[control]` table, so, as for the heartbeat interval check, keep it equal to the control node's. Points 6 and 7 and the Consequences otherwise stand, with "three heartbeat intervals" read as "the heartbeat timeout".
+
+Clients: database calls are never retried by the client library or the command line (a lost reply leaves a write's outcome unknown), so `UNAVAILABLE` from a stale node reaches the caller, who is expected to retry it, as the Consequences say. The control client retries `UNAVAILABLE` for its idempotent calls.
