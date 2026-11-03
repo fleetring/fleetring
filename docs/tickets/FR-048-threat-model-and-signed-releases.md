@@ -1,7 +1,7 @@
 ---
 id: FR-048
 title: A threat model in SECURITY.md and verifiable release artifacts
-status: in-progress
+status: done
 priority: P1
 size: M
 milestone: M10 Security
@@ -26,7 +26,7 @@ adrs: [ADR-0025]
 ## Definition of done
 
 - [x] `SECURITY.md` has the threat model table and a maintained "what a compromised X can do" section, reviewed against FR-046 and FR-047's tests.
-- [ ] A release's `SHA256SUMS` has a verifiable keyless signature, every binary and the image have attestations, and the documented verify commands succeed against the published artifacts and fail against a modified one.
+- [x] A release's `SHA256SUMS` has a verifiable keyless signature, every binary and the image have attestations, and the documented verify commands succeed against the published artifacts and fail against a modified one.
 - [x] All workflow actions are pinned by commit SHA, and the release workflow fails on an unresolved advisory.
 
 ## Progress
@@ -42,3 +42,10 @@ adrs: [ADR-0025]
   - **Reviewed against the code and tests:** `auth::policy` (`RPCS`, `ForNodes`), `auth::boundary` (token resolution, forwarding, stale denylists, stream guards, audit lines), `tls` (TLS 1.3 only, cluster name check, reload), the SQLite adapter's confinement, `replication::follower` (node calls check only that the caller is a node), and `tests/tls.rs`, `tests/scopes.rs`, and `tests/control.rs::a_node_certificate_acts_on_its_own_node_only`. Node-to-node calls not bound to placement are marked planned: FR-050.
   - **Supply chain:** checked the third criterion: every `uses:` in `.github/workflows/` names a 40-character commit, and `release.yml` runs `cargo audit --deny warnings`.
   - **Left:** the second criterion's check that the verify commands succeed against published artifacts and fail against a modified one, which waits for the first `fleetringd-v*` release.
+- 2026-11-03: Verified against the published `fleetringd` 0.2.0 release; the ticket is done.
+  - **Succeeded:**
+    - `cosign verify-blob` on `SHA256SUMS` with its `.sigstore.json` bundle, with the README's certificate identity and issuer, printed `Verified OK`.
+    - The `aarch64-apple-darwin` archive matched `SHA256SUMS`.
+    - `gh attestation verify` succeeded for that archive and for `oci://ghcr.io/fleetring/fleetringd:0.2.0`.
+  - **Failed, as they should:** a copy of `SHA256SUMS` with one byte added failed `cosign verify-blob`, and an archive with one byte appended failed `gh attestation verify`.
+  - **`RELEASING.md`** now lists these commands as the post-release checklist, so every release repeats the check.
