@@ -59,7 +59,8 @@ async fn heartbeats_report_databases_and_leave_out_unknown_ones() -> TestResult 
         handle.state().member(&node).is_some()
     })
     .await?;
-    network
+    // The operator creates databases; a node certificate may not (ADR-0026).
+    tls.client_network("tester")?
         .control_client(address)
         .create_database(CreateDatabaseRequest {
             database: "known".to_owned(),

@@ -51,6 +51,7 @@ const _: () = {
     assert_debug_send_sync::<auth::Caller>();
     assert_debug_send_sync::<auth::Credential>();
     assert_debug_send_sync::<auth::Denied>();
+    assert_debug_send_sync::<auth::ForNodes>();
     assert_debug_send_sync::<auth::Grant>();
     assert_debug_send_sync::<auth::Needed>();
     assert_debug_send_sync::<auth::Requirement>();

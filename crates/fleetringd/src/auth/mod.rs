@@ -15,7 +15,7 @@ pub use boundary::{
     authorized, require_key,
 };
 pub use denylist::Denylist;
-pub use policy::{Caller, Credential, Denied, Needed, RPCS, Requirement, Rpc, rpc_at};
+pub use policy::{Caller, Credential, Denied, ForNodes, Needed, RPCS, Requirement, Rpc, rpc_at};
 pub use scope::{Action, ParseScopeError, Scope, Scopes, Target};
 pub use token::{
     BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, IssueError, MAX_TOKEN_LEN, MAX_TOKEN_LIFETIME,
