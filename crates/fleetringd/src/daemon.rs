@@ -13,7 +13,7 @@ use tonic::transport::Server;
 
 use crate::auth::{AuthLayer, Authorizer};
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
-use crate::config::reachable;
+use crate::config::{HEARTBEATS_PER_TIMEOUT, reachable};
 use crate::control::{
     ControlHandle, ControlNode, ControlOptions, ControlService, Failover, FailoverSettings,
     NoControl, OpenError,
@@ -203,10 +203,7 @@ impl Daemon {
             (Some(role), _) => authorizer.with_control(role.node.handle()),
             (None, Some((role, _))) => authorizer.with_denylist(
                 role.membership.denylist().clone(),
-                config
-                    .membership
-                    .heartbeat_interval()
-                    .saturating_mul(DENYLIST_HEARTBEATS),
+                denylist_max_age(&config),
             ),
             (None, None) => authorizer,
         };
@@ -565,12 +562,26 @@ async fn bind(config: &Config, network: &Network) -> Result<(Listener, SocketAdd
     Ok((listener, address))
 }
 
-/// How many heartbeat intervals a data node's token denylist may go without a fresh copy before
-/// the node refuses tokens: two lost heartbeats are tolerated, as in [`HEARTBEATS_PER_TIMEOUT`],
-/// and a node cut off for longer stops trusting tokens it can no longer check (ADR-0026).
+/// How long a data node's token denylist may go without a fresh copy before the node refuses
+/// tokens (ADR-0026, amended).
+///
+/// That is the longer of the control plane's heartbeat timeout, after which it marks a member
+/// down, and [`HEARTBEATS_PER_TIMEOUT`] heartbeat intervals. A node the control plane still counts
+/// as live therefore never refuses tokens for want of a list, and a node it counts as down does
+/// within the same time: a token is trusted only as long as the node is a member in good standing.
+/// A bare multiple of the interval would shrink with it: a short interval, as a test or a tight
+/// deployment sets, would make a scheduling stall of a few hundred milliseconds refuse every
+/// token.
 ///
 /// [`HEARTBEATS_PER_TIMEOUT`]: crate::HEARTBEATS_PER_TIMEOUT
-const DENYLIST_HEARTBEATS: u32 = 3;
+fn denylist_max_age(config: &Config) -> Duration {
+    let timeout = Duration::from_millis(config.control.heartbeat_timeout_ms.get());
+    let intervals = config
+        .membership
+        .heartbeat_interval()
+        .saturating_mul(u32::try_from(HEARTBEATS_PER_TIMEOUT).unwrap_or(u32::MAX));
+    timeout.max(intervals)
+}
 
 /// Who may connect and what they may do: every connection is authenticated under `security`,
 /// and every request authorized by `authorizer` (ADR-0025).
@@ -614,5 +625,34 @@ fn serve(
         address,
         stop,
         task,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_node(tables: &str) -> Config {
+        Config::from_toml(&format!(
+            "data_dir = \"/tmp/fleetring-test\"\nlisten = \"127.0.0.1:0\"\nrole = \"data\"\n\n\
+             [node]\nid = \"data-1\"\n\n[control]\naddress = \"127.0.0.1:7400\"\n{tables}"
+        ))
+        .expect("a valid data node config")
+    }
+
+    #[test]
+    fn the_denylist_goes_stale_when_the_control_plane_would_mark_the_node_down() {
+        // The defaults: a 5 s heartbeat timeout, not three 1 s intervals.
+        assert_eq!(denylist_max_age(&data_node("")), Duration::from_secs(5));
+        // A short interval does not shorten it: the timeout is what the operator sizes against
+        // the network's jitter.
+        let fast =
+            data_node("heartbeat_timeout_ms = 1500\n\n[membership]\nheartbeat_interval_ms = 100\n");
+        assert_eq!(denylist_max_age(&fast), Duration::from_millis(1_500));
+        // Never less than three intervals, whatever the timeout.
+        let slow = data_node(
+            "heartbeat_timeout_ms = 3000\n\n[membership]\nheartbeat_interval_ms = 1000\n",
+        );
+        assert_eq!(denylist_max_age(&slow), Duration::from_secs(3));
     }
 }

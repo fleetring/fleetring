@@ -31,8 +31,14 @@ type TestResult = Result<(), Box<dyn Error>>;
 /// Guards against a hang only.
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
-/// How often the data daemon sends heartbeats, which bounds how stale its denylist is.
+/// How often the data daemon sends heartbeats, which bounds how long a revocation takes to reach
+/// it.
 const HEARTBEAT_MS: u64 = 100;
+
+/// The control plane's heartbeat timeout, which is how old the data daemon's denylist may get
+/// before it refuses tokens (ADR-0026): fifteen heartbeats, so that a heartbeat or two delayed on
+/// a loaded runner never trips it, and short enough that the test waits for it to.
+const HEARTBEAT_TIMEOUT_MS: u64 = 1_500;
 
 /// The principals every daemon in this test knows, besides `tester`.
 const PRINCIPALS: &str = "\n[[principal]]\nname = \"reader\"\nscopes = [\"read:tenant:acme/*\"]\n\
@@ -48,9 +54,8 @@ fn config(
     role: &str,
     control: Option<SocketAddr>,
 ) -> Result<String, Box<dyn Error>> {
-    let control = control.map_or_else(String::new, |address| {
-        format!("\n[control]\naddress = \"{address}\"\n")
-    });
+    let address = control.map_or_else(String::new, |address| format!("address = \"{address}\"\n"));
+    let control = format!("\n[control]\n{address}heartbeat_timeout_ms = {HEARTBEAT_TIMEOUT_MS}\n");
     // Data nodes feed every database to a file sink, so node status has sinks to filter.
     let sink = if role == "data" {
         format!(
@@ -357,9 +362,9 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
         .await
         .expect_err("revoked at the data node");
     assert_eq!(status.code(), Code::Unauthenticated, "{status}");
-    // One interval, plus the time a heartbeat takes on a loaded runner.
+    // The revocation arrives with a heartbeat, so well before the list could go stale.
     assert!(
-        waited < Duration::from_millis(HEARTBEAT_MS * 20),
+        waited < Duration::from_millis(HEARTBEAT_TIMEOUT_MS),
         "the data node refused the token after {waited:?}"
     );
     // The key's other tokens still work.
@@ -378,7 +383,7 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
     assert_eq!(ended.message(), "the token is revoked");
 
     // Cut off from the control plane, the data node stops trusting tokens once its denylist is
-    // three heartbeats old, and keeps serving certificates.
+    // as old as the control plane's heartbeat timeout, and keeps serving certificates.
     let reader = Client::new(control_target.clone(), network(&tls, "reader")?);
     control.run_until(async {}).await;
     let stale = tokio::time::timeout(HANG_GUARD, async {
