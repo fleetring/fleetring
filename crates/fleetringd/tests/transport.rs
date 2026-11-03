@@ -300,6 +300,7 @@ async fn a_four_mib_batch_round_trips_as_one_message() -> TestResult {
                 start: 0_u64.to_be_bytes().to_vec(),
                 end: end.clone(),
                 payload: vec![0xa5; 4 * 1024 * 1024],
+                chain: None,
             })),
         },
     ];

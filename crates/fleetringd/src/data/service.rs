@@ -4,7 +4,8 @@ use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
 use fleetring_proto::v1::{
     ChangeSinkStatus, CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse,
-    NodeStatusRequest, NodeStatusResponse, QueryRequest, QueryResponse, WatchLeasesRequest,
+    NodeStatusRequest, NodeStatusResponse, QueryRequest, QueryResponse, VerifyRequest,
+    VerifyResponse, WatchLeasesRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -189,5 +190,26 @@ impl Database for DatabaseService {
             watch,
             STREAM_BUFFER,
         )))
+    }
+
+    /// Answers from this node's own copy, whatever its role: the chain hash at the requested
+    /// position, or at the copy's end, recomputed from the log on disk.
+    async fn verify(
+        &self,
+        request: Request<VerifyRequest>,
+    ) -> Result<Response<VerifyResponse>, Status> {
+        let request = request.into_inner();
+        let name: DatabaseName = parse("database name", &request.database)?;
+        let at = (!request.position.is_empty()).then(|| Position::from(request.position));
+        let verified = self.node.replication().verify(&name, at).await?;
+        Ok(Response::new(VerifyResponse {
+            database: name.to_string(),
+            epoch: verified.epoch.get(),
+            position: verified
+                .position
+                .map(Position::into_bytes)
+                .unwrap_or_default(),
+            chain_hash: verified.hash.as_bytes().to_vec(),
+        }))
     }
 }

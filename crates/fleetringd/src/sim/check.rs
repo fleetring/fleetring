@@ -17,6 +17,9 @@
 //!   ([`Cluster::check_change_streams`](crate::sim::Cluster::check_change_streams));
 //! - [`lease_events_match_control`] at the end, over what the lease watchers learned and the
 //!   leases the control log granted (FR-042).
+//! - [`chains_agree`] once replicas converge and at the end, over the hash chains of every
+//!   running replica the primary counts as following its log
+//!   ([`Cluster::check_chains`](crate::sim::Cluster::check_chains)).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -29,6 +32,7 @@ use crate::MembershipView;
 use crate::changes::{ChangeRecord, RecordContent, unhex};
 use crate::control::CommandLog;
 use crate::engine::{Position, Value};
+use crate::replication::ChainHash;
 use crate::sim::workload::{Ack, History, Operation, OutcomeClass, Record, WRITES_TABLE};
 
 /// An invariant the checker enforces.
@@ -63,6 +67,9 @@ pub enum Invariant {
     /// holding one epoch, each node's events for a database arrive in epoch order, and every
     /// epoch a node acknowledged writes under was reported by that node.
     LeaseEventsMatchControl,
+    /// Every replica that follows a database's log holds the same hash chain at every position
+    /// they have in common (FR-044).
+    ChainAgrees,
 }
 
 impl fmt::Display for Invariant {
@@ -80,6 +87,7 @@ impl fmt::Display for Invariant {
             Self::ReplicasConverged => "replicas converged",
             Self::ChangeStreamConsistent => "change stream consistent",
             Self::LeaseEventsMatchControl => "lease events match control",
+            Self::ChainAgrees => "hash chains agree",
         })
     }
 }
@@ -544,6 +552,39 @@ pub fn lease_events_match_control(
 /// The rows each replica of a database holds, by host.
 pub type ReplicaRows = BTreeMap<String, BTreeSet<i64>>;
 
+/// The hash chain each replica of a database holds, by host: the hash at every position the
+/// replica still keeps one for.
+pub type ReplicaChains = BTreeMap<String, BTreeMap<Position, ChainHash>>;
+
+/// Checks that every replica in `chains` holds the same hash at every position any two of them
+/// have in common.
+///
+/// # Errors
+///
+/// [`Invariant::ChainAgrees`] naming the two replicas and the first position they differ at.
+pub fn chains_agree(database: &DatabaseName, chains: &ReplicaChains) -> Result<(), Violation> {
+    let mut all = chains.iter();
+    while let Some((host, chain)) = all.next() {
+        for (other_host, other) in all.clone() {
+            let differs = chain.iter().find_map(|(position, hash)| {
+                other
+                    .get(position)
+                    .filter(|theirs| *theirs != hash)
+                    .map(|theirs| (position, hash, theirs))
+            });
+            if let Some((position, hash, theirs)) = differs {
+                return Err(Violation::new(
+                    Invariant::ChainAgrees,
+                    format!(
+                        "{database}: at {position}, {host} holds {hash} but {other_host} holds {theirs}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks that every write to `database` that `history` says was acknowledged is held by at least
 /// `required` of `replicas`.
 ///
@@ -953,6 +994,28 @@ mod tests {
             violation.detail().contains("never saw it hold"),
             "{violation}"
         );
+    }
+
+    #[test]
+    fn chains_that_differ_at_a_common_position_are_a_violation() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let hash = |byte: u8| ChainHash::from_bytes(&[byte; ChainHash::LEN]).expect("32 bytes");
+        let mut chains = ReplicaChains::new();
+        chains.insert(
+            "a".into(),
+            BTreeMap::from([(Position::new([1]), hash(1)), (Position::new([2]), hash(2))]),
+        );
+        chains.insert("b".into(), BTreeMap::from([(Position::new([1]), hash(1))]));
+        chains.insert(
+            "c".into(),
+            BTreeMap::from([(Position::new([2]), hash(2)), (Position::new([3]), hash(3))]),
+        );
+        assert_eq!(chains_agree(&db, &chains), Ok(()));
+        chains.insert("d".into(), BTreeMap::from([(Position::new([2]), hash(9))]));
+        let violation = chains_agree(&db, &chains).expect_err("they differ");
+        assert_eq!(violation.invariant(), Invariant::ChainAgrees);
+        assert!(violation.detail().contains("a holds"), "{violation}");
+        assert!(violation.detail().contains("d holds"), "{violation}");
     }
 
     #[test]

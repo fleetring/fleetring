@@ -18,9 +18,9 @@ mod sqlite;
 mod statement;
 
 pub use adapter::{
-    Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError, EngineKind,
-    FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, OpenMode, SelfReplicating,
-    Shape,
+    BatchTransaction, Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError,
+    EngineKind, FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, OpenMode,
+    SelfReplicating, Shape,
 };
 pub use changes::{
     CaptureMode, Column, LogicalSupport, ParseCaptureModeError, RowChange, RowOperation,
@@ -35,6 +35,7 @@ pub use statement::{Executed, Rows, Statement, Transaction, Value};
 const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     const fn assert_debug_send<T: std::fmt::Debug + Send + ?Sized>() {}
+    assert_debug_send_sync::<BatchTransaction>();
     assert_debug_send_sync::<CheckpointMarker>();
     assert_debug_send_sync::<CaptureMode>();
     assert_debug_send_sync::<Column>();

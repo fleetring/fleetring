@@ -47,7 +47,7 @@ mod mirror;
 mod position;
 mod reader;
 
-pub use batch::{Batch, CutError, DecodeBatchError};
+pub use batch::{Batch, CutError, DecodeBatchError, PayloadLayout};
 pub use checksum::ChecksumOrder;
 pub use frame::{FRAME_HEADER_LEN, FrameError, FrameHeader};
 pub use header::{HeaderError, Salts, WAL_HEADER_LEN, WalHeader};
@@ -60,6 +60,7 @@ const _: () = {
     const fn assert_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     assert_send_sync::<AppendError>();
     assert_send_sync::<Batch>();
+    assert_send_sync::<PayloadLayout>();
     assert_send_sync::<ChecksumOrder>();
     assert_send_sync::<DecodeBatchError>();
     assert_send_sync::<DecodePositionError>();

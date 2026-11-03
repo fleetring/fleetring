@@ -13,8 +13,11 @@ use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Liveness, Role as DatabaseRole};
 use fleetringd::clock::{Clock as _, SystemClock};
-use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo};
-use fleetringd::engine::{Rows, Statement, Value};
+use fleetringd::data::{
+    Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo, Verification,
+};
+use fleetringd::engine::{Position, Rows, Statement, Value};
+use fleetringd::replication::ChainHash;
 use fleetringd::tls::{
     Authority, ClusterName, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
     DEFAULT_NODE_LIFETIME, Identity, Principal, Security, Validity,
@@ -204,6 +207,23 @@ enum DbCommand {
         /// Lists only the databases this node is primary for.
         #[arg(long)]
         node: Option<NodeId>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Asks every replica of a database for its hash chain at one position, the latest they all
+    /// hold unless `--at` names one, and reports whether they agree. Each replica recomputes
+    /// the hash from its log on disk, so a copy that changed since it was written is named.
+    Verify {
+        /// The database's name.
+        name: DatabaseName,
+        /// The position to verify at, as `db locate` prints it, instead of the latest every
+        /// replica holds.
+        #[arg(long, value_parser = parse_position)]
+        at: Option<Position>,
+        /// A hash recorded earlier at that position: the command also reports whether the log
+        /// still hashes to it, that is, whether nothing changed since.
+        #[arg(long)]
+        expect: Option<ChainHash>,
         #[command(flatten)]
         target: Target,
     },
@@ -424,6 +444,13 @@ fn parse_param(text: &str) -> Result<Value, String> {
     }
 }
 
+fn parse_position(text: &str) -> Result<Position, String> {
+    if text.is_empty() {
+        return Err("a position is hex digits".to_owned());
+    }
+    hex(text).map(Position::from)
+}
+
 fn hex(text: &str) -> Result<Vec<u8>, String> {
     if !text.len().is_multiple_of(2) {
         return Err(format!("'{text}' has an odd number of hex digits"));
@@ -565,6 +592,12 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             }
             format_databases(&databases)
         }
+        Command::Db(DbCommand::Verify {
+            name,
+            at,
+            expect,
+            target,
+        }) => verify(&target.client()?, &name, at, expect).await?,
         Command::Db(DbCommand::Drop { name, yes, target }) => {
             if !yes {
                 confirm_drop(&name)?;
@@ -676,6 +709,135 @@ impl SqlArgs {
             Statement::with_params(self.sql, self.params),
         ))
     }
+}
+
+/// One replica's answer to `db verify`.
+#[derive(Debug)]
+enum Answer {
+    Hash(Verification),
+    Failed(String),
+}
+
+/// Runs `db verify`: asks every replica with an address for its chain hash at `at`, or at the
+/// latest position they all hold, and reports agreement, the first replica that differs, and,
+/// with `expect`, whether the log still hashes to a hash recorded earlier.
+async fn verify(
+    client: &Client,
+    name: &DatabaseName,
+    at: Option<Position>,
+    expect: Option<ChainHash>,
+) -> Result<String, Box<dyn Error>> {
+    let location = client.locate(name).await.map_err(failed)?;
+    let replicas: Vec<(NodeId, String)> = location
+        .replicas
+        .iter()
+        .filter_map(|replica| Some((replica.node.clone(), replica.address.clone()?)))
+        .collect();
+    if replicas.is_empty() {
+        return Err(format!("no replica of {name} has an address").into());
+    }
+    let ask = |at: Option<Position>| {
+        let replicas = &replicas;
+        async move {
+            let mut answers = Vec::with_capacity(replicas.len());
+            for (node, address) in replicas {
+                let answer = match client.verify(address, name, at.as_ref()).await {
+                    Ok(verification) => Answer::Hash(verification),
+                    Err(status) => Answer::Failed(failed(status).to_string()),
+                };
+                answers.push((node.clone(), answer));
+            }
+            answers
+        }
+    };
+    // The latest position every replica holds: the lowest the control plane has heard each
+    // report, so a replica is held to what it claimed; failing that, the lowest they answer
+    // with now, asking the ones past it again there.
+    let reported = location
+        .replicas
+        .iter()
+        .filter(|replica| replica.address.is_some())
+        .map(|replica| replica.position.clone())
+        .min()
+        .flatten();
+    let mut answers = ask(at.clone().or_else(|| reported.clone())).await;
+    let position = match at.or(reported) {
+        Some(at) => Some(at),
+        None => {
+            let common = answers
+                .iter()
+                .filter_map(|(_, answer)| match answer {
+                    Answer::Hash(verification) => Some(verification.position.clone()),
+                    Answer::Failed(_) => None,
+                })
+                .min()
+                .flatten();
+            let behind = answers.iter().any(|(_, answer)| {
+                matches!(answer, Answer::Hash(verification) if verification.position != common)
+            });
+            if behind {
+                answers = ask(common.clone()).await;
+            }
+            common
+        }
+    };
+    let position_text = position
+        .as_ref()
+        .map_or_else(|| "empty log".to_owned(), ToString::to_string);
+    let mut output = format!(
+        "database: {name}
+position: {position_text}
+"
+    );
+    let mut agreed: Option<&ChainHash> = None;
+    let mut differs: Option<(&NodeId, String)> = None;
+    for (node, answer) in &answers {
+        match answer {
+            Answer::Hash(verification) => {
+                let _ = writeln!(output, "  {node}: {}", verification.chain_hash);
+                match agreed {
+                    None => agreed = Some(&verification.chain_hash),
+                    Some(hash) if *hash != verification.chain_hash && differs.is_none() => {
+                        differs = Some((node, format!("holds {}", verification.chain_hash)));
+                    }
+                    Some(_) => {}
+                }
+            }
+            Answer::Failed(reason) => {
+                let _ = writeln!(output, "  {node}: {reason}");
+                if differs.is_none() {
+                    differs = Some((node, reason.clone()));
+                }
+            }
+        }
+    }
+    let Some(hash) = agreed else {
+        return Err(format!("{output}no replica of {name} could answer").into());
+    };
+    if let Some((node, reason)) = differs {
+        return Err(format!(
+            "{output}replicas of {name} disagree at {position_text}: {node} {reason}"
+        )
+        .into());
+    }
+    let _ = writeln!(
+        output,
+        "chain hash: {hash}
+all {} replica{} agree",
+        answers.len(),
+        plural(u64::try_from(answers.len()).unwrap_or(u64::MAX))
+    );
+    if let Some(expect) = expect {
+        if expect == *hash {
+            let _ = writeln!(output, "nothing changed since {position_text}");
+        } else {
+            return Err(format!(
+                "{output}the log at {position_text} hashes to {hash}, not the expected {expect}"
+            )
+            .into());
+        }
+    }
+    Ok(output)
 }
 
 /// Asks on the terminal whether to drop `name`, and refuses without a terminal.

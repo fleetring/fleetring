@@ -37,10 +37,10 @@ pub use follower::SqliteFollower;
 use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX};
 use self::pins::Pins;
 use crate::engine::{
-    CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, EngineCapability,
-    EngineError, EngineKind, Executed, FrameBatch, FrameFollower, FrameSource, FrameSourceEngine,
-    LogicalChanges, LogicalSupport, OpenMode, PinnedSnapshot, Position, RowChange, Rows, Snapshot,
-    SnapshotFile, Statement, Transaction, Value,
+    BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
+    EngineCapability, EngineError, EngineKind, Executed, FrameBatch, FrameFollower, FrameSource,
+    FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode, PinnedSnapshot, Position,
+    RowChange, Rows, Snapshot, SnapshotFile, Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -158,6 +158,27 @@ impl DatabaseEngine for SqliteEngine {
 impl FrameSourceEngine for SqliteEngine {
     fn open_follower(&self, location: &Path) -> Result<Box<dyn FrameFollower>, EngineError> {
         Ok(Box::new(SqliteFollower::open(location)?))
+    }
+
+    /// Each transaction is the frames up to and including a commit frame. The generation's WAL
+    /// header, when the batch starts one, goes with the first; the payload's own fixed fields,
+    /// which describe the batch rather than the log, belong to none.
+    fn transactions(&self, batch: &FrameBatch) -> Result<Vec<BatchTransaction>, EngineError> {
+        let layout = Batch::layout(batch.payload.as_bytes())
+            .map_err(|error| EngineError::InvalidPayload(error.into()))?;
+        let mut from = layout.log_at;
+        Ok(layout
+            .ends
+            .into_iter()
+            .map(|(to, end)| {
+                let bytes = from..to;
+                from = to;
+                BatchTransaction {
+                    end: encode_position(end),
+                    bytes,
+                }
+            })
+            .collect())
     }
 }
 
@@ -327,6 +348,19 @@ fn read_wal_file(
     Ok(batch)
 }
 
+/// The part of `batch` up to `until`, a transaction boundary inside it or its end, as the batch a
+/// reader bounded by a position gets.
+fn cut_at(batch: &Batch, until: &Position) -> Result<FrameBatch, EngineError> {
+    let end = decode_position(until)?;
+    if batch.end() == end {
+        return Ok(frame_batch(batch));
+    }
+    let cut = batch.up_to(end).map_err(|_| EngineError::InvalidPosition {
+        position: until.clone(),
+    })?;
+    Ok(frame_batch(&cut))
+}
+
 /// The batch a primary ships or a follower serves: `batch` with its positions and payload
 /// encoded.
 fn frame_batch(batch: &Batch) -> FrameBatch {
@@ -469,14 +503,7 @@ impl FrameSource for SqliteDatabase {
         let Some(batch) = self.read_wal(after)? else {
             return Ok(None);
         };
-        let end = decode_position(until)?;
-        if batch.end() == end {
-            return Ok(Some(frame_batch(&batch)));
-        }
-        let cut = batch.up_to(end).map_err(|_| EngineError::InvalidPosition {
-            position: until.clone(),
-        })?;
-        Ok(Some(frame_batch(&cut)))
+        cut_at(&batch, until).map(Some)
     }
 
     fn checkpoint(&mut self) -> Result<CheckpointMarker, EngineError> {

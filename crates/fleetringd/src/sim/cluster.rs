@@ -21,7 +21,7 @@ use crate::engine::{EngineConfig, Execution};
 use crate::layout;
 use crate::replication::{Replication, ReplicationSettings};
 use crate::sim::SimRng;
-use crate::sim::check::{self, ControlLog, ReplicaRows, Violation};
+use crate::sim::check::{self, ControlLog, ReplicaChains, ReplicaRows, Violation};
 use crate::sim::client::{Session, WatcherSession, run_client, run_lease_watcher};
 use crate::sim::fault::{Fault, LossRate};
 use crate::sim::history::{self, Guarantee, Replicated};
@@ -890,6 +890,64 @@ impl Cluster {
         Ok(rows)
     }
 
+    /// Returns the hash chain each running replica of `database` holds, by host: the primary's,
+    /// and every follower's that the primary counts as connected and on its log, so a follower
+    /// cut off with a tail the next epoch will truncate isn't compared.
+    #[must_use]
+    pub fn replica_chains(&self, database: &DatabaseName) -> ReplicaChains {
+        let mut chains = ReplicaChains::new();
+        let Some(primary) = self.primary_replication(database) else {
+            return chains;
+        };
+        let Some(status) = primary.primary_status(database) else {
+            return chains;
+        };
+        let primary_host = self
+            .hosts
+            .iter()
+            .map(|host| host.name.clone())
+            .find(|host| {
+                self.replication(host)
+                    .is_some_and(|replication| replication.primary_status(database).is_some())
+            });
+        if let (Some(host), Some(chain)) = (primary_host, primary.chain_history(database)) {
+            chains.insert(host, chain);
+        }
+        for follower in status
+            .followers
+            .iter()
+            .filter(|follower| follower.connected && follower.reported && !follower.needs_snapshot)
+        {
+            let host = follower.node.to_string();
+            if let Some(chain) = self
+                .replication(&host)
+                .and_then(|replication| replication.chain_history(database))
+            {
+                chains.insert(host, chain);
+            }
+        }
+        chains
+    }
+
+    /// Checks that the replicas of every database created through the data plane agree on
+    /// their hash chains at every position they have in common ([`check::chains_agree`]), as
+    /// [`Cluster::replica_chains`] gathers them. Returns how many databases were checked.
+    ///
+    /// # Errors
+    ///
+    /// A [`Violation`] of [`Invariant::ChainAgrees`](check::Invariant::ChainAgrees).
+    pub fn check_chains(&self) -> Result<usize, Violation> {
+        let mut checked = 0;
+        for (database, _) in created(&self.history()) {
+            let chains = self.replica_chains(&database);
+            if chains.len() > 1 {
+                check::chains_agree(&database, &chains)?;
+                checked += 1;
+            }
+        }
+        Ok(checked)
+    }
+
     /// Runs the history checker ([`history::check`]) over every operation so far and each
     /// host's copy of every database created through the data plane, read from disk: every
     /// acknowledged write is on a write quorum and in every later read, no refused write is
@@ -950,19 +1008,21 @@ impl Cluster {
 
     /// Steps until the followers of every database created through the data plane have
     /// acknowledged everything its primary committed, then checks that every replica holds the
-    /// same rows and runs the history checker ([`Cluster::check_history`]).
+    /// same rows and the same hash chain ([`Cluster::check_chains`]), and runs the history
+    /// checker ([`Cluster::check_history`]).
     ///
     /// # Errors
     ///
     /// [`SimError::Timeout`] if the followers don't catch up within `limit`, or a [`Violation`]
-    /// of [`Invariant::ReplicasConverged`](check::Invariant::ReplicasConverged) or from the
-    /// history checker.
+    /// of [`Invariant::ReplicasConverged`](check::Invariant::ReplicasConverged),
+    /// [`Invariant::ChainAgrees`](check::Invariant::ChainAgrees), or from the history checker.
     pub fn await_replicas_converged(&mut self, limit: Duration) -> Result<Duration, SimError> {
         let took = self.run_until(limit, "replicas catching up", Self::replicas_caught_up)?;
         for (database, _) in created(&self.history()) {
             let rows = self.replica_rows(&database)?;
             check::replicas_converged(&database, &rows)?;
         }
+        self.check_chains()?;
         self.check_history()?;
         Ok(took)
     }
@@ -1180,7 +1240,8 @@ impl Cluster {
         })
     }
 
-    /// Stops every host gracefully and runs the final checks: the history checker
+    /// Stops every host gracefully and runs the final checks: the hash chains of every replica
+    /// still following agree ([`Cluster::check_chains`]), the history checker
     /// ([`Cluster::check_history`]) over the whole history and every host's copy on disk, the
     /// control log replays to the state the control node last published, which holds every
     /// acknowledged control operation, and what the lease watchers learned matches the leases
@@ -1191,6 +1252,7 @@ impl Cluster {
     /// A [`Violation`], or an error from stepping while hosts stop.
     pub fn finish(mut self) -> Result<Report, SimError> {
         self.check()?;
+        self.check_chains()?;
         let control = self.control_handle();
         self.record(EventKind::Note("shutting down".into()));
         let running: Vec<String> = self.shared.lock().running.keys().cloned().collect();

@@ -1,6 +1,8 @@
-//! FR-030, FR-032, and FR-042: the replication stream, follower mirroring, the write quorum,
-//! snapshot catch-up, and the lease watch, over real TCP and real SQLite.
+//! FR-030, FR-032, FR-042, and FR-044: the replication stream, follower mirroring, the write
+//! quorum, snapshot catch-up, the lease watch, and the log's hash chain, over real TCP and real
+//! SQLite.
 
+mod chain;
 mod common;
 mod durability;
 mod heartbeat;

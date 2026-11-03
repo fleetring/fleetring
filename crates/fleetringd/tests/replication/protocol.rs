@@ -73,6 +73,7 @@ async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResu
             start: vec![0xff; 20],
             end: vec![0xff; 21],
             payload: Vec::new(),
+            chain: None,
         })),
     };
     let (acks, status) = replicate(&follower, vec![open("fenced", 1), gap]).await?;
@@ -120,6 +121,7 @@ async fn a_follower_whose_copy_the_frames_dont_continue_asks_for_a_snapshot() ->
             start: first.position.clone(),
             end: vec![end; 20],
             payload: vec![0xa5; 64],
+            chain: None,
         })),
     };
     sender.send(foreign(0xfe)).await?;

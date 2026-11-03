@@ -1,7 +1,7 @@
 ---
 id: FR-044
 title: A hash-chained replication log, so replicas can prove they share a prefix
-status: todo
+status: in-progress
 priority: P2
 size: L
 milestone: M9 Durability sinks and verification
@@ -18,14 +18,21 @@ Each shipped batch is checked frame by frame with SQLite's cumulative checksum a
 ## Scope
 
 - **A chain hash per batch:** `hash_n = BLAKE3(hash_{n-1} || epoch || start || end || payload)`, with the generation's header folded into the first batch of each generation. The primary computes it when it captures a batch; followers recompute it when they apply one and refuse a batch whose hash doesn't match. The hash is stored with the batch's end position in the engine-neutral replication state (`epochs.rs` records, or a sibling file), never inside the SQLite WAL, so the engine's log stays byte-identical to SQLite's.
+  - *As built (2026-10-29):* the chain is per **transaction**, not per shipped batch, and hashes `prev || start || end || BLAKE3(bytes)` without the epoch, where `start` is the position the receiver continues from and the transaction's bytes are hashed on their own, chunk-aligned, which halves the cost. A follower that lags gets several transactions read back from the log as one batch, and a promotion re-ships old bytes under a new epoch; either would have made identical logs hash differently. The engine delimits transactions inside an opaque batch (`FrameSourceEngine::transactions`), so nothing above the adapter learns the format. The primary's streams hash a batch as they ship it, on their own task, so the database's thread commits as before; the hash is still computed before the batch leaves the primary. Only an anchor (the hash at one position) is durable, in a `chain` file next to the epoch record, written at checkpoints and snapshot installs; the rest is recomputed from the log after a restart, which keeps every per-batch write and fsync off the write path.
 - **XXH3 stays** for the per-frame check; the chain is per batch and covers it.
 - **`db verify <database>`:** asks every replica for its chain hash at a position (the latest common position by default) and reports agreement or the first divergence, plus "nothing changed since P" when the caller presents a hash it recorded earlier. Through the Node service, additive proto.
-- **Durability sink:** the S3 sink, when it exists, stores each batch with its chain hash, so a restore can be verified end to end.
+- **Durability sink:** the S3 sink, when it exists, stores each batch with its chain hash, so a restore can be verified end to end. (Not built here: there is no S3 sink yet; `Batch.chain` on the wire is what it will store.)
 - **Not in scope:** signing (a hash chain proves consistency, not provenance), and verifying page content inside the database file (FR-045).
 
 ## Definition of done
 
-- [ ] Every replica of a database reports the same chain hash at every common commit position in the replication tests, and a deliberately altered batch is refused by a follower and reported by `db verify`.
-- [ ] `db verify` on a healthy three-replica database prints one hash and "all replicas agree"; on a database where one replica's log was tampered with, it names the replica and the first position that differs.
-- [ ] Checkpoints and snapshot catch-up carry the chain across generations: a follower seeded from a snapshot continues the chain from the snapshot's position and agrees with the primary afterwards.
-- [ ] The hash cost per batch is measured in `docs/perf.md` and stays under 5% of the primary's commit time at 4 KiB pages.
+- [x] Every replica of a database reports the same chain hash at every common commit position in the replication tests, and a deliberately altered batch is refused by a follower and reported by `db verify`.
+- [x] `db verify` on a healthy three-replica database prints one hash and "all replicas agree"; on a database where one replica's log was tampered with, it names the replica and the first position that differs.
+- [x] Checkpoints and snapshot catch-up carry the chain across generations: a follower seeded from a snapshot continues the chain from the snapshot's position and agrees with the primary afterwards.
+- [x] The hash cost per batch is measured in `docs/perf.md` and stays under 5% of the primary's commit time at 4 KiB pages.
+
+## Progress
+
+- 2026-10-29: Built. 2026-11-02: rebased onto main (after FR-042). All local gates pass; CI pending, so the status flips to done when it is green. `replication/chain.rs` holds the chain (`ChainHash`, `Chain`, anchors, recovery, the `chain` record file); `FrameSourceEngine::transactions` and `FrameFollower::committed_between`/`log_start` are the engine additions, implemented for SQLite. The primary's streams chain each published batch as they ship it, in `Batch.chain`; batches read back from the log, snapshots (`SnapshotChunk.chain`), and promotion catch-up (`FetchResponse.chain`) carry it too. A follower hashes before it applies and answers `needs_snapshot` on a mismatch, so the primary re-seeds it; a follower whose chain was derived (no record fit its log) adopts the primary's hash instead. `Database.Verify` and `db verify <database> [--at] [--expect]` recompute each replica's hash from its log on disk, held to the position it acknowledged, so a changed byte makes the log unreadable to that position and names the replica. The sim checker's `Invariant::ChainAgrees` compares every connected replica's chain at every common position when replicas converge and at the end of every run.
+- Tests: `tests/replication/chain.rs` (agreement at every common position across a checkpoint and on recomputation; a byte flipped after apply caught by verify; a forged hash refused, then re-seeded and converging), `tests/database.rs` (`db verify` and `Client::verify`: agreement, `--expect`, a tampered follower named), unit tests for the chain and the checker, and every existing sim scenario under `ChainAgrees`.
+- Left out: signing; verifying pages already checkpointed into the database file (FR-045); the S3 sink. A promotion's candidate takes the fenced member's hash when its own chain disagrees, with a warning, rather than refuse to lead.

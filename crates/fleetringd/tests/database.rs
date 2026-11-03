@@ -1175,9 +1175,11 @@ mod binary {
     use std::path::Path;
     use std::process::{Command, Output};
 
+    use fleetringd::engine::{Statement, Value};
+
     use super::{
-        Cluster, FAST_LEASES, Location, TestResult, config, every_node_has, follower_address, name,
-        no_node_has, three, wait_until,
+        Cluster, FAST_LEASES, Location, TestResult, config, database_file, every_node_has,
+        follower_address, name, no_node_has, three, wait_until,
     };
 
     /// Runs `fleetringd` with `args` on a blocking thread, so the daemons in this process keep
@@ -1384,6 +1386,148 @@ mod binary {
             stderr.contains("Client specified an invalid argument"),
             "{stderr}"
         );
+
+        cluster.stop().await;
+        Ok(())
+    }
+
+    /// FR-044: `db verify` prints one hash and that every replica agrees, confirms a hash
+    /// recorded earlier, and names the replica whose log changed since.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_command_line_verifies_every_replicas_hash_chain() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let cluster = Cluster::start(dir.path()).await?;
+        let control = cluster.control_address()?;
+        let client = cluster.client()?;
+        let ledger = name("ledger")?;
+        let created = client.create_database(&ledger, three()?).await?;
+        client
+            .execute(&ledger, Statement::new("CREATE TABLE t (n INTEGER)"))
+            .await?;
+        for n in 0..5_i64 {
+            client
+                .execute(
+                    &ledger,
+                    Statement::with_params("INSERT INTO t VALUES (?)", [Value::Integer(n)]),
+                )
+                .await?;
+        }
+        let follower = created.followers().next().ok_or("a follower")?.node.clone();
+        // Every replica has caught up to the primary's latest position and reported so.
+        let primary_address = created
+            .primary_replica()
+            .and_then(|replica| replica.address.clone())
+            .ok_or("the primary's address")?;
+        let latest = client
+            .verify(&primary_address, &ledger, None)
+            .await?
+            .position;
+        assert!(latest.is_some());
+        wait_until("every replica reporting the latest position", async || {
+            let Ok(located) = client.locate(&ledger).await else {
+                return false;
+            };
+            located.replicas.len() == 3
+                && located
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.position == latest)
+        })
+        .await?;
+
+        let verified = stdout(
+            &fleetringd(
+                cluster.tls.dir(),
+                args(&["db", "verify", "ledger"], &control),
+            )
+            .await?,
+        )?;
+        assert!(
+            verified.starts_with(
+                "database: ledger
+position: "
+            ),
+            "{verified}"
+        );
+        assert!(
+            verified.contains(
+                "
+all 3 replicas agree
+"
+            ),
+            "{verified}"
+        );
+        let hash = verified
+            .lines()
+            .find_map(|line| line.strip_prefix("chain hash: "))
+            .ok_or("a chain hash line")?
+            .to_owned();
+        assert_eq!(hash.len(), 64, "{verified}");
+        let position = verified
+            .lines()
+            .find_map(|line| line.strip_prefix("position: "))
+            .ok_or("a position line")?
+            .to_owned();
+
+        // The same hash through the client, and `--expect` confirms nothing changed.
+        let through_client = client.verify(&primary_address, &ledger, None).await?;
+        assert_eq!(through_client.chain_hash.to_string(), hash);
+        assert_eq!(through_client.epoch.get(), 1);
+        let expected = stdout(
+            &fleetringd(
+                cluster.tls.dir(),
+                args(
+                    &[
+                        "db", "verify", "ledger", "--at", &position, "--expect", &hash,
+                    ],
+                    &control,
+                ),
+            )
+            .await?,
+        )?;
+        assert!(
+            expected.contains(&format!(
+                "nothing changed since {position}
+"
+            )),
+            "{expected}"
+        );
+        let mismatch = fleetringd(
+            cluster.tls.dir(),
+            args(
+                &["db", "verify", "ledger", "--expect", &"0".repeat(64)],
+                &control,
+            ),
+        )
+        .await?;
+        assert!(!mismatch.status.success());
+        assert!(
+            String::from_utf8_lossy(&mismatch.stderr).contains("not the expected"),
+            "{}",
+            String::from_utf8_lossy(&mismatch.stderr)
+        );
+
+        // A byte flipped in a follower's log after it was applied names that follower.
+        let wal =
+            database_file(dir.path(), follower.as_str(), "ledger").with_file_name("data.db-wal");
+        let mut bytes = std::fs::read(&wal)?;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&wal, &bytes)?;
+        let tampered = fleetringd(
+            cluster.tls.dir(),
+            args(&["db", "verify", "ledger"], &control),
+        )
+        .await?;
+        assert!(!tampered.status.success());
+        let stderr = String::from_utf8_lossy(&tampered.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "replicas of ledger disagree at {position}: {follower} "
+            )),
+            "{stderr}"
+        );
+        assert!(stderr.contains("can't be read back"), "{stderr}");
 
         cluster.stop().await;
         Ok(())

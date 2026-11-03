@@ -329,6 +329,10 @@ message Batch {
   bytes start = 2;
   bytes end = 3;
   bytes payload = 4;
+  // The sender's hash chain at `end` (FR-044): BLAKE3 over each transaction in turn, each
+  // folding in the hash before it. A follower recomputes it over the batch and refuses one
+  // that doesn't match. Unset by a sender that predates the field.
+  optional bytes chain = 5;
 }
 
 message CheckpointMarker {
@@ -379,6 +383,9 @@ message FetchResponse {
   optional Batch batch = 1;
   // The epoch of the primary that wrote the last frames of the replica's log.
   uint64 log_epoch = 2;
+  // The replica's hash chain at the batch's end, or at `after` if there is no batch (FR-044).
+  // Unset by a replica that predates the field, or whose chain doesn't reach there.
+  optional bytes chain = 3;
 }
 
 message PromoteRequest {
@@ -402,6 +409,9 @@ message SnapshotChunk {
   // restarts from offset 0.
   optional bytes position = 3;
   optional bytes checksum = 4;
+  // On the last chunk: the primary's hash chain at `position` (FR-044), which the follower's
+  // chain continues from. Unset by a primary that predates the field.
+  optional bytes chain = 5;
 }
 
 // ---- Database (v0.1 only; the router replaces it) ---------------------------------------------
@@ -424,6 +434,9 @@ service Database {
   // and lost before the node stops answering for the database. A subscriber that falls behind
   // gets RESOURCE_EXHAUSTED and opens the stream again for a fresh snapshot.
   rpc WatchLeases(WatchLeasesRequest) returns (stream LeaseUpdate);
+  // This node's hash chain over a database's replication log at a position (FR-044), read back
+  // from its copy, so that an operator can compare every replica's. Any replica answers.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 
 message WatchLeasesRequest {}
@@ -459,6 +472,22 @@ message LeaseEvent {
   string database = 1;
   uint64 epoch = 2;
   LeaseEventKind kind = 3;
+}
+
+message VerifyRequest {
+  string database = 1;
+  // The position to report the chain at; empty for the latest this replica holds.
+  bytes position = 2;
+}
+
+message VerifyResponse {
+  string database = 1;
+  // The epoch of the primary that wrote the last frames of this replica's log.
+  uint64 epoch = 2;
+  // The position the chain hash is at; empty for an empty log.
+  bytes position = 3;
+  // The 32-byte BLAKE3 chain hash at `position`.
+  bytes chain_hash = 4;
 }
 
 message NodeStatusRequest {}

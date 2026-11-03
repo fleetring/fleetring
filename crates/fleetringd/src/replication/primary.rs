@@ -15,14 +15,18 @@ use tokio::time::{self, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 
+use super::chain::{Anchor, Chain, ChainHash, Links, LogRead};
+use super::follower::blocking;
 use super::{
-    FollowerProgress, Inner, PRIMARY_METADATA_KEY, PrimaryRole, PrimaryStatus, Quorum, failed,
-    refused,
+    FollowerProgress, Inner, PRIMARY_METADATA_KEY, PrimaryRole, PrimaryStatus, Quorum, Verified,
+    chain, failed, refused,
 };
-use crate::DatabaseError;
-use crate::engine::{CheckpointMarker, EngineError, FrameBatch, Position};
+use crate::engine::{
+    CheckpointMarker, EngineCapability, EngineError, FrameBatch, FrameSourceEngine, Position,
+};
 use crate::sink::{Acknowledged, Acknowledgement, ReplicationError};
 use crate::transport::replication_client;
+use crate::{DatabaseError, DatabaseHandle};
 
 /// One database this node is primary for: what it has published, and how far each follower has
 /// got.
@@ -45,7 +49,9 @@ struct State {
     committed: Option<Position>,
     /// Published batches that some follower may still need, oldest first, each continuing the
     /// one before.
-    recent: VecDeque<FrameBatch>,
+    recent: VecDeque<Shipped>,
+    /// The hash chain over the log, once [`drive`] has rebuilt it from the record and the log.
+    chain: ChainState,
     /// The position the oldest retained batch continues from, once known.
     base: Option<Option<Position>>,
     recent_bytes: usize,
@@ -60,6 +66,24 @@ struct State {
     followers: BTreeMap<NodeId, Progress>,
     /// How far each change stream's sink has got (FR-039).
     sinks: BTreeMap<String, SinkProgress>,
+}
+
+/// A published batch, with the chain hash at its end if the chain covered it.
+#[derive(Debug, Clone)]
+struct Shipped {
+    batch: FrameBatch,
+    chain: Option<ChainHash>,
+}
+
+/// Where the primary's chain stands.
+#[derive(Debug, Default)]
+enum ChainState {
+    /// [`drive`] is rebuilding it from the record and the log; batches ship without a hash.
+    #[default]
+    Loading,
+    Ready(Chain),
+    /// A batch was published that the chain couldn't continue from; it is being rebuilt.
+    Lost,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,7 +110,7 @@ enum Plan {
     /// Nothing: the follower has everything published.
     Wait,
     /// A published batch, as it was captured.
-    Send(FrameBatch),
+    Send(Shipped),
     /// Every commit after `after`, read back from the log as one batch, valid only if no
     /// checkpoint started or ended meanwhile.
     Read {
@@ -123,6 +147,177 @@ impl Primary {
     /// How many batches have been published since this primary started serving.
     pub(super) fn published(&self) -> u64 {
         self.lock().published
+    }
+
+    /// The chain hash at `position`, if the chain is built and holds it.
+    pub(super) fn hash_at(&self, position: Option<&Position>) -> Option<ChainHash> {
+        match &self.lock().chain {
+            ChainState::Ready(chain) => chain.hash_at(position),
+            _ => None,
+        }
+    }
+
+    /// Every position the chain holds a hash at, if it is built.
+    pub(super) fn chain_history(&self) -> Option<BTreeMap<Position, ChainHash>> {
+        match &self.lock().chain {
+            ChainState::Ready(chain) => Some(chain.history()),
+            _ => None,
+        }
+    }
+
+    /// The chain's anchor, if it is built.
+    fn chain_anchor(&self) -> Option<Anchor> {
+        match &self.lock().chain {
+            ChainState::Ready(chain) => Some(chain.anchor().clone()),
+            _ => None,
+        }
+    }
+
+    /// Takes the rebuilt chain, unless a batch was published meanwhile that it doesn't reach:
+    /// then the rebuild starts over.
+    fn chain_built(&self, chain: Chain) -> Result<(), ()> {
+        let mut state = self.lock();
+        if chain.tip().0 == state.committed.as_ref()
+            || state.chain_can_reach(&chain, state.committed.as_ref())
+        {
+            state.chain = ChainState::Ready(chain);
+            Ok(())
+        } else {
+            state.chain = ChainState::Lost;
+            Err(())
+        }
+    }
+
+    /// Chains `batch`, which continues the log from `from`, and returns the hash at its end, or
+    /// `None` if the chain isn't built or can't reach `from` even through the retained batches,
+    /// in which case it is rebuilt.
+    ///
+    /// A stream calls this as it ships the batch, so the hashing lands on the stream's task
+    /// rather than the database's thread, and only the chain's bookkeeping runs under the lock.
+    /// The hash of a retained batch is kept with it, so the other streams reuse it.
+    fn link(
+        &self,
+        engine: &dyn FrameSourceEngine,
+        from: Option<&Position>,
+        batch: &FrameBatch,
+    ) -> Option<ChainHash> {
+        let from_hash = {
+            let mut state = self.lock();
+            if let Some(shipped) = state
+                .recent
+                .iter()
+                .find(|shipped| shipped.batch.end == batch.end)
+                && let Some(hash) = shipped.chain
+            {
+                return Some(hash);
+            }
+            let State { chain, recent, .. } = &mut *state;
+            let ChainState::Ready(chain) = chain else {
+                return None;
+            };
+            if chain.hash_at(from).is_none() {
+                let reached = from.is_some_and(|from| {
+                    let tip = chain.tip().0.cloned();
+                    let index = recent
+                        .iter()
+                        .position(|shipped| Some(&shipped.batch.end) == tip.as_ref())
+                        .map_or(0, |index| index + 1);
+                    let recent: Vec<&FrameBatch> = recent
+                        .iter()
+                        .skip(index)
+                        .map(|shipped| &shipped.batch)
+                        .collect();
+                    fill_gap(chain, engine, &recent, from)
+                });
+                if !reached {
+                    tracing::warn!(database = %self.name, from = ?from, "the chain doesn't reach a published batch; rebuilding it");
+                    state.chain = ChainState::Lost;
+                    return None;
+                }
+            }
+            chain.hash_at(from)?
+        };
+        let links = match Links::compute(engine, from_hash, from, batch) {
+            Ok(links) => links,
+            Err(error) => {
+                tracing::warn!(database = %self.name, %error, "can't chain a published batch; rebuilding the chain");
+                self.lock().chain = ChainState::Lost;
+                return None;
+            }
+        };
+        let hash = links.end();
+        let mut state = self.lock();
+        let ChainState::Ready(chain) = &mut state.chain else {
+            return None;
+        };
+        if let Err(error) = chain.absorb(links) {
+            tracing::warn!(database = %self.name, %error, "the chain and a published batch disagree; rebuilding the chain");
+            state.chain = ChainState::Lost;
+            return None;
+        }
+        if let Some(shipped) = state
+            .recent
+            .iter_mut()
+            .find(|shipped| shipped.batch.end == batch.end)
+        {
+            shipped.chain = Some(hash);
+        }
+        Some(hash)
+    }
+
+    /// Chains the retained batches after the chain's tip up to `target`. Returns whether the
+    /// chain holds `target` afterwards.
+    fn link_retained(&self, engine: &dyn FrameSourceEngine, target: Option<&Position>) -> bool {
+        let mut state = self.lock();
+        let State { chain, recent, .. } = &mut *state;
+        let ChainState::Ready(chain) = chain else {
+            return false;
+        };
+        if chain.hash_at(target).is_some() {
+            return true;
+        }
+        let Some(target) = target else {
+            return false;
+        };
+        let tip = chain.tip().0.cloned();
+        let index = recent
+            .iter()
+            .position(|shipped| Some(&shipped.batch.end) == tip.as_ref())
+            .map_or(0, |index| index + 1);
+        let retained: Vec<&FrameBatch> = recent
+            .iter()
+            .skip(index)
+            .map(|shipped| &shipped.batch)
+            .collect();
+        fill_gap(chain, engine, &retained, target)
+    }
+
+    /// The position the chain ends at, if it is built.
+    fn chain_tip(&self) -> Option<Option<Position>> {
+        match &self.lock().chain {
+            ChainState::Ready(chain) => Some(chain.tip().0.cloned()),
+            _ => None,
+        }
+    }
+
+    /// Whether the chain was lost and needs rebuilding; sets it loading if so.
+    fn take_lost(&self) -> bool {
+        let mut state = self.lock();
+        if matches!(state.chain, ChainState::Lost) {
+            state.chain = ChainState::Loading;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Moves the chain's anchor to `position`, where a checkpoint just ended, and returns the
+    /// anchor to record.
+    fn rebase_chain(&self, position: &Position) -> Option<Anchor> {
+        match &mut self.lock().chain {
+            ChainState::Ready(chain) => chain.rebase(position),
+            _ => None,
+        }
     }
 
     /// The highest position the write quorum holds: every batch ending at or before it is
@@ -425,13 +620,33 @@ impl Primary {
 }
 
 impl State {
+    /// Whether `chain` reaches `position` through the retained batches, which hold what was
+    /// published while the chain was being rebuilt.
+    fn chain_can_reach(&self, chain: &Chain, position: Option<&Position>) -> bool {
+        let Some(position) = position else {
+            return chain.tip().0.is_none();
+        };
+        let (tip, _) = chain.tip();
+        if tip == Some(position) {
+            return true;
+        }
+        let Some(index) = self.following(tip) else {
+            return false;
+        };
+        self.recent
+            .iter()
+            .skip(index)
+            .any(|shipped| shipped.batch.end == *position)
+    }
+
     /// Whether a follower that holds the log up to `acked` can get everything after it once the
     /// log restarts: it holds everything, or every later batch is retained.
     fn resumable(&self, acked: Option<&Position>) -> bool {
         if acked == self.committed.as_ref() {
             return true;
         }
-        let retained_to_end = self.recent.back().map(|batch| &batch.end) == self.committed.as_ref();
+        let retained_to_end =
+            self.recent.back().map(|shipped| &shipped.batch.end) == self.committed.as_ref();
         retained_to_end && self.following(acked).is_some()
     }
 
@@ -449,11 +664,12 @@ impl State {
         let position = position?;
         self.recent
             .iter()
-            .position(|batch| batch.end == *position)
+            .position(|shipped| shipped.batch.end == *position)
             .map(|index| index + 1)
     }
 
-    fn append(&mut self, batch: FrameBatch, retained_bytes: usize) {
+    fn append(&mut self, shipped: Shipped, retained_bytes: usize) {
+        let batch = &shipped.batch;
         self.log_bytes = self
             .log_bytes
             .saturating_add(u64::try_from(batch.payload.len()).unwrap_or(u64::MAX));
@@ -466,7 +682,7 @@ impl State {
             self.committed = Some(batch.end.clone());
         }
         self.published = self.published.saturating_add(1);
-        self.recent.push_back(batch);
+        self.recent.push_back(shipped);
         self.prune(retained_bytes);
     }
 
@@ -485,12 +701,12 @@ impl State {
             .min()
             .unwrap_or(self.committed.as_ref());
         while let Some(front) = self.recent.front() {
-            let held = everyone.is_some_and(|everyone| front.end <= *everyone);
+            let held = everyone.is_some_and(|everyone| front.batch.end <= *everyone);
             if !held && self.recent_bytes <= retained_bytes {
                 break;
             }
-            self.recent_bytes -= front.payload.len();
-            self.base = Some(Some(front.end.clone()));
+            self.recent_bytes -= front.batch.payload.len();
+            self.base = Some(Some(front.batch.end.clone()));
             self.recent.pop_front();
         }
     }
@@ -504,7 +720,11 @@ pub(super) fn publish(
     batch: FrameBatch,
 ) -> Acknowledgement {
     let end = batch.end.clone();
-    primary.lock().append(batch, inner.settings.retained_bytes);
+    // The batch is hashed onto the chain by the first stream that ships it, off this thread.
+    primary.lock().append(
+        Shipped { batch, chain: None },
+        inner.settings.retained_bytes,
+    );
     primary.notify();
     let quorum = inner.followers_of(primary);
     maybe_checkpoint(inner, primary, &quorum);
@@ -599,15 +819,31 @@ fn maybe_checkpoint(inner: &Arc<Inner>, primary: &Arc<Primary>, quorum: &Quorum)
     }
 }
 
+/// The engine as a frame source, which every served database's engine is.
+fn frame_source(inner: &Inner) -> Option<&dyn FrameSourceEngine> {
+    match inner.engine.capability() {
+        EngineCapability::FrameSource(engine) => Some(engine),
+        EngineCapability::SelfReplicating => None,
+    }
+}
+
 /// Runs a checkpoint that [`Primary::checkpoint_due`] or [`Primary::begin_checkpoint`] started,
-/// and records its marker for the streams to ship.
+/// and records its marker for the streams to ship, and the chain's anchor there.
 pub(super) async fn checkpoint(
     inner: &Inner,
     primary: &Primary,
     excluded: Vec<NodeId>,
 ) -> Result<CheckpointMarker, ReplicationError> {
     let result = match inner.registry().open(&primary.name).await {
-        Ok(handle) => handle.checkpoint().await,
+        Ok(handle) => {
+            // The anchor moves to the marker only if the chain reaches it, so bring the chain
+            // up to the log's end first, as a database with no follower to ship to needs.
+            let committed = primary.committed();
+            if !chain_to(inner, primary, &handle, committed.as_ref()).await {
+                tracing::debug!(database = %primary.name, "the chain doesn't reach the log's end; the checkpoint records no anchor");
+            }
+            handle.checkpoint().await
+        }
         Err(error) => Err(error),
     };
     match result {
@@ -620,6 +856,9 @@ pub(super) async fn checkpoint(
                 );
             }
             primary.end_checkpoint(Ok(&marker), &excluded);
+            if let Some(anchor) = primary.rebase_chain(&marker.position) {
+                record_anchor(inner, &primary.name, anchor).await;
+            }
             Ok(marker)
         }
         Err(error) => {
@@ -639,6 +878,257 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Records `anchor` as `database`'s chain anchor, durably. A record that can't be written only
+/// costs a recomputation from the log after a restart, so failure is logged, not returned.
+async fn record_anchor(inner: &Inner, database: &DatabaseName, anchor: Anchor) {
+    let database = database.clone();
+    let stored = blocking(inner.execution, {
+        let chains = inner.chains.clone();
+        let database = database.clone();
+        move || chains.store(&database, &anchor)
+    })
+    .await;
+    match stored {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(database = %database, %error, "can't record the chain's anchor");
+        }
+        Err(status) => {
+            tracing::warn!(database = %database, %status, "can't record the chain's anchor");
+        }
+    }
+}
+
+/// Brings the chain up to `target`, a position of the log, if it isn't there yet: through the
+/// retained batches first, then by reading the log from the chain's tip through `handle`.
+/// Returns whether the chain holds `target` afterwards.
+///
+/// A stream calls this before it ships from a position the chain hasn't reached, a snapshot
+/// before it reports the hash at its position, and a checkpoint before it moves the anchor.
+pub(super) async fn chain_to(
+    inner: &Inner,
+    primary: &Primary,
+    handle: &DatabaseHandle,
+    target: Option<&Position>,
+) -> bool {
+    let Some(engine) = frame_source(inner) else {
+        return false;
+    };
+    if primary.link_retained(engine, target) {
+        return true;
+    }
+    let (Some(tip), Some(target)) = (primary.chain_tip(), target) else {
+        return false;
+    };
+    if tip.as_ref() >= Some(target) {
+        return false;
+    }
+    match handle.committed_between(tip.clone(), target.clone()).await {
+        Ok(Some(batch)) => primary.link(engine, tip.as_ref(), &batch).is_some(),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(database = %primary.name, from = ?tip, to = %target, %error, "can't read the log to bring the chain up to date");
+            false
+        }
+    }
+}
+
+/// Rebuilds the primary's chain from its record and the log, as [`drive`] does when serving
+/// starts and [`publish`] does after a batch the chain couldn't reach.
+async fn rebuild_chain(inner: Arc<Inner>, primary: Arc<Primary>) {
+    let Ok(handle) = inner.registry().open(&primary.name).await else {
+        return;
+    };
+    loop {
+        match load_chain(&inner, &primary, &handle).await {
+            Ok(chain) => {
+                if primary.chain_built(chain).is_ok() {
+                    return;
+                }
+                // A batch was published that the rebuilt chain doesn't reach: read again.
+            }
+            Err(error) => {
+                tracing::warn!(database = %primary.name, %error, "can't build the log's hash chain");
+                return;
+            }
+        }
+    }
+}
+
+/// Reads the chain's record and the log through `handle`, and builds the chain.
+async fn load_chain(
+    inner: &Inner,
+    primary: &Primary,
+    handle: &DatabaseHandle,
+) -> Result<Chain, String> {
+    let Some(engine) = frame_source(inner) else {
+        return Err("the engine isn't a frame source".to_owned());
+    };
+    let recorded = {
+        let chains = inner.chains.clone();
+        let database = primary.name.clone();
+        blocking(inner.execution, move || chains.load(&database))
+            .await
+            .map_err(|status| status.to_string())?
+    };
+    let recorded = match recorded {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(database = %primary.name, %error, "can't read the chain's record; deriving one");
+            None
+        }
+    };
+    let position = handle.position().await.map_err(|error| error.to_string())?;
+    let anchored_at = recorded.as_ref().map(Anchor::position);
+    let read = match anchored_at {
+        Some(at) if at == position => LogRead::Continues(None),
+        Some(at) => match handle.committed_since(at).await {
+            Ok(batch) => LogRead::Continues(batch),
+            Err(error)
+                if matches!(
+                    error.engine_error(),
+                    Some(EngineError::InvalidPosition { .. })
+                ) =>
+            {
+                LogRead::Restarted(
+                    handle
+                        .committed_since(None)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+            Err(error) => return Err(error.to_string()),
+        },
+        None => LogRead::Restarted(
+            handle
+                .committed_since(None)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+    };
+    let recovered = chain::recover(engine, recorded, position.as_ref(), read)
+        .map_err(|error| error.to_string())?;
+    if let Some(anchor) = recovered.record {
+        record_anchor(inner, &primary.name, anchor).await;
+    }
+    let chain = recovered.chain;
+    if chain.is_derived() {
+        tracing::info!(database = %primary.name, anchor = ?chain.anchor().position(), "no chain record fits the log; the chain is derived from where the log begins");
+    }
+    Ok(chain)
+}
+
+/// Reports the chain at `at`, or at the log's end, recomputed from the log on disk.
+pub(super) async fn verify(
+    inner: &Inner,
+    primary: &Primary,
+    at: Option<Position>,
+) -> Result<Verified, tonic::Status> {
+    let Some(engine) = frame_source(inner) else {
+        return Err(tonic::Status::failed_precondition(format!(
+            "{} databases have no replication log to verify",
+            inner.engine.kind()
+        )));
+    };
+    let handle = inner
+        .registry()
+        .open(&primary.name)
+        .await
+        .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+    // The position the primary published, rather than what its log reads back to now.
+    let at = match at.or_else(|| primary.committed()) {
+        Some(at) => Some(at),
+        None => handle
+            .position()
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?,
+    };
+    let anchor = primary.chain_anchor().ok_or_else(|| {
+        tonic::Status::unavailable(format!(
+            "the chain of {} isn't built yet; retry",
+            primary.name
+        ))
+    })?;
+    let held = primary.hash_at(at.as_ref());
+    let hash = match (&at, anchor.position()) {
+        (Some(at), anchored) if Some(at) > anchored.as_ref() => {
+            let batch = handle
+                .committed_between(anchored.clone(), at.clone())
+                .await
+                .map_err(|error| {
+                    read_back_status(&primary.name, anchored.as_ref(), at, error.engine_error())
+                })?;
+            chain::recompute(engine, &anchor, batch.as_ref(), at)
+                .map_err(|error| unreadable(&primary.name, at, &error.to_string()))?
+        }
+        _ => held.ok_or_else(|| {
+            tonic::Status::not_found(format!(
+                "{} holds no chain hash at {}",
+                primary.name,
+                at.as_ref()
+                    .map_or_else(|| "the empty log".to_owned(), ToString::to_string)
+            ))
+        })?,
+    };
+    if let Some(held) = held
+        && held != hash
+    {
+        tracing::warn!(database = %primary.name, at = ?at, %held, recomputed = %hash, "the log on disk no longer hashes to what the chain recorded");
+    }
+    Ok(Verified {
+        epoch: primary.role.epoch,
+        position: at,
+        hash,
+    })
+}
+
+/// The status for a log that can't be read back to `at`.
+pub(super) fn unreadable(database: &DatabaseName, at: &Position, reason: &str) -> tonic::Status {
+    tonic::Status::failed_precondition(format!(
+        "the log of {database} can't be read back to {at}: {reason}"
+    ))
+}
+
+/// The status for a read of the log from `anchored` to `at` that failed with `error`: a log
+/// that no longer continues from the anchor restarted at a checkpoint whose new anchor isn't
+/// recorded yet, which a retry settles; anything else is a log that can't be read back to `at`.
+pub(super) fn read_back_status(
+    database: &DatabaseName,
+    anchored: Option<&Position>,
+    at: &Position,
+    error: Option<&EngineError>,
+) -> tonic::Status {
+    match error {
+        Some(EngineError::InvalidPosition { position }) if Some(position) == anchored => {
+            tonic::Status::unavailable(format!(
+                "the log of {database} restarted past the chain's anchor; retry"
+            ))
+        }
+        Some(error) => unreadable(database, at, &error.to_string()),
+        None => unreadable(database, at, "the database is closed"),
+    }
+}
+
+/// Extends `chain` through `recent`, the retained batches from the one that continues its tip
+/// on, until it reaches `target`. Returns whether it did.
+fn fill_gap(
+    chain: &mut Chain,
+    engine: &dyn FrameSourceEngine,
+    recent: &[&FrameBatch],
+    target: &Position,
+) -> bool {
+    for batch in recent {
+        let tip = chain.tip().0.cloned();
+        if tip.as_ref() == Some(target) {
+            return true;
+        }
+        if batch.end > *target || chain.extend(engine, tip.as_ref(), batch).is_err() {
+            return false;
+        }
+    }
+    chain.tip().0 == Some(target)
+}
+
 /// Keeps one stream open to each follower in the database's replica set, as membership changes,
 /// and starts checkpoints that come due while nothing is published.
 pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
@@ -651,6 +1141,7 @@ pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
         },
         Err(error) => tracing::warn!(database = %primary.name, %error, "can't open the database"),
     }
+    rebuild_chain(Arc::clone(&inner), Arc::clone(&primary)).await;
     let mut membership = inner.membership.clone();
     let mut streams: BTreeMap<NodeId, AbortOnDrop> = BTreeMap::new();
     loop {
@@ -719,7 +1210,7 @@ async fn follow(inner: Arc<Inner>, primary: Arc<Primary>, node: NodeId) {
 }
 
 /// Opens one stream to `node` and feeds it until it fails.
-async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
+async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> StreamEnd {
     let settings = &inner.settings;
     let Some(address) = inner.addresses.address(node) else {
         return stream_failed(format!("no address for {node}"));
@@ -772,16 +1263,25 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
     let mut deadline = Instant::now() + settings.stall_timeout;
     loop {
         while in_flight.len() < settings.max_in_flight.get() {
-            let batch = match primary.plan(sent.as_ref()) {
+            let shipped = match primary.plan(sent.as_ref()) {
                 Plan::Wait => break,
                 Plan::NeedsSnapshot => {
                     return reseed(inner, primary, node, &outgoing, &mut acks, in_flight.len())
                         .await;
                 }
-                Plan::Send(batch) => batch,
+                Plan::Send(mut shipped) => {
+                    if shipped.chain.is_none() {
+                        shipped.chain =
+                            link_from(inner, primary, sent.as_ref(), &shipped.batch).await;
+                    }
+                    shipped
+                }
                 Plan::Read { after, checkpoints } => {
                     match read_since(inner, primary, after, checkpoints).await {
-                        Ok(Some(batch)) => batch,
+                        Ok(Some(batch)) => {
+                            let chain = link_from(inner, primary, sent.as_ref(), &batch).await;
+                            Shipped { batch, chain }
+                        }
                         Ok(None) => break,
                         Err(error) if log_moved_past(primary, sent.as_ref(), &error) => {
                             return reseed(
@@ -798,15 +1298,20 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
                     }
                 }
             };
+            if primary.take_lost() {
+                tokio::spawn(rebuild_chain(Arc::clone(inner), Arc::clone(primary)));
+            }
             if in_flight.is_empty() {
                 deadline = Instant::now() + settings.stall_timeout;
             }
+            let Shipped { batch, chain } = shipped;
             let end = batch.end.clone();
             let shipped = message(Message::Batch(proto::Batch {
                 epoch: primary.role.epoch.get(),
                 start: sent.clone().map(Position::into_bytes).unwrap_or_default(),
                 end: batch.end.into_bytes(),
                 payload: batch.payload.into_bytes(),
+                chain: chain.map(|hash| hash.as_bytes().to_vec()),
             }));
             if outgoing.send(shipped).await.is_err() {
                 return stream_failed("stream closed");
@@ -865,6 +1370,24 @@ async fn stream(inner: &Inner, primary: &Primary, node: &NodeId) -> StreamEnd {
             }
         }
     }
+}
+
+/// Chains `batch`, which a stream ships from `from`, bringing the chain up to `from` first if
+/// it isn't there; `None` if the chain isn't built or can't reach `from`, which leaves it to be
+/// rebuilt.
+async fn link_from(
+    inner: &Inner,
+    primary: &Primary,
+    from: Option<&Position>,
+    batch: &FrameBatch,
+) -> Option<ChainHash> {
+    let engine = frame_source(inner)?;
+    if primary.hash_at(from).is_none()
+        && let Ok(handle) = inner.registry().open(&primary.name).await
+    {
+        chain_to(inner, primary, &handle, from).await;
+    }
+    primary.link(engine, from, batch)
 }
 
 /// Reads every commit after `after` back from the log, unless a checkpoint started or ended since

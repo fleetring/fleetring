@@ -232,6 +232,73 @@ impl Batch {
         ))
     }
 
+    /// Where the transactions of a payload written by [`to_bytes`](Self::to_bytes) end, read
+    /// from the frame headers alone: nothing is copied and no checksum is checked, so this is
+    /// cheap enough to run on every batch a primary ships. The log's hash chain (FR-044) hashes
+    /// each transaction's bytes this way.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DecodeBatchError`] if the payload's fixed fields, header, or length are
+    /// malformed. Frames that are structurally invalid in other ways are left to
+    /// [`from_bytes`](Self::from_bytes).
+    pub fn layout(bytes: &[u8]) -> Result<PayloadLayout, DecodeBatchError> {
+        let Some((fixed, rest)) = bytes.split_first_chunk::<PAYLOAD_FIXED_LEN>() else {
+            return Err(DecodeBatchError::TooShort { len: bytes.len() });
+        };
+        let [version, kind, fixed @ ..] = fixed;
+        if *version != PAYLOAD_VERSION {
+            return Err(DecodeBatchError::UnsupportedVersion { version: *version });
+        }
+        let (position, sizes) = fixed.split_at(Position::ENCODED_LEN);
+        let start = Position::from_bytes(position)
+            .map_err(|_| DecodeBatchError::TooShort { len: bytes.len() })?;
+        let page_size = header::be_u32(sizes, 0);
+        let frame_count = header::be_u32(sizes, 4);
+        if !header::is_valid_page_size(page_size) {
+            return Err(DecodeBatchError::InvalidPageSize { page_size });
+        }
+        let header_len = match *kind {
+            KIND_CONTINUES => 0,
+            KIND_STARTS => {
+                WalHeader::parse(rest)?;
+                WAL_HEADER_LEN
+            }
+            kind => return Err(DecodeBatchError::UnknownKind { kind }),
+        };
+        let frames = &rest[header_len..];
+        let frame_len = header::frame_len(page_size);
+        let expected_len = usize::try_from(frame_count)
+            .ok()
+            .and_then(|n| n.checked_mul(frame_len));
+        if expected_len != Some(frames.len()) {
+            return Err(DecodeBatchError::LengthMismatch {
+                frame_count,
+                len: frames.len(),
+            });
+        }
+        let frames_at = PAYLOAD_FIXED_LEN + header_len;
+        let ends = frames
+            .chunks_exact(frame_len)
+            .enumerate()
+            .filter(|(_, frame)| frame::frame_header(frame).is_commit())
+            .map(|(index, _)| {
+                let offset = (index + 1) * frame_len;
+                let position = Position::new(
+                    start.generation(),
+                    start
+                        .offset()
+                        .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
+                );
+                (frames_at + offset, position)
+            })
+            .collect();
+        Ok(PayloadLayout {
+            log_at: PAYLOAD_FIXED_LEN,
+            ends,
+        })
+    }
+
     /// The part of this batch up to `end`, a commit boundary inside it: a shorter batch with the
     /// same start, or this batch unchanged when `end` is its end.
     ///
@@ -289,6 +356,17 @@ impl Batch {
             checksum,
         )
     }
+}
+
+/// Where a payload's bytes of the log and its transactions are, from [`Batch::layout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadLayout {
+    /// The offset of the first byte of the log in the payload: the WAL header if the batch
+    /// starts a generation, else the first frame. The bytes before it describe the batch.
+    pub log_at: usize,
+    /// For each transaction, in order: the offset just past its commit frame in the payload,
+    /// and the log position there. The last is the batch's end.
+    pub ends: Vec<(usize, Position)>,
 }
 
 impl fmt::Debug for Batch {

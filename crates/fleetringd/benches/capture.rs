@@ -6,7 +6,9 @@
 //! the log's new frames that the actor does after every commit, and a checkpoint whenever the
 //! WAL passes the daemon's default threshold. Capture is off, or on in one of the modes; a
 //! recorded database releases every delivered batch at once, as a sink that keeps up would, so
-//! the pruning of the change table is part of the cost. Numbers live in `docs/perf.md`.
+//! the pruning of the change table is part of the cost. The `chain` bench measures what hashing
+//! one captured batch onto the log's hash chain costs the stream that ships it (FR-044).
+//! Numbers live in `docs/perf.md`.
 
 use std::fmt;
 use std::fs;
@@ -14,9 +16,10 @@ use std::hint::black_box;
 
 use divan::Bencher;
 use fleetringd::engine::{
-    CaptureMode, Database, DatabaseCapability, DatabaseEngine, OpenMode, Position, SqliteEngine,
-    Statement, Transaction, Value,
+    CaptureMode, Database, DatabaseCapability, DatabaseEngine, EngineCapability, OpenMode,
+    Position, SqliteEngine, Statement, Transaction, Value,
 };
+use fleetringd::replication::ChainHash;
 use tempfile::TempDir;
 
 fn main() {
@@ -91,6 +94,7 @@ const CHECKPOINT_THRESHOLD: u64 = 4 * 1024 * 1024;
 /// An open primary and the state the actor keeps around it.
 struct Writer {
     dir: TempDir,
+    engine: SqliteEngine,
     db: Box<dyn Database>,
     last: Option<Position>,
     next_id: i64,
@@ -115,6 +119,7 @@ impl Writer {
         }
         let mut writer = Self {
             dir,
+            engine,
             db,
             last: None,
             next_id: 0,
@@ -174,4 +179,32 @@ impl Writer {
 fn insert(bencher: Bencher, case: &Case) {
     let mut writer = Writer::open(case.capture);
     bencher.bench_local(|| writer.write(case.rows));
+}
+
+/// What hashing one captured batch of `rows` inserted rows onto the log's chain costs the
+/// stream that ships it: delimiting the batch's transactions and BLAKE3 over their bytes.
+#[divan::bench(args = [1, 100], sample_count = 100, sample_size = 20)]
+fn chain(bencher: Bencher, rows: usize) {
+    let mut writer = Writer::open(Capture::Off);
+    let before = writer.last.clone();
+    writer.write(rows);
+    let DatabaseCapability::FrameSource(frames) = writer.db.capability() else {
+        panic!("SQLite is a frame source");
+    };
+    let batch = frames
+        .committed_since(before.as_ref())
+        .expect("the log is readable")
+        .expect("the write left a batch");
+    let EngineCapability::FrameSource(engine) = writer.engine.capability() else {
+        panic!("SQLite is a frame source");
+    };
+    bencher.bench_local(|| {
+        ChainHash::chain(
+            engine,
+            ChainHash::GENESIS,
+            before.as_ref(),
+            black_box(&batch),
+        )
+        .expect("the batch hashes")
+    });
 }
