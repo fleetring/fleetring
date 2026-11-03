@@ -1,11 +1,11 @@
-//! The simulation harness: whole clusters of real daemons on turmoil's simulated network and
+//! The simulation harness: whole fleets of real daemons on turmoil's simulated network and
 //! clock, in one test process (ADR-0020).
 //!
 //! It lives in the library, behind the `simulation` feature, rather than in a test-support
 //! module, so that every test binary and every later ticket can build on one copy, and so that
 //! it is linted and documented like the daemon it drives.
 //!
-//! - [`Cluster`] runs one turmoil host per node, each running the real [`Daemon`](crate::Daemon)
+//! - [`Fleet`] runs one turmoil host per node, each running the real [`Daemon`](crate::Daemon)
 //!   in the control role, the data role, or both, through
 //!   [`Daemon::start_with`](crate::Daemon::start_with) and
 //!   [`Environment::simulated`](crate::Environment::simulated). A host's data directory is a real
@@ -14,11 +14,11 @@
 //!   hosts.
 //! - [`Workload`]s run on client hosts and record every operation, as it is sent and as its
 //!   [`Outcome`] arrives, in a [`History`].
-//! - [`check`] holds the invariants; the cluster runs them during and after a run. [`history`]
+//! - [`check`] holds the invariants; the fleet runs them during and after a run. [`history`]
 //!   checks the whole history against what each database promises, Jepsen-style, and
-//!   [`Cluster::finish`] runs it for every scenario.
+//!   [`Fleet::finish`] runs it for every scenario.
 //! - A lease watcher per data host follows the host's `WatchLeases` stream (FR-042) and records
-//!   what it learns in the [`History`]; [`Cluster::finish`] checks it against the leases the
+//!   what it learns in the [`History`]; [`Fleet::finish`] checks it against the leases the
 //!   control log granted ([`check::lease_events_match_control`]).
 //! - The [`Trace`] records faults, publications, and operations in order, so two runs of a seed
 //!   can be compared with [`Trace::compare`].
@@ -40,32 +40,32 @@
 //! ```
 //! use std::time::Duration;
 //!
-//! use fleetringd::sim::{Cluster, CreateAndAcquire};
+//! use fleetringd::sim::{Fleet, CreateAndAcquire};
 //!
-//! let mut cluster = Cluster::builder(7)
+//! let mut fleet = Fleet::builder(7)
 //!     .control("control")
 //!     .data("node-1")
 //!     .data("node-2")
 //!     .build()?;
-//! cluster.await_ring(Duration::from_secs(5))?;
+//! fleet.await_ring(Duration::from_secs(5))?;
 //! let nodes = ["node-1".parse()?, "node-2".parse()?];
-//! cluster.client("client", CreateAndAcquire::new(nodes, 4, 2, 4));
-//! cluster.partition("node-2", "control")?;
-//! cluster.run_for(Duration::from_secs(2))?;
-//! cluster.repair("node-2", "control")?;
-//! cluster.crash("control")?;
-//! cluster.restart("control")?;
-//! cluster.await_workloads(Duration::from_secs(30))?;
-//! cluster.await_ring(Duration::from_secs(5))?;
-//! let report = cluster.finish()?;
+//! fleet.client("client", CreateAndAcquire::new(nodes, 4, 2, 4));
+//! fleet.partition("node-2", "control")?;
+//! fleet.run_for(Duration::from_secs(2))?;
+//! fleet.repair("node-2", "control")?;
+//! fleet.crash("control")?;
+//! fleet.restart("control")?;
+//! fleet.await_workloads(Duration::from_secs(30))?;
+//! fleet.await_ring(Duration::from_secs(5))?;
+//! let report = fleet.finish()?;
 //! println!("{}", report.trace());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 pub mod check;
 mod client;
-mod cluster;
 mod fault;
+mod fleet;
 pub mod history;
 mod host;
 mod rng;
@@ -74,10 +74,8 @@ mod trace;
 mod workload;
 
 pub use check::{ControlLog, Invariant, ReplicaChains, ReplicaRows, Violation};
-pub use cluster::{
-    Cluster, ClusterBuilder, PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher,
-};
 pub use fault::{Fault, LossRate};
+pub use fleet::{Fleet, FleetBuilder, PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher};
 pub use history::{DurabilityMode, Guarantee, Replicated};
 pub use rng::SimRng;
 pub use trace::{DRIVER, Divergence, Event, EventKind, Replay, Trace};

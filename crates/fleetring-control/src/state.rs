@@ -101,7 +101,7 @@ impl State {
         self.members.values().map(|entry| &entry.member)
     }
 
-    /// Returns the member with `id`, if it is in the cluster.
+    /// Returns the member with `id`, if it is in the fleet.
     #[must_use]
     pub fn member(&self, id: &NodeId) -> Option<&Member> {
         self.members.get(id).map(|entry| &entry.member)
@@ -152,7 +152,7 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns [`BuildRingError::NoNodes`] if the cluster has no members. `apply` rejects joins
+    /// Returns [`BuildRingError::NoNodes`] if the fleet has no members. `apply` rejects joins
     /// that would make any other error possible.
     pub fn ring(&self) -> Result<Ring, BuildRingError> {
         membership_ring(
@@ -170,7 +170,7 @@ impl State {
     /// # Errors
     ///
     /// Returns [`Rejection::UnknownDatabase`] if there is no such database, and
-    /// [`Rejection::NoMembers`] if the cluster is empty.
+    /// [`Rejection::NoMembers`] if the fleet is empty.
     pub fn replica_set(&self, database: &DatabaseName) -> Result<Vec<NodeId>, Rejection> {
         let db = self.database_or_reject(database)?;
         let ring = self.ring().map_err(|_| Rejection::NoMembers)?;

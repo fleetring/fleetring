@@ -1,4 +1,4 @@
-//! A client for a whole cluster: the control plane, and each database's primary.
+//! A client for a whole fleet: the control plane, and each database's primary.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -33,7 +33,7 @@ use crate::transport::{Backoff, CredentialedChannel, database_client_with};
 const MAX_REDIRECTS: usize = 4;
 
 /// How long [`Client::status`] waits for the first membership update. The control plane sends
-/// none while the cluster has no members.
+/// none while the fleet has no members.
 const FIRST_UPDATE: Duration = Duration::from_secs(2);
 
 /// Where a database lives, as the control plane knows it.
@@ -60,7 +60,7 @@ pub struct Location {
 }
 
 /// What to create a database with: its replication factor and, optionally, its durability
-/// settings. Settings left unset take the cluster's defaults (`[replication] acks` and
+/// settings. Settings left unset take the fleet's defaults (`[replication] acks` and
 /// `min_replicas` on the control node).
 ///
 /// # Examples
@@ -81,14 +81,14 @@ pub struct Location {
 pub struct DatabaseSpec {
     /// How many replicas the database should have.
     pub replication_factor: ReplicationFactor,
-    /// The acknowledgement mode, or `None` for the cluster's default.
+    /// The acknowledgement mode, or `None` for the fleet's default.
     pub acks: Option<Acks>,
-    /// The floor on reachable replicas, or `None` for the cluster's default: the mode's W.
+    /// The floor on reachable replicas, or `None` for the fleet's default: the mode's W.
     pub min_replicas: Option<u8>,
 }
 
 impl DatabaseSpec {
-    /// A database with `replication_factor` replicas and the cluster's default durability.
+    /// A database with `replication_factor` replicas and the fleet's default durability.
     #[must_use]
     pub const fn new(replication_factor: ReplicationFactor) -> Self {
         Self {
@@ -265,7 +265,7 @@ pub struct Written {
     pub epoch: LeaseEpoch,
 }
 
-/// A client for a whole cluster.
+/// A client for a whole fleet.
 ///
 /// - **Control calls** (`create_database`, `drop_database`, `locate`, `list_databases`, `status`)
 ///   go to the control plane through a [`ControlClient`], which follows leader redirects and
@@ -334,7 +334,7 @@ impl Client {
             .clear();
     }
 
-    /// Creates a SQLite database with `replication_factor` replicas and the cluster's default
+    /// Creates a SQLite database with `replication_factor` replicas and the fleet's default
     /// durability, and opens it on its primary.
     ///
     /// If the control plane already has the database but no primary, because an earlier
@@ -638,11 +638,11 @@ impl Client {
         rows_from_proto(response)
     }
 
-    /// The cluster's membership as the control plane sees it: the members with their addresses
+    /// The fleet's membership as the control plane sees it: the members with their addresses
     /// and liveness, the membership epoch, and the ring, rebuilt with the function every node
     /// uses, so its fingerprint matches theirs.
     ///
-    /// A cluster without members has an empty view at epoch 0.
+    /// A fleet without members has an empty view at epoch 0.
     ///
     /// # Errors
     ///

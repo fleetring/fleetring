@@ -5,7 +5,7 @@
 //! file in the snapshot's order, as a big-endian `u16` name length, the UTF-8 name, a big-endian
 //! `u64` content length, and the content. Its checksum is XXH3-128 over the whole stream,
 //! big-endian. XXH3 catches corruption in transit or on disk; it is not a cryptographic hash and
-//! doesn't stop a peer that forges a stream on purpose. Peers are trusted members of the cluster.
+//! doesn't stop a peer that forges a stream on purpose. Peers are trusted members of the fleet.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};

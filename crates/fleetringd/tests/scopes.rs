@@ -177,7 +177,7 @@ async fn reads_acme_and_nothing_else(client: &Client, who: &str) -> TestResult {
             .expect_err("drain"),
         "drain",
     );
-    assert_eq!(drain, "Drain needs the cluster scope");
+    assert_eq!(drain, "Drain needs the fleet scope");
     denied(
         client.status().await.expect_err("membership"),
         "watch membership",

@@ -14,7 +14,7 @@ use tokio::time::Instant;
 
 use fleetringd::replication::ReplicationSettings;
 
-use crate::common::{Cluster, TestResult, name, put, settings, sqlite};
+use crate::common::{Fleet, TestResult, name, put, settings, sqlite};
 
 /// Transactions per configuration, split across its writers.
 const TRANSACTIONS: usize = 2_000;
@@ -36,23 +36,23 @@ async fn small_transactions_throughput_and_ack_latency() -> TestResult {
     );
     println!("|---|---|---|---|---|---|---|");
     for (settings, label) in [(settings(), "4 MiB"), (small_log, "256 KiB")] {
-        let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
+        let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
         for (replicas, writers) in [(1_u8, 1_i64), (3, 1), (3, 4), (3, 16), (3, 64)] {
-            measure(&cluster, label, replicas, writers).await?;
+            measure(&fleet, label, replicas, writers).await?;
         }
     }
     Ok(())
 }
 
-async fn measure(cluster: &Cluster, label: &str, replicas: u8, writers: i64) -> TestResult {
+async fn measure(fleet: &Fleet, label: &str, replicas: u8, writers: i64) -> TestResult {
     let per_writer = TRANSACTIONS / usize::try_from(writers)?;
     {
         let db = name(&format!("perf-{replicas}-{writers}"));
-        cluster.create("a", &db, replicas).await?;
+        fleet.create("a", &db, replicas).await?;
         let started = Instant::now();
         let mut tasks = JoinSet::new();
         for writer in 0..writers {
-            let registry = cluster.node("a").registry().clone();
+            let registry = fleet.node("a").registry().clone();
             let db = db.clone();
             tasks.spawn(async move {
                 let mut latencies = Vec::with_capacity(per_writer);

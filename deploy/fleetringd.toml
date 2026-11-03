@@ -1,6 +1,6 @@
 # An example fleetringd configuration, and the one the container image starts with (FR-034).
 #
-# It runs a one-node cluster: the control role and the data role in one process. To change it,
+# It runs a one-node fleet: the control role and the data role in one process. To change it,
 # mount your own file over /etc/fleetring/fleetringd.toml, or override single fields with flags:
 # `--node-id`, `--data-dir`, `--listen`, `--advertise`, `--control`, `--role`, and
 # `--insecure-plaintext`.
@@ -13,7 +13,7 @@ data_dir = "/data"
 # connections on every interface, so the port can be published from a container.
 listen = "0.0.0.0:7400"
 
-# `both` runs the control plane and hosts databases in one process. In a larger cluster, one node
+# `both` runs the control plane and hosts databases in one process. In a larger fleet, one node
 # runs `both` (or `control`), and every other node runs `data` and sets `control.address`.
 role = "both"
 
@@ -27,7 +27,7 @@ role = "both"
 # and trusts the authority certificates in `ca`; clients and other nodes must present certificates
 # from the same authority. Create them with the built-in authority, on a machine that keeps ca.key:
 #
-#   fleetringd cert init --cluster home --dir ./tls
+#   fleetringd cert init --fleet home --dir ./tls
 #   fleetringd cert node node-1 --hosts 192.0.2.10,node-1.example --dir ./tls
 #   fleetringd cert client admin --dir ./tls
 #
@@ -82,7 +82,7 @@ id = "node-1"
 # What a graceful stop (SIGINT, SIGTERM, `fleetringd stop`) does with the node's membership.
 #   "leave"   the default: the node drains first, handing each database it is primary for to
 #             the most advanced follower so clients see a short redirect instead of a failover,
-#             then leaves the cluster and the ring is rebuilt without it
+#             then leaves the fleet and the ring is rebuilt without it
 #   "stay"    the node stays a member, marked down once its heartbeats stop, and keeps its
 #             leases and its places in replica sets for a quick restart; nothing drains
 # on_shutdown = "leave"
@@ -130,7 +130,7 @@ id = "node-1"
 # file doesn't list may do nothing with its certificate alone. Keep the list identical on every
 # node. A scope is `<action>:<pattern>`, the action `read`, `write`, `admin`, or `stream` over an
 # exact database name or a prefix ending in `*`; `write` implies `read`, `admin` implies both,
-# and `stream` stands alone. `cluster` allows the operations that name no database: membership,
+# and `stream` stands alone. `fleet` allows the operations that name no database: membership,
 # draining, revoking tokens. The table of what each RPC needs is in the daemon README, under
 # "Principals and scopes".
 #
@@ -143,7 +143,7 @@ id = "node-1"
 # within one heartbeat interval.
 [[principal]]
 name = "admin"
-scopes = ["admin:*", "stream:*", "cluster"]
+scopes = ["admin:*", "stream:*", "fleet"]
 
 # A router that relays its callers' tokens: its own certificate grants nothing, and a request
 # carrying a caller's token acts as that caller.

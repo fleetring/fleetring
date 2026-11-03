@@ -4,7 +4,7 @@
 //!
 //! A client creates one database with three replicas through the data plane, then writes to it
 //! and reads it back through the `Database` service, as the command line does. The daemons
-//! replicate it themselves. [`Cluster::finish`] runs the history checker over the whole run; the
+//! replicate it themselves. [`Fleet::finish`] runs the history checker over the whole run; the
 //! assertions here are about what the faults did to the run, not about what survived.
 
 use std::error::Error;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fleetring_control::DatabaseName;
 use fleetringd::replication::ReplicationSettings;
-use fleetringd::sim::{Ack, Cluster, CreateAndWrite, Operation, Outcome, Replay, Report, seeds};
+use fleetringd::sim::{Ack, CreateAndWrite, Fleet, Operation, Outcome, Replay, Report, seeds};
 
 use crate::{BINARY, TestResult};
 
@@ -37,12 +37,12 @@ fn settings() -> ReplicationSettings {
     }
 }
 
-fn cluster(seed: u64) -> Result<Cluster, Box<dyn Error>> {
-    cluster_with(seed, settings())
+fn fleet(seed: u64) -> Result<Fleet, Box<dyn Error>> {
+    fleet_with(seed, settings())
 }
 
-fn cluster_with(seed: u64, settings: ReplicationSettings) -> Result<Cluster, Box<dyn Error>> {
-    Ok(Cluster::builder(seed)
+fn fleet_with(seed: u64, settings: ReplicationSettings) -> Result<Fleet, Box<dyn Error>> {
+    Ok(Fleet::builder(seed)
         .control(CONTROL)
         .data(DATA[0])
         .data(DATA[1])
@@ -53,9 +53,9 @@ fn cluster_with(seed: u64, settings: ReplicationSettings) -> Result<Cluster, Box
 }
 
 /// The primary the database's creation reported, once it has.
-fn primary(cluster: &Cluster) -> Option<String> {
+fn primary(fleet: &Fleet) -> Option<String> {
     let database = database().ok()?;
-    cluster
+    fleet
         .history()
         .acknowledged()
         .find_map(|(operation, ack)| match (operation, ack) {
@@ -73,13 +73,13 @@ fn primary(cluster: &Cluster) -> Option<String> {
 /// follower, stopping one gracefully, and taking the write quorum away for a while; then heals
 /// everything and checks that the followers converge.
 fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
-    let mut cluster = cluster(seed)?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    cluster.client("writer", CreateAndWrite::new(1, 3, WRITES));
-    cluster.run_until(Duration::from_secs(10), "database created", |cluster| {
-        primary(cluster).is_some()
+    let mut fleet = fleet(seed)?;
+    fleet.await_ring(Duration::from_secs(5))?;
+    fleet.client("writer", CreateAndWrite::new(1, 3, WRITES));
+    fleet.run_until(Duration::from_secs(10), "database created", |fleet| {
+        primary(fleet).is_some()
     })?;
-    let primary = primary(&cluster).ok_or("no primary")?;
+    let primary = primary(&fleet).ok_or("no primary")?;
     let followers: Vec<&str> = DATA
         .into_iter()
         .filter(|node| *node != primary.as_str())
@@ -87,37 +87,37 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
     let [first, second] = followers[..] else {
         return Err(format!("{primary} isn't one of the data hosts").into());
     };
-    cluster.run_for(Duration::from_secs(1))?;
+    fleet.run_for(Duration::from_secs(1))?;
 
-    cluster.partition(&primary, first)?;
-    cluster.run_for(Duration::from_millis(1_500))?;
-    cluster.check_history()?;
-    cluster.repair(&primary, first)?;
-    cluster.run_for(Duration::from_millis(500))?;
+    fleet.partition(&primary, first)?;
+    fleet.run_for(Duration::from_millis(1_500))?;
+    fleet.check_history()?;
+    fleet.repair(&primary, first)?;
+    fleet.run_for(Duration::from_millis(500))?;
 
-    cluster.crash(second)?;
-    cluster.run_for(Duration::from_secs(1))?;
-    cluster.check_history()?;
-    cluster.restart(second)?;
-    cluster.run_for(Duration::from_millis(500))?;
+    fleet.crash(second)?;
+    fleet.run_for(Duration::from_secs(1))?;
+    fleet.check_history()?;
+    fleet.restart(second)?;
+    fleet.run_for(Duration::from_millis(500))?;
 
     // Without either follower there is no write quorum: writes fail rather than being
     // acknowledged.
-    cluster.partition(&primary, first)?;
-    cluster.crash(second)?;
-    cluster.run_for(Duration::from_secs(2))?;
-    cluster.check_history()?;
-    cluster.repair(&primary, first)?;
-    cluster.restart(second)?;
+    fleet.partition(&primary, first)?;
+    fleet.crash(second)?;
+    fleet.run_for(Duration::from_secs(2))?;
+    fleet.check_history()?;
+    fleet.repair(&primary, first)?;
+    fleet.restart(second)?;
 
-    cluster.stop(first)?;
-    cluster.run_for(Duration::from_millis(500))?;
-    cluster.restart(first)?;
+    fleet.stop(first)?;
+    fleet.run_for(Duration::from_millis(500))?;
+    fleet.restart(first)?;
 
-    cluster.await_workloads(Duration::from_secs(120))?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    cluster.await_replicas_converged(Duration::from_secs(30))?;
-    let status = cluster
+    fleet.await_workloads(Duration::from_secs(120))?;
+    fleet.await_ring(Duration::from_secs(5))?;
+    fleet.await_replicas_converged(Duration::from_secs(30))?;
+    let status = fleet
         .replication(&primary)
         .and_then(|replication| replication.primary_status(&database().ok()?))
         .ok_or("the primary isn't serving the database")?;
@@ -128,7 +128,7 @@ fn writes_through_faults(seed: u64) -> Result<Report, Box<dyn Error>> {
             .iter()
             .all(|follower| !follower.needs_snapshot)
     );
-    Ok(cluster.finish()?)
+    Ok(fleet.finish()?)
 }
 
 #[test]
@@ -184,34 +184,34 @@ fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
         retained_bytes: 4 * 1024,
         ..settings()
     };
-    let mut cluster = cluster_with(seed, settings)?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    cluster.client("writer", CreateAndWrite::new(1, 3, WRITES));
-    cluster.run_until(Duration::from_secs(10), "database created", |cluster| {
-        primary(cluster).is_some()
+    let mut fleet = fleet_with(seed, settings)?;
+    fleet.await_ring(Duration::from_secs(5))?;
+    fleet.client("writer", CreateAndWrite::new(1, 3, WRITES));
+    fleet.run_until(Duration::from_secs(10), "database created", |fleet| {
+        primary(fleet).is_some()
     })?;
-    let primary = primary(&cluster).ok_or("no primary")?;
+    let primary = primary(&fleet).ok_or("no primary")?;
     let lagging = DATA
         .into_iter()
         .find(|node| *node != primary.as_str())
         .ok_or("a follower")?;
-    cluster.run_for(Duration::from_secs(1))?;
+    fleet.run_for(Duration::from_secs(1))?;
 
     let database = database()?;
-    let checkpointed = |cluster: &Cluster| {
-        cluster
+    let checkpointed = |fleet: &Fleet| {
+        fleet
             .replication(&primary)
             .and_then(|replication| replication.primary_status(&database))
             .and_then(|status| status.checkpointed)
     };
-    let before = checkpointed(&cluster);
-    cluster.crash(lagging)?;
+    let before = checkpointed(&fleet);
+    fleet.crash(lagging)?;
     // Twice over: the lag limit passes, then the next checkpoint leaves the follower behind.
-    cluster.run_until(
+    fleet.run_until(
         Duration::from_secs(30),
         "a checkpoint past the crashed follower",
-        |cluster| {
-            cluster
+        |fleet| {
+            fleet
                 .replication(&primary)
                 .and_then(|replication| replication.primary_status(&database))
                 .is_some_and(|status| {
@@ -223,17 +223,17 @@ fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
                 })
         },
     )?;
-    let past = checkpointed(&cluster);
-    cluster.run_until(Duration::from_secs(30), "a second checkpoint", |cluster| {
-        checkpointed(cluster) != past
+    let past = checkpointed(&fleet);
+    fleet.run_until(Duration::from_secs(30), "a second checkpoint", |fleet| {
+        checkpointed(fleet) != past
     })?;
-    cluster.check_history()?;
-    cluster.restart(lagging)?;
+    fleet.check_history()?;
+    fleet.restart(lagging)?;
 
-    cluster.await_workloads(Duration::from_secs(120))?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    cluster.await_replicas_converged(Duration::from_secs(30))?;
-    let reseeded = cluster
+    fleet.await_workloads(Duration::from_secs(120))?;
+    fleet.await_ring(Duration::from_secs(5))?;
+    fleet.await_replicas_converged(Duration::from_secs(30))?;
+    let reseeded = fleet
         .replication(lagging)
         .and_then(|replication| replication.follower_status(&database))
         .ok_or("the restarted node follows the database")?;
@@ -241,7 +241,7 @@ fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
         reseeded.snapshots >= 1,
         "{lagging} caught up through a snapshot: {reseeded:?}"
     );
-    let status = cluster
+    let status = fleet
         .replication(&primary)
         .and_then(|replication| replication.primary_status(&database))
         .ok_or("the primary isn't serving the database")?;
@@ -252,7 +252,7 @@ fn restart_past_a_checkpoint(seed: u64) -> Result<Report, Box<dyn Error>> {
             .all(|follower| !follower.needs_snapshot),
         "{status:?}"
     );
-    Ok(cluster.finish()?)
+    Ok(fleet.finish()?)
 }
 
 #[test]

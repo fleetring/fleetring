@@ -2,7 +2,7 @@
 //!
 //! A scope is `<action>:<pattern>`, where the action is `read`, `write`, `admin`, or `stream` and
 //! the pattern is an exact key or a prefix ending in `*`, the matcher the change sinks use. The
-//! word `cluster` alone is the scope for control operations that name no key. `write` implies
+//! word `fleet` alone is the scope for control operations that name no key. `write` implies
 //! `read`, `admin` implies both, and `stream` implies nothing and is implied by nothing, so a
 //! change consumer can't read tables. Everything not allowed is denied.
 //!
@@ -84,25 +84,25 @@ impl FromStr for Action {
     }
 }
 
-/// What a request touches: one key, or the cluster itself.
+/// What a request touches: one key, or the fleet itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target<'a> {
     /// The request acts on this key with this action.
     Key(Action, &'a DatabaseName),
     /// The request is a control operation that names no key: membership, draining, revocation.
-    Cluster,
+    Fleet,
 }
 
 impl fmt::Display for Target<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Key(action, key) => write!(f, "{action} on '{key}'"),
-            Self::Cluster => f.write_str("cluster"),
+            Self::Fleet => f.write_str("fleet"),
         }
     }
 }
 
-/// One rule: an action over the keys a pattern names, or `cluster`.
+/// One rule: an action over the keys a pattern names, or `fleet`.
 ///
 /// ```
 /// use fleetringd::auth::{Action, Scope, Target};
@@ -113,7 +113,7 @@ impl fmt::Display for Target<'_> {
 /// assert!(scope.allows(Target::Key(Action::Read, &key)));
 /// assert!(scope.allows(Target::Key(Action::Write, &key)));
 /// assert!(!scope.allows(Target::Key(Action::Admin, &key)));
-/// assert!(!scope.allows(Target::Cluster));
+/// assert!(!scope.allows(Target::Fleet));
 /// assert_eq!(scope.to_string(), "write:tenant:acme/*");
 /// # Ok(())
 /// # }
@@ -129,11 +129,11 @@ enum Rule {
         action: Action,
         pattern: DatabaseMatcher,
     },
-    Cluster,
+    Fleet,
 }
 
-/// The word that spells the cluster scope.
-const CLUSTER: &str = "cluster";
+/// The word that spells the fleet scope.
+const FLEET: &str = "fleet";
 
 impl Scope {
     /// The scope for `action` over the keys `pattern` names.
@@ -146,10 +146,8 @@ impl Scope {
 
     /// The scope for control operations that name no key.
     #[must_use]
-    pub fn cluster() -> Self {
-        Self {
-            rule: Rule::Cluster,
-        }
+    pub fn fleet() -> Self {
+        Self { rule: Rule::Fleet }
     }
 
     /// Whether this scope alone allows `target`.
@@ -159,8 +157,8 @@ impl Scope {
             (Rule::Keys { action, pattern }, Target::Key(wanted, key)) => {
                 action.covers(wanted) && pattern.matches(key)
             }
-            (Rule::Cluster, Target::Cluster) => true,
-            (Rule::Keys { .. }, Target::Cluster) | (Rule::Cluster, Target::Key(..)) => false,
+            (Rule::Fleet, Target::Fleet) => true,
+            (Rule::Keys { .. }, Target::Fleet) | (Rule::Fleet, Target::Key(..)) => false,
         }
     }
 
@@ -169,7 +167,7 @@ impl Scope {
     pub fn covers_some(&self, wanted: Action) -> bool {
         match &self.rule {
             Rule::Keys { action, .. } => action.covers(wanted),
-            Rule::Cluster => false,
+            Rule::Fleet => false,
         }
     }
 }
@@ -178,7 +176,7 @@ impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.rule {
             Rule::Keys { action, pattern } => write!(f, "{action}:{pattern}"),
-            Rule::Cluster => f.write_str(CLUSTER),
+            Rule::Fleet => f.write_str(FLEET),
         }
     }
 }
@@ -187,8 +185,8 @@ impl fmt::Display for Scope {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseScopeError {
-    /// The text has no `:` and isn't `cluster`.
-    #[error("a scope is `<action>:<pattern>` or `cluster`, not '{scope}'")]
+    /// The text has no `:` and isn't `fleet`.
+    #[error("a scope is `<action>:<pattern>` or `fleet`, not '{scope}'")]
     Shape {
         /// The text.
         scope: String,
@@ -211,8 +209,8 @@ impl FromStr for Scope {
     type Err = ParseScopeError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        if text == CLUSTER {
-            return Ok(Self::cluster());
+        if text == FLEET {
+            return Ok(Self::fleet());
         }
         let Some((action, pattern)) = text.split_once(':') else {
             return Err(ParseScopeError::Shape {
@@ -254,7 +252,7 @@ impl<'de> Deserialize<'de> for Scope {
 /// assert!(!scopes.allows(Target::Key(Action::Write, &acme)));
 /// assert!(!scopes.allows(Target::Key(Action::Read, &ledger)));
 /// assert!(scopes.allows(Target::Key(Action::Stream, &ledger)));
-/// assert!(!scopes.allows(Target::Cluster));
+/// assert!(!scopes.allows(Target::Fleet));
 /// # Ok(())
 /// # }
 /// ```
@@ -369,7 +367,7 @@ mod tests {
         assert!(!reader.allows(Target::Key(Action::Admin, &acme)));
         assert!(!reader.allows(Target::Key(Action::Stream, &acme)));
         assert!(!reader.allows(Target::Key(Action::Read, &key("ledger"))));
-        assert!(!reader.allows(Target::Cluster));
+        assert!(!reader.allows(Target::Fleet));
     }
 
     #[test]
@@ -385,31 +383,31 @@ mod tests {
     }
 
     #[test]
-    fn admin_on_everything_still_lacks_stream_and_cluster() {
+    fn admin_on_everything_still_lacks_stream_and_fleet() {
         let admin = scopes(&["admin:*"]);
         let any = key("anything");
         for action in [Action::Admin, Action::Write, Action::Read] {
             assert!(admin.allows(Target::Key(action, &any)), "{action}");
         }
         assert!(!admin.allows(Target::Key(Action::Stream, &any)));
-        assert!(!admin.allows(Target::Cluster));
+        assert!(!admin.allows(Target::Fleet));
     }
 
     #[test]
-    fn cluster_allows_key_less_operations_only() {
-        let cluster = scopes(&["cluster"]);
-        assert!(cluster.allows(Target::Cluster));
+    fn fleet_allows_key_less_operations_only() {
+        let fleet = scopes(&["fleet"]);
+        assert!(fleet.allows(Target::Fleet));
         for action in Action::ALL {
-            assert!(!cluster.allows(Target::Key(action, &key("tenant:acme"))));
+            assert!(!fleet.allows(Target::Key(action, &key("tenant:acme"))));
         }
-        assert!(!cluster.covers_some(Action::Read));
+        assert!(!fleet.covers_some(Action::Read));
     }
 
     #[test]
     fn no_scopes_deny_everything() {
         let none = Scopes::none();
         assert!(none.is_empty());
-        assert!(!none.allows(Target::Cluster));
+        assert!(!none.allows(Target::Fleet));
         for action in Action::ALL {
             assert!(!none.allows(Target::Key(action, &key("x"))));
             assert!(!none.covers_some(action));
@@ -432,7 +430,7 @@ mod tests {
             "write:ledger",
             "admin:*",
             "stream:ledger",
-            "cluster",
+            "fleet",
             "read:a:b:c",
         ] {
             assert_eq!(scope(text).to_string(), text);
@@ -455,16 +453,27 @@ mod tests {
                 scope: "read:".to_owned()
             })
         );
-        assert!("cluster:x".parse::<Scope>().is_err());
+        assert!("fleet:x".parse::<Scope>().is_err());
+        // 0.2's spelling of the fleet scope is gone, and the error names the new one.
+        let old = "cluster"
+            .parse::<Scope>()
+            .expect_err("cluster isn't a scope");
+        assert_eq!(
+            old,
+            ParseScopeError::Shape {
+                scope: "cluster".to_owned()
+            }
+        );
+        assert!(old.to_string().contains("`fleet`"), "{old}");
         assert!("Read:x".parse::<Scope>().is_err());
         assert!("".parse::<Scope>().is_err());
     }
 
     #[test]
     fn scopes_round_trip_through_json_as_strings() {
-        let set = scopes(&["read:tenant:*", "cluster"]);
+        let set = scopes(&["read:tenant:*", "fleet"]);
         let json = serde_json::to_string(&set).expect("scopes serialize");
-        assert_eq!(json, r#"["read:tenant:*","cluster"]"#);
+        assert_eq!(json, r#"["read:tenant:*","fleet"]"#);
         let back: Scopes = serde_json::from_str(&json).expect("scopes deserialize");
         assert_eq!(back, set);
         assert!(serde_json::from_str::<Scopes>(r#"["nope"]"#).is_err());

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
 
-use crate::common::{Cluster, TestResult, guarded, name, role, settings, sqlite};
+use crate::common::{Fleet, TestResult, guarded, name, role, settings, sqlite};
 
 fn open(database: &str, epoch: u64) -> ReplicateMessage {
     ReplicateMessage {
@@ -74,11 +74,11 @@ async fn replicate_until_judged(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResult {
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
     let db = name("fenced");
-    cluster.create("a", &db, 2).await?;
-    let follower = cluster.address("b");
-    let status = cluster
+    fleet.create("a", &db, 2).await?;
+    let follower = fleet.address("b");
+    let status = fleet
         .node("b")
         .replication
         .follower_status(&db)
@@ -105,7 +105,7 @@ async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResu
     assert!(status.message().contains("batch starts at"), "{status:?}");
 
     // The primary's own stream, which the test's streams replaced, reopens and goes on.
-    let registry = cluster.node("a").registry();
+    let registry = fleet.node("a").registry();
     guarded("a write after the stream reopens", async {
         while registry
             .execute(&db, crate::common::put(5, 5))
@@ -116,16 +116,16 @@ async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResu
         }
     })
     .await?;
-    cluster.await_caught_up("a", &db).await
+    fleet.await_caught_up("a", &db).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_whose_copy_the_frames_dont_continue_asks_for_a_snapshot() -> TestResult {
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
     let db = name("unfollowable");
-    cluster.create("a", &db, 2).await?;
+    fleet.create("a", &db, 2).await?;
     let peers = Peers::new(TransportConfig::default());
-    let mut client = replication_client(peers.channel(cluster.address("b").parse()?));
+    let mut client = replication_client(peers.channel(fleet.address("b").parse()?));
     let (sender, receiver) = mpsc::channel(8);
     sender.send(open("unfollowable", 1)).await?;
     let mut acks = client
@@ -159,7 +159,7 @@ async fn a_follower_whose_copy_the_frames_dont_continue_asks_for_a_snapshot() ->
     drop(sender);
     let ended = guarded("the stream ending", acks.message()).await??;
     assert!(ended.is_none(), "{ended:?}");
-    let status = cluster
+    let status = fleet
         .node("b")
         .replication
         .follower_status(&db)
@@ -173,7 +173,7 @@ async fn a_follower_whose_copy_the_frames_dont_continue_asks_for_a_snapshot() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn self_replicating_engines_are_refused_cleanly() -> TestResult {
-    let cluster = Cluster::start(
+    let fleet = Fleet::start(
         &["a", "b"],
         MemoryEngine::new(),
         settings(),
@@ -181,7 +181,7 @@ async fn self_replicating_engines_are_refused_cleanly() -> TestResult {
     )
     .await?;
     let db = name("memory");
-    let a = cluster.node("a");
+    let a = fleet.node("a");
     assert_eq!(
         a.replication.serve_primary(db.clone(), role(2)),
         Err(ServePrimaryError::SelfReplicating {
@@ -196,7 +196,7 @@ async fn self_replicating_engines_are_refused_cleanly() -> TestResult {
             Transaction::from(Statement::with_params("put", ["k".into(), 1.into()])),
         )
         .await?;
-    let (acks, status) = replicate(&cluster.address("b"), vec![open("memory", 1)]).await?;
+    let (acks, status) = replicate(&fleet.address("b"), vec![open("memory", 1)]).await?;
     assert!(acks.is_empty());
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert!(

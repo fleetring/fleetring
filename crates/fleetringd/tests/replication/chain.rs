@@ -19,12 +19,12 @@ use tonic::Code;
 use tonic::metadata::MetadataValue;
 
 use crate::common::{
-    Cluster, TestResult, checkpoint, eventually, guarded, name, put, settings, sqlite,
+    Fleet, TestResult, checkpoint, eventually, guarded, name, put, settings, sqlite,
 };
 
 /// Every node's chain over `db`, by node.
-fn chains(cluster: &Cluster, db: &DatabaseName) -> BTreeMap<String, BTreeMap<Position, ChainHash>> {
-    cluster
+fn chains(fleet: &Fleet, db: &DatabaseName) -> BTreeMap<String, BTreeMap<Position, ChainHash>> {
+    fleet
         .nodes
         .iter()
         .filter_map(|node| {
@@ -64,15 +64,15 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
         checkpoint_threshold: 16 * 1024,
         ..settings()
     };
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("chained");
-    cluster.create("a", &db, 3).await?;
-    let registry = cluster.node("a").registry();
+    fleet.create("a", &db, 3).await?;
+    let registry = fleet.node("a").registry();
     for i in 0..40_i64 {
         registry.execute(&db, put(i, 700)).await?;
     }
-    cluster.await_caught_up("a", &db).await?;
-    let primary = &cluster.node("a").replication;
+    fleet.await_caught_up("a", &db).await?;
+    let primary = &fleet.node("a").replication;
     assert!(
         primary
             .primary_status(&db)
@@ -83,7 +83,7 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
     );
     let marker = checkpoint(primary, &db).await?;
     for follower in ["b", "c"] {
-        let replication = &cluster.node(follower).replication;
+        let replication = &fleet.node(follower).replication;
         eventually("the follower checkpointing", || {
             replication
                 .follower_status(&db)
@@ -94,9 +94,9 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
     for i in 40..60_i64 {
         registry.execute(&db, put(i, 300)).await?;
     }
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
 
-    let held = chains(&cluster, &db);
+    let held = chains(&fleet, &db);
     assert_eq!(held.len(), 3, "every node holds a chain: {held:?}");
     let common = assert_agree(&held);
     assert!(common.len() >= 20, "{} common positions", common.len());
@@ -107,7 +107,7 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
     for node in ["a", "b", "c"] {
         let verified = guarded(
             "verifying the latest position",
-            cluster.node(node).replication.verify(&db, None),
+            fleet.node(node).replication.verify(&db, None),
         )
         .await?
         .map_err(|status| format!("{node}: {status}"))?;
@@ -116,7 +116,7 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
             primary.primary_status(&db).ok_or("primary")?.committed
         );
         latest.push(verified.hash);
-        let at_marker = cluster
+        let at_marker = fleet
             .node(node)
             .replication
             .verify(&db, Some(marker.position.clone()))
@@ -130,7 +130,7 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
     assert!(latest.iter().all(|hash| *hash == latest[0]), "{latest:?}");
 
     // A position no replica holds a hash for is reported as such.
-    let unknown = cluster
+    let unknown = fleet
         .node("b")
         .replication
         .verify(&db, Some(Position::new([0xff; 20])))
@@ -144,31 +144,31 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
 }
 
 /// Where `node` keeps `db`'s mirrored log.
-fn wal_path(cluster: &Cluster, node: &str, db: &str) -> PathBuf {
-    cluster.node(node).database_dir(db).join("data.db-wal")
+fn wal_path(fleet: &Fleet, node: &str, db: &str) -> PathBuf {
+    fleet.node(node).database_dir(db).join("data.db-wal")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_byte_changed_after_apply_is_caught_when_the_log_is_verified() -> TestResult {
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings(), BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings(), BTreeMap::new()).await?;
     let db = name("tampered");
-    cluster.create("a", &db, 3).await?;
-    let registry = cluster.node("a").registry();
+    fleet.create("a", &db, 3).await?;
+    let registry = fleet.node("a").registry();
     for i in 0..5_i64 {
         registry.execute(&db, put(i, 200)).await?;
     }
-    cluster.await_caught_up("a", &db).await?;
-    let agreed = cluster.node("c").replication.verify(&db, None).await?;
+    fleet.await_caught_up("a", &db).await?;
+    let agreed = fleet.node("c").replication.verify(&db, None).await?;
 
     // Flip a byte of page content in the last frame of b's log, after b applied and
     // acknowledged it.
-    let wal = wal_path(&cluster, "b", "tampered");
+    let wal = wal_path(&fleet, "b", "tampered");
     let mut bytes = fs::read(&wal)?;
     let last = bytes.len() - 1;
     bytes[last] ^= 0x01;
     fs::write(&wal, &bytes)?;
 
-    let refused = cluster
+    let refused = fleet
         .node("b")
         .replication
         .verify(&db, agreed.position.clone())
@@ -180,7 +180,7 @@ async fn a_byte_changed_after_apply_is_caught_when_the_log_is_verified() -> Test
         "{refused:?}"
     );
     for node in ["a", "c"] {
-        let verified = cluster.node(node).replication.verify(&db, None).await?;
+        let verified = fleet.node(node).replication.verify(&db, None).await?;
         assert_eq!(verified.hash, agreed.hash, "{node} still agrees");
     }
     Ok(())
@@ -222,24 +222,24 @@ async fn a_batch_whose_hash_differs_is_refused_and_the_follower_reseeded() -> Te
         retry_interval: std::time::Duration::from_secs(2),
         ..settings()
     };
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings, BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("forged");
     // Acknowledged by the primary alone, so a write commits while the test holds the follower.
     let two = ReplicationFactor::new(2).ok_or("nonzero")?;
     let role = PrimaryRole::new(two, LeaseEpoch::new(1))
         .with_durability(Durability::new(Acks::Local, two));
-    cluster.create_as("a", &db, role).await?;
-    let a = cluster.node("a");
-    let b = cluster.node("b");
+    fleet.create_as("a", &db, role).await?;
+    let a = fleet.node("a");
+    let b = fleet.node("b");
     a.registry().execute(&db, put(1, 100)).await?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let before = b.replication.follower_status(&db).ok_or("follows")?;
     let at = before.position.clone().ok_or("a position")?;
 
     // Commit a batch the follower hasn't seen, by taking its stream over first, so that the
     // primary's own stream doesn't ship it.
     let (sender, mut acks) = open_stream(
-        &cluster.address("b"),
+        &fleet.address("b"),
         "a",
         ReplicateOpen {
             database: db.to_string(),
@@ -314,8 +314,8 @@ async fn a_batch_whose_hash_differs_is_refused_and_the_follower_reseeded() -> Te
             .await
     );
     a.registry().execute(&db, put(3, 100)).await?;
-    cluster.await_caught_up("a", &db).await?;
-    let held = chains(&cluster, &db);
+    fleet.await_caught_up("a", &db).await?;
+    let held = chains(&fleet, &db);
     let common = assert_agree(&held);
     assert!(common.contains(&batch.end), "{common:?}");
     let status = b.replication.follower_status(&db).ok_or("follows")?;

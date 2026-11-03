@@ -113,7 +113,7 @@ const _: () = {
     assert_debug_send_sync::<tls::Accepted>();
     assert_debug_send_sync::<tls::Authority>();
     assert_debug_send_sync::<tls::AuthorityError>();
-    assert_debug_send_sync::<tls::ClusterName>();
+    assert_debug_send_sync::<tls::FleetName>();
     assert_debug_send_sync::<tls::Conn>();
     assert_debug_send_sync::<tls::HandshakeError>();
     assert_debug_send_sync::<tls::Identity>();

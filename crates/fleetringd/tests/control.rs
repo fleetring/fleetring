@@ -1252,7 +1252,7 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
     assert_eq!(drain.code(), Code::PermissionDenied, "{drain}");
     assert_eq!(
         drain.message(),
-        "Drain for node 'b' needs that node's certificate, or the cluster scope"
+        "Drain for node 'b' needs that node's certificate, or the fleet scope"
     );
     let leave = a
         .leave(LeaveRequest {
@@ -1266,7 +1266,7 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
         .await
         .expect_err("a node can't revoke tokens");
     assert_eq!(revoked.code(), Code::PermissionDenied, "{revoked}");
-    assert_eq!(revoked.message(), "RevokeToken needs the cluster scope");
+    assert_eq!(revoked.message(), "RevokeToken needs the fleet scope");
     // Nor create a database, or hand over a lease it doesn't hold.
     let created = a
         .create_database(CreateDatabaseRequest {
@@ -1305,7 +1305,7 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
     })
     .await?;
 
-    // A principal with the cluster scope may do all three to any member.
+    // A principal with the fleet scope may do all three to any member.
     operator
         .drain(DrainRequest {
             node_id: "c".into(),

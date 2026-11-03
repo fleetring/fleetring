@@ -19,16 +19,16 @@ pub enum Requirement {
     /// Only nodes call it: replication, leases, promotions, membership reports. Node-to-node
     /// calls are never authorized by key, and no principal may make them.
     Node,
-    /// A key-less control operation: a node, or a principal with the `cluster` scope.
-    Cluster,
+    /// A key-less control operation: a node, or a principal with the `fleet` scope.
+    Fleet,
     /// The action on the database the request names.
     Key(Action),
-    /// The action on the database the request names, or the `cluster` scope: inspections an
+    /// The action on the database the request names, or the `fleet` scope: inspections an
     /// operator makes across tenants, such as finding or verifying a database.
-    KeyOrCluster(Action),
+    KeyOrFleet(Action),
     /// A listing over many databases: each part of it shows a database only if the caller may
-    /// take that part's action on it, and everything to a node or a principal with `cluster`.
-    /// A principal that may take none of the actions on any key, and lacks `cluster`, is
+    /// take that part's action on it, and everything to a node or a principal with `fleet`.
+    /// A principal that may take none of the actions on any key, and lacks `fleet`, is
     /// refused.
     Listing(&'static [Action]),
 }
@@ -46,10 +46,10 @@ impl fmt::Display for Requirement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Node => f.write_str("node"),
-            Self::Cluster => f.write_str("cluster"),
+            Self::Fleet => f.write_str("fleet"),
             Self::Key(action) => write!(f, "{action} on the key"),
-            Self::KeyOrCluster(action) => write!(f, "{action} on the key, or cluster"),
-            Self::Listing(actions) => write!(f, "{} per key listed, or cluster", either(actions)),
+            Self::KeyOrFleet(action) => write!(f, "{action} on the key, or fleet"),
+            Self::Listing(actions) => write!(f, "{} per key listed, or fleet", either(actions)),
         }
     }
 }
@@ -138,7 +138,7 @@ pub const RPCS: &[Rpc] = &[
     // Every data node follows the membership.
     node_too(
         "/fleetring.v1.Control/WatchMembership",
-        Requirement::Cluster,
+        Requirement::Fleet,
         Binding::None,
     ),
     rpc(
@@ -160,7 +160,7 @@ pub const RPCS: &[Rpc] = &[
     // placement from the membership anyway.
     node_too(
         "/fleetring.v1.Control/Locate",
-        Requirement::KeyOrCluster(Action::Read),
+        Requirement::KeyOrFleet(Action::Read),
         Binding::None,
     ),
     rpc(
@@ -182,7 +182,7 @@ pub const RPCS: &[Rpc] = &[
     // ID from a node certificate.
     node_too(
         "/fleetring.v1.Control/Leave",
-        Requirement::Cluster,
+        Requirement::Fleet,
         Binding::SelfNode,
     ),
     rpc(
@@ -202,7 +202,7 @@ pub const RPCS: &[Rpc] = &[
     ),
     node_too(
         "/fleetring.v1.Control/Drain",
-        Requirement::Cluster,
+        Requirement::Fleet,
         Binding::SelfNode,
     ),
     // A draining node hands its own leases over; the handler refuses a lease it doesn't hold.
@@ -213,7 +213,7 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc(
         "/fleetring.v1.Control/RevokeToken",
-        Requirement::Cluster,
+        Requirement::Fleet,
         Binding::None,
     ),
     // Replication: nodes only.
@@ -270,7 +270,7 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc(
         "/fleetring.v1.Database/Verify",
-        Requirement::KeyOrCluster(Action::Read),
+        Requirement::KeyOrFleet(Action::Read),
         Binding::None,
     ),
 ];
@@ -285,7 +285,7 @@ pub fn rpc_at(path: &str) -> Option<&'static Rpc> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Credential {
-    /// A client certificate from the cluster authority; the scopes come from `[[principal]]`.
+    /// A client certificate from the fleet authority; the scopes come from `[[principal]]`.
     Certificate,
     /// A bearer token; the scopes are the token's.
     Token {
@@ -302,7 +302,7 @@ pub enum Credential {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Caller {
-    /// A node of the cluster, by the ID in its certificate. A node may make the node calls and
+    /// A node of the fleet, by the ID in its certificate. A node may make the node calls and
     /// the client calls a daemon makes as itself ([`ForNodes`]), each bound to placement
     /// (ADR-0031); beyond those it is a principal with no scopes (ADR-0026, point 9).
     Node(NodeId),
@@ -327,7 +327,7 @@ impl Caller {
         match self {
             Self::Node(_) | Self::Anonymous => true,
             Self::Principal { scopes, .. } => {
-                scopes.allows(Target::Cluster) || scopes.allows(Target::Key(action, key))
+                scopes.allows(Target::Fleet) || scopes.allows(Target::Key(action, key))
             }
         }
     }
@@ -353,16 +353,16 @@ impl Caller {
         };
         match rpc.requirement {
             Requirement::Node => Err(denied(Needed::Node)),
-            Requirement::Cluster if scopes.allows(Target::Cluster) => Ok(()),
-            Requirement::Cluster => Err(denied(Needed::Cluster)),
-            Requirement::KeyOrCluster(_) if scopes.allows(Target::Cluster) => Ok(()),
-            Requirement::Key(action) | Requirement::KeyOrCluster(action) => match key {
+            Requirement::Fleet if scopes.allows(Target::Fleet) => Ok(()),
+            Requirement::Fleet => Err(denied(Needed::Fleet)),
+            Requirement::KeyOrFleet(_) if scopes.allows(Target::Fleet) => Ok(()),
+            Requirement::Key(action) | Requirement::KeyOrFleet(action) => match key {
                 Some(key) if scopes.allows(Target::Key(action, key)) => Ok(()),
                 Some(key) => Err(denied(Needed::Key(action, key.clone()))),
-                None => Err(denied(Needed::Cluster)),
+                None => Err(denied(Needed::Fleet)),
             },
             Requirement::Listing(actions)
-                if scopes.allows(Target::Cluster)
+                if scopes.allows(Target::Fleet)
                     || actions.iter().any(|action| scopes.covers_some(*action)) =>
             {
                 Ok(())
@@ -378,11 +378,11 @@ impl Caller {
 pub enum Needed {
     /// A node certificate.
     Node,
-    /// The `cluster` scope.
-    Cluster,
+    /// The `fleet` scope.
+    Fleet,
     /// The action on the key.
     Key(Action, DatabaseName),
-    /// The action on at least one key, or `cluster`.
+    /// The action on at least one key, or `fleet`.
     Some(&'static [Action]),
 }
 
@@ -399,9 +399,9 @@ pub struct Denied {
 fn needed_text(needed: &Needed) -> String {
     match needed {
         Needed::Node => "a node certificate".to_owned(),
-        Needed::Cluster => "the cluster scope".to_owned(),
+        Needed::Fleet => "the fleet scope".to_owned(),
         Needed::Key(action, key) => format!("{action} on '{key}'"),
-        Needed::Some(actions) => format!("{} on some key, or the cluster scope", either(actions)),
+        Needed::Some(actions) => format!("{} on some key, or the fleet scope", either(actions)),
     }
 }
 
@@ -411,7 +411,7 @@ impl Denied {
     pub fn key(&self) -> Option<&DatabaseName> {
         match &self.needed {
             Needed::Key(_, key) => Some(key),
-            Needed::Node | Needed::Cluster | Needed::Some(_) => None,
+            Needed::Node | Needed::Fleet | Needed::Some(_) => None,
         }
     }
 
@@ -675,7 +675,7 @@ mod tests {
         }
         for rpc in RPCS
             .iter()
-            .filter(|rpc| matches!(rpc.requirement, Requirement::Cluster | Requirement::Node))
+            .filter(|rpc| matches!(rpc.requirement, Requirement::Fleet | Requirement::Node))
         {
             assert!(reader.authorize(rpc, None).is_err(), "{}", rpc.path);
         }
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn an_admin_of_everything_creates_and_drops_but_runs_no_cluster_operation() {
+    fn an_admin_of_everything_creates_and_drops_but_runs_no_fleet_operation() {
         let admin = principal(&["admin:*"]);
         let db = key("anything");
         for path in [
@@ -699,13 +699,13 @@ mod tests {
         }
         let drain = admin
             .authorize(call("/fleetring.v1.Control/Drain"), None)
-            .expect_err("drain needs cluster");
-        assert_eq!(drain.to_string(), "Drain needs the cluster scope");
+            .expect_err("drain needs fleet");
+        assert_eq!(drain.to_string(), "Drain needs the fleet scope");
     }
 
     #[test]
-    fn cluster_runs_control_operations_and_sees_every_listing_but_no_key() {
-        let operator = principal(&["cluster"]);
+    fn fleet_runs_control_operations_and_sees_every_listing_but_no_key() {
+        let operator = principal(&["fleet"]);
         for path in [
             "/fleetring.v1.Control/Drain",
             "/fleetring.v1.Control/Leave",
@@ -762,7 +762,7 @@ mod tests {
             .expect_err("leases are read");
         assert_eq!(
             leases.to_string(),
-            "WatchLeases needs read on some key, or the cluster scope"
+            "WatchLeases needs read on some key, or the fleet scope"
         );
         let nobody = principal(&[]);
         let status = nobody
@@ -770,7 +770,7 @@ mod tests {
             .expect_err("refused");
         assert_eq!(
             status.to_string(),
-            "NodeStatus needs read or stream on some key, or the cluster scope"
+            "NodeStatus needs read or stream on some key, or the fleet scope"
         );
     }
 
@@ -830,7 +830,7 @@ mod tests {
         let refusals = [
             (
                 "/fleetring.v1.Control/RevokeToken",
-                "RevokeToken needs the cluster scope",
+                "RevokeToken needs the fleet scope",
             ),
             (
                 "/fleetring.v1.Control/DropDatabase",

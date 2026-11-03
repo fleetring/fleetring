@@ -13,7 +13,7 @@ use fleetring::ReplicationFactor;
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetringd::replication::{LeaseWatch, PrimaryRole, Replication};
 
-use crate::common::{Cluster, TestResult, name, settings, sqlite};
+use crate::common::{Fleet, TestResult, name, settings, sqlite};
 
 /// How many times the primary is served at a new epoch and stopped.
 const ROUNDS: u64 = 4_000;
@@ -78,8 +78,8 @@ fn observe(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_lease_watch_changes_before_the_primary_does() -> TestResult {
-    let cluster = Cluster::start(&["a"], sqlite(), settings(), BTreeMap::new()).await?;
-    let node = cluster.node("a");
+    let fleet = Fleet::start(&["a"], sqlite(), settings(), BTreeMap::new()).await?;
+    let node = fleet.node("a");
     let database = name("churned");
     node.registry().create(&database).await?;
     let replication = node.replication.clone();

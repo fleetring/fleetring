@@ -3,7 +3,7 @@
 //! [`AuthLayer`] wraps every service a daemon serves. For each request it finds the RPC in
 //! [`RPCS`](crate::auth::RPCS) (a path the table doesn't list is refused), resolves the
 //! [`Caller`] from the connection's certificate and any `authorization: Bearer` token, and
-//! enforces the requirements that need no request body: node-only calls, `cluster`, and the
+//! enforces the requirements that need no request body: node-only calls, `fleet`, and the
 //! floor for listings. It passes the decision on in an [`Authorized`] extension, from which each
 //! handler checks the key its request names before it touches any state, and with which a
 //! streaming handler ends its stream once the token behind it expires or is revoked.
@@ -320,7 +320,7 @@ impl Authorizer {
         };
         match rpc.requirement {
             // The key is in the body; the handler checks it.
-            Requirement::Key(_) | Requirement::KeyOrCluster(_) => Ok(authorized),
+            Requirement::Key(_) | Requirement::KeyOrFleet(_) => Ok(authorized),
             _ => {
                 authorized.check(None)?;
                 Ok(authorized)
@@ -393,7 +393,7 @@ impl Authorized {
     /// is checked before each item and every [`STREAM_RECHECK`] between items. A stream opened
     /// without a token is returned as it is: certificates aren't revoked one by one (there is no
     /// revocation list), so it lasts as long as its connection, and a certificate stops being
-    /// accepted only when it expires or the cluster stops trusting the authority that issued it.
+    /// accepted only when it expires or the fleet stops trusting the authority that issued it.
     pub fn guard<T: Send + 'static>(&self, stream: BoxStream<T>) -> BoxStream<T> {
         let Caller::Principal {
             credential:
@@ -463,8 +463,8 @@ fn who(caller: &Caller) -> (String, String) {
 fn action_of(rpc: &Rpc) -> String {
     match rpc.requirement {
         Requirement::Node => "node".to_owned(),
-        Requirement::Cluster => "cluster".to_owned(),
-        Requirement::Key(action) | Requirement::KeyOrCluster(action) => action.as_str().to_owned(),
+        Requirement::Fleet => "fleet".to_owned(),
+        Requirement::Key(action) | Requirement::KeyOrFleet(action) => action.as_str().to_owned(),
         Requirement::Listing(actions) => actions
             .iter()
             .map(|action| action.as_str())
@@ -608,7 +608,7 @@ mod tests {
             std::time::Duration::from_secs(100 * 365 * 24 * 3600),
         );
         let authority =
-            Authority::create("test".parse().expect("a cluster"), validity).expect("an authority");
+            Authority::create("test".parse().expect("a fleet"), validity).expect("an authority");
         let issued = authority
             .issue_node(
                 &"n1".parse().expect("a node id"),
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(error.message(), "the token has expired");
 
         let other = Authority::create(
-            "test".parse().expect("a cluster"),
+            "test".parse().expect("a fleet"),
             Validity::new(Timestamp::ZERO, std::time::Duration::from_secs(3600)),
         )
         .expect("another authority");

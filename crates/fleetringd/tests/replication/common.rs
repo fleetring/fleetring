@@ -1,4 +1,4 @@
-//! A small cluster over real TCP: a control daemon, and data nodes that each run a registry and
+//! A small fleet over real TCP: a control daemon, and data nodes that each run a registry and
 //! replication behind their own `Replication` server.
 //!
 //! The data daemon wires replication the same way (see `tests/database.rs` for writes through
@@ -147,7 +147,7 @@ impl Node {
 }
 
 /// A control daemon and data nodes.
-pub(crate) struct Cluster {
+pub(crate) struct Fleet {
     pub(crate) nodes: Vec<Node>,
     pub(crate) addresses: Arc<BTreeMap<NodeId, String>>,
     _control: Daemon,
@@ -155,7 +155,7 @@ pub(crate) struct Cluster {
     _dir: TempDir,
 }
 
-impl Cluster {
+impl Fleet {
     /// Starts `ids.len()` data nodes running `engine`, each wrapped by `wraps` if it names it.
     pub(crate) async fn start(
         ids: &[&str],
@@ -236,15 +236,15 @@ impl Cluster {
                 _membership: tasks,
             });
         }
-        let cluster = Self {
+        let fleet = Self {
             nodes,
             addresses,
             _control: control,
             _tls: tls,
             _dir: dir,
         };
-        cluster.await_members(ids.len()).await?;
-        Ok(cluster)
+        fleet.await_members(ids.len()).await?;
+        Ok(fleet)
     }
 
     /// Waits until every node sees `count` live members.

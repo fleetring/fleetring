@@ -2,7 +2,7 @@
 //!
 //! A token is a compact JWS, `<header>.<claims>.<signature>`, each part base64url without
 //! padding. The header is `{"alg":"EdDSA","typ":"JWT","kid":"<key id>"}`; the claims are the
-//! registered `iss` (the cluster), `sub` (the principal), `jti` (the token's ID), `iat`, `nbf`,
+//! registered `iss` (the fleet), `sub` (the principal), `jti` (the token's ID), `iat`, `nbf`,
 //! and `exp`, plus one FleetRing claim, `fleetring.scopes`, the scopes as strings. Standard JWT
 //! libraries can inspect and mint them.
 //!
@@ -116,7 +116,7 @@ struct Claims {
     scopes: Vec<String>,
 }
 
-/// What a token grants: who, what, and when. The issuer is the signer's cluster.
+/// What a token grants: who, what, and when. The issuer is the signer's fleet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     /// The principal the token names.
@@ -168,8 +168,8 @@ impl fmt::Debug for TokenSigner {
 }
 
 impl TokenSigner {
-    /// A signer for the cluster `issuer` from an Ed25519 private key in PKCS#8 DER, as the
-    /// cluster authority keeps it.
+    /// A signer for the fleet `issuer` from an Ed25519 private key in PKCS#8 DER, as the
+    /// fleet authority keeps it.
     ///
     /// # Errors
     ///
@@ -299,8 +299,8 @@ pub enum TokenError {
     /// The signature doesn't verify.
     #[error("the token's signature is invalid")]
     Signature,
-    /// The token was issued for another cluster.
-    #[error("the token was issued for another cluster")]
+    /// The token was issued for another fleet.
+    #[error("the token was issued for another fleet")]
     Issuer,
     /// The token isn't valid yet.
     #[error("the token isn't valid yet")]
@@ -319,7 +319,7 @@ pub enum TokenError {
     Scope(#[source] ParseScopeError),
 }
 
-/// What a node checks tokens against: the cluster they must be issued for and the keys trusted
+/// What a node checks tokens against: the fleet they must be issued for and the keys trusted
 /// to sign them.
 ///
 /// More than one key may be trusted, so a rotation overlaps, and a later delegated issuer is one
@@ -679,7 +679,50 @@ mod tests {
     }
 
     #[test]
-    fn a_token_for_another_cluster_is_refused() {
+    fn the_fleet_scope_is_written_and_read_as_fleet_and_cluster_is_refused() {
+        use crate::auth::Target;
+
+        let signer = key(7, "prod");
+        let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
+        let none = Revocations::new();
+        let now = at_secs(2_000);
+
+        let issued = signer.issue(&grant(&["fleet"])).expect("issues");
+        let claims = issued.expose().split('.').nth(1).expect("a claims part");
+        let claims: Claims = decode_json(claims).expect("claims decode");
+        assert_eq!(claims.scopes, ["fleet"]);
+        let verified = verifier.verify(&issued, now, &none).expect("verifies");
+        assert!(verified.grant.scopes.allows(Target::Fleet));
+
+        // A token minted by 0.2 carries the scope's old spelling, which 0.3 doesn't accept.
+        let header = Header {
+            alg: ALGORITHM.to_owned(),
+            typ: Some(TYPE.to_owned()),
+            kid: signer.key_id().to_string(),
+        };
+        let claims = Claims {
+            iss: "prod".to_owned(),
+            sub: "ops".to_owned(),
+            jti: "old".to_owned(),
+            iat: None,
+            nbf: 1_000,
+            exp: 4_600,
+            scopes: vec!["cluster".to_owned()],
+        };
+        let mut text = encode_json(&header);
+        text.push('.');
+        text.push_str(&encode_json(&claims));
+        let signature = signer.key.sign(text.as_bytes());
+        text.push('.');
+        text.push_str(&URL_SAFE_NO_PAD.encode(signature.as_ref()));
+        assert!(matches!(
+            verifier.verify(&BearerToken::new(text), now, &none),
+            Err(TokenError::Scope(ParseScopeError::Shape { scope })) if scope == "cluster"
+        ));
+    }
+
+    #[test]
+    fn a_token_for_another_fleet_is_refused() {
         let signer = key(7, "staging");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
         let issued = signer.issue(&grant(&["read:x"])).expect("issues");

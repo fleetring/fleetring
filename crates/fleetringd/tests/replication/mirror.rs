@@ -7,7 +7,7 @@ use fleetringd::engine::{Statement, Transaction, Value};
 use fleetringd::replication::ReplicationSettings;
 use tokio::task::JoinSet;
 
-use crate::common::{Cluster, TestResult, checkpoint, eventually, name, put, settings, sqlite};
+use crate::common::{Fleet, TestResult, checkpoint, eventually, name, put, settings, sqlite};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpoint() -> TestResult
@@ -17,13 +17,13 @@ async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpo
         checkpoint_threshold: 16 * 1024,
         ..settings()
     };
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("mirrored");
-    cluster.create("a", &db, 3).await?;
+    fleet.create("a", &db, 3).await?;
 
     let mut writers = JoinSet::new();
     for writer in 0..4_i64 {
-        let registry = cluster.node("a").registry().clone();
+        let registry = fleet.node("a").registry().clone();
         let db = db.clone();
         writers.spawn(async move {
             for i in 0..120_i64 {
@@ -51,8 +51,8 @@ async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpo
     while let Some(written) = writers.join_next().await {
         written??;
     }
-    cluster.await_caught_up("a", &db).await?;
-    let primary = &cluster.node("a").replication;
+    fleet.await_caught_up("a", &db).await?;
+    let primary = &fleet.node("a").replication;
     let status = primary.primary_status(&db).ok_or("not primary")?;
     assert!(
         status.checkpointed.is_some(),
@@ -61,7 +61,7 @@ async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpo
 
     let marker = checkpoint(primary, &db).await?;
     for follower in ["b", "c"] {
-        let replication = &cluster.node(follower).replication;
+        let replication = &fleet.node(follower).replication;
         eventually("the follower checkpointing at the marker", || {
             replication
                 .follower_status(&db)
@@ -69,7 +69,7 @@ async fn caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpo
         })
         .await?;
     }
-    let file = |node: &str| fs::read(cluster.node(node).database_dir("mirrored").join("data.db"));
+    let file = |node: &str| fs::read(fleet.node(node).database_dir("mirrored").join("data.db"));
     let expected = file("a")?;
     for follower in ["b", "c"] {
         let copy = file(follower)?;

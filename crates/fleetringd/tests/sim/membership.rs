@@ -11,7 +11,7 @@ use std::time::Duration;
 use fleetring::NodeId;
 use fleetring_control::{DatabaseName, Liveness, Role, State, Timestamp};
 use fleetringd::sim::{
-    Ack, Cluster, CreateAndWrite, Operation, Operator, Replay, Report, Timings, seeds,
+    Ack, CreateAndWrite, Fleet, Operation, Operator, Replay, Report, Timings, seeds,
 };
 
 use crate::{BINARY, TestResult};
@@ -31,21 +31,19 @@ fn liveness(state: &State, id: &str) -> Option<Liveness> {
 /// Waits for the control plane to reach `condition`, then checks that `nodes` converge on it
 /// within two heartbeat intervals.
 fn after_event(
-    cluster: &mut Cluster,
+    fleet: &mut Fleet,
     event: &str,
     limit: Duration,
     nodes: &[&str],
     condition: impl Fn(&State) -> bool,
 ) -> TestResult {
-    cluster.run_until(limit, event, |cluster| {
-        cluster
-            .control_state()
-            .is_some_and(|state| condition(&state))
+    fleet.run_until(limit, event, |fleet| {
+        fleet.control_state().is_some_and(|state| condition(&state))
     })?;
-    cluster.note(format!("control: {event}"));
-    let took = cluster.await_ring_on(nodes, BOUND)?;
+    fleet.note(format!("control: {event}"));
+    let took = fleet.await_ring_on(nodes, BOUND)?;
     assert!(took <= BOUND, "{event}: converged after {took:?}");
-    cluster.note(format!("converged after {event}"));
+    fleet.note(format!("converged after {event}"));
     Ok(())
 }
 
@@ -55,7 +53,7 @@ fn scenario(seed: u64) -> Result<Report, Box<dyn Error>> {
         heartbeat_timeout: TIMEOUT,
         ..Timings::default()
     };
-    let mut cluster = Cluster::builder(seed)
+    let mut fleet = Fleet::builder(seed)
         .control(CONTROL)
         .data(DATA[0])
         .data(DATA[1])
@@ -63,11 +61,11 @@ fn scenario(seed: u64) -> Result<Report, Box<dyn Error>> {
         .timings(timings)
         .build()?;
     let operator = Operator::new();
-    cluster.client("operator", operator.clone());
+    fleet.client("operator", operator.clone());
 
     // Joins.
     after_event(
-        &mut cluster,
+        &mut fleet,
         "three members",
         Duration::from_secs(5),
         &DATA,
@@ -75,39 +73,31 @@ fn scenario(seed: u64) -> Result<Report, Box<dyn Error>> {
     )?;
 
     // A partition: the control plane marks node-2 down, then up again when it heals.
-    cluster.partition("node-2", CONTROL)?;
+    fleet.partition("node-2", CONTROL)?;
     let live = ["node-1", "node-3"];
-    after_event(
-        &mut cluster,
-        "node-2 down",
-        TIMEOUT + BOUND,
-        &live,
-        |state| liveness(state, "node-2") == Some(Liveness::Down),
-    )?;
+    after_event(&mut fleet, "node-2 down", TIMEOUT + BOUND, &live, |state| {
+        liveness(state, "node-2") == Some(Liveness::Down)
+    })?;
     // Still down while the partition lasts.
-    cluster.run_for(TIMEOUT)?;
-    let state = cluster.control_state().ok_or("control is down")?;
+    fleet.run_for(TIMEOUT)?;
+    let state = fleet.control_state().ok_or("control is down")?;
     assert_eq!(liveness(&state, "node-2"), Some(Liveness::Down));
-    cluster.repair("node-2", CONTROL)?;
-    after_event(&mut cluster, "node-2 up", 3 * INTERVAL, &DATA, |state| {
+    fleet.repair("node-2", CONTROL)?;
+    after_event(&mut fleet, "node-2 up", 3 * INTERVAL, &DATA, |state| {
         liveness(state, "node-2") == Some(Liveness::Live)
     })?;
 
     // A crash: node-3 is marked down, then removed.
-    cluster.crash("node-3")?;
+    fleet.crash("node-3")?;
     let two = ["node-1", "node-2"];
-    after_event(
-        &mut cluster,
-        "node-3 down",
-        TIMEOUT + BOUND,
-        &two,
-        |state| liveness(state, "node-3") == Some(Liveness::Down),
-    )?;
+    after_event(&mut fleet, "node-3 down", TIMEOUT + BOUND, &two, |state| {
+        liveness(state, "node-3") == Some(Liveness::Down)
+    })?;
     operator.push(Operation::Leave {
         node: "node-3".parse()?,
     });
     after_event(
-        &mut cluster,
+        &mut fleet,
         "node-3 left",
         Duration::from_secs(1),
         &two,
@@ -115,9 +105,9 @@ fn scenario(seed: u64) -> Result<Report, Box<dyn Error>> {
     )?;
 
     // A restart: node-3 joins again, as a laptop waking from sleep would.
-    cluster.restart("node-3")?;
+    fleet.restart("node-3")?;
     after_event(
-        &mut cluster,
+        &mut fleet,
         "node-3 rejoined",
         Duration::from_secs(1),
         &DATA,
@@ -126,13 +116,13 @@ fn scenario(seed: u64) -> Result<Report, Box<dyn Error>> {
 
     // A control node outage: every node is down when it returns, and up once heartbeats arrive.
     // Crashing the control host also checks that its log replays.
-    cluster.crash(CONTROL)?;
-    cluster.run_for(2 * TIMEOUT)?;
-    cluster.restart(CONTROL)?;
-    let restarted = Timestamp::from_millis(u64::try_from(cluster.elapsed().as_millis())?);
+    fleet.crash(CONTROL)?;
+    fleet.run_for(2 * TIMEOUT)?;
+    fleet.restart(CONTROL)?;
+    let restarted = Timestamp::from_millis(u64::try_from(fleet.elapsed().as_millis())?);
     let ids: Vec<NodeId> = DATA.iter().map(|id| id.parse()).collect::<Result<_, _>>()?;
     after_event(
-        &mut cluster,
+        &mut fleet,
         "all heard from after the outage",
         4 * INTERVAL,
         &DATA,
@@ -145,7 +135,7 @@ fn scenario(seed: u64) -> Result<Report, Box<dyn Error>> {
         },
     )?;
     assert!(operator.is_idle());
-    Ok(cluster.finish()?)
+    Ok(fleet.finish()?)
 }
 
 #[test]
@@ -159,8 +149,8 @@ fn every_live_node_publishes_the_same_ring_within_two_heartbeats() {
 }
 
 /// The primary that the acknowledged creation of `database` reported, if any.
-fn opened_primary(cluster: &Cluster, database: &DatabaseName) -> Option<String> {
-    cluster
+fn opened_primary(fleet: &Fleet, database: &DatabaseName) -> Option<String> {
+    fleet
         .history()
         .acknowledged()
         .find_map(|(operation, ack)| match (operation, ack) {
@@ -187,7 +177,7 @@ fn slow_replies_keep_nodes_live_and_their_reports_current() {
         };
         // Each message takes up to one interval, so most round trips outlast the time a node
         // gives a join or heartbeat.
-        let mut cluster = Cluster::builder(seed)
+        let mut fleet = Fleet::builder(seed)
             .control(CONTROL)
             .data(DATA[0])
             .data(DATA[1])
@@ -196,25 +186,25 @@ fn slow_replies_keep_nodes_live_and_their_reports_current() {
             .max_latency(INTERVAL)
             .operation_timeout(Duration::from_secs(5))
             .build()?;
-        cluster.run_until(Duration::from_secs(10), "three members", |cluster| {
-            cluster
+        fleet.run_until(Duration::from_secs(10), "three members", |fleet| {
+            fleet
                 .control_state()
                 .is_some_and(|state| state.membership_epoch().get() == 3)
         })?;
-        cluster.client("writer", CreateAndWrite::new(1, 3, 3));
-        cluster.await_workloads(Duration::from_secs(90))?;
+        fleet.client("writer", CreateAndWrite::new(1, 3, 3));
+        fleet.await_workloads(Duration::from_secs(90))?;
         let database: DatabaseName = "db-0".parse()?;
-        let primary: NodeId = opened_primary(&cluster, &database)
+        let primary: NodeId = opened_primary(&fleet, &database)
             .ok_or("db-0 was never opened")?
             .parse()?;
-        cluster.run_until(Duration::from_secs(20), "the primary's report", |cluster| {
-            cluster.control_state().is_some_and(|state| {
+        fleet.run_until(Duration::from_secs(20), "the primary's report", |fleet| {
+            fleet.control_state().is_some_and(|state| {
                 state
                     .report(&primary, &database)
                     .is_some_and(|report| report.role() == Role::Primary)
             })
         })?;
-        let state = cluster.control_state().ok_or("no control state")?;
+        let state = fleet.control_state().ok_or("no control state")?;
         for node in DATA {
             assert_eq!(
                 liveness(&state, node),
@@ -222,8 +212,8 @@ fn slow_replies_keep_nodes_live_and_their_reports_current() {
                 "{node} on seed {seed}"
             );
         }
-        cluster.await_ring(Duration::from_secs(20))?;
-        cluster.finish()?;
+        fleet.await_ring(Duration::from_secs(20))?;
+        fleet.finish()?;
         Ok(())
     });
 }

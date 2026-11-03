@@ -13,7 +13,7 @@ use std::time::Duration;
 use fleetring::{NodeId, Weight};
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetringd::sim::{
-    Ack, Cluster, CreateAndWrite, Operation, OutcomeClass, ReplicaRows, Report, SimRng, Step,
+    Ack, CreateAndWrite, Fleet, Operation, OutcomeClass, ReplicaRows, Report, SimRng, Step,
     Workload, check, seeds,
 };
 
@@ -85,52 +85,52 @@ fn target(operation: &Operation) -> Option<&NodeId> {
 }
 
 /// Steps until every member of `placed`, `database`'s replica set, holds the same rows, and
-/// checks that they do. [`Cluster::await_replicas_converged`] compares every data host, which
+/// checks that they do. [`Fleet::await_replicas_converged`] compares every data host, which
 /// holds only while every data host is a replica; here one isn't.
 fn await_placed_converged(
-    cluster: &mut Cluster,
+    fleet: &mut Fleet,
     database: &DatabaseName,
     placed: &[NodeId],
 ) -> TestResult {
     let placed: BTreeSet<String> = placed.iter().map(ToString::to_string).collect();
-    let rows = |cluster: &Cluster| -> Result<ReplicaRows, Box<dyn Error>> {
-        Ok(cluster
+    let rows = |fleet: &Fleet| -> Result<ReplicaRows, Box<dyn Error>> {
+        Ok(fleet
             .replica_rows(database)?
             .into_iter()
             .filter(|(host, _)| placed.contains(host))
             .collect())
     };
-    cluster.run_until(
+    fleet.run_until(
         Duration::from_secs(60),
         "the replica set converging",
-        |cluster| {
-            cluster.replicas_caught_up()
-                && rows(cluster).is_ok_and(|rows| {
+        |fleet| {
+            fleet.replicas_caught_up()
+                && rows(fleet).is_ok_and(|rows| {
                     rows.len() == placed.len() && check::replicas_converged(database, &rows).is_ok()
                 })
         },
     )?;
-    check::replicas_converged(database, &rows(cluster)?)?;
-    cluster.check_chains()?;
-    cluster.check_history()?;
+    check::replicas_converged(database, &rows(fleet)?)?;
+    fleet.check_chains()?;
+    fleet.check_history()?;
     Ok(())
 }
 
 fn attacked(seed: u64) -> Result<Report, Box<dyn Error>> {
     const DATA: [&str; 4] = ["node-1", "node-2", "node-3", "node-4"];
-    let mut builder = Cluster::builder(seed).control(CONTROL);
+    let mut builder = Fleet::builder(seed).control(CONTROL);
     for node in DATA {
         builder = builder.data(node).impostor(&impostor(node), node);
     }
-    let mut cluster = builder.operation_timeout(Duration::from_secs(2)).build()?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    cluster.client("writer", CreateAndWrite::new(1, 3, 300));
-    cluster.run_until(Duration::from_secs(20), "writes flowing", |cluster| {
-        cluster.history().acknowledged_writes().count() >= 20
+    let mut fleet = builder.operation_timeout(Duration::from_secs(2)).build()?;
+    fleet.await_ring(Duration::from_secs(5))?;
+    fleet.client("writer", CreateAndWrite::new(1, 3, 300));
+    fleet.run_until(Duration::from_secs(20), "writes flowing", |fleet| {
+        fleet.history().acknowledged_writes().count() >= 20
     })?;
 
     let db = database()?;
-    let state = cluster.control_state().ok_or("the control node is down")?;
+    let state = fleet.control_state().ok_or("the control node is down")?;
     let epoch = state.database(&db).ok_or("no db-0")?.epoch();
     let replicas = state.replica_set(&db)?;
     let outsider = DATA
@@ -160,10 +160,10 @@ fn attacked(seed: u64) -> Result<Report, Box<dyn Error>> {
         });
     }
     let attacker = impostor(outsider);
-    let began = cluster.elapsed();
-    cluster.client(&attacker, Attack::new(calls));
-    cluster.run_until(Duration::from_secs(30), "the attack ending", |cluster| {
-        cluster
+    let began = fleet.elapsed();
+    fleet.client(&attacker, Attack::new(calls));
+    fleet.run_until(Duration::from_secs(30), "the attack ending", |fleet| {
+        fleet
             .history()
             .records()
             .iter()
@@ -171,11 +171,11 @@ fn attacked(seed: u64) -> Result<Report, Box<dyn Error>> {
             .count()
             >= ROUNDS * replicas.len() * 5
     })?;
-    let ended = cluster.elapsed();
+    let ended = fleet.elapsed();
 
-    let history = cluster.history();
+    let history = fleet.history();
     check::impostor_refused(&history)?;
-    let state = cluster.control_state().ok_or("the control node is down")?;
+    let state = fleet.control_state().ok_or("the control node is down")?;
     assert_eq!(
         state.database(&db).map(|database| database.epoch()),
         Some(epoch),
@@ -210,7 +210,7 @@ fn attacked(seed: u64) -> Result<Report, Box<dyn Error>> {
         }
     }
     for node in DATA {
-        let refused = cluster.binding_refusals(node).ok_or("a node is down")?;
+        let refused = fleet.binding_refusals(node).ok_or("a node is down")?;
         let theirs = expected.get(node).copied().unwrap_or(0);
         assert_eq!(refused, theirs, "{node} refused legitimate calls");
         if replicas.iter().any(|replica| replica.as_str() == node) {
@@ -218,9 +218,9 @@ fn attacked(seed: u64) -> Result<Report, Box<dyn Error>> {
         }
     }
 
-    cluster.await_workloads(Duration::from_secs(120))?;
-    await_placed_converged(&mut cluster, &db, &replicas)?;
-    Ok(cluster.finish()?)
+    fleet.await_workloads(Duration::from_secs(120))?;
+    await_placed_converged(&mut fleet, &db, &replicas)?;
+    Ok(fleet.finish()?)
 }
 
 /// Both scenarios run four data hosts and seconds of writes, so CI runs them on the heavy
@@ -251,7 +251,7 @@ fn moved(
 fn joined(seed: u64) -> Result<Report, Box<dyn Error>> {
     const DATA: [&str; 3] = ["node-1", "node-2", "node-3"];
     const JOINING: &str = "node-4";
-    let mut cluster = Cluster::builder(seed)
+    let mut fleet = Fleet::builder(seed)
         .control(CONTROL)
         .data(DATA[0])
         .data(DATA[1])
@@ -263,28 +263,26 @@ fn joined(seed: u64) -> Result<Report, Box<dyn Error>> {
         .operation_timeout(Duration::from_secs(2))
         .build()?;
     // The fourth host can't reach the control node, so it joins only once the link heals.
-    cluster.partition(JOINING, CONTROL)?;
-    cluster.await_ring_on(&DATA, Duration::from_secs(5))?;
-    cluster.client("writer", CreateAndWrite::new(10, 3, 300));
-    cluster.run_until(
-        Duration::from_secs(30),
-        "every database written",
-        |cluster| cluster.history().acknowledged_writes().count() >= 30,
-    )?;
-    let before = cluster.control_state().ok_or("the control node is down")?;
+    fleet.partition(JOINING, CONTROL)?;
+    fleet.await_ring_on(&DATA, Duration::from_secs(5))?;
+    fleet.client("writer", CreateAndWrite::new(10, 3, 300));
+    fleet.run_until(Duration::from_secs(30), "every database written", |fleet| {
+        fleet.history().acknowledged_writes().count() >= 30
+    })?;
+    let before = fleet.control_state().ok_or("the control node is down")?;
     assert_eq!(before.members().len(), DATA.len());
 
-    cluster.repair(JOINING, CONTROL)?;
-    cluster.run_until(
+    fleet.repair(JOINING, CONTROL)?;
+    fleet.run_until(
         Duration::from_secs(10),
         "the fourth host joining",
-        |cluster| {
-            cluster
+        |fleet| {
+            fleet
                 .control_state()
                 .is_some_and(|state| state.members().len() == DATA.len() + 1)
         },
     )?;
-    let after = cluster.control_state().ok_or("the control node is down")?;
+    let after = fleet.control_state().ok_or("the control node is down")?;
     let moved = moved(&before, &after)?;
     let joining: NodeId = JOINING.parse()?;
     let database = moved
@@ -296,14 +294,14 @@ fn joined(seed: u64) -> Result<Report, Box<dyn Error>> {
         })
         .ok_or("the join moved no replica")?
         .clone();
-    cluster.note(format!("{database} moves to {JOINING}"));
+    fleet.note(format!("{database} moves to {JOINING}"));
 
-    cluster.await_workloads(Duration::from_secs(120))?;
-    cluster.await_ring(Duration::from_secs(5))?;
+    fleet.await_workloads(Duration::from_secs(120))?;
+    fleet.await_ring(Duration::from_secs(5))?;
     // The replica the join moved away keeps the copy it had; only the new replica set must
     // agree.
-    await_placed_converged(&mut cluster, &database, &after.replica_set(&database)?)?;
-    let copy = cluster
+    await_placed_converged(&mut fleet, &database, &after.replica_set(&database)?)?;
+    let copy = fleet
         .replication(JOINING)
         .and_then(|replication| replication.follower_status(&database))
         .ok_or("the new member holds no copy")?;
@@ -311,8 +309,8 @@ fn joined(seed: u64) -> Result<Report, Box<dyn Error>> {
         copy.position.is_some(),
         "{JOINING}'s copy of {database}: {copy:?}"
     );
-    cluster.assert_no_binding_refusals()?;
-    Ok(cluster.finish()?)
+    fleet.assert_no_binding_refusals()?;
+    Ok(fleet.finish()?)
 }
 
 #[test]

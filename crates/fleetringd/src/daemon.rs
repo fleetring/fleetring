@@ -124,7 +124,7 @@ impl Daemon {
     /// Every role serves gRPC on `listen`. A role that runs control recovers the control node
     /// from the data directory and serves the `Control` service there. A role that hosts data
     /// keeps its databases under `databases/` in the data directory, serves the `Database`
-    /// service (see [`data`](crate::data)), joins the cluster with its advertised address, sends
+    /// service (see [`data`](crate::data)), joins the fleet with its advertised address, sends
     /// heartbeats, and publishes the ring (see [`Membership`]). It also serves the `Replication`
     /// service: it streams every database it is primary for to that database's followers, keeps
     /// copies of those it follows, and reports both in its heartbeats (see
@@ -371,7 +371,7 @@ fn security(config: &Config, environment: &Environment) -> Result<Security, Star
         let identity = Identity::load(&tls.ca, &tls.cert, &tls.key)?;
         tracing::info!(
             subject = ?identity.peer(),
-            cluster = %identity.cluster(),
+            fleet = %identity.fleet(),
             ca = %tls.ca.display(),
             cert = %tls.cert.display(),
             "loaded the node's identity",

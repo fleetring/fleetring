@@ -6,14 +6,14 @@
 //! control node, then check what ADR-0018 promises, all in simulated time:
 //!
 //! - no acknowledged write is ever lost: every one is on a write quorum and in every later
-//!   read, and the replicas converge (the history checker in [`Cluster::finish`] and
-//!   [`Cluster::await_replicas_converged`]);
+//!   read, and the replicas converge (the history checker in [`Fleet::finish`] and
+//!   [`Fleet::await_replicas_converged`]);
 //! - at most one node acknowledges writes for a database in any epoch (the history checker,
 //!   from the primary and epoch each acknowledgement names);
 //! - a failover moves writes within the lease duration plus the failover margin plus one second;
 //! - while the control node is down, the primary keeps acknowledging writes;
 //! - the lease watchers on every node saw each lease gained by the node control granted it to,
-//!   and nothing else ([`Cluster::finish`] checks it for every run; FR-042).
+//!   and nothing else ([`Fleet::finish`] checks it for every run; FR-042).
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use fleetring_control::DatabaseName;
 use fleetringd::sim::{
-    Ack, Cluster, CreateAndWrite, LeaseSeen, Operation, Outcome, Script, Timings, seeds,
+    Ack, CreateAndWrite, Fleet, LeaseSeen, Operation, Outcome, Script, Timings, seeds,
 };
 
 use crate::{BINARY, TestResult};
@@ -44,8 +44,8 @@ fn database() -> Result<DatabaseName, Box<dyn Error>> {
     Ok("db-0".parse()?)
 }
 
-fn cluster(seed: u64, timings: Timings) -> Result<Cluster, Box<dyn Error>> {
-    Ok(Cluster::builder(seed)
+fn fleet(seed: u64, timings: Timings) -> Result<Fleet, Box<dyn Error>> {
+    Ok(Fleet::builder(seed)
         .control(CONTROL)
         .data(DATA[0])
         .data(DATA[1])
@@ -56,22 +56,22 @@ fn cluster(seed: u64, timings: Timings) -> Result<Cluster, Box<dyn Error>> {
 }
 
 /// The node the control plane names as the database's primary, while it runs and one serves.
-fn primary(cluster: &Cluster) -> Option<String> {
-    let state = cluster.control_state()?;
+fn primary(fleet: &Fleet) -> Option<String> {
+    let state = fleet.control_state()?;
     let database = state.database(&database().ok()?)?;
     let lease = database.lease()?;
     (lease.epoch() == database.epoch()).then(|| lease.holder().to_string())
 }
 
 /// The database's epoch, as the control plane last published it.
-fn epoch(cluster: &Cluster) -> Option<u64> {
-    let state = cluster.control_state()?;
+fn epoch(fleet: &Fleet) -> Option<u64> {
+    let state = fleet.control_state()?;
     Some(state.database(&database().ok()?)?.epoch().get())
 }
 
 /// Every acknowledged write, as (when it completed, the primary that acknowledged it, epoch).
-fn acknowledged_writes(cluster: &Cluster) -> Vec<(Duration, String, u64)> {
-    cluster
+fn acknowledged_writes(fleet: &Fleet) -> Vec<(Duration, String, u64)> {
+    fleet
         .history()
         .records()
         .iter()
@@ -90,68 +90,68 @@ fn acknowledged_writes(cluster: &Cluster) -> Vec<(Duration, String, u64)> {
 }
 
 /// Creates the database and waits until writes to it are acknowledged.
-fn start_writing(cluster: &mut Cluster, writes: u32) -> Result<String, Box<dyn Error>> {
-    cluster.await_ring(Duration::from_secs(30))?;
-    cluster.client(CLIENT, CreateAndWrite::new(1, 3, writes));
-    cluster.run_until(Duration::from_secs(30), "writes acknowledged", |cluster| {
-        !acknowledged_writes(cluster).is_empty()
+fn start_writing(fleet: &mut Fleet, writes: u32) -> Result<String, Box<dyn Error>> {
+    fleet.await_ring(Duration::from_secs(30))?;
+    fleet.client(CLIENT, CreateAndWrite::new(1, 3, writes));
+    fleet.run_until(Duration::from_secs(30), "writes acknowledged", |fleet| {
+        !acknowledged_writes(fleet).is_empty()
     })?;
-    Ok(primary(cluster).ok_or("no primary")?)
+    Ok(primary(fleet).ok_or("no primary")?)
 }
 
 /// Runs until a node other than `old` acknowledges a write after `since`, and returns how long
 /// after `since` that write completed.
 fn await_new_primary(
-    cluster: &mut Cluster,
+    fleet: &mut Fleet,
     old: &str,
     since: Duration,
     limit: Duration,
 ) -> Result<Duration, Box<dyn Error>> {
-    let moved = |cluster: &Cluster| {
-        acknowledged_writes(cluster)
+    let moved = |fleet: &Fleet| {
+        acknowledged_writes(fleet)
             .into_iter()
             .find(|(at, primary, _)| *at > since && primary != old)
             .map(|(at, _, _)| at)
     };
-    cluster.run_until(limit, "writes moving to a new primary", |cluster| {
-        moved(cluster).is_some()
+    fleet.run_until(limit, "writes moving to a new primary", |fleet| {
+        moved(fleet).is_some()
     })?;
-    let at = moved(cluster).ok_or("no write moved")?;
+    let at = moved(fleet).ok_or("no write moved")?;
     Ok(at - since)
 }
 
 /// Heals everything, lets the writer finish, and runs the final checks: the replicas converge,
 /// and the history checker passes over the whole run.
-fn heal_and_finish(mut cluster: Cluster) -> Result<fleetringd::sim::Report, Box<dyn Error>> {
-    cluster.await_workloads(Duration::from_secs(300))?;
-    cluster.await_ring(Duration::from_secs(60))?;
-    cluster.await_replicas_converged(Duration::from_secs(60))?;
-    Ok(cluster.finish()?)
+fn heal_and_finish(mut fleet: Fleet) -> Result<fleetringd::sim::Report, Box<dyn Error>> {
+    fleet.await_workloads(Duration::from_secs(300))?;
+    fleet.await_ring(Duration::from_secs(60))?;
+    fleet.await_replicas_converged(Duration::from_secs(60))?;
+    Ok(fleet.finish()?)
 }
 
-/// With the daemon's default timings, killing the primary of a three-node cluster moves writes
+/// With the daemon's default timings, killing the primary of a three-node fleet moves writes
 /// to a new primary within the lease duration plus the failover margin plus one second, and the
 /// client gets through by retrying, as `fleetringd db exec` does.
 fn failover_timing(seed: u64) -> TestResult {
     let timings = Timings::daemon_defaults();
-    let mut cluster = cluster(seed, timings)?;
-    let old = start_writing(&mut cluster, 900)?;
-    cluster.run_for(Duration::from_secs(3))?;
-    cluster.crash(&old)?;
-    let crashed_at = cluster.elapsed();
+    let mut fleet = fleet(seed, timings)?;
+    let old = start_writing(&mut fleet, 900)?;
+    fleet.run_for(Duration::from_secs(3))?;
+    fleet.crash(&old)?;
+    let crashed_at = fleet.elapsed();
     let budget = timings.lease_duration + timings.failover_margin + Duration::from_secs(1);
-    let took = await_new_primary(&mut cluster, &old, crashed_at, budget * 2)?;
+    let took = await_new_primary(&mut fleet, &old, crashed_at, budget * 2)?;
     assert!(
         took <= budget,
         "writes moved {took:?} after the crash, more than {budget:?}"
     );
-    assert_eq!(epoch(&cluster), Some(2), "one promotion");
-    cluster.note(format!(
+    assert_eq!(epoch(&fleet), Some(2), "one promotion");
+    fleet.note(format!(
         "writes moved {} ms after the crash",
         took.as_millis()
     ));
-    cluster.restart(&old)?;
-    let report = heal_and_finish(cluster)?;
+    fleet.restart(&old)?;
+    let report = heal_and_finish(fleet)?;
     let state = report
         .state()
         .database(&database()?)
@@ -171,56 +171,56 @@ fn a_crashed_primary_is_replaced_within_the_lease_and_margin() {
 /// writes. Every acknowledged write survives, on a write quorum, and the replicas converge.
 fn no_acknowledged_write_lost(seed: u64) -> TestResult {
     let timings = Timings::default();
-    let mut cluster = cluster(seed, timings)?;
-    let first = start_writing(&mut cluster, 700)?;
+    let mut fleet = fleet(seed, timings)?;
+    let first = start_writing(&mut fleet, 700)?;
     let failover = timings.lease_duration + timings.failover_margin + Duration::from_secs(2);
 
     // A primary crash: the lease expires and another replica takes over.
-    cluster.crash(&first)?;
-    let since = cluster.elapsed();
-    await_new_primary(&mut cluster, &first, since, failover * 2)?;
-    cluster.restart(&first)?;
-    cluster.run_for(Duration::from_secs(1))?;
+    fleet.crash(&first)?;
+    let since = fleet.elapsed();
+    await_new_primary(&mut fleet, &first, since, failover * 2)?;
+    fleet.restart(&first)?;
+    fleet.run_for(Duration::from_secs(1))?;
 
     // A partition that isolates the primary from the control node and its followers, while the
     // client can still reach it: what it commits meanwhile is never acknowledged, and is
     // truncated once it rejoins as a follower.
-    let isolated = primary(&cluster).ok_or("no primary")?;
+    let isolated = primary(&fleet).ok_or("no primary")?;
     let others: Vec<&str> = DATA
         .into_iter()
         .filter(|node| *node != isolated.as_str())
         .collect();
     for other in others.iter().copied().chain([CONTROL]) {
-        cluster.partition(&isolated, other)?;
+        fleet.partition(&isolated, other)?;
     }
-    let since = cluster.elapsed();
-    await_new_primary(&mut cluster, &isolated, since, failover * 2)?;
+    let since = fleet.elapsed();
+    await_new_primary(&mut fleet, &isolated, since, failover * 2)?;
     for other in others.iter().copied().chain([CONTROL]) {
-        cluster.repair(&isolated, other)?;
+        fleet.repair(&isolated, other)?;
     }
-    cluster.run_for(Duration::from_secs(1))?;
-    cluster.check_history()?;
+    fleet.run_for(Duration::from_secs(1))?;
+    fleet.check_history()?;
 
     // A control node outage longer than a lease: the primary keeps serving.
-    cluster.crash(CONTROL)?;
-    cluster.run_for(timings.lease_duration * 2)?;
-    cluster.restart(CONTROL)?;
-    cluster.run_for(Duration::from_secs(1))?;
+    fleet.crash(CONTROL)?;
+    fleet.run_for(timings.lease_duration * 2)?;
+    fleet.restart(CONTROL)?;
+    fleet.run_for(Duration::from_secs(1))?;
 
     // Flapping: one replica after another goes down and comes back, quicker than a lease.
     for round in 0..3 {
         let node = DATA[round % DATA.len()];
-        cluster.crash(node)?;
-        let down = Duration::from_millis(300 + cluster.rng().below(400));
-        cluster.run_for(down)?;
-        cluster.restart(node)?;
-        let up = Duration::from_millis(300 + cluster.rng().below(400));
-        cluster.run_for(up)?;
-        cluster.check_history()?;
+        fleet.crash(node)?;
+        let down = Duration::from_millis(300 + fleet.rng().below(400));
+        fleet.run_for(down)?;
+        fleet.restart(node)?;
+        let up = Duration::from_millis(300 + fleet.rng().below(400));
+        fleet.run_for(up)?;
+        fleet.check_history()?;
     }
 
-    let epochs = epoch(&cluster).ok_or("no epoch")?;
-    let report = heal_and_finish(cluster)?;
+    let epochs = epoch(&fleet).ok_or("no epoch")?;
+    let report = heal_and_finish(fleet)?;
     assert!(epochs >= 3, "at least two failovers, at epoch {epochs}");
     let primaries: BTreeSet<(String, u64)> = report
         .history()
@@ -265,20 +265,20 @@ fn no_acknowledged_write_is_lost_across_crashes_partitions_outages_and_flapping(
 /// --node` does.
 fn control_outage(seed: u64) -> TestResult {
     let timings = Timings::default();
-    let mut cluster = cluster(seed, timings)?;
-    let serving = start_writing(&mut cluster, 400)?;
-    cluster.run_for(Duration::from_secs(1))?;
-    cluster.crash(CONTROL)?;
-    let down_at = cluster.elapsed();
+    let mut fleet = fleet(seed, timings)?;
+    let serving = start_writing(&mut fleet, 400)?;
+    fleet.run_for(Duration::from_secs(1))?;
+    fleet.crash(CONTROL)?;
+    let down_at = fleet.elapsed();
     let database = database()?;
     let direct =
         (DIRECT_FIRST_VALUE..DIRECT_FIRST_VALUE + DIRECT_WRITES).map(|value| Operation::Write {
             database: database.clone(),
             value,
         });
-    cluster.client_through(DIRECT_CLIENT, &serving, Script::new(direct));
-    cluster.run_for(timings.lease_duration * 3)?;
-    let during = acknowledged_writes(&cluster)
+    fleet.client_through(DIRECT_CLIENT, &serving, Script::new(direct));
+    fleet.run_for(timings.lease_duration * 3)?;
+    let during = acknowledged_writes(&fleet)
         .into_iter()
         .filter(|(at, primary, _)| *at > down_at && *primary == serving)
         .count();
@@ -286,11 +286,11 @@ fn control_outage(seed: u64) -> TestResult {
         during > 0,
         "no write was acknowledged while control was down"
     );
-    cluster.restart(CONTROL)?;
-    cluster.run_for(timings.lease_duration * 3)?;
-    assert_eq!(epoch(&cluster), Some(1), "no failover after the outage");
-    assert_eq!(primary(&cluster).as_deref(), Some(serving.as_str()));
-    heal_and_finish(cluster)?;
+    fleet.restart(CONTROL)?;
+    fleet.run_for(timings.lease_duration * 3)?;
+    assert_eq!(epoch(&fleet), Some(1), "no failover after the outage");
+    assert_eq!(primary(&fleet).as_deref(), Some(serving.as_str()));
+    heal_and_finish(fleet)?;
     Ok(())
 }
 
@@ -304,20 +304,20 @@ fn primaries_keep_serving_while_the_control_node_is_down() {
 /// converge without it.
 fn divergent_tail(seed: u64) -> TestResult {
     let timings = Timings::default();
-    let mut cluster = cluster(seed, timings)?;
-    let old = start_writing(&mut cluster, 500)?;
-    cluster.run_for(Duration::from_secs(1))?;
+    let mut fleet = fleet(seed, timings)?;
+    let old = start_writing(&mut fleet, 500)?;
+    fleet.run_for(Duration::from_secs(1))?;
     let others: Vec<&str> = DATA
         .into_iter()
         .filter(|node| *node != old.as_str())
         .collect();
     for other in &others {
-        cluster.partition(&old, other)?;
+        fleet.partition(&old, other)?;
     }
     // The control node still reaches it: no failover yet, and every write it takes is refused.
-    let cut_at = cluster.elapsed();
-    cluster.run_for(timings.lease_duration / 2)?;
-    let acknowledged = acknowledged_writes(&cluster)
+    let cut_at = fleet.elapsed();
+    fleet.run_for(timings.lease_duration / 2)?;
+    let acknowledged = acknowledged_writes(&fleet)
         .into_iter()
         .filter(|(at, _, _)| *at > cut_at + Duration::from_millis(100))
         .count();
@@ -327,12 +327,12 @@ fn divergent_tail(seed: u64) -> TestResult {
     );
 
     // Now cut it off from the control node too, so the lease expires and a follower takes over.
-    cluster.partition(&old, CONTROL)?;
-    let since = cluster.elapsed();
+    fleet.partition(&old, CONTROL)?;
+    let since = fleet.elapsed();
     let failover = timings.lease_duration + timings.failover_margin + Duration::from_secs(2);
-    await_new_primary(&mut cluster, &old, since, failover * 2)?;
+    await_new_primary(&mut fleet, &old, since, failover * 2)?;
     let database = database()?;
-    let rows = cluster.replica_rows(&database)?;
+    let rows = fleet.replica_rows(&database)?;
     let tail: BTreeSet<i64> = {
         let on_old = rows.get(&old).cloned().unwrap_or_default();
         let elsewhere: BTreeSet<i64> = others
@@ -341,22 +341,22 @@ fn divergent_tail(seed: u64) -> TestResult {
             .collect();
         on_old.difference(&elsewhere).copied().collect()
     };
-    cluster.note(format!("{} rows only on the old primary", tail.len()));
+    fleet.note(format!("{} rows only on the old primary", tail.len()));
     for other in others.iter().copied().chain([CONTROL]) {
-        cluster.repair(&old, other)?;
+        fleet.repair(&old, other)?;
     }
-    cluster.await_workloads(Duration::from_secs(300))?;
-    cluster.await_ring(Duration::from_secs(60))?;
-    cluster.await_replicas_converged(Duration::from_secs(60))?;
+    fleet.await_workloads(Duration::from_secs(300))?;
+    fleet.await_ring(Duration::from_secs(60))?;
+    fleet.await_replicas_converged(Duration::from_secs(60))?;
     // The tail is gone from every replica, the old primary's included.
-    for (node, held) in cluster.replica_rows(&database)? {
+    for (node, held) in fleet.replica_rows(&database)? {
         let survivors: Vec<&i64> = tail.intersection(&held).collect();
         assert!(
             survivors.is_empty(),
             "divergent rows survived on {node}: {survivors:?}"
         );
     }
-    cluster.finish()?;
+    fleet.finish()?;
     Ok(())
 }
 

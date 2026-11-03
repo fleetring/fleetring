@@ -1,4 +1,4 @@
-//! Cluster members: placement attributes, liveness, and what each member reports.
+//! Fleet members: placement attributes, liveness, and what each member reports.
 
 use fleetring::{Host, Node, NodeId, Weight, Zone};
 use serde::{Deserialize, Serialize};

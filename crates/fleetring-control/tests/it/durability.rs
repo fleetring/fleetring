@@ -10,7 +10,7 @@ use fleetring_control::{
 use crate::common::{config, create, create_with, db, factor, heartbeat, id, run, zone};
 
 /// A state with members `ids` joined at time 0, each in its own zone.
-fn cluster(ids: &[&str]) -> State {
+fn fleet(ids: &[&str]) -> State {
     let mut state = State::new(config());
     for (i, name) in ids.iter().enumerate() {
         let member = Member::new(id(name)).with_zone(zone(&format!("z{i}")));
@@ -111,7 +111,7 @@ fn the_floor_defaults_to_w_and_must_lie_between_w_and_r() {
 
 #[test]
 fn a_database_records_its_settings_and_the_state_answers_quorums_from_them() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("majority", 3)).expect("create");
     run(&mut state, 0, create_with("everyone", 3, Acks::All)).expect("create");
     run(&mut state, 0, create_with("alone", 3, Acks::Local)).expect("create");
@@ -152,7 +152,7 @@ fn a_database_records_its_settings_and_the_state_answers_quorums_from_them() {
 #[test]
 fn a_promotion_fences_under_each_modes_quorum() {
     // `all`: one fenced member completes the promotion.
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create_with("everyone", 3, Acks::All)).expect("create");
     let replicas = state.replica_set(&db("everyone")).expect("replica set");
     run(&mut state, 0, acquire("everyone", &replicas[0])).expect("lease");
@@ -190,7 +190,7 @@ fn a_promotion_fences_under_each_modes_quorum() {
     run(&mut state, 2_000, complete("everyone", 2)).expect("one fenced member is Q for all");
 
     // `local`: a majority must be fenced, as for `quorum`.
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create_with("alone", 3, Acks::Local)).expect("create");
     let replicas = state.replica_set(&db("alone")).expect("replica set");
     run(&mut state, 0, acquire("alone", &replicas[0])).expect("lease");
@@ -229,7 +229,7 @@ fn a_promotion_fences_under_each_modes_quorum() {
 
 #[test]
 fn a_durability_change_waits_for_the_next_lease() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let replicas = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &replicas[0])).expect("lease");
@@ -325,7 +325,7 @@ fn old_logs_and_snapshots_load_as_quorum_with_the_floor_at_w() {
             ..
         }
     ));
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, action).expect("create");
     let database = state.database(&db("acme")).expect("exists");
     assert_eq!(database.durability(), Durability::quorum(factor(3)));
@@ -340,7 +340,7 @@ fn old_logs_and_snapshots_load_as_quorum_with_the_floor_at_w() {
     assert_eq!(database.pending_durability(), None);
 
     // New records round-trip with the fields, and a change round-trips too.
-    let mut state = cluster(&["a"]);
+    let mut state = fleet(&["a"]);
     run(&mut state, 0, create_with("solo", 1, Acks::Local)).expect("create");
     run(
         &mut state,
@@ -379,7 +379,7 @@ fn report_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> Act
 /// if another has a longer log from an older epoch; one that names a follower goes there.
 #[test]
 fn a_transfer_without_a_target_ranks_local_followers_by_log_epoch_first() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create_with("acme", 3, Acks::Local)).expect("create");
     let rs = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");

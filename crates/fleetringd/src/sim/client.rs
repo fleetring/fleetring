@@ -21,7 +21,7 @@ use crate::engine::{Statement, Value};
 use crate::environment::Network;
 use crate::replication::LeaseChange;
 use crate::sim::SimRng;
-use crate::sim::cluster::{PORT, certificate_validity};
+use crate::sim::fleet::{PORT, certificate_validity};
 use crate::sim::history::DurabilityMode;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
@@ -54,9 +54,9 @@ pub(super) struct Session {
     pub(super) entry: Option<String>,
     pub(super) timeout: Duration,
     pub(super) shared: Shared,
-    /// The principal the client acts as, issued by the cluster's test authority.
+    /// The principal the client acts as, issued by the fleet's test authority.
     pub(super) identity: Identity,
-    /// The cluster's test authority, which issues a node certificate for each node the
+    /// The fleet's test authority, which issues a node certificate for each node the
     /// workload acts as: node calls need one (ADR-0025).
     pub(super) authority: Arc<Authority>,
 }
@@ -391,7 +391,7 @@ pub(super) struct WatcherSession {
     pub(super) address: String,
     pub(super) timeout: Duration,
     pub(super) shared: Shared,
-    /// The principal the watcher acts as, issued by the cluster's test authority.
+    /// The principal the watcher acts as, issued by the fleet's test authority.
     pub(super) identity: Identity,
 }
 

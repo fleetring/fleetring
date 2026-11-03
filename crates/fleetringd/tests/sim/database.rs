@@ -4,7 +4,7 @@
 //! the `Database` service and then writes to them, while the test partitions a data node from
 //! the control node, cuts the client off from a data node, and crashes and restarts a primary.
 //! Every acknowledged write must be on a write quorum of its database's replicas and in every
-//! later read, which the history checker in [`Cluster::finish`] checks against the history and
+//! later read, which the history checker in [`Fleet::finish`] checks against the history and
 //! each host's copy on disk (FR-030, FR-036). The assertions here cover what the checker
 //! doesn't: what each acknowledgement claimed, and that the restarted primary served again.
 
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fleetring_control::DatabaseName;
-use fleetringd::sim::{Ack, Cluster, CreateAndWrite, Operation, Outcome, seeds};
+use fleetringd::sim::{Ack, CreateAndWrite, Fleet, Operation, Outcome, seeds};
 
 use crate::{BINARY, TestResult};
 
@@ -23,41 +23,41 @@ const DATABASES: u32 = 4;
 const WRITES: u32 = 60;
 
 fn writes_under_faults(seed: u64) -> TestResult {
-    let mut cluster = Cluster::builder(seed)
+    let mut fleet = Fleet::builder(seed)
         .control(CONTROL)
         .data(DATA[0])
         .data(DATA[1])
         .data(DATA[2])
         .operation_timeout(Duration::from_millis(500))
         .build()?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    cluster.client(CLIENT, CreateAndWrite::new(DATABASES, 3, WRITES));
+    fleet.await_ring(Duration::from_secs(5))?;
+    fleet.client(CLIENT, CreateAndWrite::new(DATABASES, 3, WRITES));
 
     // Let the databases get created, then disturb the writes.
-    cluster.run_until(Duration::from_secs(10), "databases created", |cluster| {
-        opened(cluster).len() == usize::try_from(DATABASES).unwrap_or(usize::MAX)
+    fleet.run_until(Duration::from_secs(10), "databases created", |fleet| {
+        opened(fleet).len() == usize::try_from(DATABASES).unwrap_or(usize::MAX)
     })?;
-    cluster.partition(DATA[1], CONTROL)?;
-    cluster.run_for(Duration::from_millis(300))?;
-    cluster.repair(DATA[1], CONTROL)?;
-    cluster.partition(CLIENT, DATA[2])?;
-    cluster.run_for(Duration::from_millis(300))?;
-    cluster.repair(CLIENT, DATA[2])?;
+    fleet.partition(DATA[1], CONTROL)?;
+    fleet.run_for(Duration::from_millis(300))?;
+    fleet.repair(DATA[1], CONTROL)?;
+    fleet.partition(CLIENT, DATA[2])?;
+    fleet.run_for(Duration::from_millis(300))?;
+    fleet.repair(CLIENT, DATA[2])?;
 
     // Crash the primary of the first database, then bring it back: it must serve it again.
     let first: DatabaseName = "db-0".parse()?;
-    let primary = opened(&cluster)
+    let primary = opened(&fleet)
         .get(&first)
         .cloned()
         .ok_or("db-0 has no primary")?;
-    cluster.crash(&primary)?;
-    cluster.run_for(Duration::from_millis(300))?;
-    cluster.restart(&primary)?;
-    let restarted_at = cluster.elapsed();
+    fleet.crash(&primary)?;
+    fleet.run_for(Duration::from_millis(300))?;
+    fleet.restart(&primary)?;
+    let restarted_at = fleet.elapsed();
 
-    cluster.await_workloads(Duration::from_secs(60))?;
-    cluster.await_ring(Duration::from_secs(5))?;
-    let report = cluster.finish()?;
+    fleet.await_workloads(Duration::from_secs(60))?;
+    fleet.await_ring(Duration::from_secs(5))?;
+    let report = fleet.finish()?;
 
     let history = report.history();
     let mut written = 0;
@@ -113,8 +113,8 @@ fn writes_under_faults(seed: u64) -> TestResult {
 }
 
 /// The primary each acknowledged creation reported so far.
-fn opened(cluster: &Cluster) -> BTreeMap<DatabaseName, String> {
-    opened_in(&cluster.history())
+fn opened(fleet: &Fleet) -> BTreeMap<DatabaseName, String> {
+    opened_in(&fleet.history())
 }
 
 fn opened_in(history: &fleetringd::sim::History) -> BTreeMap<DatabaseName, String> {
