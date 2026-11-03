@@ -3,8 +3,11 @@
 
 use std::collections::BTreeMap;
 
+use std::time::Duration;
+
 use fleetringd::DatabaseError;
 use fleetringd::ReplicationError;
+use fleetringd::replication::ReplicationSettings;
 
 use crate::common::{
     Cluster, TestResult, Wrap, eventually, guarded, name, put, routes, settings, sqlite,
@@ -13,6 +16,13 @@ use crate::proxy::{Event, Log, Proxy, Switches};
 
 /// Starts nodes `a`, `b`, and `c`, with `b` and `c` behind proxies.
 async fn proxied() -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::error::Error>> {
+    proxied_with(settings()).await
+}
+
+/// As [`proxied`], with the nodes running `settings`.
+async fn proxied_with(
+    settings: ReplicationSettings,
+) -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::error::Error>> {
     let log = Log::default();
     let b = Switches::new();
     let c = Switches::new();
@@ -31,7 +41,7 @@ async fn proxied() -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::er
             }),
         );
     }
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings(), wraps).await?;
+    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, wraps).await?;
     Ok((cluster, b, c, log))
 }
 
@@ -159,4 +169,47 @@ async fn writes_are_refused_without_a_reachable_quorum() -> TestResult {
     cluster.await_caught_up("a", &db).await?;
     registry.execute(&db, put(3, 10)).await?;
     Ok(())
+}
+
+/// A write waiting for its quorum when the node stops being the primary, as a drain or a newer
+/// epoch does, fails at once: no follower will acknowledge it to a primary that is gone, so
+/// waiting out the acknowledgement timeout only holds the client up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_waiting_for_its_quorum_fails_when_its_primary_steps_down() -> TestResult {
+    // An acknowledgement timeout far beyond the hang guard, so that only the step down can end
+    // the wait inside it.
+    let (cluster, b, c, _log) = proxied_with(ReplicationSettings {
+        ack_timeout: Duration::from_secs(3_600),
+        ..settings()
+    })
+    .await?;
+    let db = name("stepdown");
+    cluster.create("a", &db, 3).await?;
+    let primary = &cluster.node("a").replication;
+    let before = primary.primary_status(&db).ok_or("not primary")?.committed;
+
+    b.pass_acks.send_replace(false);
+    c.pass_acks.send_replace(false);
+    let write = {
+        let registry = cluster.node("a").registry().clone();
+        let db = db.clone();
+        tokio::spawn(async move { registry.execute(&db, put(1, 100)).await })
+    };
+    // The write has committed and been published once the primary's log moves on.
+    eventually("the write committing", || {
+        primary
+            .primary_status(&db)
+            .is_some_and(|status| status.committed > before)
+    })
+    .await?;
+    assert!(!write.is_finished(), "the write returned without a quorum");
+
+    primary.stop_primary(&db);
+    match guarded("the write failing", write).await?? {
+        Err(DatabaseError::Replication(ReplicationError::Failed { reason })) => {
+            assert!(reason.contains("stopped being"), "{reason}");
+            Ok(())
+        }
+        other => Err(format!("expected the write to fail, got {other:?}").into()),
+    }
 }

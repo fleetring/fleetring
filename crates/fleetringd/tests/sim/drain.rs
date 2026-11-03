@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::{DatabaseName, LeaseEpoch, Liveness};
+use fleetringd::replication::ReplicationSettings;
 use fleetringd::sim::{Cluster, CreateAndWrite, Operation, Operator, Timings, check, seeds};
 
 use crate::{BINARY, TestResult};
@@ -224,4 +225,109 @@ fn drains_under_faults(seed: u64) -> TestResult {
 #[test]
 fn drains_move_primaries_without_losing_writes_under_faults() {
     seeds::run(BINARY, &seeds::FIXED_HEAVY, drains_under_faults);
+}
+
+/// How long the primaries wait for their followers' acknowledgements in the next scenario: far
+/// longer than a drain takes, so only the step down can end a wait early.
+const ACK_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// FR-051: a write waiting for its followers' acknowledgements when its primary steps down in a
+/// drain fails at once, rather than holding the client until the acknowledgement timeout.
+///
+/// The busiest node is cut off from both followers while the writer keeps writing, so writes to
+/// its databases commit there and wait for acknowledgements that can't come. An operator drains
+/// the node. Its databases move on; every write that was waiting must end soon after, as `ABORTED`
+/// ("may or may not have taken effect"), with the history checks holding throughout.
+fn drain_releases_writes_waiting_for_acknowledgements(seed: u64) -> TestResult {
+    let mut cluster = Cluster::builder(seed)
+        .control(CONTROL)
+        .data(DATA[0])
+        .data(DATA[1])
+        .data(DATA[2])
+        .timings(Timings::default())
+        .replication(ReplicationSettings {
+            ack_timeout: ACK_TIMEOUT,
+            ..ReplicationSettings::new()
+        })
+        .operation_timeout(ACK_TIMEOUT)
+        .build()?;
+    let operator = Operator::new();
+    cluster.client(OPERATOR, operator.clone());
+    start_writing(&mut cluster, 400)?;
+
+    let (drained, held) = busiest(&cluster).ok_or("no primaries")?;
+    let held_names: Vec<DatabaseName> = held.iter().map(|(name, _)| name.clone()).collect();
+    for other in DATA.into_iter().filter(|node| *node != drained) {
+        cluster.partition(&drained, other)?;
+    }
+    cluster.run_for(Duration::from_millis(300))?;
+    let drain_requested = cluster.elapsed();
+    operator.push(Operation::Drain {
+        node: drained.parse()?,
+    });
+    cluster.run_until(
+        Duration::from_secs(20),
+        &format!("{drained}'s primaries moving"),
+        |cluster| moved(cluster, &drained, &held),
+    )?;
+    let moved_at = cluster.elapsed();
+    cluster.run_for(Duration::from_secs(1))?;
+
+    // The writes that were waiting have ended, and not by timing out: none is still pending, and
+    // each that ended did so within a moment of the move.
+    let is_held_write = |operation: &Operation| matches!(operation, Operation::Write { database, .. } if held_names.contains(database));
+    let history = cluster.history();
+    let still_pending: Vec<String> = history
+        .pending()
+        .filter(|(_, pending)| {
+            is_held_write(pending.operation()) && pending.invoked_at() <= drain_requested
+        })
+        .map(|(_, pending)| pending.operation().to_string())
+        .collect();
+    assert!(
+        still_pending.is_empty(),
+        "writes still waiting for acknowledgements 1 s after {drained}'s primaries moved: {still_pending:?}"
+    );
+    let ended: Vec<_> = history
+        .records()
+        .iter()
+        .filter(|record| {
+            is_held_write(record.operation())
+                && record.invoked_at() <= drain_requested
+                && record.completed_at() > drain_requested
+        })
+        .collect();
+    assert!(
+        !ended.is_empty(),
+        "no write was waiting for acknowledgements when the drain began"
+    );
+    for record in ended {
+        assert!(
+            record.completed_at() <= moved_at + Duration::from_secs(1),
+            "{} was still waiting {:?} after {drained}'s primaries moved: {}",
+            record.operation(),
+            record.completed_at().saturating_sub(moved_at),
+            record.outcome(),
+        );
+    }
+
+    for other in DATA.into_iter().filter(|node| *node != drained) {
+        cluster.repair(&drained, other)?;
+    }
+    cluster.await_workloads(Duration::from_secs(300))?;
+    cluster.await_ring(Duration::from_secs(60))?;
+    cluster.await_replicas_converged(Duration::from_secs(60))?;
+    cluster.check()?;
+    let report = cluster.finish()?;
+    check::one_primary_per_epoch(report.history())?;
+    Ok(())
+}
+
+#[test]
+fn a_drain_releases_writes_waiting_for_acknowledgements() {
+    seeds::run(
+        BINARY,
+        &seeds::FIXED_HEAVY,
+        drain_releases_writes_waiting_for_acknowledgements,
+    );
 }

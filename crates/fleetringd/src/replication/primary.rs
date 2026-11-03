@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -41,6 +42,9 @@ pub(super) struct Primary {
     /// Bumped whenever a batch is published, a follower acknowledges, or a checkpoint ends, so
     /// streams and waiting writes look again.
     changed: watch::Sender<u64>,
+    /// Set when this node stops serving the database as primary, so that writes still waiting
+    /// for their quorum fail at once instead of at the acknowledgement timeout.
+    retired: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -129,7 +133,21 @@ impl Primary {
             start,
             state: Mutex::default(),
             changed: watch::Sender::new(0),
+            retired: AtomicBool::new(false),
         }
+    }
+
+    /// Marks this primary as no longer serving, and wakes every write waiting for its quorum.
+    ///
+    /// Those writes committed here but no follower will acknowledge them now: the streams are
+    /// going away, and the next primary may or may not hold them.
+    pub(super) fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
     }
 
     pub(super) fn name(&self) -> &DatabaseName {
@@ -781,7 +799,9 @@ async fn wait_for_quorum(
 ) -> Result<Acknowledged, ReplicationError> {
     let mut changes = primary.changed.subscribe();
     let waited = time::timeout(limit, async {
-        while primary.acknowledged_by(&quorum.followers, &end) < quorum.needed {
+        while primary.acknowledged_by(&quorum.followers, &end) < quorum.needed
+            && !primary.is_retired()
+        {
             if changes.changed().await.is_err() {
                 return;
             }
@@ -791,6 +811,11 @@ async fn wait_for_quorum(
     let holders = primary.acknowledged_by(&quorum.followers, &end);
     if waited.is_ok() && holders >= quorum.needed {
         Ok(counts.acknowledged(count(holders + quorum.own)))
+    } else if holders < quorum.needed && primary.is_retired() {
+        Err(failed(
+            "this node stopped being the database's primary before a quorum acknowledged the write"
+                .to_owned(),
+        ))
     } else {
         Err(failed(format!(
             "{} of the {} followers a write needs did not acknowledge it within {limit:?}",
