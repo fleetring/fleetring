@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use fleetring::{ReplicationFactor, Weight};
+use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::{
     Acks, Action, Applied, DatabaseName, Durability, Engine, HostedReplica, Lease, LeaseEpoch,
     Liveness, Member, Millis, Position, Rejection, Revoked, Role, State,
@@ -27,7 +27,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
-use crate::auth::{Action as AuthAction, Caller, authorized, require_key};
+use crate::auth::{Action as AuthAction, BindingDenied, Caller, Unbound, authorized, require_key};
 use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
@@ -298,7 +298,9 @@ fn lease_response(database: &DatabaseName, lease: &Lease) -> LeaseResponse {
 /// control plane knows about each replica.
 ///
 /// While a promotion is in progress the database has no primary: the old holder's lease is at an
-/// older epoch than the database's, and nobody holds the new one yet.
+/// older epoch than the database's, and nobody holds the new one yet. The placement names the
+/// promotion's candidate instead, so that a replica can check a fence or a stream from it
+/// (ADR-0031).
 fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     let database = state.database(name).ok_or_else(|| {
         rejection_status(&Rejection::UnknownDatabase {
@@ -338,6 +340,10 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
             }
         })
         .collect();
+    let candidate = database
+        .promotion()
+        .filter(|promotion| promotion.epoch() == database.epoch())
+        .map(|promotion| promotion.candidate().to_string());
     let durability = database.durability();
     Ok(Placement {
         database: name.to_string(),
@@ -349,6 +355,7 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
         replication_factor: u32::from(database.replication_factor().get()),
         acks: acks_to_proto(durability.acks()).into(),
         min_replicas: u32::from(durability.min_replicas()),
+        candidate,
     })
 }
 
@@ -398,6 +405,119 @@ fn leases_held_by(state: &State, id: &fleetring::NodeId) -> Vec<String> {
         })
         .map(|database| database.name().to_string())
         .collect()
+}
+
+/// The node `request` comes from, if a node certificate made it: the binding checks are for
+/// nodes, and a principal's request is judged by its scopes alone (ADR-0031, point 2).
+///
+/// # Errors
+///
+/// `PERMISSION_DENIED` if the request didn't pass through the request boundary.
+fn calling_node<T>(request: &Request<T>) -> Result<Option<NodeId>, Status> {
+    Ok(match authorized(request)?.caller() {
+        Caller::Node(id) => Some(id.clone()),
+        Caller::Principal { .. } | Caller::Anonymous => None,
+    })
+}
+
+/// Checks that `node` is in `database`'s replica set, for a call bound to `replica`.
+///
+/// # Errors
+///
+/// `NOT_FOUND` for a database control state doesn't know, and a binding refusal otherwise.
+fn require_replica(
+    state: &State,
+    method: &'static str,
+    node: &NodeId,
+    database: &DatabaseName,
+) -> Result<(), Status> {
+    let replicas = state
+        .replica_set(database)
+        .map_err(|rejection| rejection_status(&rejection))?;
+    if replicas.contains(node) {
+        return Ok(());
+    }
+    Err(BindingDenied::new(
+        method,
+        node.clone(),
+        Unbound::NotReplica {
+            database: database.clone(),
+        },
+    )
+    .into_status())
+}
+
+/// Checks that `node` is the candidate of `database`'s promotion to `epoch`, for a call bound to
+/// `candidate`.
+///
+/// An epoch has one candidate, so a check against one state still holds when the command
+/// applies (ADR-0031, point 2). An unknown database, and an epoch whose promotion is over or
+/// never started, are left to `apply`, which rejects them; no promotion to such an epoch can
+/// start later, since a new one takes the epoch after the database's. An epoch past the
+/// database's is refused here, because a promotion to it could start before the command applies.
+///
+/// # Errors
+///
+/// A binding refusal.
+fn require_candidate(
+    state: &State,
+    method: &'static str,
+    node: &NodeId,
+    database: &DatabaseName,
+    epoch: LeaseEpoch,
+) -> Result<(), Status> {
+    let Some(db) = state.database(database) else {
+        return Ok(());
+    };
+    let bound = match db.promotion() {
+        Some(promotion) if promotion.epoch() == epoch => promotion.candidate() == node,
+        _ => epoch <= db.epoch(),
+    };
+    if bound {
+        return Ok(());
+    }
+    Err(BindingDenied::new(
+        method,
+        node.clone(),
+        Unbound::NotCandidate {
+            database: database.clone(),
+            epoch,
+        },
+    )
+    .into_status())
+}
+
+/// Checks that `node` holds `database`'s lease, for a call bound to `holder`.
+///
+/// The lease changes holder only when a promotion completes, and its candidate is never
+/// draining, so a lease that changed hands before the command applies is one `apply` refuses to
+/// transfer.
+///
+/// # Errors
+///
+/// A binding refusal, also for a database control state doesn't know.
+fn require_holder(
+    state: &State,
+    method: &'static str,
+    node: &NodeId,
+    database: &DatabaseName,
+) -> Result<(), Status> {
+    let db = state.database(database);
+    if db
+        .and_then(|db| db.lease())
+        .is_some_and(|lease| lease.holder() == node)
+    {
+        return Ok(());
+    }
+    Err(BindingDenied::new(
+        method,
+        node.clone(),
+        Unbound::NotHolder {
+            database: database.clone(),
+            epoch: db.map_or(LeaseEpoch::ZERO, |db| db.epoch()),
+        },
+    )
+    .into_status())
 }
 
 #[tonic::async_trait]
@@ -611,6 +731,8 @@ impl Control for ControlService {
         Ok(Response::new(ListDatabasesResponse { databases }))
     }
 
+    /// Bound to `self`: FR-046's certificate check, then `apply`, which grants a lease only to a
+    /// live, undraining member of the replica set (ADR-0031, point 2).
     async fn acquire_lease(
         &self,
         request: Request<AcquireLeaseRequest>,
@@ -628,6 +750,8 @@ impl Control for ControlService {
         }
     }
 
+    /// Bound to `self`: FR-046's certificate check, then `apply`, which renews a lease only for
+    /// its holder at its epoch (ADR-0031, point 2).
     async fn renew_lease(
         &self,
         request: Request<RenewLeaseRequest>,
@@ -670,11 +794,15 @@ impl Control for ControlService {
         }
     }
 
+    /// Bound to `replica`: a node outside the database's replica set is refused.
     async fn start_promotion(
         &self,
         request: Request<StartPromotionRequest>,
     ) -> Result<Response<PromotionResponse>, Status> {
         let database = parse("database name", &request.get_ref().database)?;
+        if let Some(node) = calling_node(&request)? {
+            require_replica(&self.node.state(), "StartPromotion", &node, &database)?;
+        }
         match self.submit(Action::StartPromotion { database }).await? {
             (
                 Applied::PromotionStarted {
@@ -698,12 +826,24 @@ impl Control for ControlService {
         request: Request<RecordFencedRequest>,
     ) -> Result<Response<RecordFencedResponse>, Status> {
         // The node named here is the fenced replica, reported by the candidate that fenced it,
-        // so it is no claim about the caller's own identity.
+        // so it is no claim about the caller's own identity; the caller must be the candidate.
+        let caller = calling_node(&request)?;
         let request = request.into_inner();
+        let database = parse("database name", &request.database)?;
+        let epoch = LeaseEpoch::new(request.epoch);
+        if let Some(caller) = caller {
+            require_candidate(
+                &self.node.state(),
+                "RecordFenced",
+                &caller,
+                &database,
+                epoch,
+            )?;
+        }
         let action = Action::RecordFenced {
-            database: parse("database name", &request.database)?,
+            database,
             node: parse("node id", &request.node_id)?,
-            epoch: LeaseEpoch::new(request.epoch),
+            epoch,
             position: Position::new(request.position),
         };
         match self.submit(action).await? {
@@ -721,11 +861,20 @@ impl Control for ControlService {
         &self,
         request: Request<CompletePromotionRequest>,
     ) -> Result<Response<CompletePromotionResponse>, Status> {
+        let caller = calling_node(&request)?;
         let request = request.into_inner();
-        let action = Action::CompletePromotion {
-            database: parse("database name", &request.database)?,
-            epoch: LeaseEpoch::new(request.epoch),
-        };
+        let database = parse("database name", &request.database)?;
+        let epoch = LeaseEpoch::new(request.epoch);
+        if let Some(caller) = caller {
+            require_candidate(
+                &self.node.state(),
+                "CompletePromotion",
+                &caller,
+                &database,
+                epoch,
+            )?;
+        }
+        let action = Action::CompletePromotion { database, epoch };
         match self.submit(action).await? {
             (
                 Applied::PromotionCompleted {
@@ -763,20 +912,9 @@ impl Control for ControlService {
     ) -> Result<Response<PromotionResponse>, Status> {
         let database: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_key(&request, &database)?;
-        // A node hands over only a lease it holds, as a draining node does.
-        if let Caller::Node(node) = authorized(&request)?.caller() {
-            let holds = self
-                .node
-                .state()
-                .database(&database)
-                .and_then(|db| db.lease())
-                .is_some_and(|lease| lease.holder() == node);
-            if !holds {
-                tracing::warn!(target: "fleetringd::audit", principal = %format!("node:{node}"), action = "admin", key = %database, rpc = "TransferLease", "denied");
-                return Err(Status::permission_denied(format!(
-                    "TransferLease of '{database}' needs its lease, or admin on it"
-                )));
-            }
+        // Bound to `holder`: a node hands over only a lease it holds, as a draining node does.
+        if let Some(node) = calling_node(&request)? {
+            require_holder(&self.node.state(), "TransferLease", &node, &database)?;
         }
         let request = request.into_inner();
         let target = if request.target.is_empty() {

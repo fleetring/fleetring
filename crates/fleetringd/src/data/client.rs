@@ -48,6 +48,8 @@ pub struct Location {
     pub epoch: LeaseEpoch,
     /// Its lease holder, which serves its requests, once it has one.
     pub primary: Option<NodeId>,
+    /// The node carrying out its promotion to `epoch`, while one is in progress (FR-050).
+    pub candidate: Option<NodeId>,
     /// Its replica set in the ring's preference order, the primary included.
     pub replicas: Vec<ReplicaInfo>,
     /// How many replicas it should have, R.

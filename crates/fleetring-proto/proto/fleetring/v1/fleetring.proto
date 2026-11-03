@@ -273,6 +273,9 @@ message Placement {
   // predates the fields, which means `quorum` with the floor at W.
   Acks acks = 8;
   uint32 min_replicas = 9;
+  // The node carrying out the promotion to `epoch`, while one is in progress (FR-050). Unset
+  // otherwise, and from a control node that predates the field.
+  optional string candidate = 10;
 }
 
 // One member of a database's replica set, as the control plane knows it.

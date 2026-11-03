@@ -21,7 +21,7 @@ use fleetring_proto::v1::{
     RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, Role,
     StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
-use fleetringd::auth::{AuthLayer, Authorizer};
+use fleetringd::auth::{AuthLayer, Authorizer, refused_binding};
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
     CommandLog, Committed, ControlClient, ControlHandle, ControlNode, ControlOptions,
@@ -1239,8 +1239,9 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
         .expect_err("not its lease");
     assert_eq!(
         transfer.message(),
-        "TransferLease of 'tenant:acme' needs its lease, or admin on it"
+        "TransferLease refused for node 'a': not the holder of database 'tenant:acme' at epoch 0"
     );
+    assert_eq!(refused_binding(&transfer), Some("holder"));
 
     // It may drain and leave itself, as a daemon does when it shuts down.
     b.drain(DrainRequest {
@@ -1271,5 +1272,367 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
         .collect();
     assert_eq!(members, ["a", "d"]);
     daemon.run_until(std::future::ready(())).await;
+    Ok(())
+}
+
+/// A control daemon with three member nodes, each with its own certificate, and a database at
+/// R = 2, so that one member is outside its replica set (FR-050).
+///
+/// The failover timer never ticks and nobody heartbeats on their own, so the control log grows
+/// only by the calls a test makes.
+struct Bound {
+    daemon: Daemon,
+    log: std::path::PathBuf,
+    operator: ControlClient,
+    nodes: std::collections::BTreeMap<String, ControlClient>,
+    database: String,
+    /// The replica set, the holder first.
+    replicas: Vec<String>,
+    /// The member outside the replica set.
+    outsider: String,
+    _dir: tempfile::TempDir,
+}
+
+impl Bound {
+    async fn start() -> Result<Self, Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
+        let text = format!(
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
+             [control]\nheartbeat_timeout_ms = 600000\ntick_interval_ms = 3600000\n{}",
+            dir.path().join("data"),
+            tls.node_table("control-1")?
+        );
+        let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+        let address = daemon.control_address().ok_or("no control address")?;
+        let operator = secure_client(address, &tls)?;
+        let mut nodes = std::collections::BTreeMap::new();
+        for id in ["a", "b", "c"] {
+            let node = node_client(address, &tls, id)?;
+            node.join(join_request(id)).await?;
+            nodes.insert(id.to_owned(), node);
+        }
+        let database = "tenant:bound".to_owned();
+        let created = operator
+            .create_database(CreateDatabaseRequest {
+                database: database.clone(),
+                replication_factor: 2,
+                engine: Engine::Sqlite.into(),
+                acks: Acks::Unspecified.into(),
+                min_replicas: 0,
+            })
+            .await?
+            .placement
+            .ok_or("no placement")?;
+        let replicas = created.followers;
+        assert_eq!(replicas.len(), 2, "{replicas:?}");
+        let outsider = ["a", "b", "c"]
+            .into_iter()
+            .find(|id| !replicas.iter().any(|replica| replica == id))
+            .ok_or("every member is a replica")?
+            .to_owned();
+        let bound = Self {
+            log: dir.path().join("data").join("control.db"),
+            daemon,
+            operator,
+            nodes,
+            database,
+            replicas,
+            outsider,
+            _dir: dir,
+        };
+        bound
+            .node(bound.holder())
+            .acquire_lease(AcquireLeaseRequest {
+                database: bound.database.clone(),
+                node_id: bound.holder().to_owned(),
+            })
+            .await?;
+        // The follower reports its copy, so that a transfer has a candidate.
+        bound
+            .node(bound.follower())
+            .heartbeat(HeartbeatRequest {
+                node_id: bound.follower().to_owned(),
+                databases: vec![DatabaseStatus {
+                    database: bound.database.clone(),
+                    role: Role::Follower.into(),
+                    epoch: 1,
+                    position: vec![0, 1],
+                }],
+            })
+            .await?;
+        Ok(bound)
+    }
+
+    fn node(&self, id: &str) -> &ControlClient {
+        &self.nodes[id]
+    }
+
+    fn holder(&self) -> &str {
+        &self.replicas[0]
+    }
+
+    fn follower(&self) -> &str {
+        &self.replicas[1]
+    }
+
+    /// The index of the last command the control log holds.
+    fn logged(&self) -> Result<i64, Box<dyn Error>> {
+        let log = rusqlite::Connection::open_with_flags(
+            &self.log,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(log.query_row(
+            "SELECT coalesce(max(log_index), 0) FROM commands",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    async fn locate(&self) -> Result<fleetring_proto::v1::Placement, Box<dyn Error>> {
+        Ok(self
+            .operator
+            .locate(LocateRequest {
+                database: self.database.clone(),
+            })
+            .await?
+            .placement
+            .ok_or("no placement")?)
+    }
+
+    /// Drains the holder and has it hand its lease over, as a draining node does, and returns
+    /// the promotion's epoch and candidate.
+    async fn transfer(&self) -> Result<(u64, String), Box<dyn Error>> {
+        let holder = self.node(self.holder());
+        holder
+            .drain(DrainRequest {
+                node_id: self.holder().to_owned(),
+            })
+            .await?;
+        let started = holder
+            .transfer_lease(TransferLeaseRequest {
+                database: self.database.clone(),
+                target: String::new(),
+            })
+            .await?;
+        assert_eq!(started.candidate, self.follower());
+        Ok((started.epoch, started.candidate))
+    }
+
+    async fn stop(self) {
+        self.daemon.run_until(std::future::ready(())).await;
+    }
+}
+
+/// Asserts that `refused` is a binding refusal naming `binding`, and that the control log still
+/// ends at `logged`.
+fn assert_refused(
+    bound: &Bound,
+    refused: &Status,
+    binding: &str,
+    logged: i64,
+) -> Result<(), Box<dyn Error>> {
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert_eq!(refused_binding(refused), Some(binding), "{refused}");
+    assert_eq!(bound.logged()?, logged, "a refused call logged nothing");
+    Ok(())
+}
+
+#[tokio::test]
+async fn start_promotion_from_outside_the_replica_set_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    let logged = bound.logged()?;
+    let request = || StartPromotionRequest {
+        database: bound.database.clone(),
+    };
+    let refused = bound
+        .node(&bound.outsider)
+        .start_promotion(request())
+        .await
+        .expect_err("not a replica");
+    assert_refused(&bound, &refused, "replica", logged)?;
+    assert_eq!(
+        refused.message(),
+        format!(
+            "StartPromotion refused for node '{}': not a replica of database 'tenant:bound'",
+            bound.outsider
+        )
+    );
+
+    // A replica passes the binding; the lease hasn't expired, so the state machine says no.
+    let early = bound
+        .node(bound.follower())
+        .start_promotion(request())
+        .await
+        .expect_err("the lease is live");
+    assert_eq!(early.code(), Code::FailedPrecondition, "{early}");
+    assert_eq!(refused_binding(&early), None);
+    bound.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_fenced_from_a_node_other_than_the_candidate_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    let (epoch, candidate) = bound.transfer().await?;
+    let fence = |node: &str, epoch: u64| RecordFencedRequest {
+        database: bound.database.clone(),
+        node_id: node.to_owned(),
+        epoch,
+        position: vec![0, 1],
+    };
+    let logged = bound.logged()?;
+    for caller in [bound.holder(), bound.outsider.as_str()] {
+        let refused = bound
+            .node(caller)
+            .record_fenced(fence(caller, epoch))
+            .await
+            .expect_err("not the candidate");
+        assert_refused(&bound, &refused, "candidate", logged)?;
+        assert_eq!(
+            refused.message(),
+            format!(
+                "RecordFenced refused for node '{caller}': not the candidate of database \
+                 'tenant:bound' at epoch {epoch}"
+            )
+        );
+    }
+    // No promotion to a later epoch exists yet, so nobody is its candidate, the current one
+    // included.
+    let ahead = bound
+        .node(&candidate)
+        .record_fenced(fence(&candidate, epoch + 1))
+        .await
+        .expect_err("no promotion to that epoch");
+    assert_refused(&bound, &ahead, "candidate", logged)?;
+
+    let recorded = bound
+        .node(&candidate)
+        .record_fenced(fence(&candidate, epoch))
+        .await?;
+    assert_eq!(recorded.fenced, 1);
+    bound.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_promotion_from_a_node_other_than_the_candidate_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    let (epoch, candidate) = bound.transfer().await?;
+    for fenced in [bound.holder(), candidate.as_str()] {
+        bound
+            .node(&candidate)
+            .record_fenced(RecordFencedRequest {
+                database: bound.database.clone(),
+                node_id: fenced.to_owned(),
+                epoch,
+                position: vec![0, 1],
+            })
+            .await?;
+    }
+    let complete = || CompletePromotionRequest {
+        database: bound.database.clone(),
+        epoch,
+    };
+    let logged = bound.logged()?;
+    for caller in [bound.holder(), bound.outsider.as_str()] {
+        let refused = bound
+            .node(caller)
+            .complete_promotion(complete())
+            .await
+            .expect_err("not the candidate");
+        assert_refused(&bound, &refused, "candidate", logged)?;
+    }
+    let completed = bound
+        .node(&candidate)
+        .complete_promotion(complete())
+        .await?;
+    assert_eq!(completed.lease.map(|lease| lease.epoch), Some(epoch));
+    // Once it completed, a repeat is the state machine's to refuse, as before.
+    let again = bound
+        .node(&candidate)
+        .complete_promotion(complete())
+        .await
+        .expect_err("no promotion left");
+    assert_eq!(again.code(), Code::FailedPrecondition, "{again}");
+    assert_eq!(refused_binding(&again), None);
+    bound.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn transfer_lease_from_a_node_that_does_not_hold_the_lease_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    bound
+        .node(bound.holder())
+        .drain(DrainRequest {
+            node_id: bound.holder().to_owned(),
+        })
+        .await?;
+    let transfer = || TransferLeaseRequest {
+        database: bound.database.clone(),
+        target: String::new(),
+    };
+    let logged = bound.logged()?;
+    for caller in [bound.follower(), bound.outsider.as_str()] {
+        let refused = bound
+            .node(caller)
+            .transfer_lease(transfer())
+            .await
+            .expect_err("not the holder");
+        assert_refused(&bound, &refused, "holder", logged)?;
+        assert_eq!(
+            refused.message(),
+            format!(
+                "TransferLease refused for node '{caller}': not the holder of database \
+                 'tenant:bound' at epoch 1"
+            )
+        );
+    }
+    let started = bound
+        .node(bound.holder())
+        .transfer_lease(transfer())
+        .await?;
+    assert_eq!(started.epoch, 2);
+    assert_eq!(started.candidate, bound.follower());
+    bound.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locate_names_the_candidate_while_a_promotion_is_in_progress() -> TestResult {
+    let bound = Bound::start().await?;
+    let before = bound.locate().await?;
+    assert_eq!(before.primary.as_deref(), Some(bound.holder()));
+    assert_eq!(before.candidate, None);
+
+    let (epoch, candidate) = bound.transfer().await?;
+    let during = bound.locate().await?;
+    assert_eq!(during.epoch, epoch);
+    assert_eq!(during.primary, None);
+    assert_eq!(during.candidate.as_deref(), Some(candidate.as_str()));
+
+    for fenced in [bound.holder(), candidate.as_str()] {
+        bound
+            .node(&candidate)
+            .record_fenced(RecordFencedRequest {
+                database: bound.database.clone(),
+                node_id: fenced.to_owned(),
+                epoch,
+                position: vec![0, 1],
+            })
+            .await?;
+    }
+    bound
+        .node(&candidate)
+        .complete_promotion(CompletePromotionRequest {
+            database: bound.database.clone(),
+            epoch,
+        })
+        .await?;
+    let after = bound.locate().await?;
+    assert_eq!(after.primary.as_deref(), Some(candidate.as_str()));
+    assert_eq!(after.candidate, None);
+    bound.stop().await;
     Ok(())
 }

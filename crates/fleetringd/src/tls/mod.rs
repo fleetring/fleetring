@@ -21,6 +21,8 @@ mod names;
 use fleetring::NodeId;
 use tonic::{Request, Status};
 
+use crate::auth::Binding;
+
 pub use authority::{
     AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE, Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME,
     DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME, Issued, Validity,
@@ -59,8 +61,9 @@ impl Peer {
     ///
     /// # Errors
     ///
-    /// `PERMISSION_DENIED`, naming the call and `claimed`, if the peer is a node other than
-    /// `claimed`; the log names both IDs.
+    /// `PERMISSION_DENIED`, naming the call and `claimed`, with
+    /// [`BINDING_KEY`](crate::auth::BINDING_KEY) metadata naming the `self` binding, if the peer
+    /// is a node other than `claimed`; the log names both IDs.
     pub fn check_node(&self, claimed: &NodeId, call: &'static str) -> Result<(), Status> {
         match self {
             Self::Node(id) if id != claimed => {
@@ -77,9 +80,16 @@ impl Peer {
                 } else {
                     ""
                 };
-                Err(Status::permission_denied(format!(
+                let mut status = Status::permission_denied(format!(
                     "{call} for node '{claimed}' needs that node's certificate{or_cluster}"
-                )))
+                ));
+                // The call is bound to `self` (ADR-0031), and says so as every binding refusal
+                // does.
+                status.metadata_mut().insert(
+                    crate::auth::BINDING_KEY,
+                    tonic::metadata::MetadataValue::from_static(Binding::SelfNode.as_str()),
+                );
+                Err(status)
             }
             _ => Ok(()),
         }
