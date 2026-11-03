@@ -8,6 +8,7 @@
 //! harness (ADR-0020), run the same code as the binary.
 
 mod actor;
+pub mod auth;
 pub mod changes;
 pub mod clock;
 mod config;
@@ -44,6 +45,11 @@ pub use sink::{
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
+    assert_debug_send_sync::<auth::Action>();
+    assert_debug_send_sync::<auth::ParseScopeError>();
+    assert_debug_send_sync::<auth::Scope>();
+    assert_debug_send_sync::<auth::Scopes>();
+    assert_debug_send_sync::<auth::Target<'static>>();
     assert_debug_send_sync::<changes::ChangeStreams>();
     assert_debug_send_sync::<clock::SimClock>();
     assert_debug_send_sync::<clock::SystemClock>();
