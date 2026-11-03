@@ -1,6 +1,6 @@
 # ADR-0026: How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire
 
-- **Status:** Proposed (2026-11-02)
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-02
 - **Related:** amends ADR-0025 (§4); ADR-0017 (control state), ADR-0020 (simulation); tickets FR-047, FR-050
 

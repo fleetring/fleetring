@@ -1,6 +1,6 @@
 # ADR-0027: Keyed leases: a fenced, renewable lease on any key, requested by a named holder and kept in control state
 
-- **Status:** Proposed (2026-11-02)
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-02
 - **Related:** ADR-0017 (control state machine), ADR-0018 (leases, epochs, quorums), ADR-0020 (simulation), ADR-0022 (failover), ADR-0025 and ADR-0026 (principals and scopes); tickets FR-042, FR-043, FR-047
 

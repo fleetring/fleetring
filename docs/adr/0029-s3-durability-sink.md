@@ -1,6 +1,6 @@
 # ADR-0029: Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore
 
-- **Status:** Proposed (2026-11-02)
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-02
 - **Related:** ADR-0016 (engine adapters, point 3: durability sinks), ADR-0018 (quorums), ADR-0020 (simulation), ADR-0022 (log epochs), ADR-0023 (durability modes), ADR-0025 and ADR-0026 (scopes), ADR-0028 (replicated sink positions); tickets FR-032, FR-039, FR-041, FR-044, FR-049
 

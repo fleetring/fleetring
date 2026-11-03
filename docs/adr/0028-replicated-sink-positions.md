@@ -1,6 +1,6 @@
 # ADR-0028: Replicated sink positions live in the database, written with the next write after a delivery
 
-- **Status:** Proposed (2026-11-02)
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-02
 - **Related:** ADR-0016 (engine adapters), ADR-0017 (control state machine), ADR-0018 (leases and quorums), ADR-0022 (failover), ADR-0023 (durability modes), ADR-0024 (logical change capture); tickets FR-039, FR-040, FR-041, FR-049
 
