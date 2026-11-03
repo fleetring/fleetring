@@ -2087,3 +2087,77 @@ async fn watch_leases_streams_the_leases_each_node_gains_and_loses() -> TestResu
     cluster.stop().await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statements_are_confined_to_the_database_they_name() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::start(dir.path()).await?;
+    let client = cluster.client()?;
+    let victim = name("victim")?;
+    let intruder = name("intruder")?;
+    let created = client.create_database(&victim, three()?).await?;
+    let primary = created.primary.clone().ok_or("no primary after create")?;
+    client.create_database(&intruder, three()?).await?;
+    client
+        .execute(
+            &victim,
+            Statement::new("CREATE TABLE notes (n INTEGER PRIMARY KEY, body TEXT)"),
+        )
+        .await?;
+    client
+        .execute(
+            &victim,
+            Statement::new("INSERT INTO notes (n, body) VALUES (1, 'mine')"),
+        )
+        .await?;
+
+    // Whichever node runs the intruder, every copy of the victim's file is out of reach.
+    for id in DATA {
+        let path = database_file(dir.path(), id, "victim");
+        let attach = format!("ATTACH DATABASE '{}' AS z", path.display());
+        let queried = client
+            .query(&intruder, Statement::new(attach.clone()))
+            .await
+            .expect_err("a query can't attach another database");
+        assert_eq!(queried.code(), Code::InvalidArgument, "{queried}");
+        assert!(queried.message().contains("attach"), "{queried}");
+        let executed = client
+            .execute(&intruder, Statement::new(attach))
+            .await
+            .expect_err("a statement can't attach another database");
+        assert_eq!(executed.code(), Code::InvalidArgument, "{executed}");
+        assert!(executed.message().contains("attach"), "{executed}");
+    }
+    // Nothing stayed attached on either connection.
+    let read = client
+        .query(&intruder, Statement::new("SELECT n FROM z.notes"))
+        .await
+        .expect_err("no database z");
+    assert_eq!(read.code(), Code::InvalidArgument, "{read}");
+    let write = client
+        .execute(
+            &intruder,
+            Statement::new("INSERT INTO z.notes (n, body) VALUES (2, 'theirs')"),
+        )
+        .await
+        .expect_err("no database z");
+    assert_eq!(write.code(), Code::InvalidArgument, "{write}");
+
+    let rows = client
+        .query(
+            &victim,
+            Statement::new("SELECT n, body FROM notes ORDER BY n"),
+        )
+        .await?;
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Integer(1), Value::from("mine")]]
+    );
+    assert_eq!(
+        notes_in(&database_file(dir.path(), primary.as_str(), "victim"))?,
+        [1]
+    );
+
+    cluster.stop().await;
+    Ok(())
+}
