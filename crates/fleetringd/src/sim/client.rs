@@ -8,10 +8,12 @@ use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Action, DatabaseName, LeaseEpoch};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CreateDatabaseRequest, Engine, HeartbeatRequest, JoinRequest,
-    LeaseResponse, LocateRequest, LocateResponse, Node, RenewLeaseRequest,
+    AcquireLeaseRequest, CreateDatabaseRequest, Engine, FenceRequest, HeartbeatRequest,
+    JoinRequest, LeaseResponse, LocateRequest, LocateResponse, Node, RenewLeaseRequest,
+    ReplicateMessage, ReplicateOpen, SnapshotRequest, replicate_message,
 };
 
+use crate::auth::refused_binding;
 use crate::control::ControlClient;
 use crate::control::rejection_status;
 use crate::data::{Client, DatabaseSpec, LeaseUpdate};
@@ -19,7 +21,7 @@ use crate::engine::{Statement, Value};
 use crate::environment::Network;
 use crate::replication::LeaseChange;
 use crate::sim::SimRng;
-use crate::sim::cluster::certificate_validity;
+use crate::sim::cluster::{PORT, certificate_validity};
 use crate::sim::history::DurabilityMode;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
@@ -27,7 +29,7 @@ use crate::sim::workload::{
     Ack, LeaseObservation, LeaseSeen, Operation, Outcome, Step, WRITES_TABLE, Workload,
 };
 use crate::tls::{Authority, Identity, Security};
-use crate::transport::Backoff;
+use crate::transport::{Backoff, replication_client};
 
 /// How long a lease watcher waits before it tries a node again after a stream failed to open or
 /// ended.
@@ -80,7 +82,7 @@ pub(super) async fn run_client(
         clients: BTreeMap::new(),
     };
     let network = Network::simulated().with_security(Security::Tls(identity));
-    let client = Client::new(control, network).with_backoff(CLIENT_BACKOFF);
+    let client = Client::new(control, network.clone()).with_backoff(CLIENT_BACKOFF);
     let client = match entry {
         Some(entry) => client.with_entry(entry),
         None => client,
@@ -96,7 +98,7 @@ pub(super) async fn run_client(
                 let node = nodes.for_operation(&operation);
                 let outcome = match tokio::time::timeout(
                     timeout,
-                    execute(&client, node.as_ref(), &shared, &operation),
+                    execute(&client, node.as_ref(), &network, &shared, &operation),
                 )
                 .await
                 {
@@ -166,10 +168,12 @@ impl NodeClients {
 }
 
 /// Sends `operation` and returns its outcome. A node's call goes through `node`, the client
-/// with that node's certificate.
+/// with that node's certificate; an impostor's node call goes over `network`, with the client's
+/// own certificate.
 async fn execute(
     data: &Client,
     node: Option<&ControlClient>,
+    network: &Network,
     shared: &Shared,
     operation: &Operation,
 ) -> Outcome {
@@ -263,6 +267,11 @@ async fn execute(
                 epoch: written.epoch,
             }),
         Operation::Read { database, value } => read(data, database, *value).await,
+        Operation::ImpostorReplicate { .. }
+        | Operation::ImpostorFence { .. }
+        | Operation::ImpostorSnapshot { .. } => {
+            return Outcome::Acknowledged(impostor(network, operation).await);
+        }
     };
     result.map_or_else(
         |status| Outcome::from_status(&status),
@@ -465,4 +474,84 @@ fn record_lease_update(shared: &Shared, watcher: &str, node: &str, update: &Leas
         shared.record(watcher, EventKind::Lease(observation.clone()));
         shared.lock().history.observe_lease(observation);
     }
+}
+
+/// Makes an impostor's node call with the client's certificate, and returns how the node
+/// answered: [`Ack::Refused`] with the status code and the binding the refusal names, or
+/// [`Ack::Served`].
+async fn impostor(network: &Network, operation: &Operation) -> Ack {
+    let answer = match operation {
+        Operation::ImpostorReplicate {
+            database,
+            target,
+            epoch,
+        } => {
+            let open = ReplicateMessage {
+                message: Some(replicate_message::Message::Open(ReplicateOpen {
+                    database: database.to_string(),
+                    epoch: epoch.get(),
+                    epoch_start: None,
+                })),
+            };
+            // No metadata names the sender: the certificate does.
+            match channel(network, target) {
+                Ok(channel) => replication_client(channel)
+                    .replicate(tokio_stream::iter([open]))
+                    .await
+                    .map(drop),
+                Err(status) => Err(status),
+            }
+        }
+        Operation::ImpostorFence {
+            database,
+            target,
+            epoch,
+            candidate,
+        } => {
+            let request = FenceRequest {
+                database: database.to_string(),
+                epoch: epoch.get(),
+                candidate: candidate.to_string(),
+            };
+            match channel(network, target) {
+                Ok(channel) => replication_client(channel).fence(request).await.map(drop),
+                Err(status) => Err(status),
+            }
+        }
+        Operation::ImpostorSnapshot {
+            database,
+            target,
+            epoch,
+        } => {
+            let request = SnapshotRequest {
+                database: database.to_string(),
+                epoch: epoch.get(),
+            };
+            match channel(network, target) {
+                Ok(channel) => replication_client(channel)
+                    .snapshot(request)
+                    .await
+                    .map(drop),
+                Err(status) => Err(status),
+            }
+        }
+        _ => Err(tonic::Status::invalid_argument("not an impostor's call")),
+    };
+    match answer {
+        Ok(()) => {
+            tracing::error!(%operation, "a node served an impostor");
+            Ack::Served
+        }
+        Err(status) => Ack::Refused {
+            code: status.code(),
+            binding: refused_binding(&status).map(str::to_owned),
+        },
+    }
+}
+
+/// A channel to `target`'s services over `network`.
+fn channel(network: &Network, target: &NodeId) -> Result<tonic::transport::Channel, tonic::Status> {
+    network
+        .channel(&format!("{target}:{PORT}"))
+        .map_err(|error| tonic::Status::unavailable(error.to_string()))
 }

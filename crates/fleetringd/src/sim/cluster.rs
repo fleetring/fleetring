@@ -162,6 +162,8 @@ pub struct ClusterBuilder {
     max_latency: Duration,
     configure: Vec<(String, Configure)>,
     replication: Option<ReplicationSettings>,
+    /// Client hosts that act as a node with that node's certificate, by name.
+    impostors: BTreeMap<String, NodeId>,
 }
 
 impl fmt::Debug for ClusterBuilder {
@@ -246,6 +248,24 @@ impl ClusterBuilder {
         self
     }
 
+    /// Makes the client host `name`, once [`Cluster::client`] adds it, present a node
+    /// certificate for `as_node` from the cluster's authority instead of a principal's: an
+    /// impostor that stole that node's key (FR-050). Its workload's node calls
+    /// ([`Operation::ImpostorReplicate`](crate::sim::Operation::ImpostorReplicate) and the
+    /// others) go out with that certificate.
+    ///
+    /// # Panics
+    ///
+    /// If `as_node` isn't a valid node ID.
+    #[must_use]
+    pub fn impostor(mut self, name: &str, as_node: &str) -> Self {
+        let node = as_node
+            .parse()
+            .unwrap_or_else(|error| panic!("'{as_node}' is not a node ID: {error}"));
+        self.impostors.insert(name.to_owned(), node);
+        self
+    }
+
     /// Changes the configuration of host `name` with `configure`, after the harness fills it in.
     #[must_use]
     pub fn configure(mut self, name: &str, configure: impl Fn(&mut Config) + 'static) -> Self {
@@ -287,6 +307,7 @@ impl ClusterBuilder {
             clients: Vec::new(),
             watchers: Vec::new(),
             partitions: BTreeSet::new(),
+            impostors: self.impostors,
             root,
         };
         for (name, role) in &self.hosts {
@@ -456,6 +477,8 @@ pub struct Cluster {
     watchers: Vec<String>,
     /// Links the test has partitioned and not repaired, each as an ordered pair.
     partitions: BTreeSet<(String, String)>,
+    /// Client hosts that act as a node with that node's certificate.
+    impostors: BTreeMap<String, NodeId>,
     root: TempDir,
 }
 
@@ -484,6 +507,7 @@ impl Cluster {
             max_latency: MAX_LATENCY,
             configure: Vec::new(),
             replication: None,
+            impostors: BTreeMap::new(),
         }
     }
 
@@ -654,6 +678,18 @@ impl Cluster {
     ///
     /// If the authority can't issue the certificate.
     fn client_identity(&self, name: &str) -> Identity {
+        if let Some(node) = self.impostors.get(name) {
+            let issued = self
+                .authority
+                .issue_node(node, &[name.to_owned()], certificate_validity())
+                .unwrap_or_else(|error| {
+                    panic!("can't issue the certificate of node {node} for '{name}': {error}")
+                });
+            return Identity::from_issued(self.authority.certificate_pem(), &issued)
+                .unwrap_or_else(|error| {
+                    panic!("can't load the certificate of node {node} for '{name}': {error}")
+                });
+        }
         let principal = WORKLOAD_PRINCIPAL
             .parse()
             .unwrap_or_else(|error| panic!("'{WORKLOAD_PRINCIPAL}' is not a principal: {error}"));
@@ -886,6 +922,43 @@ impl Cluster {
             .running
             .get(name)
             .and_then(|running| running.replication.clone())
+    }
+
+    /// How many peer calls the running data host `name` has refused since it started because
+    /// they failed their placement binding (FR-050), or `None` if it isn't running.
+    #[must_use]
+    pub fn binding_refusals(&self, name: &str) -> Option<u64> {
+        self.replication(name)
+            .map(|replication| replication.binding_refusals())
+    }
+
+    /// Checks that no running data host has refused a peer call for failing its binding: in a
+    /// cluster without impostors, every call is legitimate, membership changes and failovers
+    /// included (FR-050).
+    ///
+    /// # Errors
+    ///
+    /// [`Invariant::NodeCallsBound`](check::Invariant::NodeCallsBound) naming the hosts that
+    /// refused, and how many calls each.
+    pub fn assert_no_binding_refusals(&self) -> Result<(), Violation> {
+        let refused: Vec<String> = self
+            .data_hosts()
+            .filter_map(|host| {
+                self.binding_refusals(host)
+                    .filter(|count| *count > 0)
+                    .map(|count| format!("{host} refused {count}"))
+            })
+            .collect();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        Err(Violation::new(
+            check::Invariant::NodeCallsBound,
+            format!(
+                "legitimate node calls were refused for their binding: {}",
+                refused.join(", ")
+            ),
+        ))
     }
 
     /// Returns the rows each data host's copy of `database` holds, read from its files on disk.
@@ -1265,7 +1338,9 @@ impl Cluster {
         })
     }
 
-    /// Stops every host gracefully and runs the final checks: the hash chains of every replica
+    /// Stops every host gracefully and runs the final checks: in a cluster without impostors, no
+    /// running data host refused a peer call for its binding
+    /// ([`Cluster::assert_no_binding_refusals`]); the hash chains of every replica
     /// still following agree ([`Cluster::check_chains`]), the history checker
     /// ([`Cluster::check_history`]) over the whole history and every host's copy on disk, the
     /// control log replays to the state the control node last published, which holds every
@@ -1277,6 +1352,10 @@ impl Cluster {
     /// A [`Violation`], or an error from stepping while hosts stop.
     pub fn finish(mut self) -> Result<Report, SimError> {
         self.check()?;
+        // Only an impostor's calls are refused for their bindings.
+        if self.impostors.is_empty() {
+            self.assert_no_binding_refusals()?;
+        }
         self.check_chains()?;
         let control = self.control_handle();
         self.record(EventKind::Note("shutting down".into()));
