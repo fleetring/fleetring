@@ -8,7 +8,7 @@ use std::sync::Arc;
 use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::{
     Acks, Action, Applied, DatabaseName, Durability, Engine, HostedReplica, Lease, LeaseEpoch,
-    Liveness, Member, Millis, Position, Rejection, Revoked, Role, State,
+    Liveness, Member, Millis, Position, Rejection, ReplicaRole, Revoked, State,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
@@ -245,9 +245,9 @@ pub(crate) fn node_to_proto(member: &Member) -> proto::Node {
 }
 
 fn replica_from(status: proto::DatabaseStatus) -> Result<HostedReplica, Status> {
-    let role = match proto::Role::try_from(status.role) {
-        Ok(proto::Role::Primary) => Role::Primary,
-        Ok(proto::Role::Follower) => Role::Follower,
+    let role = match proto::ReplicaRole::try_from(status.role) {
+        Ok(proto::ReplicaRole::Primary) => ReplicaRole::Primary,
+        Ok(proto::ReplicaRole::Follower) => ReplicaRole::Follower,
         _ => {
             return Err(Status::invalid_argument(format!(
                 "database '{}' has no valid role",
@@ -271,11 +271,11 @@ fn engine_from(engine: i32) -> Result<Engine, Status> {
     }
 }
 
-fn role_to_proto(role: Role) -> proto::Role {
+fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
     match role {
-        Role::Primary => proto::Role::Primary,
-        Role::Follower => proto::Role::Follower,
-        _ => proto::Role::Unspecified,
+        ReplicaRole::Primary => proto::ReplicaRole::Primary,
+        ReplicaRole::Follower => proto::ReplicaRole::Follower,
+        _ => proto::ReplicaRole::Unspecified,
     }
 }
 
@@ -332,7 +332,7 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
                     .map(str::to_owned),
                 live: state.liveness(id, now) == Some(Liveness::Live),
                 reported_role: report
-                    .map_or(proto::Role::Unspecified, |report| {
+                    .map_or(proto::ReplicaRole::Unspecified, |report| {
                         role_to_proto(report.role())
                     })
                     .into(),

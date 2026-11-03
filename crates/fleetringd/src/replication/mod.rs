@@ -131,7 +131,7 @@ use std::time::Duration;
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{DatabaseName, Durability, LeaseEpoch};
 use fleetring_proto::v1::replication_server::ReplicationServer;
-use fleetring_proto::v1::{DatabaseStatus, Role};
+use fleetring_proto::v1::{DatabaseStatus, ReplicaRole};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -935,7 +935,7 @@ impl DatabaseStatuses for Replication {
                 name.clone(),
                 DatabaseStatus {
                     database: name.to_string(),
-                    role: Role::Follower.into(),
+                    role: ReplicaRole::Follower.into(),
                     epoch: self.inner.epochs.record(name).log_epoch(),
                     position: position.into_bytes(),
                 },
@@ -947,7 +947,7 @@ impl DatabaseStatuses for Replication {
                 name.clone(),
                 DatabaseStatus {
                     database: name.to_string(),
-                    role: Role::Primary.into(),
+                    role: ReplicaRole::Primary.into(),
                     epoch: primary.role().epoch.get(),
                     position: primary
                         .committed()

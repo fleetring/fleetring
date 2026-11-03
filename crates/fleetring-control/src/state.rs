@@ -203,7 +203,7 @@ impl State {
     /// ```
     /// use fleetring::ReplicationFactor;
     /// use fleetring_control::{
-    ///     apply, Action, Command, ControlConfig, Engine, HostedReplica, Member, Position, Role,
+    ///     apply, Action, Command, ControlConfig, Engine, HostedReplica, Member, Position, ReplicaRole,
     ///     State, Timestamp, UnknownReports,
     /// };
     ///
@@ -223,7 +223,7 @@ impl State {
     /// })?;
     /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
     /// // "b" keeps reporting its copy; "a" goes quiet.
-    /// let report = HostedReplica::new(db()?, Role::Follower, Position::new([1]));
+    /// let report = HostedReplica::new(db()?, ReplicaRole::Follower, Position::new([1]));
     /// let heartbeat = Action::Heartbeat {
     ///     id: "b".parse()?,
     ///     replicas: vec![report],

@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use fleetring_control::{Member, Role};
+use fleetring_control::{Member, ReplicaRole};
 use fleetring_proto::v1::{self as proto, Acks, CreateDatabaseRequest, DatabaseStatus, Engine};
 use fleetringd::{Config, Daemon, DatabaseStatuses, Membership, MembershipSettings};
 
@@ -20,7 +20,7 @@ impl DatabaseStatuses for Hosted {
             .into_iter()
             .map(|database| DatabaseStatus {
                 database: database.to_owned(),
-                role: proto::Role::Primary.into(),
+                role: proto::ReplicaRole::Primary.into(),
                 epoch: 1,
                 position: vec![0, 7],
             })
@@ -77,7 +77,7 @@ async fn heartbeats_report_databases_and_leave_out_unknown_ones() -> TestResult 
     .await?;
     let state = handle.state();
     let report = state.report(&node, &known).ok_or("no report")?;
-    assert_eq!(report.role(), Role::Primary);
+    assert_eq!(report.role(), ReplicaRole::Primary);
     assert_eq!(report.position().as_bytes(), [0, 7]);
     assert!(state.report(&node, &name("ghost")).is_none());
     let joined_at = state.membership_epoch();

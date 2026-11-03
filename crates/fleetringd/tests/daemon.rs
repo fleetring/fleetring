@@ -4,7 +4,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use fleetringd::replication::ReplicationSettings;
-use fleetringd::{Config, ConfigError, DataDir, DataDirError, Role};
+use fleetringd::{Config, ConfigError, DataDir, DataDirError, NodeRole};
 
 mod support;
 
@@ -23,7 +23,7 @@ fn a_minimal_config_defaults_to_both_roles_and_weight_one() -> TestResult {
     let config = Config::from_toml(MINIMAL)?;
     assert_eq!(config.node.id.as_str(), "laptop-1");
     assert_eq!(config.node.weight.get(), 1);
-    assert_eq!(config.role, Role::Both);
+    assert_eq!(config.role, NodeRole::Both);
     assert!(config.role.hosts_data() && config.role.runs_control());
     assert_eq!(config.control.address, None);
     assert_eq!(config.control, fleetringd::ControlSettings::default());

@@ -18,7 +18,7 @@ use fleetring_proto::v1::{
     DropDatabaseResponse, Engine, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
     LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
     LocateRequest, LocateResponse, MembershipUpdate, Node, PromotionResponse, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, Role,
+    RecordFencedResponse, RenewLeaseRequest, ReplicaRole, RevokeTokenRequest, RevokeTokenResponse,
     StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetringd::auth::{AuthLayer, Authorizer, refused_binding};
@@ -29,7 +29,7 @@ use fleetringd::control::{
     not_leader,
 };
 use fleetringd::transport::{TransportConfig, control_server};
-use fleetringd::{Config, ConfigError, Daemon, Role as DaemonRole};
+use fleetringd::{Config, ConfigError, Daemon, NodeRole};
 use tokio_stream::Stream;
 
 use crate::support::Tls;
@@ -128,7 +128,7 @@ heartbeat_interval_ms = 500
         "",
     ))?;
     assert_eq!(defaults.control.control_config(), ControlConfig::new());
-    assert_eq!(defaults.role, DaemonRole::Both);
+    assert_eq!(defaults.role, NodeRole::Both);
 
     for (bad, field) in [
         (
@@ -197,7 +197,7 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
             node_id: primary.clone(),
             databases: vec![DatabaseStatus {
                 database: "tenant:acme".into(),
-                role: Role::Follower.into(),
+                role: ReplicaRole::Follower.into(),
                 epoch: 0,
                 position: vec![0, 0, 0, 1],
             }],
@@ -429,7 +429,7 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
         node_id: node.into(),
         databases: vec![DatabaseStatus {
             database: database.clone(),
-            role: Role::Follower.into(),
+            role: ReplicaRole::Follower.into(),
             epoch: 1,
             position: vec![0, position],
         }],
@@ -1114,7 +1114,7 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
         .await?;
     let status = |database: &str| DatabaseStatus {
         database: database.into(),
-        role: Role::Primary.into(),
+        role: ReplicaRole::Primary.into(),
         epoch: 1,
         position: vec![0, 7],
     };
@@ -1407,7 +1407,7 @@ impl Bound {
                 node_id: bound.follower().to_owned(),
                 databases: vec![DatabaseStatus {
                     database: bound.database.clone(),
-                    role: Role::Follower.into(),
+                    role: ReplicaRole::Follower.into(),
                     epoch: 1,
                     position: vec![0, 1],
                 }],

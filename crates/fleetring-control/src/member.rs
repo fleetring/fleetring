@@ -151,7 +151,7 @@ pub enum Liveness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
-pub enum Role {
+pub enum ReplicaRole {
     /// The member accepts writes for the database.
     Primary,
     /// The member stores the database's log as a standby.
@@ -162,7 +162,7 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedReplica {
     database: DatabaseName,
-    role: Role,
+    role: ReplicaRole,
     position: Position,
     // Absent from logs written before replicas reported it.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -177,7 +177,7 @@ impl HostedReplica {
     /// Describes a replica of `database` that plays `role` and has stored the log up to
     /// `position`.
     #[must_use]
-    pub fn new(database: DatabaseName, role: Role, position: Position) -> Self {
+    pub fn new(database: DatabaseName, role: ReplicaRole, position: Position) -> Self {
         Self {
             database,
             role,
@@ -211,7 +211,7 @@ impl HostedReplica {
 
     /// Returns the role the member plays for the database.
     #[must_use]
-    pub fn role(&self) -> Role {
+    pub fn role(&self) -> ReplicaRole {
         self.role
     }
 
@@ -237,7 +237,7 @@ impl HostedReplica {
 /// What a member last reported about one database it hosts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
-    role: Role,
+    role: ReplicaRole,
     position: Position,
     at: Timestamp,
     // Absent from states written before replicas reported it.
@@ -248,7 +248,7 @@ pub struct Report {
 impl Report {
     /// Returns the role the member reported.
     #[must_use]
-    pub fn role(&self) -> Role {
+    pub fn role(&self) -> ReplicaRole {
         self.role
     }
 

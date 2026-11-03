@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
-use fleetring_control::{Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Role};
+use fleetring_control::{
+    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, ReplicaRole,
+};
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest, DrainRequest,
@@ -143,7 +145,7 @@ pub struct ReplicaInfo {
     /// Whether the control plane counts it as live.
     pub liveness: Liveness,
     /// The role it last reported for the database in a heartbeat, if it has reported one.
-    pub reported_role: Option<Role>,
+    pub reported_role: Option<ReplicaRole>,
     /// The log position it last reported for the database, if it has reported one.
     pub position: Option<Position>,
 }
@@ -171,7 +173,7 @@ pub struct ServedDatabase {
     /// The database.
     pub database: DatabaseName,
     /// The node's role for it.
-    pub role: Role,
+    pub role: ReplicaRole,
     /// The epoch of the primary that wrote the last frames of the node's copy: its own epoch on
     /// a primary.
     pub epoch: LeaseEpoch,

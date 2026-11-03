@@ -95,7 +95,7 @@ pub use database::{
     Acks, Database, DatabaseName, Durability, DurabilityError, Engine, Lease, LeaseEpoch,
     ParseAcksError, ParseDatabaseNameError, Position, Promotion, Quorums,
 };
-pub use member::{HostedReplica, Liveness, Member, Report, Role};
+pub use member::{HostedReplica, Liveness, Member, ReplicaRole, Report};
 pub use revocation::{KeyId, ParseCredentialIdError, Revocations, Revoked, TokenId};
 pub use state::{State, membership_ring};
 pub use time::{Millis, Timestamp};
@@ -132,7 +132,7 @@ const _: () = {
     assert_debug_send_sync::<Report>();
     assert_debug_send_sync::<Revocations>();
     assert_debug_send_sync::<Revoked>();
-    assert_debug_send_sync::<Role>();
+    assert_debug_send_sync::<ReplicaRole>();
     assert_debug_send_sync::<State>();
     assert_debug_send_sync::<Timestamp>();
     assert_debug_send_sync::<TokenId>();

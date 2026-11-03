@@ -4,7 +4,7 @@
 use fleetring::NodeId;
 use fleetring_control::{
     Acks, Action, Applied, Database, Durability, DurabilityError, HostedReplica, LeaseEpoch,
-    Member, Position, Quorums, Rejection, Role, State, UnknownReports,
+    Member, Position, Quorums, Rejection, ReplicaRole, State, UnknownReports,
 };
 
 use crate::common::{config, create, create_with, db, factor, heartbeat, id, run, zone};
@@ -367,7 +367,7 @@ fn report_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> Act
     Action::Heartbeat {
         id: id(node),
         replicas: vec![
-            HostedReplica::new(db(database), Role::Follower, Position::new(position))
+            HostedReplica::new(db(database), ReplicaRole::Follower, Position::new(position))
                 .with_log_epoch(LeaseEpoch::new(log_epoch)),
         ],
         unknown_reports: UnknownReports::Skip,

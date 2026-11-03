@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::ReplicationFactor;
-use fleetring_control::{Acks, DatabaseName, Durability, LeaseEpoch, Liveness, Role};
+use fleetring_control::{Acks, DatabaseName, Durability, LeaseEpoch, Liveness, ReplicaRole};
 use fleetring_proto::v1::ExecuteRequest;
 use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, LeaseUpdates, Location, primary_hint};
 use fleetringd::engine::{Statement, Value};
@@ -448,9 +448,9 @@ async fn writes_replicate_to_every_follower_through_the_daemons() -> TestResult 
     .await??;
     for replica in &located.replicas {
         let role = if replica.node == primary {
-            Role::Primary
+            ReplicaRole::Primary
         } else {
-            Role::Follower
+            ReplicaRole::Follower
         };
         assert_eq!(replica.reported_role, Some(role), "{}", replica.node);
     }
@@ -1126,9 +1126,9 @@ async fn status_node_shows_what_each_data_node_knows() -> TestResult {
             .find(|d| d.database == acme)
             .ok_or("acme not served")?;
         let role = if id == primary {
-            Role::Primary
+            ReplicaRole::Primary
         } else {
-            Role::Follower
+            ReplicaRole::Follower
         };
         assert_eq!(served.role, role, "{id}");
         assert_eq!(served.epoch.get(), 1, "{id}");

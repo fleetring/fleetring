@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use fleetringd::{Config, Role};
+use fleetringd::{Config, NodeRole};
 
 const EXAMPLE: &str = include_str!("../../../deploy/fleetringd.toml");
 
@@ -11,7 +11,7 @@ fn the_example_config_runs_a_one_node_fleet_from_the_data_volume() -> Result<(),
     let config = Config::from_toml(EXAMPLE)?;
     assert_eq!(config.data_dir.to_str(), Some("/data"));
     assert_eq!(config.listen.to_string(), "0.0.0.0:7400");
-    assert_eq!(config.role, Role::Both);
+    assert_eq!(config.role, NodeRole::Both);
     assert_eq!(config.node.id.as_str(), "node-1");
     assert_eq!(
         config.control_target().map(|a| a.to_string()).as_deref(),

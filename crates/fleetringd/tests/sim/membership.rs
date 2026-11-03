@@ -9,7 +9,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{DatabaseName, Liveness, Role, State, Timestamp};
+use fleetring_control::{DatabaseName, Liveness, ReplicaRole, State, Timestamp};
 use fleetringd::sim::{
     Ack, CreateAndWrite, Fleet, Operation, Operator, Replay, Report, Timings, seeds,
 };
@@ -201,7 +201,7 @@ fn slow_replies_keep_nodes_live_and_their_reports_current() {
             fleet.control_state().is_some_and(|state| {
                 state
                     .report(&primary, &database)
-                    .is_some_and(|report| report.role() == Role::Primary)
+                    .is_some_and(|report| report.role() == ReplicaRole::Primary)
             })
         })?;
         let state = fleet.control_state().ok_or("no control state")?;

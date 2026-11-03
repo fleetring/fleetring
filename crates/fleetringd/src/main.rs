@@ -13,7 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{Acks, DatabaseName, Liveness, Role as DatabaseRole};
+use fleetring_control::{Acks, DatabaseName, Liveness, ReplicaRole};
 use fleetring_control::{KeyId, Millis, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
@@ -29,7 +29,7 @@ use fleetringd::tls::{
     FleetName, Identity, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
-use fleetringd::{Config, Daemon, MembershipView, Network, Plaintext, Role};
+use fleetringd::{Config, Daemon, MembershipView, Network, NodeRole, Plaintext};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
 
@@ -82,7 +82,7 @@ struct DaemonArgs {
     control: Option<SocketAddr>,
     /// Overrides `role`: `both`, `data`, or `control`.
     #[arg(long, value_parser = parse_role)]
-    role: Option<Role>,
+    role: Option<NodeRole>,
     /// Runs without a `[tls]` table, in plaintext: nothing on the wire is authenticated or
     /// encrypted. For local experiments only.
     #[arg(long)]
@@ -481,11 +481,11 @@ fn parse_ttl(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn parse_role(text: &str) -> Result<Role, String> {
+fn parse_role(text: &str) -> Result<NodeRole, String> {
     match text {
-        "both" => Ok(Role::Both),
-        "data" => Ok(Role::Data),
-        "control" => Ok(Role::Control),
+        "both" => Ok(NodeRole::Both),
+        "data" => Ok(NodeRole::Data),
+        "control" => Ok(NodeRole::Control),
         other => Err(format!(
             "unknown role '{other}': expected both, data, or control"
         )),
@@ -1220,8 +1220,8 @@ fn format_node_status(status: &NodeStatus) -> String {
     }
     for database in &status.databases {
         let role = match database.role {
-            DatabaseRole::Primary => "primary",
-            DatabaseRole::Follower => "follower",
+            ReplicaRole::Primary => "primary",
+            ReplicaRole::Follower => "follower",
             _ => "unknown",
         };
         let position = database
