@@ -53,13 +53,21 @@ enum Role {
 // Every RPC states, in a `Scope:` line, what its caller needs (ADR-0025): `node` (a node
 // certificate; principals are refused), `cluster` (a node, or a principal with the `cluster`
 // scope), an action on the database the request names, or, for a listing, the action on each
-// database it shows. `fleetringd::auth::RPCS` holds the same table, and a test keeps the two
-// equal; a request for an RPC the table doesn't list is refused.
+// database it shows. A node call also states, in a `Binding:` line, what the calling node must
+// be for the database or node the request names (ADR-0031): `self` (the request names the
+// caller), `replica` (in the database's replica set), `holder` (it holds the database's lease),
+// `candidate` (the candidate of the promotion to the request's epoch), `holder or candidate`
+// (either, at the stream's epoch), or `follower` (one the primary streams the database to). A
+// call that fails its binding is refused with PERMISSION_DENIED and `fleetring-binding`
+// metadata naming the binding. `fleetringd::auth::RPCS` holds the same table, and tests keep
+// the two equal; a request for an RPC the table doesn't list is refused.
 
 service Control {
   // Scope: node.
+  // Binding: self.
   rpc Join(JoinRequest) returns (JoinResponse);
   // Scope: node.
+  // Binding: self.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   // Scope: cluster.
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
@@ -79,30 +87,38 @@ service Control {
   // Scope: read per key listed, or cluster.
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   // Scope: node.
+  // Binding: self.
   rpc AcquireLease(AcquireLeaseRequest) returns (LeaseResponse);
   // Scope: node.
+  // Binding: self.
   rpc RenewLease(RenewLeaseRequest) returns (LeaseResponse);
   // Removes a member, as a node does when it shuts down gracefully.
   // Scope: cluster.
+  // Binding: self.
   rpc Leave(LeaveRequest) returns (LeaveResponse);
   // The promotion calls (ADR-0018): the control node starts a promotion once a lease has
   // expired by the failover margin and tells the candidate, which fences replicas, records each
   // one, and completes the promotion.
   // Scope: node.
+  // Binding: replica.
   rpc StartPromotion(StartPromotionRequest) returns (PromotionResponse);
   // Scope: node.
+  // Binding: candidate.
   rpc RecordFenced(RecordFencedRequest) returns (RecordFencedResponse);
   // Scope: node.
+  // Binding: candidate.
   rpc CompletePromotion(CompletePromotionRequest) returns (CompletePromotionResponse);
   // Marks a member as draining: it gets no new lease and is never a promotion's candidate. The
   // member sees the mark in its membership updates and hands its leases over with
   // TransferLease, then leaves if it is shutting down.
   // Scope: cluster.
+  // Binding: self.
   rpc Drain(DrainRequest) returns (DrainResponse);
   // Hands a database's lease from its draining holder to a follower without waiting for the
   // lease to expire: starts a promotion at the next epoch whose candidate is the named target,
   // or the most advanced live follower. The candidate completes it as after an expiry.
   // Scope: admin on the key.
+  // Binding: holder.
   rpc TransferLease(TransferLeaseRequest) returns (PromotionResponse);
   // Adds a bearer token, or every token a signing key issued, to the denylist every node checks
   // before it trusts a token (ADR-0025). Data nodes learn the list from their heartbeat replies,
@@ -351,17 +367,22 @@ message TransferLeaseRequest {
 service Replication {
   // The primary opens one stream per follower and sends batches; the follower acknowledges.
   // Scope: node.
+  // Binding: holder or candidate.
   rpc Replicate(stream ReplicateMessage) returns (stream ReplicateAck);
   // A promotion fences a replica at a new epoch and learns its position (ADR-0018).
   // Scope: node.
+  // Binding: candidate.
   rpc Fence(FenceRequest) returns (FenceResponse);
   // Scope: node.
+  // Binding: follower.
   rpc Snapshot(SnapshotRequest) returns (stream SnapshotChunk);
   // A candidate fetches the frames it lacks from the most advanced fenced member.
   // Scope: node.
+  // Binding: candidate.
   rpc Fetch(FetchRequest) returns (FetchResponse);
   // The control node asks a promotion's candidate to carry it out.
   // Scope: node.
+  // Binding: candidate.
   rpc Promote(PromoteRequest) returns (PromoteResponse);
 }
 
