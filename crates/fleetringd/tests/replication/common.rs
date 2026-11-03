@@ -65,11 +65,19 @@ pub(crate) fn role(replicas: u8) -> PrimaryRole {
 /// a stream at once, so none relies on stall detection: no follower counts as stalled before the
 /// hang guard, however long a loaded runner takes it to apply a batch or checkpoint, or however
 /// long a test holds its acknowledgements back.
+///
+/// The acknowledgement timeout is the hang guard for the same reason. At 10 seconds it was a
+/// latency assertion no test meant to make: on a loaded Windows runner, where the whole binary
+/// took 96 seconds, one write waited out 10 seconds for a follower's fsync and failed
+/// `mirror::caught_up_followers_are_byte_identical_to_the_primary_once_both_checkpoint`, and
+/// `snapshot::a_follower_added_during_writes_catches_up_and_ends_byte_identical`, which tolerates
+/// refused writes and retries them, spent 10 seconds on each until its own guard ran out. A write
+/// that never gets its acknowledgement still fails the test, at the hang guard.
 pub(crate) fn settings() -> ReplicationSettings {
     ReplicationSettings {
         stall_timeout: HANG_GUARD,
         retry_interval: Duration::from_millis(50),
-        ack_timeout: Duration::from_secs(10),
+        ack_timeout: HANG_GUARD,
         ..ReplicationSettings::new()
     }
 }
