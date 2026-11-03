@@ -1,0 +1,6 @@
+# `cargo audit` policy. Keep it in step with `[advisories] ignore` in deny.toml: an advisory is
+# ignored in both places, with the same reason, or in neither.
+
+[advisories]
+# Nothing is ignored today. Add entries as `"RUSTSEC-YYYY-NNNN", # reason`.
+ignore = []

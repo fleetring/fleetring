@@ -1,0 +1,30 @@
+# Daily dependency audit (FR-048). `cargo audit` fetches a fresh RustSec advisory database on
+# every run, so a new advisory against a locked dependency shows up within a day, between the
+# pull-request runs of `cargo deny`. The release workflow runs the same check before it
+# publishes. Ignores live in `.cargo/audit.toml`, mirrored from `deny.toml`.
+name: Audit
+
+on:
+  schedule:
+    - cron: "29 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The action reports through a check run and opens an issue for each new advisory.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          denyWarnings: true
