@@ -7,6 +7,7 @@
 //! daemon code runs over turmoil's network and clock, on one deterministic thread.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tonic::transport::{Channel, Endpoint};
 
@@ -26,7 +27,32 @@ pub enum Network {
     Simulated,
 }
 
+/// How much longer than the longest wait inside a call a daemon's own request deadline runs, so
+/// the callee answers before the caller gives up.
+const REQUEST_MARGIN: Duration = Duration::from_secs(5);
+
 impl Network {
+    /// Returns this network with its request deadline raised, if needed, to outlast `wait` by a
+    /// margin.
+    ///
+    /// Some calls between daemons wait inside the callee for up to the acknowledgement window: a
+    /// lease transfer waits for the target to catch up, and a create waits for followers to
+    /// connect. A deadline shorter than that window cancels the call midway, and the cancellation
+    /// reaches the client as `Timeout expired`. The simulated network has no deadline.
+    #[must_use]
+    pub fn outlasting(self, wait: Duration) -> Self {
+        match self {
+            Self::Tcp(mut transport) => {
+                transport.request_timeout = transport
+                    .request_timeout
+                    .max(wait.saturating_add(REQUEST_MARGIN));
+                Self::Tcp(transport)
+            }
+            #[cfg(feature = "simulation")]
+            Self::Simulated => self,
+        }
+    }
+
     /// Opens a lazily connecting channel to `address`, given as `host:port`.
     ///
     /// # Errors
@@ -152,5 +178,32 @@ impl Environment {
 impl Default for Environment {
     fn default() -> Self {
         Self::production()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deadline(network: Network) -> Duration {
+        match network {
+            Network::Tcp(transport) => transport.request_timeout,
+            #[cfg(feature = "simulation")]
+            Network::Simulated => Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn the_request_deadline_outlasts_the_longest_wait_inside_a_call() {
+        let network = Network::default();
+        let default = deadline(network);
+        assert_eq!(
+            deadline(network.outlasting(Duration::from_secs(1))),
+            default
+        );
+        assert_eq!(
+            deadline(network.outlasting(Duration::from_secs(20))),
+            Duration::from_secs(25)
+        );
     }
 }
