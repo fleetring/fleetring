@@ -5,5 +5,10 @@
 //! whether it may run key-less control operations (`cluster`); everything else is denied.
 
 mod scope;
+mod token;
 
 pub use scope::{Action, ParseScopeError, Scope, Scopes, Target};
+pub use token::{
+    BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, IssueError, MAX_TOKEN_LEN, MAX_TOKEN_LIFETIME,
+    NOT_BEFORE_LEEWAY_SECS, TokenError, TokenSigner, TokenVerifier, Verified, VerifyingKey,
+};

@@ -13,6 +13,7 @@ authors.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+base64 = "0.22"
 blake3.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
 fleetring = { path = "../fleetring", features = ["serde"] }
@@ -23,6 +24,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+ring = "0.17"
 rusqlite = { workspace = true, features = ["functions", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1", features = ["std"] }

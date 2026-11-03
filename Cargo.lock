@@ -545,6 +545,7 @@ name = "fleetringd"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "blake3",
  "clap",
  "divan",
@@ -556,6 +557,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pki-types",
