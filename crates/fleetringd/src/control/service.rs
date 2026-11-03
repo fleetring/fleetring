@@ -27,7 +27,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
-use crate::auth::{Action as AuthAction, authorized, require_key};
+use crate::auth::{Action as AuthAction, Caller, authorized, require_key};
 use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
@@ -763,6 +763,21 @@ impl Control for ControlService {
     ) -> Result<Response<PromotionResponse>, Status> {
         let database: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_key(&request, &database)?;
+        // A node hands over only a lease it holds, as a draining node does.
+        if let Caller::Node(node) = authorized(&request)?.caller() {
+            let holds = self
+                .node
+                .state()
+                .database(&database)
+                .and_then(|db| db.lease())
+                .is_some_and(|lease| lease.holder() == node);
+            if !holds {
+                tracing::warn!(target: "fleetringd::audit", principal = %format!("node:{node}"), action = "admin", key = %database, rpc = "TransferLease", "denied");
+                return Err(Status::permission_denied(format!(
+                    "TransferLease of '{database}' needs its lease, or admin on it"
+                )));
+            }
+        }
         let request = request.into_inner();
         let target = if request.target.is_empty() {
             None

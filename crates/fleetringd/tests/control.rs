@@ -1160,3 +1160,116 @@ async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResul
     daemon.run_until(std::future::ready(())).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
+    use fleetring_proto::v1::{Revocation, RevokeTokenRequest, revocation::Revoked as Wire};
+
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    let operator = secure_client(address, &tls)?;
+    let nodes: Vec<ControlClient> = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|id| node_client(address, &tls, id))
+        .collect::<Result<_, _>>()?;
+    for (id, node) in ["a", "b", "c", "d"].into_iter().zip(&nodes) {
+        node.join(join_request(id)).await?;
+    }
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let revoke = RevokeTokenRequest {
+        revocation: Some(Revocation {
+            revoked: Some(Wire::TokenId("tok-1".into())),
+            until_ms: u64::MAX,
+        }),
+    };
+
+    // A node certificate may not drain or remove another member, nor revoke a token.
+    let drain = a
+        .drain(DrainRequest {
+            node_id: "b".into(),
+        })
+        .await
+        .expect_err("a node can't drain another");
+    assert_eq!(drain.code(), Code::PermissionDenied, "{drain}");
+    assert_eq!(
+        drain.message(),
+        "Drain for node 'b' needs that node's certificate, or the cluster scope"
+    );
+    let leave = a
+        .leave(LeaveRequest {
+            node_id: "b".into(),
+        })
+        .await
+        .expect_err("a node can't remove another");
+    assert_eq!(leave.code(), Code::PermissionDenied, "{leave}");
+    let revoked = a
+        .revoke_token(revoke.clone())
+        .await
+        .expect_err("a node can't revoke tokens");
+    assert_eq!(revoked.code(), Code::PermissionDenied, "{revoked}");
+    assert_eq!(revoked.message(), "RevokeToken needs the cluster scope");
+    // Nor create a database, or hand over a lease it doesn't hold.
+    let created = a
+        .create_database(CreateDatabaseRequest {
+            database: "tenant:acme".into(),
+            replication_factor: 1,
+            engine: Engine::Sqlite.into(),
+            acks: Acks::Unspecified.into(),
+            min_replicas: 0,
+        })
+        .await
+        .expect_err("a node can't create");
+    assert_eq!(
+        created.message(),
+        "CreateDatabase needs admin on 'tenant:acme'"
+    );
+    let transfer = a
+        .transfer_lease(TransferLeaseRequest {
+            database: "tenant:acme".into(),
+            target: String::new(),
+        })
+        .await
+        .expect_err("not its lease");
+    assert_eq!(
+        transfer.message(),
+        "TransferLease of 'tenant:acme' needs its lease, or admin on it"
+    );
+
+    // It may drain and leave itself, as a daemon does when it shuts down.
+    b.drain(DrainRequest {
+        node_id: "b".into(),
+    })
+    .await?;
+    b.leave(LeaveRequest {
+        node_id: "b".into(),
+    })
+    .await?;
+
+    // A principal with the cluster scope may do all three to any member.
+    operator
+        .drain(DrainRequest {
+            node_id: "c".into(),
+        })
+        .await?;
+    operator
+        .leave(LeaveRequest {
+            node_id: "c".into(),
+        })
+        .await?;
+    operator.revoke_token(revoke).await?;
+    let state = daemon.control().ok_or("no control handle")?.state();
+    let members: Vec<String> = state
+        .members()
+        .map(|member| member.id().to_string())
+        .collect();
+    assert_eq!(members, ["a", "d"]);
+    daemon.run_until(std::future::ready(())).await;
+    Ok(())
+}

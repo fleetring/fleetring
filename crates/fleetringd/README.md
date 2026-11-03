@@ -87,7 +87,7 @@ The subcommands take `--control <host:port>`, the address of the node that runs 
 
 ## Principals and scopes
 
-Every request comes from a node or a principal (ADR-0025). Nodes, named by their certificates, act with full scope towards each other. A principal may do what its scopes allow and nothing else: a request no scope allows is refused with `PERMISSION_DENIED`, before it touches any state, with a message that names the action and the database it needed, never the caller's scopes.
+Every request comes from a node or a principal (ADR-0025). Nodes, named by their certificates, make the node-to-node calls, and act on themselves only otherwise: a node may follow the membership, leave or drain itself, locate databases, and hand over leases it holds, and nothing more; it can't read, write, or administer a database, drain or remove another member, or revoke a token (ADR-0026). A principal may do what its scopes allow and nothing else: a request no scope allows is refused with `PERMISSION_DENIED`, before it touches any state, with a message that names the action and the database it needed, never the caller's scopes.
 
 A scope is `<action>:<pattern>`: the action is `read`, `write`, `admin`, or `stream`, and the pattern an exact database name or a prefix ending in `*` (`read:tenant:acme/*`, `write:notes`, `admin:*`). `write` implies `read`, and `admin` (create, drop, change durability, hand a lease over) implies both; `stream` stands alone, so a change consumer can't read tables. The word `cluster` is the scope for operations that name no database: membership, draining, revoking tokens.
 

@@ -180,9 +180,9 @@ async fn a_node_certificate_for_another_id_cannot_join_heartbeat_leave_or_drain(
 
     let refused = other.join(join_request("b")).await.expect_err("wrong id");
     assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
-    assert!(
-        refused.message().contains("'b'") && refused.message().contains("'other'"),
-        "{refused}"
+    assert_eq!(
+        refused.message(),
+        "Join for node 'b' needs that node's certificate"
     );
     let refused = other
         .heartbeat(HeartbeatRequest {

@@ -59,7 +59,8 @@ impl Peer {
     ///
     /// # Errors
     ///
-    /// `PERMISSION_DENIED`, naming both IDs, if the peer is a node other than `claimed`.
+    /// `PERMISSION_DENIED`, naming the call and `claimed`, if the peer is a node other than
+    /// `claimed`; the log names both IDs.
     pub fn check_node(&self, claimed: &NodeId, call: &'static str) -> Result<(), Status> {
         match self {
             Self::Node(id) if id != claimed => {
@@ -69,8 +70,15 @@ impl Peer {
                     certificate = %id,
                     "refused: the node id differs from the certificate's",
                 );
+                // Leaving or draining another member is an operator's call; the rest are the
+                // node's own and nobody else's.
+                let or_cluster = if matches!(call, "Leave" | "Drain") {
+                    ", or the cluster scope"
+                } else {
+                    ""
+                };
                 Err(Status::permission_denied(format!(
-                    "node id '{claimed}' differs from the certificate's '{id}'"
+                    "{call} for node '{claimed}' needs that node's certificate{or_cluster}"
                 )))
             }
             _ => Ok(()),

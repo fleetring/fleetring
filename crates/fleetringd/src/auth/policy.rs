@@ -54,6 +54,19 @@ impl fmt::Display for Requirement {
     }
 }
 
+/// Whether a node certificate may make an RPC (ADR-0026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForNodes {
+    /// Nodes may: every `node` RPC, and the client calls a daemon makes with its own
+    /// certificate. The handler confines a node to itself where the call names a node or a
+    /// lease.
+    Allowed,
+    /// Nodes may not: a node certificate is judged as a principal with no scopes, so one stolen
+    /// node key can't read, write, administer, or stream a database, nor revoke a token.
+    Refused,
+}
+
 /// One RPC and what it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rpc {
@@ -61,6 +74,8 @@ pub struct Rpc {
     pub path: &'static str,
     /// What the caller needs.
     pub requirement: Requirement,
+    /// Whether a node certificate may make it.
+    pub nodes: ForNodes,
 }
 
 impl Rpc {
@@ -78,8 +93,26 @@ impl Rpc {
     }
 }
 
+/// An RPC whose callers need `requirement`; nodes may make it only if it is a `node` RPC.
 const fn rpc(path: &'static str, requirement: Requirement) -> Rpc {
-    Rpc { path, requirement }
+    let nodes = match requirement {
+        Requirement::Node => ForNodes::Allowed,
+        _ => ForNodes::Refused,
+    };
+    Rpc {
+        path,
+        requirement,
+        nodes,
+    }
+}
+
+/// A client RPC that a daemon also makes with its own node certificate.
+const fn node_too(path: &'static str, requirement: Requirement) -> Rpc {
+    Rpc {
+        path,
+        requirement,
+        nodes: ForNodes::Allowed,
+    }
 }
 
 /// Every RPC the daemon serves, by service, with what it needs. The daemon README's scope table
@@ -88,7 +121,8 @@ pub const RPCS: &[Rpc] = &[
     // Control.
     rpc("/fleetring.v1.Control/Join", Requirement::Node),
     rpc("/fleetring.v1.Control/Heartbeat", Requirement::Node),
-    rpc(
+    // Every data node follows the membership.
+    node_too(
         "/fleetring.v1.Control/WatchMembership",
         Requirement::Cluster,
     ),
@@ -104,7 +138,9 @@ pub const RPCS: &[Rpc] = &[
         "/fleetring.v1.Control/ChangeDurability",
         Requirement::Key(Action::Admin),
     ),
-    rpc(
+    // A data node locates the databases it creates, serves, and drains; it computes the same
+    // placement from the membership anyway.
+    node_too(
         "/fleetring.v1.Control/Locate",
         Requirement::KeyOrCluster(Action::Read),
     ),
@@ -114,12 +150,15 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc("/fleetring.v1.Control/AcquireLease", Requirement::Node),
     rpc("/fleetring.v1.Control/RenewLease", Requirement::Node),
-    rpc("/fleetring.v1.Control/Leave", Requirement::Cluster),
+    // A node leaves, and drains, itself when it shuts down; the handler refuses another node's
+    // ID from a node certificate.
+    node_too("/fleetring.v1.Control/Leave", Requirement::Cluster),
     rpc("/fleetring.v1.Control/StartPromotion", Requirement::Node),
     rpc("/fleetring.v1.Control/RecordFenced", Requirement::Node),
     rpc("/fleetring.v1.Control/CompletePromotion", Requirement::Node),
-    rpc("/fleetring.v1.Control/Drain", Requirement::Cluster),
-    rpc(
+    node_too("/fleetring.v1.Control/Drain", Requirement::Cluster),
+    // A draining node hands its own leases over; the handler refuses a lease it doesn't hold.
+    node_too(
         "/fleetring.v1.Control/TransferLease",
         Requirement::Key(Action::Admin),
     ),
@@ -219,8 +258,13 @@ impl Caller {
     ///
     /// A [`Denied`] naming what was needed: the action and the key, never the caller's scopes.
     pub fn authorize(&self, rpc: &Rpc, key: Option<&DatabaseName>) -> Result<(), Denied> {
-        let Self::Principal { scopes, .. } = self else {
-            return Ok(());
+        let none = Scopes::none();
+        let scopes = match self {
+            Self::Anonymous => return Ok(()),
+            Self::Node(_) if rpc.nodes == ForNodes::Allowed => return Ok(()),
+            // Beyond what nodes do, a node certificate is a principal with no scopes.
+            Self::Node(_) => &none,
+            Self::Principal { scopes, .. } => scopes,
         };
         let denied = |needed: Needed| Denied {
             method: rpc.method(),
@@ -581,16 +625,62 @@ mod tests {
     }
 
     #[test]
-    fn nodes_and_plaintext_callers_pass_every_check() {
+    fn plaintext_callers_pass_every_check() {
         let db = key("x");
-        for caller in [
-            Caller::Node("n1".parse().expect("node id")),
-            Caller::Anonymous,
-        ] {
-            for rpc in RPCS {
-                assert_eq!(caller.authorize(rpc, Some(&db)), Ok(()), "{}", rpc.path);
-            }
-            assert!(caller.sees(Action::Read, &db));
+        for rpc in RPCS {
+            assert_eq!(
+                Caller::Anonymous.authorize(rpc, Some(&db)),
+                Ok(()),
+                "{}",
+                rpc.path
+            );
+        }
+        assert!(Caller::Anonymous.sees(Action::Read, &db));
+    }
+
+    #[test]
+    fn a_node_certificate_makes_node_calls_and_nothing_else() {
+        let node = Caller::Node("n1".parse().expect("node id"));
+        let db = key("tenant:acme");
+        let allowed: BTreeSet<&str> = RPCS
+            .iter()
+            .filter(|rpc| node.authorize(rpc, Some(&db)).is_ok())
+            .map(|rpc| rpc.path)
+            .collect();
+        let node_rpcs = RPCS
+            .iter()
+            .filter(|rpc| rpc.requirement == Requirement::Node)
+            .map(|rpc| rpc.path);
+        let daemon_calls = [
+            "/fleetring.v1.Control/WatchMembership",
+            "/fleetring.v1.Control/Locate",
+            "/fleetring.v1.Control/Leave",
+            "/fleetring.v1.Control/Drain",
+            "/fleetring.v1.Control/TransferLease",
+        ];
+        let expected: BTreeSet<&str> = node_rpcs.chain(daemon_calls).collect();
+        assert_eq!(allowed, expected);
+        let refusals = [
+            (
+                "/fleetring.v1.Control/RevokeToken",
+                "RevokeToken needs the cluster scope",
+            ),
+            (
+                "/fleetring.v1.Control/DropDatabase",
+                "DropDatabase needs admin on 'tenant:acme'",
+            ),
+            (
+                "/fleetring.v1.Database/Execute",
+                "Execute needs write on 'tenant:acme'",
+            ),
+            (
+                "/fleetring.v1.Database/Query",
+                "Query needs read on 'tenant:acme'",
+            ),
+        ];
+        for (path, message) in refusals {
+            let denied = node.authorize(call(path), Some(&db)).expect_err("refused");
+            assert_eq!(denied.to_string(), message, "{path}");
         }
     }
 }
