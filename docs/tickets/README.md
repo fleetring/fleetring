@@ -87,9 +87,9 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-040](FR-040-turso-adapter.md) | Turso adapter: a self-replicating engine whose change stream reads `turso_cdc` | P2 | L | FR-039 | todo |
 | [FR-041](FR-041-replicated-sink-positions.md) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | todo |
 | [FR-042](FR-042-lease-watch.md) | `WatchLeases`: a stream of the leases this node gains and loses | P2 | M | FR-031, FR-037 | done |
-| [FR-043](FR-043-keyed-leases.md) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029 | todo |
+| [FR-043](FR-043-keyed-leases.md) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029, FR-047 | todo |
 | [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | done |
-| [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032 | todo |
+| [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032, FR-047 | todo |
 | [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | done |
 | [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | in-progress |
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | in-progress |
@@ -176,6 +176,8 @@ flowchart LR
   FR041 --> FR049
   FR044 --> FR049
   FR047 --> FR049
+  FR047 --> FR043
+  FR047 --> FR045
 ```
 
 ## Critical path and estimate
