@@ -105,7 +105,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-056](FR-056-cli-contexts-json-completions.md) | CLI contexts, `--json` on every read command, shell completions, and man pages | P1 | L | FR-055, FR-059 | todo |
 | [FR-057](FR-057-tui.md) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
 | [FR-058](FR-058-desktop-app.md) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
-| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, keeping the old spellings as deprecated aliases | P1 | M | FR-047 | todo |
+| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, as a clean break in 0.3.0 | P1 | M | FR-047 | todo |
 | [FR-060](FR-060-distribution-packages.md) | Distribution packages for apt, yum, the AUR, and Homebrew | P2 | L | FR-034, FR-048 | todo |
 | [FR-061](FR-061-rails-integration.md) | A `fleetring` Ruby gem and an ActiveRecord adapter that place each tenant's database | P2 | L | FR-047, the router (no ticket yet) | todo |
 | [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | todo |

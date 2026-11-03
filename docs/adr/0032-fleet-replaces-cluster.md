@@ -21,7 +21,7 @@ Meanwhile other parts already say *fleet*. The product is FleetRing. The placeme
 - **It collides with where FleetRing runs.** "A three-node fleetringd cluster on a Kubernetes cluster" is ambiguous; "a fleet on a Kubernetes cluster" isn't.
 - **It suggests one co-located, homogeneous group.** A FleetRing deployment spans home machines and cloud VMs, cells and zones (ADR-0012), and the word should hold all of that.
 
-The rename has to happen before 1.0, while breaking changes are cheap, and it has to keep working configurations, scripts, certificates, and issued tokens working.
+The rename has to happen before 1.0, while breaking changes are cheap. Nobody runs `fleetringd` in production yet, so 0.3.0 is the cheapest moment there will be.
 
 ## Decision
 
@@ -39,24 +39,27 @@ The rename has to happen before 1.0, while breaking changes are cheap, and it ha
    | "joined the cluster", "the cluster scope", "cluster '…' is not this cluster '…'" | "joined the fleet", "the fleet scope", "fleet '…' is not this fleet '…'" |
    | "cluster" in help text, the READMEs, `deploy/fleetringd.toml`, `SECURITY.md`, and the protocol's comments | "fleet" |
 
-3. **Wire and on-disk formats don't change.**
+   The old spellings stop working; see decision 3.
+
+3. **A clean break in 0.3.0, with no aliases.** Nobody runs `fleetringd` in production yet, so the rename is done once, completely, rather than carried through 0.x:
+   - `--cluster` and the `cluster` scope stop working in 0.3.0. A configuration, script, or token that still says `cluster` is refused like any unknown flag or scope; the scope's parse error names the valid spellings, `<action>:<pattern>` or `fleet`.
+   - `token issue` writes `fleet` from 0.3.0.
+   - The release notes list every rename under breaking changes (FR-062 keeps the list).
+
+4. **Wire names change where they conflict with the [lexicon](../lexicon.md); wire numbers don't.**
+   - **The protocol:** no message or field is named `cluster`, so this rename changes only comments. Other conflicting names in the protocol (FR-062) are renamed in the same release: message, enum, and field names may change, but field numbers and RPC paths stay, so the binary encoding is unchanged and no protocol version bump is needed. Nothing serializes the protocol as JSON or looks types up by name.
    - **Certificates:** the URI is `fleetring://<name>/node/<id>`, and the word never appears in it, so every issued certificate stays valid. Docs write the placeholder as `<fleet>`.
-   - **Tokens:** `iss` holds the fleet name, as it held the cluster name. Unchanged.
-   - **The protocol:** no message or field is named `cluster`; only comments change. No protocol version bump.
-   - **The control log:** holds no scope strings or cluster names. Unchanged.
+   - **Tokens:** `iss` holds the fleet name, as it held the cluster name. The scope claim changes with decision 3, so a token minted by 0.2 with `cluster` is refused by 0.3 for fleet-scoped calls, and a 0.3 token is refused by 0.2: upgrade every node, then reissue fleet-scoped tokens.
+   - **The control log and data directories:** they hold no scope strings or cluster names, and the renames change no persisted field. A 0.2 data directory opens in 0.3. A later rename that does change what is persisted makes the daemon refuse an old data directory with a clear error, rather than migrate or misread it.
+   - **The placement spec and its golden vectors** are a separate wire format (ADR-0008) and don't change.
 
-4. **The scope string has two spellings during 0.x.**
-   - Parsing accepts `fleet` and `cluster` as the same scope, everywhere: `[[principal]] scopes`, `token issue --scope`, and the `fleetring.scopes` claim of a token a node verifies.
-   - **Writing keeps `cluster` for one minor release.** In the release that first accepts `fleet` (N), `token issue` still writes `cluster` into the claim, whichever spelling it was given, so that a token minted during a rolling upgrade works on nodes still running N−1, which know only `cluster`. From N+1, which the compatibility policy of FR-054 allows to run only beside N, it writes `fleet`.
-   - A `[[principal]]` entry that says `cluster` logs a deprecation warning at start, naming the principal.
+5. **The CLI has no hidden aliases.** `cert init --fleet` replaces `--cluster` outright, and the same holds for every other rename FR-062 makes. Contexts (FR-056) are new and only ever say `fleet`.
 
-5. **The CLI keeps `--cluster` as a hidden alias** for `--fleet`, through every 0.x release. Using it prints `warning: --cluster is deprecated and will be removed in 1.0; use --fleet` once, to stderr. Contexts (FR-056) are new and accept only `fleet`.
+6. **Rust items are renamed outright.** `fleetringd`, `fleetring-control`, and `fleetring-proto` aren't published to crates.io (`publish = false`), so `ClusterName`, `sim::Cluster`, and the `cluster()` methods have no users outside this repository, and no deprecated aliases are kept. The `fleetring` crate has no "cluster" in its API and doesn't change.
 
-6. **Rust items are renamed outright.** `fleetringd` isn't published to crates.io (`publish = false`), so `ClusterName`, `sim::Cluster`, and the `cluster()` methods have no users outside this repository, and no deprecated aliases are kept. The `fleetring` crate has no "cluster" in its API.
+7. **Accepted ADRs and finished tickets aren't rewritten.** ADR-0025 and ADR-0026 say `cluster` for the scope; this ADR amends their scope's name, and their decisions are otherwise unchanged.
 
-7. **Removal.** The `cluster` scope spelling and the `--cluster` flag are removed no earlier than 1.0, listed under breaking changes in that release's notes. Tokens last 30 days at most, so by then no token that still says `cluster` is valid.
-
-8. **What keeps the word.** Accepted ADRs and finished tickets keep their text; this ADR maps the old word to the new. "Cluster" stays where it names something else: a Kubernetes cluster, a Postgres database cluster, the systems ADR-0025 compares, and the placement crate's `kv_sharding` example's "Redis-style cluster".
+8. **What keeps the word.** Accepted ADRs and finished tickets keep their text; this ADR maps the old word to the new. "Cluster" stays where it names something else: a Kubernetes cluster, a Postgres database cluster, the systems ADR-0025 compares, and the placement crate, whose docs use the word in its general sense (a Redis-style cluster in the `kv_sharding` example, "small clusters" in diagnostics): the crate knows no fleet (ADR-0011) and is published, so it changes only in its own release.
 
 9. **"Fleet" as prose.** The README's "fleets of SQLite, libSQL, and Turso databases" uses the everyday sense, many databases, and may stay. In names, flags, types, and messages, "fleet" means only decision 1.
 
@@ -66,13 +69,13 @@ The rename has to happen before 1.0, while breaking changes are cheap, and it ha
 - **"Deployment."** Collides with Kubernetes Deployments, which is exactly where some fleets will run.
 - **"Ring."** A ring is the placement structure, and a fleet with cells holds one ring per cell plus a selector ring.
 - **"Trust domain" or "realm."** Accurate for the authority's reach (a SPIFFE trust domain is the same idea), but security jargon for what is also the unit of membership and control.
-- **A hard rename without aliases.** Every `[[principal]]` entry with `cluster`, every script with `--cluster`, and every token issued before the upgrade would break at once, and a rolling upgrade would refuse tokens on the nodes upgraded last.
-- **Writing `fleet` into tokens at once.** Simpler, but a token minted by an upgraded `fleetringd token issue` would be refused by older nodes during a rolling upgrade, which is the case FR-054 exists to make safe.
+- **Aliases through 0.x.** An earlier draft of this ADR kept `--cluster` and the `cluster` scope as deprecated aliases until 1.0, with `token issue` writing `cluster` for one more minor release so tokens survived a rolling upgrade. It protects configurations and tokens that nobody has yet, at the price of two code paths, a version-pinned test, and a lexicon full of exceptions until 1.0.
+- **Keeping protocol names that conflict with the lexicon.** Safe, since only numbers reach the wire, but the generated types are what every client reads, and a second rename later would break more people.
 
 ## Consequences
 
-- FR-059 implements it: the renames, both scope spellings, the `--cluster` alias and its warning, the token-writing rule, and tests that every old spelling still works and warns.
+- FR-059 implements it: the renames, the `fleet` scope, and tests that the old spellings are refused. FR-062 makes the other lexicon renames in the same release, and keeps the breaking-changes list for the release notes.
 - Docs change in one pass: both READMEs, `deploy/fleetringd.toml`, `SECURITY.md`, `docs/mvp.md`, `docs/roadmap.md`, `docs/review.md`, and the protocol's comments.
 - On acceptance, mark ADR-0025 and ADR-0026 as amended by this ADR for the scope's name; their decisions are otherwise unchanged.
-- The deprecation path adds two branches (a scope alias and a flag alias) that stay until 1.0.
+- Upgrading from 0.2 is all nodes, then new tokens; there is no mixed-version window for fleet-scoped tokens.
 - Contexts, the TUI, and the desktop app (ADR-0033) start with "fleet" and never carry the old word.

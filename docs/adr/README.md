@@ -40,7 +40,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0029](0029-s3-durability-sink.md) | Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore | Accepted |
 | [0030](0030-page-hash-trees.md) | Page hash trees over the checkpointed main file, kept by the engine adapter, for repair and page verification (supersedes 0010) | Accepted |
 | [0031](0031-node-calls-bound-to-placement.md) | Node-to-node calls are bound to placement: a node acts only on databases placed on it, at epochs control state gives it | Accepted |
-| [0032](0032-fleet-replaces-cluster.md) | "Fleet" replaces "cluster" for the nodes one control plane and one authority govern, with the old spellings as deprecated aliases through 0.x | Proposed |
+| [0032](0032-fleet-replaces-cluster.md) | "Fleet" replaces "cluster" for the nodes one control plane and one authority govern, as a clean break in 0.3.0 with no aliases | Proposed |
 | [0033](0033-cli-tui-desktop-surfaces.md) | The CLI, a TUI, and a desktop app are separate surfaces over one client crate, with the same RPCs and the same lexicon | Proposed |
 
 ## Template
