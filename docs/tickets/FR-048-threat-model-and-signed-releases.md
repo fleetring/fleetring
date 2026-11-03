@@ -1,7 +1,7 @@
 ---
 id: FR-048
 title: A threat model in SECURITY.md and verifiable release artifacts
-status: todo
+status: in-progress
 priority: P1
 size: M
 milestone: M10 Security
@@ -28,3 +28,12 @@ adrs: [ADR-0025]
 - [ ] `SECURITY.md` has the threat model table and a maintained "what a compromised X can do" section, reviewed against FR-046 and FR-047's tests.
 - [ ] A release's `SHA256SUMS` has a verifiable keyless signature, every binary and the image have attestations, and the documented verify commands succeed against the published artifacts and fail against a modified one.
 - [ ] All workflow actions are pinned by commit SHA, and the release workflow fails on an unresolved advisory.
+
+## Progress
+
+- 2026-11-02: The supply-chain items are done; the threat model is pending FR-047.
+  - **Pinned actions:** every `uses:` in `.github/workflows/` names a 40-character commit with the release tag in a comment, and Dependabot (`.github/dependabot.yml`, weekly) bumps them. `dtolnay/rust-toolchain` is pinned to `master`, and each use passes `toolchain:` explicitly, since the branch name used to select it.
+  - **Audit:** `.github/workflows/audit.yml` runs `cargo audit` daily against a fresh advisory database, and the release job runs `cargo audit --deny warnings` before it publishes. `.cargo/audit.toml` mirrors `deny.toml`'s ignore list, which is empty.
+  - **Signing:** the release job signs `SHA256SUMS` with keyless `cosign sign-blob` (bundle, signature, and certificate are published beside it) and attests the archives and `install.sh`; the container workflow attests each per-architecture image and the multi-arch manifest. `scripts/install.sh` verifies the signature when `cosign` is on `PATH`. The README's "Verify a release" section and the release notes show `cosign verify-blob` and `gh attestation verify`. The certificate identity matches `fleetringd-v*` tags, the tags that trigger the workflow.
+  - **Not yet verified:** signing and attestation first run on the next `fleetringd-v*` tag. The Definition-of-done check that the verify commands succeed against published artifacts and fail against a modified one waits for that release.
+  - **Pending:** the `SECURITY.md` threat model and "what a compromised X can do" section, which wait for FR-047's scopes and tokens.
