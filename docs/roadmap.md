@@ -1,6 +1,6 @@
 # Roadmap to "safe to use"
 
-The placement crate `fleetring` is released (0.1.0) and its placement is frozen by spec. The daemon `fleetringd` 0.1.0 runs clusters on machines you own, with replication and failover verified in simulation. It is **not yet safe to depend on**: `SECURITY.md` and the READMEs say so. This page lists what has to be true before that changes, as epics. Each epic links its tickets, and the ticket index in `docs/tickets/README.md` is the source of truth for status.
+The placement crate `fleetring` is released (0.1.0) and its placement is frozen by spec. The daemon `fleetringd` 0.1.0 runs fleets on machines you own, with replication and failover verified in simulation. It is **not yet safe to depend on**: `SECURITY.md` and the READMEs say so. This page lists what has to be true before that changes, as epics. Each epic links its tickets, and the ticket index in `docs/tickets/README.md` is the source of truth for status.
 
 "Safe to use" means, concretely:
 
@@ -66,8 +66,8 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
-- Compatibility tests between the previous and current release: mixed-version clusters, old logs and snapshots.
-- Chaos on a real three-node cluster in CI (kill, pause, partition with `tc`), once E1's harness exists.
+- Compatibility tests between the previous and current release: mixed-version fleets, old logs and snapshots.
+- Chaos on a real three-node fleet in CI (kill, pause, partition with `tc`), once E1's harness exists.
 
 ## Order
 

@@ -12,7 +12,7 @@
 | Replication | WAL shipping with quorum acknowledgement | followers byte-identical after checkpoints; held-back acks prove writes wait for W |
 | Failover | leases, epochs, fencing, log adoption | simulation across crashes, partitions, control outages, flapping: no acknowledged write lost, one primary per epoch |
 | Catch-up | pinned, checksummed snapshots; re-seed | cut, corrupted, and held transfers never leave a partial copy |
-| CLI | create, exec, query, locate, status | a three-node cluster on one laptop, with a failover and a rejoin, by hand |
+| CLI | create, exec, query, locate, status | a three-node fleet on one laptop, with a failover and a rejoin, by hand |
 | Transport security | mutual TLS 1.3 on every connection, built-in certificate authority, node ID and principal in the certificate | plaintext, foreign, expired, and wrong-ID peers refused in tests; certificates rotate under an open replication stream; the simulation runs under TLS |
 
 ## Known bottlenecks and gaps
