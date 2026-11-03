@@ -94,7 +94,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | in-progress |
 | [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | in-progress |
 | [FR-049](FR-049-s3-durability-sink.md) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
-| [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | todo |
+| [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | in-progress |
 | [FR-051](FR-051-flaky-replication-tests.md) | Find and fix the replication tests that fail intermittently in CI | P1 | M | — | todo |
 | [FR-052](FR-052-archive-acknowledged-durability.md) | A durability mode that acknowledges a write only once it is archived | P2 | M | FR-049, FR-035 | todo |
 | [FR-053](FR-053-object-store-workload-identity.md) | Object-store credentials from workload identity, not only static keys | P2 | S | FR-049 | todo |
