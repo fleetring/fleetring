@@ -104,24 +104,40 @@ enum Command {
     /// Drains a node.
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Follows the leases data nodes hold.
+    #[command(subcommand)]
+    Lease(LeaseCommand),
     /// Shows the members with their liveness, the membership epoch, and the ring fingerprint, as
-    /// the control plane sees them; with `--node`, as one data node sees them.
+    /// the control plane sees them; with `--node` or `--address`, as one data node sees them.
     Status {
-        /// Asks this data node (`host:port`) instead of the control plane: its membership epoch,
-        /// ring fingerprint, and the databases it serves. Nothing else is needed.
+        /// Asks this data node instead of the control plane: its membership epoch, ring
+        /// fingerprint, and the databases it serves. Its address comes from the control plane's
+        /// membership, so `--control` or `--config` is needed too.
+        #[arg(long, conflicts_with = "address")]
+        node: Option<NodeId>,
+        /// Asks the data node at this address, `host:port`, instead of the control plane. Nothing
+        /// else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
-        node: Option<String>,
+        address: Option<String>,
         #[command(flatten)]
         target: Target,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum LeaseCommand {
     /// Follows the leases one data node holds: first `held <database> epoch <n>` for each
     /// database it serves, then `gained` or `lost` lines as leases move, until the stream ends.
-    WatchLeases {
-        /// The data node to follow, `host:port`.
-        #[arg(long)]
-        node: String,
+    Watch {
+        /// The data node to follow. Its address comes from the control plane's membership, so
+        /// `--control` or `--config` is needed too.
+        #[arg(long, required_unless_present = "address", conflicts_with = "address")]
+        node: Option<NodeId>,
+        /// The address of the data node to follow, `host:port`. Nothing else is needed.
+        #[arg(long, conflicts_with_all = ["control", "config"])]
+        address: Option<String>,
         #[command(flatten)]
-        tls: TlsArgs,
+        target: Target,
     },
 }
 
@@ -160,7 +176,8 @@ enum TokenCommand {
             conflicts_with = "key_id"
         )]
         token_id: Option<TokenId>,
-        /// A signing key's ID (the `kid` header): every token it signed, for good.
+        /// A signing key's ID (the token header's `kid`): revokes every token that key signed,
+        /// for good.
         #[arg(long, allow_hyphen_values = true)]
         key_id: Option<KeyId>,
         /// How long to keep a token's revocation, at least what remains of its lifetime: 30 days
@@ -194,8 +211,9 @@ enum CertCommand {
         /// The node's ID, as `[node] id` in its configuration.
         id: NodeId,
         /// The IP addresses and DNS names peers and clients dial the node at, comma-separated.
+        /// Not the `[node] host` placement label.
         #[arg(long, value_delimiter = ',', required = true)]
-        hosts: Vec<String>,
+        addresses: Vec<String>,
         /// The directory with `ca.crt` and `ca.key`, which the new files go into.
         #[arg(long)]
         dir: PathBuf,
@@ -330,10 +348,14 @@ struct SqlArgs {
     /// `text:`, `int:`, `real:`, or `blob:` (hex digits) to choose its type.
     #[arg(allow_negative_numbers = true, value_parser = parse_param)]
     params: Vec<Value>,
-    /// Sends the request to this data node (`host:port`) instead of the primary, and follows
-    /// its redirect.
+    /// Sends the request to this data node instead of the primary, and follows its redirect.
+    /// Its address comes from the control plane's membership.
+    #[arg(long, conflicts_with = "address")]
+    node: Option<NodeId>,
+    /// Sends the request to the data node at this address, `host:port`, instead of the
+    /// primary, and follows its redirect.
     #[arg(long)]
-    node: Option<String>,
+    address: Option<String>,
     #[command(flatten)]
     target: Target,
 }
@@ -595,16 +617,17 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Cert(command) => run_cert(command)?,
         Command::Token(command) => run_token(command).await?,
         Command::Status {
-            node: Some(node),
+            node,
+            address,
             target,
-        } => {
-            // The node answers on its own; the client never asks the control plane here.
-            let client = Client::new(node.clone(), target.tls.network()?);
-            format_node_status(&client.node_status(&node).await.map_err(failed)?)
-        }
-        Command::Status { node: None, target } => {
-            format_status(&target.client()?.status().await.map_err(failed)?)
-        }
+        } => match node_address(node.as_ref(), address, &target).await? {
+            Some(address) => {
+                // The node answers on its own, about itself.
+                let client = Client::new(address.clone(), target.tls.network()?);
+                format_node_status(&client.node_status(&address).await.map_err(failed)?)
+            }
+            None => format_status(&target.client()?.status().await.map_err(failed)?),
+        },
         Command::Db(DbCommand::Create {
             name,
             replication_factor,
@@ -646,7 +669,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             )
         }
         Command::Db(DbCommand::Exec(args)) => {
-            let (client, name, statement) = args.into_parts()?;
+            let (client, name, statement) = args.into_parts().await?;
             let written = client.execute(&name, statement).await.map_err(failed)?;
             let mut output = format!(
                 "{} row{} affected; acknowledged by {} of {} replica{}",
@@ -663,7 +686,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             output
         }
         Command::Db(DbCommand::Query(args)) => {
-            let (client, name, statement) = args.into_parts()?;
+            let (client, name, statement) = args.into_parts().await?;
             format_rows(&client.query(&name, statement).await.map_err(failed)?)
         }
         Command::Db(DbCommand::Locate { name, target }) => {
@@ -697,10 +720,17 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
             format_drain(&id, &primaries)
         }
-        Command::WatchLeases { node, tls } => {
-            // The node answers on its own; the client never asks the control plane here.
-            let client = Client::new(node.clone(), tls.network()?);
-            let mut updates = client.watch_leases(&node).await.map_err(failed)?;
+        Command::Lease(LeaseCommand::Watch {
+            node,
+            address,
+            target,
+        }) => {
+            let address = node_address(node.as_ref(), address, &target)
+                .await?
+                .ok_or("pass --node or --address")?;
+            // The node answers on its own, about the leases it holds.
+            let client = Client::new(address.clone(), target.tls.network()?);
+            let mut updates = client.watch_leases(&address).await.map_err(failed)?;
             while let Some(update) = updates.next().await.map_err(failed)? {
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(format_lease_update(&update).as_bytes())?;
@@ -713,7 +743,41 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One line per lease the snapshot holds, or one line for an event.
+/// The address of the data node a command asks directly: `address` as given, or the address the
+/// control plane's membership records for `node`; `None` if neither is given.
+async fn node_address(
+    node: Option<&NodeId>,
+    address: Option<String>,
+    target: &Target,
+) -> Result<Option<String>, Box<dyn Error>> {
+    match node {
+        Some(node) => Ok(Some(member_address(&target.client()?, node).await?)),
+        None => Ok(address),
+    }
+}
+
+/// The address the member `node` advertised, from the control plane's membership.
+async fn member_address(client: &Client, node: &NodeId) -> Result<String, Box<dyn Error>> {
+    let view = client.status().await.map_err(failed)?;
+    let Some((member, _)) = view.members().find(|(member, _)| member.id() == node) else {
+        let mut message = format!("no member of the fleet has the node ID '{node}'");
+        // Node IDs may contain `:` and `.`, so an address is only told apart once no member
+        // has it as its ID.
+        if node.as_str().parse::<SocketAddr>().is_ok() || node.as_str().contains(':') {
+            let _ = write!(
+                message,
+                "\n  hint: --node takes a node ID; to dial an address, use --address {node}"
+            );
+        }
+        return Err(message.into());
+    };
+    member
+        .address()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("node '{node}' advertised no address; pass --address").into())
+}
+
+/// One line per lease the node holds when the stream opens, or one line for an event.
 fn format_lease_update(update: &LeaseUpdate) -> String {
     match update {
         LeaseUpdate::Snapshot { leases, .. } => leases
@@ -785,7 +849,7 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             };
             let what = match &revoked {
                 Revoked::TokenId(id) => format!("token {id}"),
-                Revoked::KeyId(id) => format!("key {id}"),
+                Revoked::KeyId(id) => format!("signing key {id}"),
             };
             target
                 .client()?
@@ -823,14 +887,14 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
         }
         CertCommand::Node {
             id,
-            hosts,
+            addresses,
             dir,
             ttl,
         } => {
             let authority = Authority::load(&dir)?;
             let issued = authority.issue_node(
                 &id,
-                &hosts,
+                &addresses,
                 validity(ttl.unwrap_or(DEFAULT_NODE_LIFETIME)),
             )?;
             let stem = format!("node.{id}");
@@ -838,7 +902,7 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
             Ok(format!(
                 "issued {} for {} in {}: {stem}.crt and {stem}.key\n",
                 issued.subject(),
-                hosts.join(", "),
+                addresses.join(", "),
                 dir.display()
             ))
         }
@@ -862,10 +926,14 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
 }
 
 impl SqlArgs {
-    fn into_parts(self) -> Result<(Client, DatabaseName, Statement), Box<dyn Error>> {
+    async fn into_parts(self) -> Result<(Client, DatabaseName, Statement), Box<dyn Error>> {
         let mut client = self.target.client()?;
-        if let Some(node) = self.node {
-            client = client.with_entry(node);
+        let entry = match (self.node, self.address) {
+            (Some(node), _) => Some(member_address(&client, &node).await?),
+            (None, address) => address,
+        };
+        if let Some(entry) = entry {
+            client = client.with_entry(entry);
         }
         Ok((
             client,
@@ -1375,6 +1443,73 @@ mod tests {
         for (flag, id) in [("--token-id", "-0abc_"), ("--key-id", "-0abc_")] {
             let parsed = Cli::try_parse_from(["fleetringd", "token", "revoke", flag, id]);
             assert!(parsed.is_ok(), "{flag} {id}: {:?}", parsed.err());
+        }
+    }
+
+    #[test]
+    fn node_takes_an_id_and_address_takes_an_address() {
+        let parses = |words: &[&str]| Cli::try_parse_from([&["fleetringd"][..], words].concat());
+        for words in [
+            &["status", "--node", "node-2", "--control", "c:1"][..],
+            &["status", "--address", "10.0.0.2:7400"],
+            &["lease", "watch", "--node", "node-2", "--control", "c:1"],
+            &["lease", "watch", "--address", "10.0.0.2:7400"],
+            &["db", "exec", "notes", "DELETE FROM t", "--node", "node-2"],
+            &[
+                "db",
+                "query",
+                "notes",
+                "SELECT 1",
+                "--address",
+                "10.0.0.2:7400",
+            ],
+            &[
+                "cert",
+                "node",
+                "node-2",
+                "--addresses",
+                "10.0.0.2,n2.lan",
+                "--dir",
+                ".",
+            ],
+            &["cert", "init", "--fleet", "home", "--dir", "."],
+        ] {
+            assert!(
+                parses(words).is_ok(),
+                "{words:?}: {:?}",
+                parses(words).err()
+            );
+        }
+        for words in [
+            &["status", "--node", "node-2", "--address", "10.0.0.2:7400"][..],
+            &["status", "--address", "10.0.0.2:7400", "--control", "c:1"],
+            &["lease", "watch"],
+            &[
+                "lease",
+                "watch",
+                "--address",
+                "10.0.0.2:7400",
+                "--config",
+                "f.toml",
+            ],
+            &[
+                "db",
+                "exec",
+                "notes",
+                "x",
+                "--node",
+                "a",
+                "--address",
+                "b:1",
+            ],
+            // 0.2's spellings.
+            &["watch-leases", "--node", "10.0.0.2:7400"],
+            &[
+                "cert", "node", "node-2", "--hosts", "10.0.0.2", "--dir", ".",
+            ],
+            &["cert", "init", "--cluster", "home", "--dir", "."],
+        ] {
+            assert!(parses(words).is_err(), "{words:?} should be refused");
         }
     }
 

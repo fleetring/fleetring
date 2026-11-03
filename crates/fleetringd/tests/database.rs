@@ -1200,6 +1200,39 @@ mod binary {
         .await??)
     }
 
+    /// Runs `fleetringd` with `args`, a command that streams until stopped, and returns the
+    /// first line it prints, then stops it.
+    async fn first_line(
+        tls_dir: &Path,
+        args: Vec<String>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+
+        let tls_dir = tls_dir.to_owned();
+        let line = tokio::task::spawn_blocking(move || {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+                .env("FLEETRING_TLS_DIR", &tls_dir)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut line = String::new();
+            if let Some(stdout) = child.stdout.take() {
+                BufReader::new(stdout).read_line(&mut line)?;
+            }
+            child.kill()?;
+            let output = child.wait_with_output()?;
+            assert!(
+                !line.is_empty(),
+                "no output: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok::<_, std::io::Error>(line)
+        });
+        Ok(tokio::time::timeout(super::HANG_GUARD, line).await???)
+    }
+
     fn args(words: &[&str], control: &str) -> Vec<String> {
         words
             .iter()
@@ -1308,10 +1341,37 @@ mod binary {
             ],
             &control,
         );
-        via_follower.extend(["--node".to_owned(), follower]);
+        let follower_id = location
+            .followers()
+            .next()
+            .ok_or("no follower")?
+            .node
+            .to_string();
+        let mut by_id = via_follower.clone();
+        via_follower.extend(["--address".to_owned(), follower.clone()]);
         assert_eq!(
             stdout(&fleetringd(fleet.tls.dir(), via_follower).await?)?,
             "rows\n1\n"
+        );
+        // `--node` takes the follower's ID, and the control plane's membership its address.
+        by_id.extend(["--node".to_owned(), follower_id]);
+        assert_eq!(
+            stdout(&fleetringd(fleet.tls.dir(), by_id).await?)?,
+            "rows\n1\n"
+        );
+        // An address where a node ID belongs names no member, and the error says what to use.
+        let mut by_address = args(&["db", "exec", "tenant:acme", "DELETE FROM t"], &control);
+        by_address.extend(["--node".to_owned(), follower.clone()]);
+        let refused = fleetringd(fleet.tls.dir(), by_address).await?;
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "no member of the fleet has the node ID '{follower}'"
+            )) && stderr.contains(&format!(
+                "hint: --node takes a node ID; to dial an address, use --address {follower}"
+            )),
+            "{stderr}"
         );
 
         let located = stdout(
@@ -1604,21 +1664,58 @@ all 3 replicas agree
             .fingerprint();
         for daemon in &fleet.data {
             let address = daemon.listen_address().to_string();
-            let status = stdout(
-                &fleetringd(
-                    fleet.tls.dir(),
-                    vec!["status".to_owned(), "--node".to_owned(), address],
-                )
-                .await?,
-            )?;
-            assert!(
-                status.starts_with(&format!("node: {}\n", daemon.config().node.id)),
-                "{status}"
-            );
-            assert!(
-                status.contains(&format!("ring fingerprint: {fingerprint}\n")),
-                "{status}"
-            );
+            let id = daemon.config().node.id.to_string();
+            // By address, with nothing else; by node ID, through the control plane.
+            for words in [
+                vec!["status".to_owned(), "--address".to_owned(), address],
+                args(&["status", "--node", id.as_str()], &control),
+            ] {
+                let status = stdout(&fleetringd(fleet.tls.dir(), words).await?)?;
+                assert!(status.starts_with(&format!("node: {id}\n")), "{status}");
+                assert!(
+                    status.contains(&format!("ring fingerprint: {fingerprint}\n")),
+                    "{status}"
+                );
+            }
+        }
+
+        // `lease watch` starts with the leases the primary holds, by address or by node ID.
+        let primary_address = locations[0]
+            .primary_replica()
+            .and_then(|replica| replica.address.clone())
+            .ok_or("no primary address")?;
+        for words in [
+            vec![
+                "lease".to_owned(),
+                "watch".to_owned(),
+                "--address".to_owned(),
+                primary_address.clone(),
+            ],
+            args(&["lease", "watch", "--node", primary.as_str()], &control),
+        ] {
+            let first = first_line(fleet.tls.dir(), words).await?;
+            assert!(first.starts_with("held "), "{first}");
+        }
+
+        // 0.2's spellings are gone.
+        for words in [
+            vec![
+                "watch-leases".to_owned(),
+                "--node".to_owned(),
+                primary_address.clone(),
+            ],
+            vec![
+                "cert".to_owned(),
+                "node".to_owned(),
+                "n".to_owned(),
+                "--hosts".to_owned(),
+                "127.0.0.1".to_owned(),
+                "--dir".to_owned(),
+                ".".to_owned(),
+            ],
+        ] {
+            let refused = fleetringd(fleet.tls.dir(), words.clone()).await?;
+            assert_eq!(refused.status.code(), Some(2), "{words:?}: a usage error");
         }
 
         // Durability settings are set at creation, shown by locate and list, and changed for

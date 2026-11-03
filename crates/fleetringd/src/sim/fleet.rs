@@ -666,7 +666,7 @@ impl Fleet {
 
     /// Adds a client named `name` that runs `workload`, sending each database call to the data
     /// node `entry` first instead of locating the primary through the control plane, as
-    /// `fleetringd db exec --node` does. It follows redirects from there, and reaches a primary
+    /// `fleetringd db exec --address` does. It follows redirects from there, and reaches a primary
     /// while the control node is down.
     pub fn client_through(&mut self, name: &str, entry: &str, workload: impl Workload) {
         self.add_client(name, Some(format!("{entry}:{PORT}")), workload);
