@@ -49,6 +49,29 @@ async fn replicate(
     }
 }
 
+/// As [`replicate`], but tries again while the follower ended the stream because a newer one
+/// replaced it, which says nothing about the messages sent.
+///
+/// A stream that opens at a current epoch takes the follower's slot, so the primary's own stream
+/// is ended and reopens after the retry interval. On a slow host that can happen before the
+/// follower has read the test's later messages, and the primary's stream then replaces the test's
+/// in turn. Only a stream the follower got to judge says what the test asks about.
+async fn replicate_until_judged(
+    address: &str,
+    messages: &[ReplicateMessage],
+) -> Result<(Vec<Vec<u8>>, tonic::Status), Box<dyn std::error::Error>> {
+    guarded("a stream the follower judged", async {
+        loop {
+            let (acks, status) = replicate(address, messages.to_vec()).await?;
+            if status.code() != Code::Aborted {
+                return Ok::<_, Box<dyn std::error::Error>>((acks, status));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResult {
     let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
@@ -76,7 +99,7 @@ async fn followers_refuse_older_epochs_and_batches_that_skip_ahead() -> TestResu
             chain: None,
         })),
     };
-    let (acks, status) = replicate(&follower, vec![open("fenced", 1), gap]).await?;
+    let (acks, status) = replicate_until_judged(&follower, &[open("fenced", 1), gap]).await?;
     assert_eq!(acks.len(), 1, "the copy's position comes first");
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert!(status.message().contains("batch starts at"), "{status:?}");
