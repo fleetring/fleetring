@@ -9,7 +9,7 @@ use fleetring_control::DatabaseName;
 use fleetringd::engine::{
     EngineConfig, Execution, MemoryEngine, SqliteEngine, Statement, Transaction, Value,
 };
-use fleetringd::{RecordingSink, Registry};
+use fleetringd::{RecordingPublisher, Registry};
 use tempfile::TempDir;
 
 pub(crate) type TestResult = Result<(), Box<dyn Error>>;
@@ -40,33 +40,33 @@ pub(crate) enum Kind {
     Memory,
 }
 
-/// A registry over one engine, with its sink and data directory.
+/// A registry over one engine, with its publisher and data directory.
 #[derive(Debug)]
 pub(crate) struct Fixture {
     pub(crate) kind: Kind,
     pub(crate) registry: Registry,
-    pub(crate) sink: RecordingSink,
+    pub(crate) publisher: RecordingPublisher,
     pub(crate) dir: TempDir,
 }
 
 impl Fixture {
     pub(crate) fn new(kind: Kind, config: EngineConfig) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
-        let sink = RecordingSink::new();
+        let publisher = RecordingPublisher::new();
         let root = dir.path().join("databases");
         let registry = match kind {
             Kind::Sqlite => Registry::new(
                 SqliteEngine::new(config.page_size).expect("valid page size"),
-                sink.clone(),
+                publisher.clone(),
                 root,
                 config,
             ),
-            Kind::Memory => Registry::new(MemoryEngine::new(), sink.clone(), root, config),
+            Kind::Memory => Registry::new(MemoryEngine::new(), publisher.clone(), root, config),
         };
         Self {
             kind,
             registry,
-            sink,
+            publisher,
             dir,
         }
     }

@@ -25,7 +25,7 @@ use super::{
 use crate::engine::{
     CheckpointMarker, EngineCapability, EngineError, FrameBatch, FrameSourceEngine, Position,
 };
-use crate::sink::{Acknowledged, Acknowledgement, ReplicationError};
+use crate::publisher::{Acknowledged, Acknowledgement, ReplicationError};
 use crate::transport::replication_client;
 use crate::{DatabaseError, DatabaseHandle};
 

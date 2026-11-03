@@ -2,7 +2,7 @@
 //! follower side of the `Replication` service (ADR-0016, ADR-0018).
 //!
 //! [`Replication::start`] builds both halves around one data node's [`Registry`]: the
-//! [`ReplicatedSink`] the registry's actors publish every committed batch to, and the
+//! [`ReplicatingPublisher`] the registry's actors publish every committed batch to, and the
 //! [`ReplicationService`] that peers call. Everything here handles opaque [`Position`]s and
 //! payloads only, and compares positions as bytes.
 //!
@@ -38,7 +38,7 @@
 //! (ADR-0023): a majority for `quorum`, every replica for `all`, and the primary alone for
 //! `local`.
 //!
-//! Before a write runs, the actor asks the sink ([`ReplicationSink::admit`]) whether at least
+//! Before a write runs, the actor asks the publisher ([`BatchPublisher::admit`]) whether at least
 //! the database's `min_replicas` replicas, the primary included, are connected and live. If
 //! not, the write is refused with [`ReplicationError::BelowFloor`] and nothing commits. A write
 //! that passed the floor but finds fewer than W reachable when its batch is published fails at
@@ -144,8 +144,8 @@ use crate::engine::{
     CheckpointMarker, DatabaseEngine, EngineCapability, EngineKind, Execution, Position,
 };
 use crate::membership::DatabaseStatuses;
-use crate::sink::{
-    Acknowledged, Acknowledgement, CommittedBatch, ReplicationError, ReplicationSink,
+use crate::publisher::{
+    Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
 };
 use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
@@ -415,8 +415,8 @@ pub struct Verified {
     pub hash: ChainHash,
 }
 
-/// One data node's replication: primary streams, follower copies, and the sink and service that
-/// connect them to the [`Registry`].
+/// One data node's replication: primary streams, follower copies, and the publisher and service
+/// that connect them to the [`Registry`].
 ///
 /// Cloning is cheap; clones share everything.
 #[derive(Debug, Clone)]
@@ -478,7 +478,7 @@ impl Drop for Served {
 
 impl Replication {
     /// Builds a data node's replication, and its registry through `registry`, which receives the
-    /// sink to pass to [`Registry::new`].
+    /// publisher to pass to [`Registry::new`].
     ///
     /// This is the one entry point: the daemon serves [`server`](Self::server), uses
     /// [`registry`](Self::registry) for its databases, calls
@@ -487,7 +487,7 @@ impl Replication {
     /// [`Membership::start_reporting`].
     pub fn start(
         parts: ReplicationParts,
-        registry: impl FnOnce(ReplicatedSink) -> Registry,
+        registry: impl FnOnce(ReplicatingPublisher) -> Registry,
     ) -> Self {
         let ReplicationParts {
             node,
@@ -522,7 +522,7 @@ impl Replication {
             followers: Mutex::default(),
             transfers: AtomicU64::new(0),
         });
-        let built = registry(ReplicatedSink {
+        let built = registry(ReplicatingPublisher {
             inner: Arc::downgrade(&inner),
         });
         // `inner` is new, so nothing else can have set the registry.
@@ -1115,15 +1115,15 @@ impl PrimaryFeed {
     }
 }
 
-/// The [`ReplicationSink`] that [`Replication::start`] hands the registry: it refuses a write
+/// The [`BatchPublisher`] that [`Replication::start`] hands the registry: it refuses a write
 /// while fewer than the database's `min_replicas` are reachable, gives each committed batch to
 /// the database's primary streams, and acknowledges it once the write quorum holds it.
 #[derive(Debug, Clone)]
-pub struct ReplicatedSink {
+pub struct ReplicatingPublisher {
     inner: Weak<Inner>,
 }
 
-impl ReplicationSink for ReplicatedSink {
+impl BatchPublisher for ReplicatingPublisher {
     /// Refuses the write if this node is the database's primary and fewer than its
     /// `min_replicas` replicas, this node included, are connected and live. A database this node
     /// doesn't serve is admitted here and refused when its batch is published, as before.
@@ -1301,7 +1301,7 @@ const _: () = {
     assert_debug_send_sync::<PrimaryFeed>();
     assert_debug_send_sync::<PrimaryRole>();
     assert_debug_send_sync::<PrimaryStatus>();
-    assert_debug_send_sync::<ReplicatedSink>();
+    assert_debug_send_sync::<ReplicatingPublisher>();
     assert_debug_send_sync::<Replication>();
     assert_debug_send_sync::<ReplicationParts>();
     assert_debug_send_sync::<ReplicationService>();

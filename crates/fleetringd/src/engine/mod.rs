@@ -29,7 +29,9 @@ pub use changes::{
 pub use config::{EngineConfig, Execution};
 pub use memory::MemoryEngine;
 pub use pinned::{PinnedSnapshot, SnapshotFile, SnapshotGuard};
-pub use position::{CheckpointMarker, FrameBatch, Payload, Position, ReplicaPosition, Snapshot};
+pub use position::{
+    CheckpointMarker, DatabaseSnapshot, FrameBatch, Payload, Position, ReplicaPosition,
+};
 pub use sqlite::{InvalidPageSizeError, SqliteEngine, SqliteFollower};
 pub use statement::{Executed, Rows, Statement, Transaction, Value};
 
@@ -59,7 +61,7 @@ const _: () = {
     assert_debug_send_sync::<ReplicaPosition>();
     assert_debug_send_sync::<Rows>();
     assert_debug_send_sync::<Shape>();
-    assert_debug_send_sync::<Snapshot>();
+    assert_debug_send_sync::<DatabaseSnapshot>();
     assert_debug_send_sync::<SnapshotFile>();
     assert_debug_send_sync::<SqliteEngine>();
     assert_debug_send_sync::<SqliteFollower>();

@@ -17,18 +17,19 @@ use crate::tls::Principal;
 #[non_exhaustive]
 pub enum Requirement {
     /// Only nodes call it: replication, leases, promotions, membership reports. Node-to-node
-    /// calls are never authorized by key, and no principal may make them.
+    /// calls are never authorized by a database scope, and no principal may make them.
     Node,
-    /// A key-less control operation: a node, or a principal with the `fleet` scope.
+    /// A control operation that names no database: a node, or a principal with the `fleet`
+    /// scope.
     Fleet,
     /// The action on the database the request names.
-    Key(Action),
+    Database(Action),
     /// The action on the database the request names, or the `fleet` scope: inspections an
     /// operator makes across tenants, such as finding or verifying a database.
-    KeyOrFleet(Action),
+    DatabaseOrFleet(Action),
     /// A listing over many databases: each part of it shows a database only if the caller may
     /// take that part's action on it, and everything to a node or a principal with `fleet`.
-    /// A principal that may take none of the actions on any key, and lacks `fleet`, is
+    /// A principal that may take none of the actions on any database, and lacks `fleet`, is
     /// refused.
     Listing(&'static [Action]),
 }
@@ -47,9 +48,11 @@ impl fmt::Display for Requirement {
         match self {
             Self::Node => f.write_str("node"),
             Self::Fleet => f.write_str("fleet"),
-            Self::Key(action) => write!(f, "{action} on the key"),
-            Self::KeyOrFleet(action) => write!(f, "{action} on the key, or fleet"),
-            Self::Listing(actions) => write!(f, "{} per key listed, or fleet", either(actions)),
+            Self::Database(action) => write!(f, "{action} on the database"),
+            Self::DatabaseOrFleet(action) => write!(f, "{action} on the database, or fleet"),
+            Self::Listing(actions) => {
+                write!(f, "{} per database listed, or fleet", either(actions))
+            }
         }
     }
 }
@@ -63,7 +66,7 @@ pub enum ForNodes {
     /// lease.
     Allowed,
     /// Nodes may not: a node certificate is judged as a principal with no scopes, so one stolen
-    /// node key can't read, write, administer, or stream a database, nor revoke a token.
+    /// node's private key can't read, write, administer, or stream a database, nor revoke a token.
     Refused,
 }
 
@@ -143,24 +146,24 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc(
         "/fleetring.v1.Control/CreateDatabase",
-        Requirement::Key(Action::Admin),
+        Requirement::Database(Action::Admin),
         Binding::None,
     ),
     rpc(
         "/fleetring.v1.Control/DropDatabase",
-        Requirement::Key(Action::Admin),
+        Requirement::Database(Action::Admin),
         Binding::None,
     ),
     rpc(
         "/fleetring.v1.Control/ChangeDurability",
-        Requirement::Key(Action::Admin),
+        Requirement::Database(Action::Admin),
         Binding::None,
     ),
     // A data node locates the databases it creates, serves, and drains; it computes the same
     // placement from the membership anyway.
     node_too(
         "/fleetring.v1.Control/Locate",
-        Requirement::KeyOrFleet(Action::Read),
+        Requirement::DatabaseOrFleet(Action::Read),
         Binding::None,
     ),
     rpc(
@@ -208,7 +211,7 @@ pub const RPCS: &[Rpc] = &[
     // A draining node hands its own leases over; the handler refuses a lease it doesn't hold.
     node_too(
         "/fleetring.v1.Control/TransferLease",
-        Requirement::Key(Action::Admin),
+        Requirement::Database(Action::Admin),
         Binding::Holder,
     ),
     rpc(
@@ -245,17 +248,17 @@ pub const RPCS: &[Rpc] = &[
     // Database.
     rpc(
         "/fleetring.v1.Database/Execute",
-        Requirement::Key(Action::Write),
+        Requirement::Database(Action::Write),
         Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/Query",
-        Requirement::Key(Action::Read),
+        Requirement::Database(Action::Read),
         Binding::None,
     ),
     rpc(
         "/fleetring.v1.Database/Create",
-        Requirement::Key(Action::Admin),
+        Requirement::Database(Action::Admin),
         Binding::None,
     ),
     rpc(
@@ -270,7 +273,7 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc(
         "/fleetring.v1.Database/Verify",
-        Requirement::KeyOrFleet(Action::Read),
+        Requirement::DatabaseOrFleet(Action::Read),
         Binding::None,
     ),
 ];
@@ -291,7 +294,7 @@ pub enum Credential {
     Token {
         /// The token's ID, which audit lines name instead of the token.
         id: TokenId,
-        /// The key that signed it.
+        /// The signing key that signed it.
         key: KeyId,
         /// When it expires, which ends any stream opened with it.
         expires_at: Timestamp,
@@ -321,24 +324,24 @@ pub enum Caller {
 }
 
 impl Caller {
-    /// Whether the caller may see `key` in a listing filtered by `action`.
+    /// Whether the caller may see `database` in a listing filtered by `action`.
     #[must_use]
-    pub fn sees(&self, action: Action, key: &DatabaseName) -> bool {
+    pub fn sees(&self, action: Action, database: &DatabaseName) -> bool {
         match self {
             Self::Node(_) | Self::Anonymous => true,
             Self::Principal { scopes, .. } => {
-                scopes.allows(Target::Fleet) || scopes.allows(Target::Key(action, key))
+                scopes.allows(Target::Fleet) || scopes.allows(Target::Database(action, database))
             }
         }
     }
 
-    /// Checks that the caller may make `rpc` on `key`, the database the request names if the
+    /// Checks that the caller may make `rpc` on `database`, the database the request names if the
     /// RPC names one.
     ///
     /// # Errors
     ///
-    /// A [`Denied`] naming what was needed: the action and the key, never the caller's scopes.
-    pub fn authorize(&self, rpc: &Rpc, key: Option<&DatabaseName>) -> Result<(), Denied> {
+    /// A [`Denied`] naming what was needed: the action and the database, never the caller's scopes.
+    pub fn authorize(&self, rpc: &Rpc, database: Option<&DatabaseName>) -> Result<(), Denied> {
         let none = Scopes::none();
         let scopes = match self {
             Self::Anonymous => return Ok(()),
@@ -355,12 +358,14 @@ impl Caller {
             Requirement::Node => Err(denied(Needed::Node)),
             Requirement::Fleet if scopes.allows(Target::Fleet) => Ok(()),
             Requirement::Fleet => Err(denied(Needed::Fleet)),
-            Requirement::KeyOrFleet(_) if scopes.allows(Target::Fleet) => Ok(()),
-            Requirement::Key(action) | Requirement::KeyOrFleet(action) => match key {
-                Some(key) if scopes.allows(Target::Key(action, key)) => Ok(()),
-                Some(key) => Err(denied(Needed::Key(action, key.clone()))),
-                None => Err(denied(Needed::Fleet)),
-            },
+            Requirement::DatabaseOrFleet(_) if scopes.allows(Target::Fleet) => Ok(()),
+            Requirement::Database(action) | Requirement::DatabaseOrFleet(action) => {
+                match database {
+                    Some(database) if scopes.allows(Target::Database(action, database)) => Ok(()),
+                    Some(database) => Err(denied(Needed::Database(action, database.clone()))),
+                    None => Err(denied(Needed::Fleet)),
+                }
+            }
             Requirement::Listing(actions)
                 if scopes.allows(Target::Fleet)
                     || actions.iter().any(|action| scopes.covers_some(*action)) =>
@@ -380,9 +385,9 @@ pub enum Needed {
     Node,
     /// The `fleet` scope.
     Fleet,
-    /// The action on the key.
-    Key(Action, DatabaseName),
-    /// The action on at least one key, or `fleet`.
+    /// The action on the database.
+    Database(Action, DatabaseName),
+    /// The action on at least one database, or `fleet`.
     Some(&'static [Action]),
 }
 
@@ -400,17 +405,19 @@ fn needed_text(needed: &Needed) -> String {
     match needed {
         Needed::Node => "a node certificate".to_owned(),
         Needed::Fleet => "the fleet scope".to_owned(),
-        Needed::Key(action, key) => format!("{action} on '{key}'"),
-        Needed::Some(actions) => format!("{} on some key, or the fleet scope", either(actions)),
+        Needed::Database(action, database) => format!("{action} on '{database}'"),
+        Needed::Some(actions) => {
+            format!("{} on some database, or the fleet scope", either(actions))
+        }
     }
 }
 
 impl Denied {
-    /// The key the request was refused on, if it named one.
+    /// The database the request was refused on, if it named one.
     #[must_use]
-    pub fn key(&self) -> Option<&DatabaseName> {
+    pub fn database(&self) -> Option<&DatabaseName> {
         match &self.needed {
-            Needed::Key(_, key) => Some(key),
+            Needed::Database(_, database) => Some(database),
             Needed::Node | Needed::Fleet | Needed::Some(_) => None,
         }
     }
@@ -640,16 +647,17 @@ mod tests {
         rpc_at(path).unwrap_or_else(|| panic!("{path} is in the table"))
     }
 
-    fn key(text: &str) -> DatabaseName {
+    fn database(text: &str) -> DatabaseName {
         text.parse().expect("a database name")
     }
 
     #[test]
     fn a_reader_of_one_tenant_reads_it_and_nothing_more() {
         let reader = principal(&["read:tenant:acme/*"]);
-        let mine = key("tenant:acme/orders");
-        let other = key("tenant:zed/orders");
-        let ok = |path: &str, key: Option<&DatabaseName>| reader.authorize(call(path), key);
+        let mine = database("tenant:acme/orders");
+        let other = database("tenant:zed/orders");
+        let ok =
+            |path: &str, database: Option<&DatabaseName>| reader.authorize(call(path), database);
 
         assert_eq!(ok("/fleetring.v1.Database/Query", Some(&mine)), Ok(()));
         assert_eq!(ok("/fleetring.v1.Control/Locate", Some(&mine)), Ok(()));
@@ -662,7 +670,7 @@ mod tests {
             write.to_string(),
             "Execute needs write on 'tenant:acme/orders'"
         );
-        assert_eq!(write.key(), Some(&mine));
+        assert_eq!(write.database(), Some(&mine));
         assert!(ok("/fleetring.v1.Database/Query", Some(&other)).is_err());
         for admin in [
             "/fleetring.v1.Control/CreateDatabase",
@@ -688,7 +696,7 @@ mod tests {
     #[test]
     fn an_admin_of_everything_creates_and_drops_but_runs_no_fleet_operation() {
         let admin = principal(&["admin:*"]);
-        let db = key("anything");
+        let db = database("anything");
         for path in [
             "/fleetring.v1.Control/CreateDatabase",
             "/fleetring.v1.Control/DropDatabase",
@@ -721,16 +729,16 @@ mod tests {
         );
         assert!(
             operator
-                .authorize(call("/fleetring.v1.Database/Query"), Some(&key("x")))
+                .authorize(call("/fleetring.v1.Database/Query"), Some(&database("x")))
                 .is_err()
         );
-        assert!(operator.sees(Action::Stream, &key("x")));
+        assert!(operator.sees(Action::Stream, &database("x")));
         for path in [
             "/fleetring.v1.Control/Locate",
             "/fleetring.v1.Database/Verify",
         ] {
             assert_eq!(
-                operator.authorize(call(path), Some(&key("tenant:any"))),
+                operator.authorize(call(path), Some(&database("tenant:any"))),
                 Ok(()),
                 "{path}"
             );
@@ -738,12 +746,12 @@ mod tests {
         let reader = principal(&["read:tenant:acme/*"]);
         let verify = call("/fleetring.v1.Database/Verify");
         assert_eq!(
-            reader.authorize(verify, Some(&key("tenant:acme/x"))),
+            reader.authorize(verify, Some(&database("tenant:acme/x"))),
             Ok(())
         );
         assert!(
             reader
-                .authorize(verify, Some(&key("tenant:zed/x")))
+                .authorize(verify, Some(&database("tenant:zed/x")))
                 .is_err()
         );
     }
@@ -755,14 +763,14 @@ mod tests {
             streamer.authorize(call("/fleetring.v1.Database/NodeStatus"), None),
             Ok(())
         );
-        assert!(streamer.sees(Action::Stream, &key("ledger")));
-        assert!(!streamer.sees(Action::Read, &key("ledger")));
+        assert!(streamer.sees(Action::Stream, &database("ledger")));
+        assert!(!streamer.sees(Action::Read, &database("ledger")));
         let leases = streamer
             .authorize(call("/fleetring.v1.Database/WatchLeases"), None)
             .expect_err("leases are read");
         assert_eq!(
             leases.to_string(),
-            "WatchLeases needs read on some key, or the fleet scope"
+            "WatchLeases needs read on some database, or the fleet scope"
         );
         let nobody = principal(&[]);
         let status = nobody
@@ -770,14 +778,14 @@ mod tests {
             .expect_err("refused");
         assert_eq!(
             status.to_string(),
-            "NodeStatus needs read or stream on some key, or the fleet scope"
+            "NodeStatus needs read or stream on some database, or the fleet scope"
         );
     }
 
     #[test]
     fn a_principal_without_scopes_is_refused_everything() {
         let nobody = principal(&[]);
-        let db = key("x");
+        let db = database("x");
         for rpc in RPCS {
             assert!(nobody.authorize(rpc, Some(&db)).is_err(), "{}", rpc.path);
         }
@@ -793,7 +801,7 @@ mod tests {
 
     #[test]
     fn plaintext_callers_pass_every_check() {
-        let db = key("x");
+        let db = database("x");
         for rpc in RPCS {
             assert_eq!(
                 Caller::Anonymous.authorize(rpc, Some(&db)),
@@ -808,7 +816,7 @@ mod tests {
     #[test]
     fn a_node_certificate_makes_node_calls_and_nothing_else() {
         let node = Caller::Node("n1".parse().expect("node id"));
-        let db = key("tenant:acme");
+        let db = database("tenant:acme");
         let allowed: BTreeSet<&str> = RPCS
             .iter()
             .filter(|rpc| node.authorize(rpc, Some(&db)).is_ok())

@@ -780,7 +780,7 @@ async fn member_address(client: &Client, node: &NodeId) -> Result<String, Box<dy
 /// One line per lease the node holds when the stream opens, or one line for an event.
 fn format_lease_update(update: &LeaseUpdate) -> String {
     match update {
-        LeaseUpdate::Snapshot { leases, .. } => leases
+        LeaseUpdate::Held { leases, .. } => leases
             .iter()
             .map(|(database, epoch)| format!("held {database} epoch {}\n", epoch.get()))
             .collect(),
@@ -1537,7 +1537,7 @@ mod tests {
         use fleetringd::replication::{LeaseChange, LeaseEvent};
 
         let notes: DatabaseName = "notes".parse().expect("name");
-        let snapshot = LeaseUpdate::Snapshot {
+        let snapshot = LeaseUpdate::Held {
             node: "a".parse().expect("id"),
             leases: BTreeMap::from([(notes.clone(), LeaseEpoch::new(2))]),
         };

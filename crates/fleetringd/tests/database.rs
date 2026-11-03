@@ -2050,19 +2050,19 @@ async fn next_lease_event(updates: &mut LeaseUpdates) -> Result<LeaseEvent, Box<
     }
 }
 
-/// The snapshot a fresh stream on `address` starts with.
-async fn lease_snapshot(
+/// The leases a fresh stream on `address` starts with.
+async fn held_leases(
     client: &Client,
     address: &str,
 ) -> Result<(LeaseUpdates, BTreeMap<DatabaseName, LeaseEpoch>), Box<dyn Error>> {
     let mut updates = client.watch_leases(address).await?;
     match tokio::time::timeout(HANG_GUARD, updates.next()).await?? {
-        Some(LeaseUpdate::Snapshot { leases, .. }) => Ok((updates, leases)),
-        other => Err(format!("expected a snapshot first, got {other:?}").into()),
+        Some(LeaseUpdate::Held { leases, .. }) => Ok((updates, leases)),
+        other => Err(format!("expected the held leases first, got {other:?}").into()),
     }
 }
 
-/// `WatchLeases` on every data node (FR-042): each stream starts with a snapshot, the node that
+/// `WatchLeases` on every data node (FR-042): each stream starts with the leases held, the node that
 /// takes a database's first lease reports it gained at epoch 1, a drain reports it lost at epoch
 /// 1 on the old primary and gained at epoch 2 on the new one, and a stream opened afterwards
 /// starts from the current leases with no stale event. The control node, which hosts no data,
@@ -2086,11 +2086,11 @@ async fn watch_leases_streams_the_leases_each_node_gains_and_loses() -> TestResu
     for (id, address) in &addresses {
         let mut updates = client.watch_leases(address).await?;
         match tokio::time::timeout(HANG_GUARD, updates.next()).await?? {
-            Some(LeaseUpdate::Snapshot { node, leases }) => {
+            Some(LeaseUpdate::Held { node, leases }) => {
                 assert_eq!(node.as_str(), id);
                 assert!(leases.is_empty(), "{id} holds nothing yet: {leases:?}");
             }
-            other => return Err(format!("expected a snapshot first, got {other:?}").into()),
+            other => return Err(format!("expected the held leases first, got {other:?}").into()),
         }
         watchers.insert(id.clone(), updates);
     }
@@ -2152,9 +2152,9 @@ async fn watch_leases_streams_the_leases_each_node_gains_and_loses() -> TestResu
     );
 
     // A stream opened now starts from the current leases, with no stale event before them.
-    let (mut fresh, held) = lease_snapshot(&client, &addresses[&moved_to]).await?;
+    let (mut fresh, held) = held_leases(&client, &addresses[&moved_to]).await?;
     assert_eq!(held, BTreeMap::from([(notes.clone(), LeaseEpoch::new(2))]));
-    let (mut old, held) = lease_snapshot(&client, &addresses[&primary]).await?;
+    let (mut old, held) = held_leases(&client, &addresses[&primary]).await?;
     assert!(held.is_empty(), "the drained node holds nothing: {held:?}");
     let quiet = Duration::from_millis(300);
     for stream in [&mut fresh, &mut old] {

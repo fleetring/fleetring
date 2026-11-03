@@ -14,7 +14,7 @@ use crate::engine::{
     DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Statement, Transaction,
 };
 use crate::layout;
-use crate::sink::ReplicationSink;
+use crate::publisher::BatchPublisher;
 
 /// Every open database on a data node, each owned by its own actor.
 ///
@@ -37,7 +37,7 @@ pub struct Registry {
 #[derive(Debug)]
 struct Inner {
     engine: Arc<dyn DatabaseEngine>,
-    sink: Arc<dyn ReplicationSink>,
+    publisher: Arc<dyn BatchPublisher>,
     root: PathBuf,
     config: EngineConfig,
     /// The databases that record row changes, and in which mode.
@@ -90,14 +90,14 @@ impl Registry {
     #[must_use]
     pub fn new(
         engine: impl DatabaseEngine,
-        sink: impl ReplicationSink,
+        publisher: impl BatchPublisher,
         root: impl Into<PathBuf>,
         config: EngineConfig,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 engine: Arc::new(engine),
-                sink: Arc::new(sink),
+                publisher: Arc::new(publisher),
                 root: root.into(),
                 config,
                 recorded: CaptureRules::none(),
@@ -363,7 +363,7 @@ impl Registry {
         let config = ActorConfig {
             name: name.clone(),
             engine: Arc::clone(&inner.engine),
-            sink: Arc::clone(&inner.sink),
+            publisher: Arc::clone(&inner.publisher),
             location: self.location(name),
             mode,
             execution: inner.config.execution,

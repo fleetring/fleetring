@@ -466,8 +466,9 @@ fn start_data(
             state_dir: data_dir.path().join(REPLICATION_DIR),
             settings: settings.clone(),
         },
-        move |sink| {
-            Registry::new(engine, sink, databases, engine_config).with_recorded_changes(recorded)
+        move |publisher| {
+            Registry::new(engine, publisher, databases, engine_config)
+                .with_recorded_changes(recorded)
         },
     );
     statuses.set(replication.clone());

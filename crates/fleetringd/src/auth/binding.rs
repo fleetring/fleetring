@@ -202,7 +202,7 @@ impl BindingDenied {
             target: AUDIT,
             principal = %format!("node:{}", self.node),
             rpc = self.method,
-            key = self.reason.database().map(DatabaseName::as_str),
+            database = self.reason.database().map(DatabaseName::as_str),
             epoch = self.reason.epoch().map(LeaseEpoch::get),
             binding = self.binding.as_str(),
             "denied",

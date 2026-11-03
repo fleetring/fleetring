@@ -36,7 +36,7 @@ use crate::transport::{Backoff, replication_client};
 const WATCH_RETRY: Duration = Duration::from_millis(50);
 
 /// How long a lease watcher lets a stream stay silent before it opens a replacement: a crashed
-/// host's stream stalls rather than ends, and the replacement's snapshot catches the watcher up.
+/// host's stream stalls rather than ends, and the leases the replacement starts with catch the watcher up.
 const WATCH_IDLE: Duration = Duration::from_secs(1);
 
 /// Retries for simulated clients: quick, because simulated calls fail fast.
@@ -399,7 +399,7 @@ pub(super) struct WatcherSession {
 /// beside the node would, and records every snapshot entry and event in the history (FR-042).
 ///
 /// It opens the stream again whenever it ends or fails, and replaces a stream that has been
-/// silent for [`WATCH_IDLE`] with a fresh one, swapping only once the replacement's snapshot has
+/// silent for [`WATCH_IDLE`] with a fresh one, swapping only once the replacement's held leases have
 /// arrived, so that no change falls between two streams.
 pub(super) async fn run_lease_watcher(session: WatcherSession) -> turmoil::Result {
     let WatcherSession {
@@ -450,7 +450,7 @@ pub(super) async fn run_lease_watcher(session: WatcherSession) -> turmoil::Resul
 fn record_lease_update(shared: &Shared, watcher: &str, node: &str, update: &LeaseUpdate) {
     let at = turmoil::sim_elapsed().unwrap_or_default();
     let observations: Vec<LeaseObservation> = match update {
-        LeaseUpdate::Snapshot { leases, .. } => leases
+        LeaseUpdate::Held { leases, .. } => leases
             .iter()
             .map(|(database, epoch)| {
                 LeaseObservation::new(node, at, database.clone(), *epoch, LeaseSeen::Held)

@@ -9,8 +9,8 @@ use std::time::Duration;
 use fleetring::NodeId;
 
 use crate::engine::{
-    Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError, EngineKind,
-    Executed, OpenMode, Position, ReplicaPosition, Rows, SelfReplicating, Snapshot, Statement,
+    Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot, EngineCapability, EngineError,
+    EngineKind, Executed, OpenMode, Position, ReplicaPosition, Rows, SelfReplicating, Statement,
     Transaction, Value,
 };
 
@@ -147,7 +147,7 @@ impl Database for MemoryDatabase {
         read(&stored.rows, statement)
     }
 
-    fn snapshot(&mut self, destination: &Path) -> Result<Snapshot, EngineError> {
+    fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {
         let mut store = lock(&self.store);
         let stored = store
             .get(&self.location)
@@ -155,7 +155,7 @@ impl Database for MemoryDatabase {
             .ok_or(EngineError::NotFound)?;
         let position = stored.position();
         store.insert(destination.to_owned(), stored);
-        Ok(Snapshot { position })
+        Ok(DatabaseSnapshot { position })
     }
 
     fn capability(&mut self) -> DatabaseCapability<'_> {

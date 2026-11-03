@@ -6,8 +6,8 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::engine::{
-    CaptureMode, CheckpointMarker, Executed, FrameBatch, LogicalSupport, PinnedSnapshot, Position,
-    ReplicaPosition, RowChange, Rows, Snapshot, Statement, Transaction,
+    CaptureMode, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, LogicalSupport,
+    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -66,7 +66,7 @@ pub trait Database: fmt::Debug + Send {
     /// # Errors
     ///
     /// [`EngineError::Storage`] if the copy can't be written.
-    fn snapshot(&mut self, destination: &Path) -> Result<Snapshot, EngineError>;
+    fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError>;
 
     /// How this database replicates, with access to the matching operations.
     fn capability(&mut self) -> DatabaseCapability<'_>;

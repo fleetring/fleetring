@@ -2,9 +2,9 @@
 //!
 //! A request comes from a node or from a principal. Nodes make the node-to-node calls, each
 //! bound to placement: a node acts only on databases placed on it, in the role control state
-//! gives it there ([`Binding`], ADR-0031). A principal's [`Scopes`] say which keys it may read,
-//! write, administer, or stream, and whether it may run key-less control operations
-//! (`fleet`); everything else is denied.
+//! gives it there ([`Binding`], ADR-0031). A principal's [`Scopes`] say which databases it may
+//! read, write, administer, or stream, and whether it may run the control operations that name
+//! no database (`fleet`); everything else is denied.
 
 mod binding;
 mod boundary;
@@ -16,7 +16,7 @@ mod token;
 pub use binding::{BINDING_KEY, Binding, BindingDenied, Unbound, refused_binding};
 pub use boundary::{
     AUTHORIZATION, AuthLayer, AuthService, Authorized, Authorizer, BoxStream, STREAM_RECHECK,
-    authorized, require_key,
+    authorized, require_database,
 };
 pub use denylist::Denylist;
 pub use policy::{Caller, Credential, Denied, ForNodes, Needed, RPCS, Requirement, Rpc, rpc_at};

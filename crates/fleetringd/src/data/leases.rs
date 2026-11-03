@@ -4,7 +4,7 @@
 //! holds as the first message, and from then on one event per change, derived by comparing each
 //! new set of leases with the last one sent. Updates wait in a bounded buffer for the
 //! subscriber; a subscriber that lets it fill gets `RESOURCE_EXHAUSTED` and the stream ends, so
-//! it opens the stream again and starts from a fresh snapshot rather than from a backlog that
+//! it opens the stream again and starts from the leases held then rather than from a backlog that
 //! would grow without bound.
 
 use std::pin::Pin;
@@ -18,7 +18,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
-use crate::data::convert::{lease_event_to_proto, lease_snapshot_to_proto};
+use crate::data::convert::{held_leases_to_proto, lease_event_to_proto};
 use crate::replication::{LeaseWatch, lease_events};
 
 /// The stream `WatchLeases` returns.
@@ -28,8 +28,8 @@ pub(crate) type LeaseStream = Pin<Box<dyn Stream<Item = Result<LeaseUpdate, Stat
 /// further behind than this is cut off with `RESOURCE_EXHAUSTED`.
 pub(crate) const STREAM_BUFFER: usize = 256;
 
-/// A stream of `node`'s leases from `watch`: a snapshot, then events, with room for `buffer`
-/// unread updates. Only databases `visible` accepts appear, in the snapshot and in events, so a
+/// A stream of `node`'s leases from `watch`: the leases held, then events, with room for `buffer`
+/// unread updates. Only databases `visible` accepts appear, in the held leases and in events, so a
 /// principal sees the leases on the databases it may read.
 pub(crate) fn lease_stream(
     node: NodeId,
@@ -54,8 +54,8 @@ async fn feed(
         held
     };
     let mut held = held_visible(&mut watch);
-    let snapshot = lease_snapshot_to_proto(&node, &held);
-    if updates.send(Ok(snapshot)).await.is_err() {
+    let first = held_leases_to_proto(&node, &held);
+    if updates.send(Ok(first)).await.is_err() {
         return;
     }
     loop {
@@ -74,7 +74,7 @@ async fn feed(
                 Err(TrySendError::Full(_)) => {
                     let behind = Status::resource_exhausted(format!(
                         "the lease watcher fell more than {} updates behind; open the stream \
-                         again for a fresh snapshot",
+                         again for the leases held now",
                         updates.max_capacity()
                     ));
                     // The buffer is full, so this waits for the subscriber to read one update,
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_stream_starts_with_a_snapshot_and_follows_with_events_in_order() {
+    async fn the_stream_starts_with_the_held_leases_and_follows_with_events_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let replication = replication(dir.path());
         replication
@@ -153,13 +153,12 @@ mod tests {
             .expect("serves");
         let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 8, |_| true);
 
-        let Ok(Update::Snapshot(snapshot)) = next(&mut stream).await else {
-            panic!("the first update is a snapshot");
+        let Ok(Update::Held(held)) = next(&mut stream).await else {
+            panic!("the first update is the held leases");
         };
-        assert_eq!(snapshot.node_id, "a");
+        assert_eq!(held.node_id, "a");
         assert_eq!(
-            snapshot
-                .leases
+            held.leases
                 .iter()
                 .map(|lease| (lease.database.as_str(), lease.epoch))
                 .collect::<Vec<_>>(),
@@ -213,10 +212,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let replication = replication(dir.path());
         let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 2, |_| true);
-        let Ok(Update::Snapshot(snapshot)) = next(&mut stream).await else {
-            panic!("the first update is a snapshot");
+        let Ok(Update::Held(held)) = next(&mut stream).await else {
+            panic!("the first update is the held leases");
         };
-        assert!(snapshot.leases.is_empty());
+        assert!(held.leases.is_empty());
 
         // Each change is handed to the stream's task before the next one, and nothing reads
         // the stream meanwhile: the third event finds the buffer full.
@@ -230,7 +229,7 @@ mod tests {
         let ended = loop {
             match next(&mut stream).await {
                 Ok(Update::Event(event)) => delivered.push((event.epoch, event.kind)),
-                Ok(Update::Snapshot(_)) => panic!("only one snapshot per stream"),
+                Ok(Update::Held(_)) => panic!("one held message per stream"),
                 Err(status) => break status,
             }
         };
@@ -248,17 +247,16 @@ mod tests {
         );
 
         let mut fresh = lease_stream("a".parse().expect("id"), replication.leases(), 2, |_| true);
-        let Ok(Update::Snapshot(snapshot)) = next(&mut fresh).await else {
-            panic!("a new stream starts with a snapshot");
+        let Ok(Update::Held(held)) = next(&mut fresh).await else {
+            panic!("a new stream starts with the held leases");
         };
         assert_eq!(
-            snapshot
-                .leases
+            held.leases
                 .iter()
                 .map(|lease| lease.epoch)
                 .collect::<Vec<_>>(),
             [4],
-            "the snapshot holds the current epoch, with no stale event before it"
+            "the held leases have the current epoch, with no stale event before it"
         );
         replication.stop();
     }
@@ -268,8 +266,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let replication = replication(dir.path());
         let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 2, |_| true);
-        let Ok(Update::Snapshot(_)) = next(&mut stream).await else {
-            panic!("the first update is a snapshot");
+        let Ok(Update::Held(_)) = next(&mut stream).await else {
+            panic!("the first update is the held leases");
         };
         drop(replication);
         assert!(stream.next().await.is_none(), "replication is gone");

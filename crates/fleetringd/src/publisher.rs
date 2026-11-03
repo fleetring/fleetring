@@ -1,4 +1,6 @@
-//! Where an open database's committed batches go: the replication stream, or a test's sink.
+//! Where an open database's committed batches go to be replicated: the primary's replication
+//! streams, or a test's recording. Not a change stream's sink, which receives only what the write
+//! quorum already holds.
 
 use std::fmt;
 use std::future::{self, Future};
@@ -25,7 +27,7 @@ pub struct CommittedBatch {
 /// neither call may block. The writer that committed the batch then waits for the returned
 /// [`Acknowledgement`] before its write counts as done, while the actor moves on, so several
 /// batches can be in flight at once (ADR-0016, point 11).
-pub trait ReplicationSink: fmt::Debug + Send + Sync + 'static {
+pub trait BatchPublisher: fmt::Debug + Send + Sync + 'static {
     /// Decides whether a write to `database` may run now, before anything commits.
     ///
     /// A refusal is the clean failure ADR-0023 asks for when fewer than the database's
@@ -158,14 +160,14 @@ pub enum ReplicationError {
     },
 }
 
-/// A sink that keeps every batch in memory and acknowledges at once. For tests.
+/// A publisher that keeps every batch in memory and acknowledges at once. For tests.
 #[derive(Debug, Clone, Default)]
-pub struct RecordingSink {
+pub struct RecordingPublisher {
     batches: Arc<Mutex<Vec<CommittedBatch>>>,
 }
 
-impl RecordingSink {
-    /// An empty sink.
+impl RecordingPublisher {
+    /// An empty publisher.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -178,7 +180,10 @@ impl RecordingSink {
     /// If another thread panicked while publishing.
     #[must_use]
     pub fn batches(&self) -> Vec<CommittedBatch> {
-        self.batches.lock().expect("sink lock poisoned").clone()
+        self.batches
+            .lock()
+            .expect("publisher lock poisoned")
+            .clone()
     }
 
     /// Removes and returns every batch published so far.
@@ -188,13 +193,16 @@ impl RecordingSink {
     /// If another thread panicked while publishing.
     #[must_use]
     pub fn take(&self) -> Vec<CommittedBatch> {
-        std::mem::take(&mut *self.batches.lock().expect("sink lock poisoned"))
+        std::mem::take(&mut *self.batches.lock().expect("publisher lock poisoned"))
     }
 }
 
-impl ReplicationSink for RecordingSink {
+impl BatchPublisher for RecordingPublisher {
     fn publish(&self, batch: CommittedBatch) -> Acknowledgement {
-        self.batches.lock().expect("sink lock poisoned").push(batch);
+        self.batches
+            .lock()
+            .expect("publisher lock poisoned")
+            .push(batch);
         Acknowledgement::done()
     }
 }
@@ -204,7 +212,7 @@ const _: () = {
     const fn assert_debug_send<T: fmt::Debug + Send>() {}
     assert_debug_send::<Acknowledgement>();
     assert_debug_send_sync::<CommittedBatch>();
-    assert_debug_send_sync::<RecordingSink>();
+    assert_debug_send_sync::<RecordingPublisher>();
     assert_debug_send_sync::<ReplicationError>();
     assert_debug_send_sync::<Acknowledged>();
 };

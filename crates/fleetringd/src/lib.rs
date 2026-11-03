@@ -20,11 +20,11 @@ pub mod engine;
 mod environment;
 mod layout;
 mod membership;
+mod publisher;
 mod registry;
 pub mod replication;
 #[cfg(feature = "simulation")]
 pub mod sim;
-mod sink;
 pub mod tls;
 pub mod transport;
 
@@ -40,10 +40,11 @@ pub use environment::{Environment, Network};
 pub use membership::{
     DatabaseStatuses, ManualMembership, Membership, MembershipTasks, MembershipView,
 };
-pub use registry::Registry;
-pub use sink::{
-    Acknowledged, Acknowledgement, CommittedBatch, RecordingSink, ReplicationError, ReplicationSink,
+pub use publisher::{
+    Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, RecordingPublisher,
+    ReplicationError,
 };
+pub use registry::Registry;
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
