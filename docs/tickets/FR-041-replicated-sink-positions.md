@@ -153,7 +153,7 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-041`). Paths a
 
 - `src/sim/check.rs`:
   - `pub const REPEATS_PER_FAILOVER: usize = 2;` with a doc comment citing ADR-0028 point 6.
-  - `change_stream_consistent` (per host) changes one rule: a record whose `start` doesn't continue the host's last delivered position, and isn't `None`, is accepted when it starts at a position that ends some record of **any** host at an **earlier** epoch (a replicated mark), instead of always being a gap. Its signature gains `marks: &BTreeSet<(u64, Position)>`, the `(epoch, end)` of every record across hosts, which `Cluster::check_change_streams` collects from all files first.
+  - `change_stream_consistent` (per host) changes one rule: a record whose `start` doesn't continue the host's last delivered position, and isn't `None`, is accepted when it starts at a position that ends some record of **any** host at an **earlier** epoch (a replicated mark), instead of always being a gap. Its signature gains `marks: &BTreeSet<(u64, Position)>`, the `(epoch, end)` of every record across hosts, which `Fleet::check_change_streams` collects from all files first.
   - New `Invariant::ChangeStreamResumes` ("change stream resumes at a replicated mark") and
 
     ```rust
@@ -164,7 +164,7 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-041`). Paths a
     pub fn change_streams_resume(database: &DatabaseName, streams: &[(String, Vec<ChangeRecord>)], repeats_per_failover: usize) -> Result<(), Violation>;
     ```
 
-  - `Cluster::check_change_streams` runs it with `REPEATS_PER_FAILOVER` after the per-host checks; `Cluster::finish` already calls it.
+  - `Fleet::check_change_streams` runs it with `REPEATS_PER_FAILOVER` after the per-host checks; `Fleet::finish` already calls it.
 - `tests/sim/changes.rs`: after `check_change_streams`, assert that at least one epoch after the first started at `Some(position)` (the resume happened), and update the module docs (the new primary's sink starts at the mark, not at its own position).
 - Unit tests in `check.rs`: `a_stream_resumed_at_a_mark_passes`, `a_resume_past_every_delivered_position_is_a_gap`, `more_repeats_than_the_bound_fail`, `a_first_record_from_the_beginning_after_deliveries_fails`.
 

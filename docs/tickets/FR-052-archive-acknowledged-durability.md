@@ -4,7 +4,7 @@ title: A durability mode that acknowledges a write only once it is archived
 status: todo
 priority: P2
 size: M
-milestone: M9 Durability sinks and verification
+milestone: M9 Archives and verification
 depends_on: [FR-049, FR-035]
 adrs: [ADR-0023, ADR-0029]
 ---

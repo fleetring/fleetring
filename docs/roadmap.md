@@ -17,14 +17,14 @@ The placement crate `fleetring` is released (0.1.0) and its placement is frozen 
 Every simulation run checked against the guarantees each database promises, and the same checks on real processes.
 - FR-036 history checker (in progress); nightly sweep of 500 seeds, with failing seeds filed as bugs.
 - A Jepsen-style run on real daemons with network and process faults (a `fleetring-jepsen` harness, or Jepsen itself), before the first "safe" release.
-- Fuzzing of the daemon's protocol inputs (batches, snapshots, control RPCs), next to the existing spec fuzzing.
+- Fuzzing of the daemon's protocol inputs (batches, database snapshots, control RPCs), next to the existing spec fuzzing.
 
 ### E2. Durability and operations
 - FR-035 configurable durability: `acks`, `min_replicas`, per database (ADR-0023; done).
 - FR-037 `db list`, `db drop`, per-node status (in progress).
-- FR-038 graceful departure: drain primaries before a planned stop.
-- FR-049 backups: S3-compatible snapshots plus log archiving for point-in-time restore (MVP step 5), as a durability sink separate from replicas (ADR-0016, point 3; ADR-0029).
-- Control log compaction and bounded snapshot retention.
+- FR-038: drain a node's primaries before it leaves on a planned stop.
+- FR-049 backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029).
+- Control log compaction and bounded control snapshot retention.
 - Metrics (Prometheus), health and readiness endpoints, structured logs, and a tracing span per request.
 
 ### E3. Security
@@ -47,7 +47,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - Leader redirects already exist in the client; data nodes keep serving through control outages already.
 
 ### E6. Movement
-- Live migration (MVP step 3): move a database between nodes on purpose, with snapshot, catch-up, and cutover under a new epoch, driven by `Ring::diff` when nodes join or leave.
+- Live migration (MVP step 3): move a database between nodes on purpose, with a database snapshot, catch-up, and cutover under a new epoch, driven by `Ring::diff` when nodes join or leave.
 - A rebalance planner for hot spots, and cells for home-versus-cloud placement (ADR-0012) so quorums stay local.
 - Engine-changing migrations, such as SQLite to Postgres (ADR-0021), after live migration.
 
@@ -66,7 +66,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
-- Compatibility tests between the previous and current release: mixed-version fleets, old logs and snapshots.
+- Compatibility tests between the previous and current release: mixed-version fleets, old control logs and control snapshots.
 - Chaos on a real three-node fleet in CI (kill, pause, partition with `tc`), once E1's harness exists.
 
 ## Order

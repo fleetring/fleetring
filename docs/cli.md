@@ -29,12 +29,12 @@ fleetringd context use home
 
 - **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request.
 - **Arguments** are for the thing the command acts on (`db drop <database>`); everything else is a flag. At most one positional kind per command, plus SQL and its parameters for `db exec` and `db query`.
-- **Aliases** exist only for a rename, are hidden from `--help`, and print a [deprecation warning](#14-deprecations).
+- **No aliases.** A command or flag has one spelling; a rename replaces it outright ([renames](#14-renames)).
 
 ## 2. Flags
 
 - **Long flags, kebab-case:** `--replication-factor`, `--min-replicas`. A flag's name is a lexicon term or a field of one.
-- **One flag, one kind of value, everywhere.** `--node` takes a node ID in every command; an address is `--address <host:port>`. (Today `--node` takes both; see [where `fleetringd` stands](#where-fleetringd-stands).)
+- **One flag, one kind of value, everywhere.** `--node` takes a node ID in every command; an address is `--address <host:port>`. A command that dials one node takes either: `--node` looks the address up in the control plane's membership, and `--address` needs nothing else.
 - **Short flags** only for the universal ones: `-h`, `-V`, `-o`, `-q`, `-v`. No other single letters, so they never collide.
 - **Booleans** are presence flags (`--yes`, `--insecure-plaintext`). A `--no-<x>` form exists only when the default is on.
 - **Durations** are `<n>d`, `<n>h`, `<n>m`, or `<n>s`, as `--ttl` already takes them. Sizes are bytes with an optional `KiB`, `MiB`, or `GiB`.
@@ -164,35 +164,31 @@ Documented in `--help` and the man page, and the same for every command:
 
 Commands log only warnings by default, to stderr; `RUST_LOG` raises it, and `-v, --verbose` is short for `RUST_LOG=fleetringd=debug`. The daemon logs at info. Log fields use lexicon names.
 
-## 14. Deprecations
+## 14. Renames
 
-A renamed flag, value, or command keeps its old spelling as a hidden alias that prints one warning to stderr per invocation:
+Before 1.0, a renamed flag, value, or command is a clean break: the old spelling stops working in the release that renames it, with no hidden alias and no deprecation period (ADR-0032). The old spelling fails like any unknown flag, command, or value, and the error may carry one `hint:` line naming the new spelling. The release notes list every rename under breaking changes (FR-062 keeps 0.3.0's list).
 
-```text
-warning: --cluster is deprecated and will be removed in 1.0; use --fleet
-```
-
-The warning never goes to stdout, so scripts' output doesn't change. Aliases last through 0.x (ADR-0032), and their removal is listed under breaking changes in the release notes.
+How renames work after 1.0 is decided with 1.0's compatibility promise.
 
 ## Where `fleetringd` stands
 
-As of `fleetringd` 0.2.0. "Ticket" is where the gap closes.
+As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 
 | Rule | Today | Ticket |
 |---|---|---|
-| `noun verb` structure | Mostly: `db create`, `node drain`, `cert init`, `token issue`. `watch-leases` is a top-level verb-noun; it becomes `lease watch`. | FR-056 |
-| Names from the lexicon | `--cluster`, the `cluster` scope, and "cluster" in help and logs. | FR-059 |
-| One flag, one kind of value | `--node` takes a node ID in `db list` and an address in `status`, `watch-leases`, and `db exec`; `cert node --hosts` takes addresses, not the host label. | Not ticketed ([lexicon](lexicon.md#open-conflicts)) |
+| `noun verb` structure | Yes: `db create`, `node drain`, `cert init`, `token issue`, `lease watch`. | Done (FR-062) |
+| Names from the lexicon | Yes: `--fleet`, the `fleet` scope, and "fleet" in help and logs. | Done (FR-059, FR-062) |
+| One flag, one kind of value | Yes: `--node` takes a node ID in `db list`, `status`, `lease watch`, `db exec`, and `db query`; `--address` takes `host:port`; `cert node --addresses` takes the addresses a node is dialed at. | Done (FR-062) |
 | Precedence: flag, env, context, default | Flag, then `FLEETRING_TLS_DIR` and `FLEETRING_TOKEN`, then nothing; `--ca`, `--cert`, `--key` have no environment variables. | FR-055, FR-056 |
 | Contexts | None; every command takes `--control` or `--config`, and TLS flags. | FR-056 |
 | `--json` / `-o` with stable fields | None; human output only. | FR-056 |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
 | Quiet when piped | Commands print no progress or colour; logs are warnings only. No `--quiet`. | FR-056 |
 | `NO_COLOR` | Results have no colour. Log lines on stderr use ANSI colour, honour `NO_COLOR`, but don't check for a terminal. | FR-056 |
-| Errors with the next step | `fleetringd: <error>` with `caused by:` lines; some say what to pass (`pass --control or --config`). No `hint:` lines. | FR-056 |
+| Errors with the next step | `fleetringd: <error>` with `caused by:` lines; some say what to pass (`pass --control or --config`). One `hint:` line so far, when `--node` is given an address. | FR-056 |
 | Confirmation and `--yes` | `db drop` asks on a terminal and refuses elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask. | FR-055, FR-056 |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | FR-056 |
 | Completions and man pages | None. | FR-056 |
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. No `-` for stdin. | FR-056 |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | FR-056 |
-| Deprecation aliases | None needed yet. | FR-059 |
+| Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0. | Done |

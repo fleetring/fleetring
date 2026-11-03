@@ -275,7 +275,7 @@ pub struct MembershipSettings {
 #[non_exhaustive]
 pub enum OnShutdown {
     /// Leave the fleet: the control plane removes the member at once and rebuilds the ring
-    /// without it, so its replicas move to other nodes. The default: a planned departure is no
+    /// without it, so its replicas move to other nodes. The default: a planned leave is no
     /// failure.
     #[default]
     Leave,

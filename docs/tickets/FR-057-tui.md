@@ -13,7 +13,7 @@ adrs: [ADR-0033]
 
 ## Goal
 
-Operating a fleet from a terminal today means re-running `status` and `db list`, and following leases one node at a time with `watch-leases`. A full-screen terminal UI over the existing watch streams shows the fleet as it changes: leases moving during a drain, a node going down, a sink falling behind. It follows ADR-0033: its own crate over `fleetring-client`, vim bindings, and the terminal's 16 colours, so it looks like the rest of a themed, keyboard-first desktop.
+Operating a fleet from a terminal today means re-running `status` and `db list`, and following leases one node at a time with `lease watch`. A full-screen terminal UI over the existing watch streams shows the fleet as it changes: leases moving during a drain, a node going down, a sink falling behind. It follows ADR-0033: its own crate over `fleetring-client`, vim bindings, and the terminal's 16 colours, so it looks like the rest of a themed, keyboard-first desktop.
 
 ## Decision: `fleetringd ui`, from a crate of its own
 
