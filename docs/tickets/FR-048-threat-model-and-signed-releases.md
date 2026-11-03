@@ -25,9 +25,9 @@ adrs: [ADR-0025]
 
 ## Definition of done
 
-- [ ] `SECURITY.md` has the threat model table and a maintained "what a compromised X can do" section, reviewed against FR-046 and FR-047's tests.
+- [x] `SECURITY.md` has the threat model table and a maintained "what a compromised X can do" section, reviewed against FR-046 and FR-047's tests.
 - [ ] A release's `SHA256SUMS` has a verifiable keyless signature, every binary and the image have attestations, and the documented verify commands succeed against the published artifacts and fail against a modified one.
-- [ ] All workflow actions are pinned by commit SHA, and the release workflow fails on an unresolved advisory.
+- [x] All workflow actions are pinned by commit SHA, and the release workflow fails on an unresolved advisory.
 
 ## Progress
 
@@ -37,3 +37,8 @@ adrs: [ADR-0025]
   - **Signing:** the release job signs `SHA256SUMS` with keyless `cosign sign-blob` (cosign v3, which writes only the `SHA256SUMS.sigstore.json` bundle; it holds the signature, certificate, and transparency-log proof) and attests the archives and `install.sh`; the container workflow attests each per-architecture image and the multi-arch manifest. `scripts/install.sh` verifies the signature when `cosign` is on `PATH`. The README's "Verify a release" section and the release notes show `cosign verify-blob` and `gh attestation verify`. The certificate identity matches `fleetringd-v*` tags, the tags that trigger the workflow.
   - **Not yet verified:** signing and attestation first run on the next `fleetringd-v*` tag. The Definition-of-done check that the verify commands succeed against published artifacts and fail against a modified one waits for that release.
   - **Pending:** the `SECURITY.md` threat model and "what a compromised X can do" section, which wait for FR-047's scopes and tokens.
+- 2026-11-03: The threat model is in `SECURITY.md`.
+  - **Contents:** the assets; one table with, for each actor (network attacker, compromised client, compromised data node, compromised control node, lost or leaked authority key, malicious operator, compromised CI or release pipeline), what the design prevents, what it detects, and what it doesn't cover; which properties rest on the authority key and how to rotate it and revoke its tokens; links to the scope table and the release verification steps.
+  - **Reviewed against the code and tests:** `auth::policy` (`RPCS`, `ForNodes`), `auth::boundary` (token resolution, forwarding, stale denylists, stream guards, audit lines), `tls` (TLS 1.3 only, cluster name check, reload), the SQLite adapter's confinement, `replication::follower` (node calls check only that the caller is a node), and `tests/tls.rs`, `tests/scopes.rs`, and `tests/control.rs::a_node_certificate_acts_on_its_own_node_only`. Node-to-node calls not bound to placement are marked planned: FR-050.
+  - **Supply chain:** checked the third criterion: every `uses:` in `.github/workflows/` names a 40-character commit, and `release.yml` runs `cargo audit --deny warnings`.
+  - **Left:** the second criterion's check that the verify commands succeed against published artifacts and fail against a modified one, which waits for the first `fleetringd-v*` release.
