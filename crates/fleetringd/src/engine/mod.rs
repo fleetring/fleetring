@@ -21,7 +21,7 @@ mod statement;
 pub use adapter::{
     BatchTransaction, Database, DatabaseCapability, DatabaseEngine, EngineCapability, EngineError,
     EngineKind, FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, OpenMode,
-    SelfReplicating, Shape,
+    SelfReplicating, Shape, SinkMarks,
 };
 pub use changes::{
     CaptureMode, Column, LogicalSupport, ParseCaptureModeError, RowChange, RowOperation,
@@ -71,4 +71,5 @@ const _: () = {
     assert_debug_send::<dyn Database>();
     assert_debug_send::<dyn FrameFollower>();
     assert_debug_send::<dyn LogicalChanges>();
+    assert_debug_send::<dyn SinkMarks>();
 };

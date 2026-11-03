@@ -414,3 +414,182 @@ async fn a_change_record_round_trips_through_json() -> TestResult {
     assert_eq!(Change::try_from(parsed)?, change);
     Ok(())
 }
+
+/// Sink marks (FR-041, ADR-0028), against the SQLite engine directly.
+mod marks {
+    use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::path::Path;
+
+    use fleetringd::engine::{
+        Database, DatabaseCapability, DatabaseEngine, EngineCapability, OpenMode, Position,
+        SqliteEngine, Statement, Transaction,
+    };
+    use tempfile::TempDir;
+
+    use crate::common::TestResult;
+
+    type Marks = BTreeMap<String, Position>;
+
+    fn engine() -> Result<SqliteEngine, Box<dyn Error>> {
+        Ok(SqliteEngine::new(4096)?)
+    }
+
+    fn open_new(dir: &Path) -> Result<Box<dyn Database>, Box<dyn Error>> {
+        let mut db = engine()?.open(dir, OpenMode::Create)?;
+        db.execute(&Transaction::from(Statement::new(
+            "CREATE TABLE t (value INTEGER)",
+        )))?;
+        Ok(db)
+    }
+
+    fn insert(db: &mut dyn Database, value: i64) -> Result<u64, Box<dyn Error>> {
+        let write = Transaction::from(Statement::with_params(
+            "INSERT INTO t (value) VALUES (?1)",
+            [value.into()],
+        ));
+        Ok(db.execute(&write)?.rows_affected)
+    }
+
+    fn recorded(db: &mut dyn Database) -> Result<Marks, Box<dyn Error>> {
+        Ok(db.sink_marks().ok_or("the engine keeps marks")?.marks()?)
+    }
+
+    fn stage(db: &mut dyn Database, sink: &str, position: &Position) -> TestResult {
+        db.sink_marks()
+            .ok_or("the engine keeps marks")?
+            .stage(sink, position);
+        Ok(())
+    }
+
+    #[test]
+    fn a_staged_mark_rides_on_the_next_write() -> TestResult {
+        let dir = TempDir::new()?;
+        let mut db = open_new(dir.path())?;
+        let first = Position::new([0, 1]);
+        stage(&mut *db, "s", &first)?;
+        assert!(recorded(&mut *db)?.is_empty(), "staged, not recorded");
+        insert(&mut *db, 1)?;
+        assert_eq!(recorded(&mut *db)?, Marks::from([("s".to_owned(), first)]));
+
+        // A newer mark replaces the older, and a sink without one is left alone.
+        let second = Position::new([0, 2]);
+        stage(&mut *db, "s", &Position::new([0, 9]))?;
+        stage(&mut *db, "s", &second)?;
+        stage(&mut *db, "other", &Position::new([7]))?;
+        insert(&mut *db, 2)?;
+        assert_eq!(
+            recorded(&mut *db)?,
+            Marks::from([
+                ("other".to_owned(), Position::new([7])),
+                ("s".to_owned(), second),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mark_staged_with_no_later_write_is_not_recorded() -> TestResult {
+        let dir = TempDir::new()?;
+        let mut db = open_new(dir.path())?;
+        stage(&mut *db, "s", &Position::new([1]))?;
+        db.close()?;
+        let mut reopened = engine()?.open(dir.path(), OpenMode::Existing)?;
+        assert!(recorded(&mut *reopened)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_rolled_back_write_keeps_the_mark_staged() -> TestResult {
+        let dir = TempDir::new()?;
+        let mut db = open_new(dir.path())?;
+        let mark = Position::new([4, 2]);
+        stage(&mut *db, "s", &mark)?;
+        // The first write to carry a mark also creates the marks table; rolling back takes the
+        // table with it, and the next write creates it again.
+        let failing = Transaction::from(Statement::new("INSERT INTO missing VALUES (1)"));
+        assert!(db.execute(&failing).is_err());
+        assert!(recorded(&mut *db)?.is_empty(), "nothing committed");
+        insert(&mut *db, 1)?;
+        assert_eq!(recorded(&mut *db)?, Marks::from([("s".to_owned(), mark)]));
+        Ok(())
+    }
+
+    #[test]
+    fn marks_never_count_in_rows_affected() -> TestResult {
+        let dir = TempDir::new()?;
+        let mut db = open_new(dir.path())?;
+        stage(&mut *db, "a", &Position::new([1]))?;
+        stage(&mut *db, "b", &Position::new([2]))?;
+        assert_eq!(insert(&mut *db, 1)?, 1);
+        assert_eq!(recorded(&mut *db)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn user_statements_naming_the_marks_table_are_refused() -> TestResult {
+        let dir = TempDir::new()?;
+        let mut db = open_new(dir.path())?;
+        stage(&mut *db, "s", &Position::new([1]))?;
+        insert(&mut *db, 1)?;
+        let statements = [
+            "SELECT * FROM _fleetring_sinks",
+            "INSERT INTO _fleetring_sinks (sink, position) VALUES ('x', x'00')",
+            "UPDATE _fleetring_sinks SET position = x'00'",
+            "DELETE FROM _fleetring_sinks",
+            "DROP TABLE _fleetring_sinks",
+        ];
+        for sql in statements {
+            let error = db
+                .execute(&Transaction::from(Statement::new(sql)))
+                .err()
+                .ok_or_else(|| format!("`{sql}` was accepted on the write connection"))?;
+            assert!(error.to_string().contains("reserved"), "`{sql}`: {error}");
+        }
+        for sql in [
+            "SELECT * FROM _fleetring_sinks",
+            "SELECT count(*) FROM _fleetring_sinks",
+        ] {
+            let error = db
+                .query(&Statement::new(sql))
+                .err()
+                .ok_or_else(|| format!("`{sql}` was accepted on the read connection"))?;
+            assert!(error.to_string().contains("reserved"), "`{sql}`: {error}");
+        }
+        assert_eq!(recorded(&mut *db)?.len(), 1, "the mark survived");
+        Ok(())
+    }
+
+    #[test]
+    fn marks_replicate_to_a_follower() -> TestResult {
+        let dir = TempDir::new()?;
+        let follower_dir = dir.path().join("follower");
+        let engine = engine()?;
+        let mut primary = open_new(&dir.path().join("primary"))?;
+        primary.snapshot(&follower_dir)?;
+        let EngineCapability::FrameSource(frames) = engine.capability() else {
+            return Err("sqlite is a frame source".into());
+        };
+        let mut follower = frames.open_follower(&follower_dir)?;
+
+        let mark = Position::new([0, 0, 7]);
+        stage(&mut *primary, "s", &mark)?;
+        insert(&mut *primary, 1)?;
+        let DatabaseCapability::FrameSource(log) = primary.capability() else {
+            return Err("sqlite is a frame source".into());
+        };
+        let batch = log
+            .committed_since(follower.position().as_ref())?
+            .ok_or("the write committed a batch")?;
+        follower.apply(&batch)?;
+        drop(follower);
+
+        // The follower, promoted: opened as a database, it holds the mark its primary recorded.
+        let mut promoted = engine.open(&follower_dir, OpenMode::Existing)?;
+        assert_eq!(
+            recorded(&mut *promoted)?,
+            Marks::from([("s".to_owned(), mark)])
+        );
+        Ok(())
+    }
+}

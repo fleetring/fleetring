@@ -9,8 +9,10 @@
 //! generation continues from, and refuses every other one (FR-032).
 //!
 //! Row changes for logical change streams are recorded by the `changes` module, in a change
-//! table inside the database (FR-039, ADR-0024). Names beginning with `_fleetring_` are reserved
-//! for it: a user statement that reads, writes, calls, creates, alters, or drops anything so named is
+//! table inside the database (FR-039, ADR-0024), and the positions that change sinks have been
+//! delivered up to by the `marks` module, in a second table, so that they replicate with the data
+//! (FR-041, ADR-0028). Names beginning with `_fleetring_` are reserved for them, and
+//! `_fleetring_cdc` and `_fleetring_sinks` are the tables: a user statement that reads, writes, calls, creates, alters, or drops anything so named is
 //! refused as a statement error, on both connections, so that neither the table nor the
 //! recorder's triggers can be read, forged, or broken from outside.
 //!
@@ -21,10 +23,12 @@
 
 mod changes;
 mod follower;
+mod marks;
 mod pins;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
@@ -43,12 +47,14 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, ffi, 
 pub use follower::SqliteFollower;
 
 use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX};
+use self::marks::Marks;
 use self::pins::Pins;
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
     DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
     FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode,
-    PinnedSnapshot, Position, RowChange, Rows, SnapshotFile, Statement, Transaction, Value,
+    PinnedSnapshot, Position, RowChange, Rows, SinkMarks, SnapshotFile, Statement, Transaction,
+    Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -209,6 +215,8 @@ struct SqliteDatabase {
     end: Option<fleetring_wal::Position>,
     /// The row-change recorder, once a logical change stream asked for one.
     recorder: Option<Recorder>,
+    /// The sink marks staged for the next write transaction.
+    marks: Marks,
 }
 
 impl SqliteDatabase {
@@ -273,6 +281,7 @@ impl SqliteDatabase {
             checkpointed,
             end: None,
             recorder: None,
+            marks: Marks::default(),
         })
     }
 
@@ -386,6 +395,13 @@ impl Database for SqliteDatabase {
         self.writer
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(classify)?;
+        // Staged sink marks go in first, ahead of any prune the recorder does, so that no copy
+        // holds a prune without the marks that justify it. They come before the row count below
+        // starts, so `rows_affected` never counts them.
+        if let Err(error) = self.marks.flush(&self.writer) {
+            self.roll_back();
+            return Err(error);
+        }
         let start = self.end;
         if let Some(recorder) = &mut self.recorder
             && let Err(error) = recorder.begin(&self.writer, start)
@@ -413,6 +429,7 @@ impl Database for SqliteDatabase {
             self.roll_back();
             return Err(classify(error));
         }
+        self.marks.committed();
         Ok(Executed {
             rows_affected: self
                 .writer
@@ -483,6 +500,10 @@ impl Database for SqliteDatabase {
     }
 
     fn logical_changes(&mut self) -> Option<&mut dyn LogicalChanges> {
+        Some(self)
+    }
+
+    fn sink_marks(&mut self) -> Option<&mut dyn SinkMarks> {
         Some(self)
     }
 
@@ -597,6 +618,19 @@ impl LogicalChanges for SqliteDatabase {
             recorder.release(before.as_bytes());
         }
         Ok(())
+    }
+}
+
+impl SinkMarks for SqliteDatabase {
+    fn marks(&mut self) -> Result<BTreeMap<String, Position>, EngineError> {
+        Ok(Marks::read(&self.writer)?
+            .into_iter()
+            .map(|(sink, position)| (sink, Position::from(position)))
+            .collect())
+    }
+
+    fn stage(&mut self, sink: &str, delivered: &Position) {
+        self.marks.stage(sink, delivered.as_bytes());
     }
 }
 
