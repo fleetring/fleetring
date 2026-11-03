@@ -180,21 +180,46 @@ say "downloading fleetringd $version for $target"
 download "$base_url/$archive" "$tmp/$archive" || fail "can't download $base_url/$archive"
 download "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" || fail "can't download $base_url/SHA256SUMS"
 
-# SHA256SUMS is signed keylessly by the release workflow (FR-048). With cosign installed, the
-# signature must verify before any checksum is trusted; without it, say so and carry on.
+# SHA256SUMS is signed keylessly by the release workflow (FR-048) with cosign v3, which writes a
+# Sigstore bundle. Cosign older than 2.4.2 can't check that bundle (2.4.0 and 2.4.1 fail with
+# "bundle does not contain cert"), so it counts as not installed. With a new enough cosign, the
+# signature must verify before any checksum is trusted; without one, say so and carry on.
+cosign_min="2.4.2"
+cosign_min_num=2004002
+cosign_state=missing
 if command -v cosign > /dev/null 2>&1; then
-    download "$base_url/SHA256SUMS.sigstore.json" "$tmp/SHA256SUMS.sigstore.json" \
-        || fail "can't download $base_url/SHA256SUMS.sigstore.json, so the signature can't be verified"
-    cosign verify-blob \
-        --bundle "$tmp/SHA256SUMS.sigstore.json" \
-        --certificate-identity-regexp "^https://github.com/$repo/.github/workflows/release.yml@refs/tags/fleetringd-v" \
-        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-        "$tmp/SHA256SUMS" > /dev/null \
-        || fail "the signature on SHA256SUMS doesn't verify; not installing"
-    say "verified the cosign signature on SHA256SUMS"
-else
-    say "cosign not found, so the SHA256SUMS signature wasn't checked; to check it, install cosign (https://docs.sigstore.dev/cosign/system_config/installation/)"
+    cosign_state=old
+    # "cosign version" prints a line such as "GitVersion:    v2.4.3"; this leaves "2 4 3", which
+    # is folded into MAJOR*1000000 + MINOR*1000 + PATCH.
+    cosign_ver=$(cosign version 2> /dev/null \
+        | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' | head -n 1)
+    if [ -n "$cosign_ver" ]; then
+        # shellcheck disable=SC2086 # split "MAJOR MINOR PATCH" into three words
+        cosign_num=$(printf '%s\n' $cosign_ver | awk '{ n = n * 1000 + $1 } END { print n }')
+        if [ "$cosign_num" -ge "$cosign_min_num" ]; then
+            cosign_state=ok
+        fi
+    fi
 fi
+case "$cosign_state" in
+    ok)
+        download "$base_url/SHA256SUMS.sigstore.json" "$tmp/SHA256SUMS.sigstore.json" \
+            || fail "can't download $base_url/SHA256SUMS.sigstore.json, so the signature can't be verified"
+        cosign verify-blob \
+            --bundle "$tmp/SHA256SUMS.sigstore.json" \
+            --certificate-identity-regexp "^https://github.com/$repo/.github/workflows/release.yml@refs/tags/fleetringd-v" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$tmp/SHA256SUMS" > /dev/null \
+            || fail "the signature on SHA256SUMS doesn't verify; not installing"
+        say "verified the cosign signature on SHA256SUMS"
+        ;;
+    old)
+        say "the installed cosign is too old to check the SHA256SUMS signature (needs $cosign_min or newer); to check it, upgrade cosign (https://docs.sigstore.dev/cosign/system_config/installation/)"
+        ;;
+    *)
+        say "cosign not found, so the SHA256SUMS signature wasn't checked; to check it, install cosign (https://docs.sigstore.dev/cosign/system_config/installation/)"
+        ;;
+esac
 
 expected=$(awk -v file="$archive" '$2 == file || $2 == "*" file { print $1 }' "$tmp/SHA256SUMS")
 [ -n "$expected" ] || fail "SHA256SUMS lists no checksum for $archive"
