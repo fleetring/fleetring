@@ -302,7 +302,9 @@ pub enum Credential {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Caller {
-    /// A node of the cluster, by the ID in its certificate. Nodes act with full scope.
+    /// A node of the cluster, by the ID in its certificate. A node may make the node calls and
+    /// the client calls a daemon makes as itself ([`ForNodes`]), each bound to placement
+    /// (ADR-0031); beyond those it is a principal with no scopes (ADR-0026, point 9).
     Node(NodeId),
     /// A principal with its scopes.
     Principal {
