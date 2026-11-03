@@ -2,7 +2,8 @@
 
 use fleetring::{BuildRingError, Host, NodeId, Weight};
 use fleetring_control::{
-    Action, Applied, JoinKind, LeaseEpoch, Liveness, Member, Position, Promotion, Rejection, State,
+    Action, Applied, JoinKind, LeaseEpoch, Liveness, Member, Position, Promotion, Rejection,
+    Revoked, State,
 };
 
 use crate::common::{at, config, create, db, heartbeat, id, run, zone};
@@ -964,4 +965,63 @@ fn drains_and_transfers_survive_the_log_and_old_states_load_without_them() {
     let restored: State = serde_json::from_str(&snapshot).expect("restores");
     assert_eq!(restored, state);
     assert!(restored.is_draining(&rs[0]));
+}
+
+fn revoke(revoked: Revoked, until: u64) -> Action {
+    Action::RevokeToken {
+        revoked,
+        until: at(until),
+    }
+}
+
+fn token(text: &str) -> Revoked {
+    Revoked::Token(text.parse().expect("token id"))
+}
+
+#[test]
+fn revocations_last_until_their_time_and_then_are_forgotten() {
+    let mut state = cluster(&["a"]);
+    let key = Revoked::Key("k1".parse().expect("key id"));
+
+    assert_eq!(
+        run(&mut state, 100, revoke(token("t1"), 1_000)),
+        Ok(Applied::TokenRevoked {
+            revoked: token("t1"),
+            until: at(1_000)
+        })
+    );
+    run(&mut state, 100, revoke(key.clone(), u64::MAX)).expect("revoke a key");
+    // A second revocation keeps the later time.
+    assert_eq!(
+        run(&mut state, 200, revoke(token("t1"), 500)),
+        Ok(Applied::TokenRevoked {
+            revoked: token("t1"),
+            until: at(1_000)
+        })
+    );
+    assert!(state.revocations().contains(&token("t1")));
+
+    // A revocation that has already passed changes nothing.
+    let before = state.clone();
+    assert_eq!(
+        run(&mut state, 300, revoke(token("t2"), 300)),
+        Err(Rejection::RevocationPassed {
+            revoked: token("t2"),
+            until: at(300)
+        })
+    );
+    assert_eq!(state, before);
+
+    // Time passes the token's entry; the key's stays.
+    run(&mut state, 1_000, Action::Tick).expect("tick");
+    assert!(!state.revocations().contains(&token("t1")));
+    assert!(state.revocations().contains(&key));
+    assert_eq!(state.revocations().len(), 1);
+
+    // The list survives a snapshot, and a state without one serializes as before.
+    let snapshot = serde_json::to_string(&state).expect("serializes");
+    let restored: State = serde_json::from_str(&snapshot).expect("restores");
+    assert_eq!(restored, state);
+    let empty = serde_json::to_string(&cluster(&["a"])).expect("serializes");
+    assert!(!empty.contains("revocations"), "{empty}");
 }

@@ -10,7 +10,7 @@ use crate::command::UnknownReports;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
     Action, Command, Database, DatabaseName, Durability, DurabilityError, Engine, HostedReplica,
-    Lease, LeaseEpoch, Member, Position, Promotion, Quorums, State, Timestamp,
+    Lease, LeaseEpoch, Member, Position, Promotion, Quorums, Revoked, State, Timestamp,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -97,9 +97,13 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         Action::CompletePromotion { database, epoch } => {
             complete_promotion(state, now, database, epoch)
         }
-        Action::Tick => Ok(Applied::Ticked { at: now }),
+        Action::Tick => {
+            state.revocations.forget_through(now);
+            Ok(Applied::Ticked { at: now })
+        }
         Action::Drain { id } => drain(state, id),
         Action::TransferLease { database, target } => transfer_lease(state, now, database, target),
+        Action::RevokeToken { revoked, until } => revoke_token(state, now, revoked, until),
     }?;
     state.now = now;
     Ok(applied)
@@ -226,6 +230,14 @@ pub enum Applied {
     MemberDraining {
         /// The member's ID.
         id: NodeId,
+    },
+
+    /// A bearer token or signing key is on the denylist.
+    TokenRevoked {
+        /// The token or key.
+        revoked: Revoked,
+        /// When the entry may be forgotten: the later of this and any earlier revocation's.
+        until: Timestamp,
     },
 }
 
@@ -433,6 +445,15 @@ pub enum Rejection {
         id: NodeId,
         /// The database.
         database: DatabaseName,
+    },
+
+    /// A revocation would be forgotten at once: the token it names has already expired.
+    #[error("revocation of {revoked} ends at {until}, which has passed")]
+    RevocationPassed {
+        /// The token or key.
+        revoked: Revoked,
+        /// When the entry would have been forgotten.
+        until: Timestamp,
     },
 }
 
@@ -791,6 +812,15 @@ fn best_candidate(
         });
     };
     Ok((candidate.clone(), position.clone()))
+}
+
+fn revoke_token(state: &mut State, now: Timestamp, revoked: Revoked, until: Timestamp) -> Outcome {
+    if until <= now {
+        return Err(Rejection::RevocationPassed { revoked, until });
+    }
+    state.revocations.forget_through(now);
+    let until = state.revocations.insert(revoked.clone(), until);
+    Ok(Applied::TokenRevoked { revoked, until })
 }
 
 fn drain(state: &mut State, id: NodeId) -> Outcome {

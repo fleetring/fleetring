@@ -4,7 +4,7 @@
 use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
     Acks, Action, Command, ControlConfig, DatabaseName, Durability, Engine, HostedReplica,
-    LeaseEpoch, Member, Millis, Outcome, Position, Role, State, Timestamp, apply,
+    LeaseEpoch, Member, Millis, Outcome, Position, Revoked, Role, State, Timestamp, apply,
 };
 use proptest::prelude::*;
 
@@ -149,6 +149,16 @@ fn action(state: &State, op: Op) -> Action {
         // Drops are rare, so that databases live long enough to reach promotions.
         8 if b.is_multiple_of(10) => Action::DropDatabase { name: database },
         8 if b % 10 == 5 => Action::Drain { id: id(node) },
+        // Revocations of a few tokens and keys, some already past, so the list grows, shrinks
+        // with time, and rejects.
+        8 if b % 10 == 3 => Action::RevokeToken {
+            revoked: if a.is_multiple_of(4) {
+                Revoked::Key(format!("k{}", a % 3).parse().expect("valid key id"))
+            } else {
+                Revoked::Token(format!("t{}", a % 5).parse().expect("valid token id"))
+            },
+            until: at(state.now().as_millis() + u64::from(op.a) * 20).max(at(u64::from(op.b) * 10)),
+        },
         8 if b % 10 == 7 => Action::TransferLease {
             database,
             target: (b % 4 == 3).then(|| id(NODES[(a + 1) % NODES.len()])),
