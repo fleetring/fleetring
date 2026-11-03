@@ -4,7 +4,7 @@
 use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
     Acks, Action, Command, ControlConfig, DatabaseName, Durability, Engine, HostedReplica,
-    LeaseEpoch, Member, Millis, Outcome, Position, Revoked, Role, State, Timestamp, apply,
+    LeaseEpoch, Member, Millis, Outcome, Position, ReplicaRole, Revoked, State, Timestamp, apply,
 };
 use proptest::prelude::*;
 
@@ -75,7 +75,7 @@ pub(crate) fn heartbeat(node: &str, reports: &[(&str, &[u8])]) -> Action {
         replicas: reports
             .iter()
             .map(|(name, position)| {
-                HostedReplica::new(db(name), Role::Follower, Position::new(*position))
+                HostedReplica::new(db(name), ReplicaRole::Follower, Position::new(*position))
             })
             .collect(),
         unknown_reports: fleetring_control::UnknownReports::Skip,
@@ -184,14 +184,14 @@ fn action(state: &State, op: Op) -> Action {
                     let position = vec![op.b.rotate_left(u32::try_from(i).expect("small")), op.a];
                     // Some replicas report the epoch their log came from, as newer nodes do.
                     let log_epoch = LeaseEpoch::new(u64::from(op.a % 3));
-                    HostedReplica::new(db(name), Role::Follower, Position::new(position))
+                    HostedReplica::new(db(name), ReplicaRole::Follower, Position::new(position))
                         .with_log_epoch(log_epoch)
                 })
                 .collect();
             if b.is_multiple_of(11) {
                 replicas.push(HostedReplica::new(
                     db("missing"),
-                    Role::Follower,
+                    ReplicaRole::Follower,
                     Position::default(),
                 ));
             }

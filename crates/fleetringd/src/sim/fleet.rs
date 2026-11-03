@@ -31,7 +31,8 @@ use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
 use crate::sim::workload::{Ack, History, Operation, WRITES_TABLE, Workload};
 use crate::tls::{Authority, AuthorityError, FleetName, Identity, IdentityError, Validity};
 use crate::{
-    Config, ControlSettings, Membership, MembershipSettings, NodeConfig, ReplicationConfig, Role,
+    Config, ControlSettings, Membership, MembershipSettings, NodeConfig, NodeRole,
+    ReplicationConfig,
 };
 
 /// The port every simulated daemon listens on.
@@ -155,7 +156,7 @@ type Configure = Box<dyn Fn(&mut Config)>;
 /// Describes a [`Fleet`]: its seed, its hosts and their roles, and its timings.
 pub struct FleetBuilder {
     seed: u64,
-    hosts: Vec<(String, Role)>,
+    hosts: Vec<(String, NodeRole)>,
     timings: Timings,
     duration: Duration,
     operation_timeout: Duration,
@@ -191,7 +192,7 @@ impl FleetBuilder {
 
     /// Adds a host named `name` that runs `role`. The name is also the node's ID.
     #[must_use]
-    pub fn host(mut self, name: &str, role: Role) -> Self {
+    pub fn host(mut self, name: &str, role: NodeRole) -> Self {
         self.hosts.push((name.to_owned(), role));
         self
     }
@@ -199,19 +200,19 @@ impl FleetBuilder {
     /// Adds a host that runs only the control plane.
     #[must_use]
     pub fn control(self, name: &str) -> Self {
-        self.host(name, Role::Control)
+        self.host(name, NodeRole::Control)
     }
 
     /// Adds a host that only hosts data.
     #[must_use]
     pub fn data(self, name: &str) -> Self {
-        self.host(name, Role::Data)
+        self.host(name, NodeRole::Data)
     }
 
     /// Adds a host that runs both roles.
     #[must_use]
     pub fn both(self, name: &str) -> Self {
-        self.host(name, Role::Both)
+        self.host(name, NodeRole::Both)
     }
 
     /// Runs every host with `timings`.
@@ -395,7 +396,7 @@ fn workload_principal() -> crate::PrincipalConfig {
 
 fn host_config(
     name: &str,
-    role: Role,
+    role: NodeRole,
     data_dir: PathBuf,
     timings: Timings,
 ) -> Result<Config, SimError> {
@@ -446,7 +447,7 @@ fn host_config(
 #[derive(Debug, Clone)]
 struct HostInfo {
     name: String,
-    role: Role,
+    role: NodeRole,
     data_dir: PathBuf,
     config: Config,
 }
@@ -514,7 +515,7 @@ impl Fleet {
     fn add_host(
         &mut self,
         name: &str,
-        role: Role,
+        role: NodeRole,
         config: Config,
         identity: Identity,
         data_dir: PathBuf,

@@ -538,7 +538,7 @@ fn heartbeat_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> 
         replicas: vec![
             fleetring_control::HostedReplica::new(
                 db(database),
-                fleetring_control::Role::Follower,
+                fleetring_control::ReplicaRole::Follower,
                 Position::new(position),
             )
             .with_log_epoch(LeaseEpoch::new(log_epoch)),

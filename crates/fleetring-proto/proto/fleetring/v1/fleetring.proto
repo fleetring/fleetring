@@ -41,11 +41,11 @@ enum Acks {
   ACKS_LOCAL = 3;
 }
 
-// A database's role on the node that reports it.
-enum Role {
-  ROLE_UNSPECIFIED = 0;
-  ROLE_PRIMARY = 1;
-  ROLE_FOLLOWER = 2;
+// A replica's role: whether the node that reports it is the database's primary or a follower.
+enum ReplicaRole {
+  REPLICA_ROLE_UNSPECIFIED = 0;
+  REPLICA_ROLE_PRIMARY = 1;
+  REPLICA_ROLE_FOLLOWER = 2;
 }
 
 // ---- Control ----------------------------------------------------------------------------------
@@ -143,7 +143,7 @@ message JoinResponse {
 
 message DatabaseStatus {
   string database = 1;
-  Role role = 2;
+  ReplicaRole role = 2;
   // The epoch of the primary that wrote the last frames of this replica's log: the primary's
   // own epoch on a primary. Promotions rank logs by it before their positions.
   uint64 epoch = 3;
@@ -285,7 +285,7 @@ message Replica {
   optional string address = 2;
   bool live = 3;
   // What the member last reported for the database in a heartbeat, if it has.
-  Role reported_role = 4;
+  ReplicaRole reported_role = 4;
   optional bytes position = 5;
 }
 

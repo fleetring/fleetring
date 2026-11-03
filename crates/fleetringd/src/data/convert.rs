@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{
-    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, Revocations, Revoked, Role,
-    Timestamp,
+    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, ReplicaRole, Revocations,
+    Revoked, Timestamp,
 };
 use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
@@ -187,9 +187,9 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         .replicas
         .into_iter()
         .map(|replica| {
-            let reported_role = match proto::Role::try_from(replica.reported_role) {
-                Ok(proto::Role::Primary) => Some(Role::Primary),
-                Ok(proto::Role::Follower) => Some(Role::Follower),
+            let reported_role = match proto::ReplicaRole::try_from(replica.reported_role) {
+                Ok(proto::ReplicaRole::Primary) => Some(ReplicaRole::Primary),
+                Ok(proto::ReplicaRole::Follower) => Some(ReplicaRole::Follower),
                 _ => None,
             };
             Ok(ReplicaInfo {
@@ -223,9 +223,9 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
         .databases
         .into_iter()
         .map(|status| {
-            let role = match proto::Role::try_from(status.role) {
-                Ok(proto::Role::Primary) => Role::Primary,
-                Ok(proto::Role::Follower) => Role::Follower,
+            let role = match proto::ReplicaRole::try_from(status.role) {
+                Ok(proto::ReplicaRole::Primary) => ReplicaRole::Primary,
+                Ok(proto::ReplicaRole::Follower) => ReplicaRole::Follower,
                 _ => {
                     return Err(Status::internal(format!(
                         "the reply gives database {} no role",

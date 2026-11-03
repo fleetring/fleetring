@@ -60,7 +60,7 @@ pub struct Config {
     pub control: ControlSettings,
     /// Which roles this daemon runs.
     #[serde(default)]
-    pub role: Role,
+    pub role: NodeRole,
     /// How the data role runs its open databases.
     #[serde(default)]
     pub engine: EngineConfig,
@@ -489,7 +489,7 @@ impl Default for ControlSettings {
 /// Which roles a daemon runs (ADR-0015, point 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Role {
+pub enum NodeRole {
     /// Both roles in one process: a single-machine fleet.
     #[default]
     Both,
@@ -499,7 +499,7 @@ pub enum Role {
     Control,
 }
 
-impl Role {
+impl NodeRole {
     /// Whether this role hosts databases.
     #[must_use]
     pub fn hosts_data(self) -> bool {
@@ -594,7 +594,7 @@ impl Config {
     /// Whether the daemon has an identity is checked when it starts, because the environment
     /// may supply one; see [`Daemon::start_with`](crate::Daemon::start_with).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.role == Role::Data && self.control.address.is_none() {
+        if self.role == NodeRole::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
                 field: "control.address",
                 reason: "a data-only node must know the control node's address",
