@@ -7,9 +7,10 @@
 use std::fmt;
 
 use fleetring::NodeId;
-use fleetring_control::{DatabaseName, TokenId};
+use fleetring_control::{DatabaseName, KeyId, Timestamp, TokenId};
 
 use crate::auth::{Action, Scopes, Target};
+use crate::tls::Principal;
 
 /// What an RPC needs from its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +173,10 @@ pub enum Credential {
     Token {
         /// The token's ID, which audit lines name instead of the token.
         id: TokenId,
+        /// The key that signed it.
+        key: KeyId,
+        /// When it expires, which ends any stream opened with it.
+        expires_at: Timestamp,
     },
 }
 
@@ -184,7 +189,7 @@ pub enum Caller {
     /// A principal with its scopes.
     Principal {
         /// The principal's name.
-        name: String,
+        name: Principal,
         /// What it may do.
         scopes: Scopes,
         /// How it proved who it is.
@@ -371,7 +376,7 @@ mod tests {
 
     fn principal(scopes: &[&str]) -> Caller {
         Caller::Principal {
-            name: "app".to_owned(),
+            name: "app".parse().expect("a principal"),
             scopes: scopes
                 .iter()
                 .map(|scope| scope.parse().expect("a scope"))

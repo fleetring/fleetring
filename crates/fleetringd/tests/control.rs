@@ -21,6 +21,7 @@ use fleetring_proto::v1::{
     RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, Role,
     StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
+use fleetringd::auth::{AuthLayer, Authorizer};
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
     CommandLog, Committed, ControlClient, ControlHandle, ControlNode, ControlOptions,
@@ -63,12 +64,19 @@ fn secure_client(address: SocketAddr, tls: &Tls) -> Result<ControlClient, Box<dy
         .control_client(address.to_string()))
 }
 
+/// A client acting as the node `id`, with a certificate for it, as node-to-node calls need
+/// (ADR-0025).
+fn node_client(address: SocketAddr, tls: &Tls, id: &str) -> Result<ControlClient, Box<dyn Error>> {
+    Ok(tls.node_network(id)?.control_client(address.to_string()))
+}
+
 /// Serves `node` on a random local port.
 async fn serve(node: ControlHandle) -> Result<SocketAddr, Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(
         tonic::transport::Server::builder()
+            .layer(AuthLayer::new(Authorizer::plaintext()))
             .add_service(control_server(ControlService::new(node)))
             .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
     );
@@ -156,7 +164,9 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
     let control = secure_client(address, &tls)?;
 
     for id in ["a", "b", "c"] {
-        let joined = control.join(join_request(id)).await?;
+        let joined = node_client(address, &tls, id)?
+            .join(join_request(id))
+            .await?;
         assert_eq!(joined.protocol, Some(PROTOCOL_VERSION));
     }
     let mut updates = control
@@ -180,8 +190,9 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
     assert_eq!(placement.primary, None);
     assert_eq!(placement.followers.len(), 3);
     let primary = placement.followers[0].clone();
+    let as_primary = node_client(address, &tls, &primary)?;
 
-    let beat = control
+    let beat = as_primary
         .heartbeat(HeartbeatRequest {
             node_id: primary.clone(),
             databases: vec![DatabaseStatus {
@@ -194,14 +205,14 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         .await?;
     assert_eq!(beat.membership_epoch, 3);
 
-    let lease = control
+    let lease = as_primary
         .acquire_lease(AcquireLeaseRequest {
             database: "tenant:acme".into(),
             node_id: primary.clone(),
         })
         .await?;
     assert_eq!(lease.epoch, 1);
-    let renewed = control
+    let renewed = as_primary
         .renew_lease(RenewLeaseRequest {
             database: "tenant:acme".into(),
             node_id: primary.clone(),
@@ -243,7 +254,7 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         .await
         .expect_err("unknown database");
     assert_eq!(missing.code(), Code::NotFound, "{missing}");
-    let stale = control
+    let stale = as_primary
         .renew_lease(RenewLeaseRequest {
             database: "tenant:acme".into(),
             node_id: primary.clone(),
@@ -252,7 +263,7 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         .await
         .expect_err("stale epoch");
     assert_eq!(stale.code(), Code::FailedPrecondition, "{stale}");
-    let invalid = control
+    let invalid = as_primary
         .join(join_request("Not A Label"))
         .await
         .expect_err("invalid id");
@@ -310,9 +321,15 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
         tls.node_table("control-1")?
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
-    let control = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?;
-    for id in ["a", "b", "c"] {
-        control.join(join_request(id)).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    let control = secure_client(address, &tls)?;
+    let (a, b, c) = (
+        node_client(address, &tls, "a")?,
+        node_client(address, &tls, "b")?,
+        node_client(address, &tls, "c")?,
+    );
+    for (id, node) in [("a", &a), ("b", &b), ("c", &c)] {
+        node.join(join_request(id)).await?;
     }
     let database = "tenant:acme".to_owned();
     control
@@ -324,12 +341,11 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
             min_replicas: 0,
         })
         .await?;
-    control
-        .acquire_lease(AcquireLeaseRequest {
-            database: database.clone(),
-            node_id: "a".into(),
-        })
-        .await?;
+    a.acquire_lease(AcquireLeaseRequest {
+        database: database.clone(),
+        node_id: "a".into(),
+    })
+    .await?;
     // "a" stops renewing; "b" holds the longer log, from epoch 1's primary. The lease is long
     // enough that the timer doesn't supersede the promotion while the test drives it under load.
     let report = |node: &str, position: u8| HeartbeatRequest {
@@ -353,8 +369,8 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
     // The timer notices the expiry on its own and starts a promotion: no primary at epoch 2.
     let started = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
-            control.heartbeat(report("b", 2)).await?;
-            control.heartbeat(report("c", 1)).await?;
+            b.heartbeat(report("b", 2)).await?;
+            c.heartbeat(report("c", 1)).await?;
             let placement = locate().await?;
             if placement.epoch == 2 {
                 return Ok::<_, Status>(placement);
@@ -365,7 +381,7 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
     .await
     .map_err(|_| "no promotion started")??;
     assert_eq!(started.primary, None, "no primary while the promotion runs");
-    let busy = control
+    let busy = b
         .start_promotion(StartPromotionRequest {
             database: database.clone(),
         })
@@ -379,9 +395,9 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
         epoch: 2,
         position: vec![0, position],
     };
-    let first = control.record_fenced(fence("b", 2)).await?;
+    let first = b.record_fenced(fence("b", 2)).await?;
     assert_eq!((first.fenced, first.needed), (1, 2));
-    let early = control
+    let early = b
         .complete_promotion(CompletePromotionRequest {
             database: database.clone(),
             epoch: 2,
@@ -389,14 +405,14 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
         .await
         .expect_err("one fenced member is too few");
     assert_eq!(early.code(), Code::FailedPrecondition, "{early}");
-    let second = control.record_fenced(fence("c", 1)).await?;
+    let second = b.record_fenced(fence("c", 1)).await?;
     assert_eq!((second.fenced, second.needed), (2, 2));
-    let twice = control
+    let twice = b
         .record_fenced(fence("c", 1))
         .await
         .expect_err("fenced already");
     assert_eq!(twice.code(), Code::AlreadyExists, "{twice}");
-    let completed = control
+    let completed = b
         .complete_promotion(CompletePromotionRequest {
             database: database.clone(),
             epoch: 2,
@@ -927,9 +943,12 @@ async fn durability_settings_travel_through_the_control_service() -> TestResult 
     assert_eq!(config.replication.acks, fleetring_control::Acks::Local);
     assert_eq!(config.replication.min_replicas, None);
     let daemon = Daemon::start(config).await?;
-    let control = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    let control = secure_client(address, &tls)?;
     for id in ["a", "b", "c"] {
-        control.join(join_request(id)).await?;
+        node_client(address, &tls, id)?
+            .join(join_request(id))
+            .await?;
     }
     let create = |database: &str, acks: Acks, min_replicas: u32| CreateDatabaseRequest {
         database: database.into(),
@@ -1028,8 +1047,10 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
         tls.node_table("control-1")?
     );
     let daemon = Daemon::start(Config::from_toml(&text)?).await?;
-    let control = secure_client(daemon.control_address().ok_or("no control address")?, &tls)?;
-    control.join(join_request("a")).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    let control = secure_client(address, &tls)?;
+    let a = node_client(address, &tls, "a")?;
+    a.join(join_request("a")).await?;
     control
         .create_database(CreateDatabaseRequest {
             database: "known".into(),
@@ -1046,7 +1067,7 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
         position: vec![0, 7],
     };
     // The known report lands, the unknown one is named, and the node stays live.
-    let beat = control
+    let beat = a
         .heartbeat(HeartbeatRequest {
             node_id: "a".into(),
             databases: vec![status("ghost"), status("known")],

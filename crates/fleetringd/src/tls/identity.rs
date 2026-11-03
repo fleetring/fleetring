@@ -14,7 +14,10 @@ use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use x509_parser::oid_registry::OID_SIG_ED25519;
+use x509_parser::prelude::{FromDer as _, X509Certificate};
 
+use crate::auth::{TokenVerifier, VerifyingKey};
 use crate::tls::names::{ClusterName, NameError, SubjectUri};
 use crate::tls::{Issued, Peer};
 
@@ -99,6 +102,8 @@ pub(crate) struct Loaded {
     peer: Peer,
     server: Arc<ServerConfig>,
     client: Arc<ClientConfig>,
+    /// The trusted authorities' Ed25519 keys, which sign the bearer tokens nodes accept.
+    token_keys: Vec<VerifyingKey>,
     stamp: Stamp,
 }
 
@@ -129,6 +134,7 @@ impl Loaded {
             SubjectUri::Principal { name, .. } => Peer::Principal(name.clone()),
             _ => return Err(IdentityError::Authority),
         };
+        let token_keys = authorities.iter().filter_map(token_key).collect();
         let mut roots = RootCertStore::empty();
         for authority in authorities {
             roots.add(authority)?;
@@ -151,6 +157,7 @@ impl Loaded {
             peer,
             server: Arc::new(server),
             client: Arc::new(client),
+            token_keys,
             stamp,
         })
     }
@@ -180,6 +187,17 @@ impl Loaded {
     pub(crate) fn cluster(&self) -> &ClusterName {
         self.subject.cluster()
     }
+}
+
+/// The Ed25519 key of an authority certificate, which can sign tokens; `None` for an authority
+/// with another kind of key, such as one from an external certificate authority.
+fn token_key(certificate: &CertificateDer<'_>) -> Option<VerifyingKey> {
+    let (_, parsed) = X509Certificate::from_der(certificate.as_ref()).ok()?;
+    let key = parsed.public_key();
+    if key.algorithm.algorithm != OID_SIG_ED25519 {
+        return None;
+    }
+    VerifyingKey::from_raw(key.subject_public_key.as_ref())
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -282,6 +300,15 @@ impl Identity {
     #[must_use]
     pub fn cluster(&self) -> ClusterName {
         self.inner.loaded.load().subject.cluster().clone()
+    }
+
+    /// Returns what bearer tokens are checked against: this cluster, and the Ed25519 keys of
+    /// the trusted authorities, as of the last reload (ADR-0025). During an authority rotation
+    /// both authorities' tokens verify.
+    #[must_use]
+    pub fn token_verifier(&self) -> TokenVerifier {
+        let loaded = self.current();
+        TokenVerifier::new(loaded.cluster().as_str(), loaded.token_keys.iter().cloned())
     }
 
     /// The material in use, after checking the files for a change if a check is due.

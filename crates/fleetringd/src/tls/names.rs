@@ -118,6 +118,13 @@ impl fmt::Display for Principal {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Principal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// What a certificate names, as its `fleetring://` subject alternative name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

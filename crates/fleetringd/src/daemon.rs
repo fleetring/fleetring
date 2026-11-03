@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 
+use crate::auth::{AuthLayer, Authorizer};
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::reachable;
 use crate::control::{
@@ -194,6 +195,21 @@ impl Daemon {
         } else {
             None
         };
+        let authorizer =
+            Authorizer::new(&config.principals, network.security(), environment.clock());
+        // The control node's own state is the freshest denylist; a data-only node keeps the
+        // copy its heartbeats bring.
+        let authorizer = match (&control, &data) {
+            (Some(role), _) => authorizer.with_control(role.node.handle()),
+            (None, Some((role, _))) => authorizer.with_denylist(
+                role.membership.denylist().clone(),
+                config
+                    .membership
+                    .heartbeat_interval()
+                    .saturating_mul(DENYLIST_HEARTBEATS),
+            ),
+            (None, None) => authorizer,
+        };
         let server = serve(
             listener,
             address,
@@ -204,7 +220,10 @@ impl Daemon {
             }),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
-            network.security().clone(),
+            Guard {
+                security: network.security().clone(),
+                authorizer,
+            },
         );
         let data = data.map(|(role, _)| role);
         tracing::info!(
@@ -545,8 +564,21 @@ async fn bind(config: &Config, network: &Network) -> Result<(Listener, SocketAdd
     Ok((listener, address))
 }
 
-/// Serves on `listener`, with every connection authenticated under `security`: the `Control`
-/// service if `control` runs here, and the `Database` and `Replication` services if `data`
+/// How many heartbeat intervals a data node's token denylist may go without a fresh copy before
+/// the node refuses tokens: two lost heartbeats are tolerated, as in [`HEARTBEATS_PER_TIMEOUT`],
+/// and a node cut off for longer stops trusting tokens it can no longer check (ADR-0026).
+///
+/// [`HEARTBEATS_PER_TIMEOUT`]: crate::HEARTBEATS_PER_TIMEOUT
+const DENYLIST_HEARTBEATS: u32 = 3;
+
+/// Who may connect and what they may do: every connection is authenticated under `security`,
+/// and every request authorized by `authorizer` (ADR-0025).
+struct Guard {
+    security: Security,
+    authorizer: Authorizer,
+}
+
+/// Serves on `listener`, guarded by `guard`: the `Control` service if `control` runs here, and the `Database` and `Replication` services if `data`
 /// does. A node without the control role answers control calls with [`NoControl`], which names
 /// the control node at `control_address`.
 fn serve(
@@ -555,8 +587,12 @@ fn serve(
     control: Option<ControlService>,
     data: Option<&DataNode>,
     control_address: SocketAddr,
-    security: Security,
+    guard: Guard,
 ) -> RunningServer {
+    let Guard {
+        security,
+        authorizer,
+    } = guard;
     let (stop, stopped) = oneshot::channel::<()>();
     // A dropped sender also means stop.
     let shutdown = async {
@@ -564,6 +600,7 @@ fn serve(
     };
     let no_control = control.is_none();
     let router = Server::builder()
+        .layer(AuthLayer::new(authorizer))
         .add_optional_service(control.map(control_server))
         .add_optional_service(
             no_control.then(|| control_server(NoControl::new(control_address.to_string()))),

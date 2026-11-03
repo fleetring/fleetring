@@ -252,7 +252,7 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
         .await
         .expect_err("a principal can't fence");
     assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
-    assert!(refused.message().contains("tester"), "{refused}");
+    assert_eq!(refused.message(), "Fence needs a node certificate");
 
     // A node may, and gets the real answer: the fence lands on an empty replica.
     let node = tls.node_network("peer")?;
@@ -341,7 +341,7 @@ async fn rotated_certificates_are_picked_up_without_a_restart_while_a_stream_sta
         .to_string();
     let only_successor = Identity::from_issued(
         successor.certificate_pem(),
-        &successor.issue_client(&"fresh".parse()?, Tls::validity())?,
+        &successor.issue_client(&"tester".parse()?, Tls::validity())?,
     )?;
     let fresh = Client::new(
         address.to_string(),

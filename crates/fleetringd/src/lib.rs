@@ -31,7 +31,8 @@ pub mod transport;
 pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
     Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION,
-    MembershipSettings, NodeConfig, OnShutdown, Plaintext, ReplicationConfig, Role, TlsConfig,
+    MembershipSettings, NodeConfig, OnShutdown, Plaintext, PrincipalConfig, ReplicationConfig,
+    Role, TlsConfig, TokenForwarding,
 };
 pub use daemon::{Daemon, StartError};
 pub use data_dir::{DataDir, DataDirError};

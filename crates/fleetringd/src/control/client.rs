@@ -20,7 +20,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
 
 use crate::control::redirect::leader_hint;
-use crate::transport::{Backoff, TransportConfig, control_client, retry};
+use crate::transport::{
+    Backoff, CredentialedChannel, Credentials, TransportConfig, control_client_with, retry,
+};
 
 /// How many redirects one attempt follows before it gives up and lets retries take over.
 const MAX_REDIRECTS: usize = 4;
@@ -47,6 +49,7 @@ pub struct ControlClient {
 
 struct Shared {
     connect: Box<Connect>,
+    credentials: Credentials,
     leader: Mutex<String>,
     channels: Mutex<BTreeMap<String, Channel>>,
 }
@@ -84,11 +87,25 @@ impl ControlClient {
         Self {
             shared: Arc::new(Shared {
                 connect: Box::new(connect),
+                credentials: Credentials::none(),
                 leader: Mutex::new(address.into()),
                 channels: Mutex::new(BTreeMap::new()),
             }),
             backoff: Backoff::default(),
         }
+    }
+
+    /// Sends `credentials`, such as a bearer token, with every call.
+    ///
+    /// # Panics
+    ///
+    /// If the client is already shared with a clone; set credentials before cloning.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("credentials are set before the client is cloned")
+            .credentials = credentials;
+        self
     }
 
     /// Retries idempotent calls with `backoff` instead of the default.
@@ -178,7 +195,7 @@ impl ControlClient {
         &self,
         request: CreateDatabaseRequest,
     ) -> Result<CreateDatabaseResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.create_database(request).await }
         })
@@ -194,7 +211,7 @@ impl ControlClient {
         &self,
         request: ChangeDurabilityRequest,
     ) -> Result<ChangeDurabilityResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.change_durability(request).await }
         })
@@ -211,7 +228,7 @@ impl ControlClient {
         &self,
         request: DropDatabaseRequest,
     ) -> Result<DropDatabaseResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.drop_database(request).await }
         })
@@ -253,7 +270,7 @@ impl ControlClient {
         &self,
         request: AcquireLeaseRequest,
     ) -> Result<LeaseResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.acquire_lease(request).await }
         })
@@ -279,7 +296,7 @@ impl ControlClient {
     ///
     /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
     pub async fn leave(&self, request: LeaveRequest) -> Result<LeaveResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.leave(request).await }
         })
@@ -295,7 +312,7 @@ impl ControlClient {
         &self,
         request: StartPromotionRequest,
     ) -> Result<PromotionResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.start_promotion(request).await }
         })
@@ -328,7 +345,7 @@ impl ControlClient {
         &self,
         request: CompletePromotionRequest,
     ) -> Result<CompletePromotionResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.complete_promotion(request).await }
         })
@@ -359,7 +376,7 @@ impl ControlClient {
         &self,
         request: TransferLeaseRequest,
     ) -> Result<PromotionResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.transfer_lease(request).await }
         })
@@ -376,7 +393,7 @@ impl ControlClient {
         &self,
         request: RevokeTokenRequest,
     ) -> Result<RevokeTokenResponse, Status> {
-        self.following(&|mut client: GrpcControlClient<Channel>| {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.revoke_token(request).await }
         })
@@ -385,7 +402,7 @@ impl ControlClient {
 
     async fn retrying<T, F, Fut>(&self, call: F) -> Result<T, Status>
     where
-        F: Fn(GrpcControlClient<Channel>) -> Fut,
+        F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
         retry(self.backoff, || self.following(&call)).await
@@ -394,7 +411,7 @@ impl ControlClient {
     /// Calls the current leader, and follows up to [`MAX_REDIRECTS`] redirects.
     async fn following<T, F, Fut>(&self, call: &F) -> Result<T, Status>
     where
-        F: Fn(GrpcControlClient<Channel>) -> Fut,
+        F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
         let mut redirects = 0;
@@ -413,7 +430,7 @@ impl ControlClient {
         }
     }
 
-    fn current(&self) -> Result<GrpcControlClient<Channel>, Status> {
+    fn current(&self) -> Result<GrpcControlClient<CredentialedChannel>, Status> {
         let leader = self.leader();
         let mut channels = self
             .shared
@@ -421,13 +438,16 @@ impl ControlClient {
             .lock()
             .expect("control client lock poisoned");
         if let Some(channel) = channels.get(&leader) {
-            return Ok(control_client(channel.clone()));
+            return Ok(control_client_with(
+                channel.clone(),
+                &self.shared.credentials,
+            ));
         }
         let channel = (self.shared.connect)(&leader).map_err(|error| {
             Status::unavailable(format!("can't reach control node {leader}: {error}"))
         })?;
         channels.insert(leader, channel.clone());
-        Ok(control_client(channel))
+        Ok(control_client_with(channel, &self.shared.credentials))
     }
 
     fn set_leader(&self, leader: String) {

@@ -24,6 +24,11 @@ pub(crate) const HOST: &str = "127.0.0.1";
 /// The principal the tests' clients act as.
 pub(crate) const PRINCIPAL: &str = "tester";
 
+/// The `[[principal]]` entry every test daemon gets: [`PRINCIPAL`] may administer, write, read,
+/// and stream every database, and run the cluster operations.
+pub(crate) const OPERATOR: &str =
+    "\n[[principal]]\nname = \"tester\"\nscopes = [\"admin:*\", \"stream:*\", \"cluster\"]\n";
+
 /// A certificate authority written under a test's directory.
 #[derive(Debug)]
 pub(crate) struct Tls {
@@ -81,10 +86,11 @@ impl Tls {
         Ok(self.table(&stem))
     }
 
-    /// The `[tls]` table naming `<stem>.crt` and `<stem>.key` in the authority's directory.
+    /// The `[tls]` table naming `<stem>.crt` and `<stem>.key` in the authority's directory,
+    /// followed by the [`OPERATOR`] `[[principal]]` entry.
     pub(crate) fn table(&self, stem: &str) -> String {
         format!(
-            "\n[tls]\nca = {:?}\ncert = {:?}\nkey = {:?}\n",
+            "\n[tls]\nca = {:?}\ncert = {:?}\nkey = {:?}\n{OPERATOR}",
             self.dir.join("ca.crt"),
             self.dir.join(format!("{stem}.crt")),
             self.dir.join(format!("{stem}.key")),

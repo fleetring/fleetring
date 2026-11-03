@@ -273,7 +273,7 @@ impl ClusterBuilder {
         let cluster_name: ClusterName = CLUSTER
             .parse()
             .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?;
-        let authority = Authority::create(cluster_name, certificate_validity())?;
+        let authority = Arc::new(Authority::create(cluster_name, certificate_validity())?);
         let mut cluster = Cluster {
             sim,
             authority,
@@ -346,8 +346,30 @@ impl ClusterBuilder {
 }
 
 /// The validity of every certificate the test authority issues; see [`CERTIFICATE_LIFETIME`].
-fn certificate_validity() -> Validity {
+pub(super) fn certificate_validity() -> Validity {
     Validity::new(Timestamp::from_millis(0), CERTIFICATE_LIFETIME)
+}
+
+/// The principal every simulated client acts as. Every host's configuration lets it do all a
+/// principal may: administer, write, read, and stream every database, and run cluster
+/// operations (ADR-0025).
+pub(super) const WORKLOAD_PRINCIPAL: &str = "workload";
+
+fn workload_principal() -> crate::PrincipalConfig {
+    crate::PrincipalConfig {
+        name: WORKLOAD_PRINCIPAL
+            .parse()
+            .unwrap_or_else(|error| panic!("'{WORKLOAD_PRINCIPAL}' is not a principal: {error}")),
+        scopes: ["admin:*", "stream:*", "cluster"]
+            .into_iter()
+            .map(|scope| {
+                scope
+                    .parse()
+                    .unwrap_or_else(|error| panic!("'{scope}' is not a scope: {error}"))
+            })
+            .collect(),
+        forward_tokens: crate::TokenForwarding::Refused,
+    }
 }
 
 fn host_config(
@@ -395,6 +417,7 @@ fn host_config(
         changes: ChangesConfig::default(),
         tls: None,
         insecure_plaintext: crate::Plaintext::Refused,
+        principals: vec![workload_principal()],
     })
 }
 
@@ -418,7 +441,7 @@ pub struct Cluster {
     // Dropped first: hosts close their files before the data directories go.
     sim: turmoil::Sim<'static>,
     /// The authority every host's and client's certificate chains to.
-    authority: Authority,
+    authority: Arc<Authority>,
     seed: u64,
     operation_timeout: Duration,
     rng: SimRng,
@@ -624,15 +647,16 @@ impl Cluster {
         self.add_client(name, Some(format!("{entry}:{PORT}")), workload);
     }
 
-    /// Issues a client certificate for the principal `name` from the cluster's authority.
+    /// Issues the client `name` a certificate for the principal [`WORKLOAD_PRINCIPAL`] from the
+    /// cluster's authority.
     ///
     /// # Panics
     ///
-    /// If `name` isn't a valid principal name, or the authority can't issue for it.
+    /// If the authority can't issue the certificate.
     fn client_identity(&self, name: &str) -> Identity {
-        let principal = name
+        let principal = WORKLOAD_PRINCIPAL
             .parse()
-            .unwrap_or_else(|error| panic!("client '{name}' is not a principal name: {error}"));
+            .unwrap_or_else(|error| panic!("'{WORKLOAD_PRINCIPAL}' is not a principal: {error}"));
         let issued = self
             .authority
             .issue_client(&principal, certificate_validity())
@@ -670,6 +694,7 @@ impl Cluster {
             timeout: self.operation_timeout,
             shared,
             identity,
+            authority: Arc::clone(&self.authority),
         };
         self.sim
             .client(name, run_client(session, Box::new(workload), rng));

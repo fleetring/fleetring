@@ -27,7 +27,7 @@ use crate::data::redirect::primary_hint;
 use crate::engine::{Position, Rows, Statement};
 use crate::environment::Network;
 use crate::replication::{ChainHash, LeaseEvent};
-use crate::transport::{Backoff, database_client};
+use crate::transport::{Backoff, CredentialedChannel, database_client_with};
 
 /// How many redirects one request follows before it gives up.
 const MAX_REDIRECTS: usize = 4;
@@ -673,7 +673,7 @@ impl Client {
     /// Calls `call` on the database's primary, or on the entry node, following redirects.
     async fn on_primary<T, F, Fut>(&self, name: &DatabaseName, call: F) -> Result<T, Status>
     where
-        F: Fn(DatabaseClient<Channel>) -> Fut,
+        F: Fn(DatabaseClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
         let start = match &self.entry {
@@ -689,7 +689,7 @@ impl Client {
     /// Calls the node at `start`, and follows up to [`MAX_REDIRECTS`] redirects.
     async fn following<T, F, Fut>(&self, start: String, call: F) -> Result<T, Status>
     where
-        F: Fn(DatabaseClient<Channel>) -> Fut,
+        F: Fn(DatabaseClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
         let mut address = start;
@@ -709,17 +709,20 @@ impl Client {
         }
     }
 
-    fn database(&self, address: &str) -> Result<DatabaseClient<Channel>, Status> {
+    fn database(&self, address: &str) -> Result<DatabaseClient<CredentialedChannel>, Status> {
         let mut channels = self.channels.lock().expect("client channel lock poisoned");
         if let Some(channel) = channels.get(address) {
-            return Ok(database_client(channel.clone()));
+            return Ok(database_client_with(
+                channel.clone(),
+                self.network.credentials(),
+            ));
         }
         let channel = self
             .network
             .channel(address)
             .map_err(|error| Status::unavailable(format!("can't reach {address}: {error}")))?;
         channels.insert(address.to_owned(), channel.clone());
-        Ok(database_client(channel))
+        Ok(database_client_with(channel, self.network.credentials()))
     }
 }
 
