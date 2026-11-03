@@ -13,7 +13,8 @@ use fleetring_proto::v1::{
     HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
     LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
     MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
+    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
+    TransferLeaseRequest, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
@@ -361,6 +362,23 @@ impl ControlClient {
         self.following(&|mut client: GrpcControlClient<Channel>| {
             let request = request.clone();
             async move { client.transfer_lease(request).await }
+        })
+        .await
+    }
+
+    /// Revokes a bearer token or signing key. Sent once per leader; repeating a revocation is
+    /// harmless, so a caller may retry it.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached.
+    pub async fn revoke_token(
+        &self,
+        request: RevokeTokenRequest,
+    ) -> Result<RevokeTokenResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<Channel>| {
+            let request = request.clone();
+            async move { client.revoke_token(request).await }
         })
         .await
     }

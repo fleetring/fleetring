@@ -8,7 +8,7 @@ use std::sync::Arc;
 use fleetring::{ReplicationFactor, Weight};
 use fleetring_control::{
     Acks, Action, Applied, DatabaseName, Durability, Engine, HostedReplica, Lease, LeaseEpoch,
-    Liveness, Member, Position, Rejection, Role, State,
+    Liveness, Member, Millis, Position, Rejection, Revoked, Role, State,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
@@ -18,7 +18,8 @@ use fleetring_proto::v1::{
     HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
     LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
     MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
+    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
+    TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -26,8 +27,12 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
+use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
-use crate::data::convert::{acks_from_proto, acks_to_proto};
+use crate::data::convert::{
+    acks_from_proto, acks_to_proto, revocation_from_proto, revocations_to_proto,
+};
 use crate::tls::Peer;
 
 /// The stream `WatchMembership` returns.
@@ -77,6 +82,7 @@ impl DurabilityDefaults {
 pub struct ControlService {
     node: ControlHandle,
     defaults: DurabilityDefaults,
+    clock: Arc<dyn Clock>,
 }
 
 impl ControlService {
@@ -87,7 +93,16 @@ impl ControlService {
         Self {
             node,
             defaults: DurabilityDefaults::new(),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Reads the time from `clock`, which bounds how long a token's revocation is kept; the
+    /// system clock by default.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Creates databases whose creation names no durability with `defaults`.
@@ -399,10 +414,11 @@ impl Control for ControlService {
                 Applied::MemberJoined {
                     membership_epoch, ..
                 },
-                _,
+                state,
             ) => Ok(Response::new(JoinResponse {
                 protocol: Some(PROTOCOL_VERSION),
                 membership_epoch: membership_epoch.get(),
+                revocations: revocations_to_proto(state.revocations()),
             })),
             (other, _) => Err(unexpected(&other)),
         }
@@ -438,6 +454,7 @@ impl Control for ControlService {
         Ok(Response::new(HeartbeatResponse {
             membership_epoch: state.membership_epoch().get(),
             unknown_databases,
+            revocations: revocations_to_proto(state.revocations()),
         }))
     }
 
@@ -760,6 +777,38 @@ impl Control for ControlService {
                 epoch: epoch.get(),
                 candidate: candidate.to_string(),
             })),
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn revoke_token(
+        &self,
+        request: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
+        let revocation = request
+            .into_inner()
+            .revocation
+            .ok_or_else(|| Status::invalid_argument("missing revocation"))?;
+        let (revoked, until) = revocation_from_proto(revocation)?;
+        // No token outlives this, so keeping a token's entry longer only grows the list. A key's
+        // entry may last forever.
+        let until = match revoked {
+            Revoked::Token(_) => until.min(
+                self.clock.now().saturating_add(Millis::new(
+                    u64::try_from(MAX_TOKEN_LIFETIME.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(NOT_BEFORE_LEEWAY_SECS * 1_000),
+                )),
+            ),
+            Revoked::Key(_) => until,
+        };
+        match self.submit(Action::RevokeToken { revoked, until }).await? {
+            (Applied::TokenRevoked { revoked, until }, _) => {
+                tracing::info!(%revoked, until = until.as_millis(), "revoked");
+                Ok(Response::new(RevokeTokenResponse {
+                    until_ms: until.as_millis(),
+                }))
+            }
             (other, _) => Err(unexpected(&other)),
         }
     }

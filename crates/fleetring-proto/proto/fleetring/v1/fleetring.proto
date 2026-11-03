@@ -82,6 +82,10 @@ service Control {
   // lease to expire: starts a promotion at the next epoch whose candidate is the named target,
   // or the most advanced live follower. The candidate completes it as after an expiry.
   rpc TransferLease(TransferLeaseRequest) returns (PromotionResponse);
+  // Adds a bearer token, or every token a signing key issued, to the denylist every node checks
+  // before it trusts a token (ADR-0025). Data nodes learn the list from their heartbeat replies,
+  // so a revocation reaches every live node within one heartbeat interval.
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
 }
 
 message JoinRequest {
@@ -92,6 +96,10 @@ message JoinRequest {
 message JoinResponse {
   ProtocolVersion protocol = 1;
   uint64 membership_epoch = 2;
+  // Every revoked token and signing key the control plane lists, as in `HeartbeatResponse`, so
+  // a node that starts has a denylist before its first heartbeat. Empty from a control node that
+  // predates the field.
+  repeated Revocation revocations = 3;
 }
 
 message DatabaseStatus {
@@ -113,6 +121,30 @@ message HeartbeatResponse {
   // Reported databases the control plane doesn't know. Their reports were left out; the rest of
   // the heartbeat counted.
   repeated string unknown_databases = 2;
+  // Every revoked token and signing key the control plane lists, in order. Empty from a control
+  // node that predates the field.
+  repeated Revocation revocations = 3;
+}
+
+// A token or signing key on the denylist, and when the entry may be forgotten.
+message Revocation {
+  oneof revoked {
+    // A token's `jti`.
+    string token_id = 1;
+    // A signing key's `kid`: every token it signed.
+    string key_id = 2;
+  }
+  // Milliseconds since the Unix epoch; the maximum value means never.
+  uint64 until_ms = 3;
+}
+
+message RevokeTokenRequest {
+  Revocation revocation = 1;
+}
+
+message RevokeTokenResponse {
+  // When the entry will be forgotten: the later of this request's and any earlier revocation's.
+  uint64 until_ms = 1;
 }
 
 message WatchMembershipRequest {

@@ -9,7 +9,8 @@ use fleetring_proto::v1::{
     HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
     LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
     PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
-    StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
+    RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
+    WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -140,6 +141,13 @@ impl Control for NoControl {
         &self,
         _: Request<TransferLeaseRequest>,
     ) -> Result<Response<PromotionResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn revoke_token(
+        &self,
+        _: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
         self.refuse()
     }
 }
