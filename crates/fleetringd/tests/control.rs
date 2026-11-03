@@ -309,6 +309,83 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
     Ok(())
 }
 
+/// Why one attempt to drive a promotion to its end stopped.
+#[derive(Debug)]
+enum Attempt {
+    /// The control node started a promotion at a newer epoch meanwhile, so this one's calls are
+    /// refused as stale.
+    Superseded(Status),
+    /// Anything else, which is a failure.
+    Failed(Status),
+}
+
+impl From<Status> for Attempt {
+    fn from(status: Status) -> Self {
+        if status.code() == Code::FailedPrecondition && status.message().contains("is stale") {
+            Self::Superseded(status)
+        } else {
+            Self::Failed(status)
+        }
+    }
+}
+
+/// Drives the promotion of `database` at `epoch` to its end through candidate `b`, which also
+/// reports the fences of `c`, checking each step's answer along the way.
+async fn promote(
+    b: &ControlClient,
+    database: &str,
+    epoch: u64,
+) -> Result<CompletePromotionResponse, Attempt> {
+    // A promotion in progress refuses another start. One that stalled is replaced by it, which
+    // is the control node's supersession seen from here.
+    match b
+        .start_promotion(StartPromotionRequest {
+            database: database.to_owned(),
+        })
+        .await
+    {
+        Err(busy) if busy.code() == Code::FailedPrecondition => {}
+        Err(other) => return Err(other.into()),
+        Ok(_) => {
+            return Err(Attempt::Superseded(Status::failed_precondition(
+                "a promotion that had stalled was replaced",
+            )));
+        }
+    }
+    let fence = |node: &str, position: u8| RecordFencedRequest {
+        database: database.to_owned(),
+        node_id: node.into(),
+        epoch,
+        position: vec![0, position],
+    };
+    let complete = || CompletePromotionRequest {
+        database: database.to_owned(),
+        epoch,
+    };
+    let first = b.record_fenced(fence("b", 2)).await?;
+    assert_eq!((first.fenced, first.needed), (1, 2));
+    let early = b
+        .complete_promotion(complete())
+        .await
+        .expect_err("one fenced member is too few");
+    if early.code() != Code::FailedPrecondition {
+        return Err(Attempt::Failed(early));
+    }
+    if early.message().contains("is stale") {
+        return Err(Attempt::Superseded(early));
+    }
+    let second = b.record_fenced(fence("c", 1)).await?;
+    assert_eq!((second.fenced, second.needed), (2, 2));
+    let twice = b
+        .record_fenced(fence("c", 1))
+        .await
+        .expect_err("fenced already");
+    if twice.code() != Code::AlreadyExists {
+        return Err(Attempt::from(twice));
+    }
+    Ok(b.complete_promotion(complete()).await?)
+}
+
 #[tokio::test]
 async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_leaves() -> TestResult
 {
@@ -366,63 +443,38 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
             .placement
             .ok_or_else(|| Status::internal("no placement"))
     };
-    // The timer notices the expiry on its own and starts a promotion: no primary at epoch 2.
-    let started = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    // The timer notices the expiry on its own and starts a promotion: no primary until it
+    // completes. The control node supersedes a promotion that stalls for a lease duration, with a
+    // new one at the next epoch, which a loaded runner can cause between two of the calls below
+    // (the daemon shares this test's one thread, and every command is fsynced). So the steps run
+    // as one attempt at the epoch now in force, and start over if that promotion was superseded.
+    let (epoch, completed) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             b.heartbeat(report("b", 2)).await?;
             c.heartbeat(report("c", 1)).await?;
-            let placement = locate().await?;
-            if placement.epoch == 2 {
-                return Ok::<_, Status>(placement);
+            let started = locate().await?;
+            if started.epoch < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(started.primary, None, "no primary while the promotion runs");
+            let epoch = started.epoch;
+            match promote(&b, &database, epoch).await {
+                Ok(completed) => return Ok::<_, Status>((epoch, completed)),
+                Err(Attempt::Superseded(status)) => {
+                    eprintln!("the promotion at epoch {epoch} was superseded: {status}");
+                }
+                Err(Attempt::Failed(status)) => return Err(status),
+            }
         }
     })
     .await
-    .map_err(|_| "no promotion started")??;
-    assert_eq!(started.primary, None, "no primary while the promotion runs");
-    let busy = b
-        .start_promotion(StartPromotionRequest {
-            database: database.clone(),
-        })
-        .await
-        .expect_err("already in progress");
-    assert_eq!(busy.code(), Code::FailedPrecondition, "{busy}");
-
-    let fence = |node: &str, position: u8| RecordFencedRequest {
-        database: database.clone(),
-        node_id: node.into(),
-        epoch: 2,
-        position: vec![0, position],
-    };
-    let first = b.record_fenced(fence("b", 2)).await?;
-    assert_eq!((first.fenced, first.needed), (1, 2));
-    let early = b
-        .complete_promotion(CompletePromotionRequest {
-            database: database.clone(),
-            epoch: 2,
-        })
-        .await
-        .expect_err("one fenced member is too few");
-    assert_eq!(early.code(), Code::FailedPrecondition, "{early}");
-    let second = b.record_fenced(fence("c", 1)).await?;
-    assert_eq!((second.fenced, second.needed), (2, 2));
-    let twice = b
-        .record_fenced(fence("c", 1))
-        .await
-        .expect_err("fenced already");
-    assert_eq!(twice.code(), Code::AlreadyExists, "{twice}");
-    let completed = b
-        .complete_promotion(CompletePromotionRequest {
-            database: database.clone(),
-            epoch: 2,
-        })
-        .await?;
-    assert_eq!(completed.lease.map(|lease| lease.epoch), Some(2));
+    .map_err(|_| "no promotion completed")??;
+    assert_eq!(completed.lease.map(|lease| lease.epoch), Some(epoch));
     assert_eq!(completed.adopted, vec![0, 2]);
     let promoted = locate().await?;
     assert_eq!(promoted.primary.as_deref(), Some("b"));
-    assert_eq!(promoted.epoch, 2);
+    assert_eq!(promoted.epoch, epoch);
 
     let left = control
         .leave(LeaveRequest {
