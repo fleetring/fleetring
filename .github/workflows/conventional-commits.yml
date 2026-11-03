@@ -37,4 +37,9 @@ jobs:
               echo "::error::Bad commit message: $subject"; exit 1
             fi
           done || fail=1
+          refs_pattern='^Refs: (FR-[0-9]{3,}|#[0-9]+)(, (FR-[0-9]{3,}|#[0-9]+))*$'
+          bad_refs=$(git log --no-merges --format=%B "$range" | grep '^Refs:' | grep -Ev "$refs_pattern" | head -n1 || true)
+          if [ -n "$bad_refs" ]; then
+            echo "::error::A Refs trailer lists issues as FR-NNN or #N, comma-separated: $bad_refs"; fail=1
+          fi
           exit $fail

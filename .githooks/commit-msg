@@ -18,3 +18,13 @@ if ! printf '%s' "$first_line" | grep -Eq "$pattern"; then
   echo "  got:  $first_line" >&2
   exit 1
 fi
+
+# A Refs trailer, if present, names issues as FR-NNN or #N, comma-separated.
+refs_pattern='^Refs: (FR-[0-9]{3,}|#[0-9]+)(, (FR-[0-9]{3,}|#[0-9]+))*$'
+bad_refs=$(grep '^Refs:' "$msg_file" | grep -Ev "$refs_pattern" | head -n1)
+if [ -n "$bad_refs" ]; then
+  echo "✖ A Refs trailer lists issues as FR-NNN or #N, comma-separated:" >&2
+  echo "    Refs: FR-049, #52" >&2
+  echo "  got:  $bad_refs" >&2
+  exit 1
+fi
