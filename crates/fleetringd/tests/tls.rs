@@ -436,6 +436,29 @@ fn cert_init_names_the_fleet_and_refuses_the_old_flag() -> TestResult {
     assert!(String::from_utf8(created.stdout)?.contains("for fleet home"));
     assert_eq!(Authority::load(dir.path())?.fleet().as_str(), "home");
 
+    let node = std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+        .args([
+            "cert",
+            "node",
+            "node-1",
+            "--addresses",
+            "127.0.0.1,node-1.lan",
+        ])
+        .arg("--dir")
+        .arg(dir.path())
+        .output()?;
+    assert!(node.status.success(), "{node:?}");
+    assert!(
+        String::from_utf8(node.stdout)?
+            .contains("issued fleetring://home/node/node-1 for 127.0.0.1, node-1.lan")
+    );
+    let identity = Identity::load(
+        &dir.path().join("ca.crt"),
+        &dir.path().join("node.node-1.crt"),
+        &dir.path().join("node.node-1.key"),
+    )?;
+    assert_eq!(identity.fleet().as_str(), "home");
+
     let refused = run("--cluster")?;
     assert_eq!(refused.status.code(), Some(2), "a usage error: {refused:?}");
     assert!(String::from_utf8(refused.stderr)?.contains("unexpected argument '--cluster'"));
