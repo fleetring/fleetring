@@ -1,7 +1,7 @@
 ---
 id: FR-050
 title: Bind node-to-node calls to placement, so a stolen node key reaches only its own databases
-status: in-progress
+status: done
 priority: P1
 size: M
 milestone: M10 Security
@@ -186,3 +186,4 @@ Start once FR-047 has merged and ADR-0031 is accepted. Each step is about one co
   - **Step 5, simulation:** `ClusterBuilder::impostor`, `Operation::ImpostorReplicate`/`ImpostorFence`/`ImpostorSnapshot` (the snapshot and the fence carry an epoch and a candidate, which the requests need), `Ack::Refused` and `Ack::Served` (an impostor's answer is recorded as acknowledged so that a `Script` doesn't retry it; `Served` is the violation), `check::impostor_refused`, `Invariant::NodeCallsBound`, `Cluster::binding_refusals`, and `Cluster::assert_no_binding_refusals`, which `Cluster::finish` now runs for every cluster without impostors instead of each scenario calling it. `tests/sim/binding.rs` has both named scenarios; the impostor's attack is a small workload in the test that repeats its calls every 200 ms for 3 s, and it also checks that each node's refusal count equals the impostor's refused calls to it, so no legitimate call was refused. Both run on `seeds::FIXED_HEAVY` rather than `FIXED` to keep CI time down. `Cluster::await_replicas_converged` compares every data host, which holds only while every data host is a replica, so the two scenarios compare the database's replica set instead; a replica a membership change moves away keeps its stale copy, which is existing behavior outside this ticket.
   - **Step 6, documentation:** the daemon README's binding column and paragraph, the one `SECURITY.md` sentence that said FR-050 was pending, ADR-0031's amendment, and this ticket. FR-048's threat model states the blast radius in full.
   - **Gates and timing:** fmt, clippy, the workspace tests, rustdoc, and both MSRV checks pass locally, and the simulation passes in every local run, including one built with `--cfg tokio_unstable` as CI's simulation job builds it (29 tests, exact replay). Measured on a shared machine where wall time swung by 4x with other load, the simulation's CPU time went from 133 s (27 tests, `main`) to 162 s (29 tests): 145 s for the existing scenarios, about 9 % more, for the `Locate` each replica makes when it first sees an epoch, and 18 s for the two new ones. On the quietest runs, wall time went from 151–155 s to 193–201 s.
+- 2026-11-03: Merged in PR #44; status is done.

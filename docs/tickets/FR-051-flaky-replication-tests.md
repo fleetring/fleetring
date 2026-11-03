@@ -36,7 +36,7 @@ The ticket was opened for the first three entries; later CI runs added the other
 
 - [x] Each is either fixed with its cause stated in the commit, or shown to be a test-only race and fixed in the test.
 - [x] Each test passes 200 runs in a row locally (macOS; the Windows runs can't be reproduced here).
-- [ ] None of them needs a rerun across ten consecutive CI runs on `main`.
+- [ ] None of them needs a rerun across ten consecutive pull requests whose CI needs no re-run for these tests.
 
 ## Progress
 
@@ -71,4 +71,4 @@ ADR-0026 says clients must treat `UNAVAILABLE` from a data node as retryable. Th
 
 ### Still to do
 
-- Ten consecutive green CI runs on `main` after the merge (the last acceptance criterion).
+- Ten consecutive pull requests whose CI needs no re-run for these tests (the last acceptance criterion). Pushes to `main` now run only the cache build, so pull requests are where these tests run.
