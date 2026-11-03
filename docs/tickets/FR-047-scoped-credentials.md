@@ -1,7 +1,7 @@
 ---
 id: FR-047
 title: Principals and scopes: tokens and prefix rules enforced at every RPC
-status: todo
+status: in-progress
 priority: P0
 size: L
 milestone: M10 Security
@@ -32,3 +32,9 @@ With FR-046 every caller is identified: a node by its ID, a client by the princi
 - [ ] A principal limited to `read:tenant:acme/*` can query that database and is refused on write, on another prefix, and on every admin and cluster operation, through both a client certificate and a token.
 - [ ] Token verification needs no network or control round trip, and a revoked token is refused on every node within one heartbeat interval of the revocation command.
 - [ ] `deploy/fleetringd.toml` documents `[[principal]]`, the README walkthrough issues a token for the application step, and `SECURITY.md` links the scope table.
+
+## Progress
+
+- 2026-11-02: Started on top of FR-046.
+  - **Scope policy (`fleetringd::auth`, pure):** `Action` (`read`, `write`, `admin`, `stream`) with `Action::covers` encoding the implications (write covers read, admin covers both, stream stands alone); `Scope` parsed from `<action>:<pattern>` (split at the first `:`, so keys may hold colons) or the bare word `cluster`, the pattern being the change sinks' `DatabaseMatcher`; `Scopes::allows(Target)` where `Target` is `Key(action, &key)` or `Cluster`; default deny. `admin:*` does not imply `cluster`, and `cluster` grants no key. Unit tests cover every implication, prefix versus exact patterns, parsing and printing, and JSON round trips.
+  - **Revocation (`fleetring-control`, additive):** `Action::RevokeToken { revoked: Revoked::Token(TokenId) | Revoked::Key(KeyId), until }` puts an ID on `State::revocations` until `until` (the token's expiry, or `Timestamp::MAX` for a key); revoking again keeps the later time; one whose `until` has passed is rejected as `RevocationPassed`; ticks and revocations forget the entries the time has passed. The state serializes the list only when it isn't empty, so earlier snapshots and logs are unchanged. The replay generator now emits revocations and `the_generated_log_exercises_every_kind_of_change` requires them.
