@@ -1,5 +1,6 @@
 //! Daemon configuration: a TOML file, optionally overridden by command-line flags.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -11,10 +12,12 @@ use fleetring::{Host, NodeId, Weight, Zone};
 use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
+use crate::auth::Scopes;
 use crate::changes::ChangesConfig;
 use crate::control::DurabilityDefaults;
 use crate::engine::EngineConfig;
 use crate::replication::ReplicationSettings;
+use crate::tls::Principal;
 
 /// Everything a daemon needs to start.
 ///
@@ -78,6 +81,69 @@ pub struct Config {
     /// line.
     #[serde(default)]
     pub insecure_plaintext: Plaintext,
+    /// The principals client certificates may name, with what each may do (ADR-0025). A
+    /// principal not listed may do nothing with a certificate alone. Keep the list identical on
+    /// every node.
+    #[serde(default, rename = "principal")]
+    pub principals: Vec<PrincipalConfig>,
+}
+
+/// One `[[principal]]` entry: a principal's scopes when it connects with a client certificate
+/// (ADR-0025).
+///
+/// ```toml
+/// [[principal]]
+/// name = "ops"
+/// scopes = ["admin:*", "stream:*", "cluster"]
+///
+/// [[principal]]
+/// name = "acme-app"
+/// scopes = ["write:tenant:acme/*"]
+///
+/// [[principal]]
+/// name = "router"
+/// scopes = []
+/// forward_tokens = true   # may carry its callers' tokens, and then acts as them
+/// ```
+///
+/// Each scope is `<action>:<pattern>` with the action `read`, `write`, `admin`, or `stream`,
+/// and the pattern an exact database name or a prefix ending in `*`; or the word `cluster`, for
+/// control operations that name no database. `write` implies `read`, and `admin` implies both.
+/// A request with a bearer token acts with the token's scopes instead.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalConfig {
+    /// The principal, as its client certificates name it.
+    pub name: Principal,
+    /// What it may do.
+    #[serde(default)]
+    pub scopes: Scopes,
+    /// Whether its connections may carry tokens that name other principals.
+    #[serde(default)]
+    pub forward_tokens: TokenForwarding,
+}
+
+/// Whether a principal's connections may carry bearer tokens that name another principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "bool")]
+#[non_exhaustive]
+pub enum TokenForwarding {
+    /// The default: a token must name the principal the client certificate names.
+    #[default]
+    Refused,
+    /// `forward_tokens = true`: the principal relays its callers' requests, such as a router,
+    /// and a request with a caller's token acts as that caller, with the token's scopes only.
+    Allowed,
+}
+
+impl From<bool> for TokenForwarding {
+    fn from(allowed: bool) -> Self {
+        if allowed {
+            Self::Allowed
+        } else {
+            Self::Refused
+        }
+    }
 }
 
 /// The `[tls]` table: the files the node's identity is loaded from, and reloaded from when they
@@ -555,6 +621,15 @@ impl Config {
                      in control.lease_duration_ms ({lease} ms)"
                 ),
             });
+        }
+        let mut names = BTreeSet::new();
+        for principal in &self.principals {
+            if !names.insert(&principal.name) {
+                return Err(ConfigError::Invalid {
+                    field: "principal",
+                    reason: format!("'{}' is listed more than once", principal.name),
+                });
+            }
         }
         if self.replication.retry_interval_ms == 0 {
             return Err(ConfigError::Invalid {

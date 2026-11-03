@@ -9,6 +9,7 @@ use fleetring_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
+use crate::auth::{Action, authorized, require_key};
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::DataNode;
@@ -84,8 +85,9 @@ impl Database for DatabaseService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         let request = request.into_inner();
-        let name: DatabaseName = parse("database name", &request.database)?;
         let statement = statement(request.sql, request.params)?;
         let lease = self.node.route(&name).await?;
         let stored = self
@@ -114,8 +116,9 @@ impl Database for DatabaseService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         let request = request.into_inner();
-        let name: DatabaseName = parse("database name", &request.database)?;
         let statement = statement(request.sql, request.params)?;
         self.node.route(&name).await?;
         let rows = self
@@ -132,6 +135,7 @@ impl Database for DatabaseService {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         let placement = self.node.create(&name).await?;
         Ok(Response::new(CreateResponse {
             placement: Some(placement),
@@ -142,8 +146,9 @@ impl Database for DatabaseService {
     /// replication serves or follows, as its heartbeats report them.
     async fn node_status(
         &self,
-        _request: Request<NodeStatusRequest>,
+        request: Request<NodeStatusRequest>,
     ) -> Result<Response<NodeStatusResponse>, Status> {
+        let caller = authorized(&request)?;
         let replication = self.node.replication();
         let view = replication.membership_view();
         let sinks = self
@@ -151,6 +156,7 @@ impl Database for DatabaseService {
             .change_streams()
             .status()
             .into_iter()
+            .filter(|status| caller.sees(Action::Stream, &status.database))
             .map(|status| ChangeSinkStatus {
                 sink: status.sink,
                 database: status.database.to_string(),
@@ -172,7 +178,16 @@ impl Database for DatabaseService {
             node_id: self.node.id().to_string(),
             membership_epoch: view.epoch().get(),
             ring_fingerprint: view.fingerprint().map(|fingerprint| fingerprint.get()),
-            databases: replication.statuses(),
+            databases: replication
+                .statuses()
+                .into_iter()
+                .filter(|status| {
+                    status
+                        .database
+                        .parse::<DatabaseName>()
+                        .is_ok_and(|name| caller.sees(Action::Read, &name))
+                })
+                .collect(),
             sinks,
         }))
     }
@@ -182,14 +197,18 @@ impl Database for DatabaseService {
     /// [`STREAM_BUFFER`] updates behind is cut off with `RESOURCE_EXHAUSTED`.
     async fn watch_leases(
         &self,
-        _request: Request<WatchLeasesRequest>,
+        request: Request<WatchLeasesRequest>,
     ) -> Result<Response<Self::WatchLeasesStream>, Status> {
+        let caller = authorized(&request)?.clone();
         let watch = self.node.replication().leases();
-        Ok(Response::new(lease_stream(
+        let visible = caller.clone();
+        let stream = lease_stream(
             self.node.id().clone(),
             watch,
             STREAM_BUFFER,
-        )))
+            move |database| visible.sees(Action::Read, database),
+        );
+        Ok(Response::new(caller.guard(stream)))
     }
 
     /// Answers from this node's own copy, whatever its role: the chain hash at the requested
@@ -198,8 +217,9 @@ impl Database for DatabaseService {
         &self,
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         let request = request.into_inner();
-        let name: DatabaseName = parse("database name", &request.database)?;
         let at = (!request.position.is_empty()).then(|| Position::from(request.position));
         let verified = self.node.replication().verify(&name, at).await?;
         Ok(Response::new(VerifyResponse {

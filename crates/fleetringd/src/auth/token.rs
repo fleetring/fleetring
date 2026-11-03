@@ -22,6 +22,7 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{ParseScopeError, Scope, Scopes};
+use crate::tls::Principal;
 
 /// The longest token accepted, in bytes. A token carries a few dozen scopes at most.
 pub const MAX_TOKEN_LEN: usize = 8 * 1024;
@@ -119,7 +120,7 @@ struct Claims {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     /// The principal the token names.
-    pub principal: String,
+    pub principal: Principal,
     /// What the principal may do.
     pub scopes: Scopes,
     /// The token's ID, by which it can be revoked.
@@ -222,7 +223,7 @@ impl TokenSigner {
         };
         let claims = Claims {
             iss: self.issuer.clone(),
-            sub: grant.principal.clone(),
+            sub: grant.principal.to_string(),
             jti: grant.id.to_string(),
             iat: Some(nbf),
             nbf,
@@ -413,6 +414,7 @@ impl TokenVerifier {
             return Err(TokenError::Expired);
         }
         let id: TokenId = claims.jti.parse().map_err(|_| TokenError::Malformed)?;
+        let principal: Principal = claims.sub.parse().map_err(|_| TokenError::Malformed)?;
         if revoked.refuses(&id, &key_id) {
             return Err(TokenError::Revoked);
         }
@@ -424,7 +426,7 @@ impl TokenVerifier {
             .map_err(TokenError::Scope)?;
         Ok(Verified {
             grant: Grant {
-                principal: claims.sub,
+                principal,
                 scopes,
                 id,
                 not_before: from_seconds(claims.nbf),
@@ -478,7 +480,7 @@ mod tests {
 
     fn grant(scopes: &[&str]) -> Grant {
         Grant {
-            principal: "app".to_owned(),
+            principal: "app".parse().expect("a principal"),
             scopes: scopes
                 .iter()
                 .map(|scope| scope.parse().expect("a scope"))

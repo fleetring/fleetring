@@ -17,7 +17,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::control::{ControlClient, StorageIo};
 use crate::engine::Execution;
 use crate::tls::{Conn, Raw, Security};
-use crate::transport::TransportConfig;
+use crate::transport::{Credentials, TransportConfig};
 
 /// How a daemon reaches its peers: real TCP, or turmoil's simulated network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,7 @@ impl Link {
 pub struct Network {
     link: Link,
     security: Security,
+    credentials: Credentials,
 }
 
 impl Network {
@@ -67,6 +68,7 @@ impl Network {
         Self {
             link: Link::Tcp(transport),
             security: Security::Plaintext,
+            credentials: Credentials::none(),
         }
     }
 
@@ -78,6 +80,7 @@ impl Network {
         Self {
             link: Link::Simulated,
             security: Security::Plaintext,
+            credentials: Credentials::none(),
         }
     }
 
@@ -86,6 +89,20 @@ impl Network {
     pub fn with_security(mut self, security: Security) -> Self {
         self.security = security;
         self
+    }
+
+    /// Sends `credentials`, such as a bearer token, with every request a client built from this
+    /// network makes. Nodes send none.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// Returns the credentials clients' requests carry.
+    #[must_use]
+    pub fn credentials(&self) -> &Credentials {
+        &self.credentials
     }
 
     /// Returns the identity connections carry, or plaintext.
@@ -164,7 +181,9 @@ impl Network {
     #[must_use]
     pub fn control_client(&self, address: impl Into<String>) -> ControlClient {
         let network = self.clone();
+        let credentials = self.credentials.clone();
         ControlClient::with_connector(address, move |address| network.channel(address))
+            .with_credentials(credentials)
     }
 }
 

@@ -18,6 +18,7 @@ use rustls_pki_types::pem::PemObject;
 use time::OffsetDateTime;
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
+use crate::auth::{IssueError, TokenSigner};
 use crate::tls::names::{ClusterName, Principal, SubjectUri};
 
 /// The authority's certificate, in the directory `cert init` writes.
@@ -323,6 +324,17 @@ impl Authority {
     #[must_use]
     pub fn certificate_pem(&self) -> &str {
         &self.certificate_pem
+    }
+
+    /// Returns a signer that issues bearer tokens for this cluster with the authority's key
+    /// (ADR-0025). Nodes verify them with the authority certificate they already trust.
+    ///
+    /// # Errors
+    ///
+    /// [`IssueError::Key`](crate::auth::IssueError::Key) if the key isn't one tokens can be
+    /// signed with.
+    pub fn token_signer(&self) -> Result<TokenSigner, IssueError> {
+        TokenSigner::from_pkcs8(&self.key.serialize_der(), self.cluster.as_str())
     }
 
     /// Issues a node certificate for `id`, reachable at `hosts` (IP addresses or DNS names),

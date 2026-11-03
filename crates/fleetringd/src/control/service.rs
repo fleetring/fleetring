@@ -27,6 +27,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{Action as AuthAction, authorized, require_key};
 use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
@@ -466,6 +467,7 @@ impl Control for ControlService {
         &self,
         request: Request<WatchMembershipRequest>,
     ) -> Result<Response<Self::WatchMembershipStream>, Status> {
+        let caller = authorized(&request)?.clone();
         let after_epoch = request.into_inner().after_epoch;
         // The epoch and flags the watcher holds: none until the first state is seen.
         let mut held: Option<(u64, Vec<MemberFlags>)> = None;
@@ -484,15 +486,16 @@ impl Control for ControlService {
             held = Some((epoch, flags));
             update
         });
-        Ok(Response::new(Box::pin(updates)))
+        Ok(Response::new(caller.guard(Box::pin(updates))))
     }
 
     async fn create_database(
         &self,
         request: Request<CreateDatabaseRequest>,
     ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         let request = request.into_inner();
-        let name: DatabaseName = parse("database name", &request.database)?;
         let replication_factor = u8::try_from(request.replication_factor)
             .ok()
             .and_then(ReplicationFactor::new)
@@ -523,6 +526,7 @@ impl Control for ControlService {
         request: Request<DropDatabaseRequest>,
     ) -> Result<Response<DropDatabaseResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         match self.submit(Action::DropDatabase { name }).await? {
             (Applied::DatabaseDropped { epoch, .. }, _) => {
                 Ok(Response::new(DropDatabaseResponse { epoch: epoch.get() }))
@@ -535,8 +539,9 @@ impl Control for ControlService {
         &self,
         request: Request<ChangeDurabilityRequest>,
     ) -> Result<Response<ChangeDurabilityResponse>, Status> {
+        let database: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &database)?;
         let request = request.into_inner();
-        let database: DatabaseName = parse("database name", &request.database)?;
         let replication_factor = self
             .node
             .state()
@@ -585,6 +590,7 @@ impl Control for ControlService {
         request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &name)?;
         let state = self.node.state();
         Ok(Response::new(LocateResponse {
             placement: Some(placement(&state, &name)?),
@@ -593,11 +599,13 @@ impl Control for ControlService {
 
     async fn list_databases(
         &self,
-        _request: Request<ListDatabasesRequest>,
+        request: Request<ListDatabasesRequest>,
     ) -> Result<Response<ListDatabasesResponse>, Status> {
+        let caller = authorized(&request)?;
         let state = self.node.state();
         let databases = state
             .databases()
+            .filter(|database| caller.sees(AuthAction::Read, database.name()))
             .map(|database| placement(&state, database.name()))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Response::new(ListDatabasesResponse { databases }))
@@ -753,8 +761,9 @@ impl Control for ControlService {
         &self,
         request: Request<TransferLeaseRequest>,
     ) -> Result<Response<PromotionResponse>, Status> {
+        let database: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_key(&request, &database)?;
         let request = request.into_inner();
-        let database = parse("database name", &request.database)?;
         let target = if request.target.is_empty() {
             None
         } else {

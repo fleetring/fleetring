@@ -1,8 +1,10 @@
 //! A simulated client: runs a workload and records every operation.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use fleetring::ReplicationFactor;
+use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Action, DatabaseName, LeaseEpoch};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
@@ -10,19 +12,21 @@ use fleetring_proto::v1::{
     LeaseResponse, LocateRequest, LocateResponse, Node, RenewLeaseRequest,
 };
 
+use crate::control::ControlClient;
 use crate::control::rejection_status;
 use crate::data::{Client, DatabaseSpec, LeaseUpdate};
 use crate::engine::{Statement, Value};
 use crate::environment::Network;
 use crate::replication::LeaseChange;
 use crate::sim::SimRng;
+use crate::sim::cluster::certificate_validity;
 use crate::sim::history::DurabilityMode;
 use crate::sim::host::{Shared, WorkloadState};
 use crate::sim::trace::EventKind;
 use crate::sim::workload::{
     Ack, LeaseObservation, LeaseSeen, Operation, Outcome, Step, WRITES_TABLE, Workload,
 };
-use crate::tls::{Identity, Security};
+use crate::tls::{Authority, Identity, Security};
 use crate::transport::Backoff;
 
 /// How long a lease watcher waits before it tries a node again after a stream failed to open or
@@ -50,6 +54,9 @@ pub(super) struct Session {
     pub(super) shared: Shared,
     /// The principal the client acts as, issued by the cluster's test authority.
     pub(super) identity: Identity,
+    /// The cluster's test authority, which issues a node certificate for each node the
+    /// workload acts as: node calls need one (ADR-0025).
+    pub(super) authority: Arc<Authority>,
 }
 
 /// A client: runs `workload`, records each operation, and finishes when the workload does.
@@ -65,7 +72,13 @@ pub(super) async fn run_client(
         timeout,
         shared,
         identity,
+        authority,
     } = session;
+    let mut nodes = NodeClients {
+        authority,
+        control: control.clone(),
+        clients: BTreeMap::new(),
+    };
     let network = Network::simulated().with_security(Security::Tls(identity));
     let client = Client::new(control, network).with_backoff(CLIENT_BACKOFF);
     let client = match entry {
@@ -80,9 +93,10 @@ pub(super) async fn run_client(
                     .lock()
                     .history
                     .begin(name.as_str(), invoked_at, operation.clone());
+                let node = nodes.for_operation(&operation);
                 let outcome = match tokio::time::timeout(
                     timeout,
-                    execute(&client, &shared, &operation),
+                    execute(&client, node.as_ref(), &shared, &operation),
                 )
                 .await
                 {
@@ -90,6 +104,7 @@ pub(super) async fn run_client(
                     Err(_) => {
                         // The connection may have stalled; dial a new one next time.
                         client.reconnect();
+                        nodes.clients.clear();
                         Outcome::Indeterminate { code: None }
                     }
                 };
@@ -113,9 +128,52 @@ pub(super) async fn run_client(
     Ok(())
 }
 
-/// Sends `operation` and returns its outcome.
-async fn execute(data: &Client, shared: &Shared, operation: &Operation) -> Outcome {
-    let client = data.control();
+/// The control clients a workload acts as nodes through, one per node, each with a certificate
+/// for its node.
+struct NodeClients {
+    authority: Arc<Authority>,
+    control: String,
+    clients: BTreeMap<NodeId, ControlClient>,
+}
+
+impl NodeClients {
+    /// The client for the node `operation` acts as, if it is a node's call.
+    fn for_operation(&mut self, operation: &Operation) -> Option<ControlClient> {
+        let node = match operation {
+            Operation::Join { node }
+            | Operation::Heartbeat { node }
+            | Operation::AcquireLease { node, .. }
+            | Operation::RenewLease { node, .. } => node,
+            _ => return None,
+        };
+        let client = self.clients.entry(node.clone()).or_insert_with(|| {
+            let issued = self
+                .authority
+                .issue_node(node, &[node.to_string()], certificate_validity())
+                .unwrap_or_else(|error| {
+                    panic!("can't issue a certificate for node {node}: {error}")
+                });
+            let identity = Identity::from_issued(self.authority.certificate_pem(), &issued)
+                .unwrap_or_else(|error| {
+                    panic!("can't load the certificate of node {node}: {error}")
+                });
+            Network::simulated()
+                .with_security(Security::Tls(identity))
+                .control_client(self.control.clone())
+        });
+        Some(client.clone())
+    }
+}
+
+/// Sends `operation` and returns its outcome. A node's call goes through `node`, the client
+/// with that node's certificate.
+async fn execute(
+    data: &Client,
+    node: Option<&ControlClient>,
+    shared: &Shared,
+    operation: &Operation,
+) -> Outcome {
+    let client = node.unwrap_or_else(|| data.control());
     let result = match operation {
         Operation::Join { node } => client
             .join(JoinRequest {

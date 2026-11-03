@@ -82,6 +82,58 @@ fn the_replication_table_sets_replication_settings() -> TestResult {
 }
 
 #[test]
+fn principals_are_parsed_and_validated_at_start() -> TestResult {
+    let text = format!(
+        "{MINIMAL}\n[[principal]]\nname = \"ops\"\nscopes = [\"admin:*\", \"cluster\"]\n\n\
+         [[principal]]\nname = \"router\"\nforward_tokens = true\n"
+    );
+    let config = Config::from_toml(&text)?;
+    assert_eq!(config.principals.len(), 2);
+    assert_eq!(config.principals[0].name.as_str(), "ops");
+    let scopes: Vec<String> = config.principals[0]
+        .scopes
+        .as_slice()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(scopes, ["admin:*", "cluster"]);
+    assert!(config.principals[1].scopes.is_empty());
+    assert_eq!(
+        config.principals[1].forward_tokens,
+        fleetringd::TokenForwarding::Allowed
+    );
+    assert!(Config::from_toml(MINIMAL)?.principals.is_empty());
+
+    for (bad, named) in [
+        ("scopes = [\"delete:*\"]", "delete"),
+        ("scopes = [\"read:\"]", "empty pattern"),
+        ("scopes = [\"read\"]", "<action>:<pattern>"),
+        ("role = \"admin\"", "role"),
+    ] {
+        let text = format!("{MINIMAL}\n[[principal]]\nname = \"ops\"\n{bad}\n");
+        let error = Config::from_toml(&text).expect_err(bad);
+        assert!(error.to_string().contains(named), "{bad}: {error}");
+    }
+    let text = format!("{MINIMAL}\n[[principal]]\nname = \"Ops\"\n");
+    assert!(Config::from_toml(&text).is_err(), "an invalid name");
+
+    let text =
+        format!("{MINIMAL}\n[[principal]]\nname = \"ops\"\n\n[[principal]]\nname = \"ops\"\n");
+    let error = Config::from_toml(&text).expect_err("a duplicate principal");
+    assert!(
+        matches!(
+            error,
+            ConfigError::Invalid {
+                field: "principal",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_data_only_node_needs_the_control_address() {
     let text = MINIMAL.replace("listen", "role = \"data\"\nlisten");
     let error = Config::from_toml(&text).expect_err("data role without control");

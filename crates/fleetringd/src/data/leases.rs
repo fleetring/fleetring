@@ -10,6 +10,7 @@
 use std::pin::Pin;
 
 use fleetring::NodeId;
+use fleetring_control::DatabaseName;
 use fleetring_proto::v1::LeaseUpdate;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -28,10 +29,16 @@ pub(crate) type LeaseStream = Pin<Box<dyn Stream<Item = Result<LeaseUpdate, Stat
 pub(crate) const STREAM_BUFFER: usize = 256;
 
 /// A stream of `node`'s leases from `watch`: a snapshot, then events, with room for `buffer`
-/// unread updates.
-pub(crate) fn lease_stream(node: NodeId, watch: LeaseWatch, buffer: usize) -> LeaseStream {
+/// unread updates. Only databases `visible` accepts appear, in the snapshot and in events, so a
+/// principal sees the leases on the databases it may read.
+pub(crate) fn lease_stream(
+    node: NodeId,
+    watch: LeaseWatch,
+    buffer: usize,
+    visible: impl Fn(&DatabaseName) -> bool + Send + Sync + 'static,
+) -> LeaseStream {
     let (updates, stream) = mpsc::channel(buffer.max(1));
-    tokio::spawn(feed(node, watch, updates));
+    tokio::spawn(feed(node, watch, updates, visible));
     Box::pin(ReceiverStream::new(stream))
 }
 
@@ -39,8 +46,14 @@ async fn feed(
     node: NodeId,
     mut watch: LeaseWatch,
     updates: mpsc::Sender<Result<LeaseUpdate, Status>>,
+    visible: impl Fn(&DatabaseName) -> bool + Send + Sync,
 ) {
-    let mut held = watch.held();
+    let held_visible = |watch: &mut LeaseWatch| {
+        let mut held = watch.held();
+        held.retain(|database, _| visible(database));
+        held
+    };
+    let mut held = held_visible(&mut watch);
     let snapshot = lease_snapshot_to_proto(&node, &held);
     if updates.send(Ok(snapshot)).await.is_err() {
         return;
@@ -53,7 +66,7 @@ async fn feed(
         if !changed {
             return;
         }
-        let now = watch.held();
+        let now = held_visible(&mut watch);
         for event in lease_events(&held, &now) {
             match updates.try_send(Ok(lease_event_to_proto(&event))) {
                 Ok(()) => {}
@@ -135,7 +148,7 @@ mod tests {
         replication
             .serve_primary(name("held"), role(3))
             .expect("serves");
-        let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 8);
+        let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 8, |_| true);
 
         let Ok(Update::Snapshot(snapshot)) = next(&mut stream).await else {
             panic!("the first update is a snapshot");
@@ -196,7 +209,7 @@ mod tests {
     async fn a_subscriber_that_falls_behind_is_cut_off_and_a_new_stream_starts_fresh() {
         let dir = tempfile::tempdir().expect("tempdir");
         let replication = replication(dir.path());
-        let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 2);
+        let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 2, |_| true);
         let Ok(Update::Snapshot(snapshot)) = next(&mut stream).await else {
             panic!("the first update is a snapshot");
         };
@@ -231,7 +244,7 @@ mod tests {
             "the stream ends after the error"
         );
 
-        let mut fresh = lease_stream("a".parse().expect("id"), replication.leases(), 2);
+        let mut fresh = lease_stream("a".parse().expect("id"), replication.leases(), 2, |_| true);
         let Ok(Update::Snapshot(snapshot)) = next(&mut fresh).await else {
             panic!("a new stream starts with a snapshot");
         };
@@ -251,7 +264,7 @@ mod tests {
     async fn the_stream_ends_when_replication_stops_or_the_subscriber_leaves() {
         let dir = tempfile::tempdir().expect("tempdir");
         let replication = replication(dir.path());
-        let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 2);
+        let mut stream = lease_stream("a".parse().expect("id"), replication.leases(), 2, |_| true);
         let Ok(Update::Snapshot(_)) = next(&mut stream).await else {
             panic!("the first update is a snapshot");
         };

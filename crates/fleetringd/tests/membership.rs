@@ -169,7 +169,7 @@ async fn a_control_daemon_and_two_data_daemons_converge_on_one_ring() -> TestRes
     // A data-only daemon runs no control plane, so a control call that reaches it is refused and
     // told where the control node is.
     let peer = data[0].listen_address().to_string();
-    let mut client = control_client(tls.client_network("tester")?.channel(&peer)?);
+    let mut client = control_client(tls.node_network("x")?.channel(&peer)?);
     let refused = client
         .join(JoinRequest {
             protocol: Some(PROTOCOL_VERSION),

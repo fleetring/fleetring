@@ -20,9 +20,13 @@ use fleetring_proto::v1::database_server::{Database, DatabaseServer};
 use fleetring_proto::v1::replication_client::ReplicationClient;
 use fleetring_proto::v1::replication_server::{Replication, ReplicationServer};
 use tokio_stream::Stream;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
+use crate::auth::{AUTHORIZATION, BearerToken, TokenError};
 use crate::environment::Network;
 use crate::tls::{Accepted, Raw, Security};
 
@@ -168,6 +172,93 @@ pub fn replication_client(channel: Channel) -> ReplicationClient<Channel> {
 #[must_use]
 pub fn database_client(channel: Channel) -> DatabaseClient<Channel> {
     DatabaseClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+}
+
+/// A channel whose requests carry a client's [`Credentials`].
+pub type CredentialedChannel = InterceptedService<Channel, Credentials>;
+
+/// What a client's requests carry besides its certificate: a bearer token, or nothing.
+///
+/// A node's requests carry nothing; an application's carry the token that names its principal
+/// and scopes (ADR-0025). `Debug` never shows the token.
+#[derive(Clone, Default)]
+pub struct Credentials {
+    authorization: Option<MetadataValue<Ascii>>,
+}
+
+impl Credentials {
+    /// Requests carry nothing but the connection's certificate.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Requests carry `token` as `authorization: Bearer <token>`.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Malformed`] if the token holds characters a header can't carry.
+    pub fn bearer(token: &BearerToken) -> Result<Self, TokenError> {
+        let value = format!("Bearer {}", token.expose());
+        let mut authorization =
+            MetadataValue::try_from(value).map_err(|_| TokenError::Malformed)?;
+        authorization.set_sensitive(true);
+        Ok(Self {
+            authorization: Some(authorization),
+        })
+    }
+
+    /// Whether requests carry a token.
+    #[must_use]
+    pub fn has_token(&self) -> bool {
+        self.authorization.is_some()
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = if self.has_token() {
+            "Bearer(..)"
+        } else {
+            "None"
+        };
+        f.debug_tuple("Credentials").field(&shown).finish()
+    }
+}
+
+impl Interceptor for Credentials {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if let Some(authorization) = &self.authorization {
+            request
+                .metadata_mut()
+                .insert(AUTHORIZATION, authorization.clone());
+        }
+        Ok(request)
+    }
+}
+
+/// A `Control` client over `channel` whose requests carry `credentials`, with FleetRing's
+/// message limits.
+#[must_use]
+pub fn control_client_with(
+    channel: Channel,
+    credentials: &Credentials,
+) -> ControlClient<CredentialedChannel> {
+    ControlClient::with_interceptor(channel, credentials.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+}
+
+/// A `Database` client over `channel` whose requests carry `credentials`, with FleetRing's
+/// message limits.
+#[must_use]
+pub fn database_client_with(
+    channel: Channel,
+    credentials: &Credentials,
+) -> DatabaseClient<CredentialedChannel> {
+    DatabaseClient::with_interceptor(channel, credentials.clone())
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }

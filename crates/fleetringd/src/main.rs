@@ -9,9 +9,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Liveness, Role as DatabaseRole};
+use fleetring_control::{KeyId, Millis, Timestamp, TokenId};
+use fleetring_proto::v1::revocation::Revoked;
+use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
+use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIFETIME, Scope};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
     Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo, Verification,
@@ -22,12 +28,20 @@ use fleetringd::tls::{
     Authority, ClusterName, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
     DEFAULT_NODE_LIFETIME, Identity, Principal, Security, Validity,
 };
+use fleetringd::transport::Credentials;
 use fleetringd::{Config, Daemon, MembershipView, Network, Plaintext, Role};
+use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
 
 /// The environment variable that names a directory with `ca.crt`, `client.crt`, and
 /// `client.key`, used when `--ca`, `--cert`, and `--key` aren't given.
 const TLS_DIR_VAR: &str = "FLEETRING_TLS_DIR";
+
+/// The environment variable that holds a bearer token, used when `--token` isn't given.
+const TOKEN_VAR: &str = "FLEETRING_TOKEN";
+
+/// How many random bytes a token's ID holds.
+const TOKEN_ID_BYTES: usize = 16;
 
 /// Places, replicates, and fails over SQLite databases across machines you own.
 ///
@@ -80,6 +94,10 @@ enum Command {
     /// Creates the cluster's certificate authority and issues node and client certificates.
     #[command(subcommand)]
     Cert(CertCommand),
+    /// Issues and revokes bearer tokens: signed, expiring credentials that name a principal and
+    /// carry its scopes.
+    #[command(subcommand)]
+    Token(TokenCommand),
     /// Creates, lists, writes, reads, locates, and drops databases.
     #[command(subcommand)]
     Db(DbCommand),
@@ -99,9 +117,51 @@ enum Command {
     /// Follows the leases one data node holds: first `held <database> epoch <n>` for each
     /// database it serves, then `gained` or `lost` lines as leases move, until the stream ends.
     WatchLeases {
-        /// The data node to follow, `host:port`. Nothing else is needed.
+        /// The data node to follow, `host:port`.
         #[arg(long)]
         node: String,
+        #[command(flatten)]
+        tls: TlsArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Issues a token signed with the authority's key and prints it. Run it where `ca.key` is,
+    /// off the nodes; nodes verify the token with `ca.crt` alone.
+    Issue {
+        /// The principal the token names. A client sending it must connect with a certificate
+        /// for the same principal, unless that principal forwards tokens.
+        #[arg(long)]
+        principal: Principal,
+        /// A scope the token carries: `<action>:<pattern>`, with the action `read`, `write`,
+        /// `admin`, or `stream` and the pattern a database name or a prefix ending in `*`; or
+        /// `cluster`. Repeat it for more.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<Scope>,
+        /// How long the token lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; one hour by default, 30
+        /// days at most.
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<Duration>,
+        /// The directory with `ca.crt` and `ca.key`.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Revokes a token by its ID, or every token a signing key issued. Every node refuses it
+    /// within one heartbeat interval.
+    Revoke {
+        /// The token's ID, as `token issue` printed it (its `jti` claim).
+        #[arg(long, required_unless_present = "key_id", conflicts_with = "key_id")]
+        token_id: Option<TokenId>,
+        /// A signing key's ID (the `kid` header): every token it signed, for good.
+        #[arg(long)]
+        key_id: Option<KeyId>,
+        /// How long to keep a token's revocation, at least what remains of its lifetime: 30 days
+        /// (the longest a token lasts) by default.
+        #[arg(long, value_parser = parse_ttl, conflicts_with = "key_id")]
+        ttl: Option<Duration>,
+        #[command(flatten)]
+        target: Target,
     },
 }
 
@@ -302,6 +362,10 @@ struct TlsArgs {
     /// Connects in plaintext, to a daemon started with `--insecure-plaintext`.
     #[arg(long, conflicts_with_all = ["ca", "cert", "key"])]
     insecure_plaintext: bool,
+    /// A bearer token from `token issue`, sent with every request; the request then acts with
+    /// the token's scopes. Defaults to `FLEETRING_TOKEN`, if set.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 impl TlsArgs {
@@ -329,7 +393,19 @@ impl TlsArgs {
     }
 
     fn network(&self) -> Result<Network, Box<dyn Error>> {
-        Ok(Network::default().with_security(self.security()?))
+        let network = Network::default().with_security(self.security()?);
+        let token = match &self.token {
+            Some(token) => Some(token.clone()),
+            None => std::env::var(TOKEN_VAR)
+                .ok()
+                .filter(|token| !token.is_empty()),
+        };
+        Ok(match token {
+            Some(token) => {
+                network.with_credentials(Credentials::bearer(&BearerToken::new(token.trim()))?)
+            }
+            None => network,
+        })
     }
 }
 
@@ -510,6 +586,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn Error>> {
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     let output = match command {
         Command::Cert(command) => run_cert(command)?,
+        Command::Token(command) => run_token(command).await?,
         Command::Status {
             node: Some(node),
             target,
@@ -613,9 +690,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
             format_drain(&id, &primaries)
         }
-        Command::WatchLeases { node } => {
+        Command::WatchLeases { node, tls } => {
             // The node answers on its own; the client never asks the control plane here.
-            let client = Client::new(node.clone(), Network::default());
+            let client = Client::new(node.clone(), tls.network()?);
             let mut updates = client.watch_leases(&node).await.map_err(failed)?;
             while let Some(update) = updates.next().await.map_err(failed)? {
                 let mut stdout = std::io::stdout().lock();
@@ -638,6 +715,86 @@ fn format_lease_update(update: &LeaseUpdate) -> String {
             .collect(),
         LeaseUpdate::Event(event) => format!("{event}\n"),
         _ => String::new(),
+    }
+}
+
+/// Runs a `token` command and returns what it prints.
+async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
+    match command {
+        TokenCommand::Issue {
+            principal,
+            scopes,
+            ttl,
+            dir,
+        } => {
+            let ttl = ttl.unwrap_or(DEFAULT_TOKEN_LIFETIME);
+            if ttl > MAX_TOKEN_LIFETIME {
+                return Err(format!(
+                    "a token lasts at most {} days, so its revocation stays short",
+                    MAX_TOKEN_LIFETIME.as_secs() / (24 * 60 * 60)
+                )
+                .into());
+            }
+            let signer = Authority::load(&dir)?.token_signer()?;
+            let mut random = [0_u8; TOKEN_ID_BYTES];
+            SystemRandom::new()
+                .fill(&mut random)
+                .map_err(|_| "the system's random number generator failed")?;
+            let id: TokenId = URL_SAFE_NO_PAD.encode(random).parse()?;
+            let not_before = SystemClock.now();
+            let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+            let grant = Grant {
+                principal: principal.clone(),
+                scopes: scopes.into_iter().collect(),
+                id: id.clone(),
+                not_before,
+                expires_at: not_before.saturating_add(Millis::new(ttl_millis)),
+            };
+            let token = signer.issue(&grant)?;
+            eprintln!(
+                "issued token {id} for {principal}, signed by key {}, for {}s",
+                signer.key_id(),
+                ttl.as_secs()
+            );
+            Ok(format!("{}\n", token.expose()))
+        }
+        TokenCommand::Revoke {
+            token_id,
+            key_id,
+            ttl,
+            target,
+        } => {
+            let (revoked, until) = match (token_id, key_id) {
+                (Some(id), _) => {
+                    let keep = ttl.unwrap_or(MAX_TOKEN_LIFETIME);
+                    let keep = u64::try_from(keep.as_millis()).unwrap_or(u64::MAX);
+                    (
+                        Revoked::TokenId(id.to_string()),
+                        SystemClock.now().saturating_add(Millis::new(keep)),
+                    )
+                }
+                (None, Some(id)) => (Revoked::KeyId(id.to_string()), Timestamp::MAX),
+                (None, None) => return Err("pass --token-id or --key-id".into()),
+            };
+            let what = match &revoked {
+                Revoked::TokenId(id) => format!("token {id}"),
+                Revoked::KeyId(id) => format!("key {id}"),
+            };
+            target
+                .client()?
+                .control()
+                .revoke_token(RevokeTokenRequest {
+                    revocation: Some(Revocation {
+                        revoked: Some(revoked),
+                        until_ms: until.as_millis(),
+                    }),
+                })
+                .await
+                .map_err(failed)?;
+            Ok(format!(
+                "revoked {what}; every node refuses it within one heartbeat interval\n"
+            ))
+        }
     }
 }
 
