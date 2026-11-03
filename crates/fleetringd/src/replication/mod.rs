@@ -84,7 +84,21 @@
 //! visible before the first write under the epoch is acknowledged and [`LeaseChange::Lost`]
 //! before the node stops answering for the database.
 
+//! # The hash chain
+//!
+//! Every replica keeps a BLAKE3 hash chain over the log (FR-044): one hash per
+//! transaction, each folding in the one before it, so the hash at a position commits every byte
+//! before it. The primary's stream computes each batch's hash as it ships the batch, off the
+//! database's thread, and sends it along; a follower recomputes it before applying and refuses a
+//! batch whose hash differs, by
+//! asking for a snapshot as a diverged copy does, so a corrupt or foreign log never spreads and
+//! the stream never loops on it. A snapshot carries the primary's hash at its position, which
+//! the seeded follower continues from. [`Replication::verify`] reads a replica's log back from
+//! its last recorded anchor and reports the hash at a position, for `db verify` to compare
+//! across replicas.
+
 mod archive;
+mod chain;
 mod epochs;
 mod failover;
 mod follower;
@@ -106,6 +120,7 @@ use fleetring_proto::v1::{DatabaseStatus, Role};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use self::chain::Chains;
 use self::epochs::Epochs;
 use self::follower::FollowerSlot;
 use self::primary::Primary;
@@ -120,6 +135,7 @@ use crate::sink::{
 use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
 
+pub use self::chain::{ChainHash, ParseChainHashError};
 pub use self::failover::{Fenced, PromotionRequest};
 pub use self::follower::ReplicationService;
 
@@ -365,6 +381,18 @@ pub struct FollowerStatus {
     pub snapshots: u64,
 }
 
+/// What a replica's log hashes to at a position, as [`Replication::verify`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Verified {
+    /// The epoch of the primary that wrote the last frames of the replica's log.
+    pub epoch: LeaseEpoch,
+    /// The position the hash is at, or `None` for an empty log.
+    pub position: Option<Position>,
+    /// The chain hash there, recomputed from the log on disk where it still holds the bytes.
+    pub hash: ChainHash,
+}
+
 /// One data node's replication: primary streams, follower copies, and the sink and service that
 /// connect them to the [`Registry`].
 ///
@@ -385,6 +413,8 @@ struct Inner {
     execution: Execution,
     settings: ReplicationSettings,
     epochs: Epochs,
+    /// Each database's recorded chain anchor, next to its epoch record.
+    chains: Chains,
     /// Promotions the control node asked this node to carry out.
     promotions: watch::Sender<BTreeMap<DatabaseName, PromotionRequest>>,
     /// How many streams have ended, by the database they followed. A stream that ends may mean
@@ -454,6 +484,7 @@ impl Replication {
             execution,
             settings,
             epochs: Epochs::new(state_dir.join("epochs")),
+            chains: Chains::new(state_dir.join("epochs")),
             promotions: watch::Sender::new(BTreeMap::new()),
             ended: watch::Sender::new(BTreeMap::new()),
             served: watch::Sender::new(BTreeMap::new()),
@@ -789,6 +820,56 @@ impl Replication {
         let followers = self.inner.followers_of(&primary).followers;
         primary.begin_checkpoint(&followers)?;
         primary::checkpoint(&self.inner, &primary, Vec::new()).await
+    }
+
+    /// The hash chain over this node's copy of `database`, at every position it still holds a
+    /// hash for, whether it serves the database as primary or follows it; `None` if it does
+    /// neither, or its chain isn't built yet.
+    ///
+    /// # Panics
+    ///
+    /// If the replication state's lock was poisoned by a panic in another thread.
+    #[must_use]
+    pub fn chain_history(&self, database: &DatabaseName) -> Option<BTreeMap<Position, ChainHash>> {
+        if let Some(primary) = self.inner.primary(database) {
+            return primary.chain_history();
+        }
+        self.inner
+            .slot_if_any(database)?
+            .with_chain(|chain| chain.map(chain::Chain::history))
+    }
+
+    /// The hash chain over this node's copy of `database` at `at`, or at the latest position the
+    /// copy holds, recomputed from the log on disk from the last recorded anchor on, so that a
+    /// byte that changed since the batch was applied changes the answer or makes the log
+    /// unreadable.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if this node holds no copy or no hash at `at`; `FAILED_PRECONDITION` if the
+    /// log can't be read back to `at`, as after a byte of it changed; `UNAVAILABLE` if the copy
+    /// is busy or the log restarted meanwhile, which a retry settles.
+    pub async fn verify(
+        &self,
+        database: &DatabaseName,
+        at: Option<Position>,
+    ) -> Result<Verified, tonic::Status> {
+        // A checkpoint that just restarted the log moves the chain's anchor a moment later; a
+        // read that lands in between is tried again.
+        let mut attempts = 0;
+        loop {
+            let verified = match self.inner.primary(database) {
+                Some(primary) => primary::verify(&self.inner, &primary, at.clone()).await,
+                None => follower::verify(&self.inner, database, at.clone()).await,
+            };
+            match verified {
+                Err(status) if status.code() == tonic::Code::Unavailable && attempts < 3 => {
+                    attempts += 1;
+                    tokio::time::sleep(self.inner.settings.retry_interval).await;
+                }
+                verified => return verified,
+            }
+        }
     }
 }
 
@@ -1148,6 +1229,7 @@ fn refused(error: ReplicationError) -> Acknowledgement {
 
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
+    assert_debug_send_sync::<ChainHash>();
     assert_debug_send_sync::<Fenced>();
     assert_debug_send_sync::<FollowerProgress>();
     assert_debug_send_sync::<PromotionRequest>();
@@ -1165,4 +1247,6 @@ const _: () = {
     assert_debug_send_sync::<ReplicationSettings>();
     assert_debug_send_sync::<SeedError>();
     assert_debug_send_sync::<ServePrimaryError>();
+    assert_debug_send_sync::<ParseChainHashError>();
+    assert_debug_send_sync::<Verified>();
 };

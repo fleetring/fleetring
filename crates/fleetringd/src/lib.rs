@@ -68,6 +68,7 @@ const _: () = {
     assert_debug_send_sync::<data::NodeStatus>();
     assert_debug_send_sync::<data::ReplicaInfo>();
     assert_debug_send_sync::<data::ServedDatabase>();
+    assert_debug_send_sync::<data::Verification>();
     assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<Environment>();
     assert_debug_send_sync::<Network>();

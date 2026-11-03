@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::engine::{
@@ -220,12 +221,42 @@ pub trait FrameSourceEngine: fmt::Debug + Send + Sync {
     /// [`EngineError::NotFound`] if `location` holds no copy, and [`EngineError::Storage`] if it
     /// can't be read.
     fn open_follower(&self, location: &Path) -> Result<Box<dyn FrameFollower>, EngineError>;
+
+    /// The transactions `batch` holds, in commit order: where each ends, and which of the
+    /// payload's bytes are its own. The ranges are disjoint and in order, and the last
+    /// transaction ends at the batch's end.
+    ///
+    /// The replication log's hash chain (FR-044) hashes each transaction's bytes, so the ranges
+    /// must hold exactly the bytes of the log: a batch read back from the log as several
+    /// transactions must hash the same as the batches that shipped them one at a time. Bytes of
+    /// the log that belong to no transaction, such as a log generation's header, go with the
+    /// transaction that follows them; bytes that describe the batch itself, such as its framing,
+    /// are left out of every range.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::InvalidPayload`] if the payload is malformed.
+    fn transactions(&self, batch: &FrameBatch) -> Result<Vec<BatchTransaction>, EngineError>;
+}
+
+/// One transaction inside a [`FrameBatch`], as [`FrameSourceEngine::transactions`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchTransaction {
+    /// The position just past the transaction.
+    pub end: Position,
+    /// The transaction's bytes inside the batch's payload.
+    pub bytes: Range<usize>,
 }
 
 /// A follower's copy of a frame-source database, which applies the primary's batches.
 pub trait FrameFollower: fmt::Debug + Send {
     /// The position just past the last applied transaction, or `None` before the first batch.
     fn position(&self) -> Option<Position>;
+
+    /// The position the copy's current log continues from: where the last checkpoint the copy
+    /// followed ended, or `None` if its log has never restarted. The copy can read its log back
+    /// from here on ([`committed_since`](Self::committed_since)), and from no earlier position.
+    fn log_start(&self) -> Option<Position>;
 
     /// Applies `batch` durably, and returns the new position. A follower acknowledges a batch
     /// only after this returns.
@@ -255,6 +286,22 @@ pub trait FrameFollower: fmt::Debug + Send {
     /// [`EngineError::InvalidPosition`] if `after` doesn't fit the copy's log, and
     /// [`EngineError::Storage`] if it can't be read.
     fn committed_since(&self, after: Option<&Position>) -> Result<Option<FrameBatch>, EngineError>;
+
+    /// Every transaction the copy holds after `after` up to `until`, as one batch, or `None` if
+    /// there is none.
+    ///
+    /// Verifying the log's hash chain reads the copy back this way, up to the position being
+    /// verified (FR-044).
+    ///
+    /// # Errors
+    ///
+    /// As [`committed_since`](Self::committed_since), and [`EngineError::InvalidPosition`] if
+    /// `until` isn't a transaction boundary of the copy's log after `after`.
+    fn committed_between(
+        &self,
+        after: Option<&Position>,
+        until: &Position,
+    ) -> Result<Option<FrameBatch>, EngineError>;
 
     /// Discards everything the copy holds past `position`, durably, so that it is at `position`.
     ///

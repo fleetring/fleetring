@@ -11,7 +11,7 @@ use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest, DrainRequest,
     DropDatabaseRequest, ExecuteRequest, ListDatabasesRequest, LocateRequest, NodeStatusRequest,
-    QueryRequest, WatchLeasesRequest, WatchMembershipRequest,
+    QueryRequest, VerifyRequest, WatchLeasesRequest, WatchMembershipRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status, Streaming};
@@ -26,7 +26,7 @@ use crate::data::convert::{
 use crate::data::redirect::primary_hint;
 use crate::engine::{Position, Rows, Statement};
 use crate::environment::Network;
-use crate::replication::LeaseEvent;
+use crate::replication::{ChainHash, LeaseEvent};
 use crate::transport::{Backoff, database_client};
 
 /// How many redirects one request follows before it gives up.
@@ -175,6 +175,20 @@ pub struct ServedDatabase {
     pub epoch: LeaseEpoch,
     /// Where its copy is, if it knows.
     pub position: Option<Position>,
+}
+
+/// What one replica's log hashes to at a position, as [`Client::verify`] reports it (FR-044).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Verification {
+    /// The database.
+    pub database: DatabaseName,
+    /// The epoch of the primary that wrote the last frames of the replica's log.
+    pub epoch: LeaseEpoch,
+    /// The position the hash is at, or `None` for an empty log.
+    pub position: Option<Position>,
+    /// The chain hash there.
+    pub chain_hash: ChainHash,
 }
 
 /// A recorded durability change, as [`Client::change_durability`] reports it.
@@ -531,6 +545,39 @@ impl Client {
             .await?
             .into_inner();
         Ok(LeaseUpdates { inner })
+    }
+
+    /// Asks the replica at `address` (`host:port`) what its copy of `name` hashes to at `at`,
+    /// or at the latest position it holds, recomputed from its log on disk. Every replica
+    /// answers for its own copy; `db verify` compares them.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` if the node can't be reached or its chain isn't built yet, `NOT_FOUND` if
+    /// it holds no copy or no hash at `at`, `FAILED_PRECONDITION` if its log can't be read back
+    /// to `at`, and `INTERNAL` if its reply is invalid.
+    pub async fn verify(
+        &self,
+        address: &str,
+        name: &DatabaseName,
+        at: Option<&Position>,
+    ) -> Result<Verification, Status> {
+        let response = self
+            .database(address)?
+            .verify(VerifyRequest {
+                database: name.to_string(),
+                position: at.map(|at| at.as_bytes().to_vec()).unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+        let chain_hash = ChainHash::from_bytes(&response.chain_hash)
+            .ok_or_else(|| Status::internal("the reply has an invalid chain hash"))?;
+        Ok(Verification {
+            database: name.clone(),
+            epoch: LeaseEpoch::new(response.epoch),
+            position: (!response.position.is_empty()).then(|| Position::from(response.position)),
+            chain_hash,
+        })
     }
 
     /// Runs one write statement on the database's primary, and waits until a write quorum of its

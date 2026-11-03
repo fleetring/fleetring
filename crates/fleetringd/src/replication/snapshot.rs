@@ -25,10 +25,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
 use super::archive::{Packer, Unpacker, remove_dir_if_present};
+use super::chain::ChainHash;
 use super::epochs::sync_dir;
 use super::failover;
-use super::follower::{admit, blocking};
-use super::primary::held;
+use super::follower::{admit, blocking, seeded_chain};
+use super::primary::{self, held};
 use super::{Inner, SeedError};
 use crate::engine::{EngineCapability, Execution, Position};
 use crate::transport::replication_client;
@@ -42,6 +43,14 @@ const INCOMING: &str = "incoming";
 const RETIRED: &str = "retired";
 
 pub(super) type ChunkStream = Pin<Box<dyn Stream<Item = Result<SnapshotChunk, Status>> + Send>>;
+
+/// What a snapshot transfer installed: the copy's position, and the primary's chain hash there,
+/// if the primary sent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Seeded {
+    pub(super) position: Option<Position>,
+    pub(super) chain: Option<ChainHash>,
+}
 
 /// Serves a `Snapshot` request: pins a copy of the database this node is primary for, and
 /// streams it from a task of its own.
@@ -79,9 +88,13 @@ pub(super) async fn serve(
         .await
         .map_err(|error| Status::unavailable(format!("can't pin a snapshot: {error}")))?;
     let packer = Packer::new(pinned).map_err(|error| Status::internal(error.to_string()))?;
+    // The follower continues the chain from the snapshot's position, so the chain must reach it.
+    primary::chain_to(inner, &primary, &handle, packer.position()).await;
+    let chain = primary.hash_at(packer.position());
     let (chunks, stream) = mpsc::channel(2);
     tokio::spawn(send_chunks(
         packer,
+        chain,
         inner.execution,
         inner.settings.open_timeout,
         chunks,
@@ -89,11 +102,12 @@ pub(super) async fn serve(
     Ok(Box::pin(ReceiverStream::new(stream)))
 }
 
-/// Streams `packer`'s chunks, then a last chunk with the position and checksum. Gives up, and so
-/// releases the pinned copy, once the receiver goes away or takes longer than `limit` to accept
-/// a chunk.
+/// Streams `packer`'s chunks, then a last chunk with the position, the checksum, and `chain`,
+/// the hash chain at the position. Gives up, and so releases the pinned copy, once the receiver
+/// goes away or takes longer than `limit` to accept a chunk.
 async fn send_chunks(
     mut packer: Packer,
+    chain: Option<ChainHash>,
     execution: Execution,
     limit: std::time::Duration,
     chunks: mpsc::Sender<Result<SnapshotChunk, Status>>,
@@ -121,6 +135,7 @@ async fn send_chunks(
                 data,
                 position: None,
                 checksum: None,
+                chain: None,
             },
             Ok(None) => match packer.finish() {
                 Ok(checksum) => SnapshotChunk {
@@ -133,6 +148,7 @@ async fn send_chunks(
                             .unwrap_or_default(),
                     ),
                     checksum: Some(checksum.to_vec()),
+                    chain: chain.map(|hash| hash.as_bytes().to_vec()),
                 },
                 Err(error) => {
                     let status = Status::aborted(format!("the snapshot changed: {error}"));
@@ -158,7 +174,8 @@ async fn send_chunks(
 }
 
 /// Fetches a snapshot of `database` at `epoch` from `from`, its primary, and swaps it into
-/// `location`, replacing any copy there. Returns the position the new copy is at.
+/// `location`, replacing any copy there. Returns the position the new copy is at, and the
+/// primary's chain hash there.
 ///
 /// Nothing partial is ever at `location`: the snapshot is verified in a staging directory
 /// first, and removed if anything fails.
@@ -168,18 +185,18 @@ pub(super) async fn fetch(
     epoch: u64,
     from: &NodeId,
     location: &Path,
-) -> Result<Option<Position>, Status> {
+) -> Result<Seeded, Status> {
     let staging = inner.staging(INCOMING);
     let received = receive(inner, database, epoch, from, &staging).await;
     let installed = match received {
-        Ok(position) => {
+        Ok(seeded) => {
             let aside = inner.staging(RETIRED);
             let (staging, location) = (staging.clone(), location.to_owned());
             blocking(inner.execution, move || {
                 install(&staging, &location, &aside)
             })
             .await?
-            .map(|()| position)
+            .map(|()| seeded)
             .map_err(|error| Status::internal(format!("can't install the snapshot: {error}")))
         }
         Err(status) => Err(status),
@@ -208,7 +225,7 @@ async fn receive(
     epoch: u64,
     from: &NodeId,
     staging: &Path,
-) -> Result<Option<Position>, Status> {
+) -> Result<Seeded, Status> {
     let address = inner
         .addresses
         .address(from)
@@ -248,7 +265,10 @@ async fn receive(
             blocking(inner.execution, move || unpacker.finish(&checksum))
                 .await?
                 .map_err(transfer_status)?;
-            return Ok(held(position));
+            return Ok(Seeded {
+                position: held(position),
+                chain: chunk.chain.as_deref().and_then(ChainHash::from_bytes),
+            });
         }
         let data = chunk.data;
         let (returned, written) = blocking(inner.execution, move || {
@@ -349,14 +369,16 @@ pub(super) async fn seed(
     // not change under an older one.
     admit(inner, database, epoch).await.map_err(failed)?;
     let location = inner.registry().location(database);
-    let position = time::timeout(
+    let seeded = time::timeout(
         inner.settings.open_timeout,
         fetch(inner, database, epoch, from, &location),
     )
     .await
     .map_err(|_| failed(Status::deadline_exceeded("the snapshot transfer timed out")))?
     .map_err(failed)?;
+    let position = seeded.position.clone();
     slot.seeded(position.clone());
+    seeded_chain(inner, database, &slot, &seeded).await;
     tracing::info!(database = %database, %from, ?position, "seeded a copy from a snapshot");
     Ok(position)
 }

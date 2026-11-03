@@ -6,7 +6,7 @@ use fleetring_wal::{Batch, Mirror, MirrorError};
 use rusqlite::{Connection, OpenFlags};
 
 use super::{
-    Checkpoint, DATABASE_FILE, checkpoint, decode_position, encode_position, frame_batch,
+    Checkpoint, DATABASE_FILE, checkpoint, cut_at, decode_position, encode_position, frame_batch,
     keep_wal_on_close, read_marker, read_wal_file, remove_if_present, shm_path, storage, wal_path,
     write_marker,
 };
@@ -71,6 +71,10 @@ impl FrameFollower for SqliteFollower {
         self.mirror.position().map(encode_position)
     }
 
+    fn log_start(&self) -> Option<Position> {
+        self.checkpointed.map(encode_position)
+    }
+
     fn apply(&mut self, batch: &FrameBatch) -> Result<Position, EngineError> {
         let decoded = Batch::from_bytes(batch.payload.as_bytes())
             .map_err(|error| EngineError::InvalidPayload(error.into()))?;
@@ -95,6 +99,17 @@ impl FrameFollower for SqliteFollower {
         Ok(read_wal_file(self.mirror.path(), after, self.checkpointed)?
             .as_ref()
             .map(frame_batch))
+    }
+
+    fn committed_between(
+        &self,
+        after: Option<&Position>,
+        until: &Position,
+    ) -> Result<Option<FrameBatch>, EngineError> {
+        let Some(batch) = read_wal_file(self.mirror.path(), after, self.checkpointed)? else {
+            return Ok(None);
+        };
+        cut_at(&batch, until).map(Some)
     }
 
     fn truncate_to(&mut self, position: &Position) -> Result<(), EngineError> {

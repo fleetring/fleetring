@@ -28,8 +28,11 @@ use fleetring_proto::v1::{
 use tokio::sync::{OwnedMutexGuard, watch};
 use tonic::{Code, Status};
 
+use super::chain::{ChainHash, Links};
 use super::epochs::EpochError;
-use super::follower::{FollowerSlot, blocking, engine_status};
+use super::follower::{
+    FollowerSlot, blocking, engine_status, follower_chain, frame_source, record_anchor,
+};
 use super::primary::held;
 use super::{Inner, PrimaryRole, Replication, ServePrimaryError};
 use crate::engine::{EngineCapability, EngineError, FrameBatch, FrameFollower, Payload, Position};
@@ -181,6 +184,7 @@ pub(super) async fn fetch_rpc(
     let slot = inner.slot(&name);
     let _exclusive = exclusive(inner, &slot).await?;
     let follower = open_follower(inner, &name).await?;
+    let (follower, chain) = follower_chain(inner, &name, &slot, follower).await?;
     let after = held(request.after.clone());
     let (_, batch) = blocking(inner.execution, move || {
         let batch = follower.committed_since(after.as_ref());
@@ -188,6 +192,11 @@ pub(super) async fn fetch_rpc(
     })
     .await?;
     let batch = batch.map_err(engine_status)?;
+    let reached = batch.as_ref().map_or_else(
+        || held(request.after.clone()),
+        |batch| Some(batch.end.clone()),
+    );
+    let chain = chain.hash_at(reached.as_ref());
     Ok(FetchResponse {
         // The batch continues the caller's copy from `after`, as a stream's batches do, even when
         // it starts the log's next generation.
@@ -196,8 +205,10 @@ pub(super) async fn fetch_rpc(
             start: request.after,
             end: batch.end.into_bytes(),
             payload: batch.payload.into_bytes(),
+            chain: chain.map(|hash| hash.as_bytes().to_vec()),
         }),
         log_epoch: record.log_epoch(),
+        chain: chain.map(|hash| hash.as_bytes().to_vec()),
     })
 }
 
@@ -635,6 +646,7 @@ impl Replication {
         let slot = inner.slot(database);
         let _exclusive = exclusive(inner, &slot).await?;
         let follower = open_follower(inner, database).await?;
+        let (follower, mut chain) = follower_chain(inner, database, &slot, follower).await?;
         let after = follower.position();
         let request = FetchRequest {
             database: database.to_string(),
@@ -661,16 +673,48 @@ impl Replication {
             end: Position::from(batch.end),
             payload: Payload::from(batch.payload),
         };
-        let (follower, applied) = blocking(inner.execution, move || {
-            let mut follower = follower;
-            let applied = follower.apply(&frames);
-            (follower, applied)
-        })
-        .await?;
+        let theirs = response.chain.as_deref().and_then(ChainHash::from_bytes);
+        let from = chain.hash_at(Some(&frames.start));
+        let (follower, applied, links) = {
+            let inner = Arc::clone(inner);
+            blocking(inner.execution, move || {
+                let mut follower = follower;
+                let links = frame_source(&inner).ok().zip(from).map(|(engine, from)| {
+                    Links::compute(engine, from, Some(&frames.start), &frames)
+                });
+                let applied = follower.apply(&frames);
+                (follower, applied, links)
+            })
+            .await?
+        };
         let position = applied.map_err(engine_status)?;
         drop(follower);
         set_log_epoch(inner, database, response.log_epoch).await?;
         slot.set_position(Some(position.clone()));
+        // The fenced member's chain is the one the other replicas follow: a candidate whose own
+        // differs takes it, rather than lead with a chain every follower would refuse.
+        let mine = links.and_then(|links| links.ok());
+        let anchor = match (mine, theirs) {
+            (Some(links), Some(theirs)) if links.end() == theirs => {
+                chain.commit(links);
+                chain.rebase(&position)
+            }
+            (mine, Some(theirs)) => {
+                if let Some(links) = mine {
+                    tracing::warn!(database = %database, from = %node, at = %position, ours = %links.end(), %theirs, "the fenced member's chain differs from this copy's; taking it");
+                }
+                Some(chain.adopt(Some(&position), theirs))
+            }
+            (Some(links), None) => {
+                chain.commit(links);
+                chain.rebase(&position)
+            }
+            (None, None) => None,
+        };
+        slot.set_chain(Some(chain));
+        if let Some(anchor) = anchor {
+            record_anchor(inner, database, anchor).await;
+        }
         tracing::info!(database = %database, from = %node, %position, "caught up from the most advanced fenced member");
         Ok(Some(position))
     }

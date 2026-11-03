@@ -102,3 +102,20 @@ FR-039's logical change capture (ADR-0024), from `cargo bench -p fleetringd --be
 - **The per-row cost is the trigger, not the JSON.** `id` adds about 1.2 µs per row, which is SQLite firing a trigger and inserting a short row; `after` and `full` add about 1.3 µs more per row for building and storing the row's JSON (about 150 bytes here, so the change table also takes more pages). Building the JSON in a Rust scalar function instead of SQL's `json_array`, `typeof`, and `hex` measured the same, so SQL builds it. Inserts record only the new row in either mode, so `full` costs what `after` does; updates in `full` write two rows and the updated-column list, so expect them closer to twice `after`.
 - **What changed from the first measurement.** The first numbers (2.2× on one row, 3.7× on 100 rows) were dominated by the actor re-reading and re-checksumming the whole WAL after every commit, which capture tripled in size; `fleetring-wal` now reads only the tail after the position it already has, which cut the capture-off write from 142 µs to 82 µs as well. The change table also lost its index: `change_id`s are contiguous and `start` never decreases along them, so range bounds are a binary search of point lookups, and a captured transaction dirties one page, not two.
 - The slowest samples (several milliseconds) are the checkpoints. Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
+
+## Hash chain
+
+FR-044's hash chain over the replication log, from `cargo bench -p fleetringd --bench capture -- chain`, measured 2026-10-29 on an Apple M1 Max laptop (macOS, Rust 1.99.1, release profile) while other builds shared the machine, so these are the medians of 100 samples rather than idle-machine numbers.
+
+- **Setup:** one SQLite database as the daemon opens it (4 KiB pages, WAL), one captured batch of 1 or 100 inserted rows (the same rows as the change-capture bench), hashed onto the chain as the primary's stream does before it ships the batch: the engine delimits the batch's transactions from its frame headers, without copying, and BLAKE3 runs over each transaction's bytes with the hash before it folded in.
+
+| Batch | Payload | Chain cost (median) | Raw BLAKE3 over the frame |
+|---|---|---|---|
+| 1 row, 1 frame | 4.1 KiB | 2.9 µs | 2.5 µs |
+| 100 rows, 1 frame | 4.1 KiB | 3.7 µs | 2.5 µs |
+
+- **The hash is the cost.** Delimiting the transactions and the chain's bookkeeping add a few hundred nanoseconds; the rest is BLAKE3 at about 1.6 GB/s single-threaded, so a batch costs roughly 0.6 µs per 4 KiB frame plus 0.5 µs. The transaction's bytes are hashed on their own and the digest chained, rather than fed after the chain's prefix: 80 bytes of prefix pushed every frame off BLAKE3's 1 KiB chunk boundaries and doubled the cost.
+- **None of it lands on the commit.** The database's thread captures and publishes a batch as before; the first stream to ship the batch hashes it on its own task, and the other streams reuse the hash. Against the 82 µs one-row commit measured under [Change capture](#change-capture), the hash would cost 3.5% at one row and 2.1% at 100 rows even inline; against a replicated acknowledgement of about 3 ms ([fleetringd replication](#fleetringd-replication)), the few microseconds it adds to shipping are under 0.2%. A follower hashes each batch once, on the blocking thread that applies it, before the apply's fsync.
+- **Verification** (`db verify`) reads a replica's log back from its last recorded anchor, at most one checkpoint's worth of batches, and hashes it at the same rate, so a 4 MiB log verifies in a few milliseconds.
+- Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
+
