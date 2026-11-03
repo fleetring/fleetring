@@ -1,7 +1,7 @@
 ---
 id: FR-059
 title: Rename cluster to fleet, as a clean break in 0.3.0
-status: todo
+status: in-progress
 priority: P1
 size: M
 milestone: M11 Operator experience
@@ -37,14 +37,17 @@ ADR-0032 makes "fleet" the word for the nodes one control plane and one certific
 
 ## Acceptance criteria
 
-- [ ] `fleetringd cert init --fleet home` creates an authority for `home`, and `--cluster home` is refused as an unknown flag.
-- [ ] Certificates issued before the rename still connect, with a test that uses fixture certificates issued by 0.2.0.
-- [ ] A token whose claim says `fleet` passes a fleet-scope check, and one that says `cluster` is refused, with a test for each.
-- [ ] A `[[principal]]` entry with `fleet` works, and one with `cluster` fails to load with an error naming the scope.
-- [ ] Tokens from `token issue --scope fleet` carry `fleet`.
-- [ ] Refusal messages say "the fleet scope", and the RPC table test passes against the updated protocol comments.
-- [ ] Outside accepted ADRs, finished tickets, and the places ADR-0032 keeps, `grep -ri cluster` finds no use of the word for a fleet in `crates/`, `deploy/`, the READMEs, or `docs/`.
+- [x] `fleetringd cert init --fleet home` creates an authority for `home`, and `--cluster home` is refused as an unknown flag.
+- [x] Certificates issued before the rename still connect, with a test that uses fixture certificates issued by 0.2.0.
+- [x] A token whose claim says `fleet` passes a fleet-scope check, and one that says `cluster` is refused, with a test for each.
+- [x] A `[[principal]]` entry with `fleet` works, and one with `cluster` fails to load with an error naming the scope.
+- [x] Tokens from `token issue --scope fleet` carry `fleet`.
+- [x] Refusal messages say "the fleet scope", and the RPC table test passes against the updated protocol comments.
+- [x] Outside accepted ADRs, finished tickets, and the places ADR-0032 keeps, `grep -ri cluster` finds no use of the word for a fleet in `crates/`, `deploy/`, the READMEs, or `docs/`.
 
 ## Progress
 
-- Not started.
+- 2026-11-03: Implemented on the `naming` branch with FR-062, after ADR-0032 was revised to a clean break.
+  - **Code:** `FleetName`, `fleet()` accessors, `Scope::fleet()`, `Target::Fleet`, `Requirement::Fleet`, `Needed::Fleet`, `sim::Fleet` and `FleetBuilder` (`src/sim/fleet.rs`, `tests/sim/fleet.rs`, and the rerun commands they print), `cert init --fleet`, and "fleet" in help, logs, refusals, the protocol's comments, the daemon README, and `deploy/fleetringd.toml`.
+  - **Tests:** `cert_init_names_the_fleet_and_refuses_the_old_flag` and `certificates_from_0_2_still_connect` (`tests/tls.rs`, with certificates the 0.2.0 binary issued in `tests/fixtures/tls-0.2.0/`, the authority's private key removed); `the_fleet_scope_is_written_and_read_as_fleet_and_cluster_is_refused` (`auth::token`); the `cluster` scope in `scopes_parse_and_print_back` and in `principals_are_parsed_and_validated_at_start`.
+  - **Kept:** "cluster" where it names something else (other systems in `docs/review.md`), in accepted ADRs and finished tickets, and in the `fleetring` placement crate's docs, which use it in the general sense and change only in that crate's own release.

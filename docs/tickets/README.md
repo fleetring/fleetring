@@ -38,7 +38,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M6 Replication and failover | FR-030 – FR-034 | WAL shipping, leases and failover with no acknowledged write lost, snapshot catch-up, a CLI, and release builds |
 | M7 Durability and operations | FR-035 – FR-038, FR-051, FR-054 | Configurable durability per database, and a history checker for every simulation run |
 | M8 Access and integration | FR-039 – FR-043, FR-061 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
-| M9 Durability sinks and verification | FR-044, FR-045, FR-049, FR-052, FR-053 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
+| M9 Archives and verification | FR-044, FR-045, FR-049, FR-052, FR-053 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
 | M10 Security | FR-046 – FR-048, FR-050, FR-055 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases, and node calls bound to placement |
 | M11 Operator experience | FR-056 – FR-059, FR-062 | One vocabulary (fleet, not cluster, and one word per thing), CLI contexts with stable JSON output, a k9s-style TUI, and a desktop viewer, all over one client crate |
 | M12 Distribution | FR-060 | Native packages: `.deb` and `.rpm` from the release workflow, the AUR, and a Homebrew tap, each traceable to a signed release |
@@ -105,10 +105,10 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-056](FR-056-cli-contexts-json-completions.md) | CLI contexts, `--json` on every read command, shell completions, and man pages | P1 | L | FR-055, FR-059 | todo |
 | [FR-057](FR-057-tui.md) | A k9s-style TUI for watching and operating a fleet | P2 | L | FR-056, FR-042 | todo |
 | [FR-058](FR-058-desktop-app.md) | A Tauri and React desktop app, starting as a viewer | P2 | L | FR-056 | todo |
-| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, as a clean break in 0.3.0 | P1 | M | FR-047 | todo |
+| [FR-059](FR-059-fleet-rename.md) | Rename cluster to fleet, as a clean break in 0.3.0 | P1 | M | FR-047 | in-progress |
 | [FR-060](FR-060-distribution-packages.md) | Distribution packages for apt, yum, the AUR, and Homebrew | P2 | L | FR-034, FR-048 | todo |
 | [FR-061](FR-061-rails-integration.md) | A `fleetring` Ruby gem and an ActiveRecord adapter that place each tenant's database | P2 | L | FR-047, the router (no ticket yet) | todo |
-| [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | todo |
+| [FR-062](FR-062-one-word-per-thing.md) | One word per thing: resolve the lexicon's naming conflicts in code, CLI, protocol, and docs | P1 | M | FR-059 | in-progress |
 
 ## Dependency graph
 
@@ -228,7 +228,7 @@ For `fleetringd` v0.1, the critical path is FR-022 → FR-023 → FR-028 → FR-
 - **libSQL and Turso adapters** as frame sources, capturing commits inside the engine.
 - **Turso MVCC adapter**, for concurrent writers within one database. MVCC lifts SQLite's one-write-transaction-at-a-time limit inside a node; it doesn't change FleetRing's one writer *node* per database, which leases and epochs keep (ADR-0013, point 5; ADR-0018).
 - **Postgres adapter**, self-replicating through streaming replication. `fleetringd` only places, leases, and fences.
-- **TLS between nodes** through rustls, deferred from FR-023, with a certificate story (generated per cluster, or supplied).
+- **TLS between nodes** through rustls, deferred from FR-023, with a certificate story (generated per fleet, or supplied).
 - **Engine-changing migrations**, such as SQLite to Postgres behind an `upgrade` command (ADR-0021), after live migration (MVP step 3).
 
 **Placement crate.**
