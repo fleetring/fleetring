@@ -1,4 +1,4 @@
-//! The faults a test can inject into a [`Cluster`](crate::sim::Cluster).
+//! The faults a test can inject into a [`Fleet`](crate::sim::Fleet).
 
 use std::fmt;
 use std::time::Duration;

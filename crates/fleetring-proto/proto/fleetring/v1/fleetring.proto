@@ -30,7 +30,7 @@ enum Engine {
 }
 
 // How many replicas must store a write before it is acknowledged (ADR-0023). Unspecified means
-// the cluster's default in a request, and `quorum` from a control node that predates the field.
+// the fleet's default in a request, and `quorum` from a control node that predates the field.
 enum Acks {
   ACKS_UNSPECIFIED = 0;
   // A majority: W = floor(R/2) + 1.
@@ -51,7 +51,7 @@ enum Role {
 // ---- Control ----------------------------------------------------------------------------------
 
 // Every RPC states, in a `Scope:` line, what its caller needs (ADR-0025): `node` (a node
-// certificate; principals are refused), `cluster` (a node, or a principal with the `cluster`
+// certificate; principals are refused), `fleet` (a node, or a principal with the `fleet`
 // scope), an action on the database the request names, or, for a listing, the action on each
 // database it shows. A node call also states, in a `Binding:` line, what the calling node must
 // be for the database or node the request names (ADR-0031): `self` (the request names the
@@ -69,7 +69,7 @@ service Control {
   // Scope: node.
   // Binding: self.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
-  // Scope: cluster.
+  // Scope: fleet.
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
   // Scope: admin on the key.
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
@@ -81,10 +81,10 @@ service Control {
   // (ADR-0023).
   // Scope: admin on the key.
   rpc ChangeDurability(ChangeDurabilityRequest) returns (ChangeDurabilityResponse);
-  // Scope: read on the key, or cluster.
+  // Scope: read on the key, or fleet.
   rpc Locate(LocateRequest) returns (LocateResponse);
   // Every database's placement, in name order.
-  // Scope: read per key listed, or cluster.
+  // Scope: read per key listed, or fleet.
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   // Scope: node.
   // Binding: self.
@@ -93,7 +93,7 @@ service Control {
   // Binding: self.
   rpc RenewLease(RenewLeaseRequest) returns (LeaseResponse);
   // Removes a member, as a node does when it shuts down gracefully.
-  // Scope: cluster.
+  // Scope: fleet.
   // Binding: self.
   rpc Leave(LeaveRequest) returns (LeaveResponse);
   // The promotion calls (ADR-0018): the control node starts a promotion once a lease has
@@ -111,7 +111,7 @@ service Control {
   // Marks a member as draining: it gets no new lease and is never a promotion's candidate. The
   // member sees the mark in its membership updates and hands its leases over with
   // TransferLease, then leaves if it is shutting down.
-  // Scope: cluster.
+  // Scope: fleet.
   // Binding: self.
   rpc Drain(DrainRequest) returns (DrainResponse);
   // Hands a database's lease from its draining holder to a follower without waiting for the
@@ -123,7 +123,7 @@ service Control {
   // Adds a bearer token, or every token a signing key issued, to the denylist every node checks
   // before it trusts a token (ADR-0025). Data nodes learn the list from their heartbeat replies,
   // so a revocation reaches every live node within one heartbeat interval.
-  // Scope: cluster.
+  // Scope: fleet.
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
 }
 
@@ -206,7 +206,7 @@ message CreateDatabaseRequest {
   string database = 1;
   uint32 replication_factor = 2;
   Engine engine = 3;
-  // The acknowledgement mode; unspecified for the cluster's default.
+  // The acknowledgement mode; unspecified for the fleet's default.
   Acks acks = 4;
   // The floor on reachable replicas, the primary included, below which writes are refused;
   // 0 for the default, the mode's write quorum W.
@@ -514,18 +514,18 @@ service Database {
   rpc Create(CreateRequest) returns (CreateResponse);
   // What this node knows on its own, without asking the control plane: its membership epoch and
   // ring fingerprint, and the databases it serves with their roles.
-  // Scope: read or stream per key listed, or cluster.
+  // Scope: read or stream per key listed, or fleet.
   rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
   // The leases this node holds, as the node itself sees them (FR-042): first a snapshot of every
   // database it serves with its epoch, then one event per lease gained or lost, in the order the
   // node records them. A lease is gained before the node acknowledges a write under its epoch,
   // and lost before the node stops answering for the database. A subscriber that falls behind
   // gets RESOURCE_EXHAUSTED and opens the stream again for a fresh snapshot.
-  // Scope: read per key listed, or cluster.
+  // Scope: read per key listed, or fleet.
   rpc WatchLeases(WatchLeasesRequest) returns (stream LeaseUpdate);
   // This node's hash chain over a database's replication log at a position (FR-044), read back
   // from its copy, so that an operator can compare every replica's. Any replica answers.
-  // Scope: read on the key, or cluster.
+  // Scope: read on the key, or fleet.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 

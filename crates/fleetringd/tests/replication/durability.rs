@@ -15,12 +15,12 @@ use fleetringd::replication::{PrimaryRole, Replication};
 use fleetringd::{DatabaseError, ReplicationError};
 
 use crate::common::{
-    Cluster, TestResult, Wrap, eventually, guarded, name, put, role, routes, settings, sqlite,
+    Fleet, TestResult, Wrap, eventually, guarded, name, put, role, routes, settings, sqlite,
 };
 use crate::proxy::{Event, Log, Proxy, Switches};
 
 /// Starts nodes `a`, `b`, and `c`, with `b` and `c` behind proxies.
-async fn proxied() -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::error::Error>> {
+async fn proxied() -> Result<(Fleet, Switches, Switches, Log), Box<dyn std::error::Error>> {
     let log = Log::default();
     let b = Switches::new();
     let c = Switches::new();
@@ -39,8 +39,8 @@ async fn proxied() -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::er
             }),
         );
     }
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings(), wraps).await?;
-    Ok((cluster, b, c, log))
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings(), wraps).await?;
+    Ok((fleet, b, c, log))
 }
 
 /// The role of a three-replica database in `acks`, with the floor at the mode's W.
@@ -110,17 +110,17 @@ async fn until_refused(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acks_all_waits_for_every_replica_and_refuses_writes_without_one() -> TestResult {
-    let (cluster, b, c, log) = proxied().await?;
+    let (fleet, b, c, log) = proxied().await?;
     let db = name("everyone");
-    cluster.create_as("a", &db, three(Acks::All)).await?;
-    let primary = &cluster.node("a").replication;
+    fleet.create_as("a", &db, three(Acks::All)).await?;
+    let primary = &fleet.node("a").replication;
     let before = primary.primary_status(&db).ok_or("not primary")?.committed;
 
     // Both followers apply and fsync the write, but their acknowledgements are held back.
     b.pass_acks.send_replace(false);
     c.pass_acks.send_replace(false);
     let write = {
-        let registry = cluster.node("a").registry().clone();
+        let registry = fleet.node("a").registry().clone();
         let db = db.clone();
         let log = log.clone();
         tokio::spawn(async move {
@@ -130,7 +130,7 @@ async fn acks_all_waits_for_every_replica_and_refuses_writes_without_one() -> Te
         })
     };
     for follower in ["b", "c"] {
-        let replication = &cluster.node(follower).replication;
+        let replication = &fleet.node(follower).replication;
         eventually("the follower applying the write", || {
             replication
                 .follower_status(&db)
@@ -174,7 +174,7 @@ async fn acks_all_waits_for_every_replica_and_refuses_writes_without_one() -> Te
             "the write returned before {follower} acknowledged it: {events:?}"
         );
     }
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
 
     // With one replica gone, `all` can't be met: the floor (W = 3) refuses writes before they
     // run, and the primary's files don't change.
@@ -188,11 +188,11 @@ async fn acks_all_waits_for_every_replica_and_refuses_writes_without_one() -> Te
             reachable: 2
         }
     );
-    let dir = cluster.node("a").database_dir("everyone");
+    let dir = fleet.node("a").database_dir("everyone");
     let committed = primary.primary_status(&db).ok_or("not primary")?.committed;
     let snapshot = files(&dir)?;
     for key in 100..103 {
-        let error = cluster
+        let error = fleet
             .node("a")
             .registry()
             .execute(&db, put(key, 10))
@@ -210,7 +210,7 @@ async fn acks_all_waits_for_every_replica_and_refuses_writes_without_one() -> Te
     c.cut.send_replace(false);
     guarded("a write after the replica returns", async {
         loop {
-            if cluster
+            if fleet
                 .node("a")
                 .registry()
                 .execute(&db, put(3, 10))
@@ -223,19 +223,19 @@ async fn acks_all_waits_for_every_replica_and_refuses_writes_without_one() -> Te
         }
     })
     .await?;
-    cluster.await_caught_up("a", &db).await
+    fleet.await_caught_up("a", &db).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_below_the_replica_floor_are_refused_before_they_run() -> TestResult {
-    let (cluster, b, c, _log) = proxied().await?;
+    let (fleet, b, c, _log) = proxied().await?;
     let db = name("floor");
     let factor = ReplicationFactor::new(3).expect("nonzero");
     // A majority acknowledges, but every replica must be reachable for a write to run.
     let strict = role(3).with_durability(Durability::with_min_replicas(Acks::Quorum, 3, factor)?);
-    cluster.create_as("a", &db, strict).await?;
-    let primary = &cluster.node("a").replication;
-    let registry = cluster.node("a").registry().clone();
+    fleet.create_as("a", &db, strict).await?;
+    let primary = &fleet.node("a").replication;
+    let registry = fleet.node("a").registry().clone();
     let stored = registry.execute(&db, put(1, 10)).await?;
     assert_eq!(stored.acknowledged.map(|ack| ack.reachable), Some(3));
 
@@ -254,7 +254,7 @@ async fn writes_below_the_replica_floor_are_refused_before_they_run() -> TestRes
         refused.to_string().contains("nothing committed"),
         "{refused}"
     );
-    let dir = cluster.node("a").database_dir("floor");
+    let dir = fleet.node("a").database_dir("floor");
     let snapshot = files(&dir)?;
     let committed = primary.primary_status(&db).ok_or("not primary")?.committed;
     for key in 100..105 {
@@ -293,22 +293,22 @@ async fn writes_below_the_replica_floor_are_refused_before_they_run() -> TestRes
         }
     })
     .await?;
-    cluster.await_caught_up("a", &db).await
+    fleet.await_caught_up("a", &db).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acks_local_acknowledges_after_the_primarys_own_fsync() -> TestResult {
-    let (cluster, b, c, log) = proxied().await?;
+    let (fleet, b, c, log) = proxied().await?;
     let db = name("alone");
-    cluster.create_as("a", &db, three(Acks::Local)).await?;
-    let primary = &cluster.node("a").replication;
+    fleet.create_as("a", &db, three(Acks::Local)).await?;
+    let primary = &fleet.node("a").replication;
 
     // No follower acknowledges, and the write still returns, held by the primary alone.
     b.pass_acks.send_replace(false);
     c.pass_acks.send_replace(false);
     let stored = guarded(
         "a local write",
-        cluster.node("a").registry().execute(&db, put(1, 100)),
+        fleet.node("a").registry().execute(&db, put(1, 100)),
     )
     .await??;
     log.push(Event::Written);
@@ -336,7 +336,7 @@ async fn acks_local_acknowledges_after_the_primarys_own_fsync() -> TestResult {
     // The floor is 1, so even without any follower the primary keeps taking writes.
     b.pass_acks.send_replace(true);
     c.pass_acks.send_replace(true);
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     b.cut.send_replace(true);
     c.cut.send_replace(true);
     eventually("both streams cut", || {
@@ -345,11 +345,7 @@ async fn acks_local_acknowledges_after_the_primarys_own_fsync() -> TestResult {
             .is_some_and(|status| status.followers.iter().all(|follower| !follower.connected))
     })
     .await?;
-    let stored = cluster
-        .node("a")
-        .registry()
-        .execute(&db, put(2, 10))
-        .await?;
+    let stored = fleet.node("a").registry().execute(&db, put(2, 10)).await?;
     let acknowledged = stored.acknowledged.ok_or("no acknowledgement")?;
     assert_eq!(
         (acknowledged.acknowledged_by, acknowledged.reachable),
@@ -358,5 +354,5 @@ async fn acks_local_acknowledges_after_the_primarys_own_fsync() -> TestResult {
     assert!(acknowledged.is_under_replicated());
     b.cut.send_replace(false);
     c.cut.send_replace(false);
-    cluster.await_caught_up("a", &db).await
+    fleet.await_caught_up("a", &db).await
 }

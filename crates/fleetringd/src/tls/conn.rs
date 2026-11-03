@@ -148,9 +148,9 @@ pub enum HandshakeError {
     /// The handshake didn't finish within the handshake bound (10 s).
     #[error("TLS handshake timed out after {HANDSHAKE_TIMEOUT:?}")]
     Timeout,
-    /// The peer's certificate chains to a trusted authority but names nothing this cluster
+    /// The peer's certificate chains to a trusted authority but names nothing this fleet
     /// accepts.
-    #[error("the peer's certificate names no node or principal of this cluster: {reason}")]
+    #[error("the peer's certificate names no node or principal of this fleet: {reason}")]
     Subject {
         /// Why the subject is refused, without any certificate contents.
         reason: String,
@@ -164,7 +164,7 @@ impl Security {
     /// # Errors
     ///
     /// [`HandshakeError`] if the handshake fails or the peer's certificate names nothing this
-    /// cluster accepts.
+    /// fleet accepts.
     pub async fn accept(&self, raw: Raw) -> Result<Accepted, HandshakeError> {
         match self {
             Self::Plaintext => Ok(Accepted {
@@ -189,12 +189,12 @@ impl Security {
                         reason: error.to_string(),
                     }
                 })?;
-                if subject.cluster() != loaded.cluster() {
+                if subject.fleet() != loaded.fleet() {
                     return Err(HandshakeError::Subject {
                         reason: format!(
-                            "cluster '{}' is not this cluster '{}'",
-                            subject.cluster(),
-                            loaded.cluster()
+                            "fleet '{}' is not this fleet '{}'",
+                            subject.fleet(),
+                            loaded.fleet()
                         ),
                     });
                 }

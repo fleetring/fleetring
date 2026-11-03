@@ -23,11 +23,11 @@ use tonic::Code;
 use crate::sim::SimRng;
 use crate::sim::history::DurabilityMode;
 
-/// One operation a client sends to the cluster.
+/// One operation a client sends to the fleet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Operation {
-    /// Joins `node` to the cluster, with default placement attributes.
+    /// Joins `node` to the fleet, with default placement attributes.
     Join {
         /// The node.
         node: NodeId,
@@ -108,7 +108,7 @@ pub enum Operation {
     },
     /// Opens a `Replicate` stream to `target` for `database` at `epoch`, as an impostor holding
     /// a node certificate would to take a database over (FR-050). The client's certificate must
-    /// be a node's ([`ClusterBuilder::impostor`](crate::sim::ClusterBuilder::impostor)).
+    /// be a node's ([`FleetBuilder::impostor`](crate::sim::FleetBuilder::impostor)).
     ImpostorReplicate {
         /// The database.
         database: DatabaseName,
@@ -238,9 +238,9 @@ impl fmt::Display for Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
-    /// The cluster acknowledged it: the effect is durable and must never be lost.
+    /// The fleet acknowledged it: the effect is durable and must never be lost.
     Acknowledged(Ack),
-    /// The cluster refused it; it had no effect.
+    /// The fleet refused it; it had no effect.
     Rejected {
         /// The gRPC status code.
         code: Code,
@@ -931,7 +931,7 @@ pub trait Workload: fmt::Debug + 'static {
     }
 
     /// Whether the workload runs until the simulation ends rather than finishing on its own.
-    /// [`Cluster::await_workloads`](crate::sim::Cluster::await_workloads) doesn't wait for such
+    /// [`Fleet::await_workloads`](crate::sim::Fleet::await_workloads) doesn't wait for such
     /// a workload. The default is `false`.
     fn is_endless(&self) -> bool {
         false
@@ -989,7 +989,7 @@ const OPERATOR_POLL: Duration = Duration::from_millis(10);
 /// Operations a test queues while the simulation runs, as an operator would type them.
 ///
 /// It never finishes. Each queued operation runs once, whatever its outcome. Clones share the
-/// queue, so the test keeps one and gives another to [`Cluster::client`](crate::sim::Cluster::client).
+/// queue, so the test keeps one and gives another to [`Fleet::client`](crate::sim::Fleet::client).
 #[derive(Debug, Clone, Default)]
 pub struct Operator {
     queue: Arc<Mutex<VecDeque<Operation>>>,

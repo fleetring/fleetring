@@ -1,4 +1,4 @@
-//! The cluster certificate authority: it creates itself and issues node and client certificates.
+//! The fleet certificate authority: it creates itself and issues node and client certificates.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::auth::{IssueError, TokenSigner};
-use crate::tls::names::{ClusterName, Principal, SubjectUri};
+use crate::tls::names::{FleetName, Principal, SubjectUri};
 
 /// The authority's certificate, in the directory `cert init` writes.
 pub const AUTHORITY_CERT_FILE: &str = "ca.crt";
@@ -186,11 +186,11 @@ impl Issued {
     }
 }
 
-/// The cluster's certificate authority: a self-signed Ed25519 certificate and its key.
+/// The fleet's certificate authority: a self-signed Ed25519 certificate and its key.
 ///
-/// `Debug` shows the cluster and the certificate and never the key.
+/// `Debug` shows the fleet and the certificate and never the key.
 pub struct Authority {
-    cluster: ClusterName,
+    fleet: FleetName,
     certificate_pem: String,
     /// The parameters the certificate was built from, which issuing signs under.
     params: CertificateParams,
@@ -200,7 +200,7 @@ pub struct Authority {
 impl fmt::Debug for Authority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Authority")
-            .field("cluster", &self.cluster)
+            .field("fleet", &self.fleet)
             .field("certificate_pem", &self.certificate_pem)
             .finish_non_exhaustive()
     }
@@ -214,25 +214,25 @@ enum Purpose {
 }
 
 impl Authority {
-    /// Creates a new authority for `cluster`, valid as `validity` says.
+    /// Creates a new authority for `fleet`, valid as `validity` says.
     ///
     /// # Errors
     ///
     /// [`AuthorityError`] if the dates don't fit or generation fails.
-    pub fn create(cluster: ClusterName, validity: Validity) -> Result<Self, AuthorityError> {
+    pub fn create(fleet: FleetName, validity: Validity) -> Result<Self, AuthorityError> {
         let key = KeyPair::generate_for(&PKCS_ED25519)?;
         let (not_before, not_after) = validity.dates()?;
-        let mut params = authority_params(&cluster)?;
+        let mut params = authority_params(&fleet)?;
         params.not_before = not_before;
         params.not_after = not_after;
         params.serial_number = Some(serial(&[
             b"authority",
-            cluster.as_str().as_bytes(),
+            fleet.as_str().as_bytes(),
             &validity.not_before.as_millis().to_le_bytes(),
         ]));
         let certificate = params.self_signed(&key)?;
         Ok(Self {
-            cluster,
+            fleet,
             certificate_pem: certificate.pem(),
             params,
             key,
@@ -256,8 +256,8 @@ impl Authority {
         };
         let certificate = CertificateDer::from_pem_slice(certificate_pem.as_bytes())
             .map_err(|error| invalid(&cert_path, format!("not a PEM certificate: {error}")))?;
-        let cluster = match SubjectUri::of_certificate(&certificate) {
-            Ok(SubjectUri::Authority { cluster }) => cluster,
+        let fleet = match SubjectUri::of_certificate(&certificate) {
+            Ok(SubjectUri::Authority { fleet }) => fleet,
             Ok(other) => {
                 return Err(invalid(
                     &cert_path,
@@ -280,9 +280,9 @@ impl Authority {
             ));
         }
         // The certificate was written by `cert init`, so its subject is what `create` builds.
-        let params = authority_params(&cluster)?;
+        let params = authority_params(&fleet)?;
         Ok(Self {
-            cluster,
+            fleet,
             certificate_pem,
             params,
             key,
@@ -314,10 +314,10 @@ impl Authority {
         )
     }
 
-    /// Returns the cluster the authority issues for.
+    /// Returns the fleet the authority issues for.
     #[must_use]
-    pub fn cluster(&self) -> &ClusterName {
-        &self.cluster
+    pub fn fleet(&self) -> &FleetName {
+        &self.fleet
     }
 
     /// Returns the authority's certificate, PEM-encoded: what every node and client trusts.
@@ -326,7 +326,7 @@ impl Authority {
         &self.certificate_pem
     }
 
-    /// Returns a signer that issues bearer tokens for this cluster with the authority's key
+    /// Returns a signer that issues bearer tokens for this fleet with the authority's key
     /// (ADR-0025). Nodes verify them with the authority certificate they already trust.
     ///
     /// # Errors
@@ -334,11 +334,11 @@ impl Authority {
     /// [`IssueError::Key`](crate::auth::IssueError::Key) if the key isn't one tokens can be
     /// signed with.
     pub fn token_signer(&self) -> Result<TokenSigner, IssueError> {
-        TokenSigner::from_pkcs8(&self.key.serialize_der(), self.cluster.as_str())
+        TokenSigner::from_pkcs8(&self.key.serialize_der(), self.fleet.as_str())
     }
 
     /// Issues a node certificate for `id`, reachable at `hosts` (IP addresses or DNS names),
-    /// with the URI `fleetring://<cluster>/node/<id>` as its subject alternative name.
+    /// with the URI `fleetring://<fleet>/node/<id>` as its subject alternative name.
     ///
     /// # Errors
     ///
@@ -350,7 +350,7 @@ impl Authority {
         hosts: &[String],
         validity: Validity,
     ) -> Result<Issued, AuthorityError> {
-        let subject = SubjectUri::node(&self.cluster, id);
+        let subject = SubjectUri::node(&self.fleet, id);
         let mut names = Vec::with_capacity(hosts.len() + 1);
         names.push(SanType::URI(subject.to_string().try_into()?));
         for host in hosts {
@@ -360,7 +360,7 @@ impl Authority {
     }
 
     /// Issues a client certificate for `principal`, with the URI
-    /// `fleetring://<cluster>/principal/<name>` as its subject alternative name.
+    /// `fleetring://<fleet>/principal/<name>` as its subject alternative name.
     ///
     /// # Errors
     ///
@@ -370,7 +370,7 @@ impl Authority {
         principal: &Principal,
         validity: Validity,
     ) -> Result<Issued, AuthorityError> {
-        let subject = SubjectUri::principal(&self.cluster, principal);
+        let subject = SubjectUri::principal(&self.fleet, principal);
         let names = vec![SanType::URI(subject.to_string().try_into()?)];
         self.issue(subject, names, Purpose::Client, validity)
     }
@@ -435,14 +435,14 @@ fn serial(parts: &[&[u8]]) -> SerialNumber {
 }
 
 /// The authority certificate's parameters, apart from its dates and serial: a CA that signs
-/// certificates, named by its cluster.
-fn authority_params(cluster: &ClusterName) -> Result<CertificateParams, AuthorityError> {
+/// certificates, named by its fleet.
+fn authority_params(fleet: &FleetName) -> Result<CertificateParams, AuthorityError> {
     let mut params = CertificateParams::default();
-    params.distinguished_name = distinguished_name(&format!("fleetring {cluster} authority"));
+    params.distinguished_name = distinguished_name(&format!("fleetring {fleet} authority"));
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.subject_alt_names = vec![SanType::URI(
-        SubjectUri::authority(cluster).to_string().try_into()?,
+        SubjectUri::authority(fleet).to_string().try_into()?,
     )];
     Ok(params)
 }
@@ -546,11 +546,11 @@ mod tests {
     #[test]
     fn a_written_authority_loads_back_and_refuses_to_overwrite() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cluster: ClusterName = "lab".parse().expect("cluster name");
-        let authority = Authority::create(cluster.clone(), validity()).expect("create");
+        let fleet: FleetName = "lab".parse().expect("fleet name");
+        let authority = Authority::create(fleet.clone(), validity()).expect("create");
         authority.write(dir.path()).expect("write");
         let loaded = Authority::load(dir.path()).expect("load");
-        assert_eq!(loaded.cluster(), &cluster);
+        assert_eq!(loaded.fleet(), &fleet);
         assert_eq!(loaded.certificate_pem(), authority.certificate_pem());
         let again = authority.write(dir.path()).expect_err("overwrite");
         assert!(matches!(again, AuthorityError::Exists { .. }), "{again}");
@@ -560,8 +560,8 @@ mod tests {
 
     #[test]
     fn issued_certificates_name_their_subject() {
-        let cluster: ClusterName = "lab".parse().expect("cluster name");
-        let authority = Authority::create(cluster, validity()).expect("create");
+        let fleet: FleetName = "lab".parse().expect("fleet name");
+        let authority = Authority::create(fleet, validity()).expect("create");
         let id: NodeId = "n1".parse().expect("node id");
         let node = authority
             .issue_node(&id, &["127.0.0.1".to_owned(), "n1".to_owned()], validity())

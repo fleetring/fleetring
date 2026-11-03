@@ -379,3 +379,65 @@ async fn rotated_certificates_are_picked_up_without_a_restart_while_a_stream_sta
     control.run_until(async {}).await;
     Ok(())
 }
+
+/// Certificates `fleetringd` 0.2.0 issued, when the fleet was called a cluster: an authority for
+/// `legacy`, the node `node-1` at 127.0.0.1, and the principal `tester`, each valid for a
+/// century. The authority's private key isn't kept.
+const LEGACY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls-0.2.0");
+
+#[tokio::test]
+async fn certificates_from_0_2_still_connect() -> TestResult {
+    let fixtures = Path::new(LEGACY);
+    let dir = tempfile::tempdir()?;
+    let table = format!(
+        "\n[tls]\nca = {:?}\ncert = {:?}\nkey = {:?}\n\
+         \n[[principal]]\nname = \"tester\"\nscopes = [\"admin:*\", \"fleet\"]\n",
+        fixtures.join("ca.crt"),
+        fixtures.join("node.node-1.crt"),
+        fixtures.join("node.node-1.key"),
+    );
+    let daemon = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        "node-1",
+        "both",
+        None,
+        &table,
+    ))?)
+    .await?;
+    let identity = Identity::load(
+        &fixtures.join("ca.crt"),
+        &fixtures.join("client.tester.crt"),
+        &fixtures.join("client.tester.key"),
+    )?;
+    assert_eq!(identity.fleet().as_str(), "legacy");
+    let address = daemon.control_address().ok_or("no control address")?;
+    let client = Client::new(
+        address.to_string(),
+        Network::default().with_security(Security::Tls(identity)),
+    );
+    let status = tokio::time::timeout(HANG_GUARD, client.status()).await??;
+    assert_eq!(status.members().len(), 1);
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
+#[test]
+fn cert_init_names_the_fleet_and_refuses_the_old_flag() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let run = |flag: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            .args(["cert", "init", flag, "home", "--dir"])
+            .arg(dir.path())
+            .output()
+    };
+    let created = run("--fleet")?;
+    assert!(created.status.success(), "{created:?}");
+    assert!(created.stderr.is_empty(), "{created:?}");
+    assert!(String::from_utf8(created.stdout)?.contains("for fleet home"));
+    assert_eq!(Authority::load(dir.path())?.fleet().as_str(), "home");
+
+    let refused = run("--cluster")?;
+    assert_eq!(refused.status.code(), Some(2), "a usage error: {refused:?}");
+    assert!(String::from_utf8(refused.stderr)?.contains("unexpected argument '--cluster'"));
+    Ok(())
+}

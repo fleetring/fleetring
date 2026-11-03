@@ -1,6 +1,6 @@
 //! FR-028 on the harness: the control node survives crashes.
 //!
-//! A control-only cluster, a client that joins nodes, creates databases, and sends heartbeats,
+//! A control-only fleet, a client that joins nodes, creates databases, and sends heartbeats,
 //! and a control node that crashes and restarts every 40 to 120 milliseconds. Each crash checks
 //! that the log on disk replays to the state recovery builds, and that the state holds every
 //! acknowledged member and database.
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::Action;
-use fleetringd::sim::{Ack, Cluster, Operation, Script, Timings, seeds};
+use fleetringd::sim::{Ack, Fleet, Operation, Script, Timings, seeds};
 
 use crate::{BINARY, TestResult};
 
@@ -40,30 +40,30 @@ fn crashes(seed: u64) -> TestResult {
         snapshot_every: NonZeroU64::new(5).ok_or("zero")?,
         ..Timings::default()
     };
-    let mut cluster = Cluster::builder(seed)
+    let mut fleet = Fleet::builder(seed)
         .control(CONTROL)
         .timings(timings)
         .operation_timeout(OPERATION_TIMEOUT)
         .build()?;
-    cluster.client("driver", script()?);
+    fleet.client("driver", script()?);
 
     let mut step: u64 = 0;
     let mut crashes: u64 = 0;
     let mut next_crash: u64 = 30;
     let mut restart_at: Option<u64> = None;
-    while !cluster.workloads_done() {
-        cluster.step()?;
+    while !fleet.workloads_done() {
+        fleet.step()?;
         step += 1;
         match restart_at {
             Some(at) if step >= at => {
-                cluster.restart(CONTROL)?;
+                fleet.restart(CONTROL)?;
                 restart_at = None;
                 // Vary the uptime so crashes land at different points of the command cycle.
-                next_crash = step + 40 + cluster.rng().below(80);
+                next_crash = step + 40 + fleet.rng().below(80);
             }
             None if step >= next_crash => {
                 // Crashing the control host checks its log.
-                cluster.crash(CONTROL)?;
+                fleet.crash(CONTROL)?;
                 crashes += 1;
                 restart_at = Some(step + DOWN_STEPS);
             }
@@ -74,10 +74,10 @@ fn crashes(seed: u64) -> TestResult {
         }
     }
     if restart_at.is_some() {
-        cluster.restart(CONTROL)?;
+        fleet.restart(CONTROL)?;
     }
-    cluster.run_for(Duration::from_millis(100))?;
-    let report = cluster.finish()?;
+    fleet.run_for(Duration::from_millis(100))?;
+    let report = fleet.finish()?;
 
     let acknowledged = |wanted: fn(&Ack) -> bool| {
         report

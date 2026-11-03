@@ -280,8 +280,8 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
-    /// The cluster has no members, so no database has a replica set.
-    #[error("the cluster has no members")]
+    /// The fleet has no members, so no database has a replica set.
+    #[error("the fleet has no members")]
     NoMembers,
 
     /// The durability settings don't fit the database's replication factor.

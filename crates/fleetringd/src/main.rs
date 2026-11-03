@@ -1,4 +1,4 @@
-//! The `fleetringd` binary: the daemon, and the commands that talk to a running cluster.
+//! The `fleetringd` binary: the daemon, and the commands that talk to a running fleet.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -25,8 +25,8 @@ use fleetringd::data::{
 use fleetringd::engine::{Position, Rows, Statement, Value};
 use fleetringd::replication::ChainHash;
 use fleetringd::tls::{
-    Authority, ClusterName, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
-    DEFAULT_NODE_LIFETIME, Identity, Principal, Security, Validity,
+    Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
+    FleetName, Identity, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
 use fleetringd::{Config, Daemon, MembershipView, Network, Plaintext, Role};
@@ -45,7 +45,7 @@ const TOKEN_ID_BYTES: usize = 16;
 
 /// Places, replicates, and fails over SQLite databases across machines you own.
 ///
-/// With `--config`, runs the daemon. The subcommands talk to a running cluster.
+/// With `--config`, runs the daemon. The subcommands talk to a running fleet.
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -91,7 +91,7 @@ struct DaemonArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Creates the cluster's certificate authority and issues node and client certificates.
+    /// Creates the fleet's certificate authority and issues node and client certificates.
     #[command(subcommand)]
     Cert(CertCommand),
     /// Issues and revokes bearer tokens: signed, expiring credentials that name a principal and
@@ -136,7 +136,7 @@ enum TokenCommand {
         principal: Principal,
         /// A scope the token carries: `<action>:<pattern>`, with the action `read`, `write`,
         /// `admin`, or `stream` and the pattern a database name or a prefix ending in `*`; or
-        /// `cluster`. Repeat it for more.
+        /// `fleet`. Repeat it for more.
         #[arg(long = "scope", required = true)]
         scopes: Vec<Scope>,
         /// How long the token lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; one hour by default, 30
@@ -177,9 +177,9 @@ enum CertCommand {
     /// Creates the authority: `ca.crt` and `ca.key` in the directory. Keep `ca.key` off every
     /// node; it is the one secret that issues certificates.
     Init {
-        /// The cluster's name, which every certificate the authority issues names.
+        /// The fleet's name, which every certificate the authority issues names.
         #[arg(long)]
-        cluster: ClusterName,
+        fleet: FleetName,
         /// The directory to write into; created if missing.
         #[arg(long)]
         dir: PathBuf,
@@ -230,12 +230,12 @@ enum DbCommand {
         replication_factor: u8,
         /// How many replicas must store a write before it is acknowledged: `quorum` (a
         /// majority), `all` (every replica), or `local` (the primary alone; a failover may lose
-        /// acknowledged writes). The cluster's default if unset.
+        /// acknowledged writes). The fleet's default if unset.
         #[arg(long)]
         acks: Option<Acks>,
         /// How many replicas, the primary included, must be reachable for a write to run;
         /// below it, writes are refused before anything commits. Between the write quorum and
-        /// the replication factor; the cluster's default if unset, which is the write quorum
+        /// the replication factor; the fleet's default if unset, which is the write quorum
         /// unless the control node's configuration says otherwise.
         #[arg(long)]
         min_replicas: Option<u8>,
@@ -343,7 +343,7 @@ struct SqlArgs {
 #[derive(Debug, Args)]
 struct Target {
     /// The control node's address, `host:port`: the node that runs the control role, not any node
-    /// in the cluster. A data-only node answers with the control node's address.
+    /// in the fleet. A data-only node answers with the control node's address.
     #[arg(long, conflicts_with = "config")]
     control: Option<String>,
     /// A daemon's configuration file, to take the control node's address from.
@@ -809,14 +809,14 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
 fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
     let validity = |ttl| Validity::new(SystemClock.now(), ttl);
     match command {
-        CertCommand::Init { cluster, dir, ttl } => {
+        CertCommand::Init { fleet, dir, ttl } => {
             let authority = Authority::create(
-                cluster.clone(),
+                fleet.clone(),
                 validity(ttl.unwrap_or(DEFAULT_AUTHORITY_LIFETIME)),
             )?;
             authority.write(&dir)?;
             Ok(format!(
-                "created the authority for cluster {cluster} in {}: ca.crt and ca.key (keep \
+                "created the authority for fleet {fleet} in {}: ca.crt and ca.key (keep \
                  ca.key off every node)\n",
                 dir.display()
             ))

@@ -1,5 +1,5 @@
 //! A test authority: every daemon, node, and client the integration tests run gets a certificate
-//! from it, so they run over TLS as a deployed cluster does (FR-046).
+//! from it, so they run over TLS as a deployed fleet does (FR-046).
 
 #![allow(
     dead_code,
@@ -15,8 +15,8 @@ use fleetringd::Network;
 use fleetringd::tls::{Authority, Identity, Issued, Security, Validity};
 use fleetringd::transport::TransportConfig;
 
-/// The cluster every test authority issues for.
-pub(crate) const CLUSTER: &str = "test";
+/// The fleet every test authority issues for.
+pub(crate) const FLEET: &str = "test";
 
 /// The host every test daemon listens on, and so the one its certificate names.
 pub(crate) const HOST: &str = "127.0.0.1";
@@ -25,9 +25,9 @@ pub(crate) const HOST: &str = "127.0.0.1";
 pub(crate) const PRINCIPAL: &str = "tester";
 
 /// The `[[principal]]` entry every test daemon gets: [`PRINCIPAL`] may administer, write, read,
-/// and stream every database, and run the cluster operations.
+/// and stream every database, and run the fleet operations.
 pub(crate) const OPERATOR: &str =
-    "\n[[principal]]\nname = \"tester\"\nscopes = [\"admin:*\", \"stream:*\", \"cluster\"]\n";
+    "\n[[principal]]\nname = \"tester\"\nscopes = [\"admin:*\", \"stream:*\", \"fleet\"]\n";
 
 /// A certificate authority written under a test's directory.
 #[derive(Debug)]
@@ -37,12 +37,12 @@ pub(crate) struct Tls {
 }
 
 impl Tls {
-    /// Creates an authority for [`CLUSTER`] under `root/tls`, with `ca.crt` and `ca.key`, and
+    /// Creates an authority for [`FLEET`] under `root/tls`, with `ca.crt` and `ca.key`, and
     /// `client.crt` and `client.key` for the principal [`PRINCIPAL`], so that the directory
     /// serves as `FLEETRING_TLS_DIR` for the command line.
     pub(crate) fn create(root: &Path) -> Result<Self, Box<dyn Error>> {
         let dir = root.join("tls");
-        let authority = Authority::create(CLUSTER.parse()?, Self::validity())?;
+        let authority = Authority::create(FLEET.parse()?, Self::validity())?;
         authority.write(&dir)?;
         authority
             .issue_client(&PRINCIPAL.parse()?, Self::validity())?

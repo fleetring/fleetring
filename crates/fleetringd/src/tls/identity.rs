@@ -18,7 +18,7 @@ use x509_parser::oid_registry::OID_SIG_ED25519;
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::auth::{TokenVerifier, VerifyingKey};
-use crate::tls::names::{ClusterName, NameError, SubjectUri};
+use crate::tls::names::{FleetName, NameError, SubjectUri};
 use crate::tls::{Issued, Peer};
 
 /// How long after one check of the files the next connection may check them again.
@@ -184,8 +184,8 @@ impl Loaded {
         Arc::clone(&self.client)
     }
 
-    pub(crate) fn cluster(&self) -> &ClusterName {
-        self.subject.cluster()
+    pub(crate) fn fleet(&self) -> &FleetName {
+        self.subject.fleet()
     }
 }
 
@@ -296,19 +296,19 @@ impl Identity {
         self.inner.loaded.load().peer.clone()
     }
 
-    /// Returns the cluster the certificate was issued for.
+    /// Returns the fleet the certificate was issued for.
     #[must_use]
-    pub fn cluster(&self) -> ClusterName {
-        self.inner.loaded.load().subject.cluster().clone()
+    pub fn fleet(&self) -> FleetName {
+        self.inner.loaded.load().subject.fleet().clone()
     }
 
-    /// Returns what bearer tokens are checked against: this cluster, and the Ed25519 keys of
+    /// Returns what bearer tokens are checked against: this fleet, and the Ed25519 keys of
     /// the trusted authorities, as of the last reload (ADR-0025). During an authority rotation
     /// both authorities' tokens verify.
     #[must_use]
     pub fn token_verifier(&self) -> TokenVerifier {
         let loaded = self.current();
-        TokenVerifier::new(loaded.cluster().as_str(), loaded.token_keys.iter().cloned())
+        TokenVerifier::new(loaded.fleet().as_str(), loaded.token_keys.iter().cloned())
     }
 
     /// The material in use, after checking the files for a change if a check is due.

@@ -1,25 +1,25 @@
 //! Invariants checked during and after a run (ADR-0020, point 4).
 //!
 //! Each check is a function of what it needs: control state, a log on disk, the published
-//! views, or the [`History`]. [`Cluster`](crate::sim::Cluster) runs them at the points where
+//! views, or the [`History`]. [`Fleet`](crate::sim::Fleet) runs them at the points where
 //! they hold:
 //!
-//! - [`ring_converged`] once faults heal ([`Cluster::await_ring`](crate::sim::Cluster::await_ring));
+//! - [`ring_converged`] once faults heal ([`Fleet::await_ring`](crate::sim::Fleet::await_ring));
 //! - [`control_log_replays`] and [`acknowledged_control_survives`] whenever the control host is
 //!   crashed or stopped, and at the end of a run;
 //! - [`one_primary_per_epoch`] at every check and at the end;
 //! - the history checker ([`history::check`](crate::sim::history::check)), which includes
 //!   [`acknowledged_writes_replicated`], whenever the test asks
-//!   ([`Cluster::check_history`](crate::sim::Cluster::check_history)), once replicas converge,
+//!   ([`Fleet::check_history`](crate::sim::Fleet::check_history)), once replicas converge,
 //!   and at the end, and [`replicas_converged`] once the network heals
-//!   ([`Cluster::await_replicas_converged`](crate::sim::Cluster::await_replicas_converged));
+//!   ([`Fleet::await_replicas_converged`](crate::sim::Fleet::await_replicas_converged));
 //! - [`change_stream_consistent`] at the end, for every file sink a host is configured with
-//!   ([`Cluster::check_change_streams`](crate::sim::Cluster::check_change_streams));
+//!   ([`Fleet::check_change_streams`](crate::sim::Fleet::check_change_streams));
 //! - [`lease_events_match_control`] at the end, over what the lease watchers learned and the
 //!   leases the control log granted (FR-042).
 //! - [`chains_agree`] once replicas converge and at the end, over the hash chains of every
 //!   running replica the primary counts as following its log
-//!   ([`Cluster::check_chains`](crate::sim::Cluster::check_chains)).
+//!   ([`Fleet::check_chains`](crate::sim::Fleet::check_chains)).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

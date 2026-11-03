@@ -84,7 +84,7 @@ fn the_replication_table_sets_replication_settings() -> TestResult {
 #[test]
 fn principals_are_parsed_and_validated_at_start() -> TestResult {
     let text = format!(
-        "{MINIMAL}\n[[principal]]\nname = \"ops\"\nscopes = [\"admin:*\", \"cluster\"]\n\n\
+        "{MINIMAL}\n[[principal]]\nname = \"ops\"\nscopes = [\"admin:*\", \"fleet\"]\n\n\
          [[principal]]\nname = \"router\"\nforward_tokens = true\n"
     );
     let config = Config::from_toml(&text)?;
@@ -96,7 +96,7 @@ fn principals_are_parsed_and_validated_at_start() -> TestResult {
         .iter()
         .map(ToString::to_string)
         .collect();
-    assert_eq!(scopes, ["admin:*", "cluster"]);
+    assert_eq!(scopes, ["admin:*", "fleet"]);
     assert!(config.principals[1].scopes.is_empty());
     assert_eq!(
         config.principals[1].forward_tokens,
@@ -108,6 +108,8 @@ fn principals_are_parsed_and_validated_at_start() -> TestResult {
         ("scopes = [\"delete:*\"]", "delete"),
         ("scopes = [\"read:\"]", "empty pattern"),
         ("scopes = [\"read\"]", "<action>:<pattern>"),
+        // 0.2 spelled the fleet scope `cluster`; 0.3 refuses it and names `fleet`.
+        ("scopes = [\"cluster\"]", "`fleet`, not 'cluster'"),
         ("role = \"admin\"", "role"),
     ] {
         let text = format!("{MINIMAL}\n[[principal]]\nname = \"ops\"\n{bad}\n");
@@ -269,7 +271,7 @@ mod binary {
     /// Creates a one-replica database on the daemon at `control`, so the node is a primary.
     ///
     /// The daemon logs its start before its node has joined, and a create before the join is
-    /// refused because the cluster has no members, so the create is retried until the join lands.
+    /// refused because the fleet has no members, so the create is retried until the join lands.
     fn create_database(dir: &std::path::Path, control: &str) -> TestResult {
         for attempt in 0..600 {
             let created = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
@@ -332,7 +334,7 @@ mod binary {
             "{rest:?}"
         );
         assert!(
-            rest.iter().any(|line| line.contains("left the cluster")),
+            rest.iter().any(|line| line.contains("left the fleet")),
             "{rest:?}"
         );
         assert!(
@@ -355,7 +357,7 @@ mod binary {
             "{rest:?}"
         );
         assert!(
-            !rest.iter().any(|line| line.contains("left the cluster")),
+            !rest.iter().any(|line| line.contains("left the fleet")),
             "{rest:?}"
         );
         assert!(

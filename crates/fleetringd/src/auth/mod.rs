@@ -4,7 +4,7 @@
 //! bound to placement: a node acts only on databases placed on it, in the role control state
 //! gives it there ([`Binding`], ADR-0031). A principal's [`Scopes`] say which keys it may read,
 //! write, administer, or stream, and whether it may run key-less control operations
-//! (`cluster`); everything else is denied.
+//! (`fleet`); everything else is denied.
 
 mod binding;
 mod boundary;

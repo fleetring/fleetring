@@ -1,4 +1,4 @@
-//! The names certificates carry: the cluster, and the URI that names a node, a principal, or the
+//! The names certificates carry: the fleet, and the URI that names a node, a principal, or the
 //! authority (ADR-0025).
 
 use std::fmt;
@@ -12,7 +12,7 @@ use x509_parser::prelude::{FromDer as _, X509Certificate};
 /// The URI scheme of every subject alternative name the authority issues.
 const SCHEME: &str = "fleetring://";
 
-/// The longest cluster or principal name.
+/// The longest fleet or principal name.
 const MAX_NAME_LEN: usize = 64;
 
 /// The error returned when a name doesn't fit in a certificate, or a certificate names nothing.
@@ -63,11 +63,11 @@ fn check_name(what: &'static str, name: &str) -> Result<(), NameError> {
     }
 }
 
-/// A cluster's name: 1 to 64 lowercase letters, digits, `-`, `_`, or `.`.
+/// A fleet's name: 1 to 64 lowercase letters, digits, `-`, `_`, or `.`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ClusterName(String);
+pub struct FleetName(String);
 
-impl ClusterName {
+impl FleetName {
     /// Returns the name as text.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -75,16 +75,16 @@ impl ClusterName {
     }
 }
 
-impl FromStr for ClusterName {
+impl FromStr for FleetName {
     type Err = NameError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        check_name("cluster name", text)?;
+        check_name("fleet name", text)?;
         Ok(Self(text.to_owned()))
     }
 }
 
-impl fmt::Display for ClusterName {
+impl fmt::Display for FleetName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -129,55 +129,55 @@ impl<'de> serde::Deserialize<'de> for Principal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SubjectUri {
-    /// `fleetring://<cluster>/node/<id>`: a node of the cluster.
+    /// `fleetring://<fleet>/node/<id>`: a node of the fleet.
     Node {
-        /// The cluster.
-        cluster: ClusterName,
+        /// The fleet.
+        fleet: FleetName,
         /// The node.
         id: NodeId,
     },
-    /// `fleetring://<cluster>/principal/<name>`: a client acting as a principal.
+    /// `fleetring://<fleet>/principal/<name>`: a client acting as a principal.
     Principal {
-        /// The cluster.
-        cluster: ClusterName,
+        /// The fleet.
+        fleet: FleetName,
         /// The principal.
         name: Principal,
     },
-    /// `fleetring://<cluster>/authority`: the cluster's certificate authority.
+    /// `fleetring://<fleet>/authority`: the fleet's certificate authority.
     Authority {
-        /// The cluster.
-        cluster: ClusterName,
+        /// The fleet.
+        fleet: FleetName,
     },
 }
 
 impl SubjectUri {
-    pub(crate) fn node(cluster: &ClusterName, id: &NodeId) -> Self {
+    pub(crate) fn node(fleet: &FleetName, id: &NodeId) -> Self {
         Self::Node {
-            cluster: cluster.clone(),
+            fleet: fleet.clone(),
             id: id.clone(),
         }
     }
 
-    pub(crate) fn principal(cluster: &ClusterName, name: &Principal) -> Self {
+    pub(crate) fn principal(fleet: &FleetName, name: &Principal) -> Self {
         Self::Principal {
-            cluster: cluster.clone(),
+            fleet: fleet.clone(),
             name: name.clone(),
         }
     }
 
-    pub(crate) fn authority(cluster: &ClusterName) -> Self {
+    pub(crate) fn authority(fleet: &FleetName) -> Self {
         Self::Authority {
-            cluster: cluster.clone(),
+            fleet: fleet.clone(),
         }
     }
 
-    /// Returns the cluster the URI belongs to.
+    /// Returns the fleet the URI belongs to.
     #[must_use]
-    pub fn cluster(&self) -> &ClusterName {
+    pub fn fleet(&self) -> &FleetName {
         match self {
-            Self::Node { cluster, .. }
-            | Self::Principal { cluster, .. }
-            | Self::Authority { cluster } => cluster,
+            Self::Node { fleet, .. }
+            | Self::Principal { fleet, .. }
+            | Self::Authority { fleet } => fleet,
         }
     }
 
@@ -221,18 +221,18 @@ impl FromStr for SubjectUri {
             uri: text.to_owned(),
         };
         let rest = text.strip_prefix(SCHEME).ok_or_else(malformed)?;
-        let (cluster, path) = rest.split_once('/').ok_or_else(malformed)?;
-        let cluster: ClusterName = cluster.parse()?;
+        let (fleet, path) = rest.split_once('/').ok_or_else(malformed)?;
+        let fleet: FleetName = fleet.parse()?;
         match path.split_once('/') {
             Some(("node", id)) => Ok(Self::Node {
-                cluster,
+                fleet,
                 id: id.parse()?,
             }),
             Some(("principal", name)) => Ok(Self::Principal {
-                cluster,
+                fleet,
                 name: name.parse()?,
             }),
-            None if path == "authority" => Ok(Self::Authority { cluster }),
+            None if path == "authority" => Ok(Self::Authority { fleet }),
             _ => Err(malformed()),
         }
     }
@@ -241,11 +241,11 @@ impl FromStr for SubjectUri {
 impl fmt::Display for SubjectUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Node { cluster, id } => write!(f, "{SCHEME}{cluster}/node/{id}"),
-            Self::Principal { cluster, name } => {
-                write!(f, "{SCHEME}{cluster}/principal/{name}")
+            Self::Node { fleet, id } => write!(f, "{SCHEME}{fleet}/node/{id}"),
+            Self::Principal { fleet, name } => {
+                write!(f, "{SCHEME}{fleet}/principal/{name}")
             }
-            Self::Authority { cluster } => write!(f, "{SCHEME}{cluster}/authority"),
+            Self::Authority { fleet } => write!(f, "{SCHEME}{fleet}/authority"),
         }
     }
 }
@@ -263,7 +263,7 @@ mod tests {
         ] {
             let uri: SubjectUri = text.parse().expect(text);
             assert_eq!(uri.to_string(), text);
-            assert_eq!(uri.cluster().as_str(), "lab");
+            assert_eq!(uri.fleet().as_str(), "lab");
         }
     }
 
@@ -285,8 +285,8 @@ mod tests {
     #[test]
     fn names_are_checked() {
         assert!("tenant.a-1_x".parse::<Principal>().is_ok());
-        assert!("".parse::<ClusterName>().is_err());
-        assert!("has/slash".parse::<ClusterName>().is_err());
+        assert!("".parse::<FleetName>().is_err());
+        assert!("has/slash".parse::<FleetName>().is_err());
         assert!("x".repeat(65).parse::<Principal>().is_err());
     }
 }

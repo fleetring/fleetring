@@ -43,7 +43,7 @@ pub type MembershipStream = Pin<Box<dyn Stream<Item = Result<MembershipUpdate, S
 /// `[replication] acks` and `min_replicas` (ADR-0023).
 ///
 /// A default floor that doesn't fit a database's replication factor is clamped into W ≤ floor
-/// ≤ R, since it was set for the cluster rather than for that database; an explicit floor in a
+/// ≤ R, since it was set for the fleet rather than for that database; an explicit floor in a
 /// creation is rejected instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -114,7 +114,7 @@ impl ControlService {
     }
 
     /// The durability a creation asks for: `acks` and `min_replicas` as the request carries
-    /// them, with the cluster's defaults for what it leaves unset.
+    /// them, with the fleet's defaults for what it leaves unset.
     ///
     /// # Errors
     ///

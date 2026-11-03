@@ -9,7 +9,7 @@ use fleetring_control::{
 use crate::common::{at, config, create, db, heartbeat, id, run, zone};
 
 /// A state with members `ids` joined at time 0, each in its own zone.
-fn cluster(ids: &[&str]) -> State {
+fn fleet(ids: &[&str]) -> State {
     let mut state = State::new(config());
     for (i, name) in ids.iter().enumerate() {
         let member = Member::new(id(name)).with_zone(zone(&format!("z{i}")));
@@ -64,14 +64,14 @@ fn reject(state: &mut State, millis: u64, action: Action) -> Rejection {
 }
 
 #[test]
-fn an_empty_cluster_has_no_ring() {
+fn an_empty_fleet_has_no_ring() {
     let state = State::new(config());
     assert_eq!(state.ring().err(), Some(BuildRingError::NoNodes));
 }
 
 #[test]
 fn a_lease_is_acquired_renewed_and_expires() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let replicas = state.replica_set(&db("acme")).expect("replica set");
     let (primary, other) = (&replicas[0], &replicas[1]);
@@ -124,7 +124,7 @@ fn a_lease_is_acquired_renewed_and_expires() {
 
 #[test]
 fn a_lease_goes_only_to_a_live_replica_set_member() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("solo", 1)).expect("create");
     let replicas = state.replica_set(&db("solo")).expect("replica set");
     assert_eq!(replicas.len(), 1);
@@ -159,7 +159,7 @@ fn a_lease_goes_only_to_a_live_replica_set_member() {
 
 #[test]
 fn failover_picks_the_most_advanced_live_candidate_and_needs_a_quorum() {
-    let mut state = cluster(&["a", "b", "c", "d"]);
+    let mut state = fleet(&["a", "b", "c", "d"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let rs = state.replica_set(&db("acme")).expect("replica set");
     assert_eq!(rs.len(), 3);
@@ -243,7 +243,7 @@ fn failover_picks_the_most_advanced_live_candidate_and_needs_a_quorum() {
 
 #[test]
 fn ties_go_to_the_earliest_member_in_preference_order() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let rs = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
@@ -264,7 +264,7 @@ fn ties_go_to_the_earliest_member_in_preference_order() {
 
 #[test]
 fn a_stale_holder_cannot_renew_once_a_newer_epoch_exists() {
-    let mut state = cluster(&["a", "b"]);
+    let mut state = fleet(&["a", "b"]);
     run(&mut state, 0, create("acme", 2)).expect("create");
     let rs = state.replica_set(&db("acme")).expect("replica set");
     let (old, new) = (&rs[0], &rs[1]);
@@ -298,7 +298,7 @@ fn a_stale_holder_cannot_renew_once_a_newer_epoch_exists() {
 
 #[test]
 fn a_stalled_promotion_can_be_superseded_with_a_higher_epoch() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let rs = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
@@ -343,7 +343,7 @@ fn a_stalled_promotion_can_be_superseded_with_a_higher_epoch() {
 
 #[test]
 fn stamps_that_go_backwards_count_as_the_last_accepted_time() {
-    let mut state = cluster(&["a"]);
+    let mut state = fleet(&["a"]);
     run(&mut state, 5_000, heartbeat("a", &[])).expect("heartbeat");
     run(&mut state, 1_000, create("acme", 1)).expect("create");
     assert_eq!(state.now(), at(5_000));
@@ -361,7 +361,7 @@ fn stamps_that_go_backwards_count_as_the_last_accepted_time() {
 
 #[test]
 fn membership_changes_bump_the_membership_epoch() {
-    let mut state = cluster(&["a", "b"]);
+    let mut state = fleet(&["a", "b"]);
     assert_eq!(state.membership_epoch().get(), 2);
 
     let same = state.member(&id("a")).cloned().expect("member");
@@ -401,7 +401,7 @@ fn membership_changes_bump_the_membership_epoch() {
 
 #[test]
 fn a_new_address_bumps_the_membership_epoch_but_moves_no_key() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 2)).expect("create");
     let before = state.replica_set(&db("acme")).expect("replica set");
     let fingerprint = state.ring().expect("ring").fingerprint();
@@ -458,7 +458,7 @@ fn a_join_that_would_break_the_ring_is_rejected() {
 
 #[test]
 fn heartbeats_skip_unknown_databases_and_name_them() {
-    let mut state = cluster(&["a"]);
+    let mut state = fleet(&["a"]);
     run(&mut state, 0, create("acme", 1)).expect("create");
     // A database the control plane doesn't know costs the node nothing: the heartbeat counts,
     // the known report is recorded, and the unknown name comes back.
@@ -503,7 +503,7 @@ fn heartbeats_from_old_logs_keep_rejecting_unknown_databases() {
             ..
         }
     ));
-    let mut state = cluster(&["a"]);
+    let mut state = fleet(&["a"]);
     assert!(matches!(
         reject(&mut state, 10, action),
         Rejection::UnknownDatabase { .. }
@@ -549,7 +549,7 @@ fn heartbeat_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> 
 
 #[test]
 fn a_tick_only_moves_time_and_lets_a_promotion_become_due() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let replicas = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &replicas[0])).expect("lease");
@@ -594,7 +594,7 @@ fn a_tick_only_moves_time_and_lets_a_promotion_become_due() {
 
 #[test]
 fn the_candidate_has_the_newest_log_epoch_before_the_highest_position() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let replicas = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &replicas[0])).expect("lease");
@@ -641,7 +641,7 @@ fn drop_db(database: &str) -> Action {
 
 #[test]
 fn dropping_a_database_removes_its_lease_promotion_and_reports() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     run(&mut state, 0, create("other", 3)).expect("create another");
     let rs = state.replica_set(&db("acme")).expect("replica set");
@@ -745,10 +745,10 @@ fn transfer(database: &str, target: Option<&NodeId>) -> Action {
     }
 }
 
-/// A three-member cluster with `acme` leased to its first replica, every replica reporting at
+/// A three-member fleet with `acme` leased to its first replica, every replica reporting at
 /// 1 000 ms: the first at [5], the second at [9], and the third at [7].
-fn leased_cluster() -> (State, Vec<NodeId>) {
-    let mut state = cluster(&["a", "b", "c"]);
+fn leased_fleet() -> (State, Vec<NodeId>) {
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     let rs = state.replica_set(&db("acme")).expect("replica set");
     run(&mut state, 0, acquire("acme", &rs[0])).expect("lease");
@@ -765,7 +765,7 @@ fn leased_cluster() -> (State, Vec<NodeId>) {
 
 #[test]
 fn a_transfer_hands_the_lease_to_the_most_advanced_live_follower_without_waiting() {
-    let (mut state, rs) = leased_cluster();
+    let (mut state, rs) = leased_fleet();
     // The lease is nowhere near expiry, and the holder isn't draining: no transfer.
     assert_eq!(
         reject(&mut state, 1_010, transfer("acme", None)),
@@ -835,7 +835,7 @@ fn a_transfer_hands_the_lease_to_the_most_advanced_live_follower_without_waiting
 
 #[test]
 fn a_transfer_honors_a_valid_target_and_refuses_an_unusable_one() {
-    let (mut state, rs) = leased_cluster();
+    let (mut state, rs) = leased_fleet();
     run(&mut state, 1_020, drain(rs[0].as_str())).expect("drain");
 
     // The holder names the follower it shipped its tail to, even if another reported further.
@@ -877,7 +877,7 @@ fn a_transfer_honors_a_valid_target_and_refuses_an_unusable_one() {
 
 #[test]
 fn a_draining_member_gets_no_new_lease_and_is_never_a_candidate() {
-    let mut state = cluster(&["a", "b", "c"]);
+    let mut state = fleet(&["a", "b", "c"]);
     run(&mut state, 0, create("acme", 3)).expect("create");
     run(&mut state, 0, create("other", 3)).expect("create another");
     let rs = state.replica_set(&db("acme")).expect("replica set");
@@ -941,7 +941,7 @@ fn drains_and_transfers_survive_the_log_and_old_states_load_without_them() {
 
     // A state snapshot from before members could drain or leases be transferred: no
     // `draining` on members, no `handed_over_by` on promotions.
-    let (mut state, rs) = leased_cluster();
+    let (mut state, rs) = leased_fleet();
     run(&mut state, 1_201, start("acme")).expect("promotion");
     let snapshot = serde_json::to_string(&state).expect("serializes");
     assert!(!snapshot.contains("draining"), "{snapshot}");
@@ -958,7 +958,7 @@ fn drains_and_transfers_survive_the_log_and_old_states_load_without_them() {
     );
 
     // One with a draining member and a transfer round-trips too.
-    let (mut state, rs) = leased_cluster();
+    let (mut state, rs) = leased_fleet();
     run(&mut state, 1_020, drain(rs[0].as_str())).expect("drain");
     run(&mut state, 1_030, transfer("acme", None)).expect("transfer");
     let snapshot = serde_json::to_string(&state).expect("serializes");
@@ -980,7 +980,7 @@ fn token(text: &str) -> Revoked {
 
 #[test]
 fn revocations_last_until_their_time_and_then_are_forgotten() {
-    let mut state = cluster(&["a"]);
+    let mut state = fleet(&["a"]);
     let key = Revoked::Key("k1".parse().expect("key id"));
 
     assert_eq!(
@@ -1022,6 +1022,6 @@ fn revocations_last_until_their_time_and_then_are_forgotten() {
     let snapshot = serde_json::to_string(&state).expect("serializes");
     let restored: State = serde_json::from_str(&snapshot).expect("restores");
     assert_eq!(restored, state);
-    let empty = serde_json::to_string(&cluster(&["a"])).expect("serializes");
+    let empty = serde_json::to_string(&fleet(&["a"])).expect("serializes");
     assert!(!empty.contains("revocations"), "{empty}");
 }

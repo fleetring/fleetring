@@ -1,9 +1,9 @@
-//! Mutual TLS between nodes and clients, with the cluster's own certificate authority
+//! Mutual TLS between nodes and clients, with the fleet's own certificate authority
 //! (ADR-0025).
 //!
-//! Every connection is TLS 1.3 through `rustls`. A node presents a certificate the cluster's
-//! [`Authority`] issued, whose URI subject alternative name `fleetring://<cluster>/node/<id>`
-//! names it; a client's names its principal, `fleetring://<cluster>/principal/<name>`. Both ends
+//! Every connection is TLS 1.3 through `rustls`. A node presents a certificate the fleet's
+//! [`Authority`] issued, whose URI subject alternative name `fleetring://<fleet>/node/<id>`
+//! names it; a client's names its principal, `fleetring://<fleet>/principal/<name>`. Both ends
 //! verify the other's certificate against the trusted authority certificates. The server side
 //! learns who connected as a [`Peer`], which tonic places in the extensions of every request on
 //! the connection, so each service can check the caller before it does anything.
@@ -29,13 +29,13 @@ pub use authority::{
 };
 pub use conn::{Accepted, Conn, HandshakeError, Raw};
 pub use identity::{Identity, IdentityError};
-pub use names::{ClusterName, NameError, Principal, SubjectUri};
+pub use names::{FleetName, NameError, Principal, SubjectUri};
 
 /// Who a connection authenticated as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Peer {
-    /// A node of this cluster, by the ID in its certificate.
+    /// A node of this fleet, by the ID in its certificate.
     Node(NodeId),
     /// A client acting as a principal, by the name in its certificate.
     Principal(Principal),
@@ -75,13 +75,13 @@ impl Peer {
                 );
                 // Leaving or draining another member is an operator's call; the rest are the
                 // node's own and nobody else's.
-                let or_cluster = if matches!(call, "Leave" | "Drain") {
-                    ", or the cluster scope"
+                let or_fleet = if matches!(call, "Leave" | "Drain") {
+                    ", or the fleet scope"
                 } else {
                     ""
                 };
                 let mut status = Status::permission_denied(format!(
-                    "{call} for node '{claimed}' needs that node's certificate{or_cluster}"
+                    "{call} for node '{claimed}' needs that node's certificate{or_fleet}"
                 ));
                 // The call is bound to `self` (ADR-0031), and says so as every binding refusal
                 // does.

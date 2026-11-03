@@ -133,7 +133,7 @@ impl MembershipView {
     }
 }
 
-/// A data node's view of the cluster, kept current by the tasks [`Membership::start`] runs.
+/// A data node's view of the fleet, kept current by the tasks [`Membership::start`] runs.
 ///
 /// Cloning is cheap; clones share the published view. Each clone tracks separately which views
 /// [`Membership::changed`] has returned.
@@ -145,7 +145,7 @@ pub struct Membership {
 }
 
 impl Membership {
-    /// Joins the cluster as `member` through `client`, and starts the heartbeat and ring
+    /// Joins the fleet as `member` through `client`, and starts the heartbeat and ring
     /// publication tasks on the current Tokio runtime. Heartbeats report no databases; see
     /// [`Membership::start_reporting`].
     ///
@@ -333,7 +333,7 @@ pub struct MembershipTasks {
 /// warning after the control plane has already removed the member.
 const LEAVE_FLOOR: Duration = Duration::from_secs(2);
 
-/// How a node leaves the cluster when it shuts down gracefully.
+/// How a node leaves the fleet when it shuts down gracefully.
 #[derive(Debug)]
 struct Leave {
     client: ControlClient,
@@ -344,7 +344,7 @@ struct Leave {
 }
 
 impl MembershipTasks {
-    /// Stops sending heartbeats, leaves the cluster unless the settings say to stay, stops
+    /// Stops sending heartbeats, leaves the fleet unless the settings say to stay, stops
     /// following the membership, and waits for both tasks to end.
     ///
     /// Leaving tells the control plane that this is a planned departure rather than a failure:
@@ -367,13 +367,13 @@ impl MembershipTasks {
             };
             match timeout(*limit, client.leave(request)).await {
                 Ok(Ok(response)) => {
-                    tracing::info!(node = %id, epoch = response.membership_epoch, "left the cluster");
+                    tracing::info!(node = %id, epoch = response.membership_epoch, "left the fleet");
                 }
                 Ok(Err(status)) if status.code() == Code::NotFound => {
-                    tracing::info!(node = %id, "left the cluster; the control plane had already removed the member");
+                    tracing::info!(node = %id, "left the fleet; the control plane had already removed the member");
                 }
-                Ok(Err(status)) => tracing::warn!(node = %id, %status, "can't leave the cluster"),
-                Err(_) => tracing::warn!(node = %id, "leaving the cluster timed out"),
+                Ok(Err(status)) => tracing::warn!(node = %id, %status, "can't leave the fleet"),
+                Err(_) => tracing::warn!(node = %id, "leaving the fleet timed out"),
             }
         }
         self.watch.abort();
@@ -646,7 +646,7 @@ async fn heartbeat_loop(
         if !joined {
             match timeout(interval, heartbeats.client.join(join.clone())).await {
                 Ok(Ok(response)) => {
-                    tracing::info!(node = %id, epoch = response.membership_epoch, "joined the cluster");
+                    tracing::info!(node = %id, epoch = response.membership_epoch, "joined the fleet");
                     heartbeats
                         .denylist
                         .replace(revocations_from_proto(response.revocations));
@@ -654,7 +654,7 @@ async fn heartbeat_loop(
                     timeouts = 0;
                 }
                 Ok(Err(status)) => {
-                    tracing::warn!(node = %id, %status, "can't join the cluster; will retry");
+                    tracing::warn!(node = %id, %status, "can't join the fleet; will retry");
                     timeouts = 0;
                     failing = true;
                     continue;
@@ -662,11 +662,11 @@ async fn heartbeat_loop(
                 Err(_) => {
                     timeouts += 1;
                     if timeouts >= STALLED_HEARTBEATS {
-                        tracing::warn!(node = %id, "joining the cluster keeps timing out; will retry on a new connection");
+                        tracing::warn!(node = %id, "joining the fleet keeps timing out; will retry on a new connection");
                         heartbeats.client.reconnect();
                         timeouts = 0;
                     } else {
-                        tracing::debug!(node = %id, "joining the cluster timed out; the next heartbeat shows whether it landed");
+                        tracing::debug!(node = %id, "joining the fleet timed out; the next heartbeat shows whether it landed");
                     }
                     // The control node may have recorded the join and only its reply was late.
                     // Heartbeats tell: `NOT_FOUND` means it wasn't, and the join is sent again.

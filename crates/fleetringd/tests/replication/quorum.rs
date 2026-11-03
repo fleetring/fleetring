@@ -10,19 +10,19 @@ use fleetringd::ReplicationError;
 use fleetringd::replication::ReplicationSettings;
 
 use crate::common::{
-    Cluster, TestResult, Wrap, eventually, guarded, name, put, routes, settings, sqlite,
+    Fleet, TestResult, Wrap, eventually, guarded, name, put, routes, settings, sqlite,
 };
 use crate::proxy::{Event, Log, Proxy, Switches};
 
 /// Starts nodes `a`, `b`, and `c`, with `b` and `c` behind proxies.
-async fn proxied() -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::error::Error>> {
+async fn proxied() -> Result<(Fleet, Switches, Switches, Log), Box<dyn std::error::Error>> {
     proxied_with(settings()).await
 }
 
 /// As [`proxied`], with the nodes running `settings`.
 async fn proxied_with(
     settings: ReplicationSettings,
-) -> Result<(Cluster, Switches, Switches, Log), Box<dyn std::error::Error>> {
+) -> Result<(Fleet, Switches, Switches, Log), Box<dyn std::error::Error>> {
     let log = Log::default();
     let b = Switches::new();
     let c = Switches::new();
@@ -41,23 +41,23 @@ async fn proxied_with(
             }),
         );
     }
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, wraps).await?;
-    Ok((cluster, b, c, log))
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings, wraps).await?;
+    Ok((fleet, b, c, log))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_write_is_acknowledged_before_the_write_quorum_has_fsynced_it() -> TestResult {
-    let (cluster, b, c, log) = proxied().await?;
+    let (fleet, b, c, log) = proxied().await?;
     let db = name("quorum");
-    cluster.create("a", &db, 3).await?;
-    let primary = &cluster.node("a").replication;
+    fleet.create("a", &db, 3).await?;
+    let primary = &fleet.node("a").replication;
     let before = primary.primary_status(&db).ok_or("not primary")?.committed;
 
     // Both followers apply and fsync the write, but their acknowledgements are held back.
     b.pass_acks.send_replace(false);
     c.pass_acks.send_replace(false);
     let write = {
-        let registry = cluster.node("a").registry().clone();
+        let registry = fleet.node("a").registry().clone();
         let db = db.clone();
         let log = log.clone();
         tokio::spawn(async move {
@@ -67,7 +67,7 @@ async fn no_write_is_acknowledged_before_the_write_quorum_has_fsynced_it() -> Te
         })
     };
     for follower in ["b", "c"] {
-        let replication = &cluster.node(follower).replication;
+        let replication = &fleet.node(follower).replication;
         eventually("the follower applying the write", || {
             replication
                 .follower_status(&db)
@@ -108,7 +108,7 @@ async fn no_write_is_acknowledged_before_the_write_quorum_has_fsynced_it() -> Te
         "c's acknowledgement was held back: {events:?}"
     );
     c.pass_acks.send_replace(true);
-    cluster.await_caught_up("a", &db).await
+    fleet.await_caught_up("a", &db).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -117,14 +117,14 @@ async fn writes_are_refused_without_a_reachable_quorum() -> TestResult {
     // primary sees `b`'s stream close commits unacknowledged and ends only at the timeout, after
     // which the next write is refused. At the hang guard that one write would use up the guard
     // below, so keep the old 10 seconds here.
-    let (cluster, b, c, _log) = proxied_with(ReplicationSettings {
+    let (fleet, b, c, _log) = proxied_with(ReplicationSettings {
         ack_timeout: Duration::from_secs(10),
         ..settings()
     })
     .await?;
     let db = name("under");
-    cluster.create("a", &db, 3).await?;
-    let registry = cluster.node("a").registry().clone();
+    fleet.create("a", &db, 3).await?;
+    let registry = fleet.node("a").registry().clone();
 
     // One follower is enough for R = 3.
     c.cut.send_replace(true);
@@ -174,7 +174,7 @@ async fn writes_are_refused_without_a_reachable_quorum() -> TestResult {
     // Once the followers are back, the unacknowledged write replicates too.
     b.cut.send_replace(false);
     c.cut.send_replace(false);
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     registry.execute(&db, put(3, 10)).await?;
     Ok(())
 }
@@ -186,20 +186,20 @@ async fn writes_are_refused_without_a_reachable_quorum() -> TestResult {
 async fn a_write_waiting_for_its_quorum_fails_when_its_primary_steps_down() -> TestResult {
     // An acknowledgement timeout far beyond the hang guard, so that only the step down can end
     // the wait inside it.
-    let (cluster, b, c, _log) = proxied_with(ReplicationSettings {
+    let (fleet, b, c, _log) = proxied_with(ReplicationSettings {
         ack_timeout: Duration::from_secs(3_600),
         ..settings()
     })
     .await?;
     let db = name("stepdown");
-    cluster.create("a", &db, 3).await?;
-    let primary = &cluster.node("a").replication;
+    fleet.create("a", &db, 3).await?;
+    let primary = &fleet.node("a").replication;
     let before = primary.primary_status(&db).ok_or("not primary")?.committed;
 
     b.pass_acks.send_replace(false);
     c.pass_acks.send_replace(false);
     let write = {
-        let registry = cluster.node("a").registry().clone();
+        let registry = fleet.node("a").registry().clone();
         let db = db.clone();
         tokio::spawn(async move { registry.execute(&db, put(1, 100)).await })
     };

@@ -23,7 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::common::{
-    Cluster, HANG_GUARD, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put, role,
+    Fleet, HANG_GUARD, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put, role,
     routes, settings, sqlite,
 };
 
@@ -55,9 +55,9 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
         open_timeout: Duration::from_secs(600),
         ..settings()
     };
-    let cluster = Cluster::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings, BTreeMap::new()).await?;
     let db = name("grown");
-    let pair = cluster.node("a").replica_set(&db, 2);
+    let pair = fleet.node("a").replica_set(&db, 2);
     let [primary, first] = &pair[..] else {
         return Err(format!("two replicas expected, got {pair:?}").into());
     };
@@ -65,9 +65,9 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
         .into_iter()
         .find(|node| !pair.iter().any(|member| member == node))
         .ok_or("a third node")?;
-    cluster.create(primary, &db, 2).await?;
+    fleet.create(primary, &db, 2).await?;
 
-    let registry = cluster.node(primary).registry().clone();
+    let registry = fleet.node(primary).registry().clone();
     let transactions = megabytes * 1024 * 1024 / (ROW_BYTES * ROWS_PER_TRANSACTION);
     for t in 0..transactions {
         let rows = (0..ROWS_PER_TRANSACTION).map(|r| {
@@ -76,7 +76,7 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
         });
         registry.execute(&db, Transaction::new(rows)).await?;
     }
-    cluster.await_caught_up(primary, &db).await?;
+    fleet.await_caught_up(primary, &db).await?;
 
     // Grow the replica set while a writer keeps writing.
     let writer = {
@@ -105,17 +105,17 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
             Ok::<_, DatabaseError>(acknowledged)
         })
     };
-    let replication = &cluster.node(primary).replication;
+    let replication = &fleet.node(primary).replication;
     replication.serve_primary(db.clone(), crate::common::role(3))?;
     let acknowledged = guarded("the writer", writer).await???;
     assert!(
         acknowledged > 0,
         "writes went on while the follower was added"
     );
-    cluster.await_caught_up(primary, &db).await?;
+    fleet.await_caught_up(primary, &db).await?;
     let status = replication.primary_status(&db).ok_or("not primary")?;
     assert_eq!(status.followers.len(), 2, "{status:?}");
-    let seeded = cluster
+    let seeded = fleet
         .node(added)
         .replication
         .follower_status(&db)
@@ -126,11 +126,11 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
     for i in 0..20_i64 {
         registry.execute(&db, put(2_000_000 + i, 900)).await?;
     }
-    cluster.await_caught_up(primary, &db).await?;
+    fleet.await_caught_up(primary, &db).await?;
 
     let marker = checkpoint(replication, &db).await?;
     for follower in [first.as_str(), added] {
-        let follower = &cluster.node(follower).replication;
+        let follower = &fleet.node(follower).replication;
         eventually("the follower checkpointing at the marker", || {
             follower
                 .follower_status(&db)
@@ -138,7 +138,7 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
         })
         .await?;
     }
-    let file = |node: &str| fs::read(cluster.node(node).database_dir("grown").join("data.db"));
+    let file = |node: &str| fs::read(fleet.node(node).database_dir("grown").join("data.db"));
     let expected = file(primary)?;
     assert!(
         expected.len() >= megabytes * 1024 * 1024,
@@ -328,14 +328,14 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
         "a".to_owned(),
         Tamper::wrap(Arc::clone(&faults), Arc::clone(&calls), released),
     )]);
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), wraps).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), wraps).await?;
     let db = name("tampered");
-    let follower = cluster.node("b");
+    let follower = fleet.node("b");
     let databases = follower.root.join("databases");
 
     // The first transfer is cut, the second corrupted; while the third is held, the follower has
     // no copy at all, and the failed transfers' staging directories are gone.
-    let created = cluster.create("a", &db, 2);
+    let created = fleet.create("a", &db, 2);
     let checked = async {
         eventually("the third transfer", || calls.load(Ordering::SeqCst) >= 3).await?;
         assert!(
@@ -357,10 +357,10 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
     // Seeding the copy again through a corrupted transfer fails and keeps the old copy.
     guarded(
         "the write before seeding",
-        cluster.node("a").registry().execute(&db, put(1, 4_000)),
+        fleet.node("a").registry().execute(&db, put(1, 4_000)),
     )
     .await??;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let before = fs::read(follower.database_dir("tampered").join("data.db"))?;
     let wal_before = fs::read(follower.database_dir("tampered").join("data.db-wal"))?;
     faults
@@ -392,7 +392,7 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
         follower.replication.seed(&db, &id("a"), LeaseEpoch::new(1)),
     )
     .await??;
-    let primary = &cluster.node("a").replication;
+    let primary = &fleet.node("a").replication;
     assert_eq!(
         seeded,
         primary.primary_status(&db).ok_or("primary")?.committed
@@ -401,10 +401,10 @@ async fn failed_transfers_restart_cleanly_and_never_leave_a_partial_copy() -> Te
     assert!(primary.await_writable(&db, HANG_GUARD).await);
     guarded(
         "the write after seeding",
-        cluster.node("a").registry().execute(&db, put(2, 4_000)),
+        fleet.node("a").registry().execute(&db, put(2, 4_000)),
     )
     .await??;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     Ok(())
 }
 
@@ -419,11 +419,11 @@ async fn a_seed_during_a_streams_first_transfer_takes_over_the_copy() -> TestRes
         "a".to_owned(),
         Tamper::wrap(Arc::clone(&faults), Arc::clone(&calls), released),
     )]);
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), wraps).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), wraps).await?;
     let db = name("contended");
-    let follower = cluster.node("b");
+    let follower = fleet.node("b");
 
-    let created = cluster.create("a", &db, 2);
+    let created = fleet.create("a", &db, 2);
     let seeded = async {
         // The stream has admitted the epoch and holds the copy while its transfer is held.
         eventually("the stream's transfer", || {
@@ -446,7 +446,7 @@ async fn a_seed_during_a_streams_first_transfer_takes_over_the_copy() -> TestRes
     let (created, seeded) = tokio::join!(created, seeded);
     seeded?;
     created?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let status = follower.replication.follower_status(&db).ok_or("follows")?;
     assert_eq!(
         status.snapshots, 2,
@@ -467,10 +467,10 @@ async fn a_fence_during_a_seeds_wait_goes_first_and_the_seed_then_fails() -> Tes
         "a".to_owned(),
         Tamper::wrap(Arc::clone(&faults), Arc::clone(&calls), released),
     )]);
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), wraps).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), wraps).await?;
     let db = name("fenced");
-    let primary = cluster.node("a");
-    let follower = cluster.node("b");
+    let primary = fleet.node("a");
+    let follower = fleet.node("b");
     guarded("creating the database", primary.registry().create(&db)).await??;
     primary.replication.serve_primary(db.clone(), role(2))?;
 
@@ -527,22 +527,22 @@ async fn a_fence_during_a_seeds_wait_goes_first_and_the_seed_then_fails() -> Tes
 /// replication goes on from the snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> TestResult {
-    let cluster = Cluster::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
     let db = name("diverged");
-    cluster.create("a", &db, 2).await?;
-    let primary = &cluster.node("a").replication;
-    let registry = cluster.node("a").registry();
-    let follower = &cluster.node("b").replication;
+    fleet.create("a", &db, 2).await?;
+    let primary = &fleet.node("a").replication;
+    let registry = fleet.node("a").registry();
+    let follower = &fleet.node("b").replication;
 
     registry.execute(&db, put(1, 1_000)).await?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let start = primary.primary_status(&db).ok_or("primary")?.committed;
     registry.execute(&db, put(2, 1_000)).await?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     primary.checkpoint(&db).await?;
     // The follower takes the next generation, and with it the checkpoint, at epoch 1.
     registry.execute(&db, put(3, 1_000)).await?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let before = follower.follower_status(&db).ok_or("follows")?.snapshots;
 
     // Epoch 2's log began back at `start`, before that checkpoint.
@@ -553,7 +553,7 @@ async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> Te
     primary.lead(&db, epoch, start).await?;
     assert!(primary.await_writable(&db, HANG_GUARD).await);
     write_when_admitted(|| registry.execute(&db, put(4, 1_000))).await?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let status = follower.follower_status(&db).ok_or("follows")?;
     assert_eq!(status.snapshots, before + 1, "re-seeded once: {status:?}");
     assert_eq!(status.epoch, Some(LeaseEpoch::new(2)));
@@ -563,7 +563,7 @@ async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> Te
     primary.serve_primary(db.clone(), epoch)?;
     assert!(primary.await_writable(&db, HANG_GUARD).await);
     write_when_admitted(|| registry.execute(&db, put(5, 1_000))).await?;
-    cluster.await_caught_up("a", &db).await?;
+    fleet.await_caught_up("a", &db).await?;
     let status = follower.follower_status(&db).ok_or("follows")?;
     assert_eq!(
         status.snapshots,

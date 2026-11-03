@@ -113,10 +113,10 @@ mod tests {
 
     #[test]
     fn the_rerun_command_names_the_seed_and_the_exact_test() {
-        let command = rerun_command("sim", "cluster::three_nodes", 42);
+        let command = rerun_command("sim", "fleet::three_nodes", 42);
         assert!(
             command.ends_with(
-                "FLEETRING_SIM_SEED=42 cargo test -p fleetringd --features simulation --test sim -- --exact cluster::three_nodes"
+                "FLEETRING_SIM_SEED=42 cargo test -p fleetringd --features simulation --test sim -- --exact fleet::three_nodes"
             ),
             "{command}"
         );

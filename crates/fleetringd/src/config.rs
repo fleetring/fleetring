@@ -94,7 +94,7 @@ pub struct Config {
 /// ```toml
 /// [[principal]]
 /// name = "ops"
-/// scopes = ["admin:*", "stream:*", "cluster"]
+/// scopes = ["admin:*", "stream:*", "fleet"]
 ///
 /// [[principal]]
 /// name = "acme-app"
@@ -107,7 +107,7 @@ pub struct Config {
 /// ```
 ///
 /// Each scope is `<action>:<pattern>` with the action `read`, `write`, `admin`, or `stream`,
-/// and the pattern an exact database name or a prefix ending in `*`; or the word `cluster`, for
+/// and the pattern an exact database name or a prefix ending in `*`; or the word `fleet`, for
 /// control operations that name no database. `write` implies `read`, and `admin` implies both.
 /// A request with a bearer token acts with the token's scopes instead.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -217,7 +217,7 @@ fn default_weight() -> Weight {
 }
 
 impl NodeConfig {
-    /// Returns the member this node joins the cluster as, without an address; the daemon adds the
+    /// Returns the member this node joins the fleet as, without an address; the daemon adds the
     /// advertised one.
     #[must_use]
     pub fn to_member(&self) -> Member {
@@ -264,7 +264,7 @@ pub struct MembershipSettings {
     /// How often the node sends a heartbeat, in milliseconds. The node also retries a failed
     /// join, and reopens a broken membership stream, at this interval.
     pub heartbeat_interval_ms: NonZeroU64,
-    /// Whether a graceful shutdown leaves the cluster, or stays a member that is marked down
+    /// Whether a graceful shutdown leaves the fleet, or stays a member that is marked down
     /// until it starts again.
     pub on_shutdown: OnShutdown,
 }
@@ -274,7 +274,7 @@ pub struct MembershipSettings {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum OnShutdown {
-    /// Leave the cluster: the control plane removes the member at once and rebuilds the ring
+    /// Leave the fleet: the control plane removes the member at once and rebuilds the ring
     /// without it, so its replicas move to other nodes. The default: a planned departure is no
     /// failure.
     #[default]
@@ -490,7 +490,7 @@ impl Default for ControlSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Both roles in one process: a single-machine cluster.
+    /// Both roles in one process: a single-machine fleet.
     #[default]
     Both,
     /// Hosts databases, and reaches the control node at `control`.

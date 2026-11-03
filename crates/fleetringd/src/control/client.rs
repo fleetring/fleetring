@@ -146,7 +146,7 @@ impl ControlClient {
             .clear();
     }
 
-    /// Joins the cluster. Retried.
+    /// Joins the fleet. Retried.
     ///
     /// # Errors
     ///
@@ -290,7 +290,7 @@ impl ControlClient {
         .await
     }
 
-    /// Leaves the cluster. Sent once per leader, not retried.
+    /// Leaves the fleet. Sent once per leader, not retried.
     ///
     /// # Errors
     ///

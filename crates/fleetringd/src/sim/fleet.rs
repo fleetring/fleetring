@@ -1,4 +1,4 @@
-//! A simulated cluster of real daemons, one turmoil host per node.
+//! A simulated fleet of real daemons, one turmoil host per node.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -29,7 +29,7 @@ use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
 use crate::sim::workload::{Ack, History, Operation, WRITES_TABLE, Workload};
-use crate::tls::{Authority, AuthorityError, ClusterName, Identity, IdentityError, Validity};
+use crate::tls::{Authority, AuthorityError, FleetName, Identity, IdentityError, Validity};
 use crate::{
     Config, ControlSettings, Membership, MembershipSettings, NodeConfig, ReplicationConfig, Role,
 };
@@ -37,7 +37,7 @@ use crate::{
 /// The port every simulated daemon listens on.
 pub const PORT: u16 = 7400;
 
-/// The environment variable that makes every cluster print its trace when it is dropped.
+/// The environment variable that makes every fleet print its trace when it is dropped.
 pub const TRACE_VAR: &str = "FLEETRING_SIM_TRACE";
 
 /// How long a client waits for one operation before it counts as indeterminate, by default.
@@ -53,8 +53,8 @@ const STOP_LIMIT: Duration = Duration::from_secs(30);
 /// Mixed into the seed for the workload generator, so it doesn't mirror turmoil's.
 const WORKLOAD_SALT: u64 = 0x5EED_F1EE_7219_0024;
 
-/// The cluster name the test authority issues for.
-const CLUSTER: &str = "sim";
+/// The fleet name the test authority issues for.
+const FLEET: &str = "sim";
 
 /// How long the test authority's certificates last. rustls checks validity against the wall
 /// clock, not simulated time, so they span from the epoch to well past any run.
@@ -64,8 +64,8 @@ const CERTIFICATE_LIFETIME: Duration = Duration::from_secs(100 * 365 * 24 * 60 *
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SimError {
-    /// The cluster's description is invalid.
-    #[error("invalid cluster: {0}")]
+    /// The fleet's description is invalid.
+    #[error("invalid fleet: {0}")]
     Invalid(String),
     /// The hosts' data directories can't be created.
     #[error("can't create the data directories")]
@@ -95,7 +95,7 @@ pub enum SimError {
     Diverged(#[from] Divergence),
 }
 
-/// The timings every host in a cluster runs with.
+/// The timings every host in a fleet runs with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timings {
     /// How often data nodes send heartbeats.
@@ -152,8 +152,8 @@ impl Timings {
 
 type Configure = Box<dyn Fn(&mut Config)>;
 
-/// Describes a [`Cluster`]: its seed, its hosts and their roles, and its timings.
-pub struct ClusterBuilder {
+/// Describes a [`Fleet`]: its seed, its hosts and their roles, and its timings.
+pub struct FleetBuilder {
     seed: u64,
     hosts: Vec<(String, Role)>,
     timings: Timings,
@@ -166,9 +166,9 @@ pub struct ClusterBuilder {
     impostors: BTreeMap<String, NodeId>,
 }
 
-impl fmt::Debug for ClusterBuilder {
+impl fmt::Debug for FleetBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClusterBuilder")
+        f.debug_struct("FleetBuilder")
             .field("seed", &self.seed)
             .field("hosts", &self.hosts)
             .field("timings", &self.timings)
@@ -180,7 +180,7 @@ impl fmt::Debug for ClusterBuilder {
     }
 }
 
-impl ClusterBuilder {
+impl FleetBuilder {
     /// Runs every host's replication with `settings`, through its `[replication]` table. The
     /// default is [`ReplicationSettings::new`].
     #[must_use]
@@ -230,7 +230,7 @@ impl ClusterBuilder {
     }
 
     /// Delays each message by a random time up to `max_latency`. The default is 20 ms, a busy
-    /// local network; [`Cluster::set_latency`] changes single links during a run.
+    /// local network; [`Fleet::set_latency`] changes single links during a run.
     #[must_use]
     pub fn max_latency(mut self, max_latency: Duration) -> Self {
         self.max_latency = max_latency;
@@ -248,8 +248,8 @@ impl ClusterBuilder {
         self
     }
 
-    /// Makes the client host `name`, once [`Cluster::client`] adds it, present a node
-    /// certificate for `as_node` from the cluster's authority instead of a principal's: an
+    /// Makes the client host `name`, once [`Fleet::client`] adds it, present a node
+    /// certificate for `as_node` from the fleet's authority instead of a principal's: an
     /// impostor that stole that node's key (FR-050). Its workload's node calls
     /// ([`Operation::ImpostorReplicate`](crate::sim::Operation::ImpostorReplicate) and the
     /// others) go out with that certificate.
@@ -280,7 +280,7 @@ impl ClusterBuilder {
     /// [`SimError::Invalid`] if there are no hosts, a name repeats or isn't a valid node ID, or
     /// not exactly one host runs the control plane; [`SimError::Io`] if the directories can't
     /// be created.
-    pub fn build(self) -> Result<Cluster, SimError> {
+    pub fn build(self) -> Result<Fleet, SimError> {
         let control = self.validate()?;
         let root = tempfile::tempdir()?;
         let sim = turmoil::Builder::new()
@@ -290,11 +290,11 @@ impl ClusterBuilder {
             .max_message_latency(self.max_latency)
             .build();
         let control_address = SocketAddr::new(sim.lookup(control.as_str()), PORT);
-        let cluster_name: ClusterName = CLUSTER
+        let fleet_name: FleetName = FLEET
             .parse()
             .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?;
-        let authority = Arc::new(Authority::create(cluster_name, certificate_validity())?);
-        let mut cluster = Cluster {
+        let authority = Arc::new(Authority::create(fleet_name, certificate_validity())?);
+        let mut fleet = Fleet {
             sim,
             authority,
             seed: self.seed,
@@ -311,10 +311,10 @@ impl ClusterBuilder {
             root,
         };
         for (name, role) in &self.hosts {
-            let data_dir = cluster.root.path().join(name);
+            let data_dir = fleet.root.path().join(name);
             std::fs::create_dir_all(&data_dir)?;
             let mut config = host_config(name, *role, data_dir.clone(), self.timings)?;
-            config.node.advertise = Some(SocketAddr::new(cluster.sim.lookup(name.as_str()), PORT));
+            config.node.advertise = Some(SocketAddr::new(fleet.sim.lookup(name.as_str()), PORT));
             if !role.runs_control() {
                 config.control.address = Some(control_address);
             }
@@ -324,20 +324,20 @@ impl ClusterBuilder {
             for (_, configure) in self.configure.iter().filter(|(host, _)| host == name) {
                 configure(&mut config);
             }
-            let address = cluster.sim.lookup(name.as_str()).to_string();
-            let issued = cluster.authority.issue_node(
+            let address = fleet.sim.lookup(name.as_str()).to_string();
+            let issued = fleet.authority.issue_node(
                 &config.node.id,
                 &[name.clone(), address],
                 certificate_validity(),
             )?;
-            let identity = Identity::from_issued(cluster.authority.certificate_pem(), &issued)?;
-            cluster.add_host(name, *role, config, identity, data_dir);
+            let identity = Identity::from_issued(fleet.authority.certificate_pem(), &issued)?;
+            fleet.add_host(name, *role, config, identity, data_dir);
         }
-        let data_hosts: Vec<String> = cluster.data_hosts().map(str::to_owned).collect();
+        let data_hosts: Vec<String> = fleet.data_hosts().map(str::to_owned).collect();
         for name in data_hosts {
-            cluster.add_lease_watcher(&name);
+            fleet.add_lease_watcher(&name);
         }
-        Ok(cluster)
+        Ok(fleet)
     }
 
     /// Returns the one host that runs the control plane.
@@ -372,7 +372,7 @@ pub(super) fn certificate_validity() -> Validity {
 }
 
 /// The principal every simulated client acts as. Every host's configuration lets it do all a
-/// principal may: administer, write, read, and stream every database, and run cluster
+/// principal may: administer, write, read, and stream every database, and run fleet
 /// operations (ADR-0025).
 pub(super) const WORKLOAD_PRINCIPAL: &str = "workload";
 
@@ -381,7 +381,7 @@ fn workload_principal() -> crate::PrincipalConfig {
         name: WORKLOAD_PRINCIPAL
             .parse()
             .unwrap_or_else(|error| panic!("'{WORKLOAD_PRINCIPAL}' is not a principal: {error}")),
-        scopes: ["admin:*", "stream:*", "cluster"]
+        scopes: ["admin:*", "stream:*", "fleet"]
             .into_iter()
             .map(|scope| {
                 scope
@@ -442,7 +442,7 @@ fn host_config(
     })
 }
 
-/// A host the cluster runs.
+/// A host the fleet runs.
 #[derive(Debug, Clone)]
 struct HostInfo {
     name: String,
@@ -451,14 +451,14 @@ struct HostInfo {
     config: Config,
 }
 
-/// A running cluster of simulated hosts, each running the real [`Daemon`](crate::Daemon).
+/// A running fleet of simulated hosts, each running the real [`Daemon`](crate::Daemon).
 ///
 /// Every host is a turmoil host with its own data directory, which survives crashes. The test
-/// drives simulated time with [`Cluster::step`], [`Cluster::run_for`], and [`Cluster::run_until`],
-/// injects [`Fault`]s between steps, adds [`Workload`]s with [`Cluster::client`], and checks
-/// invariants with [`Cluster::check`], [`Cluster::await_ring`], and [`Cluster::finish`]. Every
+/// drives simulated time with [`Fleet::step`], [`Fleet::run_for`], and [`Fleet::run_until`],
+/// injects [`Fault`]s between steps, adds [`Workload`]s with [`Fleet::client`], and checks
+/// invariants with [`Fleet::check`], [`Fleet::await_ring`], and [`Fleet::finish`]. Every
 /// fault, publication, and operation lands in the [`Trace`].
-pub struct Cluster {
+pub struct Fleet {
     // Dropped first: hosts close their files before the data directories go.
     sim: turmoil::Sim<'static>,
     /// The authority every host's and client's certificate chains to.
@@ -482,9 +482,9 @@ pub struct Cluster {
     root: TempDir,
 }
 
-impl fmt::Debug for Cluster {
+impl fmt::Debug for Fleet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Cluster")
+        f.debug_struct("Fleet")
             .field("seed", &self.seed)
             .field("elapsed", &self.sim.elapsed())
             .field("hosts", &self.hosts)
@@ -494,11 +494,11 @@ impl fmt::Debug for Cluster {
     }
 }
 
-impl Cluster {
-    /// Describes a cluster whose network and workloads are driven by `seed`.
+impl Fleet {
+    /// Describes a fleet whose network and workloads are driven by `seed`.
     #[must_use]
-    pub fn builder(seed: u64) -> ClusterBuilder {
-        ClusterBuilder {
+    pub fn builder(seed: u64) -> FleetBuilder {
+        FleetBuilder {
             seed,
             hosts: Vec::new(),
             timings: Timings::default(),
@@ -562,7 +562,7 @@ impl Cluster {
         self.seed
     }
 
-    /// Returns the simulated time since the cluster was built.
+    /// Returns the simulated time since the fleet was built.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.sim.elapsed()
@@ -640,7 +640,7 @@ impl Cluster {
 
     /// Returns the generator for the test's own random choices, such as when to inject faults.
     ///
-    /// It is seeded from the cluster's seed; clients added later fork from it too.
+    /// It is seeded from the fleet's seed; clients added later fork from it too.
     pub fn rng(&mut self) -> &mut SimRng {
         &mut self.rng
     }
@@ -658,7 +658,7 @@ impl Cluster {
     /// Adds a client named `name` that runs `workload` against the control plane.
     ///
     /// The client is a turmoil host of its own, so faults can name it. Its generator is forked
-    /// from the cluster's seed in the order clients are added.
+    /// from the fleet's seed in the order clients are added.
     pub fn client(&mut self, name: &str, workload: impl Workload) {
         self.add_client(name, None, workload);
     }
@@ -672,7 +672,7 @@ impl Cluster {
     }
 
     /// Issues the client `name` a certificate for the principal [`WORKLOAD_PRINCIPAL`] from the
-    /// cluster's authority.
+    /// fleet's authority.
     ///
     /// # Panics
     ///
@@ -704,7 +704,7 @@ impl Cluster {
         })
     }
 
-    /// Adds a client acting as the principal `name`, with a certificate from the cluster's
+    /// Adds a client acting as the principal `name`, with a certificate from the fleet's
     /// authority.
     ///
     /// # Panics
@@ -752,7 +752,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::step`].
+    /// As [`Fleet::step`].
     pub fn run_for(&mut self, duration: Duration) -> Result<(), SimError> {
         let end = self.sim.elapsed() + duration;
         while self.sim.elapsed() < end {
@@ -766,7 +766,7 @@ impl Cluster {
     /// # Errors
     ///
     /// [`SimError::Timeout`] naming `what` if `done` doesn't hold within `limit`, or an error
-    /// from [`Cluster::step`].
+    /// from [`Fleet::step`].
     pub fn run_until(
         &mut self,
         limit: Duration,
@@ -788,17 +788,17 @@ impl Cluster {
         }
     }
 
-    /// Steps until every workload added with [`Cluster::client`] has finished, except endless
+    /// Steps until every workload added with [`Fleet::client`] has finished, except endless
     /// ones such as an [`Operator`](crate::sim::Operator).
     ///
     /// # Errors
     ///
-    /// As [`Cluster::run_until`].
+    /// As [`Fleet::run_until`].
     pub fn await_workloads(&mut self, limit: Duration) -> Result<Duration, SimError> {
         self.run_until(limit, "workloads finishing", Self::workloads_done)
     }
 
-    /// Returns whether every workload added with [`Cluster::client`] has finished, except
+    /// Returns whether every workload added with [`Fleet::client`] has finished, except
     /// endless ones.
     #[must_use]
     pub fn workloads_done(&self) -> bool {
@@ -814,7 +814,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::await_ring_on`].
+    /// As [`Fleet::await_ring_on`].
     pub fn await_ring(&mut self, limit: Duration) -> Result<Duration, SimError> {
         let nodes: Vec<String> = self
             .data_hosts()
@@ -831,7 +831,7 @@ impl Cluster {
     ///
     /// [`SimError::Violation`] for [`Invariant::RingConverged`](check::Invariant::RingConverged)
     /// with the last disagreement if the nodes don't converge within `limit`, or an error from
-    /// [`Cluster::step`].
+    /// [`Fleet::step`].
     pub fn await_ring_on(
         &mut self,
         nodes: &[impl AsRef<str>],
@@ -933,7 +933,7 @@ impl Cluster {
     }
 
     /// Checks that no running data host has refused a peer call for failing its binding: in a
-    /// cluster without impostors, every call is legitimate, membership changes and failovers
+    /// fleet without impostors, every call is legitimate, membership changes and failovers
     /// included (FR-050).
     ///
     /// # Errors
@@ -1029,7 +1029,7 @@ impl Cluster {
 
     /// Checks that the replicas of every database created through the data plane agree on
     /// their hash chains at every position they have in common ([`check::chains_agree`]), as
-    /// [`Cluster::replica_chains`] gathers them. Returns how many databases were checked.
+    /// [`Fleet::replica_chains`] gathers them. Returns how many databases were checked.
     ///
     /// # Errors
     ///
@@ -1106,8 +1106,8 @@ impl Cluster {
 
     /// Steps until the followers of every database created through the data plane have
     /// acknowledged everything its primary committed, then checks that every replica holds the
-    /// same rows and the same hash chain ([`Cluster::check_chains`]), and runs the history
-    /// checker ([`Cluster::check_history`]).
+    /// same rows and the same hash chain ([`Fleet::check_chains`]), and runs the history
+    /// checker ([`Fleet::check_history`]).
     ///
     /// # Errors
     ///
@@ -1198,7 +1198,7 @@ impl Cluster {
                 self.shared.signal_stop(host);
                 let what = format!("{host} stopping");
                 let name = host.clone();
-                self.run_until(STOP_LIMIT, &what, |cluster| !cluster.is_running(&name))?;
+                self.run_until(STOP_LIMIT, &what, |fleet| !fleet.is_running(&name))?;
                 if *host == self.control {
                     self.check_control_log()?;
                 }
@@ -1239,11 +1239,11 @@ impl Cluster {
         }
     }
 
-    /// Drops every message between `a` and `b` until [`Cluster::repair`].
+    /// Drops every message between `a` and `b` until [`Fleet::repair`].
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn partition(&mut self, a: &str, b: &str) -> Result<(), SimError> {
         self.inject(Fault::Partition {
             a: a.to_owned(),
@@ -1255,7 +1255,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn repair(&mut self, a: &str, b: &str) -> Result<(), SimError> {
         self.inject(Fault::Repair {
             a: a.to_owned(),
@@ -1267,7 +1267,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn set_latency(&mut self, a: &str, b: &str, latency: Duration) -> Result<(), SimError> {
         self.inject(Fault::Latency {
             a: a.to_owned(),
@@ -1280,7 +1280,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn set_loss(&mut self, a: &str, b: &str, rate: LossRate) -> Result<(), SimError> {
         self.inject(Fault::Loss {
             a: a.to_owned(),
@@ -1293,7 +1293,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn crash(&mut self, name: &str) -> Result<(), SimError> {
         self.inject(Fault::Crash {
             host: name.to_owned(),
@@ -1304,7 +1304,7 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn stop(&mut self, name: &str) -> Result<(), SimError> {
         self.inject(Fault::Stop {
             host: name.to_owned(),
@@ -1331,18 +1331,18 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// As [`Cluster::inject`].
+    /// As [`Fleet::inject`].
     pub fn restart(&mut self, name: &str) -> Result<(), SimError> {
         self.inject(Fault::Restart {
             host: name.to_owned(),
         })
     }
 
-    /// Stops every host gracefully and runs the final checks: in a cluster without impostors, no
+    /// Stops every host gracefully and runs the final checks: in a fleet without impostors, no
     /// running data host refused a peer call for its binding
-    /// ([`Cluster::assert_no_binding_refusals`]); the hash chains of every replica
-    /// still following agree ([`Cluster::check_chains`]), the history checker
-    /// ([`Cluster::check_history`]) over the whole history and every host's copy on disk, the
+    /// ([`Fleet::assert_no_binding_refusals`]); the hash chains of every replica
+    /// still following agree ([`Fleet::check_chains`]), the history checker
+    /// ([`Fleet::check_history`]) over the whole history and every host's copy on disk, the
     /// control log replays to the state the control node last published, which holds every
     /// acknowledged control operation, and what the lease watchers learned matches the leases
     /// the log granted ([`check::lease_events_match_control`]).
@@ -1363,8 +1363,8 @@ impl Cluster {
         for name in &running {
             self.shared.signal_stop(name);
         }
-        let stopped = self.run_until(STOP_LIMIT, "every host stopping", |cluster| {
-            cluster.shared.lock().running.is_empty()
+        let stopped = self.run_until(STOP_LIMIT, "every host stopping", |fleet| {
+            fleet.shared.lock().running.is_empty()
         });
         if let Err(SimError::Timeout { limit, .. }) = stopped {
             let running: Vec<String> = self.shared.lock().running.keys().cloned().collect();
@@ -1403,7 +1403,7 @@ pub fn lease_watcher(node: &str) -> String {
     format!("{node}-leases")
 }
 
-impl Drop for Cluster {
+impl Drop for Fleet {
     /// Prints the trace when [`TRACE_VAR`] is set, so a failing seed can be followed event by
     /// event.
     fn drop(&mut self) {
