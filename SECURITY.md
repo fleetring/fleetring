@@ -16,7 +16,7 @@ This section describes `fleetringd` as built today. Every security ticket update
 
 - **Database contents:** each replica's SQLite files under its `data_dir`, unencrypted.
 - **The replication log and its hash chain:** each replica's log, with one BLAKE3 hash per transaction that commits every byte before it (ADR-0016 point 12).
-- **The control log:** the control node's command log and snapshot (one SQLite database): membership, databases, epochs, leases, and token revocations. It holds no key material.
+- **The control log:** the control node's command log and control snapshot (one SQLite database): membership, databases, epochs, leases, and token revocations. It holds no key material.
 - **The authority key** (`ca.key`): issues every node and client certificate and signs every token. It belongs on no node.
 - **Node and client keys:** the private key of each node's and each client's certificate.
 - **Tokens:** bearer credentials that name a principal and its scopes; one hour by default, 30 days at most.

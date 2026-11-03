@@ -1,6 +1,6 @@
 # Engineering review: where FleetRing stands, and what to change before it scales
 
-*2026-10-29, after `fleetring` 0.1.0 and `fleetringd` 0.1.0. A snapshot, to be revised as the roadmap (`docs/roadmap.md`) moves.*
+*2026-10-29, after `fleetring` 0.1.0 and `fleetringd` 0.1.0. A point-in-time review, to be revised as the roadmap (`docs/roadmap.md`) moves.*
 
 ## What exists and what it has been shown to do
 
@@ -8,10 +8,10 @@
 |---|---|---|
 | Placement (`fleetring`) | released, spec frozen | golden vectors on every CI target, a Python reference, fuzzing, allocation-free lookups |
 | Membership and ring publication | works | simulation: convergence within two heartbeat intervals after joins, partitions, crashes, control outages |
-| Control plane | one node, durable command log, Raft-ready | replay and snapshot-restore tests; 147 crash-restart cycles in simulation without losing a command |
+| Control plane | one node, durable command log, Raft-ready | replay and control-snapshot restore tests; 147 crash-restart cycles in simulation without losing a command |
 | Replication | WAL shipping with quorum acknowledgement | followers byte-identical after checkpoints; held-back acks prove writes wait for W |
 | Failover | leases, epochs, fencing, log adoption | simulation across crashes, partitions, control outages, flapping: no acknowledged write lost, one primary per epoch |
-| Catch-up | pinned, checksummed snapshots; re-seed | cut, corrupted, and held transfers never leave a partial copy |
+| Catch-up | pinned, checksummed database snapshots; re-seed | cut, corrupted, and held transfers never leave a partial copy |
 | CLI | create, exec, query, locate, status | a three-node fleet on one laptop, with a failover and a rejoin, by hand |
 | Transport security | mutual TLS 1.3 on every connection, built-in certificate authority, node ID and principal in the certificate | plaintext, foreign, expired, and wrong-ID peers refused in tests; certificates rotate under an open replication stream; the simulation runs under TLS |
 
@@ -20,7 +20,7 @@
 Each item says where it bites, with the ticket or epic that addresses it.
 
 ### On the control node
-1. **Every heartbeat is a logged, fsynced command.** At 100 nodes sending one heartbeat a second that is 100 fsyncs a second and a log that grows forever; at 10,000 nodes it is not workable. Kafka's controller keeps broker liveness in memory and logs only registration and fencing changes; CockroachDB keeps one liveness record per node. *Change:* keep heartbeats in memory on the control node, and log only the transitions (member up, member down) as commands the control node issues itself. Replay then reproduces the decisions, not the traffic, and `apply` stays pure. This amends ADR-0017's "every change is a command", so it needs an ADR. (E4)
+1. **Every heartbeat is a logged, fsynced command.** At 100 nodes sending one heartbeat a second that is 100 fsyncs a second and a log that grows forever; at 10,000 nodes it is not workable. Kafka's controller keeps broker liveness in memory and logs only registration and fencing changes; CockroachDB keeps one liveness record per node. *Change:* keep heartbeats in memory on the control node, and log only the transitions (member live, member down) as commands the control node issues itself. Replay then reproduces the decisions, not the traffic, and `apply` stays pure. This amends ADR-0017's "every change is a command", so it needs an ADR. (E4)
 2. **Lease renewal is per database.** A primary renews each of its databases every `lease_renewal_ms`, and the failover timer scans every database every tick. With a million databases that is a million renewals per interval. CockroachDB solved exactly this with epoch-based leases: one liveness record per node, and every lease the node holds is valid while the node's epoch is. *Change:* node-level leases, with database leases derived from the holder's liveness epoch; promotions still fence per database. (E4, with an ADR)
 3. **The control node is a single point** for membership changes, new databases, and failovers, though not for serving. Raft with openraft is the planned fix, and the log, replay tests, and client redirects were built for it. (E5)
 4. **The control log is never compacted,** and each accepted command clones the full `State` for publication. Fine at today's sizes; both need bounding before millions of databases. (E2)
@@ -29,8 +29,8 @@ Each item says where it bites, with the ticket or epic that addresses it.
 ### On data nodes
 6. **A thread per open database,** capped at 256 open per node with LRU eviction. Thousands of hot databases per node means thousands of threads. *Change:* a shared pool of SQLite threads with per-database serialization, which is how servers that host many SQLite files (Turso, LiteFS) do it. (E4)
 7. **Capture rescans the WAL on every commit.** Cost grows with the WAL between checkpoints, bounded today by the checkpoint threshold. An incremental reader in `fleetring-wal` removes it. (E4)
-8. **A long snapshot transfer holds off checkpoints,** so the primary's WAL grows meanwhile, and transfers restart from zero when interrupted. (E2)
-9. **Promotion catch-up has no snapshot fallback:** if a candidate can't be served from a peer's log, the promotion stalls until the next attempt. (E2)
+8. **A long database snapshot transfer holds off checkpoints,** so the primary's WAL grows meanwhile, and transfers restart from zero when interrupted. (E2)
+9. **Promotion catch-up has no database snapshot fallback:** if a candidate can't be served from a peer's log, the promotion stalls until the next attempt. (E2)
 10. **Writes below the quorum commit locally, then fail with an unknown outcome.** Kafka refuses before appending (`NotEnoughReplicas`). FR-035's `min_replicas` fixes this. (E2)
 
 ### Across the network
@@ -64,7 +64,7 @@ The design choices that depend on scale are kept behind traits or configuration,
 | Control plane | one node | Raft group of 3–5 | the command log and client redirects (built for it) |
 | SQLite execution | thread per open database | shared pool, per-database serialization | the engine adapter's execution mode |
 | Placement lookups | ask control, follow redirects | ring embedded in clients and the router | the Rust client and the router |
-| Snapshots and catch-up | pinned file copy | the same, resumable, with throttling | `replication/snapshot.rs` |
+| Database snapshots and catch-up | pinned file copy | the same, resumable, with throttling | `replication/snapshot.rs` |
 | Change fan-out | none | `ChangeSink` plugins (FR-039) | the sink trait |
 | Engines | SQLite | SQLite, libSQL/Turso, Postgres self-replicating | `DatabaseEngine` (ADR-0016) |
 

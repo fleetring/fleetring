@@ -4,7 +4,7 @@ title: Object-store credentials from workload identity, not only static keys
 status: todo
 priority: P2
 size: S
-milestone: M9 Durability sinks and verification
+milestone: M9 Archives and verification
 depends_on: [FR-049]
 adrs: [ADR-0029]
 ---

@@ -28,7 +28,7 @@ Every command today needs `--control` or `--config`, and the TLS flags or `FLEET
   - On use, the context's fleet name must match the fleet its certificates name; a mismatch names both.
 - **Precedence**, as the style guide's section 3 sets it: flag, then environment variable, then context, then default. FR-055's `--as` and `FLEETRING_AS` fit in as one level of the identity: an explicit `--ca`, `--cert`, or `--key` (or its environment variable) wins over `--as` (or `FLEETRING_AS`, or the context's `as`), which wins over the TLS directory's `client.crt` and `client.key`. `--help` states it.
 - **`-o, --output table|json|jsonl` and `--json`** on every read command: `status`, `status --node`, `db list`, `db locate`, `db verify`, `db query`, `context list`, and the lease watch (`jsonl`). The fields follow the style guide's rules; a test pins each command's JSON shape, so a rename fails CI.
-- **`lease watch --node <node-id>`** replaces `watch-leases`, with `watch-leases` as a hidden alias that warns. `--node` takes a node ID everywhere; a command that dials an address directly takes `--address <host:port>`, with the old `--node <host:port>` form accepted with a warning.
+- **`lease watch` and `--address`** landed in FR-062: `lease watch` replaced `watch-leases`, `--node` takes a node ID everywhere, and a command that dials a node directly takes `--address <host:port>`, with no aliases (ADR-0032, as revised). This ticket adds JSON output to them like the rest.
 - **Exit codes** 0, 1, 2, 3, 4, and 130 as the style guide's table defines them, mapped from gRPC status codes in one place, and listed in `--help`.
 - **Errors with hints:** a `hint:` line for the common failures (no control address, no identity, unknown database, refused scope, unavailable control plane).
 - **Confirmation:** `token revoke --key-id` asks on a terminal, `node drain` asks when the node holds a database's only replica, and both refuse without a terminal unless `--yes`.
@@ -46,7 +46,6 @@ Every command today needs `--control` or `--config`, and the TLS flags or `FLEET
 - [ ] Every read command's `--json` output parses, and a snapshot test pins its fields.
 - [ ] `lease watch -o jsonl` prints one event per line, flushed per event, and exits 0 when stdout closes.
 - [ ] A refused request exits 3, an unavailable control plane exits 4, a usage error exits 2, and each is tested.
-- [ ] `watch-leases` and `status --node <host:port>` still work and print a deprecation warning on stderr only.
 - [ ] `fleetringd completions zsh` produces a script that completes subcommands and context names, and the release archives contain the man pages.
 
 ## Progress

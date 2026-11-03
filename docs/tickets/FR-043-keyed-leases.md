@@ -15,7 +15,7 @@ adrs: [ADR-0017, ADR-0018, ADR-0025, ADR-0027]
 
 Leases today exist only for databases: the control plane grants one holder per database per epoch, fences the rest, and the ring decides who should hold it (ADR-0018). The same mechanism answers a broader question that applications keep asking: who owns `tenant:acme`'s background job, or `agent:42`'s session, right now, and how does the owner know when it no longer does? Temporal's shard ownership and Orleans' grain directory are the usual answers: a placement decision plus a fenced, renewable lease, with the holder notified when it loses it. FleetRing already has the placement (the ring) and the fencing (epochs). What's missing is a lease that isn't tied to opening a database. This ticket is gated on an ADR that decides the semantics before any code: whether a keyed lease is placed by the ring or requested by a holder, what renewal and expiry look like without a replication stream to prove liveness, and what the holder is promised across a control-plane restart.
 
-ADR-0027 is that record. In short: a holder requests a lease (the ring doesn't place it); a holder is the caller's authenticated identity plus an instance name, composed at the request boundary; one cluster-wide counter gives every grant a fresh epoch, which is the fencing token; expiry runs on command time, while the holder stops at a conservative deadline of its own; every grant, renewal, and release is durable in the control log before it is answered; watchers follow control state through `Control.WatchKeyLeases`; limits live in the control configuration; and the RPCs need `write` on the key to hold and `read` to watch.
+ADR-0027 is that record. In short: a holder requests a lease (the ring doesn't place it); a holder is the caller's authenticated identity plus an instance name, composed at the request boundary; one fleet-wide counter gives every grant a fresh epoch, which is the fencing token; expiry runs on command time, while the holder stops at a conservative deadline of its own; every grant, renewal, and release is durable in the control log before it is answered; watchers follow control state through `Control.WatchKeyLeases`; limits live in the control configuration; and the RPCs need `write` on the key to hold and `read` to watch.
 
 ## Scope
 
@@ -23,7 +23,7 @@ ADR-0027 is that record. In short: a holder requests a lease (the ring doesn't p
 - **One control action family in `fleetring-control`:** `AcquireLease { key, holder, ttl }`, `RenewLease { key, holder, epoch }`, `ReleaseLease { key, holder, epoch }`, applied through the pure `apply` with time inside the command (ADR-0017), replay-safe, and carrying an epoch that every later command must present. Nothing else: no values, no locks on groups of keys, no fairness. *Named `AcquireKeyLease`, `RenewKeyLease`, and `ReleaseKeyLease`, since `AcquireLease` and `RenewLease` are the database lease's actions.*
 - **`WatchLeases` extended** (FR-042) to keyed leases, with the key in place of the database name, so a holder learns it lost the lease the same way a data node does. *Decided by ADR-0027 point 8: a separate stream, `Control.WatchKeyLeases`, from control state, with the same snapshot-then-events shape and the same `LeaseEventKind`; `Database.WatchLeases` stays one node's view of its database leases.*
 - **The Node service exposes the four calls** for co-located workers; the control node applies them. *Decided by ADR-0027 point 11: the four calls are on the `Control` service, which the control node serves and `ControlClient` reaches through leader redirects, so no relay sits in a renewal's path.*
-- **Not in scope:** storing data under keys, leader election across clusters, and placement of keys by anything but the key's name.
+- **Not in scope:** storing data under keys, leader election across fleets, and placement of keys by anything but the key's name.
 
 ## Definition of done
 
@@ -135,7 +135,7 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
     |---|---|---|
     | `InvalidKeyLeaseTtl` | `ttl: Millis, min: Millis, max: Millis` | `key lease ttl {ttl} is outside {min} to {max}` |
     | `KeyLeaseHeld` | `key: LeaseKey, holder: KeyLeaseHolder, epoch: LeaseEpoch, retry_after: Millis` | `key '{key}' is leased to '{holder}' at epoch {epoch}; retry after {retry_after}` |
-    | `TooManyKeyLeases` | `max_keys: u32` | `the cluster already holds {max_keys} key leases` |
+    | `TooManyKeyLeases` | `max_keys: u32` | `the fleet already holds {max_keys} key leases` |
     | `KeyLeaseEpochExhausted` | — | `key lease epochs are exhausted` |
     | `UnknownKeyLease` | `key: LeaseKey` | `key '{key}' has no lease` |
     | `StaleKeyLeaseEpoch` | `key: LeaseKey, given: LeaseEpoch, current: LeaseEpoch` | `epoch {given} of key '{key}' is stale; the current epoch is {current}` |
@@ -152,12 +152,12 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
   /// Keyed leases by key, expired ones included until the next acquire forgets them.
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub(crate) key_leases: BTreeMap<LeaseKey, KeyLease>,
-  /// The epoch of the last keyed lease granted, cluster-wide (ADR-0027 point 4).
+  /// The epoch of the last keyed lease granted, fleet-wide (ADR-0027 point 4).
   #[serde(default, skip_serializing_if = "is_zero")]
   pub(crate) key_lease_epoch: LeaseEpoch,
   ```
 
-  (`fn is_zero(epoch: &LeaseEpoch) -> bool { *epoch == LeaseEpoch::ZERO }`, private), initialized empty in `State::new`, and three queries: `pub fn key_lease(&self, key: &LeaseKey) -> Option<&KeyLease>` (the record, expired or not), `pub fn key_leases_held(&self, at: Timestamp) -> impl Iterator<Item = (&LeaseKey, &KeyLease)>` (records not expired at `at.max(self.now)`, in key order), and `pub fn key_lease_epoch(&self) -> LeaseEpoch`. The `skip_serializing_if` attributes keep snapshots of clusters without keyed leases byte-identical to today's.
+  (`fn is_zero(epoch: &LeaseEpoch) -> bool { *epoch == LeaseEpoch::ZERO }`, private), initialized empty in `State::new`, and three queries: `pub fn key_lease(&self, key: &LeaseKey) -> Option<&KeyLease>` (the record, expired or not), `pub fn key_leases_held(&self, at: Timestamp) -> impl Iterator<Item = (&LeaseKey, &KeyLease)>` (records not expired at `at.max(self.now)`, in key order), and `pub fn key_lease_epoch(&self) -> LeaseEpoch`. The `skip_serializing_if` attributes keep snapshots of fleets without keyed leases byte-identical to today's.
 - Tests:
   - New module `crates/fleetring-control/tests/it/key_leases.rs` (add `mod key_leases;` to `tests/it/main.rs`), using `common::run` and a config with `KeyLeaseLimits::new(3, Millis::new(100), Millis::new(10_000))`:
     - `a_key_lease_is_acquired_renewed_and_released`: acquire at 0 with ttl 1,000 is `Granted` at epoch 1 expiring at 1,000; renew at 600 expires at 1,600; release at 700 removes it; `key_leases_held` is empty.
@@ -183,17 +183,17 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
   ```proto
   // Grants a key's lease (ADR-0027): to the caller's identity and `instance`, for `ttl_ms`. A key
   // leased to another holder answers FAILED_PRECONDITION with `fleetring-retry-after-ms` metadata.
-  // Scope: write on the key.
+  // Scope: write on the lease key.
   rpc AcquireKeyLease(AcquireKeyLeaseRequest) returns (KeyLeaseResponse);
   // Extends the caller's lease at `epoch` by its TTL. An expired lease isn't renewed.
-  // Scope: write on the key.
+  // Scope: write on the lease key.
   rpc RenewKeyLease(RenewKeyLeaseRequest) returns (KeyLeaseResponse);
   // Ends the caller's lease at `epoch`.
-  // Scope: write on the key.
+  // Scope: write on the lease key.
   rpc ReleaseKeyLease(ReleaseKeyLeaseRequest) returns (ReleaseKeyLeaseResponse);
   // Every live keyed lease under `prefix`, then one event per lease gained or lost, in epoch order
   // per key. Shows only the keys the caller may read.
-  // Scope: read per key listed, or cluster.
+  // Scope: read per lease key listed, or fleet.
   rpc WatchKeyLeases(WatchKeyLeasesRequest) returns (stream KeyLeaseUpdate);
 
   message AcquireKeyLeaseRequest {
@@ -230,11 +230,11 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
   }
   message KeyLeaseUpdate {
     oneof update {
-      KeyLeaseSnapshot snapshot = 1;
+      HeldKeyLeases held = 1;
       KeyLeaseEvent event = 2;
     }
   }
-  message KeyLeaseSnapshot {
+  message HeldKeyLeases {
     repeated HeldKeyLease leases = 1;
   }
   message HeldKeyLease {
@@ -274,10 +274,10 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
 - `crates/fleetringd/src/auth/policy.rs`, `RPCS`, after `RevokeToken`: `AcquireKeyLease`, `RenewKeyLease`, `ReleaseKeyLease` with `Requirement::Key(Action::Write)`, and `WatchKeyLeases` with `Requirement::Listing(Action::Read)`. The existing policy tests then require the `// Scope:` lines written in step 3 and four rows in the daemon README's scope table:
 
   ```text
-  | `Control.AcquireKeyLease` | write on the key |
-  | `Control.RenewKeyLease` | write on the key |
-  | `Control.ReleaseKeyLease` | write on the key |
-  | `Control.WatchKeyLeases` | read per key listed, or cluster |
+  | `Control.AcquireKeyLease` | write on the lease key |
+  | `Control.RenewKeyLease` | write on the lease key |
+  | `Control.ReleaseKeyLease` | write on the lease key |
+  | `Control.WatchKeyLeases` | read per lease key listed, or fleet |
   ```
 
 - Tests in `crates/fleetringd/tests/scopes.rs`:
@@ -327,7 +327,7 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
   - `lease watch [--prefix <P>]` prints `held <key> epoch <n> holder <h>` per snapshot entry, then `gained …` and `lost …` lines;
   - `lease hold <KEY> --instance <I> --ttl <DURATION>` acquires, waiting `retry_after` while held, prints `gained <key> epoch <n>`, renews every `ttl / 3`, prints `lost <key> epoch <n>` and exits with status 3 when a renewal is refused or the deadline passes, and on SIGINT or SIGTERM releases, prints `released …`, and exits 0.
   Durations parse with `parse_ttl` in `main.rs`, extended to accept `<n>ms` as well as `<n>s`, `<n>m`, `<n>h`, and `<n>d` (with a unit test `durations_parse_in_milliseconds_too`).
-- Tests in `crates/fleetringd/tests/daemon.rs` (binary tests): `the_lease_commands_acquire_renew_release_and_watch` (a one-node cluster; `lease watch` in the background; acquire, renew, release; the watch printed `gained` and `lost` lines with the same epoch) and `lease_hold_releases_on_sigint` (Unix only: `hold` prints `gained`, gets SIGINT, prints `released`, exits 0, and the watch printed `lost`). Losing a held key to another holder is covered by the simulation (step 6), not by binary tests.
+- Tests in `crates/fleetringd/tests/daemon.rs` (binary tests): `the_lease_commands_acquire_renew_release_and_watch` (a one-node fleet; `lease watch` in the background; acquire, renew, release; the watch printed `gained` and `lost` lines with the same epoch) and `lease_hold_releases_on_sigint` (Unix only: `hold` prints `gained`, gets SIGINT, prints `released`, exits 0, and the watch printed `lost`). Losing a held key to another holder is covered by the simulation (step 6), not by binary tests.
 
 ### Step 6: simulation
 
@@ -336,7 +336,7 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
   - `Ack` gains `KeyLease { holder: String, epoch: LeaseEpoch }` and `KeyLeaseReleased`.
   - New workload `KeyLeaseContender::new(keys: Vec<LeaseKey>, instance: &str, ttl: Duration, holds: u32, renewals: u32)`: picks a key with the run's `SimRng`, acquires, on `Held` waits `retry_after`, on a grant renews every `ttl / 3` until `renewals` renewals succeeded, then releases; a refused or unanswered renewal drops the lease and starts over; finishes after `holds` holds. It never acts after `invoked_at + ttl - ttl / 10` of its last successful acquire or renewal.
 - `crates/fleetringd/src/sim/client.rs`: execute the three operations through the host's `ControlClient`, mapping `KeyLeaseHeld` (FAILED_PRECONDITION with the retry metadata) to a rejection the workload can read.
-- `crates/fleetringd/src/sim/cluster.rs`: `ClusterBuilder::key_lease_watcher(self) -> Self` adds a client host `key-leases` that follows `Control.WatchKeyLeases("")` for the whole run, reconnecting as `lease_watcher` does, and records each snapshot entry and event as a `KeyLeaseObservation { key, holder, epoch, seen: LeaseSeen }` in the `History`. `Timings` gains `key_lease_limits: KeyLeaseLimits` (default `KeyLeaseLimits::DEFAULT`) applied to the control node's configuration.
+- `crates/fleetringd/src/sim/fleet.rs`: `FleetBuilder::key_lease_watcher(self) -> Self` adds a client host `key-leases` that follows `Control.WatchKeyLeases("")` for the whole run, reconnecting as `lease_watcher` does, and records each snapshot entry and event as a `KeyLeaseObservation { key, holder, epoch, seen: LeaseSeen }` in the `History`. `Timings` gains `key_lease_limits: KeyLeaseLimits` (default `KeyLeaseLimits::DEFAULT`) applied to the control node's configuration.
 - `crates/fleetringd/src/sim/check.rs`: `Invariant::KeyLeasesExclusive` ("key leases exclusive") and `Invariant::KeyLeaseEventsMatchControl` ("key lease events match control"), and:
 
   ```rust
@@ -350,7 +350,7 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
   pub fn key_lease_events_match_control(history: &History, control: &ControlLog) -> Result<(), Violation>;
   ```
 
-  `ControlLog` gains `key_lease_holders(&self) -> &BTreeMap<(LeaseKey, LeaseEpoch), KeyLeaseHolder>`, filled while replaying; `acknowledged_control_survives` also requires every acknowledged acquire to be in it. `Cluster::finish` runs both new checks.
+  `ControlLog` gains `key_lease_holders(&self) -> &BTreeMap<(LeaseKey, LeaseEpoch), KeyLeaseHolder>`, filled while replaying; `acknowledged_control_survives` also requires every acknowledged acquire to be in it. `Fleet::finish` runs both new checks.
 - `crates/fleetringd/tests/sim/key_leases.rs` (add `mod key_leases;` to `tests/sim/main.rs`), with `key_lease_limits = KeyLeaseLimits::new(64, Millis::new(1_000), Millis::new(30_000))`, a control host, one data host, the key-lease watcher, and contenders `holder-1`, `holder-2`, `holder-3` over keys `job:0` to `job:3`, ttl 2 s:
   - `key_leases_stay_exclusive_under_faults` (`seeds::FIXED`): partition `holder-1` from the control host for 5 s, crash `holder-2` for 4 s, crash and restart the control host (down 1.5 s), then let the workloads finish. Asserts, besides `finish()`: the watcher saw at least one key go `LOST` and then `GAINED` by a different holder, and every key was granted at least twice.
   - `a_control_restart_keeps_every_renewed_key_lease` (`seeds::FIXED`): ttl 10 s, one contender renewing every 1 s; crash the control host for 2 s; the contender's next renewal succeeds at the same epoch, and no other epoch was granted for its key.
@@ -367,6 +367,7 @@ Start only once ADR-0027 is accepted and FR-047 has merged. Each step is about o
 - **Command-log load.** At the default limits the worst case is 6,000 renewals a second (ADR-0027 point 9). The simulation and tests run far below it; a benchmark of the control node under keyed-lease load belongs with E4.
 - **Advisory without epochs.** A resource that ignores the epoch gets mutual exclusion only under the bounded clock-rate assumption. Fenced writes to FleetRing databases are a possible follow-up ticket.
 - **FR-047 is still in review.** Steps 3 and 4 use its `Caller`, `authorized`, `require_key`, and `RPCS`; if those names change before it merges, follow them.
+- **FR-062 renamed what this plan builds on.** `require_key` is `require_database`, and `Requirement::Key` is `Requirement::Database`, whose message says "on the database". A lease key isn't a database, so keyed leases need their own requirement, such as `Requirement::LeaseKey(Action)` printing "on the lease key", which this plan's `Scope:` lines and README rows already say. `lease watch` now exists for the database leases one node holds (`--node <node-id>` or `--address`); the keyed-lease watch adds `--prefix` to the same command, and the two forms exclude each other.
 - **Generator churn.** Widening the replay generator's selector from 16 to 20 changes every generated log; the tests regenerate their logs, so nothing golden breaks, but counts in `the_generated_log_exercises_every_kind_of_change` may need the log length raised.
 
 ## Progress

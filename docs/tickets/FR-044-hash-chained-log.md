@@ -4,7 +4,7 @@ title: A hash-chained replication log, so replicas can prove they share a prefix
 status: done
 priority: P2
 size: L
-milestone: M9 Durability sinks and verification
+milestone: M9 Archives and verification
 depends_on: [FR-030, FR-032]
 adrs: [ADR-0016, ADR-0018]
 ---

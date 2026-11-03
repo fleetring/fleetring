@@ -347,7 +347,7 @@ impl MembershipTasks {
     /// Stops sending heartbeats, leaves the fleet unless the settings say to stay, stops
     /// following the membership, and waits for both tasks to end.
     ///
-    /// Leaving tells the control plane that this is a planned departure rather than a failure:
+    /// Leaving tells the control plane that this node is leaving as planned, not failing:
     /// the member is removed at once, and the ring is rebuilt without it. If the control plane
     /// doesn't answer within one heartbeat interval, or two seconds if that is longer, the node stops
     /// anyway and is marked down once its heartbeats are missed, as a node that stays is. A

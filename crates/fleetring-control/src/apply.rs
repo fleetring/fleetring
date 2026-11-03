@@ -128,7 +128,7 @@ pub enum Applied {
     MemberLeft {
         /// The member's ID.
         id: NodeId,
-        /// The membership epoch after the departure.
+        /// The membership epoch after the member left.
         membership_epoch: Epoch,
     },
 

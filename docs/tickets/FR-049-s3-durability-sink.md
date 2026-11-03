@@ -4,7 +4,7 @@ title: An S3 durability sink with verifiable point-in-time restore
 status: todo
 priority: P1
 size: L
-milestone: M9 Durability sinks and verification
+milestone: M9 Archives and verification
 depends_on: [FR-039, FR-041, FR-044, FR-047]
 adrs: [ADR-0016, ADR-0028, ADR-0029]
 ---
@@ -13,7 +13,7 @@ adrs: [ADR-0016, ADR-0028, ADR-0029]
 
 ## Context
 
-Replicas don't protect against a bad `DROP TABLE`, which replicates in a round trip, or against losing the cluster. ADR-0016 point 3 keeps durability sinks apart from replicas, and the roadmap's "Recoverable" criterion asks for backups with point-in-time restore. ADR-0029 decides the design: an archive is a physical change stream (FR-039) that writes one immutable, chain-carrying segment per delivery to an object store, plus base snapshots pinned at the archive's own position; a restore picks a snapshot, walks segments by position preferring the newest epoch, verifies every batch against the FR-044 hash chain, and builds a new database, online, or a plain SQLite file, offline. Replicated sink positions (FR-041, ADR-0028) let a new primary continue the archive. The S3 client is `rusty-s3`, sans-I/O, over the daemon's own `hyper` and `rustls`.
+Replicas don't protect against a bad `DROP TABLE`, which replicates in a round trip, or against losing the fleet. ADR-0016 point 3 keeps durability sinks, which FleetRing builds as archives, apart from replicas, and the roadmap's "Recoverable" criterion asks for backups with point-in-time restore. ADR-0029 decides the design: an archive is a physical change stream (FR-039) that writes one immutable, chain-carrying segment per delivery to an object store, plus base snapshots pinned at the archive's own position; a restore picks a snapshot, walks segments by position preferring the newest epoch, verifies every batch against the FR-044 hash chain, and builds a new database, online, or a plain SQLite file, offline. Replicated sink positions (FR-041, ADR-0028) let a new primary continue the archive. The S3 client is `rusty-s3`, sans-I/O, over the daemon's own `hyper` and `rustls`.
 
 ## Scope
 
@@ -281,13 +281,13 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-049`). Every p
   ```proto
   // Builds a new database from an archive (FR-049): the database must exist in the control plane,
   // unleased, and this node must be the first live member of its replica set.
-  // Scope: admin on the key.
+  // Scope: admin on the database.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
   // What an archive holds for a database: its snapshots and the range its segments cover.
-  // Scope: read on the key, or cluster.
+  // Scope: read on the database, or fleet.
   rpc DescribeArchive(DescribeArchiveRequest) returns (DescribeArchiveResponse);
   // Restores into a scratch directory, verifying every batch against the chain, and discards it.
-  // Scope: read on the key, or cluster.
+  // Scope: read on the database, or fleet.
   rpc VerifyArchive(VerifyArchiveRequest) returns (VerifyArchiveResponse);
 
   message RestoreLatest {}
@@ -349,8 +349,8 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-049`). Every p
   }
   ```
 
-- `src/data/service.rs`: the three handlers. `restore` calls `require_key` on `database` and again on `source` (both `admin`, the RPC's action), finds the archive by name among the node's archives (`NOT_FOUND` naming it otherwise), maps `RestoreError::DataLoss` to `DATA_LOSS`, `Plan` to `FAILED_PRECONDITION` with the furthest position, `Store(Unavailable)` to `UNAVAILABLE`. `describe_archive` builds a `Listing`; `verify_archive` runs `restore_into` into a scratch directory under the replication state directory and removes it.
-- `src/auth/policy.rs`: three rows in `RPCS` (`Requirement::Key(Action::Admin)` for `Restore`, `Requirement::KeyOrCluster(Action::Read)` for the others); the `// Scope:` comments above; the daemon README's scope table gains the three rows (the policy tests enforce all three places).
+- `src/data/service.rs`: the three handlers. `restore` calls `require_database` on `database` and again on `source` (both `admin`, the RPC's action), finds the archive by name among the node's archives (`NOT_FOUND` naming it otherwise), maps `RestoreError::DataLoss` to `DATA_LOSS`, `Plan` to `FAILED_PRECONDITION` with the furthest position, `Store(Unavailable)` to `UNAVAILABLE`. `describe_archive` builds a `Listing`; `verify_archive` runs `restore_into` into a scratch directory under the replication state directory and removes it.
+- `src/auth/policy.rs`: three rows in `RPCS` (`Requirement::Database(Action::Admin)` for `Restore`, `Requirement::DatabaseOrFleet(Action::Read)` for the others); the `// Scope:` comments above; the daemon README's scope table gains the three rows (the policy tests enforce all three places).
 - `src/data/client.rs`: `pub enum RestorePoint { Latest, Position(Position), Time(u64) }`; `Client::restore_database(&self, target: &DatabaseName, spec: DatabaseSpec, archive: &str, source: &DatabaseName, point: RestorePoint) -> Result<Restoration, Status>` (control `CreateDatabase`, then `Database.Restore` on the first live replica, as `create_database_with` does); `Client::describe_archive(&self, archive: &str, database: &DatabaseName) -> Result<ArchiveDescription, Status>`; `Client::verify_archive(&self, archive: &str, database: &DatabaseName, point: RestorePoint) -> Result<Verification, Status>`.
 - `src/main.rs`: `db restore <TARGET> --archive <NAME> --from <SOURCE> [--at-position <HEX> | --at-time <RFC3339>] [--replicas N] [--acks MODE]`; `db archive describe <SOURCE> --archive <NAME>`; `db archive verify <SOURCE> --archive <NAME> [--at-…]`, which also asks the live replicas for `Verify` at the restored position and prints `archive agrees with every replica` or the replicas that differ; `archive restore --config <PATH> --archive <NAME> --from <SOURCE> --to <DIR> [--at-…]`, offline, which builds the store from the configuration, runs `restore_into` on `<DIR>`, then opens it once as a primary would (removing `-shm`) so the directory holds a plain SQLite database. Enable `time`'s `parsing` and `formatting` features for RFC 3339.
 - Tests:
@@ -361,7 +361,7 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-049`). Every p
 
 ### Step 7: simulation
 
-- `src/sim/cluster.rs`: `ClusterBuilder::archive(self, name: &str, store: Arc<dyn ObjectStore>, configure: impl Fn(&mut ArchiveConfig) + 'static) -> Self`, which adds a `directory`-kind `[[archive]]` entry (path unused) to every data host and puts `store` in each host's `Environment::object_stores` under `name`, so every host writes to one store outside the simulated network that survives crashes. `Cluster::object_store(&self, name) -> Option<Arc<dyn ObjectStore>>`.
+- `src/sim/fleet.rs`: `FleetBuilder::archive(self, name: &str, store: Arc<dyn ObjectStore>, configure: impl Fn(&mut ArchiveConfig) + 'static) -> Self`, which adds a `directory`-kind `[[archive]]` entry (path unused) to every data host and puts `store` in each host's `Environment::object_stores` under `name`, so every host writes to one store outside the simulated network that survives crashes. `Fleet::object_store(&self, name) -> Option<Arc<dyn ObjectStore>>`.
 - `src/sim/check.rs`: `Invariant::ArchiveRestoresAcknowledgedPrefix` ("archive restores an acknowledged prefix") and
 
   ```rust
@@ -371,7 +371,7 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-049`). Every p
   pub fn archive_restores_prefix(history: &History, database: &DatabaseName, restored: &BTreeSet<i64>, position: Option<&Position>, streams: &[(String, Vec<ChangeRecord>)], complete_before: Option<Duration>) -> Result<(), Violation>;
   ```
 
-- `tests/sim/archive.rs` (add `mod archive;` to `tests/sim/main.rs`): `archives_restore_an_acknowledged_prefix_after_faults`, over `seeds::FIXED_HEAVY`. A control host and three data hosts, each with a logical file sink (as `tests/sim/changes.rs` configures it) and an archive to one shared `MemoryStore` wrapped in `FaultyStore` failing every 7th call, with `segment_interval_ms = 200` and `snapshot_after_bytes = 64 KiB`. The writer runs `CreateAndWrite::new(1, 3, 400)`; the scenario crashes the primary, isolates the next one, flaps a replica (the faults of `tests/sim/changes.rs`), waits for workloads, convergence, and `ChangeStreams::await_caught_up`, then restores offline with `restore_into` (on the test thread, `Execution::Inline`) to: `Latest` (with `complete_before` the time the last write was acknowledged), the end position of the segment in the middle of the listing, and a time halfway through the run. Each restored copy is read with `rusqlite` and checked with `check::archive_restores_prefix`; the test also asserts that at least one segment was archived at each of two epochs and that the listing holds at least two snapshots. `Cluster::finish` must still pass.
+- `tests/sim/archive.rs` (add `mod archive;` to `tests/sim/main.rs`): `archives_restore_an_acknowledged_prefix_after_faults`, over `seeds::FIXED_HEAVY`. A control host and three data hosts, each with a logical file sink (as `tests/sim/changes.rs` configures it) and an archive to one shared `MemoryStore` wrapped in `FaultyStore` failing every 7th call, with `segment_interval_ms = 200` and `snapshot_after_bytes = 64 KiB`. The writer runs `CreateAndWrite::new(1, 3, 400)`; the scenario crashes the primary, isolates the next one, flaps a replica (the faults of `tests/sim/changes.rs`), waits for workloads, convergence, and `ChangeStreams::await_caught_up`, then restores offline with `restore_into` (on the test thread, `Execution::Inline`) to: `Latest` (with `complete_before` the time the last write was acknowledged), the end position of the segment in the middle of the listing, and a time halfway through the run. Each restored copy is read with `rusqlite` and checked with `check::archive_restores_prefix`; the test also asserts that at least one segment was archived at each of two epochs and that the listing holds at least two snapshots. `Fleet::finish` must still pass.
 
 ### Step 8: documentation
 

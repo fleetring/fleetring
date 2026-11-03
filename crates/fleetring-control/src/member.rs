@@ -137,7 +137,7 @@ impl From<&Node> for Member {
     }
 }
 
-/// Whether a member has sent a heartbeat recently enough to count as up.
+/// Whether a member has sent a heartbeat recently enough to count as live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Liveness {

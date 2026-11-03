@@ -4,7 +4,7 @@ title: Merkle anti-entropy over pages, so a returning follower fetches only what
 status: todo
 priority: P2
 size: L
-milestone: M9 Durability sinks and verification
+milestone: M9 Archives and verification
 depends_on: [FR-044, FR-032, FR-047]
 adrs: [ADR-0010, ADR-0016, ADR-0030]
 ---
@@ -33,7 +33,7 @@ ADR-0030 settles the design and supersedes ADR-0010: the tree covers the main fi
 - [ ] Tree maintenance cost per batch is measured in `docs/perf.md`. *(Per ADR-0030 the work happens per checkpoint; `docs/perf.md` reports it per checkpoint and amortized per batch at the default threshold.)*
 - [ ] ADR-0030 is accepted, ADR-0010's status reads "Superseded by ADR-0030", and both index rows say so.
 - [ ] A repair interrupted at any point leaves a copy that is either the old one, the repaired one, or treated as missing and re-seeded in full; never a mix that a stream applies to.
-- [ ] `Replication.Repair` and `Database.RepairReplica` are in `auth::RPCS` (node, and admin on the key), with matching proto comments and README rows.
+- [ ] `Replication.Repair` and `Database.RepairReplica` are in `auth::RPCS` (node, and admin on the database), with matching proto comments and README rows.
 
 ## Implementation plan
 
@@ -263,10 +263,10 @@ Start once ADR-0030 is accepted. Each step is about one commit (`feat(fleetringd
     }
     ```
 
-  - service `Database`: `// Sends the follower a Reseed on its stream, which repairs or re-seeds its copy (FR-045). Answered by the primary.` `// Scope: admin on the key.` `rpc RepairReplica(RepairReplicaRequest) returns (RepairReplicaResponse);` with `message RepairReplicaRequest { string database = 1; string node_id = 2; }` and `message RepairReplicaResponse {}`.
+  - service `Database`: `// Sends the follower a Reseed on its stream, which repairs or re-seeds its copy (FR-045). Answered by the primary.` `// Scope: admin on the database.` `rpc RepairReplica(RepairReplicaRequest) returns (RepairReplicaResponse);` with `message RepairReplicaRequest { string database = 1; string node_id = 2; }` and `message RepairReplicaResponse {}`.
 - `src/replication/mod.rs`, `Replication::verify`: with `pages`, scan the copy's main file on a blocking thread (a follower settles nothing; it scans the file as checkpointed, with `log_start()` as `checkpoint`); on the primary also report `tree_summary().root` as `maintained_root`, and if the scan differs, log at `error`, replace the maintained tree with the scan (`TreeFile::write_all`), and still report both.
 - `src/replication/primary.rs`: `Primary::request_reseed(&self, node: &NodeId) -> bool`, which sends `Reseed` on that follower's stream as `needs_snapshot` handling does; `Replication::repair_replica(database, node) -> Result<(), Status>` (`NOT_FOUND` if not a follower of this primary).
-- `src/data/service.rs`: `repair_replica` handler (route to the primary as other data calls do); `src/auth/policy.rs`: `rpc("/fleetring.v1.Database/RepairReplica", Requirement::Key(Action::Admin))`; README row.
+- `src/data/service.rs`: `repair_replica` handler (route to the primary as other data calls do); `src/auth/policy.rs`: `rpc("/fleetring.v1.Database/RepairReplica", Requirement::Database(Action::Admin))`; README row.
 - `src/data/client.rs`: `Client::verify_pages(&self, database: &DatabaseName) -> Result<PageVerification, Status>` (each replica's `PageTree`, grouped by checkpoint), `Client::repair_replica(&self, database: &DatabaseName, node: &NodeId) -> Result<(), Status>`.
 - `src/main.rs`, `db verify <DATABASE> --pages [--repair]`: prints one line per replica (`<node> checkpoint <pos> root <hash>`), then `all replicas at checkpoint <pos> are byte-identical`, or the replicas whose root differs, or `<node> is at another checkpoint (<pos>); not comparable`; and `the primary's main file changed outside the log` when its rescan differs from its maintained root. With `--repair`, calls `repair_replica` for each differing follower and prints `repairing <node>`.
 - Tests in `tests/database.rs`:

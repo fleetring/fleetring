@@ -9,7 +9,7 @@ Each entry gives a definition, where the word applies, its canonical spelling in
 - **CLI**: the `fleetringd` subcommands (see the [CLI style guide](cli.md)).
 - **UI**: the TUI and the desktop app (ADR-0033).
 
-A word marked *planned* names something decided but not yet built. A word marked *rename pending* is still spelled the old way in code, and the entry names the ticket that changes it.
+A word marked *planned* names something decided but not yet built. Accepted ADRs and finished tickets keep the words they were written with; [renamed in 0.3.0](#renamed-in-030) maps the old words to these.
 
 ## Hierarchy
 
@@ -37,7 +37,7 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 
 | Instead of | Say | Why |
 |---|---|---|
-| cluster | [fleet](#fleet) | Decided in ADR-0032; `cluster` stays as a deprecated alias through 0.x (FR-059). |
+| cluster | [fleet](#fleet) | ADR-0032; renamed in 0.3.0 (FR-059). |
 | master, leader (for a database) | [primary](#primary) | "Leader" is kept for the control plane ([leader](#leader)). |
 | slave, secondary, standby, read replica | [follower](#follower) | |
 | server, instance, box | [node](#node), or [host](#host) for the machine | |
@@ -47,9 +47,14 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | CA (in prose) | [authority](#authority) | `ca.crt`, `ca.key`, and `--ca` keep the short form. |
 | blocklist, revocation list (for tokens) | [denylist](#denylist) | "Certificate revocation list" names a thing FleetRing doesn't have. |
 | up, alive, healthy, dead | live, down ([liveness](#liveness)) | |
-| decommission, depart | [leave](#leave) | |
+| decommission, depart, departure | [leave](#leave) | FR-038's title keeps "departure"; ticket titles are history. |
+| host (for where a node is dialed) | [address](#address) | A [host](#host) is the machine label. |
 | changefeed, CDC (in names) | [change stream](#change-stream) | `_fleetring_cdc` keeps its name; it is an on-disk table. |
-| backup (as a noun for the mechanism) | [archive](#archive) | "Backup" is fine in prose for what an archive is for. |
+| backup (as a noun for the mechanism), durability sink | [archive](#archive) | "Backup" is fine in prose for what an archive is for. ADR-0016 says durability sink; it is accepted, so it keeps the word. |
+| sink (for where committed batches go to be replicated) | [batch publisher](#batch-publisher) | A [sink](#sink) is only a change stream's destination. |
+| snapshot (alone) | [database snapshot, base snapshot, or control snapshot](#snapshot) | Say which state is copied. |
+| key (for a database, in the daemon) | [database](#database) | "Key" alone is the placement key; other keys say which: private key, signing key, lease key. |
+| role (alone) | [node role](#node-role) or [replica role](#replica-role) | |
 | API key, password | [token](#token) or [certificate](#certificate) | |
 
 ## Terms
@@ -78,13 +83,21 @@ The engine adapter: the code behind the `DatabaseEngine` trait that turns one [e
 - **Code:** `DatabaseEngine`, `FrameSourceEngine`; "SQLite adapter". **CLI:** none.
 - **Not:** driver, backend, plugin, connector.
 
+### Address
+
+Where a node is dialed: `host:port`, or the IP addresses and DNS names its certificate names. A member advertises one (`[node] advertise`), and placements carry it for each replica.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `Member::address`, protocol `Node.address` and `Replica.address`, `[node] advertise`. **CLI:** `--address <host:port>` where a command dials one node (`status`, `lease watch`, `db exec`, `db query`); `cert node --addresses` for the names a node certificate carries; `address=` after each member in `status`.
+- **Not:** host (that is the machine label), endpoint, URL, `--node` (which takes a node ID).
+
 ### Archive
 
-A durability sink: a physical [change stream](#change-stream) plus base [snapshots](#snapshot), written as immutable objects to an object store, with point-in-time restore (ADR-0029). Separate from replicas: replicas give availability, an archive gives recovery. "Durability sink" (ADR-0016, point 3) is the general idea; an archive is the kind FleetRing builds. *Planned* (FR-049).
+A database's history kept for recovery: a physical [change stream](#change-stream) plus base [snapshots](#snapshot), written as immutable objects to an object store, with point-in-time restore (ADR-0029). Separate from replicas: replicas give availability, an archive gives recovery. *Planned* (FR-049).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `[[archive]]` in config, `ObjectStore`, `S3Store`. **CLI:** *planned*.
-- **Not:** backup (as the mechanism's name), dump, export, durability sink (in names; use it in prose only for the general category).
+- **Not:** backup (as the mechanism's name), dump, export, durability sink. ADR-0016, point 3, says "durability sink" for the same idea; the ADR is accepted and keeps its words, and everything else says archive.
 
 ### Audit line
 
@@ -109,6 +122,14 @@ One committed write transaction's changes as the engine ships them: an opaque pa
 - **Applies to:** daemon.
 - **Code:** `FrameBatch`, protocol `Batch`, `CommittedBatch`. **CLI:** "batch" in `status --node` backlogs.
 - **Not:** frame (a frame is SQLite's unit inside a batch, and stays below the adapter), transaction (in replication code), chunk (a [snapshot](#snapshot) is sent in chunks), record, event.
+
+### Batch publisher
+
+Where a database's actor hands each committed batch to be replicated, right after the commit; it also decides, before a write runs, whether enough replicas are reachable for it to run at all (ADR-0023). On a data node it is replication's primary streams; in tests, a recording.
+
+- **Applies to:** daemon.
+- **Code:** `BatchPublisher` (`admit`, `publish`), `ReplicatingPublisher`, `RecordingPublisher`, module `fleetringd::publisher`. **CLI:** none.
+- **Not:** sink (a [sink](#sink) receives a change stream, after the write quorum holds a batch), feed, outbox, queue.
 
 ### Binding
 
@@ -139,7 +160,7 @@ A partition of the key space with its own ring. A directory, a ring over the cel
 An X.509 certificate from the fleet's [authority](#authority). A *node certificate* names a node, `fleetring://<fleet>/node/<id>`; a *client certificate* names a [principal](#principal), `fleetring://<fleet>/principal/<name>` (ADR-0025). Every connection is mutual TLS with them.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `tls::Identity` (a certificate, its key, and the trusted authorities), `SubjectUri`. **CLI:** `fleetringd cert node`, `fleetringd cert client`; files `node.<id>.crt`, `client.<principal>.crt`; flags `--cert`, `--key`.
+- **Code:** `tls::Identity` (a certificate, its private key, and the trusted authorities), `SubjectUri`. **CLI:** `fleetringd cert node`, `fleetringd cert client`; files `node.<id>.crt`, `client.<principal>.crt`; flags `--cert`, and `--key` for the certificate's private key.
 - **Not:** cert (fine in commands and files, not in prose), key pair (the certificate and its private key together are an *identity*), credential (a credential is a certificate *or* a token).
 
 ### Change stream
@@ -176,7 +197,7 @@ Anything that calls the fleet's RPCs as a [principal](#principal): the CLI, the 
 
 ### Control log
 
-The control plane's durable, ordered list of commands, and the snapshot it compacts into. Replaying it with `apply` rebuilds control state exactly (ADR-0017). It holds no key material.
+The control plane's durable, ordered list of commands, and the *control snapshot* it compacts into. Replaying it with `apply` rebuilds control state exactly (ADR-0017). It holds no key material.
 
 - **Applies to:** daemon.
 - **Code:** `fleetring_control::Command`, `State`, `apply`. **CLI:** none.
@@ -187,7 +208,7 @@ The control plane's durable, ordered list of commands, and the snapshot it compa
 A node that runs the control role: it holds the control log and answers control RPCs. Today a fleet has one; with Raft it will have three or five, of which one is the [leader](#leader).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Role::Control` or `Role::Both` in config. **CLI:** `--control <host:port>`, `role = "control"`.
+- **Code:** `NodeRole::Control` or `NodeRole::Both`. **CLI:** `--control <host:port>`, `role = "control"`.
 - **Not:** master, coordinator, manager, controller, metadata server.
 
 ### Control plane
@@ -203,12 +224,12 @@ The control service as a whole: membership, placement records, epochs, leases, p
 A node that runs the data role: it hosts replicas and serves database calls. A node with `role = "both"` is a data node and a control node.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `role = "data"`. **CLI:** "data node" in help; `status --node`.
+- **Code:** `NodeRole::Data`, `role = "data"`. **CLI:** "data node" in help; `status --node <node-id>`.
 - **Not:** storage node, worker, server.
 
 ### Database
 
-One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, replicates, and fails over as a unit. Its name is its placement [key](#key). The placement crate never says "database".
+One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, replicates, and fails over as a unit. Its name is its placement [key](#key), but the daemon, its scopes, and its messages say "database": `admin on the database`, `auth::Target::Database`. The placement crate never says "database".
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetring_control::Database`, `DatabaseName`. **CLI:** the noun `db` (`fleetringd db create`), the argument `<database>`; "database" in output headers.
@@ -296,14 +317,14 @@ The set of nodes that one control plane and one certificate authority govern, un
 
 - **Applies to:** crate (test fixtures, such as `fixtures::fleet(12, 3)`), daemon, CLI, UI.
 - **Code:** `Fleet` (simulation harness), `FleetName`. **CLI:** `--fleet <name>`.
-- **Not:** cluster (*rename pending*, FR-059: code still has `ClusterName`, `--cluster`, the `cluster` scope, and `sim::Cluster`), deployment, ring (a fleet can hold many rings), mesh, realm.
+- **Not:** cluster (0.2's word, renamed in 0.3.0 by FR-059), deployment, ring (a fleet can hold many rings), mesh, realm.
 
 ### Fleet name
 
 The name `cert init --fleet` gives the authority. Every certificate it issues carries it in its `fleetring://<fleet>/…` URI, every token carries it as `iss`, and a node refuses a certificate or token for another fleet.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `FleetName` (*rename pending*: `ClusterName`, FR-059). **CLI:** `--fleet` (*rename pending*: `--cluster`).
+- **Code:** `FleetName`; `fleet()` on `SubjectUri`, `Identity`, and `Authority`. **CLI:** `cert init --fleet <name>`.
 - **Not:** cluster name, trust domain, realm, namespace.
 
 ### Fleet scope
@@ -311,15 +332,15 @@ The name `cert init --fleet` gives the authority. Every certificate it issues ca
 The scope for operations that name no database: membership, draining, removing members, revoking tokens. A principal without it sees only the databases its other scopes cover.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Scope::fleet()` (*rename pending*: `Scope::cluster()`, FR-059). **CLI:** `--scope fleet`, `scopes = ["fleet"]` (*rename pending*: `cluster`, which stays accepted through 0.x).
-- **Not:** cluster (deprecated), operator, superuser, root, global.
+- **Code:** `Scope::fleet()`, `auth::Target::Fleet`, `Requirement::Fleet`. **CLI:** `--scope fleet`, `scopes = ["fleet"]`.
+- **Not:** cluster (0.2's spelling; refused since 0.3.0), operator, superuser, root, global.
 
 ### Follower
 
 A replica that isn't the primary: it applies the primary's batches and can be promoted.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Role::Follower`, `replication::follower`. **CLI:** "followers" in `db locate`.
+- **Code:** `ReplicaRole::Follower`, `replication::follower`. **CLI:** "followers" in `db locate`.
 - **Not:** slave, secondary, standby, read replica, backup, replica (when only non-primaries are meant).
 
 ### Hash chain
@@ -348,7 +369,7 @@ Who holds a lease: for a database lease, the primary; for a keyed lease, the nam
 
 ### Host
 
-A placement label for the machine a node runs on, when several nodes share one; replicas spread across hosts after zones (ADR-0006). "Host" also keeps its network sense in `host:port`. *Conflict:* `cert node --hosts` takes the IP addresses and DNS names a node is dialed at, which is the network sense, not this label (see [open conflicts](#open-conflicts)).
+A placement label for the machine a node runs on, when several nodes share one; replicas spread across hosts after zones (ADR-0006). "Host" also keeps its network sense inside `host:port`, but the names a node is dialed at are its [addresses](#address) (`cert node --addresses`).
 
 - **Applies to:** crate, daemon, CLI, UI.
 - **Code:** `Host`, `[node] host`. **CLI:** `host=` after each member in `status`.
@@ -364,11 +385,11 @@ A node becoming a member: its first call to the control plane, which records it 
 
 ### Key
 
-In the placement crate, the opaque bytes that name a placeable thing; the crate places keys and knows nothing else (ADR-0011). In the daemon, a database's name is its key. Other keys always get their qualifier: *private key* (`--key`, `ca.key`), *signing key* (`--key-id`, the token header's `kid`), *lease key* (a keyed lease's name), *object key* (in an archive).
+The placement key: in the placement crate, the opaque bytes that name a placeable thing; the crate places keys and knows nothing else (ADR-0011). In the daemon, a database's name is its key, and names, scopes, and messages there say [database](#database). "Key" alone means only this. Other keys always get their qualifier: *private key* (`--key`, `ca.key`), *signing key* (`--key-id`, the token header's `kid`), *lease key* (a keyed lease's name), *object key* (in an archive).
 
 - **Applies to:** crate (only this word), daemon.
-- **Code:** `&[u8]` or `impl AsRef<[u8]>` in placement; `DatabaseName` in the daemon. **CLI:** `<database>` where the key is a database name.
-- **Not:** database (in the crate), shard key, partition key, ID, item.
+- **Code:** `&[u8]` or `impl AsRef<[u8]>` in placement; `DatabaseName` in the daemon. **CLI:** `<database>` where the key is a database name; `--key <path>` is the client certificate's private key, and `--key-id` a signing key's ID, as their help says.
+- **Not:** database (in the crate), key alone for a private or signing key, shard key, partition key, ID, item.
 
 ### Keyed lease
 
@@ -391,7 +412,7 @@ The control node that accepts control commands. Today the only control node; wit
 The right of one node to write one database at one lease epoch, granted and renewed by the control plane (ADR-0018). A lease expires unless renewed; safety still never depends on clocks, because epochs fence.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Lease`, `AcquireLease`, `RenewLease`, `WatchLeases`. **CLI:** `fleetringd watch-leases` (to become `lease watch`, FR-056).
+- **Code:** `Lease`, `AcquireLease`, `RenewLease`, `WatchLeases`, `HeldLeases`, `LeaseUpdate::Held`. **CLI:** `fleetringd lease watch --node <node-id>` or `--address <host:port>`, which prints `held`, `gained`, and `lost` lines.
 - **Not:** lock, ownership, token, claim.
 
 ### Leave
@@ -400,7 +421,7 @@ A member removing itself from the fleet's membership, as a node does when it shu
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Control.Leave`. **CLI:** `on_shutdown = "leave"`; "left the fleet" in logs. No command removes another member yet; when one is added, it is `fleetringd node remove <node-id>`.
-- **Not:** depart (FR-038's title says "departure"; new names say leave), decommission, deregister, kick.
+- **Not:** depart, departure (FR-038's title keeps it), decommission, deregister, kick.
 
 ### Liveness
 
@@ -423,8 +444,16 @@ A node as the fleet's membership records it: its ID, placement attributes, addre
 One `fleetringd` process: a member of the fleet, a ring member, a data node, a control node, or both. In the placement crate, a ring member with an ID, a weight, a zone, and a host.
 
 - **Applies to:** crate, daemon, CLI, UI.
-- **Code:** `Node`, `NodeId`, `[node]`. **CLI:** the noun `node` (`fleetringd node drain`), `<node-id>`. *Conflict:* `--node` takes a node ID in `db list` and an address in `status`, `watch-leases`, and `db exec` (see [open conflicts](#open-conflicts)).
+- **Code:** `Node`, `NodeId`, `[node]`. **CLI:** the noun `node` (`fleetringd node drain`), `<node-id>`, and `--node <node-id>` in every command that takes one; a node's [address](#address) is `--address`.
 - **Not:** server, instance, host (unless the machine is meant), worker, replica, peer (as a name), daemon (fine for the binary).
+
+### Node role
+
+What a daemon runs: `data`, `control`, or `both` (ADR-0015).
+
+- **Applies to:** daemon, CLI.
+- **Code:** `fleetringd::NodeRole`, `role` in config. **CLI:** `--role data|control|both`.
+- **Not:** role alone (say whose), mode, type, kind, function.
 
 ### Placement
 
@@ -463,7 +492,7 @@ The first node of a key's replica set: the primary when it is live and holds the
 The replica that holds a database's lease at its current lease epoch, and the only one that accepts writes.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Role::Primary`. **CLI:** the `PRIMARY` column in `db list`; `db list --node <node-id>` lists one node's primaries.
+- **Code:** `ReplicaRole::Primary`. **CLI:** the `PRIMARY` column in `db list`; `db list --node <node-id>` lists one node's primaries.
 - **Not:** leader, master, writer (fine in prose about write ownership), owner, main.
 
 ### Principal
@@ -498,6 +527,14 @@ One database's copy on one node, the primary's copy included.
 - **Code:** `HostedReplica`, protocol `Replica`. **CLI:** the `REPLICAS` column in `db list`.
 - **Not:** follower (a follower is a replica that isn't the primary), copy (fine in prose), shard, instance, node.
 
+### Replica role
+
+Whether a replica is its database's primary or a follower, as the node hosting it reports.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetring_control::ReplicaRole`, protocol enum `ReplicaRole` (`REPLICA_ROLE_PRIMARY`, `REPLICA_ROLE_FOLLOWER`). **CLI:** `primary` or `follower` after each database in `status --node`.
+- **Not:** role alone (say whose), state, mode.
+
 ### Replica set
 
 The ordered list of distinct nodes that hold a key's replicas: the first R nodes of its preference list (ADR-0006).
@@ -522,14 +559,6 @@ The placement structure over a set of nodes, with a strategy (weighted rendezvou
 - **Code:** `Ring`, `RingBuilder`, `RingSpec`. **CLI:** "ring fingerprint" in `status`.
 - **Not:** hash ring (fine in prose), cluster, topology, circle, keyspace.
 
-### Role
-
-What a daemon runs: `data`, `control`, or `both` (ADR-0015). *Conflict:* the same word names a replica's part for a database, primary or follower (see [open conflicts](#open-conflicts)).
-
-- **Applies to:** daemon, CLI.
-- **Code:** `fleetringd::Role`, `role` in config. **CLI:** `--role data|control|both`.
-- **Not:** mode, type, kind, function.
-
 ### Router
 
 *Planned* (MVP step 4). The front door that speaks the libSQL/Hrana protocol, so existing libSQL and Turso clients reach the right primary unchanged. It forwards its callers' tokens.
@@ -540,7 +569,7 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015). *Conflict:* the sam
 
 ### Scope
 
-`<action>:<pattern>`, where the pattern is an exact database name or a prefix ending in `*`, or the [fleet scope](#fleet-scope). Default deny (ADR-0025).
+`<action>:<pattern>`, where the pattern is an exact database name or a prefix ending in `*`, or the [fleet scope](#fleet-scope). Default deny (ADR-0025). What an RPC needs is stated in the same words: `admin on the database`, `read per database listed, or fleet`.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::Scope`, `Scopes`. **CLI:** `--scope`, `scopes = […]` in `[[principal]]`.
@@ -556,18 +585,18 @@ One immutable archive object holding a run of delivered batches between two posi
 
 ### Sink
 
-Where a [change stream](#change-stream) delivers: a `file`, a `webhook`, or an archive. A sink's *position* is how far it has delivered (ADR-0028). *Conflict:* `ReplicationSink` uses the word for the replication stream (see [open conflicts](#open-conflicts)).
+Where a [change stream](#change-stream) delivers: a `file`, a `webhook`, or an archive. A sink's *position* is how far it has delivered (ADR-0028). Only change streams have sinks; replication hands batches to a [batch publisher](#batch-publisher).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `ChangeSink`, `[[changes.sink]]`. **CLI:** sink progress in `status --node`.
-- **Not:** consumer (a consumer reads from a sink's destination), target, destination (fine in prose), subscriber, exporter.
+- **Code:** `ChangeSink`, `[[changes.sink]]`, protocol `ChangeSinkStatus`. **CLI:** sink progress in `status --node`.
+- **Not:** consumer (a consumer reads from a sink's destination), target, destination (fine in prose), subscriber, exporter, publisher.
 
 ### Snapshot
 
-A consistent copy of state at one point. Always say which: a *database snapshot* seeds or re-seeds a replica (`Replication.Snapshot`, FR-032); a *base snapshot* starts an archive's restore chain (ADR-0029); a *control snapshot* compacts the control log. `LeaseSnapshot`, the first message of `WatchLeases`, is the leases a node holds when the stream opens.
+A consistent copy of state at one point. Always say which: a *database snapshot* seeds or re-seeds a replica (FR-032); a *base snapshot* starts an archive's restore chain (ADR-0029); a *control snapshot* compacts the control log. The leases a node holds when a `WatchLeases` stream opens aren't a snapshot; they are its *held leases*.
 
 - **Applies to:** daemon, UI.
-- **Code:** as above. **CLI:** none yet.
+- **Code:** `engine::DatabaseSnapshot`, `Replication.Snapshot` (whose messages, `SnapshotRequest` and `SnapshotChunk`, only ever carry a database snapshot); the control log's `snapshots` table and its "control snapshot" errors; protocol `HeldLeases` for the leases. **CLI:** none yet.
 - **Not:** backup, dump, image, checkpoint.
 
 ### Spec
@@ -626,20 +655,24 @@ A placement label for a failure domain (a room, a rack, a cloud availability zon
 - **Code:** `Zone`, `[node] zone`. **CLI:** `zone=` after each member in `status`.
 - **Not:** region, datacenter (as the label's name; fine as a value), AZ (as the label's name), rack (same), cell.
 
-## Open conflicts
+## Renamed in 0.3.0
 
-Places where code uses two words for one thing, or one word for two things. Each is a candidate for a rename ticket; none is ticketed yet, except where a ticket is named.
+0.3.0 gave each thing one name, with no aliases (ADR-0032; FR-059 and FR-062, whose breaking-changes list is the full record). Accepted ADRs and finished tickets keep the old words; read them with this table.
 
-| Conflict | Where | Proposed fix |
-|---|---|---|
-| `cluster` for the fleet | `ClusterName`, `cert init --cluster`, the `cluster` scope, `sim::Cluster`, docs, logs | FR-059 (ADR-0032). |
-| `Role` for two things | `fleetringd::Role` (data, control, both) and `fleetring_control::Role` (primary, follower); `main.rs` imports the second as `DatabaseRole` | Rename the second to `ReplicaRole`, keeping the protocol enum's wire values. |
-| `--node` takes two kinds of value | A node ID in `db list --node`; an address in `status --node`, `watch-leases --node`, and `db exec --node` | Keep `--node <node-id>` everywhere; addresses become `--address <host:port>`, with the old form as an alias. |
-| `host` for two things | The machine label (`[node] host`) and the dial addresses in `cert node --hosts` | Rename the flag to `--addresses`, with `--hosts` as an alias. |
-| `sink` for two things | `ChangeSink` (change streams) and `ReplicationSink` (where an actor's committed batches go, the replication stream) | Rename `ReplicationSink` to `BatchPublisher` or similar. |
-| Durability sink and archive for one thing | ADR-0016 says durability sink; ADR-0029 and the config say archive | Names say archive; "durability sink" stays in prose for the category. |
-| `snapshot` for four things | Database snapshots, archive base snapshots, the control snapshot, and `LeaseSnapshot` | Qualify in prose; consider renaming `LeaseSnapshot` to `HeldLeases` at the next protocol version. |
-| `Node` and `Member` in the protocol | `Member` wraps `Node` plus liveness and draining | Consistent with this lexicon (a member is the record); no rename. |
-| `key` for several things | The placement key; private keys (`--key`); signing keys (`--key-id`); "admin on the key" in the protocol's scope lines, meaning the database name | Protocol comments and CLI help say "on the database"; other keys keep their qualifier. |
-| Departure and leave | FR-038's title and some docs say departure; code says `Leave` | New text says leave. |
-| Live and up | `Liveness::Live` in code; "up" in some docs | New text says live and down. |
+| Old word | Word now |
+|---|---|
+| cluster, `ClusterName`, `--cluster`, the `cluster` scope, `sim::Cluster` | [fleet](#fleet), `FleetName`, `--fleet`, the `fleet` scope, `sim::Fleet` |
+| `fleetringd::Role` | [node role](#node-role), `NodeRole` |
+| `fleetring_control::Role`, protocol `Role` | [replica role](#replica-role), `ReplicaRole` |
+| `--node <host:port>` | `--address <host:port>`; `--node` takes a node ID |
+| `watch-leases` | `lease watch` |
+| `cert node --hosts` | `cert node --addresses` |
+| `ReplicationSink` | [batch publisher](#batch-publisher), `BatchPublisher` |
+| durability sink (ADR-0016) | [archive](#archive) |
+| `engine::Snapshot` | `engine::DatabaseSnapshot` |
+| `LeaseSnapshot`, `LeaseUpdate::Snapshot` | `HeldLeases`, `LeaseUpdate::Held` |
+| "admin on the key", `Target::Key`, `require_key` | "admin on the database", `Target::Database`, `require_database` |
+| departure | [leave](#leave) |
+| up | [live](#liveness) |
+
+`Node` and `Member` in the protocol were never a conflict: a [member](#member) is the record of a [node](#node).

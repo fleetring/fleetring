@@ -352,7 +352,7 @@ impl DataNode {
     /// quorum, is connected or `writable_wait` passes.
     ///
     /// Waiting for every live follower, not just a write quorum, means the first write isn't
-    /// reported under-replicated while all of its replicas are up. The lease is recorded first,
+    /// reported under-replicated while all of its replicas are live. The lease is recorded first,
     /// so that renewals go on during the wait, and [`DataNode::route`] holds a request back
     /// until the wait ends. If the wait runs out before the database's `min_replicas` are
     /// connected, the database is served but every write is refused until they are

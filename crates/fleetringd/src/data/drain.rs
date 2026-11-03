@@ -1,6 +1,6 @@
 //! Draining: handing a node's leases to other replicas before it leaves (ADR-0018, ADR-0022).
 //!
-//! A planned departure needn't cost clients a failover. Once the control plane has marked the
+//! Leaving as planned needn't cost clients a failover. Once the control plane has marked the
 //! node as draining (`Control.Drain`), [`drain`] hands over every database the node is primary
 //! for, in parallel up to a concurrency limit, each within a bound:
 //!
