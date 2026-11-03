@@ -6,9 +6,9 @@ use fleetring_wal::{Batch, Mirror, MirrorError};
 use rusqlite::{Connection, OpenFlags};
 
 use super::{
-    Checkpoint, DATABASE_FILE, checkpoint, cut_at, decode_position, encode_position, frame_batch,
-    keep_wal_on_close, read_marker, read_wal_file, remove_if_present, shm_path, storage, wal_path,
-    write_marker,
+    Checkpoint, DATABASE_FILE, checkpoint, cut_at, decode_position, defend, encode_position,
+    frame_batch, keep_wal_on_close, read_marker, read_wal_file, remove_if_present, shm_path,
+    storage, wal_path, write_marker,
 };
 use crate::engine::{CheckpointMarker, EngineError, FrameBatch, FrameFollower, Position};
 
@@ -58,6 +58,7 @@ impl SqliteFollower {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(storage)?;
+        defend(&conn)?;
         if mode == Checkpoint::Passive {
             keep_wal_on_close(&conn)?;
         }
