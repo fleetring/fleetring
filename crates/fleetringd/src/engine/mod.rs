@@ -5,7 +5,8 @@
 //! `fleetringd` ships to followers, or self-replicating; callers ask through
 //! [`DatabaseEngine::capability`] and [`Database::capability`].
 //!
-//! - [`SqliteEngine`] is the frame source for plain SQLite. WAL details stay inside it.
+//! - [`SqliteEngine`] is the frame source for plain SQLite. WAL details stay inside it, and user
+//!   statements are confined to the database they name.
 //! - [`MemoryEngine`] is a self-replicating test engine that has no WAL at all.
 
 mod adapter;

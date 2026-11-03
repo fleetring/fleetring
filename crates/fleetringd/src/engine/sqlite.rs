@@ -13,24 +13,32 @@
 //! for it: a user statement that reads, writes, calls, creates, alters, or drops anything so named is
 //! refused as a statement error, on both connections, so that neither the table nor the
 //! recorder's triggers can be read, forged, or broken from outside.
+//!
+//! User statements are confined to the database they name. One that attaches or detaches a
+//! database, loads an extension, or runs a pragma other than read-only introspection is refused
+//! as a statement error, so it can't reach another database's files or change how this one is
+//! journaled and checkpointed. The connections also run in SQLite's defensive mode.
 
 mod changes;
 mod follower;
 mod pins;
+#[cfg(test)]
+mod tests;
 
 use std::error::Error;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use fleetring_wal::{Batch, ReadError, ReadFileError, read_committed_file};
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, ffi, params};
 
 pub use follower::SqliteFollower;
 
@@ -188,9 +196,9 @@ struct SqliteDatabase {
     path: PathBuf,
     writer: Connection,
     reader: Connection,
-    /// The reservation of `_fleetring_` names on each connection.
-    writing: Arc<Reservation>,
-    reading: Arc<Reservation>,
+    /// The confinement of user statements on each connection.
+    writing: Arc<Confinement>,
+    reading: Arc<Confinement>,
     /// The engine's pinned snapshots, which hold off checkpoints.
     pins: Arc<Pins>,
     /// Where the last checkpoint ended: the only earlier-generation position the current
@@ -215,6 +223,7 @@ impl SqliteDatabase {
             flags |= OpenFlags::SQLITE_OPEN_CREATE;
         }
         let writer = Connection::open_with_flags(&path, flags).map_err(storage)?;
+        defend(&writer)?;
         keep_wal_on_close(&writer)?;
         if mode == OpenMode::Create {
             writer
@@ -241,17 +250,18 @@ impl SqliteDatabase {
                  PRAGMA recursive_triggers = ON;",
             )
             .map_err(storage)?;
-        let writing = reserve_names(&writer);
+        let writing = confine(&writer);
         let reader = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(storage)?;
+        defend(&reader)?;
         keep_wal_on_close(&reader)?;
         reader
             .execute_batch("PRAGMA query_only = 1; PRAGMA wal_autocheckpoint = 0;")
             .map_err(storage)?;
-        let reading = reserve_names(&reader);
+        let reading = confine(&reader);
         let checkpointed = read_marker(&path)?;
         Ok(Self {
             path,
@@ -274,7 +284,7 @@ impl SqliteDatabase {
         for statement in transaction.statements() {
             {
                 let _user = UserStatement::enter(&self.writing);
-                run(&self.writer, statement)?;
+                run(&self.writer, statement, &self.writing)?;
             }
             if self.writing.defines_program.swap(false, Ordering::Relaxed) {
                 refuse_programs_on_reserved_names(&self.writer)?;
@@ -413,12 +423,14 @@ impl Database for SqliteDatabase {
     }
 
     fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError> {
-        let mut prepared = {
-            let _user = UserStatement::enter(&self.reading);
-            self.reader
-                .prepare_cached(statement.sql())
-                .map_err(classify)?
-        };
+        // Confined while it steps too: SQLite prepares statements of its own while stepping some,
+        // such as a pragma table-valued function's pragma, and reprepares after a schema change.
+        let _user = UserStatement::enter(&self.reading);
+        let classify = |error| self.reading.classify(error);
+        let mut prepared = self
+            .reader
+            .prepare_cached(statement.sql())
+            .map_err(classify)?;
         let columns: Vec<String> = prepared
             .column_names()
             .into_iter()
@@ -612,25 +624,90 @@ fn checkpoint(conn: &Connection, mode: Checkpoint) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// The reservation of `_fleetring_` names on one connection.
+/// The confinement of user statements on one connection.
 #[derive(Debug, Default)]
-struct Reservation {
-    /// Whether the connection is preparing a user statement, which the reservation applies to.
+struct Confinement {
+    /// Whether the connection is preparing or running a user statement, which the confinement
+    /// applies to.
     user: AtomicBool,
     /// Whether the user statement being prepared defines a trigger or a view, whose body SQLite
     /// authorizes only when it runs, so the adapter checks it afterwards.
     defines_program: AtomicBool,
+    /// Why the user statement was refused, kept for its error.
+    refused: Mutex<Option<Refusal>>,
 }
 
-/// Installs the reservation of `_fleetring_` names on `conn`: while a user statement is being
-/// prepared, one that names a reserved table, index, trigger, or view is refused, unless the
-/// access comes from one of the recorder's own triggers.
+impl Confinement {
+    /// Records the first reason a user statement is refused.
+    fn refuse(&self, refusal: Refusal) {
+        self.refused
+            .lock()
+            .expect("refusal lock poisoned")
+            .get_or_insert(refusal);
+    }
+
+    /// Sorts an error from preparing or running a user statement, reporting a refusal with its
+    /// reason. A refused statement fails on the refusal, whichever code SQLite reports it with:
+    /// a refused function, for one, is a plain error rather than an authorization failure.
+    fn classify(&self, error: rusqlite::Error) -> EngineError {
+        let refusal = self.refused.lock().expect("refusal lock poisoned").take();
+        match refusal {
+            Some(refusal) => EngineError::Statement {
+                message: refusal.to_string(),
+            },
+            None => classify(error),
+        }
+    }
+}
+
+/// Why a user statement was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// It names something beginning with `_fleetring_`.
+    Reserved,
+    /// It attaches or detaches a database.
+    OtherDatabase,
+    /// It loads an extension.
+    Extension,
+    /// It runs a pragma that isn't read-only introspection.
+    Pragma(String),
+    /// It asks for an action the adapter doesn't recognize, by SQLite's action code.
+    Unrecognized(i32),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reserved => write!(
+                f,
+                "names beginning with `{RESERVED_PREFIX}` are reserved for fleetringd"
+            ),
+            Self::OtherDatabase => f.write_str(
+                "statements can't attach or detach databases: each runs only on the database it names",
+            ),
+            Self::Extension => f.write_str("statements can't load extensions"),
+            Self::Pragma(name) => write!(
+                f,
+                "pragma `{name}` isn't allowed: statements may run only read-only introspection pragmas"
+            ),
+            Self::Unrecognized(code) => {
+                write!(f, "statements can't perform SQLite action {code}")
+            }
+        }
+    }
+}
+
+/// Installs the confinement of user statements on `conn`. While a user statement is being
+/// prepared or run, the authorizer refuses one that attaches or detaches a database, loads an
+/// extension, runs a pragma other than read-only introspection, or names a reserved table,
+/// index, trigger, view, or function, unless the access comes from one of the recorder's own
+/// triggers.
 ///
-/// SQLite authorizes a statement when it is prepared, so the reservation applies only around
-/// preparing user statements; the adapter's own statements prepare with it clear.
-fn reserve_names(conn: &Connection) -> Arc<Reservation> {
-    let reservation = Arc::new(Reservation::default());
-    let seen = Arc::clone(&reservation);
+/// SQLite authorizes a statement when it is prepared, so the confinement applies only around
+/// user statements; the adapter's own statements prepare with it clear.
+fn confine(conn: &Connection) -> Arc<Confinement> {
+    let confinement = Arc::new(Confinement::default());
+    let seen = Arc::clone(&confinement);
     conn.authorizer(Some(move |context: AuthContext<'_>| {
         if !seen.user.load(Ordering::Relaxed) {
             return Authorization::Allow;
@@ -650,13 +727,71 @@ fn reserve_names(conn: &Connection) -> Arc<Reservation> {
         ) {
             seen.defines_program.store(true, Ordering::Relaxed);
         }
-        if names_reserved(&context.action) {
-            Authorization::Deny
-        } else {
-            Authorization::Allow
+        match refusal(&context.action) {
+            Some(refusal) => {
+                seen.refuse(refusal);
+                Authorization::Deny
+            }
+            None => Authorization::Allow,
         }
     }));
-    reservation
+    confinement
+}
+
+/// Why a user statement may not perform `action`, if it may not.
+fn refusal(action: &AuthAction<'_>) -> Option<Refusal> {
+    match *action {
+        // Another database's file, or any file at all, is outside the named database.
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Some(Refusal::OtherDatabase),
+        // An `ATTACH` or `DETACH` whose argument isn't a literal arrives without it.
+        AuthAction::Unknown {
+            code: ffi::SQLITE_ATTACH | ffi::SQLITE_DETACH,
+            ..
+        } => Some(Refusal::OtherDatabase),
+        // Fail closed on anything the authorizer can't name.
+        AuthAction::Unknown { code, .. } => Some(Refusal::Unrecognized(code)),
+        AuthAction::Function { function_name }
+            if function_name.eq_ignore_ascii_case("load_extension") =>
+        {
+            Some(Refusal::Extension)
+        }
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } if !pragma_allowed(pragma_name, pragma_value) => {
+            Some(Refusal::Pragma(pragma_name.to_ascii_lowercase()))
+        }
+        _ if names_reserved(action) => Some(Refusal::Reserved),
+        _ => None,
+    }
+}
+
+/// Whether a user statement may run pragma `name`, with `value` as its argument if it has one.
+///
+/// Only read-only introspection is allowed. Every other pragma, including the read form of one
+/// not listed here, is refused: the rest set how the database is journaled, synced, locked,
+/// checkpointed, cached, or trusted, or write its header or schema directly, all of which the
+/// adapter owns.
+fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        // Each takes an object's name, or nothing, and only reports on the schema; none has a
+        // setter.
+        "table_info" | "table_xinfo" | "index_list" | "index_info" | "index_xinfo"
+        | "foreign_key_list" => true,
+        // `foreign_key_check` takes a table and only reads rows. `integrity_check` and
+        // `quick_check` take a table or an error limit and only read pages.
+        "foreign_key_check" | "integrity_check" | "quick_check" => true,
+        // Each reads a header field. With a value, `user_version`, `application_id`, and
+        // `schema_version` write the header, the last also invalidating the schema; `page_size`
+        // would change the page size the adapter chose.
+        "user_version" | "application_id" | "schema_version" | "page_size" => value.is_none(),
+        // Each reads a count from the header and has no setter; a value means nothing, so it is
+        // refused rather than ignored.
+        "page_count" | "freelist_count" => value.is_none(),
+        // Lists the options SQLite was built with and reads nothing of the database.
+        "compile_options" => value.is_none(),
+        _ => false,
+    }
 }
 
 /// Fails if a trigger or view in the schema names something reserved, after a user statement
@@ -743,14 +878,15 @@ fn names_reserved(action: &AuthAction<'_>) -> bool {
     }
 }
 
-/// Marks a connection as preparing a user statement while it lives.
-struct UserStatement<'c>(&'c Reservation);
+/// Marks a connection as preparing or running a user statement while it lives.
+struct UserStatement<'c>(&'c Confinement);
 
 impl<'c> UserStatement<'c> {
-    fn enter(reservation: &'c Reservation) -> Self {
-        reservation.user.store(true, Ordering::Relaxed);
-        reservation.defines_program.store(false, Ordering::Relaxed);
-        Self(reservation)
+    fn enter(confinement: &'c Confinement) -> Self {
+        confinement.user.store(true, Ordering::Relaxed);
+        confinement.defines_program.store(false, Ordering::Relaxed);
+        *confinement.refused.lock().expect("refusal lock poisoned") = None;
+        Self(confinement)
     }
 }
 
@@ -760,6 +896,15 @@ impl Drop for UserStatement<'_> {
     }
 }
 
+/// Turns on SQLite's defensive mode, which stops any statement from corrupting the database
+/// through `writable_schema`, shadow-table or `sqlite_dbpage` writes, or `journal_mode = OFF`.
+/// Extension loading stays off, as SQLite opens every connection.
+fn defend(conn: &Connection) -> Result<(), EngineError> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(storage)?;
+    Ok(())
+}
+
 /// Stops the last connection to close from checkpointing and deleting the WAL.
 fn keep_wal_on_close(conn: &Connection) -> Result<(), EngineError> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
@@ -767,7 +912,13 @@ fn keep_wal_on_close(conn: &Connection) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn run(conn: &Connection, statement: &Statement) -> Result<(), EngineError> {
+/// Runs a user statement on `conn`, which `confinement` confines.
+fn run(
+    conn: &Connection,
+    statement: &Statement,
+    confinement: &Confinement,
+) -> Result<(), EngineError> {
+    let classify = |error| confinement.classify(error);
     let mut prepared = conn.prepare_cached(statement.sql()).map_err(classify)?;
     let mut rows = prepared
         .query(rusqlite::params_from_iter(
@@ -806,13 +957,6 @@ fn value_from_sql(value: ValueRef<'_>) -> Value {
 
 /// Sorts an error from running SQL into a statement error or a storage failure.
 fn classify(error: rusqlite::Error) -> EngineError {
-    if error.sqlite_error_code() == Some(ErrorCode::AuthorizationForStatementDenied) {
-        return EngineError::Statement {
-            message: format!(
-                "names beginning with `{RESERVED_PREFIX}` are reserved for fleetringd"
-            ),
-        };
-    }
     let storage_failure = matches!(
         error.sqlite_error_code(),
         Some(
