@@ -31,6 +31,7 @@ Every simulation run checked against the guarantees each database promises, and 
 - FR-046 mutual TLS between nodes and clients, with a built-in certificate authority (`fleetringd cert`), certificates reloaded without a restart (ADR-0025).
 - FR-047 principals and scopes: prefix rules with four actions and default deny, client certificates and signed expiring tokens, enforced at every RPC (ADR-0025).
 - FR-048 a threat model in `SECURITY.md`, a dependency audit that fails releases, and keyless-signed, attested release artifacts.
+- FR-050 node calls bound to placement (ADR-0031): a stolen node key reaches only the databases placed on that node.
 - An external review of the replication and failover protocol and of the auth design.
 
 ### E4. Scale
