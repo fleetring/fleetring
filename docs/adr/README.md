@@ -18,7 +18,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0007](0007-bounded-loads-policy.md) | Bounded loads as a deterministic policy applied at assignment time | Accepted |
 | [0008](0008-placement-spec-vectors-fingerprints.md) | Versioned placement spec, golden vectors, and ring fingerprints | Accepted |
 | [0009](0009-toolchain-lints-ci.md) | Toolchain, lint, dependency, and CI policy | Accepted (test matrix amended by 0014) |
-| [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Proposed (deferred; superseded by 0030 once accepted) |
+| [0010](0010-replica-anti-entropy-hash-trees.md) | Replica anti-entropy with page-level hash trees (replication layer, not this crate) | Superseded by 0030 |
 | [0011](0011-generic-placement-core.md) | `fleetring` is general-purpose placement infrastructure; the product stays SQLite-focused | Accepted |
 | [0012](0012-cells-nested-placement.md) | Cells: nested placement by composing rings (directory or ring picks the cell, the cell's ring picks nodes) | Accepted |
 | [0013](0013-async-boundaries.md) | Async boundaries: synchronous placement, async I/O, engine-owned concurrency | Accepted |
@@ -34,12 +34,12 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Accepted |
 | [0024](0024-logical-change-capture.md) | Logical change capture through a replicated, Turso-shaped change table inside the database | Accepted |
 | [0025](0025-principals-and-scopes.md) | Principals and scopes: mutual TLS between nodes and prefix-scoped credentials for clients | Accepted |
-| [0026](0026-scope-enforcement-details.md) | How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire (amends 0025) | Proposed |
-| [0027](0027-keyed-leases.md) | Keyed leases: a fenced, renewable lease on any key, requested by a named holder and kept in control state | Proposed |
-| [0028](0028-replicated-sink-positions.md) | Replicated sink positions live in the database, written with the next write after a delivery | Proposed |
-| [0029](0029-s3-durability-sink.md) | Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore | Proposed |
-| [0030](0030-page-hash-trees.md) | Page hash trees over the checkpointed main file, kept by the engine adapter, for repair and page verification (supersedes 0010) | Proposed |
-| [0031](0031-node-calls-bound-to-placement.md) | Node-to-node calls are bound to placement: a node acts only on databases placed on it, at epochs control state gives it | Proposed |
+| [0026](0026-scope-enforcement-details.md) | How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire (amends 0025) | Accepted |
+| [0027](0027-keyed-leases.md) | Keyed leases: a fenced, renewable lease on any key, requested by a named holder and kept in control state | Accepted |
+| [0028](0028-replicated-sink-positions.md) | Replicated sink positions live in the database, written with the next write after a delivery | Accepted |
+| [0029](0029-s3-durability-sink.md) | Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore | Accepted |
+| [0030](0030-page-hash-trees.md) | Page hash trees over the checkpointed main file, kept by the engine adapter, for repair and page verification (supersedes 0010) | Accepted |
+| [0031](0031-node-calls-bound-to-placement.md) | Node-to-node calls are bound to placement: a node acts only on databases placed on it, at epochs control state gives it | Accepted |
 
 ## Template
 

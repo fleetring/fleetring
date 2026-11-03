@@ -1,6 +1,6 @@
 # ADR-0010: Replica anti-entropy with page-level hash trees
 
-- **Status:** Proposed, deferred until replication work starts (MVP steps 2–3); to be superseded by [ADR-0030](0030-page-hash-trees.md) when that is accepted
+- **Status:** Superseded by [ADR-0030](0030-page-hash-trees.md) (2026-11-03)
 - **Date:** 2026-10-27
 - **Scope:** the replication and migration layer (`fleetringd`, or a `fleetring-repl` crate). It does **not** apply to the `fleetring` placement crate, which never moves data (ADR-0001).
 - **Related:** ADR-0001, ADR-0006

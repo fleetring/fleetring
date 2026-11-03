@@ -1,6 +1,6 @@
 # ADR-0030: Page hash trees over the checkpointed main file, kept by the engine adapter, for repair and page verification
 
-- **Status:** Proposed (2026-11-02)
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-02
 - **Supersedes:** ADR-0010 (proposed, deferred)
 - **Related:** ADR-0016 (engine adapters, points 7, 8, and 12), ADR-0019 (protocol), ADR-0022 (re-seeding), ADR-0025 (node-only replication); tickets FR-032, FR-044, FR-045

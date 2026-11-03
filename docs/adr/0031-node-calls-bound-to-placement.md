@@ -1,6 +1,6 @@
 # ADR-0031: Node-to-node calls are bound to placement: a node acts only on databases placed on it, at epochs control state gives it
 
-- **Status:** Proposed (2026-11-02)
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-02
 - **Related:** ADR-0017 (control state machine), ADR-0018 (epochs), ADR-0022 (failover), ADR-0025 (principals and scopes), ADR-0026 (scope enforcement, proposed with FR-047); tickets FR-046, FR-047, FR-050
 
