@@ -39,7 +39,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | M7 Durability and operations | FR-035 – FR-038, FR-051, FR-054 | Configurable durability per database, and a history checker for every simulation run |
 | M8 Access and integration | FR-039 – FR-043 | Change streams, lease watching and keyed leases, then the router, the client, and the MCP server |
 | M9 Durability sinks and verification | FR-044, FR-045, FR-049, FR-052, FR-053 | A hash-chained log, Merkle anti-entropy, and verifiable archives with point-in-time restore, so replicas and archives can prove what they hold |
-| M10 Security | FR-046 – FR-048, FR-050 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases, and node calls bound to placement |
+| M10 Security | FR-046 – FR-048, FR-050, FR-055 | Mutual TLS with a built-in certificate authority, principals and scopes with tokens, the threat model and signed releases, and node calls bound to placement |
 
 ## Index
 
@@ -99,6 +99,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-052](FR-052-archive-acknowledged-durability.md) | A durability mode that acknowledges a write only once it is archived | P2 | M | FR-049, FR-035 | todo |
 | [FR-053](FR-053-object-store-workload-identity.md) | Object-store credentials from workload identity, not only static keys | P2 | S | FR-049 | todo |
 | [FR-054](FR-054-upgrade-and-rolling-upgrades.md) | `fleetringd upgrade` and a tested rolling upgrade | P1 | L | FR-038, FR-048 | todo |
+| [FR-055](FR-055-cli-identity-ergonomics.md) | Pick a client identity without repeating `--cert` and `--key` | P2 | S | FR-047 | todo |
 
 ## Dependency graph
 
