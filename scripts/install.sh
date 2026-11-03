@@ -5,9 +5,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
 #     | sh -s -- --version 0.1.0 --prefix /usr/local
 #
-# It picks the archive for this OS and CPU, checks it against the release's SHA256SUMS, and
-# copies the binary to PREFIX/bin. Supported: Linux (glibc 2.36 or newer) and macOS, each on
-# x86_64 and ARM64. On Windows, download the .zip from the release page.
+# It picks the archive for this OS and CPU, checks it against the release's SHA256SUMS (after
+# verifying that file's cosign signature, when cosign is installed), and copies
+# the binary to PREFIX/bin. Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
+# and ARM64. On Windows, download the .zip from the release page.
 
 set -eu
 
@@ -178,6 +179,22 @@ trap 'exit 1' HUP INT TERM
 say "downloading fleetringd $version for $target"
 download "$base_url/$archive" "$tmp/$archive" || fail "can't download $base_url/$archive"
 download "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" || fail "can't download $base_url/SHA256SUMS"
+
+# SHA256SUMS is signed keylessly by the release workflow (FR-048). With cosign installed, the
+# signature must verify before any checksum is trusted; without it, say so and carry on.
+if command -v cosign > /dev/null 2>&1; then
+    download "$base_url/SHA256SUMS.sigstore.json" "$tmp/SHA256SUMS.sigstore.json" \
+        || fail "can't download $base_url/SHA256SUMS.sigstore.json, so the signature can't be verified"
+    cosign verify-blob \
+        --bundle "$tmp/SHA256SUMS.sigstore.json" \
+        --certificate-identity-regexp "^https://github.com/$repo/.github/workflows/release.yml@refs/tags/fleetringd-v" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        "$tmp/SHA256SUMS" > /dev/null \
+        || fail "the signature on SHA256SUMS doesn't verify; not installing"
+    say "verified the cosign signature on SHA256SUMS"
+else
+    say "cosign not found, so the SHA256SUMS signature wasn't checked; to check it, install cosign (https://docs.sigstore.dev/cosign/system_config/installation/)"
+fi
 
 expected=$(awk -v file="$archive" '$2 == file || $2 == "*" file { print $1 }' "$tmp/SHA256SUMS")
 [ -n "$expected" ] || fail "SHA256SUMS lists no checksum for $archive"
