@@ -32,7 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The tag names the version `fleetringd --version` prints, so they must agree.
       - id: version
         name: read the version and check it against the tag
@@ -76,7 +76,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Linux builds run in Debian 12, so the binaries need glibc 2.36, not the runner's 2.39,
       # and match the container image's runtime.
@@ -89,7 +89,7 @@ jobs:
             "rust:$RUST_VERSION-slim-bookworm" \
             cargo build --locked --release -p fleetringd --target "$TARGET"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: runner.os != 'Linux'
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -139,7 +139,7 @@ jobs:
           rm -r "$name"
           ls -l
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fleetringd-${{ matrix.target }}
           path: dist/*
@@ -154,8 +154,8 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: fleetringd-*
           path: dist
@@ -169,7 +169,7 @@ jobs:
           done
           sha256sum -- *.tar.gz *.zip install.sh > SHA256SUMS
           cat SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fleetringd-${{ env.VERSION }}-dist
           path: dist/*

@@ -1,0 +1,9 @@
+# Bumps the commit SHAs that pin every workflow action (FR-048).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
