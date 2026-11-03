@@ -93,7 +93,7 @@ These items follow the Rust API Guidelines and common Rust best practices.
 | [FR-045](FR-045-merkle-anti-entropy.md) | Merkle anti-entropy over pages, so a returning follower fetches only what differs | P2 | L | FR-044, FR-032, FR-047 | todo |
 | [FR-046](FR-046-mutual-tls.md) | Mutual TLS between nodes and clients, with a built-in certificate authority | P0 | L | FR-029, FR-037 | done |
 | [FR-047](FR-047-scoped-credentials.md) | Principals and scopes: tokens and prefix rules enforced at every RPC | P0 | L | FR-046 | in-progress |
-| [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | in-progress |
+| [FR-048](FR-048-threat-model-and-signed-releases.md) | A threat model in SECURITY.md and verifiable release artifacts | P1 | M | FR-034, FR-046, FR-047 | done |
 | [FR-049](FR-049-s3-durability-sink.md) | An S3 durability sink with verifiable point-in-time restore | P1 | L | FR-039, FR-041, FR-044, FR-047 | todo |
 | [FR-050](FR-050-node-calls-bound-to-placement.md) | Bind node-to-node calls to placement, so a stolen node key reaches only its own databases | P1 | M | FR-047 | in-progress |
 | [FR-051](FR-051-flaky-replication-tests.md) | Find and fix the replication tests that fail intermittently in CI | P1 | M | — | in-progress |
