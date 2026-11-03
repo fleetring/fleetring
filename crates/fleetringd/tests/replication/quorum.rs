@@ -113,7 +113,15 @@ async fn no_write_is_acknowledged_before_the_write_quorum_has_fsynced_it() -> Te
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_are_refused_without_a_reachable_quorum() -> TestResult {
-    let (cluster, b, c, _log) = proxied().await?;
+    // This test does rely on the acknowledgement timeout: a write that slips in just before the
+    // primary sees `b`'s stream close commits unacknowledged and ends only at the timeout, after
+    // which the next write is refused. At the hang guard that one write would use up the guard
+    // below, so keep the old 10 seconds here.
+    let (cluster, b, c, _log) = proxied_with(ReplicationSettings {
+        ack_timeout: Duration::from_secs(10),
+        ..settings()
+    })
+    .await?;
     let db = name("under");
     cluster.create("a", &db, 3).await?;
     let registry = cluster.node("a").registry().clone();
