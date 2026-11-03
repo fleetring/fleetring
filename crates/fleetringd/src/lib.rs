@@ -47,7 +47,13 @@ const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     assert_debug_send_sync::<auth::Action>();
     assert_debug_send_sync::<auth::BearerToken>();
+    assert_debug_send_sync::<auth::Caller>();
+    assert_debug_send_sync::<auth::Credential>();
+    assert_debug_send_sync::<auth::Denied>();
     assert_debug_send_sync::<auth::Grant>();
+    assert_debug_send_sync::<auth::Needed>();
+    assert_debug_send_sync::<auth::Requirement>();
+    assert_debug_send_sync::<auth::Rpc>();
     assert_debug_send_sync::<auth::IssueError>();
     assert_debug_send_sync::<auth::ParseScopeError>();
     assert_debug_send_sync::<auth::Scope>();
