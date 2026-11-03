@@ -38,7 +38,8 @@ const HEARTBEAT_MS: u64 = 100;
 const PRINCIPALS: &str = "\n[[principal]]\nname = \"reader\"\nscopes = [\"read:tenant:acme/*\"]\n\
      \n[[principal]]\nname = \"app\"\n\
      \n[[principal]]\nname = \"router\"\nforward_tokens = true\n\
-     \n[[principal]]\nname = \"streamer\"\nscopes = [\"stream:tenant:acme/*\"]\n";
+     \n[[principal]]\nname = \"streamer\"\nscopes = [\"stream:tenant:acme/*\"]\n\
+     \n[[principal]]\nname = \"writer\"\nscopes = [\"write:tenant:acme/*\"]\n";
 
 fn config(
     dir: &Path,
@@ -313,6 +314,7 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
     assert_eq!(status.code(), Code::Unauthenticated, "{status}");
 
     data_node_calls_are_scoped(&tls, &control_target, &data_target).await?;
+    statements_stay_in_their_database(&tls, &control_target, &dir.path().join("data-1")).await?;
 
     // An open stream ends once its token is revoked.
     let mut leases = app.watch_leases(&data_target).await?;
@@ -418,6 +420,93 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
 
     late.run_until(async {}).await;
     data.run_until(async {}).await;
+    Ok(())
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}
+
+/// A principal that may read or write `tenant:acme/*` can't reach another tenant's database
+/// file from a statement: the engine confines every statement to the database it names, which
+/// the scope model depends on (ADR-0026). `ATTACH` through `Query` or `Execute`, and
+/// `VACUUM INTO`, are refused before they run.
+async fn statements_stay_in_their_database(
+    tls: &Tls,
+    control: &str,
+    data_dir: &Path,
+) -> TestResult {
+    let acme: DatabaseName = "tenant:acme/orders".parse()?;
+    let zed: DatabaseName = "tenant:zed/orders".parse()?;
+    // Another tenant's database file on the same node, as an attacker would guess it.
+    let files = files_under(data_dir);
+    let target = files
+        .iter()
+        .find(|path| {
+            let text = path.to_string_lossy();
+            text.contains("zed") && !text.ends_with("-wal") && !text.ends_with("-shm")
+        })
+        .or_else(|| files.first())
+        .ok_or("no database files on the data node")?
+        .to_string_lossy()
+        .replace('\'', "''");
+    let attach = format!("ATTACH DATABASE '{target}' AS other");
+    let reader = Client::new(control.to_owned(), network(tls, "reader")?);
+    let writer = Client::new(control.to_owned(), network(tls, "writer")?);
+    let refused = |status: tonic::Status, what: &str| {
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+    };
+    refused(
+        reader
+            .query(&acme, Statement::new(attach.clone()))
+            .await
+            .expect_err("attach through query"),
+        "attach through query",
+    );
+    refused(
+        writer
+            .execute(&acme, Statement::new(attach.clone()))
+            .await
+            .expect_err("attach through execute"),
+        "attach through execute",
+    );
+    refused(
+        writer
+            .execute(&acme, Statement::new(format!("VACUUM INTO '{target}'")))
+            .await
+            .expect_err("vacuum into another file"),
+        "vacuum into",
+    );
+    refused(
+        writer
+            .execute(&acme, Statement::new("DETACH DATABASE main"))
+            .await
+            .expect_err("detach"),
+        "detach",
+    );
+    // The writer still writes its own tenant, and the other tenant is untouched.
+    writer.execute(&acme, write_one()).await?;
+    let admin = Client::new(control.to_owned(), network(tls, "tester")?);
+    let rows = admin.query(&zed, read_one()).await?;
+    assert_eq!(
+        rows.rows,
+        [vec![Value::Integer(1)]],
+        "tenant:zed/orders changed"
+    );
     Ok(())
 }
 
