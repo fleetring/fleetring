@@ -43,8 +43,10 @@
 //! not, the write is refused with [`ReplicationError::BelowFloor`] and nothing commits. A write
 //! that passed the floor but finds fewer than W reachable when its batch is published fails at
 //! once with [`ReplicationError::UnderReplicated`], and one whose quorum doesn't complete within
-//! [`ReplicationSettings::ack_timeout`] fails too. In those two cases the write has committed on
-//! the primary and may still replicate later; it just isn't acknowledged.
+//! [`ReplicationSettings::ack_timeout`] fails too, and so does one still waiting when this node
+//! stops being the database's primary (a drain, or a newer epoch), since no follower will
+//! acknowledge it to a primary that is gone. In those cases the write has committed on the
+//! primary and may still replicate later; it just isn't acknowledged.
 //!
 //! # Checkpoints
 //!
@@ -469,6 +471,7 @@ struct Served {
 
 impl Drop for Served {
     fn drop(&mut self) {
+        self.primary.retire();
         self.driver.abort();
     }
 }
