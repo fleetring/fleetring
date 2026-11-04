@@ -14,6 +14,7 @@ mod failover;
 mod fleet;
 mod history;
 mod membership;
+mod observe;
 mod replication;
 
 use std::error::Error;
