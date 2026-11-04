@@ -8,15 +8,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fleetring_control::LeaseEpoch;
+use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::replication_server::Replication as ReplicationRpc;
 use fleetring_proto::v1::{
     FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest, PromoteResponse,
     ReplicateMessage, SnapshotChunk, SnapshotRequest,
 };
-use fleetringd::DatabaseError;
 use fleetringd::engine::{Statement, Transaction, Value};
 use fleetringd::replication::{PrimaryRole, ReplicationService, ReplicationSettings, SeedError};
+use fleetringd::{DatabaseError, Registry};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -87,7 +87,7 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
             for i in 0..300_i64 {
                 let k = 1_000_000 + i;
                 let len = usize::try_from(1 + (i * 37) % 3_000).expect("small");
-                if tolerate(registry.execute(&db, put(k, len)).await)? {
+                if write(&registry, &db, put(k, len)).await? {
                     acknowledged += 1;
                 } else {
                     // Refused or unacknowledged while the streams reopen: retry later, as a
@@ -99,15 +99,18 @@ async fn added_follower_catches_up(megabytes: usize) -> TestResult {
                         "DELETE FROM kv WHERE k = ?1",
                         [Value::Integer(i)],
                     ));
-                    tolerate(registry.execute(&db, delete).await)?;
+                    write(&registry, &db, delete).await?;
                 }
             }
-            Ok::<_, DatabaseError>(acknowledged)
+            Ok::<_, WriterError>(acknowledged)
         })
     };
     let replication = &fleet.node(primary).replication;
     replication.serve_primary(db.clone(), crate::common::role(3))?;
-    let acknowledged = guarded("the writer", writer).await???;
+    // Each write is guarded, so the writer ends.
+    let acknowledged = writer
+        .await?
+        .map_err(|error| error as Box<dyn std::error::Error>)?;
     assert!(
         acknowledged > 0,
         "writes went on while the follower was added"
@@ -172,6 +175,27 @@ where
     .await
     .map_err(|_| "the write was never admitted")??;
     Ok(())
+}
+
+/// Why the writer stopped.
+type WriterError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Runs one of the writer's writes, and says whether it was acknowledged, as [`tolerate`] judges.
+///
+/// The hang guard bounds each write, not the writer's 330 of them together. Their total is a
+/// measure of the disk: on a Windows runner, where `%TEMP%` is on a disk whose fsync takes tens of
+/// milliseconds while the rest of the binary writes to it, and over a second in a slow spell, the
+/// writer took 30 seconds alongside the other tests, and more than 60 when the runner was busier,
+/// though no write hung.
+async fn write(
+    registry: &Registry,
+    database: &DatabaseName,
+    transaction: Transaction,
+) -> Result<bool, WriterError> {
+    let written = tokio::time::timeout(HANG_GUARD, registry.execute(database, transaction))
+        .await
+        .map_err(|_| "a write didn't finish")?;
+    Ok(tolerate(written)?)
 }
 
 /// Whether a write was acknowledged. A write that committed on the primary but wasn't
