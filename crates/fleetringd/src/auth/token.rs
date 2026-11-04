@@ -319,6 +319,40 @@ pub enum TokenError {
     Scope(#[source] ParseScopeError),
 }
 
+/// A refused token's error, with the token's ID when the signature verified, so that the ID is
+/// the issuer's and not whatever a sender wrote into a forged token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    error: TokenError,
+    token: Option<TokenId>,
+}
+
+impl Refusal {
+    fn of(error: TokenError) -> Self {
+        Self { error, token: None }
+    }
+
+    fn of_token(error: TokenError, token: Option<TokenId>) -> Self {
+        Self { error, token }
+    }
+
+    /// Why the token is refused.
+    pub(crate) fn into_error(self) -> TokenError {
+        self.error
+    }
+
+    /// The refused token's ID, if its signature verified and its claims carry one.
+    pub(crate) fn token(&self) -> Option<&TokenId> {
+        self.token.as_ref()
+    }
+}
+
+impl From<TokenError> for Refusal {
+    fn from(error: TokenError) -> Self {
+        Self::of(error)
+    }
+}
+
 /// What a node checks tokens against: the fleet they must be issued for and the keys trusted
 /// to sign them.
 ///
@@ -349,9 +383,9 @@ impl TokenVerifier {
     /// Verifies `token` at `now` against the trusted keys and `revoked`, and returns what it
     /// grants with the key that signed it.
     ///
-    /// The checks run in an order that does no work for an untrusted sender: the size, the
-    /// header, a trusted and unrevoked key, the signature, and only then the claims, the
-    /// validity window, and the token's own revocation.
+    /// The checks run in an order that does little work for an untrusted sender: the size, the
+    /// header, a trusted key, the signature, and only then the claims, the validity window, and
+    /// the revocation of the token or its key.
     ///
     /// # Errors
     ///
@@ -362,15 +396,28 @@ impl TokenVerifier {
         now: Timestamp,
         revoked: &Revocations,
     ) -> Result<Verified, TokenError> {
+        self.verify_identified(token, now, revoked)
+            .map_err(Refusal::into_error)
+    }
+
+    /// Verifies `token` as [`verify`](Self::verify) does, and names the token in a refusal once
+    /// its signature has verified: an expired, revoked, or otherwise refused token can still be
+    /// told apart from the others by its ID, which an audit line records.
+    pub(crate) fn verify_identified(
+        &self,
+        token: &BearerToken,
+        now: Timestamp,
+        revoked: &Revocations,
+    ) -> Result<Verified, Refusal> {
         let text = token.expose();
         if text.len() > MAX_TOKEN_LEN {
-            return Err(TokenError::Malformed);
+            return Err(TokenError::Malformed.into());
         }
         let mut parts = text.split('.');
         let (Some(header), Some(claims), Some(signature), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
-            return Err(TokenError::Malformed);
+            return Err(TokenError::Malformed.into());
         };
         let signed = text
             .get(..header.len() + 1 + claims.len())
@@ -378,10 +425,10 @@ impl TokenVerifier {
 
         let header: Header = decode_json(header)?;
         if header.alg != ALGORITHM {
-            return Err(TokenError::Algorithm);
+            return Err(TokenError::Algorithm.into());
         }
         if header.typ.as_deref().is_some_and(|typ| typ != TYPE) {
-            return Err(TokenError::Malformed);
+            return Err(TokenError::Malformed.into());
         }
         let key_id: KeyId = header.kid.parse().map_err(|_| TokenError::Malformed)?;
         let key = self
@@ -389,9 +436,6 @@ impl TokenVerifier {
             .iter()
             .find(|key| key.id == key_id)
             .ok_or(TokenError::UnknownKey)?;
-        if revoked.contains(&fleetring_control::Revoked::Key(key_id.clone())) {
-            return Err(TokenError::Revoked);
-        }
         let signature = URL_SAFE_NO_PAD
             .decode(signature)
             .map_err(|_| TokenError::Malformed)?;
@@ -399,31 +443,40 @@ impl TokenVerifier {
             .verify(signed.as_bytes(), &signature)
             .map_err(|_| TokenError::Signature)?;
 
+        // The signature holds, so the claims are the issuer's and so is the ID they carry.
         let claims: Claims = decode_json(claims)?;
+        let id: Option<TokenId> = claims.jti.parse().ok();
+        let refuse = |error| Refusal::of_token(error, id.clone());
+        if revoked.contains(&fleetring_control::Revoked::Key(key_id.clone())) {
+            return Err(refuse(TokenError::Revoked));
+        }
         if claims.iss != self.issuer {
-            return Err(TokenError::Issuer);
+            return Err(refuse(TokenError::Issuer));
         }
         if claims.exp.saturating_sub(claims.nbf) > MAX_TOKEN_LIFETIME.as_secs() {
-            return Err(TokenError::Lifetime);
+            return Err(refuse(TokenError::Lifetime));
         }
         let now_secs = seconds(now);
         if now_secs.saturating_add(NOT_BEFORE_LEEWAY_SECS) < claims.nbf {
-            return Err(TokenError::NotYetValid);
+            return Err(refuse(TokenError::NotYetValid));
         }
         if now_secs >= claims.exp {
-            return Err(TokenError::Expired);
+            return Err(refuse(TokenError::Expired));
         }
-        let id: TokenId = claims.jti.parse().map_err(|_| TokenError::Malformed)?;
-        let principal: Principal = claims.sub.parse().map_err(|_| TokenError::Malformed)?;
+        let id = id.clone().ok_or(TokenError::Malformed)?;
+        let principal: Principal = claims
+            .sub
+            .parse()
+            .map_err(|_| refuse(TokenError::Malformed))?;
         if revoked.refuses(&id, &key_id) {
-            return Err(TokenError::Revoked);
+            return Err(refuse(TokenError::Revoked));
         }
         let scopes = claims
             .scopes
             .iter()
             .map(|scope| scope.parse())
             .collect::<Result<Scopes, _>>()
-            .map_err(TokenError::Scope)?;
+            .map_err(|error| refuse(TokenError::Scope(error)))?;
         Ok(Verified {
             grant: Grant {
                 principal,

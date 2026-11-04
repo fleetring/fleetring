@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -34,7 +34,8 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
 
 /// The environment variable that names a directory with `ca.crt`, `client.crt`, and
-/// `client.key`, used when `--ca`, `--cert`, and `--key` aren't given.
+/// `client.key`, and the `client.<principal>.crt` and `.key` files `--as` picks from. It supplies
+/// whatever `--ca`, `--cert`, `--key`, and `--as` (and their variables) leave open.
 const TLS_DIR_VAR: &str = "FLEETRING_TLS_DIR";
 
 /// The environment variable that holds a bearer token, used when `--token` isn't given.
@@ -376,25 +377,44 @@ struct Target {
 }
 
 /// The identity a command connects with: a client certificate from `cert client`.
+///
+/// Each of the three files is the first of these that names it: the flag, the environment
+/// variable, `--as` (or `FLEETRING_AS`) for the certificate and key, and the default under
+/// `FLEETRING_TLS_DIR`.
 #[derive(Debug, Args)]
 struct TlsArgs {
-    /// The trusted authority certificates, PEM. Defaults to `ca.crt` under `FLEETRING_TLS_DIR`.
-    #[arg(long)]
+    /// The trusted authority certificates, PEM. Defaults to `$FLEETRING_TLS_DIR/ca.crt`.
+    #[arg(long, env = "FLEETRING_CA")]
     ca: Option<PathBuf>,
-    /// The client certificate, PEM. Defaults to `client.crt` under `FLEETRING_TLS_DIR`.
-    #[arg(long)]
+    /// The client certificate, PEM. Overrides `--as`. Defaults to
+    /// `$FLEETRING_TLS_DIR/client.crt`.
+    #[arg(long, env = "FLEETRING_CERT")]
     cert: Option<PathBuf>,
-    /// The client certificate's private key, PEM. Defaults to `client.key` under
-    /// `FLEETRING_TLS_DIR`.
-    #[arg(long)]
+    /// The client certificate's private key, PEM. Overrides `--as`. Defaults to
+    /// `$FLEETRING_TLS_DIR/client.key`.
+    #[arg(long, env = "FLEETRING_KEY")]
     key: Option<PathBuf>,
+    /// Acts as this principal, using `client.<principal>.crt` and `client.<principal>.key` under
+    /// `FLEETRING_TLS_DIR`, as `cert client <principal>` writes them. An explicit `--cert` or
+    /// `--key`, or its environment variable, wins over this for that file, and this wins over
+    /// `client.crt` and `client.key`.
+    #[arg(long = "as", env = "FLEETRING_AS", value_name = "PRINCIPAL")]
+    principal: Option<Principal>,
     /// Connects in plaintext, to a daemon started with `--insecure-plaintext`.
-    #[arg(long, conflicts_with_all = ["ca", "cert", "key"])]
+    #[arg(long, conflicts_with_all = ["ca", "cert", "key", "principal"])]
     insecure_plaintext: bool,
     /// A bearer token from `token issue`, sent with every request; the request then acts with
     /// the token's scopes. Defaults to `FLEETRING_TOKEN`, if set.
     #[arg(long)]
     token: Option<String>,
+}
+
+/// The three files a command's identity is loaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityFiles {
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 impl TlsArgs {
@@ -403,22 +423,54 @@ impl TlsArgs {
             return Ok(Security::Plaintext);
         }
         let dir = std::env::var_os(TLS_DIR_VAR).map(PathBuf::from);
-        let path =
-            |given: &Option<PathBuf>, name: &str, flag: &str| -> Result<PathBuf, Box<dyn Error>> {
-                match (given, &dir) {
-                    (Some(path), _) => Ok(path.clone()),
-                    (None, Some(dir)) => Ok(dir.join(name)),
-                    (None, None) => Err(format!(
-                        "pass --{flag} (or set {TLS_DIR_VAR} to a directory with ca.crt, \
+        let files = self.files(dir.as_deref())?;
+        Ok(Security::Tls(Identity::load(
+            &files.ca,
+            &files.cert,
+            &files.key,
+        )?))
+    }
+
+    /// Picks the identity files. Each takes the first of: its flag or environment variable (clap
+    /// has already merged the two), the principal's file under `dir` if `--as` names one, and
+    /// the default name under `dir`.
+    ///
+    /// # Errors
+    ///
+    /// If a file has none of those and `dir` is unset; if `--as` is needed and `dir` is unset;
+    /// or if `--as` is needed and the principal's certificate or key is missing from `dir`.
+    fn files(&self, dir: Option<&Path>) -> Result<IdentityFiles, Box<dyn Error>> {
+        let in_dir = |name: &str, flag: &str| -> Result<PathBuf, Box<dyn Error>> {
+            dir.map(|dir| dir.join(name)).ok_or_else(|| {
+                format!(
+                    "pass --{flag} (or set {TLS_DIR_VAR} to a directory with ca.crt, \
                      client.crt, and client.key), or --insecure-plaintext"
-                    )
-                    .into()),
-                }
-            };
-        let ca = path(&self.ca, "ca.crt", "ca")?;
-        let cert = path(&self.cert, "client.crt", "cert")?;
-        let key = path(&self.key, "client.key", "key")?;
-        Ok(Security::Tls(Identity::load(&ca, &cert, &key)?))
+                )
+                .into()
+            })
+        };
+        // `--as` only matters for a file nothing more explicit names.
+        let named = match (&self.principal, &self.cert, &self.key) {
+            (Some(principal), None, _) | (Some(principal), _, None) => {
+                Some(principal_files(principal, dir)?)
+            }
+            _ => None,
+        };
+        let ca = match &self.ca {
+            Some(ca) => ca.clone(),
+            None => in_dir("ca.crt", "ca")?,
+        };
+        let cert = match (&self.cert, &named) {
+            (Some(cert), _) => cert.clone(),
+            (None, Some((cert, _))) => cert.clone(),
+            (None, None) => in_dir("client.crt", "cert")?,
+        };
+        let key = match (&self.key, &named) {
+            (Some(key), _) => key.clone(),
+            (None, Some((_, key))) => key.clone(),
+            (None, None) => in_dir("client.key", "key")?,
+        };
+        Ok(IdentityFiles { ca, cert, key })
     }
 
     fn network(&self) -> Result<Network, Box<dyn Error>> {
@@ -436,6 +488,37 @@ impl TlsArgs {
             None => network,
         })
     }
+}
+
+/// The certificate and key `cert client <principal>` writes under `dir`.
+///
+/// # Errors
+///
+/// If `dir` is unset, or either file is missing; the message names both files.
+fn principal_files(
+    principal: &Principal,
+    dir: Option<&Path>,
+) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let Some(dir) = dir else {
+        return Err(format!(
+            "--as {principal} needs {TLS_DIR_VAR} to find client.{principal}.crt and \
+             client.{principal}.key; set it, or pass --cert and --key"
+        )
+        .into());
+    };
+    let cert = dir.join(format!("client.{principal}.crt"));
+    let key = dir.join(format!("client.{principal}.key"));
+    if cert.is_file() && key.is_file() {
+        return Ok((cert, key));
+    }
+    Err(format!(
+        "no client identity for principal '{principal}': looked for {} and {}\n  \
+         hint: create it with `fleetringd cert client {principal} --dir {}`",
+        cert.display(),
+        key.display(),
+        dir.display(),
+    )
+    .into())
 }
 
 impl Target {
@@ -1435,6 +1518,119 @@ mod tests {
         for bad in ["int:x", "real:", "blob:0", "blob:zz"] {
             assert!(parse_param(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Identity arguments as the command line, after clap has merged each flag with its variable.
+    fn tls_args(cert: Option<&str>, key: Option<&str>, principal: Option<&str>) -> TlsArgs {
+        TlsArgs {
+            ca: None,
+            cert: cert.map(PathBuf::from),
+            key: key.map(PathBuf::from),
+            principal: principal.map(|name| name.parse().expect("a principal")),
+            insecure_plaintext: false,
+            token: None,
+        }
+    }
+
+    fn files(ca: &str, cert: &str, key: &str) -> IdentityFiles {
+        IdentityFiles {
+            ca: PathBuf::from(ca),
+            cert: PathBuf::from(cert),
+            key: PathBuf::from(key),
+        }
+    }
+
+    #[test]
+    fn the_identity_files_come_from_a_flag_then_as_then_the_directory() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let root = dir.path();
+        for name in ["client.app.crt", "client.app.key"] {
+            std::fs::write(root.join(name), "").expect("a file");
+        }
+        let at = |name: &str| root.join(name).to_str().expect("a UTF-8 path").to_owned();
+
+        // The directory's defaults.
+        assert_eq!(
+            tls_args(None, None, None).files(Some(root)).expect("files"),
+            files(&at("ca.crt"), &at("client.crt"), &at("client.key")),
+        );
+        // `--as` replaces the certificate and the key, not the authority.
+        assert_eq!(
+            tls_args(None, None, Some("app"))
+                .files(Some(root))
+                .expect("files"),
+            files(&at("ca.crt"), &at("client.app.crt"), &at("client.app.key")),
+        );
+        // An explicit file beats `--as`, one file at a time.
+        assert_eq!(
+            tls_args(Some("c.crt"), None, Some("app"))
+                .files(Some(root))
+                .expect("files"),
+            files(&at("ca.crt"), "c.crt", &at("client.app.key")),
+        );
+        assert_eq!(
+            tls_args(None, Some("c.key"), Some("app"))
+                .files(Some(root))
+                .expect("files"),
+            files(&at("ca.crt"), &at("client.app.crt"), "c.key"),
+        );
+        // With both named, `--as` isn't consulted: its files needn't exist, nor the directory.
+        let mut explicit = tls_args(Some("c.crt"), Some("c.key"), Some("nobody"));
+        explicit.ca = Some(PathBuf::from("ca.pem"));
+        assert_eq!(
+            explicit.files(None).expect("files"),
+            files("ca.pem", "c.crt", "c.key"),
+        );
+    }
+
+    #[test]
+    fn an_unknown_principal_names_the_files_it_looked_for() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let root = dir.path();
+        // A certificate without its key is as unknown as neither.
+        std::fs::write(root.join("client.half.crt"), "").expect("a file");
+        for name in ["nobody", "half"] {
+            let error = tls_args(None, None, Some(name))
+                .files(Some(root))
+                .expect_err("unknown principal")
+                .to_string();
+            let cert = root.join(format!("client.{name}.crt"));
+            let key = root.join(format!("client.{name}.key"));
+            assert!(
+                error.starts_with(&format!(
+                    "no client identity for principal '{name}': looked for {} and {}",
+                    cert.display(),
+                    key.display()
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "hint: create it with `fleetringd cert client {name} --dir"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_files_need_a_directory_unless_every_file_is_named() {
+        let error = tls_args(None, None, Some("app"))
+            .files(None)
+            .expect_err("no directory")
+            .to_string();
+        assert!(
+            error.starts_with("--as app needs FLEETRING_TLS_DIR to find client.app.crt"),
+            "{error}"
+        );
+        let error = tls_args(None, None, None)
+            .files(None)
+            .expect_err("no directory")
+            .to_string();
+        assert!(
+            error.starts_with("pass --ca (or set FLEETRING_TLS_DIR"),
+            "{error}"
+        );
     }
 
     #[test]

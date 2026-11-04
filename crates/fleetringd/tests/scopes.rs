@@ -628,6 +628,10 @@ async fn fleetringd(
         std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
             .env("FLEETRING_TLS_DIR", &tls_dir)
             .env_remove("FLEETRING_TOKEN")
+            .env_remove("FLEETRING_AS")
+            .env_remove("FLEETRING_CA")
+            .env_remove("FLEETRING_CERT")
+            .env_remove("FLEETRING_KEY")
             .envs(env)
             .args(&args)
             .output()
@@ -837,6 +841,219 @@ async fn the_command_line_acts_as_its_certificate_or_its_token() -> TestResult {
         .await?,
         "app with a revoked token",
         "the token is revoked",
+    );
+
+    node.run_until(async {}).await;
+    Ok(())
+}
+
+/// FR-055: the identity a command acts as comes from the first of its flag, its environment
+/// variable, `--as` (or `FLEETRING_AS`), and the `client.crt` and `client.key` in
+/// `FLEETRING_TLS_DIR`.
+///
+/// `reader` may read `tenant:acme/*` and `app` may do nothing, so which of them a command acted
+/// as shows in whether its query was allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let node = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "node-1",
+        "both",
+        None,
+    )?)?)
+    .await?;
+    let control = node
+        .control_address()
+        .ok_or("no control address")?
+        .to_string();
+    let tls_dir = tls.dir().to_owned();
+    let tls_text = tls_dir.to_str().ok_or("a non-UTF-8 path")?.to_owned();
+    let target = ["--control", control.as_str()];
+
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let output = fleetringd(&tls_dir, &[], &[&["status"][..], &target].concat()).await?;
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("node-1")
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    for words in [
+        &[
+            "db",
+            "create",
+            "tenant:acme/orders",
+            "--replication-factor",
+            "1",
+        ][..],
+        &[
+            "db",
+            "exec",
+            "tenant:acme/orders",
+            "CREATE TABLE t (v INTEGER)",
+        ],
+    ] {
+        succeeded(
+            &fleetringd(&tls_dir, &[], &[words, &target].concat()).await?,
+            "operator",
+        )?;
+    }
+    for principal in ["reader", "app"] {
+        succeeded(
+            &fleetringd(
+                &tls_dir,
+                &[],
+                &["cert", "client", principal, "--dir", &tls_text],
+            )
+            .await?,
+            "cert client",
+        )?;
+    }
+    let file = |name: &str| tls_dir.join(name).to_str().map(str::to_owned);
+    let reader_cert = file("client.reader.crt").ok_or("a non-UTF-8 path")?;
+    let reader_key = file("client.reader.key").ok_or("a non-UTF-8 path")?;
+    let app_cert = file("client.app.crt").ok_or("a non-UTF-8 path")?;
+    let app_key = file("client.app.key").ok_or("a non-UTF-8 path")?;
+    let ca = file("ca.crt").ok_or("a non-UTF-8 path")?;
+    let query = [
+        "db",
+        "query",
+        "tenant:acme/orders",
+        "SELECT count(*) FROM t",
+        "--control",
+        control.as_str(),
+    ];
+    fn with<'a>(query: &[&'a str], extra: &[&'a str]) -> Vec<&'a str> {
+        [query, extra].concat()
+    }
+    let denied = "needs read on 'tenant:acme/orders'";
+
+    // Without any of them, the command acts as `tester`, whose files are the defaults.
+    succeeded(
+        &fleetringd(&tls_dir, &[], &query).await?,
+        "the default identity",
+    )?;
+
+    // `--as` and `FLEETRING_AS` pick `client.<principal>.crt` and `.key` from the directory.
+    succeeded(
+        &fleetringd(&tls_dir, &[], &with(&query, &["--as", "reader"])).await?,
+        "--as reader",
+    )?;
+    failed_with(
+        &fleetringd(&tls_dir, &[], &with(&query, &["--as", "app"])).await?,
+        "--as app",
+        denied,
+    );
+    succeeded(
+        &fleetringd(&tls_dir, &[("FLEETRING_AS", "reader")], &query).await?,
+        "FLEETRING_AS=reader",
+    )?;
+    failed_with(
+        &fleetringd(&tls_dir, &[("FLEETRING_AS", "app")], &query).await?,
+        "FLEETRING_AS=app",
+        denied,
+    );
+
+    // The flag beats its environment variable, and `--as` beats `FLEETRING_AS`.
+    let as_app = [
+        ("FLEETRING_CERT", app_cert.as_str()),
+        ("FLEETRING_KEY", app_key.as_str()),
+    ];
+    succeeded(
+        &fleetringd(
+            &tls_dir,
+            &as_app,
+            &with(&query, &["--cert", &reader_cert, "--key", &reader_key]),
+        )
+        .await?,
+        "--cert and --key over FLEETRING_CERT and FLEETRING_KEY",
+    )?;
+    succeeded(
+        &fleetringd(
+            &tls_dir,
+            &[("FLEETRING_AS", "app")],
+            &with(&query, &["--as", "reader"]),
+        )
+        .await?,
+        "--as over FLEETRING_AS",
+    )?;
+
+    // The environment variables beat `--as` and `FLEETRING_AS`.
+    failed_with(
+        &fleetringd(&tls_dir, &as_app, &with(&query, &["--as", "reader"])).await?,
+        "FLEETRING_CERT and FLEETRING_KEY over --as",
+        denied,
+    );
+    let over_as = [
+        ("FLEETRING_CERT", app_cert.as_str()),
+        ("FLEETRING_KEY", app_key.as_str()),
+        ("FLEETRING_AS", "reader"),
+    ];
+    failed_with(
+        &fleetringd(&tls_dir, &over_as, &query).await?,
+        "FLEETRING_CERT and FLEETRING_KEY over FLEETRING_AS",
+        denied,
+    );
+
+    // FLEETRING_CA, FLEETRING_CERT, and FLEETRING_KEY alone stand in for the three flags, with
+    // no usable directory.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty)?;
+    let all = [
+        ("FLEETRING_CA", ca.as_str()),
+        ("FLEETRING_CERT", reader_cert.as_str()),
+        ("FLEETRING_KEY", reader_key.as_str()),
+    ];
+    succeeded(
+        &fleetringd(&empty, &all, &query).await?,
+        "the three variables",
+    )?;
+    let flags = with(
+        &query,
+        &["--ca", &ca, "--cert", &reader_cert, "--key", &reader_key],
+    );
+    succeeded(&fleetringd(&empty, &[], &flags).await?, "the three flags")?;
+
+    // An unknown principal is an error that names the files it looked for, and how to make them.
+    let nobody_cert = tls_dir.join("client.nobody.crt");
+    let nobody_key = tls_dir.join("client.nobody.key");
+    for (what, env, flags) in [
+        ("--as", &[][..], &["--as", "nobody"][..]),
+        ("FLEETRING_AS", &[("FLEETRING_AS", "nobody")][..], &[][..]),
+    ] {
+        let output = fleetringd(&tls_dir, env, &with(&query, flags)).await?;
+        assert!(!output.status.success(), "{what} nobody should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for needle in [
+            "fleetringd: no client identity for principal 'nobody'",
+            nobody_cert.to_str().ok_or("a non-UTF-8 path")?,
+            nobody_key.to_str().ok_or("a non-UTF-8 path")?,
+            "hint: create it with `fleetringd cert client nobody --dir",
+        ] {
+            assert!(stderr.contains(needle), "{what}: {needle} not in {stderr}");
+        }
+    }
+
+    // `--as` without a directory says what it needs.
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            .env_remove("FLEETRING_TLS_DIR")
+            .env_remove("FLEETRING_AS")
+            .args(["status", "--control", "127.0.0.1:1", "--as", "reader"])
+            .output()
+    })
+    .await??;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--as reader needs FLEETRING_TLS_DIR to find client.reader.crt"),
+        "{stderr}"
     );
 
     node.run_until(async {}).await;

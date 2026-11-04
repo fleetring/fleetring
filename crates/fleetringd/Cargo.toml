@@ -15,7 +15,7 @@ authors.workspace = true
 arc-swap.workspace = true
 base64 = "0.22"
 blake3.workspace = true
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 fleetring = { path = "../fleetring", features = ["serde"] }
 fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
 fleetring-proto = { version = "0.0.0", path = "../fleetring-proto" }

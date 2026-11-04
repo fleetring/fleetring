@@ -26,7 +26,8 @@
 //!
 //! A database whose transfer can't start, because no follower is live or the control plane
 //! refuses it, is reported as stuck and keeps serving: its lease expires and fails over the slow
-//! way once the node stops. Safety never depends on any of this: the transfer is the promotion
+//! way once the node stops. A database with no other replica at all is stuck too, and says so:
+//! it is unavailable until this node returns. Safety never depends on any of this: the transfer is the promotion
 //! protocol with a chosen candidate, and the quorum rules of ADR-0018 hold throughout.
 
 use std::num::NonZeroUsize;
@@ -89,6 +90,8 @@ impl DrainReport {
 enum Stuck {
     #[error("not serving the database")]
     NotServing,
+    #[error("no other replica; the database is unavailable until this node returns")]
+    NoOtherReplica,
     #[error("no live follower is connected")]
     NoFollower,
     #[error("the control plane refused the transfer: {0}")]
@@ -150,7 +153,16 @@ pub(crate) async fn drain(node: &DataNode, settings: DrainSettings) -> DrainRepo
                 report.moved.push((database, to));
             }
             Err(stuck) => {
-                tracing::warn!(database = %database, %stuck, "can't hand the lease over; it will fail over once this node stops");
+                match stuck {
+                    // There is nothing to fail over to, so the database stays down until this
+                    // node, or a replica added meanwhile, serves it again.
+                    Stuck::NoOtherReplica => {
+                        tracing::warn!(database = %database, "no other replica; the database is unavailable until this node returns");
+                    }
+                    _ => {
+                        tracing::warn!(database = %database, %stuck, "can't hand the lease over; it will fail over once this node stops");
+                    }
+                }
                 report.stuck.push((database, stuck.to_string()));
             }
         }
@@ -169,6 +181,15 @@ async fn transfer(
     settings: DrainSettings,
 ) -> Result<Option<NodeId>, Stuck> {
     let replication = node.replication();
+    // A database whose replica set holds no other node has nowhere to go. Say so before the
+    // node refuses its requests for a hand-over that can't happen.
+    if replication
+        .replica_set(database, lease.replication_factor)
+        .iter()
+        .all(|replica| replica == node.id())
+    {
+        return Err(Stuck::NoOtherReplica);
+    }
     // 1. Stop taking writes. The guard lifts the refusal when the hand-over is over, whether the
     //    lease is gone by then or the database is stuck and keeps serving.
     let _refusing = node.refuse_requests(database);

@@ -328,9 +328,16 @@ mod binary {
                 .any(|line| line.contains("draining: handing leases over")),
             "{rest:?}"
         );
+        // With one replica there is no failover to promise: the log says the database is
+        // unavailable until the node returns.
+        assert!(
+            rest.iter().any(|line| line
+                .contains("no other replica; the database is unavailable until this node returns")),
+            "{rest:?}"
+        );
         assert!(
             rest.iter()
-                .any(|line| line.contains("can't hand the lease over")),
+                .all(|line| !line.contains("it will fail over once this node stops")),
             "{rest:?}"
         );
         assert!(

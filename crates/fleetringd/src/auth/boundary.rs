@@ -197,6 +197,17 @@ impl Authorizer {
     /// `PERMISSION_DENIED` for a token on a node's connection, or one naming another principal
     /// than the client certificate unless that principal forwards tokens.
     pub fn resolve(&self, peer: &Peer, token: Option<&BearerToken>) -> Result<Caller, Status> {
+        self.resolve_identified(peer, token)
+            .map_err(|refused| refused.status)
+    }
+
+    /// Resolves as [`resolve`](Self::resolve) does, and names the token in a refusal when it
+    /// verified far enough to have an ID, for the audit line.
+    fn resolve_identified(
+        &self,
+        peer: &Peer,
+        token: Option<&BearerToken>,
+    ) -> Result<Caller, Refused> {
         let Some(token) = token else {
             return Ok(match peer {
                 Peer::Node(id) => Caller::Node(id.clone()),
@@ -217,7 +228,8 @@ impl Authorizer {
             Peer::Node(_) => {
                 return Err(Status::permission_denied(
                     "a node's connection carries no bearer token",
-                ));
+                )
+                .into());
             }
             Peer::Principal(name) => Some(name),
             _ => None,
@@ -225,13 +237,17 @@ impl Authorizer {
         let Some(identity) = &self.inner.identity else {
             return Err(Status::unauthenticated(
                 "bearer tokens need a TLS connection to verify against",
-            ));
+            )
+            .into());
         };
         let verifier = identity.token_verifier();
         let now = self.inner.clock.now();
         let verified = self
-            .with_revocations(|revoked| verifier.verify(token, now, revoked))?
-            .map_err(|error| Status::unauthenticated(error.to_string()))?;
+            .with_revocations(|revoked| verifier.verify_identified(token, now, revoked))?
+            .map_err(|refusal| Refused {
+                status: Status::unauthenticated(refusal.clone().into_error().to_string()),
+                token: refusal.token().cloned(),
+            })?;
         if let Some(name) = certificate
             && *name != verified.grant.principal
         {
@@ -241,9 +257,12 @@ impl Authorizer {
                 .get(name)
                 .is_some_and(|entry| entry.forward_tokens == TokenForwarding::Allowed);
             if !forwards {
-                return Err(Status::permission_denied(
-                    "the token names another principal than the client certificate",
-                ));
+                return Err(Refused {
+                    status: Status::permission_denied(
+                        "the token names another principal than the client certificate",
+                    ),
+                    token: Some(verified.grant.id),
+                });
             }
         }
         Ok(Caller::Principal {
@@ -289,20 +308,25 @@ impl Authorizer {
             }
             None => Peer::Plaintext,
         };
-        let resolved =
-            bearer_token(request.headers()).and_then(|token| self.resolve(&peer, token.as_ref()));
+        let resolved = match bearer_token(request.headers()) {
+            Ok(token) => self.resolve_identified(&peer, token.as_ref()),
+            Err(status) => Err(status.into()),
+        };
         let caller = match resolved {
             Ok(caller) => caller,
-            Err(status) => {
+            Err(Refused { status, token }) => {
                 let principal = match &peer {
                     Peer::Node(id) => format!("node:{id}"),
                     Peer::Principal(name) => name.to_string(),
                     _ => "anonymous".to_owned(),
                 };
+                // The ID is there whenever the token verified far enough to have one.
+                let credential =
+                    token.map_or_else(|| "token".to_owned(), |id| format!("token:{id}"));
                 tracing::warn!(
                     target: AUDIT,
                     principal,
-                    credential = "token",
+                    credential,
                     action = action_of(rpc),
                     database = None::<&str>,
                     rpc = rpc.method(),
@@ -325,6 +349,22 @@ impl Authorizer {
                 authorized.check(None)?;
                 Ok(authorized)
             }
+        }
+    }
+}
+
+/// Why a request's credentials were refused, and which token it carried if the token verified far
+/// enough to have an ID. The ID is for the audit line; the client only sees the status.
+struct Refused {
+    status: Status,
+    token: Option<TokenId>,
+}
+
+impl From<Status> for Refused {
+    fn from(status: Status) -> Self {
+        Self {
+            status,
+            token: None,
         }
     }
 }
@@ -1032,5 +1072,142 @@ mod tests {
         let mut stream = cert.guard(Box::pin(ReceiverStream::new(receiver)));
         items.send(Ok(9_u32)).await.expect("sent");
         assert_eq!(stream.next().await.map(|item| item.ok()), Some(Some(9)));
+    }
+    /// Collects the audit lines a test logs.
+    #[derive(Clone, Default)]
+    struct AuditLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AuditLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log isn't poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl AuditLog {
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.0.lock().expect("the log isn't poisoned").clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Admits a call to `Join` as `app`, carrying `bearer`, and returns the audit lines logged
+    /// and whether it was admitted.
+    fn admit_with(auth: &Authorizer, bearer: &BearerToken) -> (Vec<String>, bool) {
+        let log = AuditLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let mut request = http::Request::builder()
+            .uri("/fleetring.v1.Control/Join")
+            .header(AUTHORIZATION, format!("Bearer {}", bearer.expose()))
+            .body(())
+            .expect("a request");
+        request.extensions_mut().insert(principal("app"));
+        let admitted =
+            tracing::subscriber::with_default(subscriber, || auth.admit(&request).is_ok());
+        (log.lines(), admitted)
+    }
+
+    #[test]
+    fn a_refused_tokens_audit_line_names_it_once_it_verified() {
+        let fixture = fixture();
+        let denylist = fresh();
+        let auth = authorizer_at(
+            &fixture,
+            &[],
+            SimClock::new(Timestamp::from_millis(1_000)),
+            denylist.clone(),
+        );
+        let credential = |lines: &[String]| -> String {
+            let refusal = lines
+                .iter()
+                .find(|line| line.contains("refused a token"))
+                .unwrap_or_else(|| panic!("no refusal in {lines:?}"));
+            refusal
+                .split_whitespace()
+                .find(|word| word.starts_with("credential="))
+                .unwrap_or_else(|| panic!("no credential in {refusal}"))
+                .to_owned()
+        };
+
+        // A revoked token, as `token revoke --token-id` leaves it.
+        let bearer = token(&fixture.signer, "app", &["read:x"], "t1");
+        denylist.replace(
+            [(Revoked::Token("t1".parse().expect("id")), Timestamp::MAX)]
+                .into_iter()
+                .collect(),
+        );
+        let (lines, admitted) = admit_with(&auth, &bearer);
+        assert!(!admitted);
+        assert_eq!(credential(&lines), "credential=\"token:t1\"", "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("the token is revoked")),
+            "{lines:?}"
+        );
+
+        // So is a token whose signing key is revoked.
+        denylist.replace(
+            [(
+                Revoked::Key(fixture.signer.key_id().clone()),
+                Timestamp::MAX,
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let other = token(&fixture.signer, "app", &["read:x"], "t2");
+        let (lines, _) = admit_with(&auth, &other);
+        assert_eq!(credential(&lines), "credential=\"token:t2\"", "{lines:?}");
+
+        // And an expired one.
+        denylist.replace(Revocations::new());
+        let late = authorizer_at(
+            &fixture,
+            &[],
+            SimClock::new(Timestamp::from_millis(3_600_000)),
+            fresh(),
+        );
+        let (lines, _) = admit_with(&late, &bearer);
+        assert_eq!(credential(&lines), "credential=\"token:t1\"", "{lines:?}");
+
+        // A token that never verified has no ID to name, and a forged ID isn't believed.
+        let tampered = BearerToken::new(format!("{}x", bearer.expose()));
+        let (lines, _) = admit_with(&auth, &tampered);
+        assert_eq!(credential(&lines), "credential=\"token\"", "{lines:?}");
+        let foreign = Authority::create(
+            "test".parse().expect("a fleet"),
+            Validity::new(Timestamp::ZERO, std::time::Duration::from_secs(3600)),
+        )
+        .expect("another authority");
+        let forged = token(
+            &foreign.token_signer().expect("a signer"),
+            "app",
+            &["admin:*"],
+            "t9",
+        );
+        let (lines, _) = admit_with(&auth, &forged);
+        assert_eq!(credential(&lines), "credential=\"token\"", "{lines:?}");
     }
 }

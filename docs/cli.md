@@ -179,14 +179,14 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | `noun verb` structure | Yes: `db create`, `node drain`, `cert init`, `token issue`, `lease watch`. | Done (FR-062) |
 | Names from the lexicon | Yes: `--fleet`, the `fleet` scope, and "fleet" in help and logs. | Done (FR-059, FR-062) |
 | One flag, one kind of value | Yes: `--node` takes a node ID in `db list`, `status`, `lease watch`, `db exec`, and `db query`; `--address` takes `host:port`; `cert node --addresses` takes the addresses a node is dialed at. | Done (FR-062) |
-| Precedence: flag, env, context, default | Flag, then `FLEETRING_TLS_DIR` and `FLEETRING_TOKEN`, then nothing; `--ca`, `--cert`, `--key` have no environment variables. | FR-055, FR-056 |
+| Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key` (`FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`); `--token` has `FLEETRING_TOKEN`. No context step. | FR-056 |
 | Contexts | None; every command takes `--control` or `--config`, and TLS flags. | FR-056 |
 | `--json` / `-o` with stable fields | None; human output only. | FR-056 |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
 | Quiet when piped | Commands print no progress or colour; logs are warnings only. No `--quiet`. | FR-056 |
 | `NO_COLOR` | Results have no colour. Log lines on stderr use ANSI colour, honour `NO_COLOR`, but don't check for a terminal. | FR-056 |
 | Errors with the next step | `fleetringd: <error>` with `caused by:` lines; some say what to pass (`pass --control or --config`). One `hint:` line so far, when `--node` is given an address. | FR-056 |
-| Confirmation and `--yes` | `db drop` asks on a terminal and refuses elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask. | FR-055, FR-056 |
+| Confirmation and `--yes` | `db drop` asks on a terminal and refuses elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask; the draining node logs `no other replica; the database is unavailable until this node returns` for a database that has none (FR-055). | FR-056 |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | FR-056 |
 | Completions and man pages | None. | FR-056 |
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. No `-` for stdin. | FR-056 |
