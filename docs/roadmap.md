@@ -1,13 +1,13 @@
 # Roadmap to "safe to use"
 
-The placement crate `fleetring` is released (0.1.0) and its placement is frozen by spec. The daemon `fleetringd` has three releases, and 0.3.0 is the latest. 0.1.0 runs fleets on machines you own, with replication and failover verified in simulation; 0.2.0 adds mutual TLS, scopes and tokens, drain, change streams, and signed releases; 0.3.0 adds archives with point-in-time restore and the fleet vocabulary. It is still **not yet safe to depend on**: `SECURITY.md` and the READMEs say so. This page lists what has to be true before that changes, as epics. Each epic links its tickets. Status lives in [GitHub Issues](https://github.com/fleetring/fleetring/issues); `docs/tickets/README.md` archives the tickets finished before the move, and `docs/plans/` holds the implementation plans.
+The placement crate `fleetring` is released (0.1.0) and its placement is frozen by spec. The daemon `fleetringd` has four releases, and 0.4.0 is the latest. 0.1.0 runs fleets on machines you own, with replication and failover verified in simulation; 0.2.0 adds mutual TLS, scopes and tokens, drain, change streams, and signed releases; 0.3.0 adds archives with point-in-time restore and the fleet vocabulary; 0.4.0 adds metrics and health checks, verified upgrades, and a tested rolling upgrade. It is still **not yet safe to depend on**: `SECURITY.md` and the READMEs say so. This page lists what has to be true before that changes, as epics. Each epic links its tickets. Status lives in [GitHub Issues](https://github.com/fleetring/fleetring/issues); `docs/tickets/README.md` archives the tickets finished before the move, and `docs/plans/` holds the implementation plans.
 
 "Safe to use" means, concretely:
 
 1. **No known way to lose an acknowledged write**, shown by the history checker (FR-036) on every simulation run, nightly sweeps over random seeds, and a fault-injection run on real processes. *Progress: the checker and the nightly sweep are in place; fault injection on real processes (FR-065) is not started.*
 2. **Secure by default across machines:** TLS between nodes, an authenticated data plane, and a written threat model. *Progress: done in 0.2.0, except the external review (criterion 6).*
-3. **Recoverable:** backups with point-in-time restore, and a tested rolling upgrade from the previous release. *Progress: backups and restore done in 0.3.0; the tested rolling upgrade (FR-054) is done.*
-4. **Operable:** metrics, health checks, documented limits and tuning, and a drain for planned maintenance. *Progress: the drain is done in 0.2.0; metrics, health and readiness (FR-063) are done; limits and tuning are not written yet.*
+3. **Recoverable:** backups with point-in-time restore, and a tested rolling upgrade from the previous release. *Progress: backups and restore done in 0.3.0; the tested rolling upgrade (FR-054) done in 0.4.0.*
+4. **Operable:** metrics, health checks, documented limits and tuning, and a drain for planned maintenance. *Progress: the drain is done in 0.2.0; metrics, health and readiness (FR-063) done in 0.4.0; limits and tuning are not written yet.*
 5. **No single point of failure** in the control plane, or the single-node behaviour documented and bounded. *Progress: not started (FR-064).*
 6. **Reviewed:** the protocol and the auth design reviewed by someone outside the project. *Progress: not started.*
 
@@ -25,7 +25,7 @@ Every simulation run checked against the guarantees each database promises, and 
 - FR-038: drain a node's primaries before it leaves on a planned stop (done in 0.2.0).
 - [FR-049](https://github.com/fleetring/fleetring/issues/52) backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029; [plan](plans/FR-049-s3-durability-sink.md)). Archives write verifiable segments and base snapshots to S3 or a directory; `db restore` builds a new database from one, and `archive restore` a plain SQLite file with no fleet (done in 0.3.0).
 - Control log compaction and bounded control snapshot retention, in FR-064 (E5).
-- [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request ([ADR-0034](adr/0034-metrics-health-and-logs.md), accepted; [plan](plans/FR-063-metrics-health-readiness.md)). The admin listener serves `/metrics`, `/healthz`, and `/readyz`, loopback by default and TLS with listed scrapers elsewhere; every request runs in an `rpc` span with a request ID that travels on the calls it causes (done).
+- [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request ([ADR-0034](adr/0034-metrics-health-and-logs.md), accepted; [plan](plans/FR-063-metrics-health-readiness.md)). The admin listener serves `/metrics`, `/healthz`, and `/readyz`, loopback by default and TLS with listed scrapers elsewhere; every request runs in an `rpc` span with a request ID that travels on the calls it causes (done in 0.4.0).
 
 ### E3. Security
 - FR-046 mutual TLS between nodes and clients, with a built-in certificate authority (`fleetringd cert`), certificates reloaded without a restart (ADR-0025; done in 0.2.0).
@@ -63,7 +63,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - An operator guide: configuration reference, tuning (leases, heartbeat intervals, checkpoint thresholds, open-database caps), limits, and what each failure looks like.
 - An `examples/` directory for the daemon: a multi-tenant API, an agent with its own database, a change-stream consumer.
 - A changelog for the daemon, and a compatibility policy for the config file, the protocol, and the on-disk formats (rolling upgrades N to N+1 tested in CI).
-- [FR-054](https://github.com/fleetring/fleetring/issues/57): `fleetringd upgrade`, a cosign-verified self-upgrade with rollback and a restart in place; the version compatibility policy (two adjacent release lines, members report their software, new control commands gated as fleet features; ADR-0038); and a nightly rolling upgrade from the previous release ([plan](plans/FR-054-upgrade.md); done).
+- [FR-054](https://github.com/fleetring/fleetring/issues/57): `fleetringd upgrade`, a cosign-verified self-upgrade with rollback and a restart in place; the version compatibility policy (two adjacent release lines, members report their software, new control commands gated as fleet features; ADR-0038); and a nightly rolling upgrade from the previous release ([plan](plans/FR-054-upgrade.md); done in 0.4.0).
 
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
