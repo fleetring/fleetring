@@ -1,0 +1,69 @@
+# The rolling upgrade from the previous release to `main` (FR-054, ADR-0038): a three-node fleet
+# on the previous release's verified binaries moves to the current build one node at a time under
+# writes, and the history check finds no lost acknowledged write. Nightly, and by hand as part of
+# a release's pre-flight (RELEASING.md); never on pull requests.
+name: Rolling upgrade
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "The release to upgrade from, such as 0.3.0; the newest final release if empty"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rolling:
+    name: rolling upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The test downloads the previous release with the current build's `fleetringd upgrade`,
+      # which verifies it with cosign, as an operator's upgrade does.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - id: baseline
+        name: pick the release to upgrade from
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.inputs.baseline }}
+        run: |
+          baseline="$REQUESTED"
+          if [ -z "$baseline" ]; then
+            baseline=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+              --exclude-pre-releases --limit 100 --json tagName \
+              --jq '[.[].tagName | select(startswith("fleetringd-v"))][0] // ""')
+            baseline="${baseline#fleetringd-v}"
+          fi
+          # 0.3.0 is the first release a rolling upgrade starts from: 0.2 to 0.3 renamed the
+          # fleet scope, so it isn't a rolling upgrade (ADR-0038).
+          case "$baseline" in
+            "" | 0.0.* | 0.1.* | 0.2.*)
+              echo "::notice::no release at or after 0.3.0 to upgrade from (found '$baseline')"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "upgrading from fleetringd $baseline"
+              echo "version=$baseline" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+      - name: rolling upgrade
+        if: steps.baseline.outputs.version != ''
+        env:
+          FLEETRINGD_BASELINE_VERSION: ${{ steps.baseline.outputs.version }}
+        run: |
+          cargo test -p fleetringd --test upgrade -- --ignored --nocapture \
+            rolling::a_fleet_rolls_from_the_previous_release_to_this_build_under_writes
