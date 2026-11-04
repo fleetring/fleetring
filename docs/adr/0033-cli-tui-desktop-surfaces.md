@@ -1,6 +1,6 @@
 # ADR-0033: The CLI, a TUI, and a desktop app are separate surfaces over one client crate
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-03
 - **Related:** ADR-0015 (crate layout), ADR-0019 (gRPC), ADR-0025 and ADR-0026 (principals and scopes), ADR-0032 (fleet); tickets FR-042, FR-055, FR-056, FR-057, FR-058; [lexicon](../lexicon.md), [CLI style guide](../cli.md)
 

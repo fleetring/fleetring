@@ -1,6 +1,6 @@
 # ADR-0036: Faults are injected into real daemons by an in-repo harness: five `fleetringd` processes in Docker, judged by the history checker
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-03
 - **Related:** ADR-0009 (toolchain and CI), ADR-0014 (OS test matrix), ADR-0018 (leases, epochs, quorums), ADR-0020 (simulation), ADR-0022 (failover), ADR-0025 (principals and scopes); tickets FR-036, FR-065
 

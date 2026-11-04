@@ -1,6 +1,6 @@
 # ADR-0034: Metrics, health, and readiness on a separate admin listener, with bounded labels and a span per request
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-03
 - **Related:** ADR-0013 (async boundaries), ADR-0015 (daemon layout), ADR-0020 (simulation), ADR-0025 and ADR-0026 (principals, scopes, enforcement), ADR-0033 (surfaces); tickets FR-063
 

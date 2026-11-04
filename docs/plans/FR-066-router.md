@@ -772,6 +772,15 @@ See Documentation below; also this ticket's Progress and ADR-0037's status once 
 - `SECURITY.md`: the router as an actor (what a compromised router can do: what its callers' unexpired tokens allow; it holds tokens in memory only and never logs them; it has no denylist, so revocation is enforced by nodes within ADR-0026's bound).
 - The FR-061 issue (#63): replace "the router, which has no ticket yet" with FR-066 (#69).
 
+## Owner decisions (2026-11-03)
+
+The open questions this plan raised were decided as recommended:
+
+- The protocol minor version: whichever of FR-064 and FR-066 lands first takes 1.1, the other 1.2.
+- Interactive transactions stay in v1, with a 30 s timeout and at most 64 waiting writes per database.
+- If `@libsql/client` drops the URL path, document the host form for that client rather than add a header form.
+- No denylist on the router in v1; data nodes stay the authoritative token check.
+
 ## Open risks
 
 - **Client behaviour this plan can't verify from here.** That `@libsql/client` keeps a URL's path when it has a trailing slash, accepts results without `rows_read`/`rows_written`, sends blobs with a given padding, and reports a JSON error body; and which `libsql` crate version builds without C. Step 11's suites pin each; a mismatch is fixed in the router, not the clients. If `@libsql/client` drops the path regardless, the host form is the documented way for it.
