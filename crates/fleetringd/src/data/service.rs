@@ -41,11 +41,19 @@ impl DatabaseService {
         require_database(&request, &name)?;
         let request = request.into_inner();
         let statement = statement(request.sql, request.params)?;
-        let lease = self.node.route(&name).await?;
-        let stored = self
+        let admitted = self.node.route(&name).await?;
+        let lease = admitted.lease();
+        let published = self
             .node
             .registry()
-            .execute(&name, Transaction::from(statement))
+            .commit(&name, Transaction::from(statement))
+            .await
+            .map_err(|error| database_status(&error))?;
+        // The write is in the database's log now, so a drain may step down: it ships the tail,
+        // this write included, before it does.
+        drop(admitted);
+        let stored = published
+            .stored()
             .await
             .map_err(|error| database_status(&error))?;
         // A write that committed no batch has nothing new to replicate: report how many replicas
@@ -72,7 +80,7 @@ impl DatabaseService {
         require_database(&request, &name)?;
         let request = request.into_inner();
         let statement = statement(request.sql, request.params)?;
-        self.node.route(&name).await?;
+        let _admitted = self.node.route(&name).await?;
         let rows = self
             .node
             .registry()

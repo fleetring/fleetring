@@ -206,6 +206,41 @@ pub struct Stored {
     pub acknowledged: Option<Acknowledged>,
 }
 
+/// A write transaction that has run, and whose batch, if it committed one, replication has
+/// taken: it is part of the database's log, and only its acknowledgement is outstanding.
+pub(crate) struct Published {
+    executed: Executed,
+    acknowledgement: Option<Acknowledgement>,
+}
+
+impl Published {
+    /// Waits for replication to acknowledge the batch, if the transaction committed one.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Replication`] if replication couldn't store the batch; the write
+    /// committed locally.
+    pub(crate) async fn stored(self) -> Result<Stored, DatabaseError> {
+        let acknowledged = match self.acknowledgement {
+            Some(acknowledgement) => Some(acknowledgement.wait().await?),
+            None => None,
+        };
+        Ok(Stored {
+            rows_affected: self.executed.rows_affected,
+            acknowledged,
+        })
+    }
+}
+
+impl fmt::Debug for Published {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Published")
+            .field("executed", &self.executed)
+            .field("replicated", &self.acknowledgement.is_some())
+            .finish()
+    }
+}
+
 /// A cheap, cloneable handle to an open database's actor.
 ///
 /// A handle stops working when its database closes, after an idle timeout or an eviction:
@@ -432,16 +467,25 @@ impl DatabaseHandle {
         permit: mpsc::Permit<'_, Request>,
         transaction: Transaction,
     ) -> Result<Stored, DatabaseError> {
+        self.commit_reserved(permit, transaction)
+            .await?
+            .stored()
+            .await
+    }
+
+    /// Runs `transaction` and returns once its batch, if it committed one, is in replication's
+    /// hands, without waiting for the acknowledgement.
+    pub(crate) async fn commit_reserved(
+        &self,
+        permit: mpsc::Permit<'_, Request>,
+        transaction: Transaction,
+    ) -> Result<Published, DatabaseError> {
         let (reply, result) = oneshot::channel();
         permit.send(Request::Execute(transaction, reply));
         let (executed, acknowledgement) = self.await_reply(result).await?;
-        let acknowledged = match acknowledgement {
-            Some(acknowledgement) => Some(acknowledgement.wait().await?),
-            None => None,
-        };
-        Ok(Stored {
-            rows_affected: executed.rows_affected,
-            acknowledged,
+        Ok(Published {
+            executed,
+            acknowledgement,
         })
     }
 

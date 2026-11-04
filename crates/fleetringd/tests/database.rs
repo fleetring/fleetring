@@ -2043,6 +2043,77 @@ async fn draining_a_node_moves_its_primaries_while_a_client_keeps_writing() -> T
     Ok(())
 }
 
+/// A write the primary admitted before a drain began, and that is still running when the drain
+/// would step down, completes: the drain waits for it to reach replication and ships it with the
+/// tail. Stepping down under it would leave its batch with no primary to publish to, and fail it
+/// as `ABORTED`, "may or may not have taken effect", though the hand-over was planned.
+///
+/// The write is held in the primary's engine by the test, not by timing: another connection
+/// holds the database's SQLite write lock, so the write waits on it (rusqlite's five-second busy
+/// timeout) until the test lets go, well after the drain began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_running_when_a_drain_begins_completes() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(dir.path()).await?;
+    let client = fleet.client()?;
+    let database = name("held")?;
+    let location = client.create_database(&database, three()?).await?;
+    client
+        .execute(&database, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    let primary = location.primary.ok_or("no primary")?;
+
+    let lock = rusqlite::Connection::open(database_file(dir.path(), primary.as_str(), "held"))?;
+    lock.execute_batch("BEGIN IMMEDIATE")?;
+    let writer = {
+        let client = fleet.client()?;
+        let database = database.clone();
+        tokio::spawn(async move {
+            client
+                .execute(&database, Statement::new("INSERT INTO t VALUES (1)"))
+                .await
+        })
+    };
+    // The write reaches the engine and waits for the lock; then the drain begins, and without
+    // waiting for the write would have handed the lease over and stepped down by the time the
+    // lock is let go.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.drain_node(&primary).await?;
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    lock.execute_batch("ROLLBACK")?;
+    drop(lock);
+
+    let written = tokio::time::timeout(HANG_GUARD, writer).await??;
+    match &written {
+        Ok(written) => assert_eq!(written.rows_affected, 1),
+        // A write that reached the primary only once the drain refused writes is refused before
+        // it runs, which is safe to retry; it never ends as "may or may not have taken effect".
+        Err(status) => assert_eq!(status.code(), Code::Unavailable, "{status:?}"),
+    }
+    wait_until("the lease has moved", async || {
+        client.locate(&database).await.is_ok_and(|location| {
+            location.epoch.get() == 2
+                && location
+                    .primary
+                    .as_ref()
+                    .is_some_and(|primary_now| *primary_now != primary)
+        })
+    })
+    .await?;
+    if written.is_ok() {
+        let rows = client
+            .query(&database, Statement::new("SELECT count(*) FROM t"))
+            .await?;
+        assert_eq!(
+            rows.rows.first().and_then(|row| row.first()),
+            Some(&Value::Integer(1)),
+            "the acknowledged write is on the new primary"
+        );
+    }
+    fleet.stop().await;
+    Ok(())
+}
+
 /// The next event on `updates`, failing instead of hanging.
 async fn next_lease_event(updates: &mut LeaseUpdates) -> Result<LeaseEvent, Box<dyn Error>> {
     match tokio::time::timeout(HANG_GUARD, updates.next()).await?? {
