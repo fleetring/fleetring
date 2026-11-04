@@ -38,6 +38,7 @@
 
 mod format;
 mod keys;
+mod s3;
 mod store;
 
 use std::fmt;
@@ -47,6 +48,7 @@ pub use self::format::{
     decode_segment, encode_descriptor, encode_segment,
 };
 pub use self::keys::{ArchiveKeys, SegmentName, SnapshotObject};
+pub use self::s3::{CredentialSource, HttpPolicy, PathStyle, S3ConfigError, S3Settings, S3Store};
 pub use self::store::{
     DirectoryStore, FaultyStore, MemoryStore, ObjectEntry, ObjectStore, StoreError, StoreFuture,
 };
@@ -58,6 +60,12 @@ const _: () = {
     assert_debug_send_sync::<FaultyStore>();
     assert_debug_send_sync::<FormatError>();
     assert_debug_send_sync::<MemoryStore>();
+    assert_debug_send_sync::<CredentialSource>();
+    assert_debug_send_sync::<HttpPolicy>();
+    assert_debug_send_sync::<PathStyle>();
+    assert_debug_send_sync::<S3ConfigError>();
+    assert_debug_send_sync::<S3Settings>();
+    assert_debug_send_sync::<S3Store>();
     assert_debug_send_sync::<ObjectEntry>();
     assert_debug_send_sync::<SegmentHeader>();
     assert_debug_send_sync::<SegmentName>();
