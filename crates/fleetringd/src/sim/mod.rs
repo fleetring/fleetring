@@ -75,7 +75,9 @@ mod workload;
 
 pub use check::{ControlLog, Invariant, ReplicaChains, ReplicaRows, Violation};
 pub use fault::{Fault, LossRate};
-pub use fleet::{Fleet, FleetBuilder, PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher};
+pub use fleet::{
+    Fleet, FleetBuilder, PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher, written_values,
+};
 pub use history::{DurabilityMode, Guarantee, Replicated};
 pub use rng::SimRng;
 pub use trace::{DRIVER, Divergence, Event, EventKind, Replay, Trace};

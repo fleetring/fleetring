@@ -8,6 +8,7 @@ use tokio::sync::watch;
 
 use crate::clock::SimClock;
 use crate::control::ControlHandle;
+use crate::durability::ObjectStore;
 use crate::replication::Replication;
 use crate::sim::seeds::millis;
 use crate::sim::trace::{Event, EventKind, Trace};
@@ -35,6 +36,9 @@ pub(super) struct Inner {
     pub(super) running: BTreeMap<String, Running>,
     pub(super) stops: BTreeMap<String, watch::Sender<u64>>,
     pub(super) workloads: BTreeMap<String, WorkloadState>,
+    /// The object stores every data host's archives write to, by archive name: outside the
+    /// simulated network, shared by every host, and surviving every crash (ADR-0029, point 16).
+    pub(super) object_stores: BTreeMap<String, Arc<dyn ObjectStore>>,
 }
 
 /// What a running host exposes.
@@ -91,8 +95,12 @@ pub(super) async fn run_host(
         .ok_or_else(|| format!("no stop signal for {name}"))?;
     let elapsed = turmoil::sim_elapsed().unwrap_or_default();
     let clock = SimClock::new(Timestamp::from_millis(millis(elapsed)));
-    let environment = Environment::simulated(clock)
+    let mut environment = Environment::simulated(clock)
         .with_network(Network::simulated().with_security(Security::Tls(identity)));
+    let stores = shared.lock().object_stores.clone();
+    for (archive, store) in stores {
+        environment = environment.with_object_store(archive, store);
+    }
     let daemon = Daemon::start_with(config, environment).await?;
     let membership = daemon.membership();
     shared.lock().running.insert(
