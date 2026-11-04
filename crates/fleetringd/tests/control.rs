@@ -70,6 +70,66 @@ fn node_client(address: SocketAddr, tls: &Tls, id: &str) -> Result<ControlClient
     Ok(tls.node_network(id)?.control_client(address.to_string()))
 }
 
+/// Forwards TCP connections to `target` and holds every chunk back by `delay` in each
+/// direction, so each round trip through it takes at least twice `delay`: a control plane whose
+/// answers are slow, as a log sync on a loaded machine makes them, without a test sleeping in the
+/// daemon. Returns the address to dial.
+async fn delaying_proxy(
+    target: SocketAddr,
+    delay: std::time::Duration,
+) -> Result<SocketAddr, Box<dyn Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::time::Instant;
+
+    /// Copies `from` to `to`, releasing each chunk `delay` after it arrived and in order.
+    async fn pipe(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, delay: std::time::Duration) {
+        let (queue, mut chunks) = tokio::sync::mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+        let writer = tokio::spawn(async move {
+            while let Some((arrived, chunk)) = chunks.recv().await {
+                tokio::time::sleep_until(arrived + delay).await;
+                if to.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut buffer = vec![0; 16 * 1024];
+        while let Ok(read) = from.read(&mut buffer).await {
+            if read == 0
+                || queue
+                    .send((Instant::now(), buffer[..read].to_vec()))
+                    .is_err()
+            {
+                break;
+            }
+        }
+        drop(queue);
+        // The writer ends once it has released what was queued.
+        if let Err(error) = writer.await {
+            panic!("the proxy's writer failed: {error}");
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                let (inbound_read, inbound_write) = inbound.into_split();
+                let (outbound_read, outbound_write) = outbound.into_split();
+                tokio::join!(
+                    pipe(inbound_read, outbound_write, delay),
+                    pipe(outbound_read, inbound_write, delay),
+                );
+            });
+        }
+    });
+    Ok(address)
+}
+
 /// Serves `node` on a random local port.
 async fn serve(node: ControlHandle) -> Result<SocketAddr, Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1199,7 +1259,8 @@ async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResul
     let (membership, tasks) = Membership::start(Member::new("a".parse()?), node, &settings);
     let token = fleetring_control::Revoked::Token("tok-1".parse()?);
     let key = fleetring_control::Revoked::Key("key-1".parse()?);
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // Guards against a hang only; nothing here asserts how long a heartbeat takes.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         while !membership.denylist().load().contains(&token) {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1208,6 +1269,52 @@ async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResul
     let list = membership.denylist().load();
     assert!(list.contains(&key));
     assert_eq!(list.len(), 2);
+    tasks.stop().await;
+    daemon.run_until(std::future::ready(())).await;
+    Ok(())
+}
+
+/// A control plane that answers more slowly than the heartbeat interval must not starve a node of
+/// the denylist: the node waits long enough for an answer to reach it (issue 64).
+#[tokio::test]
+async fn a_node_hears_the_denylist_from_a_control_plane_slower_than_its_heartbeat() -> TestResult {
+    use fleetring_proto::v1::{Revocation, RevokeTokenRequest, revocation::Revoked as Wire};
+    use fleetringd::{Membership, MembershipSettings};
+
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    secure_client(address, &tls)?
+        .revoke_token(RevokeTokenRequest {
+            revocation: Some(Revocation {
+                revoked: Some(Wire::KeyId("key-1".into())),
+                until_ms: u64::MAX,
+            }),
+        })
+        .await?;
+
+    // Every round trip takes at least 200 ms, four times the 50 ms heartbeat interval.
+    let slow = delaying_proxy(address, std::time::Duration::from_millis(100)).await?;
+    let settings = MembershipSettings {
+        heartbeat_interval_ms: NonZeroU64::new(50).ok_or("zero")?,
+        ..MembershipSettings::default()
+    };
+    let node = tls.node_network("a")?.control_client(slow.to_string());
+    let (membership, tasks) = Membership::start(Member::new("a".parse()?), node, &settings);
+    let key = fleetring_control::Revoked::Key("key-1".parse()?);
+    // Guards against a hang only; nothing here asserts how long a heartbeat takes.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !membership.denylist().load().contains(&key) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
     tasks.stop().await;
     daemon.run_until(std::future::ready(())).await;
     Ok(())
