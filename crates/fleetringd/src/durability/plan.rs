@@ -8,6 +8,11 @@
 //! of the target, the next candidate is tried, and then the plan is refused, naming the
 //! furthest position the archive reaches.
 //!
+//! The latest point is the furthest a walk reaches. A segment past it that the snapshot's
+//! segments don't lead to, through any epoch, is a gap, and the plan is refused; one they do
+//! lead to is a superseded epoch's, as while an old and a new primary's segments from one
+//! position overlap, and isn't.
+//!
 //! A time target selects only which acknowledged prefix to restore, by each segment's
 //! `archived_at_ms`: the walk stops before the first segment archived after the target. Clocks
 //! never decide what the copy holds beyond that; every byte is still verified against the chain.
@@ -21,7 +26,8 @@ use crate::engine::Position;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RestoreTarget {
-    /// The furthest point the archive holds.
+    /// The furthest point a walk of the archive's segments reaches, preferring the newest
+    /// epoch.
     Latest,
     /// Exactly the log up to a position, which must be a transaction boundary.
     Position(Position),
@@ -97,17 +103,22 @@ pub fn plan(listing: &Listing, target: &RestoreTarget) -> Result<RestorePlan, Pl
             .min()
             .flatten(),
     };
-    let (goal, by_time) = match target {
-        RestoreTarget::Latest => (listing.latest().0, None),
-        RestoreTarget::Position(position) => (Some(position.clone()), None),
-        RestoreTarget::Time(ms) => (None, Some(*ms)),
+    let goal = match target {
+        RestoreTarget::Latest => Goal::Latest,
+        RestoreTarget::Position(position) => Goal::Position(position),
+        RestoreTarget::Time(ms) => Goal::Time(*ms),
+    };
+    let by_time = match goal {
+        Goal::Time(ms) => Some(ms),
+        _ => None,
     };
     let mut candidates: Vec<&SnapshotEntry> = listing
         .snapshots
         .iter()
-        .filter(|snapshot| match by_time {
-            Some(ms) => snapshot.descriptor.taken_at_ms <= ms,
-            None => snapshot.position <= goal,
+        .filter(|snapshot| match goal {
+            Goal::Time(ms) => snapshot.descriptor.taken_at_ms <= ms,
+            Goal::Position(position) => snapshot.position.as_ref() <= Some(position),
+            Goal::Latest => true,
         })
         .collect();
     if candidates.is_empty() {
@@ -126,7 +137,7 @@ pub fn plan(listing: &Listing, target: &RestoreTarget) -> Result<RestorePlan, Pl
     }
     let mut furthest: Option<Option<Position>> = None;
     for snapshot in candidates {
-        let walk = walk(listing, snapshot, goal.as_ref(), by_time);
+        let walk = walk(listing, snapshot, goal);
         if walk.reached {
             return Ok(RestorePlan {
                 snapshot: snapshot.clone(),
@@ -144,6 +155,17 @@ pub fn plan(listing: &Listing, target: &RestoreTarget) -> Result<RestorePlan, Pl
     })
 }
 
+/// Where a walk heads.
+#[derive(Debug, Clone, Copy)]
+enum Goal<'a> {
+    /// As far as segments lead.
+    Latest,
+    /// To a position, cutting the last segment back to it.
+    Position(&'a Position),
+    /// Up to the last segment archived by a time.
+    Time(u64),
+}
+
 /// Where a walk from one snapshot got.
 struct Walk {
     segments: Vec<SegmentEntry>,
@@ -152,18 +174,14 @@ struct Walk {
     reached: bool,
 }
 
-/// Walks segments from `snapshot` towards `goal`, a position, or towards the last segment
-/// archived by `by_time`.
-fn walk(
-    listing: &Listing,
-    snapshot: &SnapshotEntry,
-    goal: Option<&Position>,
-    by_time: Option<u64>,
-) -> Walk {
+/// Walks segments from `snapshot` towards `goal`.
+fn walk(listing: &Listing, snapshot: &SnapshotEntry, goal: Goal<'_>) -> Walk {
     let mut segments = Vec::new();
     let mut position = snapshot.position.clone();
     loop {
-        if by_time.is_none() && position.as_ref() >= goal {
+        if let Goal::Position(goal) = goal
+            && position.as_ref() >= Some(goal)
+        {
             return Walk {
                 segments,
                 position,
@@ -185,13 +203,24 @@ fn walk(
                 ))
             });
         let Some(next) = next else {
-            // No segment continues the copy. A time target is reached here only if nothing
-            // archived by then lies beyond: otherwise a segment is missing.
-            let reached = by_time.is_some_and(|ms| {
-                !listing.segments.iter().any(|segment| {
-                    segment.name.archived_at_ms <= ms && Some(&segment.name.end) > position.as_ref()
-                })
-            });
+            // No segment continues the copy. The latest point or a time is reached here unless a
+            // segment (archived by the time) lies beyond that the snapshot's segments don't lead
+            // to: then one is missing. One they lead to through another epoch was superseded.
+            let reached = match goal {
+                Goal::Position(_) => false,
+                Goal::Latest | Goal::Time(_) => {
+                    let leads = listing.reachable_from([snapshot.position.clone()]);
+                    !listing.segments.iter().any(|segment| {
+                        let counted = match goal {
+                            Goal::Time(ms) => segment.name.archived_at_ms <= ms,
+                            _ => true,
+                        };
+                        counted
+                            && Some(&segment.name.end) > position.as_ref()
+                            && !leads.contains(&segment.name.start)
+                    })
+                }
+            };
             return Walk {
                 segments,
                 position,
@@ -199,7 +228,9 @@ fn walk(
                 reached,
             };
         };
-        if by_time.is_some_and(|ms| next.name.archived_at_ms > ms) {
+        if let Goal::Time(ms) = goal
+            && next.name.archived_at_ms > ms
+        {
             return Walk {
                 segments,
                 position,
@@ -209,8 +240,7 @@ fn walk(
         }
         position = Some(next.name.end.clone());
         segments.push(next.clone());
-        if let Some(goal) = goal
-            && by_time.is_none()
+        if let Goal::Position(goal) = goal
             && position.as_ref() > Some(goal)
         {
             return Walk {
@@ -369,6 +399,36 @@ mod tests {
             plan.segments[1..]
                 .iter()
                 .all(|s| s.name.epoch == LeaseEpoch::new(2))
+        );
+    }
+
+    #[test]
+    fn latest_is_where_the_newest_epoch_reaches_while_two_epochs_overlap() {
+        // The old primary archived 3..7; the new one resumed from its mark at 3 and has so far
+        // archived only to 5.
+        let archive = listing(
+            vec![snapshot(1, 1, 100)],
+            vec![
+                segment(1, 3, 1, 200),
+                segment(3, 7, 1, 300),
+                segment(3, 5, 2, 310),
+            ],
+        );
+        let plan = plan(&archive, &RestoreTarget::Latest).expect("a plan");
+        assert_eq!(spans(&plan), [(1, 3), (3, 5)]);
+        assert_eq!(plan.position, Some(at(5)));
+        let by_time = super::plan(&archive, &RestoreTarget::Time(1_000)).expect("a plan");
+        assert_eq!(by_time.position, Some(at(5)));
+        // A segment past that no epoch's segments lead to is still a gap.
+        let mut gapped = archive.clone();
+        gapped.segments.push(segment(8, 9, 2, 400));
+        let unreachable = Err(PlanError::Unreachable {
+            furthest: Some(at(5)),
+        });
+        assert_eq!(super::plan(&gapped, &RestoreTarget::Latest), unreachable);
+        assert_eq!(
+            super::plan(&gapped, &RestoreTarget::Time(1_000)),
+            unreachable
         );
     }
 
