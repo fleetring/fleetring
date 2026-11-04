@@ -109,9 +109,13 @@ pub(super) struct Inner {
     leases: Mutex<BTreeMap<DatabaseName, HeldLease>>,
     /// The databases this node has started serving and still waits for the followers of, each
     /// with the number of starts waiting.
-    settling: watch::Sender<BTreeMap<DatabaseName, usize>>,
-    /// The databases whose requests are refused while their leases are handed over.
+    settling: Counts,
+    /// The databases whose requests are refused while their leases are handed over. A request is
+    /// admitted, and counted in `admitted`, under this lock, so that none slips in between.
     refusing: Mutex<BTreeSet<DatabaseName>>,
+    /// The requests admitted for each database that haven't put their writes in replication's
+    /// hands yet ([`Admitted`]); a drain waits for them before it steps down.
+    admitted: Counts,
     /// Held while a drain runs, so that two never hand the same lease over.
     pub(super) draining: tokio::sync::Mutex<()>,
     /// One permit: held while this node builds a restored or verified copy on its disk.
@@ -134,34 +138,56 @@ impl Drop for Refusing<'_> {
     }
 }
 
-/// Counts one start of `name` as settling until it is dropped, even if the start is cancelled.
-struct Settling<'node> {
-    node: &'node DataNode,
+/// How many of something are under way per database; a database with none has no entry.
+type Counts = watch::Sender<BTreeMap<DatabaseName, usize>>;
+
+/// Counts one of something under way for `name` in `counts` until it is dropped, even if it is
+/// cancelled.
+#[derive(Debug)]
+struct Counted<'node> {
+    counts: &'node Counts,
     name: DatabaseName,
 }
 
-impl<'node> Settling<'node> {
-    fn begin(node: &'node DataNode, name: &DatabaseName) -> Self {
-        node.inner.settling.send_modify(|settling| {
-            *settling.entry(name.clone()).or_default() += 1;
+impl<'node> Counted<'node> {
+    fn begin(counts: &'node Counts, name: &DatabaseName) -> Self {
+        counts.send_modify(|counts| {
+            *counts.entry(name.clone()).or_default() += 1;
         });
         Self {
-            node,
+            counts,
             name: name.clone(),
         }
     }
 }
 
-impl Drop for Settling<'_> {
+impl Drop for Counted<'_> {
     fn drop(&mut self) {
-        self.node.inner.settling.send_modify(|settling| {
-            if let Some(count) = settling.get_mut(&self.name) {
+        self.counts.send_modify(|counts| {
+            if let Some(count) = counts.get_mut(&self.name) {
                 *count -= 1;
                 if *count == 0 {
-                    settling.remove(&self.name);
+                    counts.remove(&self.name);
                 }
             }
         });
+    }
+}
+
+/// A request [`DataNode::route`] admitted on a database this node is primary for. A drain that
+/// starts while it lives waits for it to be dropped before it steps down, so that its write
+/// isn't cut off between its commit and replication: drop it once the write is in
+/// replication's hands ([`Registry::commit`]), or the request has ended.
+#[derive(Debug)]
+pub(crate) struct Admitted<'node> {
+    lease: HeldLease,
+    _counted: Counted<'node>,
+}
+
+impl Admitted<'_> {
+    /// The lease the request is served under.
+    pub(crate) fn lease(&self) -> HeldLease {
+        self.lease
     }
 }
 
@@ -190,6 +216,7 @@ impl DataNode {
                 leases: Mutex::new(BTreeMap::new()),
                 settling: watch::Sender::new(BTreeMap::new()),
                 refusing: Mutex::new(BTreeSet::new()),
+                admitted: watch::Sender::new(BTreeMap::new()),
                 draining: tokio::sync::Mutex::new(()),
                 staging: tokio::sync::Semaphore::new(1),
                 creating: NameLocks::default(),
@@ -330,7 +357,8 @@ impl DataNode {
         &self.inner.id
     }
 
-    /// Returns the lease this node holds on `name`, so the caller may serve it locally.
+    /// Admits a request for `name` if this node holds its lease, so the caller may serve it
+    /// locally while the returned guard lives.
     ///
     /// # Errors
     ///
@@ -338,15 +366,11 @@ impl DataNode {
     /// node does yet; `UNAVAILABLE` if the control plane can't be reached, the primary has no
     /// known address, or this node is handing the lease over; and the control plane's status
     /// otherwise, such as `NOT_FOUND`.
-    pub(crate) async fn route(&self, name: &DatabaseName) -> Result<HeldLease, Status> {
+    pub(crate) async fn route(&self, name: &DatabaseName) -> Result<Admitted<'_>, Status> {
         if let Some(lease) = self.held(name) {
-            if self.refusing().contains(name) {
-                return Err(Status::unavailable(format!(
-                    "database {name} is moving to a new primary; retry"
-                )));
-            }
+            let admitted = self.admit(name, lease)?;
             self.await_settled(name).await;
-            return Ok(lease);
+            return Ok(admitted);
         }
         let placement = self.locate(name).await?;
         match placement.primary.as_deref() {
@@ -356,11 +380,40 @@ impl DataNode {
                     .open(name)
                     .await
                     .map_err(|error| missing_file(name, &error))?;
-                self.serve(name, &placement).await
+                let lease = self.serve(name, &placement).await?;
+                self.admit(name, lease)
             }
             Some(primary) => Err(redirect(name, &placement, primary)),
             None => Err(no_primary(name, &placement)),
         }
+    }
+
+    /// Admits a request for `name` under `lease`, unless the lease is being handed over. The
+    /// refusal is checked and the request counted under one lock, so a drain that refuses
+    /// requests afterwards sees every request admitted before it.
+    fn admit(&self, name: &DatabaseName, lease: HeldLease) -> Result<Admitted<'_>, Status> {
+        let refusing = self.refusing();
+        if refusing.contains(name) {
+            return Err(Status::unavailable(format!(
+                "database {name} is moving to a new primary; retry"
+            )));
+        }
+        let counted = Counted::begin(&self.inner.admitted, name);
+        drop(refusing);
+        Ok(Admitted {
+            lease,
+            _counted: counted,
+        })
+    }
+
+    /// Waits until every request admitted for `name` has put its write in replication's hands or
+    /// ended, or `limit` passes. Returns whether they all did. Called once requests are refused
+    /// ([`DataNode::refuse_requests`]), so that no new one is admitted meanwhile.
+    pub(super) async fn await_admitted(&self, name: &DatabaseName, limit: Duration) -> bool {
+        let mut admitted = self.inner.admitted.subscribe();
+        let done = admitted.wait_for(|admitted| !admitted.contains_key(name));
+        // The sender lives as long as the node.
+        matches!(tokio::time::timeout(limit, done).await, Ok(Ok(_)))
     }
 
     /// Makes this node `name`'s primary, if the control plane has created the database and not
@@ -542,7 +595,7 @@ impl DataNode {
                 }
             }
         }
-        let _settling = Settling::begin(self, name);
+        let _settling = Counted::begin(&self.inner.settling, name);
         self.leases().insert(name.clone(), lease);
         self.await_replicas(name).await;
         Ok(())

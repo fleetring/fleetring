@@ -8,7 +8,9 @@ use std::{io, mem};
 use fleetring_control::DatabaseName;
 use tokio::sync::{oneshot, watch};
 
-use crate::actor::{self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Stored};
+use crate::actor::{
+    self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Published, Stored,
+};
 use crate::changes::CaptureRules;
 use crate::engine::{
     DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Statement, Transaction,
@@ -161,10 +163,25 @@ impl Registry {
         name: &DatabaseName,
         transaction: Transaction,
     ) -> Result<Stored, DatabaseError> {
+        self.commit(name, transaction).await?.stored().await
+    }
+
+    /// Runs `transaction` on an existing database, opening it if needed, and returns once its
+    /// batch, if it committed one, is in replication's hands; [`Published::stored`] waits for
+    /// the acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Self::execute), but for the acknowledgement.
+    pub(crate) async fn commit(
+        &self,
+        name: &DatabaseName,
+        transaction: Transaction,
+    ) -> Result<Published, DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
-                return handle.execute_reserved(permit, transaction).await;
+                return handle.commit_reserved(permit, transaction).await;
             }
         }
     }

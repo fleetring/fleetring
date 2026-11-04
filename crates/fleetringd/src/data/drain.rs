@@ -6,7 +6,9 @@
 //!
 //! 1. **Stop taking writes.** Requests for the database answer `UNAVAILABLE` until the lease is
 //!    gone; from then on they are redirected to the new primary as any request to a non-primary
-//!    is. Writes already accepted finish.
+//!    is. Writes already admitted finish: the drain waits, within the hand-over bound, until each
+//!    has committed and put its batch in replication's hands, so the tail shipped next includes
+//!    it, and none commits after the step down, when its batch could only fail as uncertain.
 //! 2. **Pick the target:** under `quorum` and `all`, the connected, live follower that has
 //!    acknowledged the most, preferring the earliest in the ring's preference order on ties,
 //!    since every follower holds the current epoch's log. Under `local` (ADR-0023) a follower may
@@ -52,8 +54,10 @@ pub(crate) struct DrainSettings {
     /// How long to wait for the target to acknowledge the tail before the transfer is asked for
     /// anyway; the candidate fetches what it lacks during the promotion.
     pub(crate) catch_up: Duration,
-    /// How long one hand-over may take from the transfer to the new primary serving, and how
-    /// long the control plane gets to answer a call.
+    /// How long one hand-over may take from the transfer to the new primary serving, how long
+    /// the control plane gets to answer a call, and how long the writes admitted before the
+    /// hand-over get to reach replication before the node steps down anyway. The daemon sets it
+    /// to `ack_timeout`, which also bounds how long an admitted write waits for its followers.
     pub(crate) handover: Duration,
 }
 
@@ -197,8 +201,13 @@ async fn transfer(
         return Err(Stuck::NoOtherReplica);
     }
     // 1. Stop taking writes. The guard lifts the refusal when the hand-over is over, whether the
-    //    lease is gone by then or the database is stuck and keeps serving.
+    //    lease is gone by then or the database is stuck and keeps serving. Then let the writes
+    //    already admitted reach replication, so that the tail includes them and none commits
+    //    after the step down, when it could only fail as uncertain.
     let _refusing = node.refuse_requests(database);
+    if !node.await_admitted(database, settings.handover).await {
+        tracing::warn!(database = %database, limit = ?settings.handover, "writes admitted before the hand-over are still running; stepping down anyway");
+    }
 
     // 2. Pick the target and ship it the tail. A `local` database's followers may hold logs from
     //    different epochs, which only the control plane can rank, so it chooses; the tail is
