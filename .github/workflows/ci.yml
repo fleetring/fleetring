@@ -76,6 +76,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # On Windows runners the default temp directory is on C:, where an fsync takes 20-70 ms and
+      # stalls for seconds every few minutes; the workspace disk takes about 0.3 ms. The
+      # replication tests fsync every write, so they keep their files on the workspace disk (#54).
+      - name: temp directory on the workspace disk
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: all features
         if: runner.os == 'Linux'
         run: cargo test --workspace --all-features --no-fail-fast
