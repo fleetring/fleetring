@@ -610,6 +610,9 @@ message ChangeSinkStatus {
   uint64 resets = 7;
   // The last delivery failure's reason; empty if none.
   string last_error = 8;
+  // Set when the sink's position is kept in the database and replicates with it (FR-041); unset
+  // when it is kept on this node only, or by a node that predates the field.
+  bool replicated = 9;
 }
 
 message Value {

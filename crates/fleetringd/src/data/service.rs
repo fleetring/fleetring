@@ -10,6 +10,7 @@ use fleetring_proto::v1::{
 use tonic::{Request, Response, Status};
 
 use crate::auth::{Action, authorized, require_database};
+use crate::changes::MarkHome;
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::DataNode;
@@ -172,6 +173,7 @@ impl Database for DatabaseService {
                 failures: status.failures,
                 resets: status.resets,
                 last_error: status.last_error.unwrap_or_default(),
+                replicated: status.home == Some(MarkHome::Replicated),
             })
             .collect();
         Ok(Response::new(NodeStatusResponse {

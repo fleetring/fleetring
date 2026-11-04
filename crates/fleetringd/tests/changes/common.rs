@@ -17,7 +17,9 @@ use fleetringd::changes::{
 };
 use fleetringd::clock::SystemClock;
 use fleetringd::engine::{
-    CaptureMode, EngineConfig, Execution, SqliteEngine, Statement, Transaction,
+    CaptureMode, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot, EngineCapability,
+    EngineConfig, EngineError, EngineKind, Executed, Execution, LogicalChanges, LogicalSupport,
+    OpenMode, Rows, SqliteEngine, Statement, Transaction,
 };
 use fleetringd::replication::{
     EpochHolders, PrimaryRole, Replication, ReplicationParts, ReplicationSettings,
@@ -108,6 +110,16 @@ impl Harness {
         sinks: Vec<ConfiguredSink>,
         mode: CaptureMode,
     ) -> Result<Node, Box<dyn Error>> {
+        self.node_on(sqlite(), sinks, mode).await
+    }
+
+    /// As [`node_capturing`](Self::node_capturing), on `engine`.
+    pub(crate) async fn node_on(
+        &self,
+        engine: impl DatabaseEngine + Clone,
+        sinks: Vec<ConfiguredSink>,
+        mode: CaptureMode,
+    ) -> Result<Node, Box<dyn Error>> {
         let control_address = self.control.control_address().ok_or("no control address")?;
         let id: NodeId = "node".parse()?;
         let network = self.tls.node_network("node")?;
@@ -120,7 +132,7 @@ impl Harness {
             },
         );
         let root = self.root();
-        let replication = start_replication(id, &root, membership.clone(), network, mode);
+        let replication = start_replication(id, &root, engine, membership.clone(), network, mode);
         let streams = ChangeStreams::start(ChangeParts {
             sinks,
             replication: replication.clone(),
@@ -203,6 +215,7 @@ impl Node {
 fn start_replication(
     node: NodeId,
     root: &Path,
+    engine: impl DatabaseEngine + Clone,
     membership: Membership,
     network: Network,
     mode: CaptureMode,
@@ -214,7 +227,6 @@ fn start_replication(
         ..EngineConfig::default()
     };
     let databases = root.join("databases");
-    let engine = SqliteEngine::new(PAGE_SIZE).expect("valid page size");
     let registry_engine = engine.clone();
     Replication::start(
         ReplicationParts {
@@ -237,6 +249,69 @@ fn start_replication(
                 .with_recorded_changes(CaptureRules::every(every_database(), mode))
         },
     )
+}
+
+/// The SQLite engine the tests run.
+pub(crate) fn sqlite() -> SqliteEngine {
+    SqliteEngine::new(PAGE_SIZE).expect("valid page size")
+}
+
+/// SQLite with the sink marks taken away: every operation is SQLite's except `sink_marks`, which
+/// is `None`, as for an engine that can't keep positions inside its database (ADR-0028).
+#[derive(Debug, Clone)]
+pub(crate) struct NoMarks(SqliteEngine);
+
+impl NoMarks {
+    pub(crate) fn new() -> Self {
+        Self(sqlite())
+    }
+}
+
+impl DatabaseEngine for NoMarks {
+    fn kind(&self) -> EngineKind {
+        self.0.kind()
+    }
+
+    fn capability(&self) -> EngineCapability<'_> {
+        self.0.capability()
+    }
+
+    fn logical_support(&self) -> LogicalSupport {
+        self.0.logical_support()
+    }
+
+    fn open(&self, location: &Path, mode: OpenMode) -> Result<Box<dyn Database>, EngineError> {
+        Ok(Box::new(NoMarksDatabase(self.0.open(location, mode)?)))
+    }
+}
+
+#[derive(Debug)]
+struct NoMarksDatabase(Box<dyn Database>);
+
+impl Database for NoMarksDatabase {
+    fn execute(&mut self, transaction: &Transaction) -> Result<Executed, EngineError> {
+        self.0.execute(transaction)
+    }
+
+    fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError> {
+        self.0.query(statement)
+    }
+
+    fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {
+        self.0.snapshot(destination)
+    }
+
+    fn capability(&mut self) -> DatabaseCapability<'_> {
+        self.0.capability()
+    }
+
+    fn logical_changes(&mut self) -> Option<&mut dyn LogicalChanges> {
+        self.0.logical_changes()
+    }
+
+    fn close(self: Box<Self>) -> Result<(), EngineError> {
+        self.0.close()
+    }
 }
 
 /// Inserts `value` into `t`.

@@ -13,7 +13,7 @@ use fleetring_control::{
 use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
 
-use crate::changes::SinkStatus;
+use crate::changes::{MarkHome, SinkStatus};
 use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
 use crate::engine::{Position, Rows, Statement, Value};
 use crate::replication::{LeaseChange, LeaseEvent};
@@ -251,6 +251,11 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
                 sink: status.sink,
                 database: parse_reply("database name", &status.database)?,
                 position: held(status.position),
+                home: Some(if status.replicated {
+                    MarkHome::Replicated
+                } else {
+                    MarkHome::Local
+                }),
                 acknowledged: held(status.acknowledged),
                 backlog: status.backlog,
                 failures: status.failures,

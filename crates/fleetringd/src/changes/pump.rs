@@ -8,7 +8,7 @@ use tokio::time;
 
 use crate::DatabaseError;
 use crate::changes::position::PositionStore;
-use crate::changes::{Change, ChangeKind, ChangeSettings, ChangeSink, Format};
+use crate::changes::{Change, ChangeKind, ChangeSettings, ChangeSink, Format, MarkHome};
 use crate::engine::{EngineError, Position};
 use crate::replication::Replication;
 
@@ -33,6 +33,8 @@ pub(super) struct PumpContext {
 pub(super) struct PumpState {
     /// The last position delivered and recorded.
     pub(super) position: Option<Position>,
+    /// Where the position is kept, or `None` until the pump has opened its database.
+    pub(super) home: Option<MarkHome>,
     /// The write quorum's position, as of the pump's last look.
     pub(super) acknowledged: Option<Position>,
     /// The batches the primary published since the pump last delivered, as far as it knows.
@@ -66,14 +68,12 @@ enum Delivery {
 pub(super) async fn run(ctx: PumpContext) {
     let sink = ctx.sink.name().to_owned();
     let database = ctx.database.clone();
-    let mut position = match ctx.store.load() {
-        Ok(position) => position,
-        Err(error) => {
-            tracing::warn!(%sink, %database, %error, path = %ctx.store.path().display(), "can't read the sink's position; starting from the log's beginning");
-            None
-        }
-    };
-    lock(&ctx.state).position = position.clone();
+    let (home, mut position) = recorded_position(&ctx).await;
+    {
+        let mut state = lock(&ctx.state);
+        state.position = position.clone();
+        state.home = Some(home);
+    }
     let mut backoff = ctx.settings.retry_initial;
     loop {
         let Some(mut feed) = ctx.replication.primary_feed(&database) else {
@@ -91,11 +91,7 @@ pub(super) async fn run(ctx: PumpContext) {
                 let epoch = feed.epoch();
                 match deliver(&ctx, epoch, position.clone(), until.clone()).await {
                     Ok(Delivery::Delivered) => {
-                        if let Err(error) = ctx.store.save(&until) {
-                            // Delivered but not recorded: the change is delivered again after
-                            // a restart, which at-least-once allows.
-                            tracing::warn!(%sink, %database, %error, "can't record the sink's position");
-                        }
+                        record(&ctx, home, &until).await;
                         position = Some(until.clone());
                         feed.delivered(&sink, position.clone());
                         {
@@ -144,6 +140,60 @@ pub(super) async fn run(ctx: PumpContext) {
             }
             if !feed.is_current() {
                 break;
+            }
+        }
+    }
+}
+
+/// Where the pump's position is kept and what it is: the mark in the database when its engine
+/// keeps marks, which replicates and so outlives the node that recorded it (ADR-0028), else the
+/// node's own file.
+async fn recorded_position(ctx: &PumpContext) -> (MarkHome, Option<Position>) {
+    let sink = ctx.sink.name();
+    let database = &ctx.database;
+    let marks = match ctx.replication.registry().open(database).await {
+        Ok(handle) => handle.sink_marks().await,
+        Err(error) => Err(error),
+    };
+    match marks {
+        Ok(Some(mut marks)) => return (MarkHome::Replicated, marks.remove(sink)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%sink, %database, %error, "can't read the sink's mark; keeping its position on this node");
+        }
+    }
+    let position = match ctx.store.load() {
+        Ok(position) => position,
+        Err(error) => {
+            tracing::warn!(%sink, %database, %error, path = %ctx.store.path().display(), "can't read the sink's position; starting from the log's beginning");
+            None
+        }
+    };
+    (MarkHome::Local, position)
+}
+
+/// Records that the sink has been delivered up to `until`, where its position is kept.
+///
+/// A mark is staged before the pump asks for a release, so that the adapter never prunes past
+/// a mark it hasn't staged. Failing to record is not failing the delivery: the change is
+/// delivered again after a restart or a failover, which at-least-once allows, and the next
+/// delivery records a newer position.
+async fn record(ctx: &PumpContext, home: MarkHome, until: &Position) {
+    let sink = ctx.sink.name();
+    let database = &ctx.database;
+    match home {
+        MarkHome::Local => {
+            if let Err(error) = ctx.store.save(until) {
+                tracing::warn!(%sink, %database, %error, "can't record the sink's position");
+            }
+        }
+        MarkHome::Replicated => {
+            let staged = match ctx.replication.registry().open(database).await {
+                Ok(handle) => handle.stage_sink_mark(sink.to_owned(), until.clone()).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = staged {
+                tracing::debug!(%sink, %database, %error, "can't stage the sink's mark");
             }
         }
     }

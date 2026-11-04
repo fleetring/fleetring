@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fleetring::ReplicationFactor;
 use fleetring_control::Liveness;
-use fleetringd::changes::{Format, SinkKind, database_file};
+use fleetringd::changes::{Format, MarkHome, SinkKind, database_file};
 use fleetringd::data::Client;
 use fleetringd::engine::{CaptureMode, Statement};
 use fleetringd::{Config, ConfigError, Daemon};
@@ -196,9 +196,28 @@ async fn a_configured_file_sink_is_fed_and_reported_in_the_node_status() -> Test
                 && status.sinks[0].database == ledger
                 && status.sinks[0].position.is_some()
                 && status.sinks[0].position == status.sinks[0].acknowledged
+                && status.sinks[0].home == Some(MarkHome::Replicated)
         })
     })
     .await?;
+
+    // The command line says where the position is kept.
+    let tls_dir = tls.dir().to_owned();
+    let command_address = address.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            .env("FLEETRING_TLS_DIR", tls_dir)
+            .args(["status", "--address", &command_address])
+            .output()
+    })
+    .await??;
+    let printed = String::from_utf8(output.stdout)?;
+    assert!(output.status.success(), "{printed}");
+    assert!(
+        printed.contains("archive ledger position=") && printed.contains(") acknowledged="),
+        "{printed}"
+    );
+    assert!(printed.contains("(replicated)"), "{printed}");
     daemon.run_until(std::future::ready(())).await;
     Ok(())
 }
