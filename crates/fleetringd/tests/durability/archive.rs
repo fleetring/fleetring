@@ -10,7 +10,7 @@ use fleetringd::Config;
 use fleetringd::clock::SystemClock;
 use fleetringd::durability::{
     Archive, ArchiveConfig, ArchiveError, ArchiveParts, DirectoryStore, FaultyStore, Listing,
-    MemoryStore, ObjectStore, decode_segment,
+    MemoryStore, ObjectStore, RestoreTarget, decode_segment, plan,
 };
 use fleetringd::engine::{Execution, MemoryEngine};
 use fleetringd::replication::ChainHash;
@@ -181,6 +181,63 @@ async fn a_failing_store_delays_the_archive_but_never_a_write() -> TestResult {
     node.await_archived().await?;
     let listing = Listing::read(&inner, &node.archive.keys(&ledger), &ledger).await?;
     assert_one_path(&listing, node.position(&ledger).await?.as_ref());
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_primary_continues_the_archive_from_the_mark_without_a_snapshot() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let root = dir.path().join("node");
+    let node = Node::start(&root, Arc::new(store.clone()), settings());
+    let ledger = create_ledger(&node).await?;
+    for value in 1..=5 {
+        node.execute(&ledger, insert(value)).await?;
+        node.await_archived().await?;
+    }
+    // One more write records the last delivery's mark in the database.
+    node.execute(&ledger, insert(6)).await?;
+    node.await_archived().await?;
+    node.stop().await;
+
+    // A new primary at the next epoch, with an archive that knows nothing yet: its stream starts
+    // at the mark the database holds, and the archive finds the segment that ends there.
+    let node = Node::start(&root, Arc::new(store.clone()), settings());
+    node.serve(&ledger, 2)?;
+    for value in 7..=10 {
+        node.execute(&ledger, insert(value)).await?;
+    }
+    node.await_archived().await?;
+    let listing = node.listing(&ledger).await?;
+    assert_eq!(
+        listing.snapshots.len(),
+        1,
+        "no new base snapshot: {listing:#?}"
+    );
+    let second = fleetring_control::LeaseEpoch::new(2);
+    let first_of_second = listing
+        .segments
+        .iter()
+        .filter(|segment| segment.name.epoch == second)
+        .min_by(|a, b| a.name.start.cmp(&b.name.start))
+        .ok_or("the new primary archives")?;
+    // It continues where an earlier segment ends: at the mark, repeating what the old primary
+    // archived after it.
+    assert!(
+        listing
+            .segments
+            .iter()
+            .any(|segment| Some(&segment.name.end) == first_of_second.name.start.as_ref()),
+        "{listing:#?}"
+    );
+    // A restore walks through both epochs, preferring the new one where they overlap.
+    let plan = plan(&listing, &RestoreTarget::Latest)?;
+    assert_eq!(plan.position, node.position(&ledger).await?);
+    assert_eq!(
+        plan.segments.last().map(|segment| segment.name.epoch),
+        Some(second)
+    );
     node.stop().await;
     Ok(())
 }
