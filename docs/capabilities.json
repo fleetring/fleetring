@@ -421,11 +421,24 @@
       "component": "fleetringd",
       "area": "operations",
       "title": "fleetringd upgrade and rolling upgrades",
-      "description": "A verified self-upgrade, and a fleet that moves from one release to the next one node at a time without losing an acknowledged write.",
-      "status": "planned",
+      "description": "fleetringd upgrade verifies a release with cosign, swaps the binary with a rollback kept, and restarts the node in place, and a fleet moves one node at a time without losing an acknowledged write.",
+      "status": "built",
+      "since": "0.4.0",
       "ticket": "FR-054",
       "issue": 57,
-      "docs": "https://github.com/fleetring/fleetring/issues/57"
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#upgrading"
+    },
+    {
+      "id": "undrain-and-remove",
+      "component": "fleetringd",
+      "area": "operations",
+      "title": "Undrain and remove members",
+      "description": "fleetringd node undrain clears a drain without a restart, and fleetringd node remove takes out a member that is gone for good, so it no longer holds the fleet back.",
+      "status": "built",
+      "since": "0.4.0",
+      "ticket": "FR-054",
+      "issue": 57,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#upgrading"
     },
     {
       "id": "cli-contexts",

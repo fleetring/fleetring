@@ -1,7 +1,7 @@
 ---
 id: FR-054
 title: "`fleetringd upgrade` and a tested rolling upgrade"
-status: in review
+status: done
 priority: P1
 size: L
 milestone: M7 Durability and operations
