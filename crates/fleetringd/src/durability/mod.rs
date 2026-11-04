@@ -44,7 +44,7 @@ mod listing;
 mod plan;
 mod restore;
 mod retention;
-mod s3;
+pub(crate) mod s3;
 mod store;
 
 use std::fmt;

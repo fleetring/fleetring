@@ -53,6 +53,17 @@ pub(crate) const REPLICATION_DIR: &str = "replication";
 /// The directory, inside the data directory, where change streams keep each sink's positions.
 pub(crate) const CHANGES_DIR: &str = "changes";
 
+/// How a daemon stops: for good, or to restart in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Stop {
+    /// Drains and leaves, or stays, as `[membership] on_shutdown` says.
+    AsConfigured,
+    /// Drains as `on_shutdown` says, but stays a member: the process executes its binary again
+    /// at once, as after `SIGHUP` (ADR-0038, point 8).
+    Restart,
+}
+
 /// A started daemon that holds its data directory.
 #[derive(Debug)]
 pub struct Daemon {
@@ -404,8 +415,19 @@ impl Daemon {
     /// instead of waiting for its heartbeats to stop. A lease that can't be handed over expires
     /// and fails over as usual. One that stays does neither.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
-        shutdown.await;
-        tracing::info!(node = %self.config.node.id, "fleetringd shutting down");
+        self.run_until_stop(async {
+            shutdown.await;
+            Stop::AsConfigured
+        })
+        .await;
+    }
+
+    /// Serves until `stop` completes, then stops as [`Daemon::run_until`] does, or, for
+    /// [`Stop::Restart`], drains as it does but stays a member, since the node comes straight
+    /// back (ADR-0038, point 8).
+    pub async fn run_until_stop(self, stop: impl Future<Output = Stop>) {
+        let stop = stop.await;
+        tracing::info!(node = %self.config.node.id, ?stop, "fleetringd shutting down");
         drop(self.sampler);
         let replication = match self.data {
             Some(data) => {
@@ -415,7 +437,10 @@ impl Daemon {
                     data.node.drain_before_leaving(data.drain).await;
                 }
                 drop(data.keeper);
-                data.tasks.stop().await;
+                match stop {
+                    Stop::Restart => data.tasks.stop_without_leaving().await,
+                    Stop::AsConfigured => data.tasks.stop().await,
+                }
                 // Sinks get what is acknowledged so far; a pump that can't finish continues
                 // from its recorded position next time.
                 data.changes.stop(data.drain.handover).await;

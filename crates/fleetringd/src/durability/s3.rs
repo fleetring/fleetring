@@ -2,7 +2,7 @@
 //! replies without doing I/O, over the daemon's own `hyper` and `rustls` (ADR-0029, point 15).
 
 mod credentials;
-mod http;
+pub(crate) mod http;
 
 use std::fmt;
 use std::path::PathBuf;

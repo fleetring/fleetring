@@ -385,6 +385,13 @@ struct Leave {
 }
 
 impl MembershipTasks {
+    /// Stops as [`MembershipTasks::stop`] does, but stays a member whatever the settings say,
+    /// as a node that restarts in place does.
+    pub async fn stop_without_leaving(mut self) {
+        self.leave.on_shutdown = OnShutdown::Stay;
+        self.stop().await;
+    }
+
     /// Stops sending heartbeats, leaves the fleet unless the settings say to stay, stops
     /// following the membership, and waits for both tasks to end.
     ///
