@@ -1,6 +1,6 @@
 # Roadmap to "safe to use"
 
-The placement crate `fleetring` is released (0.1.0) and its placement is frozen by spec. The daemon `fleetringd` 0.1.0 runs fleets on machines you own, with replication and failover verified in simulation. It is **not yet safe to depend on**: `SECURITY.md` and the READMEs say so. This page lists what has to be true before that changes, as epics. Each epic links its tickets, and the ticket index in `docs/tickets/README.md` is the source of truth for status.
+The placement crate `fleetring` is released (0.1.0) and its placement is frozen by spec. The daemon `fleetringd` 0.1.0 runs fleets on machines you own, with replication and failover verified in simulation. It is **not yet safe to depend on**: `SECURITY.md` and the READMEs say so. This page lists what has to be true before that changes, as epics. Each epic links its tickets. Status lives in [GitHub Issues](https://github.com/fleetring/fleetring/issues) and the [FleetRing roadmap project](https://github.com/orgs/fleetring/projects/3); `docs/tickets/README.md` archives the tickets finished before the move, and `docs/plans/` holds the implementation plans.
 
 "Safe to use" means, concretely:
 
@@ -16,7 +16,7 @@ The placement crate `fleetring` is released (0.1.0) and its placement is frozen 
 ### E1. Correctness, verified
 Every simulation run checked against the guarantees each database promises, and the same checks on real processes.
 - FR-036 history checker (in progress); nightly sweep of 500 seeds, with failing seeds filed as bugs.
-- A Jepsen-style run on real daemons with network and process faults (a `fleetring-jepsen` harness, or Jepsen itself), before the first "safe" release.
+- [FR-065](https://github.com/fleetring/fleetring/issues/68): a Jepsen-style run on real daemons before the first "safe" release. An in-repo harness, `fleetring-chaos`, runs five daemons in containers with partitions, kills, pauses, and clock skew, and judges each run with FR-036's checker, nightly (ADR-0036, proposed; [plan](plans/FR-065-fault-injection-harness.md)).
 - Fuzzing of the daemon's protocol inputs (batches, database snapshots, control RPCs), next to the existing spec fuzzing.
 
 ### E2. Durability and operations
@@ -24,8 +24,8 @@ Every simulation run checked against the guarantees each database promises, and 
 - FR-037 `db list`, `db drop`, per-node status (in progress).
 - FR-038: drain a node's primaries before it leaves on a planned stop.
 - FR-049 backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029).
-- Control log compaction and bounded control snapshot retention.
-- Metrics (Prometheus), health and readiness endpoints, structured logs, and a tracing span per request.
+- Control log compaction and bounded control snapshot retention, in FR-064 (E5).
+- [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request (ADR-0034, proposed; [plan](plans/FR-063-metrics-health-readiness.md)).
 
 ### E3. Security
 - FR-046 mutual TLS between nodes and clients, with a built-in certificate authority (`fleetringd cert`), certificates reloaded without a restart (ADR-0025).
@@ -43,7 +43,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - Benchmarks at 10,000 databases per node and 1,000 nodes in simulation, recorded in `docs/perf.md`.
 
 ### E5. Control plane availability
-- Raft for the control log with openraft, three or five control nodes (ADR-0017 planned it; the command log and replay tests are ready for it).
+- [FR-064](https://github.com/fleetring/fleetring/issues/67): Raft for the control log with openraft, three or five control nodes, with control snapshots, log compaction, and an upgrade from one control node (ADR-0017 planned it; ADR-0035, proposed, decides what it left open; [plan](plans/FR-064-raft-control-plane.md)).
 - Leader redirects already exist in the client; data nodes keep serving through control outages already.
 
 ### E6. Movement
@@ -52,7 +52,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - Engine-changing migrations, such as SQLite to Postgres (ADR-0021), after live migration.
 
 ### E7. Access and integration
-- The router (MVP step 4): the libSQL/Hrana front door, so existing libSQL and Turso clients work unchanged. The enforcement point for auth.
+- [FR-066](https://github.com/fleetring/fleetring/issues/69): the router (MVP step 4), the libSQL/Hrana front door, so existing libSQL and Turso clients work unchanged. The first enforcement point for auth, forwarding each caller's token (ADR-0037, proposed; [plan](plans/FR-066-router.md)). FR-061, the Rails adapter ([#63](https://github.com/fleetring/fleetring/issues/63)), waits for it.
 - The Rust client that embeds the ring and skips the hop.
 - The MCP server for agents (MVP step 6): `memory.write`, `memory.search`, `db.query`, `db.fork`.
 - FR-039 change streams: a sink trait to Kafka, Pub/Sub, webhooks, or analytics stores.
@@ -67,8 +67,8 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
 - Compatibility tests between the previous and current release: mixed-version fleets, old control logs and control snapshots.
-- Chaos on a real three-node fleet in CI (kill, pause, partition with `tc`), once E1's harness exists.
+- Chaos on a real fleet in CI: FR-065's nightly job (kill, pause, partition with `iptables`, clock skew), never on pull requests.
 
 ## Order
 
-E1 and E2's first three tickets are in progress or next. E3 moved ahead of E6 and E7: nothing on the wire is authenticated, node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round. E4 and E5 can start as soon as the ADRs for node-level leases and Raft are written, in parallel with E7. E8 and E9 run alongside everything and gate the "safe" label.
+E1 and E2's first three tickets are in progress or next. E3 moved ahead of E6 and E7: nothing on the wire is authenticated, node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round. E5 (FR-064) can start once ADR-0035 is accepted, and E4 once the ADR for node-level leases is written, in parallel with E7 (FR-066). FR-063 and FR-065 gate the "safe" label and depend on neither. E8 and E9 run alongside everything and gate the "safe" label.
