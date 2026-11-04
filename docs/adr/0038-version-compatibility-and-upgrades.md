@@ -1,0 +1,83 @@
+# ADR-0038: A fleet runs two adjacent release lines at once, gates new control commands as fleet features, and upgrades a node with a verified, atomic binary swap
+
+- **Status:** Accepted (2026-11-04)
+- **Date:** 2026-11-04
+- **Related:** ADR-0017 (control state machine), ADR-0018 (leases, epochs, quorums), ADR-0019 (gRPC transport), ADR-0020 (simulation), ADR-0022 (failover), ADR-0035 (Raft control group); tickets FR-038 (drain), FR-048 (signed releases), FR-054
+
+## Context
+
+Upgrading a node today means re-running `install.sh` and restarting by hand. Nothing checks that the new release can run beside the rest of the fleet, nothing says which releases may mix, and a control command that a new release adds would be applied by a new control node while members that don't know it carry on. The roadmap's "Recoverable" criterion asks for a tested rolling upgrade from the previous release.
+
+Forces:
+
+- **0.3.0 is the baseline.** It is the first release after the clean break of the 0.3.0 renames (ADR-0032, FR-062). 0.2 and 0.3 speak the same bytes on the wire, but the `cluster` scope became `fleet`, so fleet-scoped tokens and `[[principal]]` lists differ between them; FR-062's documented path is to upgrade every node, then reissue fleet-scoped tokens. Moving from 0.2 is therefore not a rolling upgrade, and is out of scope. 0.3.0 nodes send no version in `Join` or `Heartbeat`, so the first rolling upgrade, 0.3.0 to the next release, has to work with members that say nothing about themselves.
+- **One control node applies the log today; a Raft group will (ADR-0035).** Every new `Action` variant is a change to the control log. An older control node can't decode it: after a rollback of the control node today, and on a lagging voter under Raft. `control.db` already carries a format number (1 today, 2 once ADR-0035 lands), which describes the file, not which commands the log may hold.
+- **The binary comes from the network.** `upgrade` replaces the program that holds the fleet's data. Releases are signed keylessly with cosign as one bundle, `SHA256SUMS.sigstore.json`, by the release workflow on a `fleetringd-v` tag (FR-048, `RELEASING.md`); `install.sh` verifies that signature when cosign 2.4.2 or newer is installed, and only warns otherwise.
+- **Safety never depends on the upgrade.** Epochs fence and W + Q > R (ADR-0018). A drain is a promotion with a chosen candidate (FR-038, ADR-0022), so moving a node's primaries off before it restarts costs clients a redirect, not a failover, and is as safe as a failover.
+- **Three ways to run a node:** systemd, the container image (distroless, UID 65532, binary owned by root), and a plain process in a terminal.
+
+Precedents: CockroachDB lets a cluster mix the current and previous major release, gates new behaviour behind a cluster version that is finalized once every node runs the new release, and refuses nodes older than the finalized version. Kafka gates features by version levels that brokers advertise. etcd supports rolling upgrades one minor release at a time and refuses a member two minors apart. Nomad, Consul, and Vault document "upgrade followers, then the leader" with `-version` checks.
+
+## Decision
+
+1. **Versions and the window.** A *release* is a `fleetringd` version, `MAJOR.MINOR.PATCH` with an optional prerelease (`0.4.0-rc.1`). Its *release line* is `MAJOR.MINOR`; a prerelease belongs to its line. **A fleet runs at most two adjacent release lines at once: one line and the one before it, within one major.** Patch releases of a line always mix. Under 1.0 the minor is the unit, as the issue proposes: 0.3 and 0.4 mix, 0.3 and 0.5 don't. An upgrade never skips a line: from 0.3 to 0.5, every member reaches 0.4 first. A downgrade within the window is allowed unless a feature the older release lacks is enabled (point 4).
+
+2. **Every node reports its software.** A new protocol message, `Software { version, protocol, control_format, features }`, rides on `JoinRequest.software` (field 3), on `HeartbeatRequest.software` (field 3), and on each `Member.software` (field 4) of a membership update. `version` is what `fleetringd --version` prints; `protocol` is the highest protocol version the node speaks; `control_format` is the newest `control.db` format it reads (1 in this release, 2 once ADR-0035 lands); `features` names the fleet features (point 4) it can apply and act on. `PROTOCOL_VERSION` moves from 1.0 to 1.1.
+   - **Control state records it** on the member (`Member::software`), so replaying the log restores it. A join whose software differs from the record is an update: the membership epoch grows, as for a changed address, so every watcher sees the new versions.
+   - **Heartbeats correct the record.** A member that joined while the control node was older has no record; the control node fills it from the member's next heartbeat. The control node includes the software in the `Heartbeat` command only when it differs from the record, so the log doesn't grow by a version per heartbeat.
+   - **A member that reports nothing is a 0.3.0 node:** version `0.3.0`, protocol 1.0, control-log format 1, and no features. This is what makes the first rolling upgrade, 0.3.0 to the next release, work: the new control node and the new nodes see the 0.3.0 members as the previous line and accept them, and the 0.3.0 control node ignores the new fields, which are optional in the protocol and in the log's JSON.
+
+3. **What is refused, and with which error.** Each refusal is `FAILED_PRECONDITION` with a message that names both nodes and both versions, and a `hint:` in the CLI where there is a next step.
+   - **A join from another protocol major**, as today (`check_protocol`).
+   - **A join whose release line is outside the window** with any member's, live or down: `Rejection::IncompatibleVersion` (`node 'n4' runs fleetringd 0.5.0, which can't run beside node 'n1' on 0.3.0: a fleet runs at most two adjacent release lines`). A data node whose join is refused keeps retrying and logs the reason, as for any refused join.
+   - **A join from a member that lacks an enabled feature**: `Rejection::MissingFeature`.
+   - **A command that needs a feature some member lacks**: `Rejection::FeatureUnsupported` (point 4).
+   - **Heartbeats are never refused for a version.** A refused heartbeat would make a live node look down and fail its databases over.
+   - **`fleetringd upgrade` refuses before it downloads** a release that would put the fleet outside the window, naming the member that blocks it, and refuses any release whose signature or checksum doesn't verify (points 6 and 7).
+
+4. **New control commands are fleet features, enabled on first use once every member supports them.** `fleetring_control::Feature` lists the commands that not every member can read or act on. A command that needs one (`Action::feature`) is accepted only if the feature is already enabled, or if every member, live or down, reports it; that first accepted command enables it for good in control state (`State::features`). Enabling is part of the command's own transition in `apply`, so it is pure, logged, and replayed like everything else. Otherwise the command is rejected with `FeatureUnsupported`, naming the feature and the first member that lacks it with that member's version, and the state is untouched: a mixed fleet refuses the command instead of applying it on some nodes only.
+   - **The control node screens a command against the gate before it logs it** (`State::check_features`), and doesn't log a refused one. Rejections leave the state untouched, `State::now` included, so an unlogged rejection replays the same; and an older control node, after a rollback, never meets a command it can't decode in a log that never used the feature.
+   - **Once a feature is enabled, members that lack it are refused** (`MissingFeature`), so rolling a node back below the release that introduced it is refused by the fleet, not discovered later. Rolling back is therefore safe until a new command is first used, and the upgrade notes say so.
+   - **The first feature is `undrain`:** `Control.Undrain` and `fleetringd node undrain <node-id>` clear a member's draining mark without a restart, for a drain that turns out not to be needed, such as an upgrade abandoned after its drain. 0.3.0 can't decode it in its log.
+
+5. **`fleetringd upgrade [--version X.Y.Z] [--check] [--no-restart] [--rollback]`.** It finds the newest final release (`fleetringd-vX.Y.Z` tags, prereleases only when `--version` names one) from GitHub's releases API, for the target the running binary was built for, and downloads the archive, `SHA256SUMS`, and `SHA256SUMS.sigstore.json` into a fresh temporary directory. `--base-url` (or `FLEETRINGD_BASE_URL`) reads a mirror laid out as `install.sh`'s `--base-url` expects, and needs `--version`; `FLEETRINGD_RELEASES_URL` points the newest-release lookup at a mirror's copy of the releases list. Only `https://` is fetched, and `http://` only from a loopback address. `--check` reports the newest release, the installed one, and, given `--control` or `--config`, whether the fleet's window allows it, and changes nothing; it exits 1 when a newer release exists that the fleet doesn't allow. Naming the installed version with `--version` reinstalls it.
+
+6. **Verification: cosign, or nothing.**
+   - **The signature first.** `cosign` on `PATH`, at 2.4.2 or newer as `install.sh` requires, runs `cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json --certificate-identity-regexp '^https://github.com/fleetring/fleetring/.github/workflows/release.yml@refs/tags/fleetringd-v' --certificate-oidc-issuer https://token.actions.githubusercontent.com`, the same identity `RELEASING.md` documents. A missing or older cosign is a refusal that says how to install it; there is no flag to skip verification. Unlike `install.sh`, which only warns, `upgrade` replaces a running node's binary without a person looking at it, so it never installs unverified.
+   - **Then the checksum:** the archive's SHA-256 must match its line in the verified `SHA256SUMS`.
+   - **Then the binary:** the one file the archive's `fleetringd-<version>-<target>/` directory holds as `fleetringd` is extracted, and must print `fleetringd <version>` for the version asked for.
+   - **No in-process verification for now.** The `sigstore` crate (0.14, Apache-2.0) describes itself as experimental, declares no MSRV, and its `verify` feature pulls in its Fulcio and Rekor clients: 355 crates in a scratch build, more than this workspace's whole lock file (305), including `aws-lc-sys` (a C and CMake build), `reqwest`, `openidconnect`, `tough`, and `webbrowser`. That is too much code, and too much build tooling, to add to a security-critical path to save installing one binary. Revisit when a verify-only feature without network clients exists.
+
+7. **Atomic replacement, with the previous binary kept.** The new binary is written beside the installed one as a temporary file, made executable, synced, and renamed over it, so the path always holds a whole binary; the installed one is first hard-linked (or copied) to `fleetringd.previous` the same way. `upgrade --rollback` swaps the two, so the upgraded binary becomes `fleetringd.previous` and a second rollback rolls forward. The binary replaced is the one `upgrade` runs as; with `--config`, a running daemon's binary must be that same file. On Windows, `upgrade` checks but doesn't install: download the `.zip`, as `install.sh` says.
+
+8. **Restart in place.** A daemon writes `<data_dir>/fleetringd.process` (its PID, its binary's path, and its version) when it starts, and removes it when it stops. `SIGHUP` restarts it in place: it stops exactly as on `SIGTERM` (drain and leave, or stay, as `[membership] on_shutdown` says), releases the data directory, and executes its binary's path again with the same arguments, keeping its PID. With `--config` naming a running node, and unless `--no-restart`, `upgrade`:
+   1. checks the window against the fleet's members, before downloading;
+   2. downloads, verifies, and swaps the binary;
+   3. drains the node (`Control.Drain`) and waits, bounded, until it is primary for nothing;
+   4. sends `SIGHUP`;
+   5. waits until the control plane lists the member as live on the new version;
+   6. waits until each of the node's replicas has reached the position its primary reported when the node rejoined.
+
+   It works the same under the three supervisors: systemd keeps tracking the same PID, a container's PID 1 stays PID 1, and a plain process stays in its terminal. Where the binary can't be written, as in the container image, the image is the release: upgrade by running the new tag, and give `docker stop` time to drain. A daemon that wrote no process file (0.3.0) can't be restarted in place; `upgrade` drains it, swaps the binary, and says to restart it with its supervisor (`systemctl restart fleetringd`, or stop and start it), which drains it again on the way down.
+
+9. **The rolling-upgrade test runs nightly and before a release, never per pull request.** An ignored integration test starts a three-node fleet on the previous release's binary, writes and reads throughout with one retry per write, upgrades each node in turn with the current build's `upgrade` command, and checks the whole history: every acknowledged write is read back, and every read returned only acknowledged or in-flight writes. The baseline comes from `FLEETRINGD_BASELINE_VERSION`, which the current build's own `upgrade --version <baseline> --no-restart` downloads and verifies with the real cosign into a scratch directory, or from `FLEETRINGD_BASELINE_BIN`, a binary built locally. A scheduled workflow runs it with the newest final release at or after 0.3.0, and `RELEASING.md`'s pre-flight requires a green run. The fast tests of `upgrade` (refusals, swap, rollback, restart) run on every pull request against a local release server and a stand-in `cosign` that checks the arguments it is given, with no network.
+
+## Alternatives considered
+
+- **An explicit "finalize" step**, as CockroachDB's cluster version. It is one more command an operator must remember, and until it runs every new command is refused. Enabling a feature on its first use needs no step and keeps rollback possible for as long as nobody uses the new command.
+- **Gating by control-log format number.** The number ADR-0035 gives `control.db` describes the file, and moves only when the storage changes; tying every new command to it would either bump it per command or bundle unrelated commands. Named features gate each command on its own, and the format stays the storage's.
+- **Refusing a mixed fleet outright.** Simple, but it rules out the rolling upgrade the roadmap asks for.
+- **A wider window,** such as any two lines within a major. Every release would then have to read every older release's log and speak every older protocol minor, and the tests would have to cover each pair.
+- **Verifying in process with the `sigstore` crate.** Point 6.
+- **Installing with only a checksum when cosign is missing,** as `install.sh` does. A checksum downloaded from the same place as the archive proves nothing about who built it.
+- **Restarting through the supervisor** (`systemctl restart`). It ties the command to one supervisor, and has no equivalent for a plain process. Re-executing in place works under all three.
+- **A remote "restart" RPC.** It would make restarting any node a network capability to guard; a signal needs the node's own operating-system user.
+
+## Consequences
+
+- Rolling upgrades are supported from 0.3.0 on, one release line at a time, and the fleet enforces the window rather than the operator remembering it.
+- Every future control command that older members can't read or act on adds a `Feature` variant, reports it in `Software.features`, and is refused until every member supports it. FR-064's group commands are the next users.
+- Rollback is safe until a feature is first used. The README says so, and `--rollback` reports when the fleet will refuse the previous release.
+- `upgrade` needs cosign on the machine; the README says how to install it.
+- `<data_dir>/fleetringd.process` is a new file in the data directory, and `SIGHUP` now restarts a daemon instead of terminating it.
+- A nightly workflow downloads the previous release; per-pull-request CI grows only by the fast `upgrade` tests.
