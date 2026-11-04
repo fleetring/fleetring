@@ -148,6 +148,139 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Database.DescribeArchive` | read on the database, or fleet | — |
 | `Database.VerifyArchive` | admin on the database | — |
 
+## Observability
+
+A running daemon offers three things an operator collects: metrics, health and readiness probes, and logs (ADR-0034).
+
+### The admin listener
+
+Apart from the gRPC port, the daemon serves HTTP/1.1 on `[admin] listen`, `127.0.0.1:7401` by default: `/metrics` in the OpenMetrics text format (`application/openmetrics-text; version=1.0.0`), `/healthz`, and `/readyz`. It answers `GET` and `HEAD` on those three paths, `405` for any other method, and `404` for any other path. `[admin] enabled = false` turns it off; the daemon keeps its metrics either way. It serves at most 64 connections at once and closes any beyond them as soon as it accepts them.
+
+On loopback it serves plaintext, and every endpoint is open to whoever can connect to the machine. Any other address fails validation unless one of two fields says how to expose it:
+
+- **`tls = true`.** The listener presents the node's own `[tls]` certificate, reloaded when its files change, and asks for a client certificate from the fleet's authority without requiring one. `/metrics` then answers only a principal listed in `[admin] scrapers`: `401` without a client certificate, `403` for any other principal or a node's certificate (logged on `fleetringd::audit`). `/healthz` and `/readyz` answer anyone, since a probe must learn whether the node is up. A scraper's certificate grants nothing on the gRPC port unless a `[[principal]]` entry also lists it.
+- **`allow_plaintext = true`.** For a network you control, such as a pod network behind a network policy: every endpoint is open to whoever can connect, and the daemon warns at every start.
+
+Inside a container the default loopback address is reachable only from the container, so set `listen` and one of the two. To let Prometheus scrape over TLS, issue it a client certificate and list it:
+
+```sh
+fleetringd cert client prometheus --dir ./tls
+```
+
+```toml
+[admin]
+listen = "0.0.0.0:7401"
+tls = true
+scrapers = ["prometheus"]
+```
+
+```yaml
+scrape_configs:
+  - job_name: fleetring
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/fleetring/ca.crt
+      cert_file: /etc/prometheus/fleetring/client.prometheus.crt
+      key_file: /etc/prometheus/fleetring/client.prometheus.key
+    static_configs:
+      - targets: ["192.0.2.10:7401", "192.0.2.11:7401"]
+```
+
+The node certificate must name the address Prometheus dials (`cert node --addresses`).
+
+### Health and readiness
+
+`/healthz` answers `200` with `ok` while the process can serve, and `503` with `control writer stopped` once a control node's writer has stopped after a storage failure, the one state only a restart recovers from.
+
+`/readyz` answers `200` when every check of the node's roles passes, and `503` otherwise, with every check in a JSON body: `{"ready": false, "checks": [{"name": "joined", "ok": false, "detail": "not joined to the fleet yet"}, …]}`. Every check reads local state; a probe never waits on another node.
+
+| Check | Role | Passes when | Detail when it fails |
+|---|---|---|---|
+| `joined` | data | the node has joined the fleet | `not joined to the fleet yet` |
+| `ring` | data | it has published a ring | `no ring published yet` |
+| `denylist` | data | its token denylist is no older than the stale bound, so it accepts tokens | `no denylist yet`, or `denylist is <n> ms old; tokens are refused` |
+| `draining` | data | the node isn't draining | `the node is draining` |
+| `control_log` | control | the control log recovered and its writer runs | `the control writer stopped; restart the node` |
+| `leader` | control | a control leader is known; always, until the Raft control group (FR-064) | — |
+
+A draining node answers `503`, so a load balancer stops sending it work while its leases move. In Kubernetes:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 7401 }
+readinessProbe:
+  httpGet: { path: /readyz, port: 7401 }
+```
+
+With `[admin] tls = true`, add `scheme: HTTPS` to both; the kubelet doesn't verify the certificate.
+
+### Metrics
+
+Every family carries the `fleetring_` prefix, lexicon words, and base units in its name (`_seconds`, `_bytes`); counters end in `_total`. Durations are histograms with buckets from 0.5 ms doubling to about 16 s. Families a node's roles never update stay at 0, or have no series; every family is listed from the first scrape. Renaming or removing a family is a breaking change, listed in the release notes.
+
+| Family | Type | Labels | What it says |
+|---|---|---|---|
+| `fleetring_build_info` | gauge | `version`, `protocol` | The daemon's version and protocol version; always 1. |
+| `fleetring_node_info` | gauge | `node_id`, `node_role`, `fleet` | This node's ID, node role, and fleet name; always 1. |
+| `fleetring_rpc_requests_total` | counter | `service`, `method`, `code` | RPCs this node served, by final status code. |
+| `fleetring_rpc_duration_seconds` | histogram | `service`, `method` | Time to serve unary RPCs, from request to final status. |
+| `fleetring_rpc_in_flight` | gauge | `service`, `method` | RPCs being served now, streams included. |
+| `fleetring_auth_refusals_total` | counter | `reason` | Requests refused at the request boundary or by a handler's scope or binding check. |
+| `fleetring_denylist_age_seconds` | gauge | — | Seconds since the token denylist last arrived; +Inf (written `inf`) before the first. |
+| `fleetring_denylist_entries` | gauge | — | Revoked tokens and signing keys on the denylist. |
+| `fleetring_membership_epoch` | gauge | — | The membership epoch this node last published. |
+| `fleetring_heartbeats_total` | counter | `outcome` | Heartbeats sent to the control plane, by outcome. |
+| `fleetring_heartbeat_duration_seconds` | histogram | — | Time from sending a heartbeat to its reply. |
+| `fleetring_members` | gauge | `liveness` | Members of the fleet, by liveness, as control state has them. |
+| `fleetring_members_draining` | gauge | — | Members marked as draining. |
+| `fleetring_databases` | gauge | `replica_role` | Databases this node hosts, by replica role. |
+| `fleetring_databases_open` | gauge | — | Databases this node has open. |
+| `fleetring_databases_under_replicated` | gauge | — | Databases this node is primary for with fewer replicas reachable than the replication factor. |
+| `fleetring_leases_held` | gauge | — | Database leases this node holds. |
+| `fleetring_writes_total` | counter | `outcome` | `Execute` calls, by outcome. |
+| `fleetring_write_duration_seconds` | histogram | — | Time from receiving an acknowledged write to replying, write quorum included. |
+| `fleetring_queries_total` | counter | `outcome` | `Query` calls, by outcome. |
+| `fleetring_query_duration_seconds` | histogram | — | Time to answer a query that succeeded. |
+| `fleetring_replication_batches_sent_total` | counter | — | Batches this node sent to followers. |
+| `fleetring_replication_sent_bytes_total` | counter | — | Batch payload bytes this node sent to followers. |
+| `fleetring_replication_batches_applied_total` | counter | — | Batches this node applied as a follower. |
+| `fleetring_replication_snapshots_sent_total` | counter | — | Database snapshots this node served to followers. |
+| `fleetring_replication_reseeds_total` | counter | — | Followers this node told to re-seed from a database snapshot. |
+| `fleetring_replication_followers` | gauge | `state` | Followers of the databases this node is primary for, by state. |
+| `fleetring_lease_renewals_total` | counter | `outcome` | Lease renewals this node asked for, by outcome. |
+| `fleetring_lease_transfers_total` | counter | `outcome` | Leases this node handed over while draining, by outcome. |
+| `fleetring_promotions_total` | counter | `outcome` | Promotions this node carried out as candidate, by outcome. |
+| `fleetring_promotion_duration_seconds` | histogram | — | Time from a promotion notice to serving as primary. |
+| `fleetring_control_commands_total` | counter | `action`, `outcome` | Control commands logged, by action and whether `apply` accepted them. |
+| `fleetring_control_log_index` | gauge | — | The index of the last logged control command. |
+| `fleetring_control_log_write_duration_seconds` | histogram | — | Time to log one group of control commands, its sync included. |
+| `fleetring_control_mailbox_depth` | gauge | — | Control commands waiting for the writer. |
+| `fleetring_control_snapshot_index` | gauge | — | The log index of the last control snapshot saved; 0 before the first. |
+| `fleetring_control_promotions_in_progress` | gauge | — | Databases with a promotion in progress. |
+| `fleetring_control_databases` | gauge | — | Databases control state records. |
+| `fleetring_control_leader` | gauge | — | 1 if this node is the control plane's leader. |
+| `fleetring_change_deliveries_total` | counter | `sink`, `outcome` | Change stream deliveries, by sink and outcome. |
+| `fleetring_change_resets_total` | counter | `sink` | Times a sink's stream skipped ahead because the log moved past it. |
+| `fleetring_change_backlog_batches` | gauge | `sink` | Batches published but not yet delivered, summed over databases. |
+| `fleetring_change_backlog_batches_max` | gauge | `sink` | The largest backlog of any one database. |
+
+Label values come from closed sets the code fixes, or from the node's own configuration:
+
+- `service`: `control`, `replication`, `database`, or `unknown`; `method`: an RPC of the table above, or `unknown`; `code`: a gRPC status code in lower snake case (`ok`, `not_found`, `permission_denied`, …).
+- `reason`: `scope`, `binding`, `unauthenticated`, `denylist_stale`, `no_requirement`.
+- `outcome`: heartbeats `recorded`, `failed`; writes `acknowledged`, `refused`, `aborted`, `redirected`, `failed`; queries `ok`, `redirected`, `failed`; renewals `renewed`, `refused`, `failed`; transfers `completed`, `failed`; promotions `completed`, `superseded`, `failed`; control commands `applied`, `rejected`; change deliveries `delivered`, `failed`.
+- `action`: a control command's action in snake case (`join`, `heartbeat`, `create_database`, …), or `other`.
+- `state`: `caught_up`, `behind`, `disconnected`, `reseeding`; `replica_role`: `primary`, `follower`; `liveness`: `live`, `down`; `node_role`: `data`, `control`, `both`.
+- `sink`: a `[[changes.sink]]` or `[[archive]]` entry's name.
+
+No label is ever a database name, a principal, a token or key ID, a peer node, an address, or SQL. A node can hold 10,000 databases, and a database's name is tenant data, so per-database questions (which database, which follower, how far one sink is on one database) are answered by `fleetringd status --node <id>`, which scopes protect; spreads over databases are gauges a sampler refreshes every `[admin] sample_interval_ms` (10 s by default), as counts, sums, and maxima.
+
+### Logs and request IDs
+
+Log lines go to stderr, filtered by `RUST_LOG` (`info` for the daemon, `warn` for commands). `--log-format text|json`, then `FLEETRING_LOG_FORMAT`, then the daemon's `[log] format` choose the format; text is the default. JSON is one object per line, with the event's fields, its current span (`span`), and the spans it sits in (`spans`).
+
+Every request runs in an `rpc` span with `service`, `method`, and `request_id`, and with `principal` or `node`, `database`, `code`, and `duration_ms` once they are known; audit lines sit inside it. Credentials are never span fields, but principals and database names are, so treat logs as sensitive (`SECURITY.md`). The request ID is the incoming `x-request-id` when it is 1 to 64 characters of `[A-Za-z0-9._-]`, and otherwise `<node-id>-<16 hex digits>` from a counter. The calls a node makes while serving the request, such as a data node's `AcquireLease` for a `Create`, carry the same `x-request-id`, so `grep` for one ID finds the request's lines on every node it reached. Work handed to another task (replication streams, change stream pumps) gets IDs of its own.
+
 ## Install
 
 - **Release archives** for Linux (glibc 2.36 or newer), macOS, and Windows, on x86_64 and ARM64 (Windows on x86_64 only), are on the [releases page](https://github.com/fleetring/fleetring/releases), with a `SHA256SUMS` file.

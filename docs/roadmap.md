@@ -7,7 +7,7 @@ The placement crate `fleetring` is released (0.1.0) and its placement is frozen 
 1. **No known way to lose an acknowledged write**, shown by the history checker (FR-036) on every simulation run, nightly sweeps over random seeds, and a fault-injection run on real processes. *Progress: the checker and the nightly sweep are in place; fault injection on real processes (FR-065) is not started.*
 2. **Secure by default across machines:** TLS between nodes, an authenticated data plane, and a written threat model. *Progress: done in 0.2.0, except the external review (criterion 6).*
 3. **Recoverable:** backups with point-in-time restore, and a tested rolling upgrade from the previous release. *Progress: backups and restore done in 0.3.0; the rolling upgrade (FR-054) is in progress.*
-4. **Operable:** metrics, health checks, documented limits and tuning, and a drain for planned maintenance. *Progress: the drain is done in 0.2.0; metrics and health (FR-063) are in progress; limits and tuning are not written yet.*
+4. **Operable:** metrics, health checks, documented limits and tuning, and a drain for planned maintenance. *Progress: the drain is done in 0.2.0; metrics, health and readiness (FR-063) are done; limits and tuning are not written yet.*
 5. **No single point of failure** in the control plane, or the single-node behaviour documented and bounded. *Progress: not started (FR-064).*
 6. **Reviewed:** the protocol and the auth design reviewed by someone outside the project. *Progress: not started.*
 
@@ -25,7 +25,7 @@ Every simulation run checked against the guarantees each database promises, and 
 - FR-038: drain a node's primaries before it leaves on a planned stop (done in 0.2.0).
 - [FR-049](https://github.com/fleetring/fleetring/issues/52) backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029; [plan](plans/FR-049-s3-durability-sink.md)). Archives write verifiable segments and base snapshots to S3 or a directory; `db restore` builds a new database from one, and `archive restore` a plain SQLite file with no fleet (done in 0.3.0).
 - Control log compaction and bounded control snapshot retention, in FR-064 (E5).
-- [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request (in progress; ADR-0034, accepted; [plan](plans/FR-063-metrics-health-readiness.md)).
+- [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request ([ADR-0034](adr/0034-metrics-health-and-logs.md), accepted; [plan](plans/FR-063-metrics-health-readiness.md)). The admin listener serves `/metrics`, `/healthz`, and `/readyz`, loopback by default and TLS with listed scrapers elsewhere; every request runs in an `rpc` span with a request ID that travels on the calls it causes (done).
 
 ### E3. Security
 - FR-046 mutual TLS between nodes and clients, with a built-in certificate authority (`fleetringd cert`), certificates reloaded without a restart (ADR-0025; done in 0.2.0).
@@ -71,4 +71,4 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 
 ## Order
 
-E1's history checker, E2's durability, drain, and backups, and E3's authentication are done. FR-063 (metrics and health) and FR-054 (`fleetringd upgrade` and the tested rolling upgrade) are in progress. E3 moved ahead of E6 and E7 because node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round; its external review is still open. E5 (FR-064) can start now that ADR-0035 is accepted, and E4 once the ADR for node-level leases is written, in parallel with E7 (FR-066). FR-063 and FR-065 gate the "safe" label and depend on neither. E8 and E9 run alongside everything and gate the "safe" label.
+E1's history checker, E2's durability, drain, and backups, and E3's authentication are done. FR-063 (metrics and health) is done, and FR-054 (`fleetringd upgrade` and the tested rolling upgrade) is in progress. E3 moved ahead of E6 and E7 because node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round; its external review is still open. E5 (FR-064) can start now that ADR-0035 is accepted, and E4 once the ADR for node-level leases is written, in parallel with E7 (FR-066). FR-063 and FR-065 gate the "safe" label and depend on neither. E8 and E9 run alongside everything and gate the "safe" label.

@@ -188,6 +188,34 @@ id = "node-1"
 # store = "directory"
 # path = "/backups/fleetring"
 
+# [admin]
+# The admin listener (ADR-0034): HTTP/1.1 apart from the gRPC port, serving `/metrics` (OpenMetrics
+# text), `/healthz` (200 while the process can serve), and `/readyz` (200 when the node should get
+# work; 503 with a JSON body naming each failing check, such as `draining`). The daemon README's
+# "Observability" section lists every metric and check.
+#
+# The default address is loopback, which inside a container is reachable only from the container
+# itself. To scrape or probe from outside, set `listen` to a reachable address and either
+#   tls = true              serve HTTPS with this node's [tls] certificate; `/metrics` then needs
+#                           a client certificate whose principal `scrapers` lists (issue one with
+#                           `fleetringd cert client prometheus`), and the probes answer anyone
+#   allow_plaintext = true  serve plaintext to anyone who can connect, for a network you control
+#                           (a pod network behind a network policy); the daemon warns at every start
+# A non-loopback `listen` with neither fails validation.
+#
+# enabled = true                 # false: no admin listener; metrics are still kept
+# listen = "127.0.0.1:7401"
+# tls = false
+# scrapers = ["prometheus"]      # principals whose client certificates may read /metrics over TLS
+# allow_plaintext = false
+# sample_interval_ms = 10000     # how often the gauges over databases and members are refreshed
+
+# [log]
+# How log lines are written to stderr: "text" (the default) or "json", one object per line with
+# the current span; every request's lines carry its `rpc` span and `request_id`. `--log-format`
+# and FLEETRING_LOG_FORMAT override it. `RUST_LOG` sets the level (info by default).
+# format = "text"
+
 # Principals: what each client certificate may do (ADR-0025). Every connection carries a
 # certificate, and a principal (`cert client <name>`) may do only what its scopes allow; one this
 # file doesn't list may do nothing with its certificate alone. Keep the list identical on every

@@ -73,3 +73,11 @@ Precedents: etcd serves `/metrics` and `/health` on `--listen-metrics-urls`, sep
 - `tracing-subscriber` gains its `json` feature, and the daemon gains `prometheus-client` and hyper's server feature; `deny.toml` already allows their licences.
 - The simulation is unaffected: metrics have no effect on behaviour, the admin listener doesn't start, and the harness reads each host's exposition directly.
 - Follow-up decisions: opt-in per-database metrics, OpenTelemetry export, and the gRPC health service, each in its own ticket if asked for.
+
+## Amendment (2026-11-04): details the implementation settled
+
+FR-063's implementation adds these details; the decision above stands.
+
+- **Every family is listed from the first scrape.** `prometheus-client` leaves a labelled family out of the exposition until it has a series, so a node would list some families only after the first event that updates them. The daemon lists every family in the table from the start, with its `HELP` and `TYPE` lines, and creates every series of a closed outcome or reason set, of each configured sink, and of each control action and outcome at zero. The RPC families get a series per RPC as RPCs arrive, since one per RPC and status code would spend most of the series budget on combinations that never happen.
+- **Infinity is written `inf`.** `fleetring_denylist_age_seconds` before the first denylist is +Inf, which `prometheus-client`'s float encoder writes as `inf`; Prometheus parses both spellings.
+- **`--log-format` and the daemon's options.** clap's rule that refuses the daemon's options next to a subcommand also refuses a global flag given before the subcommand's name, so the binary checks that conflict itself and `--log-format` works on either side of a command's name.
