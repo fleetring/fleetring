@@ -441,7 +441,7 @@ impl Inner {
         database: &DatabaseName,
         start: &Position,
     ) -> Result<Option<ChainHash>, SinkError> {
-        let listing = Listing::read(self.store.as_ref(), keys, database)
+        let listing = Listing::read(self.store.as_ref(), keys, database, self.engine.kind())
             .await
             .map_err(|error| failed(format!("can't list the archive: {error}")))?;
         let (_, latest_ms) = listing.latest();
@@ -571,15 +571,16 @@ impl Inner {
     /// Deletes what retention says no kept snapshot's path can use. A failure leaves the rest
     /// for the next snapshot.
     async fn prune(&self, keys: &ArchiveKeys, database: &DatabaseName) {
-        let pruned = match Listing::read(self.store.as_ref(), keys, database).await {
-            Ok(listing) => {
-                let doomed = retention(&listing, self.settings.keep_snapshots);
-                apply_retention(self.store.as_ref(), &doomed)
-                    .await
-                    .map(|()| doomed.len())
-            }
-            Err(error) => Err(error),
-        };
+        let pruned =
+            match Listing::read(self.store.as_ref(), keys, database, self.engine.kind()).await {
+                Ok(listing) => {
+                    let doomed = retention(&listing, self.settings.keep_snapshots);
+                    apply_retention(self.store.as_ref(), &doomed)
+                        .await
+                        .map(|()| doomed.len())
+                }
+                Err(error) => Err(error),
+            };
         match pruned {
             Ok(0) => {}
             Ok(deleted) => {

@@ -16,7 +16,7 @@ use fleetringd::changes::{ChangeParts, ChangeSettings, ChangeStreams, DatabaseMa
 use fleetringd::clock::SystemClock;
 use fleetringd::durability::{Archive, ArchiveParts, ArchiveSettings, Listing, ObjectStore};
 use fleetringd::engine::{
-    DatabaseEngine, EngineConfig, Execution, SqliteEngine, Statement, Transaction,
+    DatabaseEngine, EngineConfig, EngineKind, Execution, SqliteEngine, Statement, Transaction,
 };
 use fleetringd::replication::{
     EpochHolders, PrimaryRole, Replication, ReplicationParts, ReplicationSettings,
@@ -204,6 +204,7 @@ impl Node {
             self.archive.store().as_ref(),
             &self.archive.keys(database),
             database,
+            EngineKind::Sqlite,
         )
         .await?)
     }

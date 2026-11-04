@@ -16,7 +16,7 @@ use fleetringd::durability::{
     ArchiveKeys, FaultyStore, Listing, MemoryStore, ObjectStore, RestoreTarget, Restored,
     restore_into,
 };
-use fleetringd::engine::{Execution, Position, SqliteEngine};
+use fleetringd::engine::{EngineKind, Execution, Position, SqliteEngine};
 use fleetringd::sim::{
     Ack, CreateAndWrite, Fleet, Operation, Outcome, Timings, check, seeds, written_values,
 };
@@ -172,7 +172,7 @@ fn archives_restore_after_faults(seed: u64) -> TestResult {
         .enable_time()
         .build()?;
     let listing = |runtime: &tokio::runtime::Runtime| {
-        runtime.block_on(Listing::read(&store, &keys, &database))
+        runtime.block_on(Listing::read(&store, &keys, &database, EngineKind::Sqlite))
     };
     fleet.run_until(
         Duration::from_secs(60),
