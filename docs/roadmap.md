@@ -6,7 +6,7 @@ The placement crate `fleetring` is released (0.1.0) and its placement is frozen 
 
 1. **No known way to lose an acknowledged write**, shown by the history checker (FR-036) on every simulation run, nightly sweeps over random seeds, and a fault-injection run on real processes. *Progress: the checker and the nightly sweep are in place; fault injection on real processes (FR-065) is not started.*
 2. **Secure by default across machines:** TLS between nodes, an authenticated data plane, and a written threat model. *Progress: done in 0.2.0, except the external review (criterion 6).*
-3. **Recoverable:** backups with point-in-time restore, and a tested rolling upgrade from the previous release. *Progress: backups and restore done in 0.3.0; the rolling upgrade (FR-054) is in progress.*
+3. **Recoverable:** backups with point-in-time restore, and a tested rolling upgrade from the previous release. *Progress: backups and restore done in 0.3.0; the tested rolling upgrade (FR-054) is done.*
 4. **Operable:** metrics, health checks, documented limits and tuning, and a drain for planned maintenance. *Progress: the drain is done in 0.2.0; metrics, health and readiness (FR-063) are done; limits and tuning are not written yet.*
 5. **No single point of failure** in the control plane, or the single-node behaviour documented and bounded. *Progress: not started (FR-064).*
 6. **Reviewed:** the protocol and the auth design reviewed by someone outside the project. *Progress: not started.*
@@ -63,7 +63,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - An operator guide: configuration reference, tuning (leases, heartbeat intervals, checkpoint thresholds, open-database caps), limits, and what each failure looks like.
 - An `examples/` directory for the daemon: a multi-tenant API, an agent with its own database, a change-stream consumer.
 - A changelog for the daemon, and a compatibility policy for the config file, the protocol, and the on-disk formats (rolling upgrades N to N+1 tested in CI).
-- [FR-054](https://github.com/fleetring/fleetring/issues/57): `fleetringd upgrade`, a cosign-verified self-upgrade with rollback and a restart in place; the version compatibility policy (two adjacent release lines, members report their software, new control commands gated as fleet features; ADR-0038); and a nightly rolling upgrade from the previous release ([plan](plans/FR-054-upgrade.md); in review).
+- [FR-054](https://github.com/fleetring/fleetring/issues/57): `fleetringd upgrade`, a cosign-verified self-upgrade with rollback and a restart in place; the version compatibility policy (two adjacent release lines, members report their software, new control commands gated as fleet features; ADR-0038); and a nightly rolling upgrade from the previous release ([plan](plans/FR-054-upgrade.md); done).
 
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
@@ -72,4 +72,4 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 
 ## Order
 
-E1's history checker, E2's durability, drain, and backups, and E3's authentication are done. FR-063 (metrics and health) is done, and FR-054 (`fleetringd upgrade` and the tested rolling upgrade) is in progress. E3 moved ahead of E6 and E7 because node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round; its external review is still open. E5 (FR-064) can start now that ADR-0035 is accepted, and E4 once the ADR for node-level leases is written, in parallel with E7 (FR-066). FR-063 and FR-065 gate the "safe" label and depend on neither. E8 and E9 run alongside everything and gate the "safe" label.
+E1's history checker, E2's durability, drain, and backups, and E3's authentication are done. FR-063 (metrics and health) is done, and so is FR-054 (`fleetringd upgrade` and the tested rolling upgrade). E3 moved ahead of E6 and E7 because node identity gates the worker and keyed-lease designs (FR-042, FR-043), and the router attaches to the principal model rather than the other way round; its external review is still open. E5 (FR-064) can start now that ADR-0035 is accepted, and E4 once the ADR for node-level leases is written, in parallel with E7 (FR-066). FR-063 and FR-065 gate the "safe" label and depend on neither. E8 and E9 run alongside everything and gate the "safe" label.
