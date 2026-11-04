@@ -95,59 +95,107 @@ fn down_members_count_toward_the_window() {
 }
 
 #[test]
-fn rejoining_on_a_new_release_is_an_update_that_grows_the_membership_epoch() {
+fn a_new_release_is_recorded_without_changing_the_membership_epoch() {
     let mut state = fleet(&[("a", None), ("b", None)]);
     let epoch = state.membership_epoch();
-    let rejoined = run(&mut state, 10, join("a", None)).expect("rejoin");
+    let upgraded = run(&mut state, 20, join("a", Some(current("0.4.0")))).expect("upgrade");
     assert!(matches!(
-        rejoined,
+        upgraded,
         Applied::MemberJoined {
             kind: JoinKind::Rejoined,
             ..
         }
     ));
     assert_eq!(state.membership_epoch(), epoch);
-    let upgraded = run(&mut state, 20, join("a", Some(current("0.4.0")))).expect("upgrade");
-    assert!(matches!(
-        upgraded,
-        Applied::MemberJoined {
-            kind: JoinKind::Updated,
-            ..
-        }
-    ));
-    assert!(state.membership_epoch() > epoch);
     assert_eq!(
         state.member(&id("a")).and_then(Member::software),
         Some(&current("0.4.0"))
     );
+    // A changed attribute still grows it.
+    let moved = Action::Join {
+        member: Member::new(id("a"))
+            .with_address("10.0.0.9:7400")
+            .with_software(current("0.4.0")),
+    };
+    assert!(matches!(
+        run(&mut state, 30, moved),
+        Ok(Applied::MemberJoined {
+            kind: JoinKind::Updated,
+            ..
+        })
+    ));
+    assert!(state.membership_epoch() > epoch);
 }
 
 #[test]
-fn a_heartbeat_corrects_the_record_once_and_is_never_refused_for_its_software() {
+fn a_heartbeat_corrects_the_record_and_is_never_refused_for_its_software() {
     // "a" joined a control node too old to record software.
     let mut state = fleet(&[("a", None), ("b", None)]);
     let epoch = state.membership_epoch();
-    let heartbeat = |software| Action::Heartbeat {
-        id: id("a"),
-        replicas: Vec::new(),
-        unknown_reports: fleetring_control::UnknownReports::Skip,
-        software,
-    };
-    run(&mut state, 10, heartbeat(Some(current("0.4.0")))).expect("recorded");
-    let corrected = state.membership_epoch();
-    assert!(corrected > epoch);
+    run(&mut state, 10, heartbeat("a", Some(current("0.4.0")))).expect("recorded");
+    assert_eq!(state.membership_epoch(), epoch);
     assert_eq!(
         state.member(&id("a")).and_then(Member::software),
         Some(&current("0.4.0"))
     );
-    // The same software again changes nothing.
-    run(&mut state, 20, heartbeat(Some(current("0.4.0")))).expect("unchanged");
-    assert_eq!(state.membership_epoch(), corrected);
     // Software the window would refuse at a join is still recorded: the node is live.
-    run(&mut state, 30, heartbeat(Some(current("0.9.0")))).expect("never refused");
+    run(&mut state, 30, heartbeat("a", Some(current("0.9.0")))).expect("never refused");
     assert_eq!(
         state.member(&id("a")).map(Member::running),
         Some(current("0.9.0"))
+    );
+}
+
+fn heartbeat(node: &str, software: Option<Software>) -> Action {
+    Action::Heartbeat {
+        id: id(node),
+        replicas: Vec::new(),
+        unknown_reports: fleetring_control::UnknownReports::Skip,
+        software,
+    }
+}
+
+/// `action` as a control node of a release without software, such as 0.3.0 after a rollback,
+/// decodes it from the log: its types have no `software` fields, so they are dropped.
+fn without_software(action: &Action) -> Action {
+    let mut value = serde_json::to_value(action).expect("serialize");
+    if let Some(bodies) = value.as_object_mut() {
+        for body in bodies.values_mut().filter_map(|body| body.as_object_mut()) {
+            body.remove("software");
+            if let Some(member) = body.get_mut("member").and_then(|m| m.as_object_mut()) {
+                member.remove("software");
+            }
+        }
+    }
+    serde_json::from_value(value).expect("deserialize")
+}
+
+/// A control node rolled back to 0.3.0 replays the same log without the software. It must reach
+/// the same membership epoch and members, or its data nodes, holding a newer epoch, would ignore
+/// its updates until its epoch caught up.
+#[test]
+fn a_log_replayed_without_software_reaches_the_same_membership() {
+    let log = [
+        join("a", None),
+        join("b", None),
+        join("a", Some(current("0.4.0"))),
+        heartbeat("b", Some(current("0.4.0"))),
+        join("c", Some(current("0.4.0"))),
+        join("b", Some(current("0.4.0"))),
+        heartbeat("a", Some(current("0.4.1"))),
+    ];
+    let mut new = State::new(config());
+    let mut old = State::new(config());
+    for (at_ms, action) in (0..).zip(&log) {
+        run(&mut new, at_ms, action.clone()).expect("new");
+        run(&mut old, at_ms, without_software(action)).expect("old");
+    }
+    assert_eq!(old.membership_epoch(), new.membership_epoch());
+    let ids = |state: &State| state.members().map(|m| m.id().clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&old), ids(&new));
+    assert_eq!(
+        old.ring().expect("ring").fingerprint(),
+        new.ring().expect("ring").fingerprint()
     );
 }
 
