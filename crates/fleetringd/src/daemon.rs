@@ -496,6 +496,7 @@ fn start_data(
         replication.clone(),
         changes.clone(),
         control,
+        archives,
         settings.ack_timeout,
     );
     let drain = DrainSettings::new(settings.stall_timeout, settings.ack_timeout);

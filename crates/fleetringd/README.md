@@ -136,6 +136,9 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Database.NodeStatus` | read or stream per database listed, or fleet | — |
 | `Database.WatchLeases` | read per database listed, or fleet | — |
 | `Database.Verify` | read on the database, or fleet | — |
+| `Database.Restore` | admin on the database | — |
+| `Database.DescribeArchive` | read on the database, or fleet | — |
+| `Database.VerifyArchive` | read on the database, or fleet | — |
 
 ## Install
 

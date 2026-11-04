@@ -1186,7 +1186,7 @@ mod binary {
     /// serving.
     /// Runs the binary with the client certificate under `tls_dir`, as `FLEETRING_TLS_DIR`
     /// names it.
-    async fn fleetringd(
+    pub(super) async fn fleetringd(
         tls_dir: &Path,
         args: Vec<String>,
     ) -> Result<Output, Box<dyn std::error::Error>> {
@@ -1233,7 +1233,7 @@ mod binary {
         Ok(tokio::time::timeout(super::HANG_GUARD, line).await???)
     }
 
-    fn args(words: &[&str], control: &str) -> Vec<String> {
+    pub(super) fn args(words: &[&str], control: &str) -> Vec<String> {
         words
             .iter()
             .map(|word| (*word).to_owned())
@@ -1241,7 +1241,7 @@ mod binary {
             .collect()
     }
 
-    fn stdout(output: &Output) -> Result<String, Box<dyn std::error::Error>> {
+    pub(super) fn stdout(output: &Output) -> Result<String, Box<dyn std::error::Error>> {
         let text = String::from_utf8(output.stdout.clone())?;
         assert!(
             output.status.success(),
@@ -2239,4 +2239,323 @@ async fn statements_are_confined_to_the_database_they_name() -> TestResult {
 
     fleet.stop().await;
     Ok(())
+}
+
+/// FR-049: archives every data daemon shares, and restores from them into new databases.
+mod archives {
+    use std::path::Path;
+
+    use fleetring_control::DatabaseName;
+    use fleetring_proto::v1::RestoreRequest;
+    use fleetringd::data::{Client, DatabaseSpec};
+    use fleetringd::durability::RestoreTarget;
+    use fleetringd::engine::{Position, Statement, Value};
+    use fleetringd::transport::database_client;
+    use tonic::Code;
+
+    use super::{Fleet, HANG_GUARD, TestResult, every_node_has, name, network, three, wait_until};
+
+    /// The archive's name in every test here.
+    pub(super) const ARCHIVE: &str = "backups";
+
+    /// A fleet whose data daemons all archive every database to one directory, segmenting
+    /// every 50 ms.
+    pub(super) async fn archived_fleet(dir: &Path) -> Result<Fleet, Box<dyn std::error::Error>> {
+        let table = format!(
+            "\n[[archive]]\nname = \"{ARCHIVE}\"\ndatabases = [\"*\"]\nstore = \"directory\"\n\
+             path = {:?}\nsegment_interval_ms = 50\n",
+            dir.join("archive")
+        );
+        Fleet::start_configured(dir, "", "", &table).await
+    }
+
+    /// Creates `database` with three replicas and the values `1..=count` in `t`, and waits until
+    /// its primary has archived them all.
+    pub(super) async fn create_archived(
+        fleet: &Fleet,
+        client: &Client,
+        database: &DatabaseName,
+        count: i64,
+    ) -> TestResult {
+        client.create_database(database, three()?).await?;
+        client
+            .execute(
+                database,
+                Statement::new("CREATE TABLE t (x INTEGER NOT NULL)"),
+            )
+            .await?;
+        for x in 1..=count {
+            client
+                .execute(
+                    database,
+                    Statement::with_params("INSERT INTO t (x) VALUES (?1)", [Value::Integer(x)]),
+                )
+                .await?;
+        }
+        let primary = client.locate(database).await?.primary.ok_or("a primary")?;
+        let streams = fleet
+            .data_daemon(primary.as_str())?
+            .change_streams()
+            .ok_or("change streams")?;
+        if !streams.await_caught_up(HANG_GUARD).await {
+            return Err("the archive didn't catch up".into());
+        }
+        Ok(())
+    }
+
+    async fn values(
+        client: &Client,
+        database: &DatabaseName,
+    ) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+        let rows = client
+            .query(database, Statement::new("SELECT x FROM t ORDER BY x"))
+            .await?;
+        Ok(rows
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Integer(x)) => Some(*x),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The hash every replica of `database` with an address reports at its latest position,
+    /// once they all report the same position and hash.
+    async fn converged(
+        client: &Client,
+        database: &DatabaseName,
+    ) -> Result<(Option<Position>, fleetringd::replication::ChainHash), Box<dyn std::error::Error>>
+    {
+        let mut agreed = None;
+        wait_until("every replica agreeing", async || {
+            let Ok(location) = client.locate(database).await else {
+                return false;
+            };
+            let mut answers = Vec::new();
+            for replica in &location.replicas {
+                let Some(address) = &replica.address else {
+                    return false;
+                };
+                match client.verify(address, database, None).await {
+                    Ok(answer) => answers.push((answer.position, answer.chain_hash)),
+                    Err(_) => return false,
+                }
+            }
+            let same = answers.len() == 3 && answers.windows(2).all(|pair| pair[0] == pair[1]);
+            if same {
+                agreed = answers.pop();
+            }
+            same
+        })
+        .await?;
+        Ok(agreed.ok_or("an answer")?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_restore_creates_a_new_database_from_the_archive_and_serves_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived(&fleet, &client, &ledger, 20).await?;
+        let (position, hash) = converged(&client, &ledger).await?;
+
+        let restored = name("restored")?;
+        let restoration = client
+            .restore_database(
+                &restored,
+                DatabaseSpec::new(three()?),
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await?;
+        assert_eq!(restoration.position, position);
+        assert_eq!(
+            restoration.chain_hash, hash,
+            "the chain every replica reports"
+        );
+        assert!(restoration.location.primary.is_some());
+        assert_eq!(
+            values(&client, &restored).await?,
+            (1..=20).collect::<Vec<_>>()
+        );
+
+        // The new database takes writes, and its followers seed from it and converge.
+        client
+            .execute(
+                &restored,
+                Statement::with_params("INSERT INTO t (x) VALUES (?1)", [Value::Integer(21)]),
+            )
+            .await?;
+        assert_eq!(
+            values(&client, &restored).await?,
+            (1..=21).collect::<Vec<_>>()
+        );
+        converged(&client, &restored).await?;
+        assert!(every_node_has(dir.path(), "restored"));
+        // The source is untouched.
+        assert_eq!(
+            values(&client, &ledger).await?,
+            (1..=20).collect::<Vec<_>>()
+        );
+        fleet.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_refuses_a_database_that_already_has_a_lease() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived(&fleet, &client, &ledger, 3).await?;
+        let other = name("other")?;
+        create_archived(&fleet, &client, &other, 1).await?;
+
+        let refused = client
+            .restore_database(
+                &other,
+                DatabaseSpec::new(three()?),
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await
+            .expect_err("a database with a primary isn't restored over");
+        assert_eq!(refused.code(), Code::AlreadyExists, "{refused:?}");
+
+        // Asked directly, the primary refuses too, and the database keeps its rows.
+        let location = client.locate(&other).await?;
+        let primary = location
+            .primary_replica()
+            .and_then(|replica| replica.address.clone())
+            .ok_or("the primary's address")?;
+        let refused = database_client(network(&fleet.tls)?.channel(&primary)?)
+            .restore(RestoreRequest {
+                database: other.to_string(),
+                archive: ARCHIVE.to_owned(),
+                source: ledger.to_string(),
+                point: None,
+            })
+            .await
+            .expect_err("a leased database isn't restored over");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+        assert!(
+            refused.message().contains("already has a lease"),
+            "{refused:?}"
+        );
+        assert_eq!(values(&client, &other).await?, [1]);
+
+        // An archive the node doesn't have is named.
+        let missing = client
+            .restore_database(
+                &name("fresh")?,
+                DatabaseSpec::new(three()?),
+                "nope",
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await
+            .expect_err("no such archive");
+        assert_eq!(missing.code(), Code::NotFound, "{missing:?}");
+        assert!(missing.message().contains("nope"), "{missing:?}");
+        // The failed restore left an unleased database, which a retry with the right archive
+        // finishes.
+        let retried = client
+            .restore_database(
+                &name("fresh")?,
+                DatabaseSpec::new(three()?),
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await?;
+        assert!(retried.location.primary.is_some());
+        assert_eq!(values(&client, &name("fresh")?).await?, [1, 2, 3]);
+        fleet.stop().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_archive_verify_agrees_with_the_live_replicas() -> TestResult {
+        use super::binary::{args, fleetringd, stdout};
+
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived(&fleet, &client, &ledger, 5).await?;
+        converged(&client, &ledger).await?;
+        let control = fleet.control_address()?;
+
+        let verified = stdout(
+            &fleetringd(
+                fleet.tls.dir(),
+                args(
+                    &["db", "archive", "verify", "ledger", "--archive", ARCHIVE],
+                    &control,
+                ),
+            )
+            .await?,
+        )?;
+        assert!(
+            verified.contains("archive agrees with every replica\n"),
+            "{verified}"
+        );
+        let described = stdout(
+            &fleetringd(
+                fleet.tls.dir(),
+                args(
+                    &["db", "archive", "show", "ledger", "--archive", ARCHIVE],
+                    &control,
+                ),
+            )
+            .await?,
+        )?;
+        assert!(described.contains("database: ledger\n"), "{described}");
+        assert!(described.contains("snapshots:\n  "), "{described}");
+
+        // Offline, from a configuration that names the archive and no fleet, a restore leaves a
+        // plain SQLite database.
+        let config = dir.path().join("offline.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\ninsecure_plaintext = true\n\n\
+                 [node]\nid = \"offline\"\n\n[[archive]]\nname = \"{ARCHIVE}\"\n\
+                 databases = [\"*\"]\nstore = \"directory\"\npath = {:?}\n",
+                dir.path().join("offline"),
+                dir.path().join("archive")
+            ),
+        )?;
+        let to = dir.path().join("recovered");
+        let words: Vec<String> = [
+            "archive",
+            "restore",
+            "--config",
+            config.to_str().ok_or("a UTF-8 path")?,
+            "--archive",
+            ARCHIVE,
+            "--from",
+            "ledger",
+            "--to",
+            to.to_str().ok_or("a UTF-8 path")?,
+        ]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
+        let restored = stdout(&fleetringd(fleet.tls.dir(), words).await?)?;
+        assert!(restored.contains("plain SQLite database"), "{restored}");
+        let conn = rusqlite::Connection::open(to.join("data.db"))?;
+        let rows = conn
+            .prepare("SELECT x FROM t ORDER BY x")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        assert_eq!(rows, (1..=5).collect::<Vec<_>>());
+        fleet.stop().await;
+        Ok(())
+    }
 }

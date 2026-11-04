@@ -2,10 +2,12 @@
 
 use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
+use fleetring_proto::v1::restore_point::Point;
 use fleetring_proto::v1::{
-    ChangeSinkStatus, CreateRequest, CreateResponse, ExecuteRequest, ExecuteResponse,
-    NodeStatusRequest, NodeStatusResponse, QueryRequest, QueryResponse, VerifyRequest,
-    VerifyResponse, WatchLeasesRequest,
+    ArchivedSnapshot, ChangeSinkStatus, CreateRequest, CreateResponse, DescribeArchiveRequest,
+    DescribeArchiveResponse, ExecuteRequest, ExecuteResponse, NodeStatusRequest,
+    NodeStatusResponse, QueryRequest, QueryResponse, RestorePoint, RestoreRequest, RestoreResponse,
+    VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest, VerifyResponse, WatchLeasesRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -13,7 +15,8 @@ use crate::auth::{Action, authorized, require_database};
 use crate::changes::MarkHome;
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
-use crate::data::node::DataNode;
+use crate::data::node::{DataNode, restore_status};
+use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
 
@@ -75,6 +78,22 @@ fn engine_status(error: &EngineError) -> Status {
         EngineError::NotFound => Status::not_found(message),
         EngineError::AlreadyExists => Status::already_exists(message),
         _ => Status::internal(message),
+    }
+}
+
+/// The restore target a request's point names: the latest point if it names none.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for an empty position.
+fn restore_target(point: Option<RestorePoint>) -> Result<RestoreTarget, Status> {
+    match point.and_then(|point| point.point) {
+        None | Some(Point::Latest(_)) => Ok(RestoreTarget::Latest),
+        Some(Point::Position(position)) if position.is_empty() => Err(Status::invalid_argument(
+            "a restore point's position is empty",
+        )),
+        Some(Point::Position(position)) => Ok(RestoreTarget::Position(Position::from(position))),
+        Some(Point::TimeMs(ms)) => Ok(RestoreTarget::Time(ms)),
     }
 }
 
@@ -211,6 +230,127 @@ impl Database for DatabaseService {
             move |database| visible.sees(Action::Read, database),
         );
         Ok(Response::new(caller.guard(stream)))
+    }
+
+    /// Restores `source` from the archive into the new database `database`, which needs admin
+    /// on both: the call creates `database`, and copies `source`'s history into it, including
+    /// what its caller's scopes may no longer show (ADR-0029, point 17).
+    async fn restore(
+        &self,
+        request: Request<RestoreRequest>,
+    ) -> Result<Response<RestoreResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        let source: DatabaseName = parse("source database name", &request.get_ref().source)?;
+        require_database(&request, &name)?;
+        require_database(&request, &source)?;
+        let request = request.into_inner();
+        let target = restore_target(request.point)?;
+        let archive = self.node.archive(&request.archive)?;
+        let (placement, restored) = self.node.restore(&name, archive, &source, &target).await?;
+        Ok(Response::new(RestoreResponse {
+            placement: Some(placement),
+            position: restored
+                .position
+                .map(Position::into_bytes)
+                .unwrap_or_default(),
+            chain_hash: restored.chain.as_bytes().to_vec(),
+            snapshot: restored.snapshot,
+            segments: restored.segments,
+            archived_at_ms: restored.archived_at_ms,
+        }))
+    }
+
+    /// Lists what the archive holds for the database, from any node that has the archive.
+    async fn describe_archive(
+        &self,
+        request: Request<DescribeArchiveRequest>,
+    ) -> Result<Response<DescribeArchiveResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let archive = self.node.archive(&request.get_ref().archive)?;
+        let store = archive.store();
+        let listing = Listing::read(store.as_ref(), &archive.keys(&name), &name)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!("can't list archive `{}`: {error}", archive.name()))
+            })?;
+        let (latest, latest_ms) = listing.latest();
+        let mut snapshots: Vec<ArchivedSnapshot> = listing
+            .snapshots
+            .iter()
+            .map(|snapshot| ArchivedSnapshot {
+                id: snapshot.id.clone(),
+                epoch: snapshot.epoch.get(),
+                position: snapshot
+                    .position
+                    .clone()
+                    .map(Position::into_bytes)
+                    .unwrap_or_default(),
+                taken_at_ms: snapshot.descriptor.taken_at_ms,
+                bytes: snapshot.descriptor.bytes,
+            })
+            .collect();
+        snapshots.sort_by(|a, b| (&a.position, a.epoch).cmp(&(&b.position, b.epoch)));
+        Ok(Response::new(DescribeArchiveResponse {
+            database: name.to_string(),
+            snapshots,
+            latest: latest.map(Position::into_bytes).unwrap_or_default(),
+            latest_ms,
+            segments: u32::try_from(listing.segments.len()).unwrap_or(u32::MAX),
+            segment_bytes: listing.segments.iter().map(|segment| segment.size).sum(),
+            incomplete: u32::try_from(listing.incomplete.len()).unwrap_or(u32::MAX),
+            damaged: listing
+                .damaged
+                .iter()
+                .map(|damaged| format!("{}: {}", damaged.key, damaged.reason))
+                .collect(),
+        }))
+    }
+
+    /// Restores the archived database into a scratch directory beside this node's databases,
+    /// verifying every batch, and removes the directory again.
+    async fn verify_archive(
+        &self,
+        request: Request<VerifyArchiveRequest>,
+    ) -> Result<Response<VerifyArchiveResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let request = request.into_inner();
+        let target = restore_target(request.point)?;
+        let archive = self.node.archive(&request.archive)?;
+        let replication = self.node.replication();
+        let scratch = replication.restore_staging();
+        let restored = restore_into(
+            archive.store().as_ref(),
+            &archive.keys(&name),
+            &name,
+            replication.engine(),
+            &target,
+            &scratch,
+            replication.execution(),
+        )
+        .await
+        .map_err(|error| restore_status(&name, archive.name(), &error));
+        let removed = {
+            let scratch = scratch.clone();
+            crate::durability::blocking(replication.execution(), move || {
+                crate::replication::remove_dir_if_present(&scratch)
+            })
+            .await
+        };
+        if !matches!(removed, Ok(Ok(()))) {
+            tracing::warn!(dir = %scratch.display(), "can't remove a verified archive's scratch copy");
+        }
+        let restored = restored?;
+        Ok(Response::new(VerifyArchiveResponse {
+            position: restored
+                .position
+                .map(Position::into_bytes)
+                .unwrap_or_default(),
+            chain_hash: restored.chain.as_bytes().to_vec(),
+            snapshot: restored.snapshot,
+            segments: restored.segments,
+        }))
     }
 
     /// Answers from this node's own copy, whatever its role: the chain hash at the requested

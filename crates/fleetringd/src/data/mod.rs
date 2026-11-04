@@ -51,8 +51,9 @@ mod redirect;
 mod service;
 
 pub use client::{
-    Client, DatabaseSpec, DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus,
-    ReplicaInfo, ServedDatabase, Verification, Written,
+    ArchiveDescription, ArchiveVerification, ArchivedSnapshot, Client, DatabaseSpec,
+    DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus, ReplicaInfo, Restoration,
+    ServedDatabase, Verification, Written,
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};

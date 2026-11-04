@@ -1059,3 +1059,177 @@ async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> 
     node.run_until(async {}).await;
     Ok(())
 }
+
+/// FR-049: restoring from and describing archives.
+mod archives {
+    use super::*;
+    use fleetringd::durability::RestoreTarget;
+
+    /// A control daemon, and a data daemon that archives every database to a directory, with
+    /// `tenant:acme` created, written, and archived.
+    struct Archived {
+        control: Daemon,
+        data: Daemon,
+        tls: Tls,
+        control_target: String,
+        data_target: String,
+    }
+
+    impl Archived {
+        async fn start(dir: &Path) -> Result<Self, Box<dyn Error>> {
+            let tls = Tls::create(dir)?;
+            let control = Daemon::start(Config::from_toml(&config(
+                dir, &tls, "control", "control", None,
+            )?)?)
+            .await?;
+            let address = control.control_address().ok_or("no control address")?;
+            let archive = format!(
+                "\n[[archive]]\nname = \"backups\"\ndatabases = [\"*\"]\nstore = \"directory\"\n\
+                 path = {:?}\nsegment_interval_ms = 50\n",
+                dir.join("archive")
+            );
+            let text = format!(
+                "{}{archive}",
+                config(dir, &tls, "data-1", "data", Some(address))?
+            );
+            let data = Daemon::start(Config::from_toml(&text)?).await?;
+            let archived = Self {
+                control_target: address.to_string(),
+                data_target: data.listen_address().to_string(),
+                control,
+                data,
+                tls,
+            };
+            let admin = archived.client("tester")?;
+            tokio::time::timeout(HANG_GUARD, async {
+                loop {
+                    match admin.status().await {
+                        Ok(view) if view.members().len() == 1 => {
+                            return Ok::<_, tonic::Status>(());
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
+                }
+            })
+            .await??;
+            let acme: DatabaseName = "tenant:acme".parse()?;
+            admin
+                .create_database_with(&acme, DatabaseSpec::new(ReplicationFactor::ONE))
+                .await?;
+            admin
+                .execute(&acme, Statement::new("CREATE TABLE t (v INTEGER)"))
+                .await?;
+            admin.execute(&acme, write_one()).await?;
+            let streams = archived.data.change_streams().ok_or("change streams")?;
+            if !streams.await_caught_up(HANG_GUARD).await {
+                return Err("the archive didn't catch up".into());
+            }
+            Ok(archived)
+        }
+
+        fn client(&self, principal: &str) -> Result<Client, Box<dyn Error>> {
+            Ok(Client::new(
+                self.control_target.clone(),
+                network(&self.tls, principal)?,
+            ))
+        }
+
+        /// A client acting as `app` with a token carrying `scopes`.
+        fn app(&self, scopes: &[&str], id: &str) -> Result<Client, Box<dyn Error>> {
+            let signer = self.tls.authority().token_signer()?;
+            let token = token(&signer, "app", scopes, id, Duration::from_secs(3600))?;
+            Ok(Client::new(
+                self.control_target.clone(),
+                with_token(network(&self.tls, "app")?, &token)?,
+            ))
+        }
+
+        async fn stop(self) {
+            self.data.run_until(async {}).await;
+            self.control.run_until(async {}).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_needs_admin_on_the_target_and_the_source() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let archived = Archived::start(dir.path()).await?;
+        let acme: DatabaseName = "tenant:acme".parse()?;
+        let target: DatabaseName = "restored/x".parse()?;
+        let spec = DatabaseSpec::new(ReplicationFactor::ONE);
+
+        // Admin on the new database and read on the source aren't enough: a restore copies the
+        // source's whole history into a database its caller controls.
+        let reader = archived.app(&["admin:restored/*", "read:tenant:*"], "restore-1")?;
+        let refused = reader
+            .restore_database(&target, spec, "backups", &acme, &RestoreTarget::Latest)
+            .await
+            .expect_err("no admin on the source");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+        assert_eq!(refused.message(), "Restore needs admin on 'tenant:acme'");
+
+        // Admin on the source but not on the new database is refused at creation.
+        let source_admin = archived.app(&["admin:tenant:*"], "restore-2")?;
+        let refused = source_admin
+            .restore_database(
+                &"other/y".parse()?,
+                spec,
+                "backups",
+                &acme,
+                &RestoreTarget::Latest,
+            )
+            .await
+            .expect_err("no admin on the target");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+
+        // Admin on both restores.
+        let both = archived.app(&["admin:restored/*", "admin:tenant:*"], "restore-3")?;
+        let restored = both
+            .restore_database(&target, spec, "backups", &acme, &RestoreTarget::Latest)
+            .await?;
+        assert!(restored.location.primary.is_some());
+        let rows = both.query(&target, read_one()).await?;
+        assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+        archived.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describing_an_archive_needs_read_on_the_key() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let archived = Archived::start(dir.path()).await?;
+        let acme: DatabaseName = "tenant:acme".parse()?;
+        let data = archived.data_target.clone();
+
+        let other = archived.app(&["read:tenant:zed*"], "describe-1")?;
+        let refused = other
+            .describe_archive(&data, "backups", &acme)
+            .await
+            .expect_err("no read on the database");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+        assert_eq!(
+            refused.message(),
+            "DescribeArchive needs read on 'tenant:acme'"
+        );
+        let refused = other
+            .verify_archive(&data, "backups", &acme, &RestoreTarget::Latest)
+            .await
+            .expect_err("no read on the database");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+
+        for (scopes, id) in [
+            (["read:tenant:acme"], "describe-2"),
+            (["fleet"], "describe-3"),
+        ] {
+            let allowed = archived.app(&scopes, id)?;
+            let described = allowed.describe_archive(&data, "backups", &acme).await?;
+            assert_eq!(described.snapshots.len(), 1, "{scopes:?}");
+            let verified = allowed
+                .verify_archive(&data, "backups", &acme, &RestoreTarget::Latest)
+                .await?;
+            assert_eq!(verified.position, described.latest, "{scopes:?}");
+        }
+        archived.stop().await;
+        Ok(())
+    }
+}

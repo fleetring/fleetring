@@ -3,5 +3,6 @@
 mod archive;
 mod common;
 mod fake_s3;
+mod restore;
 mod s3;
 mod store;

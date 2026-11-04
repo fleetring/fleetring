@@ -16,6 +16,7 @@ use crate::control::ControlClient;
 use crate::data::convert::durability_of;
 use crate::data::redirect::not_primary;
 use crate::data::service::database_status;
+use crate::durability::{Archive, RestoreError, RestoreTarget, Restored, StoreError, restore_into};
 use crate::engine::EngineError;
 use crate::replication::{PrimaryRole, Replication, ServePrimaryError};
 use crate::{DatabaseError, Registry};
@@ -99,6 +100,8 @@ pub(super) struct Inner {
     pub(super) replication: Replication,
     pub(super) changes: ChangeStreams,
     pub(super) control: ControlClient,
+    /// The archives this node writes, which restores read from (FR-049).
+    pub(super) archives: Vec<Archive>,
     /// How long a node that starts serving a database waits for its followers' streams before
     /// it takes writes.
     pub(super) writable_wait: Duration,
@@ -164,6 +167,7 @@ impl DataNode {
         replication: Replication,
         changes: ChangeStreams,
         control: ControlClient,
+        archives: Vec<Archive>,
         writable_wait: Duration,
     ) -> Self {
         Self {
@@ -172,6 +176,7 @@ impl DataNode {
                 replication,
                 changes,
                 control,
+                archives,
                 writable_wait,
                 leases: Mutex::new(BTreeMap::new()),
                 settling: watch::Sender::new(BTreeMap::new()),
@@ -191,6 +196,97 @@ impl DataNode {
 
     pub(crate) fn change_streams(&self) -> &ChangeStreams {
         &self.inner.changes
+    }
+
+    /// The archive this node writes under `name`.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` naming the archive if no `[[archive]]` entry here has that name.
+    pub(crate) fn archive(&self, name: &str) -> Result<&Archive, Status> {
+        self.inner
+            .archives
+            .iter()
+            .find(|archive| archive.name() == name)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "this node has no archive named `{name}`; add an [[archive]] entry for it"
+                ))
+            })
+    }
+
+    /// Builds `name`, a database the control plane has created and never leased, from the
+    /// archive's copy of `source` at `target`, and serves it: restores into a staging directory,
+    /// verifying every batch against the hash chain, moves the copy into place, takes the first
+    /// lease, and serves it as `create` does. A copy a failed restore left here is replaced; one
+    /// a lease was taken for never is.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` if the database has a lease or this node isn't in its replica set,
+    /// or the archive can't reach the target; `DATA_LOSS` naming the object if one is missing
+    /// or altered; `UNAVAILABLE` if the store can't be reached; and the status of a failed
+    /// control call.
+    pub(crate) async fn restore(
+        &self,
+        name: &DatabaseName,
+        archive: &Archive,
+        source: &DatabaseName,
+        target: &RestoreTarget,
+    ) -> Result<(Placement, Restored), Status> {
+        let placement = self.locate(name).await?;
+        let id = self.inner.id.as_str();
+        if placement.epoch > 0 || placement.primary.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "{name} already has a lease at epoch {}; a restore builds a new database, so \
+                 drop it first or restore under another name",
+                placement.epoch
+            )));
+        }
+        if !placement
+            .replicas
+            .iter()
+            .any(|replica| replica.node_id == id)
+        {
+            return Err(Status::failed_precondition(format!(
+                "{id} isn't in the replica set of {name}"
+            )));
+        }
+        // Never leased, so nothing in a copy here was ever acknowledged: it is what a failed
+        // restore or create left.
+        self.registry().close(name).await;
+        self.registry()
+            .remove(name)
+            .await
+            .map_err(|error| Status::internal(format!("can't remove the old copy: {error}")))?;
+        let replication = self.replication();
+        let staging = replication.restore_staging();
+        let restored = restore_into(
+            archive.store().as_ref(),
+            &archive.keys(source),
+            source,
+            replication.engine(),
+            target,
+            &staging,
+            replication.execution(),
+        )
+        .await
+        .map_err(|error| restore_status(source, archive.name(), &error))?;
+        replication
+            .install_restored(name, &staging, restored.position.as_ref(), restored.chain)
+            .await?;
+        let lease = self
+            .inner
+            .control
+            .acquire_lease(AcquireLeaseRequest {
+                database: name.to_string(),
+                node_id: id.to_owned(),
+            })
+            .await?;
+        tracing::info!(database = %name, %source, archive = archive.name(), epoch = lease.epoch, position = ?restored.position, segments = restored.segments, "restored from the archive and took the first lease");
+        let placement = self.locate(name).await?;
+        self.serve(name, &placement).await?;
+        Ok((placement, restored))
     }
 
     /// This node's ID.
@@ -504,6 +600,19 @@ fn no_primary(name: &DatabaseName, placement: &Placement) -> Status {
         Status::failed_precondition(format!(
             "database {name} has no primary yet; finish creating it"
         ))
+    }
+}
+
+/// The status a failed restore of `source` from `archive` answers with.
+pub(crate) fn restore_status(source: &DatabaseName, archive: &str, error: &RestoreError) -> Status {
+    let message = format!("restoring {source} from archive `{archive}`: {error}");
+    match error {
+        RestoreError::DataLoss { .. } => Status::data_loss(message),
+        RestoreError::Plan(_)
+        | RestoreError::NotBoundary { .. }
+        | RestoreError::SelfReplicating(_) => Status::failed_precondition(message),
+        RestoreError::Store(StoreError::Unavailable { .. }) => Status::unavailable(message),
+        _ => Status::internal(message),
     }
 }
 

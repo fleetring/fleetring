@@ -42,12 +42,14 @@ mod format;
 mod keys;
 mod listing;
 mod plan;
+mod restore;
 mod retention;
 mod s3;
 mod store;
 
 use std::fmt;
 
+pub(crate) use self::archive::blocking;
 pub use self::archive::{Archive, ArchiveError, ArchiveParts, build_store};
 pub use self::config::{ArchiveConfig, ArchiveSettings, CHUNK_BYTES, CredentialKind, StoreKind};
 pub use self::format::{
@@ -57,6 +59,7 @@ pub use self::format::{
 pub use self::keys::{ArchiveKeys, SegmentName, SnapshotObject};
 pub use self::listing::{DamagedObject, IncompleteSnapshot, Listing, SegmentEntry, SnapshotEntry};
 pub use self::plan::{PlanError, RestorePlan, RestoreTarget, plan};
+pub use self::restore::{RestoreError, Restored, finish_offline, restore_into};
 pub use self::retention::{apply_retention, retention};
 pub use self::s3::{CredentialSource, HttpPolicy, PathStyle, S3ConfigError, S3Settings, S3Store};
 pub use self::store::{
@@ -76,7 +79,9 @@ const _: () = {
     assert_debug_send_sync::<IncompleteSnapshot>();
     assert_debug_send_sync::<Listing>();
     assert_debug_send_sync::<PlanError>();
+    assert_debug_send_sync::<RestoreError>();
     assert_debug_send_sync::<RestorePlan>();
+    assert_debug_send_sync::<Restored>();
     assert_debug_send_sync::<RestoreTarget>();
     assert_debug_send_sync::<SegmentEntry>();
     assert_debug_send_sync::<SnapshotEntry>();

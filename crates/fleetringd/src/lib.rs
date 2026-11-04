@@ -88,7 +88,11 @@ const _: () = {
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
     assert_debug_send_sync::<Daemon>();
+    assert_debug_send_sync::<data::ArchiveDescription>();
+    assert_debug_send_sync::<data::ArchiveVerification>();
+    assert_debug_send_sync::<data::ArchivedSnapshot>();
     assert_debug_send_sync::<data::Client>();
+    assert_debug_send_sync::<data::Restoration>();
     assert_debug_send_sync::<data::DatabaseSpec>();
     assert_debug_send_sync::<data::DurabilityChange>();
     assert_debug_send_sync::<data::LeaseUpdate>();
