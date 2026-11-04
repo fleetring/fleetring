@@ -63,6 +63,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - An operator guide: configuration reference, tuning (leases, heartbeat intervals, checkpoint thresholds, open-database caps), limits, and what each failure looks like.
 - An `examples/` directory for the daemon: a multi-tenant API, an agent with its own database, a change-stream consumer.
 - A changelog for the daemon, and a compatibility policy for the config file, the protocol, and the on-disk formats (rolling upgrades N to N+1 tested in CI).
+- [FR-054](https://github.com/fleetring/fleetring/issues/57): `fleetringd upgrade`, a cosign-verified self-upgrade with rollback and a restart in place; the version compatibility policy (two adjacent release lines, members report their software, new control commands gated as fleet features; ADR-0038); and a nightly rolling upgrade from the previous release ([plan](plans/FR-054-upgrade.md); in review).
 
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
