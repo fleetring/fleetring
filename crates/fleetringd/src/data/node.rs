@@ -115,6 +115,8 @@ pub(super) struct Inner {
     pub(super) draining: tokio::sync::Mutex<()>,
     /// One permit: held while this node builds a restored or verified copy on its disk.
     staging: tokio::sync::Semaphore,
+    /// Held per database while it is created or restored here, so that two never race.
+    creating: NameLocks,
 }
 
 /// Refuses requests for one database until it is dropped.
@@ -185,6 +187,7 @@ impl DataNode {
                 refusing: Mutex::new(BTreeSet::new()),
                 draining: tokio::sync::Mutex::new(()),
                 staging: tokio::sync::Semaphore::new(1),
+                creating: NameLocks::default(),
             }),
         }
     }
@@ -253,6 +256,9 @@ impl DataNode {
         target: &RestoreTarget,
     ) -> Result<(Placement, Restored), Status> {
         let _staging = self.staging_permit()?;
+        // A create or another restore of the name waits, so neither removes or replaces the
+        // copy this one installs.
+        let _creating = self.inner.creating.lock(name).await;
         let placement = self.locate(name).await?;
         let id = self.inner.id.as_str();
         if placement.epoch > 0 || placement.primary.is_some() {
@@ -356,6 +362,7 @@ impl DataNode {
     /// the database's replica set, or the control plane refuses the lease; and the status of a
     /// failed control call or database creation.
     pub(crate) async fn create(&self, name: &DatabaseName) -> Result<Placement, Status> {
+        let _creating = self.inner.creating.lock(name).await;
         let placement = self.locate(name).await?;
         let id = self.inner.id.as_str();
         match placement.primary.as_deref() {
@@ -592,6 +599,50 @@ impl DataNode {
     }
 }
 
+/// An async lock per database name, each forgotten once no one holds or waits for it.
+#[derive(Debug, Default)]
+struct NameLocks(Mutex<BTreeMap<DatabaseName, Arc<tokio::sync::Mutex<()>>>>);
+
+/// Holds one name's lock while it lives.
+struct NameGuard<'locks> {
+    locks: &'locks NameLocks,
+    name: DatabaseName,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl NameLocks {
+    fn map(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, Arc<tokio::sync::Mutex<()>>>> {
+        self.0.lock().expect("name locks poisoned")
+    }
+
+    /// Waits until no one else holds `name`'s lock, then holds it.
+    async fn lock(&self, name: &DatabaseName) -> NameGuard<'_> {
+        let lock = Arc::clone(self.map().entry(name.clone()).or_default());
+        let guard = lock.lock_owned().await;
+        NameGuard {
+            locks: self,
+            name: name.clone(),
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for NameGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        // A poisoned lock means a panic elsewhere; a destructor mustn't add another.
+        let Ok(mut map) = self.locks.0.lock() else {
+            return;
+        };
+        if map
+            .get(&self.name)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            map.remove(&self.name);
+        }
+    }
+}
+
 /// The redirect to `primary`, or `UNAVAILABLE` if the control plane knows no address for it.
 fn redirect(name: &DatabaseName, placement: &Placement, primary: &str) -> Status {
     let address = placement
@@ -642,5 +693,28 @@ fn missing_file(name: &DatabaseName, error: &DatabaseError) -> Status {
         ))
     } else {
         database_status(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn one_name_is_created_or_restored_by_one_caller_at_a_time() {
+        let locks = NameLocks::default();
+        let a: DatabaseName = "a".parse().expect("a name");
+        let b: DatabaseName = "b".parse().expect("a name");
+        let first = locks.lock(&a).await;
+        // Another name isn't held up.
+        drop(locks.lock(&b).await);
+        let second = tokio::time::timeout(Duration::from_millis(50), locks.lock(&a)).await;
+        assert!(second.is_err(), "the second caller waits for the first");
+        drop(first);
+        let third = locks.lock(&a).await;
+        drop(third);
+        assert!(locks.map().is_empty(), "locks no one holds are forgotten");
     }
 }
