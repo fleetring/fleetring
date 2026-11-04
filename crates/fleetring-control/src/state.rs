@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use fleetring::{BuildRingError, Epoch, Node, NodeId, ReplicationFactor, Ring};
 use serde::{Deserialize, Serialize};
 
-use crate::apply::plan_promotion;
+use crate::apply::{check_join_software, plan_promotion};
 use crate::{
     Acks, Action, ControlConfig, Database, DatabaseName, Feature, Liveness, Member, Quorums,
     Rejection, Report, Revocations, Timestamp,
@@ -127,6 +127,52 @@ impl State {
             Some(feature) => self.check_feature(feature),
             None => Ok(()),
         }
+    }
+
+    /// Checks every rule [`apply`](crate::apply) refuses `action` for because of software: the
+    /// feature gate ([`State::check_features`]) and, for a join, the release window and the
+    /// enabled features (ADR-0038, point 3). A join on the software the member is recorded with
+    /// always passes, as `apply` lets it rejoin.
+    ///
+    /// The control node makes this check before it logs a command, so that a command refused for
+    /// software never reaches the log. A control node of an older release, after a rollback,
+    /// decodes the log without the software, so it would accept such a command: a refused join
+    /// would make a new member there.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::FeatureUnsupported`] as [`State::check_features`] returns it;
+    /// [`Rejection::MissingFeature`] for a join that lacks an enabled feature; and
+    /// [`Rejection::IncompatibleVersion`] for a join whose release line is outside the window of
+    /// another member's, live or down.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring_control::{
+    ///     apply, Action, Command, ControlConfig, Member, Rejection, Release, Software, State,
+    ///     Timestamp,
+    /// };
+    ///
+    /// let mut state = State::new(ControlConfig::new());
+    /// let join = Action::Join { member: Member::new("old".parse()?) }; // 0.3.0 reports nothing
+    /// apply(&mut state, Command::new(Timestamp::from_millis(0), join))?;
+    /// let far = Action::Join {
+    ///     member: Member::new("far".parse()?).with_software(Software::new(Release::new(0, 5, 0), 1)),
+    /// };
+    /// assert!(matches!(
+    ///     state.check_admission(&far),
+    ///     Err(Rejection::IncompatibleVersion { .. })
+    /// ));
+    /// assert!(state.check_admission(&Action::Tick).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn check_admission(&self, action: &Action) -> Result<(), Rejection> {
+        self.check_features(action)?;
+        if let Action::Join { member } = action {
+            check_join_software(self, member)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn check_feature(&self, feature: Feature) -> Result<(), Rejection> {

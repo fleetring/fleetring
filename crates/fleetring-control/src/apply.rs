@@ -31,7 +31,8 @@ pub type Outcome = Result<Applied, Rejection>;
 ///
 /// **Features.** An action that needs a fleet feature ([`Action::feature`]) is checked against
 /// the gate first ([`State::check_features`]); the first one accepted enables the feature for
-/// good (ADR-0038, point 4).
+/// good (ADR-0038, point 4). A join is checked against the release window and the enabled
+/// features; [`State::check_admission`] makes both checks without applying anything.
 ///
 /// # Errors
 ///
@@ -525,13 +526,8 @@ pub enum Rejection {
 }
 
 fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
+    check_join_software(state, &member)?;
     let id = member.id().clone();
-    // A member that rejoins on the software it is recorded with changes no release in the fleet,
-    // so it is never refused for it: a heartbeat may have recorded software a join would refuse.
-    let recorded = state.members.get(&id).map(|entry| entry.member.software());
-    if recorded != Some(member.software()) {
-        check_software(state, &id, &member.running())?;
-    }
     // Software isn't compared: a rejoin on a new release with the same attributes keeps the
     // membership epoch, so that a control node of a release that ignores software, such as
     // 0.3.0 after a rollback, replays the log to the same epoch (ADR-0038, point 2).
@@ -572,6 +568,21 @@ fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
         membership_epoch,
         kind,
     })
+}
+
+/// Checks the software of a joining `member`, as [`State::check_admission`] and `join` both do.
+///
+/// A member that rejoins on the software it is recorded with changes no release in the fleet, so
+/// it is never refused for it: a heartbeat may have recorded software a join would refuse.
+pub(crate) fn check_join_software(state: &State, member: &Member) -> Result<(), Rejection> {
+    let recorded = state
+        .members
+        .get(member.id())
+        .map(|entry| entry.member.software());
+    if recorded == Some(member.software()) {
+        return Ok(());
+    }
+    check_software(state, member.id(), &member.running())
 }
 
 /// Checks that a member `id` running `software` may join: it supports every enabled feature,

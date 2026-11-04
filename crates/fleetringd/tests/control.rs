@@ -1936,3 +1936,131 @@ async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResu
     assert_eq!(undrains, 1);
     Ok(())
 }
+
+/// `action` as a control node of a release without software, such as 0.3.0 after a rollback,
+/// decodes it from the log: its types have no `software` fields, so they are dropped.
+fn without_software(action: &Action) -> Result<Action, Box<dyn Error>> {
+    let mut value = serde_json::to_value(action)?;
+    if let Some(bodies) = value.as_object_mut() {
+        for body in bodies.values_mut().filter_map(|body| body.as_object_mut()) {
+            body.remove("software");
+            if let Some(member) = body.get_mut("member").and_then(|m| m.as_object_mut()) {
+                member.remove("software");
+            }
+        }
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+/// A join the control node refuses for its software is refused before it is logged, as a
+/// command that needs a feature is (ADR-0038, point 4). A control node rolled back to 0.3.0
+/// replays the log without software, and would accept a logged one: a node the fleet refused
+/// would become a member there, and the epoch would grow once per retry. So the log holds none,
+/// and a replay without software reaches the same members, epoch, and ring.
+#[tokio::test]
+async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
+    use fleetring_control::{Rejection, Software};
+    use fleetringd::control::SubmitError;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("control.db");
+    let node = ControlNode::open(&path, ControlOptions::default(), TickClock::default()).await?;
+    let handle = node.handle();
+    let join = |id: &str, software: Option<Software>| -> Result<Action, Box<dyn Error>> {
+        let member = Member::new(id.parse()?);
+        Ok(Action::Join {
+            member: match software {
+                Some(software) => member.with_software(software),
+                None => member,
+            },
+        })
+    };
+    let current = fleetringd::software::running();
+
+    // "old" reports nothing, as 0.3.0 does; "new" runs this build.
+    handle.submit(join("old", None)?).await?;
+    handle.submit(join("new", Some(current.clone()))?).await?;
+    // A node on another major is refused at every retry, as its heartbeat loop sends them.
+    let far = Software::new("9.0.0".parse()?, 1);
+    for _ in 0..3 {
+        let refused = handle
+            .submit(join("far", Some(far.clone()))?)
+            .await
+            .expect_err("9.0 can't run beside 0.3");
+        assert!(
+            matches!(
+                &refused,
+                SubmitError::Refused(Rejection::IncompatibleVersion { id, .. }) if id.as_str() == "far"
+            ),
+            "{refused:?}"
+        );
+    }
+    handle.submit(join("old", Some(current.clone()))?).await?;
+    let before_feature = handle.state();
+
+    // Once a feature is enabled, a node without it is refused, a new one and a rollback alike.
+    handle
+        .submit(Action::Undrain { id: "new".parse()? })
+        .await?;
+    let featureless = Software::new(fleetringd::software::release(), 1);
+    for refused in [join("late", Some(featureless))?, join("old", None)?] {
+        let refused = handle.submit(refused).await.expect_err("lacks undrain");
+        assert!(
+            matches!(
+                &refused,
+                SubmitError::Refused(Rejection::MissingFeature { .. })
+            ),
+            "{refused:?}"
+        );
+    }
+    let published = handle.state();
+    node.shutdown().await;
+
+    let log = CommandLog::open(&path, ControlConfig::new())?;
+    let logged: Vec<Action> = log
+        .commands()?
+        .into_iter()
+        .map(|(_, command)| command.action)
+        .collect();
+    let joins: Vec<&str> = logged
+        .iter()
+        .filter_map(|action| match action {
+            Action::Join { member } => Some(member.id().as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(joins, ["old", "new", "old"], "no refused join is logged");
+    let (replayed, outcomes) = replay(&log)?;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert_eq!(replayed, *published);
+
+    // A control node rolled back before the feature was first used replays the log so far
+    // without software, and reaches the membership this build published.
+    let mut old = State::new(log.genesis());
+    let unfeatured = logged
+        .iter()
+        .take_while(|action| !matches!(action, Action::Undrain { .. }));
+    for (at, action) in (1..).zip(unfeatured) {
+        apply(
+            &mut old,
+            Command::new(Timestamp::from_millis(at), without_software(action)?),
+        )?;
+    }
+    assert_eq!(old.membership_epoch(), before_feature.membership_epoch());
+    let ids = |state: &State| state.members().map(|m| m.id().clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&old), ids(&before_feature));
+    assert_eq!(
+        old.ring()?.fingerprint(),
+        before_feature.ring()?.fingerprint()
+    );
+    // It accepts what this build refused, which is why the refusal must never reach the log.
+    apply(
+        &mut old,
+        Command::new(
+            Timestamp::from_millis(100),
+            without_software(&join("far", Some(far))?)?,
+        ),
+    )?;
+    assert!(old.member(&"far".parse()?).is_some());
+    Ok(())
+}

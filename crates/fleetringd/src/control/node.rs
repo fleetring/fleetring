@@ -126,11 +126,13 @@ pub enum SubmitError {
     /// and the node must restart to recover it.
     #[error("can't log the command")]
     Storage(#[source] LogError),
-    /// The command needs a fleet feature a member doesn't support, so it was refused before it
-    /// was logged (ADR-0038, point 4). Nothing changed, and nothing was logged, so a control node
-    /// of an older release never meets the command in its log.
+    /// The command was refused for software before it was logged ([`State::check_admission`],
+    /// ADR-0038, point 4): a join whose release is outside the window or lacks an enabled
+    /// feature, or a command that needs a fleet feature a member doesn't support. Nothing changed,
+    /// and nothing was logged, so a control node of an older release, which would accept the
+    /// command, never meets it in its log.
     #[error(transparent)]
-    Unsupported(Rejection),
+    Refused(Rejection),
 }
 
 /// A command that was logged and applied.
@@ -466,18 +468,19 @@ impl Writer {
     /// Stamps and numbers `submits` in order, logs them in one transaction, then applies,
     /// publishes, and answers each. Nothing is answered before the whole group is durable.
     ///
-    /// A command that needs a fleet feature some member lacks is refused at once and never
-    /// logged. It is checked against the state the commands queued before it in the group leave,
-    /// which is the state `apply` will see.
+    /// A command `apply` would refuse for software, a join or a command that needs a fleet
+    /// feature some member lacks, is refused at once and never logged ([`State::check_admission`]).
+    /// It is checked against the state the commands queued before it in the group leave, which is
+    /// the state `apply` will see.
     fn commit_group(&mut self, submits: Vec<(Action, Reply)>) -> Flow {
         let mut commands: Vec<(LogIndex, Command)> = Vec::with_capacity(submits.len());
         let mut replies = Vec::with_capacity(submits.len());
         let mut last = self.last_index;
         let mut exhausted = None;
-        // The state after the group's commands so far, built only once a command needs a feature.
+        // The state after the group's commands so far, built only once a command needs screening.
         let mut preview: Option<State> = None;
         for (action, reply) in submits {
-            if action.feature().is_some() {
+            if needs_screening(&action) {
                 let preview = preview.get_or_insert_with(|| {
                     let mut state = self.state.clone();
                     for (_, command) in &commands {
@@ -485,8 +488,8 @@ impl Writer {
                     }
                     state
                 });
-                if let Err(rejection) = preview.check_features(&action) {
-                    let _unheard = reply.send(Err(SubmitError::Unsupported(rejection)));
+                if let Err(rejection) = preview.check_admission(&action) {
+                    let _unheard = reply.send(Err(SubmitError::Refused(rejection)));
                     continue;
                 }
             }
@@ -569,4 +572,10 @@ impl Writer {
             state,
         }
     }
+}
+
+/// Whether `action` may be refused for software, so the writer screens it before it logs it: a
+/// join, or a command that needs a fleet feature.
+fn needs_screening(action: &Action) -> bool {
+    action.feature().is_some() || matches!(action, Action::Join { .. })
 }
