@@ -10,10 +10,13 @@ use fleetring_control::{
     Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, ReplicaRole,
 };
 use fleetring_proto::v1::database_client::DatabaseClient;
+use fleetring_proto::v1::restore_point::Point;
 use fleetring_proto::v1::{
-    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest, DrainRequest,
-    DropDatabaseRequest, ExecuteRequest, ListDatabasesRequest, LocateRequest, NodeStatusRequest,
-    QueryRequest, VerifyRequest, WatchLeasesRequest, WatchMembershipRequest,
+    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest,
+    DescribeArchiveRequest, DrainRequest, DropDatabaseRequest, ExecuteRequest,
+    ListDatabasesRequest, LocateRequest, NodeStatusRequest, QueryRequest, RestoreLatest,
+    RestoreRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
+    WatchMembershipRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status, Streaming};
@@ -26,6 +29,7 @@ use crate::data::convert::{
     params_to_proto, rows_from_proto,
 };
 use crate::data::redirect::primary_hint;
+use crate::durability::RestoreTarget;
 use crate::engine::{Position, Rows, Statement};
 use crate::environment::Network;
 use crate::replication::{ChainHash, LeaseEvent};
@@ -193,6 +197,96 @@ pub struct Verification {
     pub position: Option<Position>,
     /// The chain hash there.
     pub chain_hash: ChainHash,
+}
+
+/// A database restored from an archive, as [`Client::restore_database`] reports it (FR-049).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Restoration {
+    /// Where the new database lives.
+    pub location: Location,
+    /// The position it starts at, or `None` for the log's beginning.
+    pub position: Option<Position>,
+    /// The hash chain there, verified over every batch applied.
+    pub chain_hash: ChainHash,
+    /// The archive's snapshot the restore started from.
+    pub snapshot: String,
+    /// How many segments it applied.
+    pub segments: u32,
+    /// When the last segment applied was archived, or `None` if none was.
+    pub archived_at_ms: Option<u64>,
+}
+
+/// One complete snapshot in an archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ArchivedSnapshot {
+    /// Its ID.
+    pub id: String,
+    /// The epoch of the primary that took it.
+    pub epoch: LeaseEpoch,
+    /// The position it holds the log up to.
+    pub position: Option<Position>,
+    /// When it was taken, by the archiving node's clock.
+    pub taken_at_ms: u64,
+    /// The packed stream's length.
+    pub bytes: u64,
+}
+
+/// What an archive holds for a database, as [`Client::describe_archive`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ArchiveDescription {
+    /// The database.
+    pub database: DatabaseName,
+    /// Its complete snapshots, oldest first.
+    pub snapshots: Vec<ArchivedSnapshot>,
+    /// The furthest position a snapshot or segment reaches.
+    pub latest: Option<Position>,
+    /// When the last segment was archived.
+    pub latest_ms: Option<u64>,
+    /// How many segments it holds.
+    pub segments: u32,
+    /// Their bytes.
+    pub segment_bytes: u64,
+    /// How many snapshots are incomplete.
+    pub incomplete: u32,
+    /// The objects a restore won't use, with why.
+    pub damaged: Vec<String>,
+}
+
+/// An archive restored into a scratch copy and verified, as [`Client::verify_archive`] reports
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ArchiveVerification {
+    /// The position the restored copy reached.
+    pub position: Option<Position>,
+    /// The hash chain there, verified over every batch applied.
+    pub chain_hash: ChainHash,
+    /// The snapshot it started from.
+    pub snapshot: String,
+    /// How many segments it applied.
+    pub segments: u32,
+}
+
+/// The protocol's form of a restore target.
+fn restore_point(target: &RestoreTarget) -> proto::RestorePoint {
+    let point = match target {
+        RestoreTarget::Position(position) => Point::Position(position.as_bytes().to_vec()),
+        RestoreTarget::Time(ms) => Point::TimeMs(*ms),
+        _ => Point::Latest(RestoreLatest {}),
+    };
+    proto::RestorePoint { point: Some(point) }
+}
+
+fn optional_position(bytes: Vec<u8>) -> Option<Position> {
+    (!bytes.is_empty()).then(|| Position::from(bytes))
+}
+
+fn chain_hash(bytes: &[u8]) -> Result<ChainHash, Status> {
+    ChainHash::from_bytes(bytes)
+        .ok_or_else(|| Status::internal("the reply has an invalid chain hash"))
 }
 
 /// A recorded durability change, as [`Client::change_durability`] reports it.
@@ -405,6 +499,149 @@ impl Client {
             })
             .await?;
         location(placement_of(created.placement)?)
+    }
+
+    /// Creates `name` as `spec` says, and builds it from `archive`'s copy of `source` at
+    /// `target` instead of empty (FR-049): the control plane places it, then the first live
+    /// member of its replica set restores it, verifying every batch against the hash chain, takes
+    /// the first lease, and serves it. If the control plane already has the database but it was
+    /// never leased, because an earlier restore failed, this retries it.
+    ///
+    /// # Errors
+    ///
+    /// `ALREADY_EXISTS` if the database exists and has a primary; `FAILED_PRECONDITION` if it
+    /// has a lease or the archive can't reach the target; `DATA_LOSS` naming the object if one
+    /// is missing or altered; `NOT_FOUND` if the node has no such archive; and the status of a
+    /// failed control or database call.
+    pub async fn restore_database(
+        &self,
+        name: &DatabaseName,
+        spec: DatabaseSpec,
+        archive: &str,
+        source: &DatabaseName,
+        target: &RestoreTarget,
+    ) -> Result<Restoration, Status> {
+        let request = CreateDatabaseRequest {
+            database: name.to_string(),
+            replication_factor: u32::from(spec.replication_factor.get()),
+            engine: proto::Engine::Sqlite.into(),
+            acks: spec
+                .acks
+                .map_or(proto::Acks::Unspecified, acks_to_proto)
+                .into(),
+            min_replicas: u32::from(spec.min_replicas.unwrap_or(0)),
+        };
+        let placement = match self.control.create_database(request).await {
+            Ok(response) => placement_of(response.placement)?,
+            Err(status) if status.code() == Code::AlreadyExists => {
+                let placement = self.placement(name).await?;
+                if placement.primary.is_some() {
+                    return Err(status);
+                }
+                placement
+            }
+            Err(status) => return Err(status),
+        };
+        let start = match &self.entry {
+            Some(entry) => entry.clone(),
+            None => first_candidate(&placement).ok_or_else(|| {
+                Status::unavailable(format!(
+                    "no member of the replica set of {name} has an address"
+                ))
+            })?,
+        };
+        let point = restore_point(target);
+        let restored = self
+            .following(start, |mut client| {
+                let request = RestoreRequest {
+                    database: name.to_string(),
+                    archive: archive.to_owned(),
+                    source: source.to_string(),
+                    point: Some(point.clone()),
+                };
+                async move { client.restore(request).await }
+            })
+            .await?;
+        Ok(Restoration {
+            location: location(placement_of(restored.placement)?)?,
+            position: optional_position(restored.position),
+            chain_hash: chain_hash(&restored.chain_hash)?,
+            snapshot: restored.snapshot,
+            segments: restored.segments,
+            archived_at_ms: restored.archived_at_ms,
+        })
+    }
+
+    /// Asks the data node at `address` (`host:port`) what `archive` holds for `name`.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if the node has no such archive, `UNAVAILABLE` if it or the store can't be
+    /// reached, and `INTERNAL` if its reply is invalid.
+    pub async fn describe_archive(
+        &self,
+        address: &str,
+        archive: &str,
+        name: &DatabaseName,
+    ) -> Result<ArchiveDescription, Status> {
+        let response = self
+            .database(address)?
+            .describe_archive(DescribeArchiveRequest {
+                database: name.to_string(),
+                archive: archive.to_owned(),
+            })
+            .await?
+            .into_inner();
+        Ok(ArchiveDescription {
+            database: name.clone(),
+            snapshots: response
+                .snapshots
+                .into_iter()
+                .map(|snapshot| ArchivedSnapshot {
+                    id: snapshot.id,
+                    epoch: LeaseEpoch::new(snapshot.epoch),
+                    position: optional_position(snapshot.position),
+                    taken_at_ms: snapshot.taken_at_ms,
+                    bytes: snapshot.bytes,
+                })
+                .collect(),
+            latest: optional_position(response.latest),
+            latest_ms: response.latest_ms,
+            segments: response.segments,
+            segment_bytes: response.segment_bytes,
+            incomplete: response.incomplete,
+            damaged: response.damaged,
+        })
+    }
+
+    /// Asks the data node at `address` (`host:port`) to restore `archive`'s copy of `name` at
+    /// `target` into a scratch directory, verifying every batch, and to discard it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::restore_database`]'s restore.
+    pub async fn verify_archive(
+        &self,
+        address: &str,
+        archive: &str,
+        name: &DatabaseName,
+        target: &RestoreTarget,
+    ) -> Result<ArchiveVerification, Status> {
+        let response = self
+            .database(address)?
+            .verify_archive(VerifyArchiveRequest {
+                database: name.to_string(),
+                archive: archive.to_owned(),
+                point: Some(restore_point(target)),
+            })
+            .await?
+            .into_inner();
+        Ok(ArchiveVerification {
+            position: optional_position(response.position),
+            chain_hash: chain_hash(&response.chain_hash)?,
+            snapshot: response.snapshot,
+            segments: response.segments,
+        })
     }
 
     /// Drops a database for good, and returns the epoch it was at. Its primary stops serving it

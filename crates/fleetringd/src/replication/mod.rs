@@ -150,7 +150,7 @@ use crate::publisher::{
 use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
 
-pub(crate) use self::archive::Packer;
+pub(crate) use self::archive::{Packer, Unpacker, remove_dir_if_present};
 pub use self::binding::{EpochAuthority, EpochHolders, HoldersFuture};
 pub use self::chain::{ChainHash, ParseChainHashError};
 pub use self::failover::{Fenced, PromotionRequest};
@@ -853,6 +853,40 @@ impl Replication {
         epoch: LeaseEpoch,
     ) -> Result<Option<Position>, SeedError> {
         snapshot::seed(&self.inner, database, from, epoch.get()).await
+    }
+
+    /// A fresh directory, beside the databases, for a restore to build a copy in before
+    /// [`install_restored`](Self::install_restored) moves it into place.
+    pub(crate) fn restore_staging(&self) -> PathBuf {
+        snapshot::restore_staging(&self.inner)
+    }
+
+    /// Moves the copy a restore built in `staging` into `database`'s place, which must hold no
+    /// copy, and records the hash chain `chain` at the copy's `position` as the chain's anchor,
+    /// so that the database's first primary continues the chain the archive verified.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` if the database is open here or this node holds a copy of it, and
+    /// `INTERNAL` if the copy can't be moved.
+    pub(crate) async fn install_restored(
+        &self,
+        database: &DatabaseName,
+        staging: &std::path::Path,
+        position: Option<&Position>,
+        chain: ChainHash,
+    ) -> Result<(), tonic::Status> {
+        snapshot::install_restored(&self.inner, database, staging, position, chain).await
+    }
+
+    /// The engine the node's databases run on.
+    pub(crate) fn engine(&self) -> Arc<dyn DatabaseEngine> {
+        Arc::clone(&self.inner.engine)
+    }
+
+    /// Where blocking storage calls run.
+    pub(crate) fn execution(&self) -> Execution {
+        self.inner.execution
     }
 
     /// Checkpoints `database` now, if every follower holds everything, and ships the marker.

@@ -21,9 +21,13 @@ use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIF
 use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
-    Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo, Verification,
+    ArchiveDescription, Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo,
+    Verification,
 };
-use fleetringd::engine::{Position, Rows, Statement, Value};
+use fleetringd::durability::{
+    ArchiveKeys, RestoreTarget, build_store, finish_offline, restore_into,
+};
+use fleetringd::engine::{Execution, Position, Rows, SqliteEngine, Statement, Value};
 use fleetringd::replication::ChainHash;
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
@@ -109,6 +113,9 @@ enum Command {
     /// Follows the leases data nodes hold.
     #[command(subcommand)]
     Lease(LeaseCommand),
+    /// Works with archives without a fleet: restores a database from one offline.
+    #[command(subcommand)]
+    Archive(ArchiveCommand),
     /// Shows the members with their liveness, the membership epoch, and the ring fingerprint, as
     /// the control plane sees them; with `--node` or `--address`, as one data node sees them.
     Status {
@@ -121,6 +128,88 @@ enum Command {
         /// else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
+        #[command(flatten)]
+        target: Target,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ArchiveCommand {
+    /// Restores an archived database into a new directory, with no fleet: for disaster
+    /// recovery. The directory then holds a plain SQLite database, `data.db`, that `sqlite3`
+    /// opens directly. Every batch is verified against the hash chain on the way.
+    Restore {
+        /// A daemon's configuration file, whose `[[archive]]` entry names the store.
+        #[arg(long)]
+        config: PathBuf,
+        /// The `[[archive]]` entry's name.
+        #[arg(long)]
+        archive: String,
+        /// The archived database to restore.
+        #[arg(long)]
+        from: DatabaseName,
+        /// The directory to write, which must not exist.
+        #[arg(long)]
+        to: PathBuf,
+        #[command(flatten)]
+        point: PointArgs,
+    },
+}
+
+/// Which point of an archive a command restores: the latest unless one is named.
+#[derive(Debug, Args)]
+struct PointArgs {
+    /// Restores exactly the log up to this position, a transaction boundary, as `db locate` or
+    /// `db archive describe` prints positions.
+    #[arg(long, value_parser = parse_position, conflicts_with = "at_time")]
+    at_position: Option<Position>,
+    /// Restores every segment archived at or before this time, RFC 3339, such as
+    /// `2026-11-03T09:30:00Z`, by the archiving nodes' clocks. The restore may stop up to one
+    /// segment interval before it, and never holds a write acknowledged after it.
+    #[arg(long, value_parser = parse_time)]
+    at_time: Option<u64>,
+}
+
+impl PointArgs {
+    fn target(&self) -> RestoreTarget {
+        match (&self.at_position, self.at_time) {
+            (Some(position), _) => RestoreTarget::Position(position.clone()),
+            (None, Some(ms)) => RestoreTarget::Time(ms),
+            (None, None) => RestoreTarget::Latest,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum DbArchiveCommand {
+    /// Shows what an archive holds for a database: its snapshots, how far its segments reach,
+    /// and anything a restore won't use.
+    Show {
+        /// The archived database.
+        name: DatabaseName,
+        /// The `[[archive]]` entry's name.
+        #[arg(long)]
+        archive: String,
+        /// Asks the data node at this address, `host:port`, instead of the first live member.
+        #[arg(long)]
+        address: Option<String>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Restores an archived database into a scratch copy on a data node, verifying every batch
+    /// against the hash chain, and discards it; then asks each live replica for its hash at the
+    /// restored position and reports whether they agree with the archive.
+    Verify {
+        /// The archived database.
+        name: DatabaseName,
+        /// The `[[archive]]` entry's name.
+        #[arg(long)]
+        archive: String,
+        /// Asks the data node at this address, `host:port`, instead of the first live member.
+        #[arg(long)]
+        address: Option<String>,
+        #[command(flatten)]
+        point: PointArgs,
         #[command(flatten)]
         target: Target,
     },
@@ -314,6 +403,32 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
+    /// Creates a new database from an archived one: the first live member of its replica set
+    /// restores it, verifying every batch against the hash chain, and serves it. The archived
+    /// database needs not exist any more; restoring under its own name needs it dropped first.
+    Restore {
+        /// The new database's name.
+        name: DatabaseName,
+        /// The `[[archive]]` entry's name.
+        #[arg(long)]
+        archive: String,
+        /// The archived database to restore.
+        #[arg(long)]
+        from: DatabaseName,
+        #[command(flatten)]
+        point: PointArgs,
+        /// How many replicas the new database has, the primary included.
+        #[arg(long, default_value_t = 3)]
+        replication_factor: u8,
+        /// The acknowledgement mode, as for `db create`; the fleet's default if unset.
+        #[arg(long)]
+        acks: Option<Acks>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Shows and verifies a database's archive.
+    #[command(subcommand)]
+    Archive(DbArchiveCommand),
     /// Drops a database for good: every replica deletes its copy.
     Drop {
         /// The database's name.
@@ -633,6 +748,28 @@ fn parse_param(text: &str) -> Result<Value, String> {
     }
 }
 
+/// A time in RFC 3339, as milliseconds since the Unix epoch.
+fn parse_time(text: &str) -> Result<u64, String> {
+    let time = time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .map_err(|error| {
+            format!("'{text}' isn't an RFC 3339 time, such as 2026-11-03T09:30:00Z: {error}")
+        })?;
+    u64::try_from(time.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| format!("'{text}' is before 1970"))
+}
+
+/// Milliseconds since the Unix epoch in RFC 3339.
+fn format_time(ms: u64) -> String {
+    i128::from(ms)
+        .checked_mul(1_000_000)
+        .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .and_then(|time| {
+            time.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| format!("{ms} ms"))
+}
+
 fn parse_position(text: &str) -> Result<Position, String> {
     if text.is_empty() {
         return Err("a position is hex digits".to_owned());
@@ -789,6 +926,66 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             expect,
             target,
         }) => verify(&target.client()?, &name, at, expect).await?,
+        Command::Db(DbCommand::Restore {
+            name,
+            archive,
+            from,
+            point,
+            replication_factor,
+            acks,
+            target,
+        }) => {
+            let replication_factor = ReplicationFactor::new(replication_factor)
+                .ok_or("the replication factor must be at least 1")?;
+            let mut spec = DatabaseSpec::new(replication_factor);
+            if let Some(acks) = acks {
+                spec = spec.with_acks(acks);
+            }
+            let restored = target
+                .client()?
+                .restore_database(&name, spec, &archive, &from, &point.target())
+                .await
+                .map_err(failed)?;
+            format!(
+                "restored {name} from {from} in archive {archive}\n{}{}",
+                format_restored(
+                    restored.position.as_ref(),
+                    &restored.chain_hash,
+                    &restored.snapshot,
+                    restored.segments,
+                    restored.archived_at_ms
+                ),
+                format_location(&restored.location)
+            )
+        }
+        Command::Db(DbCommand::Archive(DbArchiveCommand::Show {
+            name,
+            archive,
+            address,
+            target,
+        })) => {
+            let client = target.client()?;
+            let address = archive_node(&client, address).await?;
+            let description = client
+                .describe_archive(&address, &archive, &name)
+                .await
+                .map_err(failed)?;
+            format_archive(&archive, &description)
+        }
+        Command::Db(DbCommand::Archive(DbArchiveCommand::Verify {
+            name,
+            archive,
+            address,
+            point,
+            target,
+        })) => verify_archive(&target.client()?, &name, &archive, address, &point.target()).await?,
+        Command::Archive(ArchiveCommand::Restore {
+            config,
+            archive,
+            from,
+            to,
+            point,
+        }) => restore_offline(&config, &archive, &from, &to, &point.target()).await?,
         Command::Db(DbCommand::Drop { name, yes, target }) => {
             if !yes {
                 confirm_drop(&name)?;
@@ -838,6 +1035,194 @@ async fn node_address(
         Some(node) => Ok(Some(member_address(&target.client()?, node).await?)),
         None => Ok(address),
     }
+}
+
+/// The data node an archive command asks: `address` as given, or the first live member with an
+/// address.
+async fn archive_node(client: &Client, address: Option<String>) -> Result<String, Box<dyn Error>> {
+    if let Some(address) = address {
+        return Ok(address);
+    }
+    let view = client.status().await.map_err(failed)?;
+    view.members()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .find_map(|(member, _)| member.address().map(str::to_owned))
+        .ok_or_else(|| "no live data node has an address; pass --address".into())
+}
+
+/// What a restore reports: where it got, verified how, from what.
+fn format_restored(
+    position: Option<&Position>,
+    chain_hash: &ChainHash,
+    snapshot: &str,
+    segments: u32,
+    archived_at_ms: Option<u64>,
+) -> String {
+    format!(
+        "position: {}\nchain hash: {chain_hash}\nsnapshot: {snapshot}\nsegments applied: \
+         {segments}\nlast segment archived: {}\n",
+        position.map_or_else(|| "the log's beginning".to_owned(), ToString::to_string),
+        archived_at_ms.map_or_else(|| "none applied".to_owned(), format_time),
+    )
+}
+
+/// `db archive describe`'s report.
+fn format_archive(archive: &str, description: &ArchiveDescription) -> String {
+    let mut output = format!(
+        "database: {}\narchive: {archive}\nlatest: {}\nlast segment archived: {}\n\
+         segments: {} ({} bytes)\nsnapshots:\n",
+        description.database,
+        description
+            .latest
+            .as_ref()
+            .map_or_else(|| "nothing archived".to_owned(), ToString::to_string),
+        description
+            .latest_ms
+            .map_or_else(|| "none".to_owned(), format_time),
+        description.segments,
+        description.segment_bytes,
+    );
+    if description.snapshots.is_empty() {
+        output.push_str("  none\n");
+    }
+    for snapshot in &description.snapshots {
+        let _ = writeln!(
+            output,
+            "  {}: position {} epoch {} taken {} ({} bytes)",
+            snapshot.id,
+            snapshot
+                .position
+                .as_ref()
+                .map_or_else(|| "begin".to_owned(), ToString::to_string),
+            snapshot.epoch.get(),
+            format_time(snapshot.taken_at_ms),
+            snapshot.bytes
+        );
+    }
+    if description.incomplete > 0 {
+        let _ = writeln!(output, "incomplete snapshots: {}", description.incomplete);
+    }
+    for damaged in &description.damaged {
+        let _ = writeln!(output, "unusable: {damaged}");
+    }
+    output
+}
+
+/// Runs `db archive verify`: a scratch restore on a data node, then each live replica's hash at
+/// the restored position, compared with the archive's.
+async fn verify_archive(
+    client: &Client,
+    name: &DatabaseName,
+    archive: &str,
+    address: Option<String>,
+    target: &RestoreTarget,
+) -> Result<String, Box<dyn Error>> {
+    let address = archive_node(client, address).await?;
+    let verified = client
+        .verify_archive(&address, archive, name, target)
+        .await
+        .map_err(failed)?;
+    let mut output = format!(
+        "database: {name}\narchive: {archive}\n{}",
+        format_restored(
+            verified.position.as_ref(),
+            &verified.chain_hash,
+            &verified.snapshot,
+            verified.segments,
+            None
+        )
+    );
+    let location = match client.locate(name).await {
+        Ok(location) => location,
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            output.push_str("the archive verifies; there is no live database to compare it with\n");
+            return Ok(output);
+        }
+        Err(status) => return Err(failed(status)),
+    };
+    let mut differ = Vec::new();
+    let mut unanswered = Vec::new();
+    for replica in &location.replicas {
+        let Some(address) = &replica.address else {
+            continue;
+        };
+        match client
+            .verify(address, name, verified.position.as_ref())
+            .await
+        {
+            Ok(answer) if answer.chain_hash == verified.chain_hash => {
+                let _ = writeln!(output, "  {}: agrees", replica.node);
+            }
+            Ok(answer) => {
+                let _ = writeln!(output, "  {}: holds {}", replica.node, answer.chain_hash);
+                differ.push(replica.node.to_string());
+            }
+            Err(status) => {
+                let _ = writeln!(output, "  {}: {}", replica.node, failed(status));
+                unanswered.push(replica.node.to_string());
+            }
+        }
+    }
+    if !differ.is_empty() {
+        return Err(format!(
+            "{output}the archive differs from {} at its latest point",
+            differ.join(", ")
+        )
+        .into());
+    }
+    if unanswered.is_empty() {
+        output.push_str("archive agrees with every replica\n");
+    } else {
+        let _ = writeln!(
+            output,
+            "archive agrees with every replica that answered; {} couldn't",
+            unanswered.join(", ")
+        );
+    }
+    Ok(output)
+}
+
+/// Runs `archive restore`: builds the store `config`'s `[[archive]]` entry names, restores `from`
+/// into `to`, and checkpoints it so that `data.db` holds every row.
+async fn restore_offline(
+    config: &Path,
+    archive: &str,
+    from: &DatabaseName,
+    to: &Path,
+    target: &RestoreTarget,
+) -> Result<String, Box<dyn Error>> {
+    let config = Config::load(config)?;
+    let entry = config
+        .archive
+        .iter()
+        .find(|entry| entry.name == archive)
+        .ok_or_else(|| format!("the configuration has no [[archive]] named `{archive}`"))?;
+    let store = build_store(entry, std::sync::Arc::new(SystemClock), Execution::Threads)?;
+    let engine = SqliteEngine::new(config.engine.page_size)?;
+    let restored = restore_into(
+        store.as_ref(),
+        &ArchiveKeys::new(&entry.prefix, from),
+        from,
+        std::sync::Arc::new(engine.clone()),
+        target,
+        to,
+        Execution::Threads,
+    )
+    .await?;
+    finish_offline(&engine, to)?;
+    Ok(format!(
+        "restored {from} from archive {archive} into {}\n{}the directory holds a plain SQLite \
+         database: {}\n",
+        to.display(),
+        format_restored(
+            restored.position.as_ref(),
+            &restored.chain,
+            &restored.snapshot,
+            restored.segments,
+            restored.archived_at_ms
+        ),
+        to.join("data.db").display()
+    ))
 }
 
 /// The address the member `node` advertised, from the control plane's membership.

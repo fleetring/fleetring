@@ -28,7 +28,7 @@ use super::archive::{Packer, Unpacker, remove_dir_if_present};
 use super::chain::ChainHash;
 use super::epochs::sync_dir;
 use super::failover;
-use super::follower::{admit, blocking, seeded_chain};
+use super::follower::{admit, blocking, record_anchor, seeded_chain};
 use super::primary::{self, held};
 use super::{Inner, SeedError};
 use crate::engine::{EngineCapability, Execution, Position};
@@ -41,6 +41,7 @@ const CHUNK_BYTES: usize = 1024 * 1024;
 /// so these never collide with one.
 const INCOMING: &str = "incoming";
 const RETIRED: &str = "retired";
+const RESTORING: &str = "restoring";
 
 pub(super) type ChunkStream = Pin<Box<dyn Stream<Item = Result<SnapshotChunk, Status>> + Send>>;
 
@@ -330,13 +331,61 @@ pub(super) fn sweep(root: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let staged = [INCOMING, RETIRED, "outgoing"]
+        let staged = [INCOMING, RETIRED, RESTORING, "outgoing"]
             .iter()
             .any(|kind| name.starts_with(&format!(".{kind}-")));
         if staged && let Err(error) = remove_dir_if_present(&entry.path()) {
             tracing::warn!(dir = %entry.path().display(), %error, "can't remove a staging directory");
         }
     }
+}
+
+/// A fresh directory for a restore to build a copy in, beside the databases, so that installing
+/// it is a rename. One a crash leaves behind is removed when replication starts.
+pub(super) fn restore_staging(inner: &Inner) -> PathBuf {
+    inner.staging(RESTORING)
+}
+
+/// Moves the copy a restore built in `staging` into `database`'s place, which holds no copy, and
+/// records the chain's anchor at the copy's position, as a seeded follower's is (ADR-0029,
+/// point 12).
+pub(super) async fn install_restored(
+    inner: &Arc<Inner>,
+    database: &DatabaseName,
+    staging: &Path,
+    position: Option<&Position>,
+    chain: ChainHash,
+) -> Result<(), Status> {
+    if inner.primary(database).is_some() || inner.registry().is_open(database) {
+        return Err(Status::failed_precondition(format!(
+            "{database} is open on this node; a restore creates a new database"
+        )));
+    }
+    let location = inner.registry().location(database);
+    let aside = inner.staging(RETIRED);
+    let installed = {
+        let (staging, location) = (staging.to_owned(), location.clone());
+        blocking(inner.execution, move || {
+            if location.try_exists()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} holds a copy", location.display()),
+                ));
+            }
+            install(&staging, &location, &aside)
+        })
+        .await?
+    };
+    installed.map_err(|error| match error.kind() {
+        io::ErrorKind::AlreadyExists => Status::failed_precondition(format!(
+            "this node already holds a copy of {database}: {error}"
+        )),
+        _ => Status::internal(format!("can't install the restored copy: {error}")),
+    })?;
+    let anchor = super::chain::Anchor::new(position, chain, super::chain::Provenance::Recorded);
+    record_anchor(inner, database, anchor).await;
+    tracing::info!(database = %database, ?position, %chain, "installed a restored copy");
+    Ok(())
 }
 
 /// Seeds this node's copy of `database` from `from`, as [`Replication::seed`] describes.

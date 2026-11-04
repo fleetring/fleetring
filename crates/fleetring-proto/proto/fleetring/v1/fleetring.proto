@@ -527,6 +527,101 @@ service Database {
   // from its copy, so that an operator can compare every replica's. Any replica answers.
   // Scope: read on the database, or fleet.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // Builds a new database from an archive (FR-049): the database must exist in the control plane,
+  // unleased, and the receiving node must be in its replica set. The node restores the archived
+  // `source` into its own copy, verifying every batch against the hash chain, takes the first
+  // lease, and serves it; followers seed from it. The handler also requires admin on `source`.
+  // Scope: admin on the database.
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+  // What an archive holds for a database: its snapshots and how far its segments reach.
+  // Scope: read on the database, or fleet.
+  rpc DescribeArchive(DescribeArchiveRequest) returns (DescribeArchiveResponse);
+  // Restores an archived database into a scratch directory, verifying every batch against the
+  // hash chain, and discards it.
+  // Scope: read on the database, or fleet.
+  rpc VerifyArchive(VerifyArchiveRequest) returns (VerifyArchiveResponse);
+}
+
+message RestoreLatest {}
+
+// What a restore rebuilds.
+message RestorePoint {
+  oneof point {
+    // The furthest point the archive holds.
+    RestoreLatest latest = 1;
+    // Exactly the log up to a position, which must be a transaction boundary.
+    bytes position = 2;
+    // Every segment archived at or before a time: milliseconds since the Unix epoch, by the
+    // archiving nodes' clocks. A time selects which acknowledged prefix to restore, nothing more.
+    uint64 time_ms = 3;
+  }
+}
+
+message RestoreRequest {
+  // The new database.
+  string database = 1;
+  // The `[[archive]]` entry's name.
+  string archive = 2;
+  // The archived database to restore from.
+  string source = 3;
+  // Unset for the latest point.
+  RestorePoint point = 4;
+}
+
+message RestoreResponse {
+  Placement placement = 1;
+  // The position the new database starts at; empty for the log's beginning.
+  bytes position = 2;
+  // The 32-byte hash chain at `position`, verified over every batch applied.
+  bytes chain_hash = 3;
+  // The snapshot the restore started from.
+  string snapshot = 4;
+  // How many segments it applied.
+  uint32 segments = 5;
+  // When the last segment applied was archived; unset if the restore applied no segment.
+  optional uint64 archived_at_ms = 6;
+}
+
+message DescribeArchiveRequest {
+  string database = 1;
+  string archive = 2;
+}
+
+message ArchivedSnapshot {
+  string id = 1;
+  uint64 epoch = 2;
+  bytes position = 3;
+  uint64 taken_at_ms = 4;
+  uint64 bytes = 5;
+}
+
+message DescribeArchiveResponse {
+  string database = 1;
+  // The complete snapshots, oldest first.
+  repeated ArchivedSnapshot snapshots = 2;
+  // The furthest position a snapshot or segment reaches, and when its last segment was archived.
+  bytes latest = 3;
+  optional uint64 latest_ms = 4;
+  uint32 segments = 5;
+  uint64 segment_bytes = 6;
+  // Objects a restore won't use: incomplete snapshots, and objects that don't read back as what
+  // their names say.
+  uint32 incomplete = 7;
+  repeated string damaged = 8;
+}
+
+message VerifyArchiveRequest {
+  string database = 1;
+  string archive = 2;
+  // Unset for the latest point.
+  RestorePoint point = 3;
+}
+
+message VerifyArchiveResponse {
+  bytes position = 1;
+  bytes chain_hash = 2;
+  string snapshot = 3;
+  uint32 segments = 4;
 }
 
 message WatchLeasesRequest {}

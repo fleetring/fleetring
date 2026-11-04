@@ -276,6 +276,21 @@ pub const RPCS: &[Rpc] = &[
         Requirement::DatabaseOrFleet(Action::Read),
         Binding::None,
     ),
+    rpc(
+        "/fleetring.v1.Database/Restore",
+        Requirement::Database(Action::Admin),
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Database/DescribeArchive",
+        Requirement::DatabaseOrFleet(Action::Read),
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Database/VerifyArchive",
+        Requirement::DatabaseOrFleet(Action::Read),
+        Binding::None,
+    ),
 ];
 
 /// The RPC served at `path`, or `None` for a path the table doesn't list, which is refused.
