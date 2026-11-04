@@ -531,14 +531,17 @@ service Database {
   // unleased, and the receiving node must be in its replica set. The node restores the archived
   // `source` into its own copy, verifying every batch against the hash chain, takes the first
   // lease, and serves it; followers seed from it. The handler also requires admin on `source`.
+  // A node runs one restore or verification at a time; another gets UNAVAILABLE.
   // Scope: admin on the database.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
   // What an archive holds for a database: its snapshots and how far its segments reach.
   // Scope: read on the database, or fleet.
   rpc DescribeArchive(DescribeArchiveRequest) returns (DescribeArchiveResponse);
   // Restores an archived database into a scratch directory, verifying every batch against the
-  // hash chain, and discards it.
-  // Scope: read on the database, or fleet.
+  // hash chain, and discards it. It costs the node a whole copy on its disk, so it needs admin,
+  // as a restore does, and a node runs one verification or restore at a time; another gets
+  // UNAVAILABLE, which a retry settles.
+  // Scope: admin on the database.
   rpc VerifyArchive(VerifyArchiveRequest) returns (VerifyArchiveResponse);
 }
 

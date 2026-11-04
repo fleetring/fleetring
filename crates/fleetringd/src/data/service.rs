@@ -308,7 +308,8 @@ impl Database for DatabaseService {
     }
 
     /// Restores the archived database into a scratch directory beside this node's databases,
-    /// verifying every batch, and removes the directory again.
+    /// verifying every batch, and removes the directory again. One at a time per node, with
+    /// restores.
     async fn verify_archive(
         &self,
         request: Request<VerifyArchiveRequest>,
@@ -318,6 +319,7 @@ impl Database for DatabaseService {
         let request = request.into_inner();
         let target = restore_target(request.point)?;
         let archive = self.node.archive(&request.archive)?;
+        let _staging = self.node.staging_permit()?;
         let replication = self.node.replication();
         let scratch = replication.restore_staging();
         let restored = restore_into(

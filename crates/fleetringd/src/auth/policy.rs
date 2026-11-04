@@ -288,7 +288,7 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc(
         "/fleetring.v1.Database/VerifyArchive",
-        Requirement::DatabaseOrFleet(Action::Read),
+        Requirement::Database(Action::Admin),
         Binding::None,
     ),
 ];
