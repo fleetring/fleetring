@@ -869,8 +869,10 @@ mod tests {
         }
         assert!(
             text.contains(&format!(
-                "fleetring_build_info{{version=\"{}\",protocol=\"1.0\"}} 1\n",
-                env!("CARGO_PKG_VERSION")
+                "fleetring_build_info{{version=\"{}\",protocol=\"{}.{}\"}} 1\n",
+                env!("CARGO_PKG_VERSION"),
+                PROTOCOL_VERSION.major,
+                PROTOCOL_VERSION.minor
             )),
             "{text}"
         );

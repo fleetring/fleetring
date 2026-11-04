@@ -180,6 +180,7 @@ async fn a_control_daemon_and_two_data_daemons_converge_on_one_ring() -> TestRes
                 weight: 1,
                 address: None,
             }),
+            software: None,
         })
         .await
         .expect_err("a data-only node serves no control service");

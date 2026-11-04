@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::command::UnknownReports;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
-    Action, Command, Database, DatabaseName, Durability, DurabilityError, Engine, HostedReplica,
-    Lease, LeaseEpoch, Member, Position, Promotion, Quorums, Revoked, State, Timestamp,
+    Action, Command, Database, DatabaseName, Durability, DurabilityError, Engine, Feature,
+    HostedReplica, Lease, LeaseEpoch, Member, Position, Promotion, Quorums, Release, Revoked,
+    Software, State, Timestamp,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -27,6 +28,10 @@ pub type Outcome = Result<Applied, Rejection>;
 /// [`State::now`] to the time it ran at.
 ///
 /// **Rejections** leave the state exactly as it was, including [`State::now`].
+///
+/// **Features.** An action that needs a fleet feature ([`Action::feature`]) is checked against
+/// the gate first ([`State::check_features`]); the first one accepted enables the feature for
+/// good (ADR-0038, point 4).
 ///
 /// # Errors
 ///
@@ -62,6 +67,10 @@ pub type Outcome = Result<Applied, Rejection>;
 /// ```
 pub fn apply(state: &mut State, command: Command) -> Outcome {
     let now = command.at.max(state.now);
+    let feature = command.action.feature();
+    if let Some(feature) = feature {
+        state.check_feature(feature)?;
+    }
     let applied = match command.action {
         Action::Join { member } => join(state, now, member),
         Action::Leave { id } => leave(state, id),
@@ -69,7 +78,8 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             id,
             replicas,
             unknown_reports,
-        } => heartbeat(state, now, id, replicas, unknown_reports),
+            software,
+        } => heartbeat(state, now, id, replicas, unknown_reports, software),
         Action::CreateDatabase {
             name,
             replication_factor,
@@ -102,9 +112,13 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             Ok(Applied::Ticked { at: now })
         }
         Action::Drain { id } => drain(state, id),
+        Action::Undrain { id } => undrain(state, id),
         Action::TransferLease { database, target } => transfer_lease(state, now, database, target),
         Action::RevokeToken { revoked, until } => revoke_token(state, now, revoked, until),
     }?;
+    if let Some(feature) = feature {
+        state.features.insert(feature);
+    }
     state.now = now;
     Ok(applied)
 }
@@ -228,6 +242,12 @@ pub enum Applied {
 
     /// A member is draining: it gets no new lease, and it may hand its leases over.
     MemberDraining {
+        /// The member's ID.
+        id: NodeId,
+    },
+
+    /// A member's draining mark is cleared: it may take leases again.
+    MemberUndrained {
         /// The member's ID.
         id: NodeId,
     },
@@ -447,6 +467,53 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
+    /// The joining member's release is more than one release line from a member's, or in another
+    /// major: a fleet runs at most two adjacent release lines at once (ADR-0038, point 1).
+    #[error(
+        "node '{id}' runs fleetringd {release}, which can't run beside node '{member}' on \
+         {member_release}: a fleet runs at most two adjacent release lines at once"
+    )]
+    IncompatibleVersion {
+        /// The joining node's ID.
+        id: NodeId,
+        /// The joining node's release.
+        release: Release,
+        /// A member whose release line is too far from it.
+        member: NodeId,
+        /// That member's release.
+        member_release: Release,
+    },
+
+    /// The joining member lacks a fleet feature the fleet has enabled, so it couldn't read or
+    /// act on commands the fleet already uses.
+    #[error(
+        "node '{id}' runs fleetringd {release}, which lacks the fleet feature '{feature}' this \
+         fleet uses; it needs a release that supports it"
+    )]
+    MissingFeature {
+        /// The joining node's ID.
+        id: NodeId,
+        /// The joining node's release.
+        release: Release,
+        /// The enabled feature it lacks.
+        feature: Feature,
+    },
+
+    /// The command needs a fleet feature that a member doesn't support yet, so applying it would
+    /// leave that member behind.
+    #[error(
+        "the fleet can't use '{feature}' yet: node '{id}' runs fleetringd {release}, which \
+         doesn't support it; upgrade every member first"
+    )]
+    FeatureUnsupported {
+        /// The feature the command needs.
+        feature: Feature,
+        /// The first member, in ID order, that doesn't support it.
+        id: NodeId,
+        /// That member's release.
+        release: Release,
+    },
+
     /// A revocation would be forgotten at once: the token it names has already expired.
     #[error("revocation of {revoked} ends at {until}, which has passed")]
     RevocationPassed {
@@ -459,6 +526,12 @@ pub enum Rejection {
 
 fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
     let id = member.id().clone();
+    // A member that rejoins on the software it is recorded with changes no release in the fleet,
+    // so it is never refused for it: a heartbeat may have recorded software a join would refuse.
+    let recorded = state.members.get(&id).map(|entry| entry.member.software());
+    if recorded != Some(member.software()) {
+        check_software(state, &id, &member.running())?;
+    }
     let kind = match state.members.get(&id) {
         None => JoinKind::New,
         Some(entry) if entry.member == member => JoinKind::Rejoined,
@@ -498,6 +571,39 @@ fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
     })
 }
 
+/// Checks that a member `id` running `software` may join: it supports every enabled feature,
+/// and its release line is within the window of every other member's, live or down (ADR-0038,
+/// point 3).
+fn check_software(state: &State, id: &NodeId, software: &Software) -> Result<(), Rejection> {
+    if let Some(feature) = state
+        .features
+        .iter()
+        .copied()
+        .find(|feature| !software.supports(*feature))
+    {
+        return Err(Rejection::MissingFeature {
+            id: id.clone(),
+            release: software.release().clone(),
+            feature,
+        });
+    }
+    for (other, entry) in &state.members {
+        if other == id {
+            continue;
+        }
+        let theirs = entry.member.running();
+        if !software.release().runs_beside(theirs.release()) {
+            return Err(Rejection::IncompatibleVersion {
+                id: id.clone(),
+                release: software.release().clone(),
+                member: other.clone(),
+                member_release: theirs.release().clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn leave(state: &mut State, id: NodeId) -> Outcome {
     if !state.members.contains_key(&id) {
         return Err(Rejection::UnknownMember { id });
@@ -518,10 +624,18 @@ fn heartbeat(
     id: NodeId,
     replicas: Vec<HostedReplica>,
     unknown_reports: UnknownReports,
+    software: Option<Software>,
 ) -> Outcome {
-    if !state.members.contains_key(&id) {
+    let Some(entry) = state.members.get(&id) else {
         return Err(Rejection::UnknownMember { id });
-    }
+    };
+    // A heartbeat is never refused for its software: that would make a live node look down. It
+    // only corrects the record, which grows the membership epoch as a join would.
+    let software = software.filter(|software| entry.member.software() != Some(software));
+    let membership_epoch = match software {
+        Some(_) => next_membership_epoch(state.membership_epoch)?,
+        None => state.membership_epoch,
+    };
     let mut seen = BTreeSet::new();
     let mut unknown = Vec::new();
     for replica in &replicas {
@@ -553,6 +667,10 @@ fn heartbeat(
     };
     entry.last_heartbeat = now;
     entry.reports = reports;
+    if let Some(software) = software {
+        entry.member = entry.member.clone().with_software(software);
+    }
+    state.membership_epoch = membership_epoch;
     Ok(Applied::HeartbeatRecorded { id, unknown })
 }
 
@@ -829,6 +947,14 @@ fn drain(state: &mut State, id: NodeId) -> Outcome {
     };
     entry.draining = true;
     Ok(Applied::MemberDraining { id })
+}
+
+fn undrain(state: &mut State, id: NodeId) -> Outcome {
+    let Some(entry) = state.members.get_mut(&id) else {
+        return Err(Rejection::UnknownMember { id });
+    };
+    entry.draining = false;
+    Ok(Applied::MemberUndrained { id })
 }
 
 /// Starts a promotion for `database` at the next epoch without waiting for its lease to expire,

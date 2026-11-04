@@ -544,6 +544,7 @@ fn heartbeat_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> 
             .with_log_epoch(LeaseEpoch::new(log_epoch)),
         ],
         unknown_reports: fleetring_control::UnknownReports::Skip,
+        software: None,
     }
 }
 

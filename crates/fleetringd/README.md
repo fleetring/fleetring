@@ -131,6 +131,7 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Control.RecordFenced` | node | candidate |
 | `Control.CompletePromotion` | node | candidate |
 | `Control.Drain` | fleet | self |
+| `Control.Undrain` | fleet | — |
 | `Control.TransferLease` | admin on the database | holder |
 | `Control.RevokeToken` | fleet | — |
 | `Replication.Replicate` | node | holder or candidate |

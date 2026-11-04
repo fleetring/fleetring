@@ -14,7 +14,7 @@ use fleetring_proto::v1::{
     LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
     MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
     RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
-    TransferLeaseRequest, WatchMembershipRequest,
+    TransferLeaseRequest, UndrainRequest, UndrainResponse, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
@@ -361,6 +361,20 @@ impl ControlClient {
         self.retrying(|mut client| {
             let request = request.clone();
             async move { client.drain(request).await }
+        })
+        .await
+    }
+
+    /// Clears a member's draining mark. Retried: clearing it twice changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt: `FAILED_PRECONDITION` while a member doesn't support the
+    /// `undrain` feature.
+    pub async fn undrain(&self, request: UndrainRequest) -> Result<UndrainResponse, Status> {
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.undrain(request).await }
         })
         .await
     }

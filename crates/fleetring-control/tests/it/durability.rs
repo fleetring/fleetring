@@ -371,6 +371,7 @@ fn report_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> Act
                 .with_log_epoch(LeaseEpoch::new(log_epoch)),
         ],
         unknown_reports: UnknownReports::Skip,
+        software: None,
     }
 }
 

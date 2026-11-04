@@ -1407,9 +1407,10 @@ mod binary {
         );
         for daemon in &fleet.data {
             let line = format!(
-                "  {} live weight=1 address={}\n",
+                "  {} live weight=1 address={} version={}\n",
                 daemon.config().node.id,
-                daemon.listen_address()
+                daemon.listen_address(),
+                fleetringd::software::VERSION
             );
             assert!(status.contains(&line), "{line} in {status}");
         }

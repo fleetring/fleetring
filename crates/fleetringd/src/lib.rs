@@ -27,6 +27,7 @@ mod registry;
 pub mod replication;
 #[cfg(feature = "simulation")]
 pub mod sim;
+pub mod software;
 pub mod tls;
 pub mod transport;
 

@@ -1,14 +1,14 @@
 //! Control state and the queries the control plane answers from it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fleetring::{BuildRingError, Epoch, Node, NodeId, ReplicationFactor, Ring};
 use serde::{Deserialize, Serialize};
 
 use crate::apply::plan_promotion;
 use crate::{
-    Acks, ControlConfig, Database, DatabaseName, Liveness, Member, Quorums, Rejection, Report,
-    Revocations, Timestamp,
+    Acks, Action, ControlConfig, Database, DatabaseName, Feature, Liveness, Member, Quorums,
+    Rejection, Report, Revocations, Timestamp,
 };
 
 /// Everything the control plane knows: members, their liveness, and databases with their leases.
@@ -40,6 +40,9 @@ pub struct State {
     /// Revoked bearer tokens and signing keys. Absent from states written before revocation.
     #[serde(default, skip_serializing_if = "Revocations::is_empty")]
     pub(crate) revocations: Revocations,
+    /// The fleet features enabled for good. Absent from states written before features.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) features: BTreeSet<Feature>,
 }
 
 /// A member with its liveness and its latest reports.
@@ -65,7 +68,82 @@ impl State {
             members: BTreeMap::new(),
             databases: BTreeMap::new(),
             revocations: Revocations::new(),
+            features: BTreeSet::new(),
         }
+    }
+
+    /// Returns the fleet features enabled for good, in order (ADR-0038, point 4).
+    pub fn features(&self) -> impl ExactSizeIterator<Item = Feature> + '_ {
+        self.features.iter().copied()
+    }
+
+    /// Returns whether `feature` is enabled: a command that needed it was accepted once every
+    /// member supported it.
+    #[must_use]
+    pub fn is_enabled(&self, feature: Feature) -> bool {
+        self.features.contains(&feature)
+    }
+
+    /// Checks `action` against the feature gate alone: it passes if it needs no feature, if its
+    /// feature is enabled, or if every member, live or down, supports the feature.
+    ///
+    /// [`apply`](crate::apply) makes the same check. The control node also makes it before it
+    /// logs a command, so that a refused command never reaches the log, where a control node of
+    /// an older release, after a rollback, couldn't read it.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::FeatureUnsupported`] naming the feature and the first member, in ID order,
+    /// that lacks it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring_control::{
+    ///     apply, Action, Command, ControlConfig, Feature, Member, Rejection, Release, Software,
+    ///     State, Timestamp,
+    /// };
+    ///
+    /// let mut state = State::new(ControlConfig::new());
+    /// let at = Timestamp::from_millis(0);
+    /// let new = Software::new(Release::new(0, 4, 0), 1).with_feature(Feature::Undrain);
+    /// let join = |id: &str, software: Option<Software>| -> Result<Action, Box<dyn std::error::Error>> {
+    ///     let member = Member::new(id.parse()?);
+    ///     Ok(Action::Join { member: match software { Some(s) => member.with_software(s), None => member } })
+    /// };
+    /// apply(&mut state, Command::new(at, join("a", Some(new.clone()))?))?;
+    /// apply(&mut state, Command::new(at, join("b", None)?))?; // 0.3.0 reports nothing
+    /// let undrain = Action::Undrain { id: "a".parse()? };
+    /// assert!(matches!(
+    ///     state.check_features(&undrain),
+    ///     Err(Rejection::FeatureUnsupported { feature: Feature::Undrain, .. })
+    /// ));
+    /// apply(&mut state, Command::new(at, join("b", Some(new))?))?;
+    /// assert!(state.check_features(&undrain).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn check_features(&self, action: &Action) -> Result<(), Rejection> {
+        match action.feature() {
+            Some(feature) => self.check_feature(feature),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn check_feature(&self, feature: Feature) -> Result<(), Rejection> {
+        if self.is_enabled(feature) {
+            return Ok(());
+        }
+        for (id, entry) in &self.members {
+            let software = entry.member.running();
+            if !software.supports(feature) {
+                return Err(Rejection::FeatureUnsupported {
+                    feature,
+                    id: id.clone(),
+                    release: software.release().clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Returns the timing rules the state runs under.
@@ -228,6 +306,7 @@ impl State {
     ///     id: "b".parse()?,
     ///     replicas: vec![report],
     ///     unknown_reports: UnknownReports::Skip,
+    ///     software: None,
     /// };
     /// run(&mut state, 12_000, heartbeat)?;
     /// assert!(state.promotions_due(Timestamp::from_millis(11_000)).is_empty());

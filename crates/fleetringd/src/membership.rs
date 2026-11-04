@@ -47,6 +47,7 @@ use crate::auth::Denylist;
 use crate::control::{ControlClient, member_from, node_to_proto};
 use crate::data::convert::revocations_from_proto;
 use crate::observe::MembershipMetrics;
+use crate::software::{running, software_from_proto, software_to_proto};
 use crate::{MembershipSettings, OnShutdown};
 
 /// How many heartbeat replies in a row may report a later membership epoch than the published one
@@ -544,7 +545,11 @@ fn members_from(
                 Liveness::Down
             };
             let is_draining = member.draining;
-            let member = member_from(member.node)?;
+            let software = member.software.map(software_from_proto).transpose()?;
+            let mut member = member_from(member.node)?;
+            if let Some(software) = software {
+                member = member.with_software(software);
+            }
             if is_draining {
                 draining.push(member.id().clone());
             }
@@ -649,6 +654,7 @@ impl Heartbeats {
         let request = HeartbeatRequest {
             node_id: id.to_owned(),
             databases: self.databases.statuses(),
+            software: Some(software_to_proto(&running())),
         };
         let sent = tokio::time::Instant::now();
         let result = timeout(self.limit, self.client.heartbeat(request)).await;
@@ -682,6 +688,7 @@ async fn heartbeat_loop(
     let join = JoinRequest {
         protocol: Some(PROTOCOL_VERSION),
         node: Some(node_to_proto(&heartbeats.member)),
+        software: Some(software_to_proto(&running())),
     };
     let mut joined = false;
     let mut failing = false;
@@ -844,6 +851,7 @@ mod tests {
                     }),
                     live,
                     draining: false,
+                    software: None,
                 })
                 .collect(),
         }

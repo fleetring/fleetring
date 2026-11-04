@@ -9,7 +9,8 @@
 //!   epoch, and every database with its engine, epoch, lease, and any promotion in progress.
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create or drop a database,
 //!   change its durability, acquire or renew a lease, start a promotion, record a fenced member,
-//!   complete a promotion, tick, drain a member, transfer a lease, or revoke a bearer token.
+//!   complete a promotion, tick, drain or undrain a member, transfer a lease, or revoke a bearer
+//!   token.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -44,6 +45,12 @@
 //!   serves it stops once its next renewal is refused.
 //! - **Ticks** change only the time, so liveness and lease expiry advance without other traffic.
 //! - **Positions** are opaque bytes compared lexicographically (ADR-0016).
+//! - **Software:** each member records the [`Software`] it runs; one that reports none runs
+//!   [`Software::baseline`], release 0.3.0. A join is refused when its release line is more than
+//!   one line from any member's, or when it lacks an enabled feature (ADR-0038).
+//! - **Features** gate commands that not every member can read or act on: such a command is
+//!   accepted only once every member supports its [`Feature`], and the first one accepted
+//!   enables the feature for good.
 //! - **Revocations** list token and key IDs, never credentials, each until a time after which it
 //!   is forgotten; ticks and revocations forget the entries the time has passed (ADR-0025).
 //!
@@ -85,6 +92,7 @@ mod config;
 mod database;
 mod member;
 mod revocation;
+mod software;
 mod state;
 mod time;
 
@@ -97,6 +105,7 @@ pub use database::{
 };
 pub use member::{HostedReplica, Liveness, Member, ReplicaRole, Report};
 pub use revocation::{KeyId, ParseCredentialIdError, Revocations, Revoked, TokenId};
+pub use software::{Feature, ParseFeatureError, ParseReleaseError, Release, Software};
 pub use state::{State, membership_ring};
 pub use time::{Millis, Timestamp};
 
@@ -113,6 +122,7 @@ const _: () = {
     assert_debug_send_sync::<Durability>();
     assert_debug_send_sync::<DurabilityError>();
     assert_debug_send_sync::<Engine>();
+    assert_debug_send_sync::<Feature>();
     assert_debug_send_sync::<HostedReplica>();
     assert_debug_send_sync::<JoinKind>();
     assert_debug_send_sync::<KeyId>();
@@ -125,14 +135,18 @@ const _: () = {
     assert_debug_send_sync::<ParseAcksError>();
     assert_debug_send_sync::<ParseCredentialIdError>();
     assert_debug_send_sync::<ParseDatabaseNameError>();
+    assert_debug_send_sync::<ParseFeatureError>();
+    assert_debug_send_sync::<ParseReleaseError>();
     assert_debug_send_sync::<Position>();
     assert_debug_send_sync::<Promotion>();
     assert_debug_send_sync::<Quorums>();
     assert_debug_send_sync::<Rejection>();
+    assert_debug_send_sync::<Release>();
     assert_debug_send_sync::<Report>();
     assert_debug_send_sync::<Revocations>();
     assert_debug_send_sync::<Revoked>();
     assert_debug_send_sync::<ReplicaRole>();
+    assert_debug_send_sync::<Software>();
     assert_debug_send_sync::<State>();
     assert_debug_send_sync::<Timestamp>();
     assert_debug_send_sync::<TokenId>();

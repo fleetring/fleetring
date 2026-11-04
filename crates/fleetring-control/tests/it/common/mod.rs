@@ -3,8 +3,9 @@
 
 use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
-    Acks, Action, Command, ControlConfig, DatabaseName, Durability, Engine, HostedReplica,
-    LeaseEpoch, Member, Millis, Outcome, Position, ReplicaRole, Revoked, State, Timestamp, apply,
+    Acks, Action, Command, ControlConfig, DatabaseName, Durability, Engine, Feature, HostedReplica,
+    LeaseEpoch, Member, Millis, Outcome, Position, Release, ReplicaRole, Revoked, Software, State,
+    Timestamp, apply,
 };
 use proptest::prelude::*;
 
@@ -79,6 +80,7 @@ pub(crate) fn heartbeat(node: &str, reports: &[(&str, &[u8])]) -> Action {
             })
             .collect(),
         unknown_reports: fleetring_control::UnknownReports::Skip,
+        software: None,
     }
 }
 
@@ -127,6 +129,17 @@ impl Generator {
     }
 }
 
+/// Software a generated member reports: releases from two adjacent lines and one too far from
+/// them, with and without the `undrain` feature.
+pub(crate) fn software_for(b: usize) -> Software {
+    match b % 4 {
+        0 => Software::new(Release::new(0, 3, 1), 1),
+        1 => Software::new(Release::new(0, 4, 0), 1).with_feature(Feature::Undrain),
+        2 => Software::new(Release::new(0, 4, 2), 1).with_feature(Feature::Undrain),
+        _ => Software::new(Release::new(0, 6, 0), 1).with_feature(Feature::Undrain),
+    }
+}
+
 fn action(state: &State, op: Op) -> Action {
     let a = usize::from(op.a);
     let b = usize::from(op.b);
@@ -142,6 +155,11 @@ fn action(state: &State, op: Op) -> Action {
             if b.is_multiple_of(2) {
                 joining = joining.with_address(format!("{node}.local:{}", 7400 + b % 3));
             }
+            // Members report software, sometimes too far apart to run together, so replays cover
+            // version refusals and feature gates too.
+            if b % 5 == 1 {
+                joining = joining.with_software(software_for(b));
+            }
             Action::Join { member: joining }
         }
         1 if b.is_multiple_of(3) => Action::Leave { id: id(node) },
@@ -149,6 +167,7 @@ fn action(state: &State, op: Op) -> Action {
         // Drops are rare, so that databases live long enough to reach promotions.
         8 if b.is_multiple_of(10) => Action::DropDatabase { name: database },
         8 if b % 10 == 5 => Action::Drain { id: id(node) },
+        8 if b % 10 == 9 => Action::Undrain { id: id(node) },
         // Revocations of a few tokens and keys, some already past, so the list grows, shrinks
         // with time, and rejects.
         8 if b % 10 == 3 => Action::RevokeToken {
@@ -205,6 +224,7 @@ fn action(state: &State, op: Op) -> Action {
                 id: id(node),
                 replicas,
                 unknown_reports,
+                software: (b % 7 == 2).then(|| software_for(b)),
             }
         }
         9 => Action::AcquireLease {

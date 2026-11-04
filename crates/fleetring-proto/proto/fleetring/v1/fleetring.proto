@@ -23,6 +23,22 @@ message Node {
   optional string address = 5;
 }
 
+// What a node runs (ADR-0038): its release, and the newest protocol, control-log format, and
+// fleet features it speaks. A node that sends none is taken to run 0.3.0: protocol 1.0,
+// control-log format 1, and no features.
+message Software {
+  // The release, `MAJOR.MINOR.PATCH` with an optional prerelease, as `fleetringd --version`
+  // prints it.
+  string version = 1;
+  ProtocolVersion protocol = 2;
+  // The newest `control.db` format the node reads.
+  uint32 control_format = 3;
+  // The fleet features the node can apply and act on, by name, such as `undrain`. A command that
+  // needs a feature is refused until every member lists it; names a node doesn't know are
+  // ignored.
+  repeated string features = 4;
+}
+
 // The storage engine behind a database (ADR-0021).
 enum Engine {
   ENGINE_UNSPECIFIED = 0;
@@ -108,6 +124,11 @@ service Control {
   // Scope: node.
   // Binding: candidate.
   rpc CompletePromotion(CompletePromotionRequest) returns (CompletePromotionResponse);
+  // Clears a member's draining mark, so that it may take leases again without a restart. A fleet
+  // feature (`undrain`): refused with FAILED_PRECONDITION until every member supports it. An
+  // operator's call: nodes never make it.
+  // Scope: fleet.
+  rpc Undrain(UndrainRequest) returns (UndrainResponse);
   // Marks a member as draining: it gets no new lease and is never a promotion's candidate. The
   // member sees the mark in its membership updates and hands its leases over with
   // TransferLease, then leaves if it is shutting down.
@@ -130,6 +151,10 @@ service Control {
 message JoinRequest {
   ProtocolVersion protocol = 1;
   Node node = 2;
+  // Unset by nodes older than this field, which run 0.3.0. A join whose release is more than one
+  // release line from a member's, or that lacks a feature the fleet has enabled, is refused with
+  // FAILED_PRECONDITION.
+  Software software = 3;
 }
 
 message JoinResponse {
@@ -153,6 +178,9 @@ message DatabaseStatus {
 message HeartbeatRequest {
   string node_id = 1;
   repeated DatabaseStatus databases = 2;
+  // Unset by nodes older than this field. Corrects the control plane's record of the node's
+  // software, as after the control node was upgraded; never a reason to refuse the heartbeat.
+  Software software = 3;
 }
 
 message HeartbeatResponse {
@@ -195,6 +223,9 @@ message Member {
   bool live = 2;
   // Set while the member is draining: handing its leases over before it leaves.
   bool draining = 3;
+  // What the member runs, as it last reported; unset if it reported nothing, as 0.3.0 doesn't,
+  // or if the control node predates the field.
+  Software software = 4;
 }
 
 message MembershipUpdate {
@@ -348,6 +379,12 @@ message CompletePromotionResponse {
   // The most advanced position among the fenced members, as the control plane compares them.
   bytes adopted = 2;
 }
+
+message UndrainRequest {
+  string node_id = 1;
+}
+
+message UndrainResponse {}
 
 message DrainRequest {
   string node_id = 1;

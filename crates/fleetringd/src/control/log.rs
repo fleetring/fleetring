@@ -25,7 +25,7 @@ use fleetring_control::{Command, ControlConfig, State, apply};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The log format this build writes and reads.
-const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 1;
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;

@@ -208,6 +208,12 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Fleet,
         Binding::SelfNode,
     ),
+    // Only an operator cancels a drain; a node never does.
+    rpc(
+        "/fleetring.v1.Control/Undrain",
+        Requirement::Fleet,
+        Binding::None,
+    ),
     // A draining node hands its own leases over; the handler refuses a lease it doesn't hold.
     node_too(
         "/fleetring.v1.Control/TransferLease",

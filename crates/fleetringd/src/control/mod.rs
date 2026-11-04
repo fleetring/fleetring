@@ -25,6 +25,7 @@ mod service;
 pub use absent::NoControl;
 pub use client::ControlClient;
 pub use failover::{Failover, FailoverSettings};
+pub(crate) use log::FORMAT_VERSION;
 pub use log::{CommandLog, LogError, LogIndex, Recovered};
 pub use node::{
     Committed, ControlHandle, ControlNode, ControlOptions, OpenError, RecoverySummary, StorageIo,
