@@ -234,7 +234,10 @@ impl Installed {
         let staged = self.sibling(".", ".new");
         fs::copy(new, &staged).map_err(io_error(&staged))?;
         make_executable(&staged)?;
-        File::open(&staged)
+        // Windows flushes a file only through a handle that may write it.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)
             .and_then(|file| file.sync_all())
             .map_err(io_error(&staged))?;
         fs::rename(&staged, &self.path).map_err(io_error(&self.path))?;
