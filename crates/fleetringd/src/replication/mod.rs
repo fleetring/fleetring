@@ -1101,6 +1101,18 @@ impl PrimaryFeed {
             .sink_delivered(sink, position, self.inner.clock.now());
     }
 
+    /// The hash chain over the log (FR-044) at `position`, brought up to it from the log if the
+    /// chain hasn't reached it yet; `None` if the chain isn't built, doesn't hold `position`, or
+    /// can't be brought up to it.
+    pub(crate) async fn chain_at(&self, position: Option<&Position>) -> Option<ChainHash> {
+        if let Some(hash) = self.primary.hash_at(position) {
+            return Some(hash);
+        }
+        let handle = self.inner.registry().open(self.primary.name()).await.ok()?;
+        primary::chain_to(&self.inner, &self.primary, &handle, position).await;
+        self.primary.hash_at(position)
+    }
+
     /// Whether the primary this feed follows still serves the database.
     pub(crate) fn is_current(&self) -> bool {
         self.inner

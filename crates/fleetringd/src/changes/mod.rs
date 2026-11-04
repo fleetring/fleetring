@@ -76,7 +76,7 @@ use tokio::time;
 use self::position::PositionStore;
 use self::pump::{PumpContext, PumpState};
 use crate::engine::{Execution, Payload, Position, RowChange};
-use crate::replication::Replication;
+use crate::replication::{ChainHash, Replication};
 
 pub use self::config::{ChangesConfig, Format, SinkConfig, SinkKind};
 pub use self::file::{FileSink, database_file};
@@ -109,6 +109,16 @@ pub struct Change {
     pub position: Position,
     /// The batch's content.
     pub kind: ChangeKind,
+    /// The hash chain over the log (FR-044) at [`start`](Self::start), as the primary holds it.
+    ///
+    /// Only physical changes carry the chain, for an archive to record and a restore to check
+    /// (ADR-0029). `None` for a logical change, while the primary's chain isn't built yet or no
+    /// longer holds the position, and for the log's beginning after a checkpoint, where the
+    /// chain is held at the position the log continues from rather than at `None`.
+    pub chain_start: Option<ChainHash>,
+    /// The hash chain at [`position`](Self::position), as the primary holds it; `None` as for
+    /// [`chain_start`](Self::chain_start).
+    pub chain_end: Option<ChainHash>,
 }
 
 /// What a [`Change`] carries: one of the two shapes of change (ADR-0016).
@@ -134,6 +144,13 @@ pub trait ChangeSink: fmt::Debug + Send + Sync + 'static {
 
     /// Takes one change. Completes once the sink has it as durably as it promises.
     fn publish(&self, change: Change) -> Published;
+
+    /// The least time between the end of one delivery and the pump's next read of the log, so
+    /// that a sink that pays per delivery, such as an archive writing one object each, receives
+    /// fewer, larger batches. The default is zero: the pump reads again at once.
+    fn pace(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The error a sink returns when it couldn't take a change. The pump retries either way,

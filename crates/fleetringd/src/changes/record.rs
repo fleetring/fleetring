@@ -89,6 +89,7 @@ pub enum ParseRecordError {
     },
 }
 
+/// A record carries no chain hashes, so the change it parses to has none.
 impl TryFrom<ChangeRecord> for Change {
     type Error = ParseRecordError;
 
@@ -119,6 +120,8 @@ impl TryFrom<ChangeRecord> for Change {
             start,
             position,
             kind,
+            chain_start: None,
+            chain_end: None,
         })
     }
 }
