@@ -8,7 +8,8 @@
 //!    gone; from then on they are redirected to the new primary as any request to a non-primary
 //!    is. Writes already admitted finish: the drain waits, within the hand-over bound, until each
 //!    has committed and put its batch in replication's hands, so the tail shipped next includes
-//!    it, and none commits after the step down, when its batch could only fail as uncertain.
+//!    it rather than failing it as uncertain after the step down. A write whose client
+//!    disconnected stops being waited for, and may still commit after the step down (#87).
 //! 2. **Pick the target:** under `quorum` and `all`, the connected, live follower that has
 //!    acknowledged the most, preferring the earliest in the ring's preference order on ties,
 //!    since every follower holds the current epoch's log. Under `local` (ADR-0023) a follower may
@@ -202,8 +203,8 @@ async fn transfer(
     }
     // 1. Stop taking writes. The guard lifts the refusal when the hand-over is over, whether the
     //    lease is gone by then or the database is stuck and keeps serving. Then let the writes
-    //    already admitted reach replication, so that the tail includes them and none commits
-    //    after the step down, when it could only fail as uncertain.
+    //    already admitted reach replication, so that the tail includes them rather than their
+    //    failing as uncertain after the step down (a disconnected client's write excepted, #87).
     let _refusing = node.refuse_requests(database);
     if !node.await_admitted(database, settings.handover).await {
         tracing::warn!(database = %database, limit = ?settings.handover, "writes admitted before the hand-over are still running; stepping down anyway");
