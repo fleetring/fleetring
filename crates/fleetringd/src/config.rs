@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::auth::Scopes;
 use crate::changes::ChangesConfig;
 use crate::control::DurabilityDefaults;
+use crate::durability::ArchiveConfig;
 use crate::engine::EngineConfig;
 use crate::replication::ReplicationSettings;
 use crate::tls::Principal;
@@ -45,7 +46,8 @@ use crate::tls::Principal;
 /// [`TlsConfig`]. The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
 /// `[membership]` table sets how often a data node sends heartbeats; see [`MembershipSettings`].
 /// The `[replication]` table paces replication; see [`ReplicationConfig`]. The `[changes]`
-/// table lists the sinks that receive each database's changes; see [`ChangesConfig`].
+/// table lists the sinks that receive each database's changes; see [`ChangesConfig`]. Each
+/// `[[archive]]` entry writes databases to an object store; see [`ArchiveConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -73,6 +75,9 @@ pub struct Config {
     /// Where the data role streams its databases' changes (FR-039).
     #[serde(default)]
     pub changes: ChangesConfig,
+    /// The archives the data role writes its databases to (FR-049): `[[archive]]` entries.
+    #[serde(default)]
+    pub archive: Vec<ArchiveConfig>,
     /// The certificate, key, and trusted authorities every connection carries (ADR-0025).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -589,7 +594,8 @@ impl Config {
     /// [`ConfigError::Missing`] if a field this role needs is absent, and
     /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
     /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
-    /// below the lease duration, or a `[[changes.sink]]` entry is invalid.
+    /// below the lease duration, or a `[[changes.sink]]` or `[[archive]]` entry is invalid, or two
+    /// share a name.
     ///
     /// Whether the daemon has an identity is checked when it starts, because the environment
     /// may supply one; see [`Daemon::start_with`](crate::Daemon::start_with).
@@ -637,7 +643,27 @@ impl Config {
                 reason: "must be at least 1 ms".to_owned(),
             });
         }
-        self.changes.validate()
+        self.changes.validate()?;
+        let mut names: BTreeSet<&str> = self
+            .changes
+            .sink
+            .iter()
+            .map(|sink| sink.name.as_str())
+            .collect();
+        for archive in &self.archive {
+            archive.validate()?;
+            if !names.insert(&archive.name) {
+                return Err(ConfigError::Invalid {
+                    field: "archive",
+                    reason: format!(
+                        "`{}` names another archive or sink: marks are kept by name, so each \
+                         must be unique",
+                        archive.name
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 

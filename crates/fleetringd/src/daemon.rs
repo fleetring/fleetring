@@ -19,7 +19,8 @@ use crate::control::{
     NoControl, OpenError,
 };
 use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSettings};
-use crate::engine::{Execution, InvalidPageSizeError, SqliteEngine};
+use crate::durability::{Archive, ArchiveError, ArchiveParts, build_store};
+use crate::engine::{DatabaseEngine, Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
 use crate::replication::{Replication, ReplicationParts};
 use crate::tls::{Identity, IdentityError, Security};
@@ -113,6 +114,9 @@ pub enum StartError {
     /// A `[[changes.sink]]` entry can't be built.
     #[error("invalid change sink configuration")]
     Sink(#[from] BuildSinkError),
+    /// An `[[archive]]` entry can't be built.
+    #[error("invalid archive configuration")]
+    Archive(#[from] ArchiveError),
     /// The `[tls]` files can't be loaded.
     #[error("can't load the [tls] identity")]
     Identity(#[from] IdentityError),
@@ -434,6 +438,7 @@ fn start_data(
     bound: SocketAddr,
 ) -> Result<(DataRole, DataNode), StartError> {
     let engine = SqliteEngine::new(config.engine.page_size)?;
+    let archive_engine: Arc<dyn DatabaseEngine> = Arc::new(engine.clone());
     let network = environment.network();
     let control = network.control_client(control_address(config, bound).to_string());
     let member = config
@@ -472,12 +477,14 @@ fn start_data(
         },
     );
     statuses.set(replication.clone());
-    let sinks = config
+    let mut sinks = config
         .changes
         .sink
         .iter()
         .map(|sink| build_sink(sink, config.engine.execution))
         .collect::<Result<Vec<_>, _>>()?;
+    let archives = start_archives(config, environment, &replication, &archive_engine)?;
+    sinks.extend(archives.iter().map(Archive::sink));
     let changes = ChangeStreams::start(ChangeParts {
         sinks,
         replication: replication.clone(),
@@ -511,6 +518,35 @@ fn start_data(
         drain,
     };
     Ok((role, node))
+}
+
+/// Builds every `[[archive]]` entry's archive, writing to the store the environment puts in
+/// its place, if any, else to the one the entry names.
+fn start_archives(
+    config: &Config,
+    environment: &Environment,
+    replication: &Replication,
+    engine: &Arc<dyn DatabaseEngine>,
+) -> Result<Vec<Archive>, StartError> {
+    config
+        .archive
+        .iter()
+        .map(|entry| {
+            let store = match environment.object_store(&entry.name) {
+                Some(store) => store,
+                None => build_store(entry, environment.clock(), config.engine.execution)?,
+            };
+            let parts = ArchiveParts {
+                replication: replication.clone(),
+                engine: Arc::clone(engine),
+                clock: environment.clock(),
+                execution: config.engine.execution,
+            };
+            let archive = Archive::new(entry, store, parts)?;
+            tracing::info!(archive = %entry.name, store = ?entry.store, prefix = %entry.prefix, "archiving databases");
+            Ok(archive)
+        })
+        .collect()
 }
 
 /// The databases a data node's heartbeats report: those of its replication, once it exists.

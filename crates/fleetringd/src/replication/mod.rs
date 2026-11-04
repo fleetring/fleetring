@@ -150,6 +150,7 @@ use crate::publisher::{
 use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
 
+pub(crate) use self::archive::Packer;
 pub use self::binding::{EpochAuthority, EpochHolders, HoldersFuture};
 pub use self::chain::{ChainHash, ParseChainHashError};
 pub use self::failover::{Fenced, PromotionRequest};

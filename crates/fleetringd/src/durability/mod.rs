@@ -36,18 +36,28 @@
 //! volumes, and [`FaultyStore`] fails a fixed schedule of calls. The archive logic above them is
 //! written once against the trait and knows nothing about any one store.
 
+mod archive;
+mod config;
 mod format;
 mod keys;
+mod listing;
+mod plan;
+mod retention;
 mod s3;
 mod store;
 
 use std::fmt;
 
+pub use self::archive::{Archive, ArchiveError, ArchiveParts, build_store};
+pub use self::config::{ArchiveConfig, ArchiveSettings, CHUNK_BYTES, CredentialKind, StoreKind};
 pub use self::format::{
-    FORMAT, FormatError, SEGMENT_MAGIC, SegmentHeader, SnapshotDescriptor, decode_descriptor,
-    decode_segment, encode_descriptor, encode_segment,
+    FORMAT, FormatError, SEGMENT_MAGIC, SegmentHeader, SnapshotDescriptor, checksum_hex,
+    decode_descriptor, decode_segment, encode_descriptor, encode_segment,
 };
 pub use self::keys::{ArchiveKeys, SegmentName, SnapshotObject};
+pub use self::listing::{DamagedObject, IncompleteSnapshot, Listing, SegmentEntry, SnapshotEntry};
+pub use self::plan::{PlanError, RestorePlan, RestoreTarget, plan};
+pub use self::retention::{apply_retention, retention};
 pub use self::s3::{CredentialSource, HttpPolicy, PathStyle, S3ConfigError, S3Settings, S3Store};
 pub use self::store::{
     DirectoryStore, FaultyStore, MemoryStore, ObjectEntry, ObjectStore, StoreError, StoreFuture,
@@ -55,7 +65,22 @@ pub use self::store::{
 
 const _: () = {
     const fn assert_debug_send_sync<T: fmt::Debug + Send + Sync>() {}
+    assert_debug_send_sync::<Archive>();
+    assert_debug_send_sync::<ArchiveConfig>();
+    assert_debug_send_sync::<ArchiveError>();
     assert_debug_send_sync::<ArchiveKeys>();
+    assert_debug_send_sync::<ArchiveParts>();
+    assert_debug_send_sync::<ArchiveSettings>();
+    assert_debug_send_sync::<CredentialKind>();
+    assert_debug_send_sync::<DamagedObject>();
+    assert_debug_send_sync::<IncompleteSnapshot>();
+    assert_debug_send_sync::<Listing>();
+    assert_debug_send_sync::<PlanError>();
+    assert_debug_send_sync::<RestorePlan>();
+    assert_debug_send_sync::<RestoreTarget>();
+    assert_debug_send_sync::<SegmentEntry>();
+    assert_debug_send_sync::<SnapshotEntry>();
+    assert_debug_send_sync::<StoreKind>();
     assert_debug_send_sync::<DirectoryStore>();
     assert_debug_send_sync::<FaultyStore>();
     assert_debug_send_sync::<FormatError>();

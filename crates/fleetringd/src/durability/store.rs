@@ -84,6 +84,36 @@ impl StoreError {
     }
 }
 
+/// How many times an archive retries a store call that failed for a reason that may pass,
+/// before it gives up and lets its caller retry the whole operation.
+const CALL_RETRIES: u32 = 3;
+
+/// The wait before the first retry of a store call; each later wait doubles.
+const CALL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Runs `call` until it succeeds, fails for good, or has failed transiently
+/// [`CALL_RETRIES`] times more, waiting a doubling backoff between attempts. An operation of
+/// several calls, such as uploading a snapshot, retries each call, so that a store that fails
+/// one call in a few never fails the whole operation every time.
+pub(crate) async fn retrying<T, F>(mut call: impl FnMut() -> F) -> Result<T, StoreError>
+where
+    F: Future<Output = Result<T, StoreError>>,
+{
+    let mut backoff = CALL_BACKOFF;
+    let mut retries = 0;
+    loop {
+        match call().await {
+            Err(error) if error.is_transient() && retries < CALL_RETRIES => {
+                retries += 1;
+                tracing::debug!(%error, retry_in = ?backoff, "an object store call failed");
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Checks that `key` is a valid object key.
 pub(crate) fn check_key(key: &str) -> Result<(), StoreError> {
     if key.split('/').all(valid_component) {

@@ -88,6 +88,26 @@ impl ChainHash {
         }
     }
 
+    /// The hash at the end of each of `batch`'s transactions, in order, chained onto `prev`, the
+    /// hash at `from_position`, as [`chain`](Self::chain) computes them: what a restore checks
+    /// an archived batch against, and cuts it by (ADR-0029).
+    ///
+    /// # Errors
+    ///
+    /// As [`chain`](Self::chain).
+    pub fn chain_each(
+        engine: &dyn FrameSourceEngine,
+        prev: Self,
+        from_position: Option<&Position>,
+        batch: &FrameBatch,
+    ) -> Result<Vec<(Position, Self)>, EngineError> {
+        match Links::compute(engine, prev, from_position, batch) {
+            Ok(links) => Ok(links.hashes),
+            Err(ChainError::Payload(error)) => Err(error),
+            Err(error) => Err(EngineError::InvalidPayload(error.into())),
+        }
+    }
+
     /// The hash of the transaction from `start` to `end` with `bytes`, chained onto `prev`.
     ///
     /// The input is `prev`, then each position as its length (a little-endian `u32`) and its
