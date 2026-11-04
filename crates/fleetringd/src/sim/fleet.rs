@@ -14,10 +14,10 @@ use fleetring_control::{DatabaseName, State, Timestamp};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
-use crate::changes::{ChangeRecord, ChangesConfig, SinkKind, database_file};
+use crate::changes::{ChangeRecord, ChangesConfig, SinkKind, database_file, unhex};
 use crate::control::ControlHandle;
 use crate::daemon::{CONTROL_DB, DATABASES_DIR};
-use crate::engine::{EngineConfig, Execution};
+use crate::engine::{EngineConfig, Execution, Position};
 use crate::layout;
 use crate::replication::{Replication, ReplicationSettings};
 use crate::sim::SimRng;
@@ -152,6 +152,9 @@ impl Timings {
 }
 
 type Configure = Box<dyn Fn(&mut Config)>;
+
+/// Each host's records of one sink's stream of one database, in file order.
+type HostStreams = Vec<(String, Vec<ChangeRecord>)>;
 
 /// Describes a [`Fleet`]: its seed, its hosts and their roles, and its timings.
 pub struct FleetBuilder {
@@ -1074,15 +1077,17 @@ impl Fleet {
     /// Checks every file sink the data hosts are configured with
     /// ([`check::change_stream_consistent`]): for each database created through the data plane,
     /// the lines each host's sink wrote are an in-order, gapless stream of writes the history
-    /// knows, with duplicates allowed and nothing refused or invented. Returns how many records
-    /// were checked.
+    /// knows, with duplicates allowed and nothing refused or invented. A record that resumes at
+    /// the end of an earlier epoch's record, as a new primary's does, is not a gap. Returns how
+    /// many records were checked.
     ///
     /// # Errors
     ///
     /// A [`Violation`], or [`SimError::Simulation`] if a sink's file can't be read.
     pub fn check_change_streams(&self) -> Result<usize, SimError> {
         let history = self.history();
-        let mut checked = 0;
+        // Each sink's stream of each database, per host: a sink's marks are its own.
+        let mut streams: BTreeMap<(String, DatabaseName), HostStreams> = BTreeMap::new();
         for host in self.hosts.iter().filter(|host| host.role.hosts_data()) {
             for sink in &host.config.changes.sink {
                 let (SinkKind::File, Some(dir)) = (sink.kind, &sink.path) else {
@@ -1097,9 +1102,26 @@ impl Fleet {
                             path.display()
                         ))
                     })?;
-                    check::change_stream_consistent(&history, &database, &host.name, &records)?;
-                    checked += records.len();
+                    streams
+                        .entry((sink.name.clone(), database))
+                        .or_default()
+                        .push((host.name.clone(), records));
                 }
+            }
+        }
+        let mut checked = 0;
+        for ((_, database), hosts) in &streams {
+            // The `(epoch, end)` of every record on any host: where a new primary may resume.
+            let mut marks = BTreeSet::new();
+            for record in hosts.iter().flat_map(|(_, records)| records) {
+                let end = unhex(&record.position).map_err(|_| {
+                    SimError::Simulation(format!("{database} has a position that isn't hex"))
+                })?;
+                marks.insert((record.epoch, Position::from(end)));
+            }
+            for (host, records) in hosts {
+                check::change_stream_consistent(&history, database, host, records, &marks)?;
+                checked += records.len();
             }
         }
         Ok(checked)
