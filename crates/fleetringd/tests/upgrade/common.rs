@@ -41,11 +41,35 @@ pub(crate) fn lines_ahead(minors: u64) -> Release {
     Release::new(major, minor + minors, 0)
 }
 
+/// The release one line before this build's, `.0`: within the fleet's window, and older.
+pub(crate) fn line_behind() -> Release {
+    let (major, minor) = current().line();
+    Release::new(major, minor.saturating_sub(1), 0)
+}
+
+/// Runs `fleetringd node <args>` against `fleet`'s control node as the test principal.
+pub(crate) fn node_command(fleet: &ProcessFleet, args: &[&str]) -> TestResult<Output> {
+    Ok(fleet
+        .command(Path::new(env!("CARGO_BIN_EXE_fleetringd")), "/usr/bin:/bin")
+        .arg("node")
+        .args(args)
+        .args(["--control", &fleet.control])
+        .output()?)
+}
+
 /// How long a test waits for a fleet to reach a state before it fails.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(120);
 
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(100);
+
+/// The most times in a row the writer resends one write the primary refused before committing
+/// anything, before the test fails: the bound on how long a leave and rejoin keeps a database
+/// from taking writes. Each resend waits [`POLL`] first, so 30 is at least three seconds. Twelve
+/// rolling runs under load, 4 at a time beside 4 CPU hogs, needed at most one resend in a row,
+/// and the restart in place none; a regression that keeps writes out for seconds fails here
+/// rather than pass as resends.
+pub(crate) const MAX_REFUSALS_IN_A_ROW: u64 = 30;
 
 /// Calls `ready` until it returns `Some`, giving up with `what` after about [`PATIENCE`] of
 /// polls.
@@ -353,6 +377,17 @@ impl ProcessFleet {
     /// Starts `count` nodes, each running a copy of `binary`, and waits until every one is a
     /// live member.
     pub(crate) fn start(root: &Path, binary: &Path, count: usize) -> TestResult<Self> {
+        Self::start_with(root, binary, count, "both")
+    }
+
+    /// Starts a fleet as [`ProcessFleet::start`] does, with `node-1` in `first_role`: `both`, or
+    /// `control` for a control node that is no member.
+    pub(crate) fn start_with(
+        root: &Path,
+        binary: &Path,
+        count: usize,
+        first_role: &str,
+    ) -> TestResult<Self> {
         let tls = Tls::create(root)?;
         let control = format!("127.0.0.1:{}", free_port()?);
         let mut nodes = Vec::with_capacity(count);
@@ -369,7 +404,7 @@ impl ProcessFleet {
                 format!("127.0.0.1:{}", free_port()?)
             };
             let role = if index == 1 {
-                "role = \"both\"\n".to_owned()
+                format!("role = \"{first_role}\"\n")
             } else {
                 format!("role = \"data\"\n\n[control]\naddress = \"{control}\"\n")
             };
@@ -508,6 +543,32 @@ pub(crate) async fn wait_for_members(
     }
 }
 
+/// Waits until every node in `ids` has reported its software as `release` to the control plane:
+/// stricter than [`wait_for_members`], since a member that reported nothing runs 0.3.0 too.
+pub(crate) async fn wait_for_reported(
+    client: &Client,
+    ids: &[&str],
+    release: &Release,
+) -> TestResult {
+    for _ in 0..PATIENCE.as_millis() / POLL.as_millis() {
+        if let Ok(view) = client.status().await {
+            let reported = ids.iter().all(|id| {
+                view.members().any(|(member, _)| {
+                    member.id().as_str() == *id
+                        && member
+                            .software()
+                            .is_some_and(|software| software.release() == release)
+                })
+            });
+            if reported {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    Err(format!("members {ids:?} never reported {release}").into())
+}
+
 /// What the writer saw: each write it attempted, whether it was acknowledged, and how many writes
 /// needed their one retry.
 #[derive(Debug, Default)]
@@ -522,6 +583,8 @@ pub(crate) struct History {
     pub(crate) reads: u64,
     /// Sends of a write the primary refused before committing anything, which a client resends.
     pub(crate) refused: u64,
+    /// The most resends one write needed before the primary took it.
+    pub(crate) longest_refusal: u64,
 }
 
 /// Creates the three-replica database `history` with its table, retrying until the fleet has
@@ -642,16 +705,17 @@ async fn send(
     };
     let polls = PATIENCE.as_millis() / POLL.as_millis();
     let mut outcome = write().await;
-    let mut refused = 0;
+    let mut refused: u64 = 0;
     while let Err(status) = &outcome
         && status.message().ends_with("nothing committed")
-        && refused < polls
+        && u128::from(refused) < polls
     {
         refused += 1;
         history.refused += 1;
         tokio::time::sleep(POLL).await;
         outcome = write().await;
     }
+    history.longest_refusal = history.longest_refusal.max(refused);
     outcome
 }
 
@@ -680,8 +744,17 @@ pub(crate) async fn check_history(
 ) -> TestResult {
     assert!(
         history.failed.is_empty(),
-        "writes failed after their retry: {:?}",
-        history.failed
+        "writes failed after their retry: {:?} ({} clean refusals resent, at most {} in a row)",
+        history.failed,
+        history.refused,
+        history.longest_refusal
+    );
+    assert!(
+        history.longest_refusal <= MAX_REFUSALS_IN_A_ROW,
+        "a write was refused {} times in a row before the primary took it, more than \
+         {MAX_REFUSALS_IN_A_ROW} ({} clean refusals resent in all)",
+        history.longest_refusal,
+        history.refused
     );
     assert!(history.stale_reads.is_empty(), "{:?}", history.stale_reads);
     let rows = client

@@ -93,6 +93,8 @@ pub struct MembershipView {
     members: Vec<(Member, Liveness)>,
     /// The members that are draining, in ID order.
     draining: Vec<NodeId>,
+    /// The fleet features enabled for good.
+    features: Vec<String>,
 }
 
 impl MembershipView {
@@ -475,6 +477,7 @@ impl Publisher {
     /// Publishes the membership in `update`, rebuilding the ring only if the epoch changed.
     fn apply(&self, update: MembershipUpdate) {
         let epoch = Epoch::new(update.membership_epoch);
+        let features = update.features.clone();
         let (members, draining) = match members_from(update) {
             Ok(members) => members,
             Err(status) => {
@@ -490,17 +493,19 @@ impl Publisher {
                 .members
                 .iter()
                 .zip(&members)
-                .all(|((a, _), (b, _))| a == b);
+                .all(|((a, _), (b, _))| same_attributes(a, b));
         let view = if same_members {
             MembershipView {
                 members,
                 draining,
+                features,
                 ..MembershipView::clone(&previous)
             }
         } else {
             match rebuild(epoch, members, draining) {
                 Some(view) => MembershipView {
                     previous_ring: previous.ring.clone(),
+                    features,
                     ..view
                 },
                 None => return,
@@ -526,10 +531,27 @@ impl MembershipView {
     /// `INTERNAL` if the update names an invalid member or its members can't form a ring.
     pub(crate) fn from_update(update: MembershipUpdate) -> Result<Self, tonic::Status> {
         let epoch = Epoch::new(update.membership_epoch);
+        let features = update.features.clone();
         let (members, draining) = members_from(update)
             .map_err(|status| tonic::Status::internal(format!("invalid membership: {status}")))?;
         rebuild(epoch, members, draining)
+            .map(|view| MembershipView { features, ..view })
             .ok_or_else(|| tonic::Status::internal("the membership can't form a ring"))
+    }
+}
+
+/// Whether two members differ only in their software, which changes no ring.
+fn same_attributes(a: &Member, b: &Member) -> bool {
+    a.same_attributes(b)
+}
+
+impl MembershipView {
+    /// Returns the names of the fleet features the fleet has enabled for good, as the control
+    /// plane last said, including any this build doesn't know (ADR-0038): a release that lacks
+    /// one can't join. Empty from a control node that predates them, or that hasn't enabled any.
+    #[must_use]
+    pub fn features(&self) -> &[String] {
+        &self.features
     }
 }
 
@@ -592,6 +614,7 @@ fn rebuild(
                 previous_ring: None,
                 members,
                 draining,
+                features: Vec::new(),
             })
         }
         Err(error) => {
@@ -861,6 +884,7 @@ mod tests {
                     software: None,
                 })
                 .collect(),
+            features: Vec::new(),
         }
     }
 

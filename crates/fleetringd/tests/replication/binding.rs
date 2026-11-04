@@ -120,6 +120,7 @@ fn members(epoch: u64, ids: &[&str]) -> MembershipUpdate {
                 software: None,
             })
             .collect(),
+        features: Vec::new(),
     }
 }
 

@@ -107,22 +107,18 @@ pub(crate) fn is_running(data_dir: &Path) -> Result<bool, UpgradeError> {
 /// Asks the daemon `pid` to restart in place, with `SIGHUP`.
 #[cfg(unix)]
 pub(crate) fn restart(pid: u32) -> Result<(), UpgradeError> {
-    let status = std::process::Command::new("kill")
-        .arg("-HUP")
-        .arg(pid.to_string())
-        .status()
-        .map_err(|error| UpgradeError::Restart {
-            reason: format!("can't run kill: {error}"),
+    use rustix::process::{Pid, Signal, kill_process};
+    let target = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| UpgradeError::Restart {
+            reason: format!("the process file names pid {pid}, which isn't a process"),
         })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(UpgradeError::Restart {
-            reason: format!(
-                "kill -HUP {pid} failed ({status}); is the daemon running as another user?"
-            ),
-        })
-    }
+    kill_process(target, Signal::HUP).map_err(|error| UpgradeError::Restart {
+        reason: format!(
+            "can't send SIGHUP to pid {pid}: {error}; is the daemon running as another user?"
+        ),
+    })
 }
 
 /// Restarting in place needs `SIGHUP`, which only Unix has.

@@ -12,6 +12,7 @@ mod rolling;
 mod support;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
@@ -22,8 +23,8 @@ use fleetringd::upgrade::ProcessFile;
 
 use crate::common::{
     Defect, ProcessFleet, ReleaseServer, TestResult, check_history, create_history_database,
-    current, fake_binary, fake_cosign, lines_ahead, path_with, printed, wait_for, wait_for_members,
-    write_release, write_releases_list, write_until,
+    current, fake_binary, fake_cosign, line_behind, lines_ahead, node_command, path_with, printed,
+    wait_for, wait_for_members, write_release, write_releases_list, write_until,
 };
 
 /// A scratch install of this build, a release server, and a stand-in cosign.
@@ -430,5 +431,230 @@ fn upgrading_a_running_node_drains_restarts_and_rejoins_it() -> TestResult {
     let history = runtime.block_on(writer)?;
     assert!(history.acknowledged.len() > 10, "{history:?}");
     runtime.block_on(check_history(&client, &name, &history))?;
+    Ok(())
+}
+
+/// Waits until the control plane says the fleet has enabled `feature`.
+async fn wait_for_feature(client: &fleetringd::data::Client, feature: &str) -> TestResult {
+    for _ in 0..1_200 {
+        if let Ok(view) = client.status().await
+            && view.features().iter().any(|enabled| enabled == feature)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(format!("the fleet never enabled {feature}").into())
+}
+
+/// Once the fleet has used `undrain`, a release without it would be refused at its join, or, on a
+/// control node, couldn't read the log: `--check`, `--version`, and `--rollback` refuse it before
+/// anything is swapped, naming the feature, on a data node and on a control node that is no
+/// member. The control-only node then restarts in place on this build.
+#[test]
+fn a_release_without_an_enabled_feature_is_refused_before_it_is_installed() -> TestResult {
+    let bench = Bench::new()?;
+    let fleet =
+        ProcessFleet::start_with(&bench.dir.path().join("fleet"), &bench.bin, 2, "control")?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let client = fleet.client()?;
+    runtime.block_on(wait_for_members(&client, &["node-2"], None))?;
+    let undrained = node_command(&fleet, &["undrain", "node-2"])?;
+    assert!(undrained.status.success(), "{}", printed(&undrained));
+    runtime.block_on(wait_for_feature(&client, "undrain"))?;
+
+    let older = line_behind();
+    let url = bench.publish(&older, &fake_binary(&older), Defect::None)?;
+    let version = older.to_string();
+    let lacks = "lacks the fleet feature 'undrain' this fleet uses";
+    for node in &fleet.nodes {
+        let installed = fs::read(&node.bin)?;
+        let upgrade = |args: &[&str]| -> TestResult<Output> {
+            Ok(fleet
+                .command(&node.bin, &bench.path())
+                .arg("upgrade")
+                .args(args)
+                .arg("--config")
+                .arg(&node.config)
+                .output()?)
+        };
+
+        let check = upgrade(&["--check", "--version", &version, "--base-url", &url])?;
+        assert_eq!(
+            check.status.code(),
+            Some(1),
+            "{}: {}",
+            node.id,
+            printed(&check)
+        );
+        assert!(
+            String::from_utf8_lossy(&check.stdout)
+                .contains(&format!("fleet: doesn't allow {older}: it {lacks}")),
+            "{}: {}",
+            node.id,
+            printed(&check)
+        );
+
+        let downgrade = upgrade(&["--version", &version, "--base-url", &url])?;
+        assert_eq!(
+            downgrade.status.code(),
+            Some(1),
+            "{}: {}",
+            node.id,
+            printed(&downgrade)
+        );
+        assert!(
+            String::from_utf8_lossy(&downgrade.stderr).contains(&format!(
+                "the fleet doesn't allow fleetringd {older}: it {lacks}"
+            )),
+            "{}: {}",
+            node.id,
+            printed(&downgrade)
+        );
+        assert_eq!(fs::read(&node.bin)?, installed, "{} was replaced", node.id);
+
+        let previous = node.bin.with_file_name("fleetringd.previous");
+        fs::write(&previous, fake_binary(&older))?;
+        fs::set_permissions(&previous, fs::Permissions::from_mode(0o755))?;
+        let rollback = upgrade(&["--rollback"])?;
+        assert_eq!(
+            rollback.status.code(),
+            Some(1),
+            "{}: {}",
+            node.id,
+            printed(&rollback)
+        );
+        assert!(
+            String::from_utf8_lossy(&rollback.stderr).contains(lacks),
+            "{}: {}",
+            node.id,
+            printed(&rollback)
+        );
+        assert_eq!(
+            fs::read(&node.bin)?,
+            installed,
+            "{} was rolled back",
+            node.id
+        );
+        assert_eq!(fs::read(&previous)?, fake_binary(&older));
+        fs::remove_file(&previous)?;
+    }
+
+    // The control-only node is no member: it restarts in place without a drain, and is back
+    // once the control plane answers.
+    let control = &fleet.nodes[0];
+    let url = bench.publish(&current(), &bench.original, Defect::None)?;
+    let reinstalled = fleet
+        .command(&control.bin, &bench.path())
+        .args([
+            "upgrade",
+            "--version",
+            &current().to_string(),
+            "--base-url",
+            &url,
+        ])
+        .arg("--config")
+        .arg(&control.config)
+        .output()?;
+    assert!(
+        reinstalled.status.success(),
+        "{}\n{}",
+        printed(&reinstalled),
+        fleet.logs()
+    );
+    let stdout = String::from_utf8_lossy(&reinstalled.stdout);
+    assert!(
+        !stdout.contains("drained")
+            && stdout.contains("restarted node-1 in place")
+            && stdout.contains(&format!("the control plane answers again on {}", current())),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// A member that died for good on an old release holds the fleet back: it counts toward the
+/// window and the feature gate until `node remove` takes it out. A live member is refused unless
+/// `--force`, and without a terminal the command needs `--yes`.
+#[test]
+fn removing_a_member_that_is_gone_unblocks_the_fleet() -> TestResult {
+    let bench = Bench::new()?;
+    let fleet = ProcessFleet::start(&bench.dir.path().join("fleet"), &bench.bin, 2)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let client = fleet.client()?;
+    runtime.block_on(wait_for_members(&client, &["node-1", "node-2"], None))?;
+    // "old" joins as 0.3.0 does, reporting nothing, and is never heard from again.
+    let old = fleet
+        .tls
+        .node_network("old")?
+        .control_client(fleet.control.clone());
+    runtime.block_on(old.join(fleetring_proto::v1::JoinRequest {
+        protocol: Some(fleetring_proto::PROTOCOL_VERSION),
+        node: Some(fleetring_proto::v1::Node {
+            id: "old".into(),
+            zone: None,
+            host: None,
+            weight: 1,
+            address: None,
+        }),
+        software: None,
+    }))?;
+
+    let blocked = node_command(&fleet, &["undrain", "node-2"])?;
+    assert_eq!(blocked.status.code(), Some(1), "{}", printed(&blocked));
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("node 'old' runs fleetringd 0.3.0"),
+        "{}",
+        printed(&blocked)
+    );
+
+    let live = node_command(&fleet, &["remove", "node-2", "--yes"])?;
+    assert_eq!(live.status.code(), Some(1), "{}", printed(&live));
+    assert!(
+        String::from_utf8_lossy(&live.stderr).contains("node 'node-2' is live"),
+        "{}",
+        printed(&live)
+    );
+
+    let down = runtime.block_on(async {
+        for _ in 0..1_200 {
+            if let Ok(view) = client.status().await
+                && view.members().any(|(member, liveness)| {
+                    member.id().as_str() == "old" && liveness == fleetring_control::Liveness::Down
+                })
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    });
+    assert!(down, "'old' never went down\n{}", fleet.logs());
+    // Without a terminal, removing needs --yes.
+    let unconfirmed = node_command(&fleet, &["remove", "old"])?;
+    assert_eq!(
+        unconfirmed.status.code(),
+        Some(1),
+        "{}",
+        printed(&unconfirmed)
+    );
+    assert!(
+        String::from_utf8_lossy(&unconfirmed.stderr).contains("pass --yes to remove old"),
+        "{}",
+        printed(&unconfirmed)
+    );
+    let removed = node_command(&fleet, &["remove", "old", "--yes"])?;
+    assert!(removed.status.success(), "{}", printed(&removed));
+    assert!(
+        String::from_utf8_lossy(&removed.stdout).starts_with("removed old from the fleet"),
+        "{}",
+        printed(&removed)
+    );
+    let undrained = node_command(&fleet, &["undrain", "node-2"])?;
+    assert!(undrained.status.success(), "{}", printed(&undrained));
+
+    // `--force` removes a live member, which joins again at its next heartbeat.
+    let forced = node_command(&fleet, &["remove", "node-2", "--yes", "--force"])?;
+    assert!(forced.status.success(), "{}", printed(&forced));
+    runtime.block_on(wait_for_members(&client, &["node-2"], None))?;
     Ok(())
 }
