@@ -135,3 +135,29 @@ FR-044's hash chain over the replication log, from `cargo bench -p fleetringd --
 - **Verification** (`db verify`) reads a replica's log back from its last recorded anchor, at most one checkpoint's worth of batches, and hashes it at the same rate, so a 4 MiB log verifies in a few milliseconds.
 - Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
 
+
+## Request path
+
+FR-063's trace layer, metrics, and request IDs on every RPC (ADR-0034), measured 2026-11-04 on an Apple M1 Max laptop (macOS, Rust 1.99.1, release profile) while other builds kept the load average near 11 on its 10 cores, so the end-to-end numbers move by more than the effect between runs; the micro-benchmark isolates it.
+
+- **The layer alone,** from `cargo bench -p fleetringd --bench observe`: one unary request through a service that answers at once with a message and `grpc-status` trailers, read to the end, with the daemon's log subscriber installed and writing to nowhere. `bare` calls the service; `traced` calls it through `TraceLayer`. Medians of 200 samples of 200 calls.
+
+| Case | Subscriber at `info` (the default) | at `debug` |
+|---|---|---|
+| `bare` | 0.48 µs | 0.50 µs |
+| `traced`, `code` and `duration_ms` recorded at every level | 2.19 µs | 2.90 µs |
+| `traced`, recorded only at `debug` (shipped) | 1.82 µs | 2.92 µs |
+
+- **What a request pays:** about 1.35 µs at `info`: the request ID, the `rpc` span with its three fields, the in-flight gauge up and down, the request counter and duration histogram, two clock reads, and a second boxed body that watches for the trailers. Recording `code` and `duration_ms` into the span cost another 0.37 µs at `info`, where only the `debug` line `rpc finished` reads them, so they are recorded only when `debug` is on (the plan's fallback for this risk). At `debug` each request also formats that line, about 2.4 µs in all.
+- **End to end,** from `cargo test -p fleetringd --release --test observe -- --ignored --nocapture rpc_latency`: one daemon running both roles over TLS, 4,000 calls per case on one HTTP/2 connection, split across the callers. `Locate` touches no storage, so it is the request path alone; `Execute` writes one 64-byte row with its fsync, replication factor 1. Medians of three runs on each side; "after" is before the fallback above.
+
+| RPC | Callers | Before: calls/s | After: calls/s | Before: p50 | After: p50 |
+|---|---|---|---|---|---|
+| `Locate` | 1 | 15,605 | 14,622 | 60 µs | 64 µs |
+| `Locate` | 16 | 31,532 | 29,947 | 493 µs | 522 µs |
+| `Execute` | 1 | 5,593 | 5,507 | 144 µs | 154 µs |
+| `Execute` | 16 | 6,636 | 6,996 | 1–2 ms | 1 ms |
+
+- **Reading it:** the layer's 1.35 µs is about 2% of the cheapest RPC's 60 µs and under 1% of a local write; against a replicated acknowledgement of about 3 ms ([fleetringd replication](#fleetringd-replication)) it is 0.05%. Streams (`Replicate`, `Snapshot`, `WatchMembership`, `WatchLeases`) pay it once per stream, not per batch, and a batch costs two counter increments. The sampler reads the replication state's locks once per `[admin] sample_interval_ms` (10 s), off the write path.
+- **The `capture` bench didn't move,** as nothing on its path changed (`cargo bench -p fleetringd --bench capture -- insert`, fastest of 40 samples, before → after): 1 row with capture off 67.9 → 70.1 µs, 100 rows 188.1 → 182.8 µs; in `after` 130.2 → 134.0 µs and 412.7 → 418.8 µs.
+- Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
