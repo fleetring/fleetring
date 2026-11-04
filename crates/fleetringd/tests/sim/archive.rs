@@ -168,7 +168,9 @@ fn archives_restore_after_faults(seed: u64) -> TestResult {
     // The archive catches up with everything the primary committed.
     let database = database()?;
     let keys = ArchiveKeys::new(PREFIX, &database);
-    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
     let listing = |runtime: &tokio::runtime::Runtime| {
         runtime.block_on(Listing::read(&store, &keys, &database))
     };
