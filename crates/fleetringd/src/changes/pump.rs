@@ -216,7 +216,10 @@ async fn deliver(
         Ok(Some(batch)) => batch,
         // Nothing between the two positions: the sink is at `until` already.
         Ok(None) => return Ok(Delivery::Delivered),
-        Err(error) if log_moved(&error) => return Ok(Delivery::LogMoved),
+        // A pump already at the log's beginning has nowhere further back to go: the write quorum
+        // is at a position the log doesn't hold yet, as when a follower that must take a snapshot
+        // still reports its old position. Retrying with backoff, not restarting in a tight loop.
+        Err(error) if log_moved(&error) && after.is_some() => return Ok(Delivery::LogMoved),
         Err(error) => return Err(error.to_string()),
     };
     let kind = match ctx.format {
