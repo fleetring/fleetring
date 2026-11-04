@@ -73,6 +73,13 @@ The daemon is released separately from the crate (FR-034). It isn't published to
 ## 1. Pre-flight
 
 - [ ] CI is green on `main`, including `test (ubuntu-24.04-arm)` and `simulation (fixed seeds)`.
+- [ ] **The rolling upgrade passes from the previous release** (FR-054, ADR-0038): `.github/workflows/rolling-upgrade.yml` starts three nodes on the previous release's binaries, downloaded and verified with cosign, and moves them one at a time to `main` under writes. It runs nightly; if it hasn't run since the last merge, run it by hand (Actions → Rolling upgrade → Run workflow, optionally naming the release to upgrade from). Locally, with cosign installed:
+
+  ```sh
+  FLEETRINGD_BASELINE_VERSION=<previous> cargo test -p fleetringd --test upgrade -- --ignored --nocapture rolling
+  ```
+
+  If the release changes the protocol, the control log, or a command that older members can't read, its notes say which releases it runs beside, and a new control command is a fleet feature (ADR-0038, point 4).
 - [ ] `RUST_VERSION` agrees in `.github/workflows/release.yml` and the `Dockerfile`.
 - [ ] **A manual dry run, only if the release or container workflows changed since the last release.** Check with:
 

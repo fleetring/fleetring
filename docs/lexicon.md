@@ -262,10 +262,10 @@ In cells: the explicit rules, by longest prefix or exact key, that pick a key's 
 
 ### Drain
 
-Marking a member as draining: it gets no new leases and is never a promotion's candidate, and it hands every lease it holds to a follower through a [transfer](#transfer) (FR-038). A drained node stays a follower until it stops.
+Marking a member as draining: it gets no new leases and is never a promotion's candidate, and it hands every lease it holds to a follower through a [transfer](#transfer) (FR-038). A drained node stays a follower until it stops, restarts, or is *undrained*: its mark cleared, a [fleet feature](#fleet-feature).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Control.Drain`, protocol `Member.draining`. **CLI:** `fleetringd node drain <node-id>`; `[membership] on_shutdown = "leave"`.
+- **Code:** `Control.Drain`, `Control.Undrain`, `Action::Undrain`, protocol `Member.draining`. **CLI:** `fleetringd node drain <node-id>`, `fleetringd node undrain <node-id>`; `[membership] on_shutdown = "leave"`.
 - **Not:** evacuate, cordon, decommission, step down.
 
 ### Durability
@@ -327,6 +327,14 @@ The set of nodes that one control plane and one certificate authority govern, un
 - **Applies to:** crate (test fixtures, such as `fixtures::fleet(12, 3)`), daemon, CLI, UI.
 - **Code:** `Fleet` (simulation harness), `FleetName`. **CLI:** `--fleet <name>`.
 - **Not:** cluster (0.2's word, renamed in 0.3.0 by FR-059), deployment, ring (a fleet can hold many rings), mesh, realm.
+
+### Fleet feature
+
+A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The first is `undrain`.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetring_control::Feature`, `Action::feature`, `State::features`, `State::check_features`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
+- **Not:** feature flag (alone), capability, cluster version, finalization.
 
 ### Fleet name
 
@@ -544,6 +552,14 @@ Whether a node should be sent work now: `/readyz` passes when every check of its
 - **Code:** `observe::health::Probes`, `Readiness`, `Check`. **CLI:** none.
 - **Not:** liveness (a member's liveness is the control plane's view; see [liveness](#liveness)), status, up.
 
+### Release
+
+A published version of `fleetringd`, `MAJOR.MINOR.PATCH` with an optional prerelease such as `-rc.1`, built and signed by the release workflow from a `fleetringd-vX.Y.Z` tag. Its *release line* is `MAJOR.MINOR`; a fleet runs at most two adjacent lines at once (ADR-0038).
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetring_control::Release`, `Release::line`, `Release::runs_beside`. **CLI:** `--version` (of `upgrade`), `version=` in `fleetringd status`.
+- **Not:** build, cluster version, version (alone, for a line).
+
 ### Replica
 
 One database's copy on one node, the primary's copy included.
@@ -600,6 +616,14 @@ The placement structure over a set of nodes, with a strategy (weighted rendezvou
 - **Code:** `Ring`, `RingBuilder`, `RingSpec`. **CLI:** "ring fingerprint" in `status`.
 - **Not:** hash ring (fine in prose), cluster, topology, circle, keyspace.
 
+### Rollback
+
+Returning a node to the binary its last [upgrade](#upgrade) replaced, kept beside it as `fleetringd.previous`. A rollback swaps the two, so a second one rolls forward; the fleet refuses one below a release whose [fleet feature](#fleet-feature) is enabled.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `upgrade::Mode::Rollback`. **CLI:** `fleetringd upgrade --rollback`.
+- **Not:** downgrade (for this), revert, restore (that builds a database from an archive).
+
 ### Router
 
 *Planned* (MVP step 4). The front door that speaks the libSQL/Hrana protocol, so existing libSQL and Turso clients reach the right primary unchanged. It forwards its callers' tokens.
@@ -648,6 +672,14 @@ A consistent copy of state at one point. Always say which: a *database snapshot*
 - **Code:** `engine::DatabaseSnapshot`, `Replication.Snapshot` (whose messages, `SnapshotRequest` and `SnapshotChunk`, only ever carry a database snapshot); `durability::SnapshotDescriptor`, `SnapshotEntry`, and protocol `ArchivedSnapshot` for base snapshots; the control log's `snapshots` table and its "control snapshot" errors; protocol `HeldLeases` for the leases. **CLI:** `snapshots` in `db archive show`, and `snapshot` in a restore's report, both base snapshots.
 - **Not:** backup, dump, image, checkpoint.
 
+### Software
+
+What a member reports it runs: its [release](#release), the newest protocol and control-log format it speaks, and the [fleet features](#fleet-feature) it supports. A member that reports none runs 0.3.0 (ADR-0038).
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetring_control::Software`, `Member::software`, `Member::running`; protocol `Software` on `JoinRequest`, `HeartbeatRequest`, and `Member`. **CLI:** `version=` in `fleetringd status`.
+- **Not:** build info, version info, capabilities.
+
 ### Spec
 
 The placement spec: the normative description of placement that every implementation, in any language, must reproduce, with golden vectors (ADR-0008, [`spec/placement-v1.md`](spec/placement-v1.md)). Also the serializable form of a ring (`RingSpec`) or of cells (`CellsSpec`).
@@ -687,6 +719,14 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 - **Applies to:** daemon, UI.
 - **Code:** `Control.TransferLease`. **CLI:** none yet ("hands over" in drain output).
 - **Not:** handoff (as a name; "hand over" is fine in prose), switchover, migration (moving the data itself), step down.
+
+### Upgrade
+
+Moving a node to another [release](#release): verify the release's signature and checksum, swap the binary atomically, and restart the node in place after a [drain](#drain), within the fleet's window of release lines (ADR-0038). A *rolling upgrade* moves a fleet one node at a time.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetringd upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`; `SIGHUP` restarts a daemon in place.
+- **Not:** update, self-update, patch (a patch is one kind of release).
 
 ### Weight
 

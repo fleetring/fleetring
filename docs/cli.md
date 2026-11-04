@@ -26,6 +26,7 @@ fleetringd context use home
   | `verify` | check, and report only | no |
   | `restore` | build a new item from an archive, never over an existing one | no |
   | `drain` | move work off, keeping data | asks |
+  | `undrain` | clear a drain mark, so the node takes work again | no |
   | `drop`, `remove`, `revoke` | delete for good | asks |
 
 - **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request.
@@ -195,3 +196,4 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. No `-` for stdin. | FR-056 |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | FR-056 |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0. | Done |
+| `upgrade` | `upgrade` installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place; `--check` changes nothing and exits 1 when the fleet doesn't allow the newest release; `--timeout` bounds each step, 5m by default (ADR-0038). | Done (FR-054) |

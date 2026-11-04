@@ -71,7 +71,7 @@ fleetringd db drop notes --yes --config fleetringd.toml
 
 Each database chooses its durability when it is created (ADR-0023). `--acks quorum` (the default) acknowledges a write once a majority of its replicas hold it; `--acks all` waits for every replica, so one replica down blocks writes; `--acks local` acknowledges after the primary's own fsync, which is fastest but may lose acknowledged writes when the primary fails over. `--min-replicas <n>` sets the floor: a write that arrives while fewer than `n` replicas, the primary included, are reachable is refused with `UNAVAILABLE` before anything commits, so it can be retried cleanly; it must lie between the write quorum and the replication factor, and defaults to the write quorum. `db locate` and `db list` show the settings, `db set-durability` changes them from the database's next epoch on, and `[replication] acks` and `min_replicas` in the control node's configuration set the defaults for databases created without them.
 
-**Drain.** `fleetringd node drain <id>` hands every database the node is primary for to a follower, through the same epoch and fencing rules as a failover but without waiting for a lease to expire: clients see a brief `UNAVAILABLE` and a redirect instead of a failover's pause. A database with no other replica has nowhere to go; the node logs `no other replica; the database is unavailable until this node returns` for it and keeps serving it until the node stops. The node gets no new primaries afterwards and stays a follower until it stops or restarts. A graceful stop (`Ctrl-C`, SIGTERM) with `[membership] on_shutdown = "leave"`, the default, drains the same way before it leaves; `on_shutdown = "stay"` keeps the node's leases for a quick restart and does neither.
+**Drain.** `fleetringd node drain <id>` hands every database the node is primary for to a follower, through the same epoch and fencing rules as a failover but without waiting for a lease to expire: clients see a brief `UNAVAILABLE` and a redirect instead of a failover's pause. A database with no other replica has nowhere to go; the node logs `no other replica; the database is unavailable until this node returns` for it and keeps serving it until the node stops. The node gets no new primaries afterwards and stays a follower until it stops or restarts, or until `fleetringd node undrain <id>` clears the mark once every member supports it (see [Upgrading](#upgrading)). A graceful stop (`Ctrl-C`, SIGTERM) with `[membership] on_shutdown = "leave"`, the default, drains the same way before it leaves; `on_shutdown = "stay"` keeps the node's leases for a quick restart and does neither.
 
 **Change streams.** A `[[changes.sink]]` entry in a data node's configuration sends every acknowledged batch of the databases it names to a sink: a `file` sink appends one JSON line per batch to a file per database, and a `webhook` sink POSTs each batch as JSON. `format = "logical"` (the default) sends the rows each transaction inserted, updated, or deleted; `format = "physical"` sends the opaque batch for a mirror or an archive. A logical sink's `capture` says how much of each row it gets: `id` the key alone, `after` (the default) the key and the new values of inserted and updated rows, `full` also the old values of updated and deleted rows and the names of the updated columns; a database named by several sinks records in the strongest mode asked for. `databases` lists exact names or prefixes ending in `*`, such as `["tenant:*", "ledger"]`. Sinks run beside replication and only see batches the write quorum holds, so a slow or failing sink never delays a write; delivery is at least once, in commit order. Row changes are recorded inside the database, in a table named `_fleetring_cdc` that replicates with the data so a promoted follower continues the stream, and so is each sink's position, a mark in a table named `_fleetring_sinks` that the database's next write carries after a delivery: a new primary resumes each stream at the newest mark the write quorum holds, and a failover repeats only what the old primary delivered after it, usually the last batch or two, never a gap. An engine that can't keep marks inside its database keeps positions under `<data_dir>/changes/` on that node alone, and a failover then repeats everything since the last checkpoint. `status --node` (or `--address`) shows each sink's position, whether it is `replicated` or `local`, and its backlog. Configure the same sinks on every node that may become a primary. Names beginning with `_fleetring_` are reserved, and `db exec` and `db query` refuse statements that touch them. Schema changes aren't streamed.
 
@@ -292,6 +292,48 @@ Every request runs in an `rpc` span with `service`, `method`, and `request_id`, 
   ```
 
 - **The container image**, for `linux/amd64` and `linux/arm64`: `ghcr.io/fleetring/fleetringd`.
+
+## Upgrading
+
+**Which releases run together** (ADR-0038). A release's line is its `MAJOR.MINOR`. A fleet runs at most two adjacent lines at once, such as 0.3.x beside 0.4.x, and never 0.3.x beside 0.5.x, so upgrade one line at a time; patch releases of a line always mix. Every node reports its release, protocol, control-log format, and fleet features in `Join` and `Heartbeat`, and `fleetringd status` prints each member's `version=`. A node that reports nothing runs 0.3.0, the first release a rolling upgrade starts from. The control plane refuses a join outside the window with `FAILED_PRECONDITION`, naming both nodes and releases; the refused node keeps retrying and logs why. Moving from 0.2 to 0.3 isn't a rolling upgrade: upgrade every node, then reissue fleet-scoped tokens, as the 0.3.0 release notes say.
+
+**New commands wait for every member.** A command a release adds that older members can't read or act on is a fleet feature; the first is `fleetringd node undrain <node-id>`, which clears a drain mark without a restart. While any member, live or down, runs a release without the feature, the control plane refuses the command with `FAILED_PRECONDITION` and names that member, rather than apply it on some nodes only. The first such command it accepts enables the feature for good, and from then on a node whose release lacks it can't join: rolling back below the release that introduced it is refused. Until a new command is first used, rolling back is safe.
+
+**`fleetringd upgrade`.** It needs `cosign` 2.4.2 or newer on `PATH` ([install it](https://docs.sigstore.dev/cosign/system_config/installation/)), and refuses to install anything without it.
+
+```sh
+fleetringd upgrade --check --config /etc/fleetring/fleetringd.toml   # what's newer, and does the fleet allow it?
+fleetringd upgrade --config /etc/fleetring/fleetringd.toml           # the newest release, then restart this node
+fleetringd upgrade --version 0.4.1 --config /etc/fleetring/fleetringd.toml
+fleetringd upgrade --rollback --config /etc/fleetring/fleetringd.toml
+```
+
+1. It finds the newest final release on GitHub, or the one `--version` names (naming the installed one reinstalls it), for the platform the binary was built for. `--base-url <url>` reads a mirror laid out as `install.sh --base-url` expects and needs `--version`; `--releases-url <url>` reads a mirror's copy of GitHub's releases list.
+2. With `--config` (or `--control`), it asks the control plane for every member's release and refuses one the window forbids, before downloading anything.
+3. It downloads the archive, `SHA256SUMS`, and `SHA256SUMS.sigstore.json`, and verifies the signature with `cosign verify-blob` against the release workflow's identity (the one [`RELEASING.md`](https://github.com/fleetring/fleetring/blob/main/RELEASING.md#verify-what-was-published) names), then the archive's checksum, then that the binary inside says it is the release asked for. Any failure refuses, says why, and changes nothing.
+4. It writes the new binary beside the installed one and renames it into place, so the path always holds a whole binary, and keeps the installed one as `fleetringd.previous`.
+5. With `--config` naming a running node, and unless `--no-restart`, it drains the node, restarts it in place, waits until the control plane lists it as live on the new release, and waits until each of its replicas reaches the position its primary had when it rejoined. `--timeout` bounds each step (5 minutes by default).
+
+`--check` prints the installed release, the newest one, and whether the fleet allows it, and changes nothing; it exits 1 when a newer release exists that the fleet doesn't allow. The command acts as your principal, like every other command, so drain and status need the `fleet` scope. Upgrade the data nodes one at a time, then the control node, each after the last has rejoined.
+
+**Restarting in place.** A running daemon writes `<data_dir>/fleetringd.process` with its process ID and binary. `SIGHUP` restarts it: it drains as a stop does, stays a member, and executes the same binary path with the same arguments, so it keeps its process ID and loads the new binary.
+
+- **systemd:** run `fleetringd upgrade --config …` as the binary's owner (usually root). The unit needs no change, since the main process ID stays the same. To restart through systemd instead, pass `--no-restart` and run `systemctl restart fleetringd`; the stop drains and leaves, so give `TimeoutStopSec` room for a drain.
+- **The container image:** the binary belongs to root and the daemon runs as UID 65532, so `fleetringd upgrade` can't replace it, and the image is the release anyway. Upgrade by running the new tag on the same volume: `docker stop --time 60 fleetringd` (SIGTERM drains and leaves), then `docker run` `ghcr.io/fleetring/fleetringd:X.Y.Z` as before. `fleetringd upgrade --check` works from anywhere.
+- **A plain process:** `fleetringd upgrade --config …` restarts it in place in its terminal; or press Ctrl-C and start the new binary.
+
+A daemon that wrote no process file, such as 0.3.0, can't restart in place: the command replaces the binary and says to restart the node with its supervisor.
+
+**Rolling back.** `fleetringd upgrade --rollback --config …` swaps `fleetringd` and `fleetringd.previous` and restarts the node as an upgrade does; a second rollback rolls forward again. If the new binary doesn't run at all, `fleetringd.previous upgrade --rollback` does the same. A release without the command, such as 0.3.0, rolls back by hand: `mv fleetringd.previous fleetringd`, then restart. The fleet refuses a rollback below a release whose fleet feature is enabled.
+
+**By hand**, without the command, for each node in turn, the control node last:
+
+1. Check what the fleet runs (`fleetringd status`) and the release notes.
+2. Download the release and verify it as [`RELEASING.md`](https://github.com/fleetring/fleetring/blob/main/RELEASING.md#verify-what-was-published) shows, or with `install.sh` on a machine with cosign.
+3. Drain the node: `fleetringd node drain <node-id>`, then wait until `fleetringd db list --node <node-id>` lists nothing.
+4. Replace the binary by writing the new one beside it and renaming it into place, as `install.sh` does.
+5. Restart the node: `systemctl restart fleetringd`, a new container, or Ctrl-C and start. The stop drains again and leaves; the node rejoins when it starts.
+6. Wait until `fleetringd status` lists the node as live on the new version, and `fleetringd db locate` shows its replicas at their primaries' positions, before the next node.
 
 ## License
 
