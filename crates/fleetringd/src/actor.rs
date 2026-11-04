@@ -46,6 +46,7 @@ pub(crate) enum Request {
     Checkpoint(Reply<CheckpointMarker>),
     Snapshot(PathBuf, Reply<DatabaseSnapshot>),
     PinSnapshot(Reply<PinnedSnapshot>),
+    PinSnapshotAt(Option<Position>, Reply<PinnedSnapshot>),
     ReplicaPositions(Reply<Vec<ReplicaPosition>>),
 }
 
@@ -92,6 +93,9 @@ impl Request {
             Self::PinSnapshot(reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::PinSnapshotAt(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
             Self::ReplicaPositions(reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -115,6 +119,7 @@ impl fmt::Debug for Request {
             Self::Checkpoint(_) => "Checkpoint",
             Self::Snapshot(..) => "Snapshot",
             Self::PinSnapshot(_) => "PinSnapshot",
+            Self::PinSnapshotAt(..) => "PinSnapshotAt",
             Self::ReplicaPositions(_) => "ReplicaPositions",
         })
     }
@@ -385,6 +390,21 @@ impl DatabaseHandle {
     /// if the database is closed or the copy can't be pinned.
     pub async fn pin_snapshot(&self) -> Result<PinnedSnapshot, DatabaseError> {
         self.call(Request::PinSnapshot).await
+    }
+
+    /// Pins a consistent copy of a frame-source database that holds its log up to `at`, for an
+    /// archive's base snapshot; see [`FrameSource::pin_snapshot_at`].
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] unless the engine is a frame source, and [`DatabaseError`]
+    /// if the database is closed, `at` isn't a commit boundary of its current log, or the copy
+    /// can't be pinned.
+    pub async fn pin_snapshot_at(
+        &self,
+        at: Option<Position>,
+    ) -> Result<PinnedSnapshot, DatabaseError> {
+        self.call(|reply| Request::PinSnapshotAt(at, reply)).await
     }
 
     /// How far each replica of a self-replicating database has got.
@@ -739,6 +759,15 @@ impl Actor {
                 let result = self
                     .call(|database| {
                         Ok(frame_source(database, "pinning a snapshot")?.pin_snapshot()?)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::PinSnapshotAt(at, reply) => {
+                let result = self
+                    .call(move |database| {
+                        Ok(frame_source(database, "pinning a snapshot")?
+                            .pin_snapshot_at(at.as_ref())?)
                     })
                     .await;
                 let _ = reply.send(result);

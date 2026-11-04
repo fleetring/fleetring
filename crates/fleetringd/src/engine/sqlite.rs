@@ -583,6 +583,44 @@ impl FrameSource for SqliteDatabase {
             pin,
         ))
     }
+
+    fn pin_snapshot_at(&mut self, at: Option<&Position>) -> Result<PinnedSnapshot, EngineError> {
+        // As in `pin_snapshot`, the committed prefix read here is complete, and the pin holds
+        // off checkpoints until the snapshot is dropped.
+        let batch = self.read_wal(None)?;
+        let in_log = match (at, &batch) {
+            (Some(at), Some(batch)) => match cut_at(batch, at) {
+                Ok(_) => Some(decode_position(at)?),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        let marker = self.checkpointed.map(encode_position);
+        let at_log_start = at.is_none() || at == marker.as_ref();
+        if in_log.is_none() && !at_log_start {
+            let position = at.cloned().unwrap_or_default();
+            return Err(EngineError::InvalidPosition { position });
+        }
+        let header = in_log
+            .and(batch.as_ref())
+            .and_then(|batch| batch.header().copied());
+        let pin = self.pins.pin(&self.path, header);
+        let mut files = Vec::with_capacity(3);
+        if let Some(marker) = open_if_present(&checkpoint_path(&self.path)).map_err(storage)? {
+            let len = marker.metadata().map_err(storage)?.len();
+            files.push(SnapshotFile::new(CHECKPOINT_FILE, marker, len));
+        }
+        let database = File::open(&self.path).map_err(storage)?;
+        let len = database.metadata().map_err(storage)?.len();
+        files.push(SnapshotFile::new(DATABASE_FILE, database, len));
+        if let Some(end) = in_log {
+            // The WAL's prefix up to `at`, last, as `pin_snapshot` reads it.
+            let wal = File::open(self.wal_path()).map_err(storage)?;
+            files.push(SnapshotFile::new(WAL_FILE, wal, end.offset()));
+        }
+        // Without the WAL, the main file holds the log up to the last checkpoint.
+        Ok(PinnedSnapshot::new(at.cloned(), files, pin))
+    }
 }
 
 impl LogicalChanges for SqliteDatabase {
