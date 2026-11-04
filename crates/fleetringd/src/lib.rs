@@ -16,6 +16,7 @@ pub mod control;
 mod daemon;
 pub mod data;
 mod data_dir;
+pub mod durability;
 pub mod engine;
 mod environment;
 mod layout;
