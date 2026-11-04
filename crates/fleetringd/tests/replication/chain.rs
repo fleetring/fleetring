@@ -143,6 +143,51 @@ async fn every_replica_reports_the_same_chain_hash_at_every_common_position() ->
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_derived_from_where_the_log_begins_agrees_with_verify() -> TestResult {
+    let fleet = Fleet::start(&["a"], sqlite(), settings(), BTreeMap::new()).await?;
+    let db = name("derived");
+    fleet.create("a", &db, 1).await?;
+    let node = fleet.node("a");
+    for i in 0..3_i64 {
+        node.registry().execute(&db, put(i, 100)).await?;
+    }
+    // Without its record, a primary that serves the database again derives its chain from where
+    // the log's generation begins, past the generation's header.
+    node.replication.stop_primary(&db);
+    match fs::remove_file(node.root.join("replication/epochs/derived/chain")) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    node.replication.serve_primary(
+        db.clone(),
+        PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(2)),
+    )?;
+    node.registry().execute(&db, put(3, 100)).await?;
+    let verified = guarded("verifying", async {
+        loop {
+            match node.replication.verify(&db, None).await {
+                Err(status) if status.code() == Code::Unavailable => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                verified => return verified,
+            }
+        }
+    })
+    .await??;
+    let position = verified.position.clone().ok_or("a position")?;
+    let held = node
+        .replication
+        .chain_history(&db)
+        .and_then(|chain| chain.get(&position).copied());
+    assert_eq!(
+        held,
+        Some(verified.hash),
+        "the chain holds what the log reads back to"
+    );
+    Ok(())
+}
+
 /// Where `node` keeps `db`'s mirrored log.
 fn wal_path(fleet: &Fleet, node: &str, db: &str) -> PathBuf {
     fleet.node(node).database_dir(db).join("data.db-wal")

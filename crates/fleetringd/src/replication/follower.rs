@@ -225,11 +225,11 @@ fn recover_chain(
         Some(at) => match follower.committed_since(at.as_ref()) {
             Ok(batch) => LogRead::Continues(batch),
             Err(EngineError::InvalidPosition { .. }) => {
-                LogRead::Restarted(follower.committed_since(None).map_err(engine_status)?)
+                LogRead::Restarted(log_from_its_start(follower).map_err(engine_status)?)
             }
             Err(error) => return Err(engine_status(error)),
         },
-        None => LogRead::Restarted(follower.committed_since(None).map_err(engine_status)?),
+        None => LogRead::Restarted(log_from_its_start(follower).map_err(engine_status)?),
     };
     let recovered = chain::recover(engine, recorded, position.as_ref(), read)
         .map_err(|error| Status::data_loss(format!("can't hash the log of {database}: {error}")))?;
@@ -243,6 +243,18 @@ fn recover_chain(
         tracing::info!(database = %database, anchor = ?chain.anchor().position(), "no chain record fits the copy; the chain is derived from where its log begins");
     }
     Ok(chain)
+}
+
+/// The copy's current log as a chain derived from where it begins hashes it: read back from the
+/// batch's own start, as [`verify`] reads it, so that bytes before that position, such as a
+/// generation's header, are in neither. Blocking.
+fn log_from_its_start(follower: &dyn FrameFollower) -> Result<Option<FrameBatch>, EngineError> {
+    let Some(whole) = follower.committed_since(None)? else {
+        return Ok(None);
+    };
+    Ok(follower
+        .committed_since(Some(&whole.start))?
+        .or(Some(whole)))
 }
 
 /// The chain over the copy `follower` opened, from the slot if a stream built it, else rebuilt
