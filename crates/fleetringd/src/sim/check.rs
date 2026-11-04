@@ -13,7 +13,8 @@
 //!   ([`Fleet::check_history`](crate::sim::Fleet::check_history)), once replicas converge,
 //!   and at the end, and [`replicas_converged`] once the network heals
 //!   ([`Fleet::await_replicas_converged`](crate::sim::Fleet::await_replicas_converged));
-//! - [`change_stream_consistent`] at the end, for every file sink a host is configured with
+//! - [`change_stream_consistent`] and [`change_streams_resume`] at the end, for every file sink a
+//!   host is configured with
 //!   ([`Fleet::check_change_streams`](crate::sim::Fleet::check_change_streams));
 //! - [`lease_events_match_control`] at the end, over what the lease watchers learned and the
 //!   leases the control log granted (FR-042).
@@ -62,6 +63,9 @@ pub enum Invariant {
     /// A change sink's file holds the database's writes in commit order, with no gap and no
     /// write that was refused or never made (FR-039).
     ChangeStreamConsistent,
+    /// After a failover, a change stream continues at a mark the old primary replicated, and
+    /// repeats no more than the bound allows (FR-041, ADR-0028).
+    ChangeStreamResumes,
     /// What the lease watchers learned matches the leases control granted (FR-042): a node
     /// reports holding a database only at an epoch control leased to it, no two nodes report
     /// holding one epoch, each node's events for a database arrive in epoch order, and every
@@ -89,6 +93,7 @@ impl fmt::Display for Invariant {
             Self::MonotonicReads => "monotonic reads",
             Self::ReplicasConverged => "replicas converged",
             Self::ChangeStreamConsistent => "change stream consistent",
+            Self::ChangeStreamResumes => "change stream resumes at a replicated mark",
             Self::LeaseEventsMatchControl => "lease events match control",
             Self::ChainAgrees => "hash chains agree",
             Self::NodeCallsBound => "node calls bound to placement",
@@ -704,12 +709,20 @@ pub fn replicas_converged(
     Ok(())
 }
 
+/// How many records a failover may make a change stream repeat: what the old primary delivered
+/// after the newest mark that reached the write quorum. With writes flowing that is the last
+/// delivery, and the one before it when the next write was already running as the mark was staged
+/// (ADR-0028, point 6).
+pub const REPEATS_PER_FAILOVER: usize = 2;
+
 /// Checks the lines a file sink on `host` wrote for `database`, in file order, against
 /// `history`: the records' positions never go backwards, each record continues the one before
 /// it or repeats delivered positions (a duplicate, which at-least-once allows), and a record may
-/// start from the log's beginning only when the pump started or restarted there. Every row is an
-/// insert into the writes table of a value some write in the history made, and never one the
-/// history says was refused.
+/// start from the log's beginning only when the pump started or restarted there. A record that
+/// starts elsewhere than where the host left off is a resume, and is accepted when its start is
+/// a replicated mark: the end of some record, of any host, at an earlier epoch. `marks` holds the
+/// `(epoch, end)` of every record of the sink across hosts. Every row is an insert into the writes
+/// table of a value some write in the history made, and never one the history says was refused.
 ///
 /// # Errors
 ///
@@ -719,6 +732,7 @@ pub fn change_stream_consistent(
     database: &DatabaseName,
     host: &str,
     records: &[ChangeRecord],
+    marks: &BTreeSet<(u64, Position)>,
 ) -> Result<(), Violation> {
     let violation = |detail: String| {
         Violation::new(
@@ -772,6 +786,11 @@ pub fn change_stream_consistent(
             (_, None) => {}
             // A duplicate of what was delivered already.
             (Some(delivered), Some(_)) if position <= *delivered => {}
+            // A resume at a mark an earlier epoch's primary replicated.
+            (_, Some(start))
+                if marks
+                    .iter()
+                    .any(|(at, end)| *at < record.epoch && end == start) => {}
             (Some(delivered), Some(start)) if start > delivered => {
                 return Err(violation(format!(
                     "record {index} starts at {start}, past the last delivered position {delivered}: a gap"
@@ -823,6 +842,81 @@ pub fn change_stream_consistent(
                         "record {index} delivers write {value}, which no client made"
                     )));
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks, across every host's file sink stream of `database` (each a host and its records, in
+/// file order), that a failover continues the stream where the old primary's replicated mark left
+/// it. Taking the streams by epoch, the first record each host wrote at an epoch after the first
+/// starts at a position some earlier epoch delivered up to, never at the log's beginning, since
+/// something was delivered before; and the records of earlier epochs that end after that start,
+/// the repeats, number at most `repeats_per_failover`. A record is counted once however often a
+/// restarted pump delivered it again.
+///
+/// # Errors
+///
+/// [`Invariant::ChangeStreamResumes`] naming the epoch whose first record breaks it.
+pub fn change_streams_resume(
+    database: &DatabaseName,
+    streams: &[(String, Vec<ChangeRecord>)],
+    repeats_per_failover: usize,
+) -> Result<(), Violation> {
+    let violation = |detail: String| {
+        Violation::new(
+            Invariant::ChangeStreamResumes,
+            format!("{database}'s stream: {detail}"),
+        )
+    };
+    // Every record as (epoch, start, end, host), with its positions decoded.
+    let mut all: Vec<(u64, Option<Position>, Position, &str)> = Vec::new();
+    for (host, records) in streams {
+        for record in records {
+            let end = unhex(&record.position)
+                .map(Position::from)
+                .map_err(|_| violation(format!("{host} has a position that isn't hex")))?;
+            let start = record
+                .start
+                .as_deref()
+                .map(unhex)
+                .transpose()
+                .map_err(|_| violation(format!("{host} has a start that isn't hex")))?
+                .map(Position::from);
+            all.push((record.epoch, start, end, host));
+        }
+    }
+    let epochs: BTreeSet<u64> = all.iter().map(|(epoch, ..)| *epoch).collect();
+    for epoch in epochs.iter().skip(1) {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (_, start, _, host) in all.iter().filter(|(at, ..)| at == epoch) {
+            if !seen.insert(host) {
+                continue;
+            }
+            let earlier = || all.iter().filter(|(at, ..)| at < epoch);
+            let Some(start) = start else {
+                return Err(violation(format!(
+                    "{host}'s first record at epoch {epoch} starts from the log's beginning, \
+                     though an earlier epoch delivered"
+                )));
+            };
+            if !earlier().any(|(_, _, end, _)| end == start) {
+                return Err(violation(format!(
+                    "{host}'s first record at epoch {epoch} starts at {start}, which no earlier \
+                     epoch delivered up to"
+                )));
+            }
+            let repeats: BTreeSet<(u64, &Position)> = earlier()
+                .filter(|(_, _, end, _)| end > start)
+                .map(|(at, _, end, _)| (*at, end))
+                .collect();
+            if repeats.len() > repeats_per_failover {
+                return Err(violation(format!(
+                    "{host}'s resume at epoch {epoch} from {start} repeats {} records, more than \
+                     the {repeats_per_failover} a failover may",
+                    repeats.len()
+                )));
             }
         }
     }
@@ -1084,5 +1178,116 @@ mod tests {
         let violation = one_primary_per_epoch(&history).expect_err("two primaries");
         assert_eq!(violation.invariant(), Invariant::OnePrimaryPerEpoch);
         assert!(violation.detail().contains("b and c"), "{violation}");
+    }
+
+    fn delivered(epoch: u64, start: Option<&str>, end: &str) -> ChangeRecord {
+        ChangeRecord {
+            database: "db".to_owned(),
+            epoch,
+            start: start.map(str::to_owned),
+            position: end.to_owned(),
+            content: RecordContent::Logical { rows: Vec::new() },
+        }
+    }
+
+    /// The `(epoch, end)` of every record, as the fleet collects them.
+    fn marks_of(streams: &[(String, Vec<ChangeRecord>)]) -> BTreeSet<(u64, Position)> {
+        streams
+            .iter()
+            .flat_map(|(_, records)| records)
+            .map(|record| {
+                let end = unhex(&record.position).expect("hex");
+                (record.epoch, Position::from(end))
+            })
+            .collect()
+    }
+
+    fn failed_over(resumed: ChangeRecord) -> Vec<(String, Vec<ChangeRecord>)> {
+        vec![
+            (
+                "a".to_owned(),
+                vec![
+                    delivered(1, None, "01"),
+                    delivered(1, Some("01"), "02"),
+                    delivered(1, Some("02"), "03"),
+                ],
+            ),
+            ("b".to_owned(), vec![resumed]),
+        ]
+    }
+
+    fn consistent(streams: &[(String, Vec<ChangeRecord>)], host: usize) -> Result<(), Violation> {
+        let db: DatabaseName = "db".parse().expect("name");
+        let (name, records) = &streams[host];
+        change_stream_consistent(&History::default(), &db, name, records, &marks_of(streams))
+    }
+
+    #[test]
+    fn a_stream_resumed_at_a_mark_passes() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let streams = failed_over(delivered(2, Some("02"), "04"));
+        assert_eq!(consistent(&streams, 0), Ok(()));
+        assert_eq!(consistent(&streams, 1), Ok(()));
+        // The record at 03 is the one repeat.
+        assert_eq!(change_streams_resume(&db, &streams, 1), Ok(()));
+        assert_eq!(
+            change_streams_resume(&db, &streams, REPEATS_PER_FAILOVER),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_resume_past_every_delivered_position_is_a_gap() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let streams = failed_over(delivered(2, Some("09"), "0a"));
+        let violation = consistent(&streams, 1).expect_err("nothing delivered up to 09");
+        assert_eq!(violation.invariant(), Invariant::ChangeStreamConsistent);
+        let violation = change_streams_resume(&db, &streams, REPEATS_PER_FAILOVER)
+            .expect_err("09 is no earlier epoch's mark");
+        assert_eq!(violation.invariant(), Invariant::ChangeStreamResumes);
+    }
+
+    #[test]
+    fn more_repeats_than_the_bound_fail() {
+        let db: DatabaseName = "db".parse().expect("name");
+        // Epoch 2 resumes at 01: the records ending at 02 and 03 are repeated, and a third
+        // delivery at epoch 1 is one too many.
+        let mut streams = failed_over(delivered(2, Some("01"), "04"));
+        assert_eq!(
+            change_streams_resume(&db, &streams, REPEATS_PER_FAILOVER),
+            Ok(())
+        );
+        streams[0].1.push(delivered(1, Some("03"), "03aa"));
+        let violation =
+            change_streams_resume(&db, &streams, REPEATS_PER_FAILOVER).expect_err("three repeats");
+        assert!(violation.detail().contains("repeats 3"), "{violation}");
+        assert_eq!(change_streams_resume(&db, &streams, 3), Ok(()));
+        // A pump that delivered the same record twice on one epoch repeats it once.
+        streams[0].1.pop();
+        streams[0].1.push(delivered(1, Some("01"), "02"));
+        assert_eq!(
+            change_streams_resume(&db, &streams, REPEATS_PER_FAILOVER),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_first_record_from_the_beginning_after_deliveries_fails() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let streams = failed_over(delivered(2, None, "04"));
+        // Per host, starting from the log's beginning is always allowed: a pump may reset.
+        assert_eq!(consistent(&streams, 1), Ok(()));
+        let violation = change_streams_resume(&db, &streams, REPEATS_PER_FAILOVER)
+            .expect_err("a new epoch restarted from the beginning");
+        assert!(
+            violation.detail().contains("log's beginning"),
+            "{violation}"
+        );
+        // With nothing delivered before, the first epoch starts from the beginning.
+        let first = vec![("a".to_owned(), vec![delivered(1, None, "01")])];
+        assert_eq!(
+            change_streams_resume(&db, &first, REPEATS_PER_FAILOVER),
+            Ok(())
+        );
     }
 }
