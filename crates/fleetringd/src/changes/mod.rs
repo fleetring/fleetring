@@ -76,6 +76,7 @@ use tokio::time;
 use self::position::PositionStore;
 use self::pump::{PumpContext, PumpState};
 use crate::engine::{Execution, Payload, Position, RowChange};
+use crate::observe::ChangeMetrics;
 use crate::replication::{ChainHash, Replication};
 
 pub use self::config::{ChangesConfig, Format, SinkConfig, SinkKind};
@@ -233,6 +234,10 @@ pub struct ChangeParts {
     pub state_dir: PathBuf,
     /// How pumps retry.
     pub settings: ChangeSettings,
+    /// Where deliveries and resets are counted: the daemon's
+    /// [`Metrics::changes`](crate::observe::Metrics::changes), or a default handle that isn't
+    /// registered anywhere.
+    pub metrics: ChangeMetrics,
 }
 
 /// One sink's progress on one database, as the node's status reports it.
@@ -274,6 +279,7 @@ struct Inner {
     replication: Replication,
     state_dir: PathBuf,
     settings: ChangeSettings,
+    metrics: ChangeMetrics,
     pumps: Mutex<BTreeMap<(String, DatabaseName), Pump>>,
     supervisor: Mutex<Option<AbortOnDrop>>,
 }
@@ -306,13 +312,18 @@ impl ChangeStreams {
             replication,
             state_dir,
             settings,
+            metrics,
         } = parts;
+        for configured in &sinks {
+            metrics.add_sink(configured.sink.name());
+        }
         let served = replication.served();
         let inner = Arc::new(Inner {
             sinks,
             replication,
             state_dir,
             settings,
+            metrics,
             pumps: Mutex::default(),
             supervisor: Mutex::default(),
         });
@@ -449,6 +460,7 @@ impl Inner {
                     store: PositionStore::new(&self.state_dir, &name, database),
                     state: Arc::clone(&state),
                     settings: self.settings,
+                    metrics: self.metrics.clone(),
                     streams: Arc::downgrade(self),
                 };
                 let task = tokio::spawn(pump::run(context));

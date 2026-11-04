@@ -144,6 +144,7 @@ use crate::engine::{
     CheckpointMarker, DatabaseEngine, EngineCapability, EngineKind, Execution, Position,
 };
 use crate::membership::DatabaseStatuses;
+use crate::observe::ReplicationMetrics;
 use crate::publisher::{
     Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
 };
@@ -267,6 +268,10 @@ pub struct ReplicationParts {
     pub state_dir: PathBuf,
     /// Pacing and bounds.
     pub settings: ReplicationSettings,
+    /// Where batches, snapshots, and re-seeds are counted: the daemon's
+    /// [`Metrics::replication`](crate::observe::Metrics::replication), or a default handle that
+    /// isn't registered anywhere.
+    pub metrics: ReplicationMetrics,
 }
 
 /// How a node serves a database as its primary.
@@ -461,6 +466,7 @@ struct Inner {
     followers: Mutex<BTreeMap<DatabaseName, Arc<FollowerSlot>>>,
     /// Numbers staging directories, so that two transfers never share one.
     transfers: AtomicU64,
+    metrics: ReplicationMetrics,
 }
 
 /// A database this node is primary for, and the task that drives its streams.
@@ -501,6 +507,7 @@ impl Replication {
             execution,
             state_dir,
             settings,
+            metrics,
         } = parts;
         let inner = Arc::new(Inner {
             node,
@@ -522,6 +529,7 @@ impl Replication {
             primaries: Mutex::default(),
             followers: Mutex::default(),
             transfers: AtomicU64::new(0),
+            metrics,
         });
         let built = registry(ReplicatingPublisher {
             inner: Arc::downgrade(&inner),

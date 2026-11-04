@@ -261,6 +261,12 @@ async fn renew_all(node: &DataNode, limit: Duration) {
         let Ok((database, epoch, renewed)) = joined else {
             continue;
         };
+        let outcome = match &renewed {
+            Ok(Ok(_)) => "renewed",
+            Ok(Err(status)) if missing_database(status).is_some() || is_lost(status) => "refused",
+            Ok(Err(_)) | Err(_) => "failed",
+        };
+        node.metrics().renewal(outcome);
         match renewed {
             Ok(Ok(_)) => {}
             Ok(Err(status)) if missing_database(&status).is_some() => {
@@ -342,14 +348,38 @@ async fn promote(
     request: PromotionRequest,
     settings: LeaseSettings,
 ) -> Result<(), Status> {
-    let replication = node.replication();
-    let epoch = request.epoch;
-    if replication
+    if node
+        .replication()
         .serving(database)
-        .is_some_and(|role| role.epoch == epoch)
+        .is_some_and(|role| role.epoch == request.epoch)
     {
         return Ok(());
     }
+    let started = tokio::time::Instant::now();
+    let result = carry_out(node, database, request, settings).await;
+    match &result {
+        Ok(()) => node
+            .metrics()
+            .promotion("completed", Some(started.elapsed())),
+        Err(status) if status.code() == Code::FailedPrecondition => {
+            node.metrics().promotion("superseded", None);
+        }
+        Err(_) => node.metrics().promotion("failed", None),
+    }
+    result
+}
+
+/// Fences a quorum, adopts the most advanced log among it, completes the promotion, and serves
+/// `database` at `request.epoch`. `FAILED_PRECONDITION` means control state has moved past the
+/// epoch, or this node is no longer a candidate.
+async fn carry_out(
+    node: &DataNode,
+    database: &DatabaseName,
+    request: PromotionRequest,
+    settings: LeaseSettings,
+) -> Result<(), Status> {
+    let replication = node.replication();
+    let epoch = request.epoch;
     if replication
         .highest_epoch(database)
         .is_some_and(|highest| highest > epoch)

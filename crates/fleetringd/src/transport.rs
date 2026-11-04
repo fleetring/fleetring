@@ -28,6 +28,7 @@ use tonic::{Code, Status};
 
 use crate::auth::{AUTHORIZATION, BearerToken, TokenError};
 use crate::environment::Network;
+use crate::observe::request_id::{self, REQUEST_ID_KEY};
 use crate::tls::{Accepted, Raw, Security};
 
 /// Timeouts for connections to peers.
@@ -228,12 +229,20 @@ impl fmt::Debug for Credentials {
     }
 }
 
+/// Requests also carry the ID of the request the calling task serves, if any, unless they name
+/// one already (ADR-0034 point 8): a data node's control call on behalf of a request carries
+/// the request's ID.
 impl Interceptor for Credentials {
     fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        let metadata = request.metadata_mut();
         if let Some(authorization) = &self.authorization {
-            request
-                .metadata_mut()
-                .insert(AUTHORIZATION, authorization.clone());
+            metadata.insert(AUTHORIZATION, authorization.clone());
+        }
+        if !metadata.contains_key(REQUEST_ID_KEY)
+            && let Some(id) = request_id::current()
+            && let Ok(value) = MetadataValue::try_from(id.as_str())
+        {
+            metadata.insert(REQUEST_ID_KEY, value);
         }
         Ok(request)
     }

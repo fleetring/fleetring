@@ -29,6 +29,10 @@ pub(crate) const PRINCIPAL: &str = "tester";
 pub(crate) const OPERATOR: &str =
     "\n[[principal]]\nname = \"tester\"\nscopes = [\"admin:*\", \"stream:*\", \"fleet\"]\n";
 
+/// The `[admin]` table every test daemon gets: its admin listener on a port of its own, so that
+/// daemons running at once never contend for the default 7401.
+pub(crate) const ADMIN: &str = "\n[admin]\nlisten = \"127.0.0.1:0\"\n";
+
 /// A certificate authority written under a test's directory.
 #[derive(Debug)]
 pub(crate) struct Tls {
@@ -81,14 +85,26 @@ impl Tls {
     /// Issues `node.<id>.crt` and `node.<id>.key` for [`HOST`], and returns the `[tls]` table
     /// that names them, to append to the node's configuration.
     pub(crate) fn node_table(&self, id: &str) -> Result<String, Box<dyn Error>> {
+        Ok(format!("{}{ADMIN}", self.node_tls_table(id)?))
+    }
+
+    /// Issues the node's files as [`node_table`](Self::node_table) does, and returns the
+    /// `[tls]` table without the [`ADMIN`] table, for a configuration that sets its own.
+    pub(crate) fn node_tls_table(&self, id: &str) -> Result<String, Box<dyn Error>> {
         let stem = format!("node.{id}");
         self.issue_node(id)?.write(&self.dir, &stem)?;
-        Ok(self.table(&stem))
+        Ok(self.tls_table(&stem))
     }
 
     /// The `[tls]` table naming `<stem>.crt` and `<stem>.key` in the authority's directory,
-    /// followed by the [`OPERATOR`] `[[principal]]` entry.
+    /// followed by the [`OPERATOR`] `[[principal]]` entry and the [`ADMIN`] table.
     pub(crate) fn table(&self, stem: &str) -> String {
+        format!("{}{ADMIN}", self.tls_table(stem))
+    }
+
+    /// The `[tls]` table naming `<stem>.crt` and `<stem>.key` in the authority's directory,
+    /// followed by the [`OPERATOR`] `[[principal]]` entry, without an `[admin]` table.
+    pub(crate) fn tls_table(&self, stem: &str) -> String {
         format!(
             "\n[tls]\nca = {:?}\ncert = {:?}\nkey = {:?}\n{OPERATOR}",
             self.dir.join("ca.crt"),

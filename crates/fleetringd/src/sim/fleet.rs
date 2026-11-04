@@ -493,6 +493,9 @@ fn host_config(
         tls: None,
         insecure_plaintext: crate::Plaintext::Refused,
         principals: vec![workload_principal()],
+        // The admin listener doesn't start on a simulated network; the sampler runs on its clock.
+        admin: crate::AdminConfig::default(),
+        log: crate::LogConfig::default(),
     })
 }
 
@@ -687,6 +690,18 @@ impl Fleet {
     #[must_use]
     pub fn is_running(&self, name: &str) -> bool {
         self.shared.lock().running.contains_key(name)
+    }
+
+    /// Returns host `name`'s metrics exposition, while its daemon runs (ADR-0034). The admin
+    /// listener doesn't start on the simulated network; this reads the registry directly. Each
+    /// incarnation counts from zero.
+    #[must_use]
+    pub fn metrics(&self, name: &str) -> Option<String> {
+        self.shared
+            .lock()
+            .running
+            .get(name)
+            .map(|running| running.metrics.encode())
     }
 
     /// Returns a handle to the control node, while it runs.

@@ -22,12 +22,16 @@ use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSe
 use crate::durability::{Archive, ArchiveError, ArchiveParts, build_store};
 use crate::engine::{DatabaseEngine, Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
+use crate::observe::admin::{self, AdminParts, AdminTlsParts, RunningAdmin};
+use crate::observe::health::Probes;
+use crate::observe::sampler::{Sampler, Sources};
+use crate::observe::{Metrics, NodeInfo, TraceLayer};
 use crate::replication::{Replication, ReplicationParts};
 use crate::tls::{Identity, IdentityError, Security};
 use crate::transport::{Listener, Peers, control_server, database_server, incoming};
 use crate::{
-    Config, ConfigError, DataDir, DataDirError, DatabaseStatuses, Membership, MembershipTasks,
-    OnShutdown, Plaintext, Registry,
+    AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, DataDir, DataDirError,
+    DatabaseStatuses, Membership, MembershipTasks, OnShutdown, Plaintext, Registry,
 };
 
 /// How long shutdown waits for open connections to close before it drops them.
@@ -57,6 +61,9 @@ pub struct Daemon {
     server: RunningServer,
     control: Option<ControlRole>,
     data: Option<DataRole>,
+    metrics: Metrics,
+    admin: Option<RunningAdmin>,
+    sampler: Sampler,
 }
 
 /// What the control role runs: the control node, and its failover timer.
@@ -162,8 +169,11 @@ impl Daemon {
     ///
     /// [`StartError`] if the configuration is invalid, there is no identity and plaintext isn't
     /// allowed, the identity can't be loaded, another daemon holds the directory, the control
-    /// log can't be recovered, `listen` can't be bound, or `[engine] page_size` isn't a valid
-    /// page size.
+    /// log can't be recovered, `listen` or `[admin] listen` can't be bound, `[admin] tls` is set
+    /// without an identity, or `[engine] page_size` isn't a valid page size.
+    ///
+    /// Over TCP it also serves the admin listener (`[admin]`, ADR-0034); under simulation it
+    /// doesn't, and [`Daemon::metrics`] reads the same registry.
     pub async fn start_with(
         mut config: Config,
         environment: Environment,
@@ -179,9 +189,15 @@ impl Daemon {
         let environment = environment
             .clone()
             .with_network(environment.network().clone().with_security(security));
+        let fleet = match environment.network().security() {
+            Security::Tls(identity) => Some(identity.fleet()),
+            Security::Plaintext => None,
+        };
+        let admin_tls = admin_tls(&config, environment.network().security())?;
+        let metrics = Metrics::new(&NodeInfo::new(config.node.id.clone(), config.role, fleet));
         let data_dir = DataDir::lock(&config.data_dir)?;
         let control = if config.role.runs_control() {
-            let node = open_control(&config, &data_dir, &environment).await?;
+            let node = open_control(&config, &data_dir, &environment, &metrics).await?;
             let failover = Failover::start(
                 node.handle(),
                 environment.clock(),
@@ -194,8 +210,15 @@ impl Daemon {
         };
         let network = environment.network();
         let (listener, address) = bind(&config, network).await?;
+        let admin_listener = bind_admin(&config, network).await?;
         let data = if config.role.hosts_data() {
-            Some(start_data(&config, &data_dir, &environment, address)?)
+            Some(start_data(
+                &config,
+                &data_dir,
+                &environment,
+                address,
+                &metrics,
+            )?)
         } else {
             None
         };
@@ -225,8 +248,51 @@ impl Daemon {
                 security: network.security().clone(),
                 authorizer,
             },
+            TraceLayer::new(config.node.id.clone(), &metrics),
         );
         let data = data.map(|(role, _)| role);
+        let sampler = Sampler::start(
+            Sources {
+                membership: data.as_ref().map(|role| role.membership.clone()),
+                replication: data.as_ref().map(|role| role.replication.clone()),
+                changes: data.as_ref().map(|role| role.changes.clone()),
+                sinks: data
+                    .as_ref()
+                    .map(|role| {
+                        role.changes
+                            .sinks()
+                            .iter()
+                            .map(|configured| configured.sink.name().to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                control: control.as_ref().map(|role| role.node.handle()),
+            },
+            metrics.sampled().clone(),
+            config.admin.sample_interval(),
+        );
+        let admin = match admin_listener {
+            Some(listener) => {
+                let admin_address = config.admin.listen;
+                let running = admin::start(AdminParts {
+                    listener,
+                    metrics: metrics.clone(),
+                    probes: Probes {
+                        node: config.node.id.clone(),
+                        membership: data.as_ref().map(|role| role.membership.clone()),
+                        denylist_max_age: denylist_max_age(&config),
+                        control: control.as_ref().map(|role| role.node.handle()),
+                    },
+                    tls: admin_tls,
+                })
+                .map_err(|source| StartError::Listen {
+                    address: admin_address,
+                    source,
+                })?;
+                Some(running)
+            }
+            None => None,
+        };
         tracing::info!(
             node = %config.node.id,
             zone = ?config.node.zone.as_ref().map(|zone| zone.as_str()),
@@ -239,6 +305,9 @@ impl Daemon {
             heartbeat_interval_ms = config.membership.heartbeat_interval_ms.get(),
             data_dir = %data_dir.path().display(),
             tls = !network.security().is_plaintext(),
+            admin = %admin
+                .as_ref()
+                .map_or_else(|| "off".to_owned(), |admin| admin.address().to_string()),
             "fleetringd started",
         );
         Ok(Self {
@@ -247,7 +316,25 @@ impl Daemon {
             server,
             control,
             data,
+            metrics,
+            admin,
+            sampler,
         })
+    }
+
+    /// The daemon's metrics: the registry the admin listener serves at `/metrics`.
+    #[must_use]
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// The address the admin listener serves on, if it runs (ADR-0034).
+    ///
+    /// It differs from the configured `[admin] listen` when that names port 0. It is `None`
+    /// when `[admin] enabled = false`, and under simulation, whose network isn't TCP.
+    #[must_use]
+    pub fn admin_address(&self) -> Option<SocketAddr> {
+        self.admin.as_ref().map(RunningAdmin::address)
     }
 
     /// The configuration the daemon started with.
@@ -319,6 +406,7 @@ impl Daemon {
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
         shutdown.await;
         tracing::info!(node = %self.config.node.id, "fleetringd shutting down");
+        drop(self.sampler);
         let replication = match self.data {
             Some(data) => {
                 if self.config.membership.on_shutdown == OnShutdown::Leave {
@@ -338,6 +426,11 @@ impl Daemon {
         // Stop accepting calls, then stop the control writer, which also ends membership streams
         // so the server can finish.
         let _server_gone = self.server.stop.send(());
+        // Probes answer until here, so a draining node reports `draining` rather than going
+        // silent; they stop before the control writer, which `/healthz` would report.
+        if let Some(admin) = self.admin {
+            admin.stop().await;
+        }
         if let Some(control) = self.control {
             control.failover.stop().await;
             control.node.shutdown().await;
@@ -406,12 +499,65 @@ async fn open_control(
     config: &Config,
     data_dir: &DataDir,
     environment: &Environment,
+    metrics: &Metrics,
 ) -> Result<ControlNode, StartError> {
     let options = ControlOptions::new(config.control.control_config())
         .with_snapshot_every(config.control.snapshot_every)
         .with_storage_io(environment.control_storage_io());
     let path = data_dir.path().join(CONTROL_DB);
-    Ok(ControlNode::open(path, options, environment.clock()).await?)
+    Ok(ControlNode::open_with_metrics(
+        path,
+        options,
+        environment.clock(),
+        metrics.control().clone(),
+    )
+    .await?)
+}
+
+/// What the admin listener serves over TLS, if `[admin] tls = true`: the node's own identity,
+/// which `[admin] tls` needs.
+fn admin_tls(config: &Config, security: &Security) -> Result<Option<AdminTlsParts>, StartError> {
+    if config.admin.enabled == AdminListener::Disabled || config.admin.tls == AdminTls::Off {
+        return Ok(None);
+    }
+    match security {
+        Security::Tls(identity) => Ok(Some(AdminTlsParts {
+            identity: identity.clone(),
+            scrapers: config.admin.scrapers.clone(),
+        })),
+        Security::Plaintext => Err(StartError::Config(ConfigError::Missing {
+            field: "tls",
+            reason: "admin.tls = true serves the node's certificate; add a [tls] table",
+        })),
+    }
+}
+
+/// Binds `[admin] listen`, unless the admin listener is disabled or the network isn't TCP, as
+/// under simulation (ADR-0034 point 1).
+async fn bind_admin(
+    config: &Config,
+    network: &Network,
+) -> Result<Option<tokio::net::TcpListener>, StartError> {
+    let admin = &config.admin;
+    if admin.enabled == AdminListener::Disabled || !network.is_tcp() {
+        return Ok(None);
+    }
+    if admin.tls == AdminTls::Off && !admin.listen.ip().is_loopback() {
+        // Validation lets this through only with `allow_plaintext`.
+        debug_assert_eq!(admin.allow_plaintext, AdminPlaintext::Allowed);
+        tracing::warn!(
+            listen = %admin.listen,
+            "admin.allow_plaintext is set: serving metrics and probes in plaintext on a \
+             non-loopback address, to anyone who can connect",
+        );
+    }
+    let listener = tokio::net::TcpListener::bind(admin.listen)
+        .await
+        .map_err(|source| StartError::Listen {
+            address: admin.listen,
+            source,
+        })?;
+    Ok(Some(listener))
 }
 
 /// The address this node reaches the control plane at: `[control] address`, or else its own
@@ -436,6 +582,7 @@ fn start_data(
     data_dir: &DataDir,
     environment: &Environment,
     bound: SocketAddr,
+    metrics: &Metrics,
 ) -> Result<(DataRole, DataNode), StartError> {
     let engine = SqliteEngine::new(config.engine.page_size)?;
     let archive_engine: Arc<dyn DatabaseEngine> = Arc::new(engine.clone());
@@ -448,11 +595,12 @@ fn start_data(
     // Replication reads membership, and heartbeats report replication's databases, so membership
     // starts first and learns its source of statuses as soon as replication exists.
     let statuses = ReplicationStatuses::default();
-    let (membership, tasks) = Membership::start_reporting(
+    let (membership, tasks) = Membership::start_observed(
         member,
         control.clone(),
         &config.membership,
         statuses.clone(),
+        metrics.membership().clone(),
     );
     let settings = config.replication.settings();
     let databases = data_dir.path().join(DATABASES_DIR);
@@ -470,6 +618,7 @@ fn start_data(
             execution: config.engine.execution,
             state_dir: data_dir.path().join(REPLICATION_DIR),
             settings: settings.clone(),
+            metrics: metrics.replication().clone(),
         },
         move |publisher| {
             Registry::new(engine, publisher, databases, engine_config)
@@ -490,6 +639,7 @@ fn start_data(
         replication: replication.clone(),
         state_dir: data_dir.path().join(CHANGES_DIR),
         settings: ChangeSettings::new(),
+        metrics: metrics.changes().clone(),
     });
     let node = DataNode::new(
         config.node.id.clone(),
@@ -498,6 +648,7 @@ fn start_data(
         control,
         archives,
         settings.ack_timeout,
+        metrics.data().clone(),
     );
     let drain = DrainSettings::new(settings.stall_timeout, settings.ack_timeout);
     let keeper = LeaseKeeper::start(
@@ -638,6 +789,7 @@ fn serve(
     data: Option<&DataNode>,
     control_address: SocketAddr,
     guard: Guard,
+    trace: TraceLayer,
 ) -> RunningServer {
     let Guard {
         security,
@@ -649,8 +801,14 @@ fn serve(
         let _stop = stopped.await;
     };
     let no_control = control.is_none();
+    // The trace layer is outermost, so its span covers the boundary's checks and audit lines.
     let router = Server::builder()
-        .layer(AuthLayer::new(authorizer))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(trace)
+                .layer(AuthLayer::new(authorizer))
+                .into_inner(),
+        )
         .add_optional_service(control.map(control_server))
         .add_optional_service(
             no_control.then(|| control_server(NoControl::new(control_address.to_string()))),

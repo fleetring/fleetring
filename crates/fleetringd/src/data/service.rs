@@ -9,13 +9,14 @@ use fleetring_proto::v1::{
     NodeStatusResponse, QueryRequest, QueryResponse, RestorePoint, RestoreRequest, RestoreResponse,
     VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest, VerifyResponse, WatchLeasesRequest,
 };
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::auth::{Action, authorized, require_database};
 use crate::changes::MarkHome;
 use crate::data::convert::{parse, rows_to_proto, statement};
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
+use crate::data::redirect::primary_hint;
 use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
@@ -30,6 +31,69 @@ pub(crate) struct DatabaseService {
 impl DatabaseService {
     pub(crate) fn new(node: DataNode) -> Self {
         Self { node }
+    }
+
+    async fn run_execute(
+        &self,
+        request: Request<ExecuteRequest>,
+    ) -> Result<Response<ExecuteResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let request = request.into_inner();
+        let statement = statement(request.sql, request.params)?;
+        let lease = self.node.route(&name).await?;
+        let stored = self
+            .node
+            .registry()
+            .execute(&name, Transaction::from(statement))
+            .await
+            .map_err(|error| database_status(&error))?;
+        // A write that committed no batch has nothing new to replicate: report how many replicas
+        // hold everything committed so far.
+        let acknowledged = stored
+            .acknowledged
+            .or_else(|| self.node.replication().holders(&name))
+            .unwrap_or_else(|| Acknowledged::new(1, 1, lease.replicas()));
+        Ok(Response::new(ExecuteResponse {
+            rows_affected: stored.rows_affected,
+            acknowledged_by: acknowledged.acknowledged_by,
+            under_replicated: acknowledged.is_under_replicated(),
+            replicas: acknowledged.replicas,
+            primary: self.node.id().to_string(),
+            epoch: lease.epoch.get(),
+        }))
+    }
+
+    async fn run_query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let request = request.into_inner();
+        let statement = statement(request.sql, request.params)?;
+        self.node.route(&name).await?;
+        let rows = self
+            .node
+            .registry()
+            .query(&name, statement)
+            .await
+            .map_err(|error| database_status(&error))?;
+        Ok(Response::new(rows_to_proto(rows)))
+    }
+}
+
+/// How an `Execute` that failed with `status` is counted: `redirected` to the primary,
+/// `refused` before it ran (no primary here to name, or no such database), `aborted` when it may
+/// or may not have taken effect, and `failed` otherwise.
+fn write_outcome(status: &Status) -> &'static str {
+    if primary_hint(status).is_some() {
+        return "redirected";
+    }
+    match status.code() {
+        Code::Unavailable | Code::NotFound => "refused",
+        Code::Aborted => "aborted",
+        _ => "failed",
     }
 }
 
@@ -105,49 +169,29 @@ impl Database for DatabaseService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
-        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
-        require_database(&request, &name)?;
-        let request = request.into_inner();
-        let statement = statement(request.sql, request.params)?;
-        let lease = self.node.route(&name).await?;
-        let stored = self
-            .node
-            .registry()
-            .execute(&name, Transaction::from(statement))
-            .await
-            .map_err(|error| database_status(&error))?;
-        // A write that committed no batch has nothing new to replicate: report how many replicas
-        // hold everything committed so far.
-        let acknowledged = stored
-            .acknowledged
-            .or_else(|| self.node.replication().holders(&name))
-            .unwrap_or_else(|| Acknowledged::new(1, 1, lease.replicas()));
-        Ok(Response::new(ExecuteResponse {
-            rows_affected: stored.rows_affected,
-            acknowledged_by: acknowledged.acknowledged_by,
-            under_replicated: acknowledged.is_under_replicated(),
-            replicas: acknowledged.replicas,
-            primary: self.node.id().to_string(),
-            epoch: lease.epoch.get(),
-        }))
+        let started = tokio::time::Instant::now();
+        let result = self.run_execute(request).await;
+        let metrics = self.node.metrics();
+        match &result {
+            Ok(_) => metrics.write("acknowledged", Some(started.elapsed())),
+            Err(status) => metrics.write(write_outcome(status), None),
+        }
+        result
     }
 
     async fn query(
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
-        require_database(&request, &name)?;
-        let request = request.into_inner();
-        let statement = statement(request.sql, request.params)?;
-        self.node.route(&name).await?;
-        let rows = self
-            .node
-            .registry()
-            .query(&name, statement)
-            .await
-            .map_err(|error| database_status(&error))?;
-        Ok(Response::new(rows_to_proto(rows)))
+        let started = tokio::time::Instant::now();
+        let result = self.run_query(request).await;
+        let metrics = self.node.metrics();
+        match &result {
+            Ok(_) => metrics.query("ok", Some(started.elapsed())),
+            Err(status) if primary_hint(status).is_some() => metrics.query("redirected", None),
+            Err(_) => metrics.query("failed", None),
+        }
+        result
     }
 
     async fn create(

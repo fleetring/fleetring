@@ -147,6 +147,7 @@ impl Harness {
                 retry_initial: Duration::from_millis(10),
                 retry_max: Duration::from_millis(100),
             },
+            metrics: fleetringd::observe::ChangeMetrics::default(),
         });
         guarded(
             "membership converging",
@@ -249,6 +250,7 @@ fn start_replication(
                 retry_interval: Duration::from_millis(50),
                 ..ReplicationSettings::new()
             },
+            metrics: fleetringd::observe::ReplicationMetrics::default(),
         },
         move |sink| {
             Registry::new(registry_engine, sink, databases, config)
@@ -429,6 +431,7 @@ impl Fleet {
                     retry_initial: Duration::from_millis(10),
                     retry_max: Duration::from_millis(100),
                 },
+                metrics: fleetringd::observe::ChangeMetrics::default(),
             });
             let router = tonic::service::Routes::new(replication_server(replication.service()));
             let (stop, stopped) = oneshot::channel::<()>();
@@ -622,6 +625,7 @@ fn start_fleet_replication(
             execution: Execution::Threads,
             state_dir: root.join("replication"),
             settings: fleet_settings(),
+            metrics: fleetringd::observe::ReplicationMetrics::default(),
         },
         move |sink| {
             Registry::new(registry_engine, sink, databases, config).with_recorded_changes(

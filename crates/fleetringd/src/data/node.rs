@@ -18,6 +18,7 @@ use crate::data::redirect::not_primary;
 use crate::data::service::database_status;
 use crate::durability::{Archive, RestoreError, RestoreTarget, Restored, StoreError, restore_into};
 use crate::engine::EngineError;
+use crate::observe::DataMetrics;
 use crate::replication::{PrimaryRole, Replication, ServePrimaryError};
 use crate::{DatabaseError, Registry};
 
@@ -117,6 +118,8 @@ pub(super) struct Inner {
     staging: tokio::sync::Semaphore,
     /// Held per database while it is created or restored here, so that two never race.
     creating: NameLocks,
+    /// Where writes, queries, renewals, transfers, and promotions are counted.
+    metrics: DataMetrics,
 }
 
 /// Refuses requests for one database until it is dropped.
@@ -165,7 +168,8 @@ impl Drop for Settling<'_> {
 impl DataNode {
     /// A node with ID `id` that keeps its databases in `replication`'s registry, and asks the
     /// control plane through `control`. A database it starts serving waits up to `writable_wait`
-    /// for every live follower, and at least a write quorum, to connect.
+    /// for every live follower, and at least a write quorum, to connect. It counts what it does
+    /// in `metrics`.
     pub(crate) fn new(
         id: NodeId,
         replication: Replication,
@@ -173,6 +177,7 @@ impl DataNode {
         control: ControlClient,
         archives: Vec<Archive>,
         writable_wait: Duration,
+        metrics: DataMetrics,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -188,8 +193,14 @@ impl DataNode {
                 draining: tokio::sync::Mutex::new(()),
                 staging: tokio::sync::Semaphore::new(1),
                 creating: NameLocks::default(),
+                metrics,
             }),
         }
+    }
+
+    /// Where the node counts writes, queries, renewals, transfers, and promotions.
+    pub(crate) fn metrics(&self) -> &DataMetrics {
+        &self.inner.metrics
     }
 
     pub(crate) fn registry(&self) -> &Registry {

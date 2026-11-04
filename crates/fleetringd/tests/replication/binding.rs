@@ -202,6 +202,7 @@ impl Bound {
                 execution: Execution::Threads,
                 state_dir: root.join("replication"),
                 settings: settings(),
+                metrics: fleetringd::observe::ReplicationMetrics::default(),
             },
             move |sink| Registry::new(registry_engine, sink, databases, config),
         );

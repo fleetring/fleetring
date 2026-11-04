@@ -10,6 +10,7 @@ use crate::DatabaseError;
 use crate::changes::position::PositionStore;
 use crate::changes::{Change, ChangeKind, ChangeSettings, ChangeSink, Format, MarkHome};
 use crate::engine::{EngineError, Position};
+use crate::observe::ChangeMetrics;
 use crate::replication::{PrimaryFeed, Replication};
 
 /// How often a pump that is waiting looks whether its primary was replaced.
@@ -24,6 +25,7 @@ pub(super) struct PumpContext {
     pub(super) store: PositionStore,
     pub(super) state: Arc<Mutex<PumpState>>,
     pub(super) settings: ChangeSettings,
+    pub(super) metrics: ChangeMetrics,
     /// The streams, which release delivered row changes once every logical sink has them.
     pub(super) streams: Weak<super::Inner>,
 }
@@ -91,6 +93,7 @@ pub(super) async fn run(ctx: PumpContext) {
                 let epoch = feed.epoch();
                 match deliver(&ctx, &feed, epoch, position.clone(), until.clone()).await {
                     Ok(Delivery::Delivered) => {
+                        ctx.metrics.delivered(&sink);
                         record(&ctx, home, &until).await;
                         position = Some(until.clone());
                         feed.delivered(&sink, position.clone());
@@ -120,6 +123,7 @@ pub(super) async fn run(ctx: PumpContext) {
                         position = None;
                         feed.delivered(&sink, None);
                         lock(&ctx.state).resets += 1;
+                        ctx.metrics.reset(&sink);
                         continue;
                     }
                     Err(reason) => {
@@ -127,6 +131,7 @@ pub(super) async fn run(ctx: PumpContext) {
                         {
                             let mut state = lock(&ctx.state);
                             state.failures += 1;
+                            ctx.metrics.delivery_failed(&sink);
                             state.last_error = Some(reason);
                             state.caught_up = false;
                         }

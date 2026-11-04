@@ -1,11 +1,13 @@
 //! Daemon configuration: a TOML file, optionally overridden by command-line flags.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use fleetring::{Host, NodeId, Weight, Zone};
@@ -91,6 +93,198 @@ pub struct Config {
     /// every node.
     #[serde(default, rename = "principal")]
     pub principals: Vec<PrincipalConfig>,
+    /// The admin listener: metrics, health, and readiness over HTTP (ADR-0034).
+    #[serde(default)]
+    pub admin: AdminConfig,
+    /// How the daemon writes its log lines.
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+/// The `[log]` table: how the daemon writes its log lines (ADR-0034 point 8).
+///
+/// ```toml
+/// [log]
+/// format = "json"   # or "text", the default
+/// ```
+///
+/// `--log-format` and `FLEETRING_LOG_FORMAT` override it, in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// The format of every log line.
+    pub format: LogFormat,
+}
+
+/// How log lines are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum LogFormat {
+    /// Human-readable lines, the default.
+    #[default]
+    Text,
+    /// One JSON object per line, with the current span and its parents.
+    Json,
+}
+
+impl LogFormat {
+    /// The format's name, as the configuration and the command line spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The error returned when a log format isn't `text` or `json`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown log format '{0}'; use text or json")]
+pub struct ParseLogFormatError(String);
+
+impl FromStr for LogFormat {
+    type Err = ParseLogFormatError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(ParseLogFormatError(other.to_owned())),
+        }
+    }
+}
+
+/// The default admin listener: loopback, next to the gRPC port's default 7400.
+const DEFAULT_ADMIN_LISTEN: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 7401);
+
+/// How often sampled gauges are refreshed, by default.
+const DEFAULT_SAMPLE_INTERVAL: NonZeroU64 = NonZeroU64::new(10_000).expect("10000 is nonzero");
+
+/// The `[admin]` table: the HTTP listener for metrics and probes (ADR-0034).
+///
+/// ```toml
+/// [admin]
+/// enabled = true                 # false: no admin listener
+/// listen = "127.0.0.1:7401"
+/// tls = false                    # true: HTTPS with the node's [tls] certificate
+/// scrapers = ["prometheus"]      # principals whose client certificates may read /metrics
+/// allow_plaintext = false        # true: plaintext on a non-loopback address
+/// sample_interval_ms = 10000     # how often sampled gauges are refreshed
+/// ```
+///
+/// The listener serves `/metrics`, `/healthz`, and `/readyz`. A `listen` address that isn't
+/// loopback needs `tls = true` or `allow_plaintext = true`. With `tls`, `/metrics` answers only
+/// client certificates whose principal `scrapers` lists; the probes answer anyone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Whether the daemon serves the admin listener.
+    pub enabled: AdminListener,
+    /// The address it listens on.
+    pub listen: SocketAddr,
+    /// Whether it serves HTTPS with the node's `[tls]` certificate.
+    pub tls: AdminTls,
+    /// The principals whose client certificates may read `/metrics` over TLS.
+    pub scrapers: Vec<Principal>,
+    /// Whether it may serve plaintext on an address that isn't loopback.
+    pub allow_plaintext: AdminPlaintext,
+    /// How often the sampled gauges are refreshed, in milliseconds.
+    pub sample_interval_ms: NonZeroU64,
+}
+
+impl AdminConfig {
+    /// Returns how often the sampled gauges are refreshed.
+    #[must_use]
+    pub fn sample_interval(&self) -> Duration {
+        Duration::from_millis(self.sample_interval_ms.get())
+    }
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: AdminListener::Enabled,
+            listen: DEFAULT_ADMIN_LISTEN,
+            tls: AdminTls::Off,
+            scrapers: Vec::new(),
+            allow_plaintext: AdminPlaintext::Refused,
+            sample_interval_ms: DEFAULT_SAMPLE_INTERVAL,
+        }
+    }
+}
+
+/// Whether the daemon serves the admin listener: `[admin] enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "bool")]
+#[non_exhaustive]
+pub enum AdminListener {
+    /// The default: the daemon serves it.
+    #[default]
+    Enabled,
+    /// `enabled = false`: no admin listener. Metrics are still kept.
+    Disabled,
+}
+
+impl From<bool> for AdminListener {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+/// Whether the admin listener serves HTTPS: `[admin] tls`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "bool")]
+#[non_exhaustive]
+pub enum AdminTls {
+    /// The default: plaintext HTTP.
+    #[default]
+    Off,
+    /// `tls = true`: HTTPS with the node's own `[tls]` certificate, reloaded with it, asking
+    /// for a client certificate from the fleet's authority without requiring one.
+    NodeIdentity,
+}
+
+impl From<bool> for AdminTls {
+    fn from(tls: bool) -> Self {
+        if tls { Self::NodeIdentity } else { Self::Off }
+    }
+}
+
+/// Whether the admin listener may serve plaintext on an address that isn't loopback:
+/// `[admin] allow_plaintext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "bool")]
+#[non_exhaustive]
+pub enum AdminPlaintext {
+    /// The default: such an address fails validation unless `tls = true`.
+    #[default]
+    Refused,
+    /// `allow_plaintext = true`: for a network the operator controls, where anyone who can
+    /// connect may read the metrics. The daemon warns at every start.
+    Allowed,
+}
+
+impl From<bool> for AdminPlaintext {
+    fn from(allowed: bool) -> Self {
+        if allowed {
+            Self::Allowed
+        } else {
+            Self::Refused
+        }
+    }
 }
 
 /// One `[[principal]]` entry: a principal's scopes when it connects with a client certificate
@@ -595,7 +789,8 @@ impl Config {
     /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
     /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
     /// below the lease duration, or a `[[changes.sink]]` or `[[archive]]` entry is invalid, or two
-    /// share a name.
+    /// share a name, or `[admin] listen` isn't a loopback address while neither `admin.tls` nor
+    /// `admin.allow_plaintext` is set, or `[admin] scrapers` names a principal twice.
     ///
     /// Whether the daemon has an identity is checked when it starts, because the environment
     /// may supply one; see [`Daemon::start_with`](crate::Daemon::start_with).
@@ -643,6 +838,7 @@ impl Config {
                 reason: "must be at least 1 ms".to_owned(),
             });
         }
+        self.validate_admin()?;
         self.changes.validate()?;
         let mut names: BTreeSet<&str> = self
             .changes
@@ -665,6 +861,34 @@ impl Config {
         }
         Ok(())
     }
+
+    fn validate_admin(&self) -> Result<(), ConfigError> {
+        let admin = &self.admin;
+        if admin.enabled == AdminListener::Enabled
+            && !admin.listen.ip().is_loopback()
+            && admin.tls == AdminTls::Off
+            && admin.allow_plaintext == AdminPlaintext::Refused
+        {
+            return Err(ConfigError::Invalid {
+                field: "admin.listen",
+                reason: format!(
+                    "{} isn't a loopback address; set admin.tls = true, or \
+                     admin.allow_plaintext = true on a network you control",
+                    admin.listen
+                ),
+            });
+        }
+        let mut scrapers = BTreeSet::new();
+        for scraper in &admin.scrapers {
+            if !scrapers.insert(scraper) {
+                return Err(ConfigError::Invalid {
+                    field: "admin.scrapers",
+                    reason: format!("'{scraper}' is listed more than once"),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The address a client on this machine dials to reach a server bound to `address`: the loopback
@@ -678,5 +902,81 @@ pub(crate) fn reachable(address: SocketAddr) -> SocketAddr {
             SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6.port())
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = "data_dir = \"/tmp/fleetring-test\"\nlisten = \"127.0.0.1:7400\"\n\n\
+                           [node]\nid = \"node-1\"\n";
+
+    fn with(tables: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!("{MINIMAL}{tables}"))
+    }
+
+    #[test]
+    fn the_admin_listener_defaults_to_loopback_plaintext() {
+        let defaults = with("").expect("a minimal config");
+        let empty = with("\n[admin]\n").expect("an empty [admin] table");
+        assert_eq!(defaults.admin, empty.admin);
+        let admin = defaults.admin;
+        assert_eq!(admin.enabled, AdminListener::Enabled);
+        assert_eq!(admin.listen, "127.0.0.1:7401".parse().expect("an address"));
+        assert_eq!(admin.tls, AdminTls::Off);
+        assert!(admin.scrapers.is_empty());
+        assert_eq!(admin.allow_plaintext, AdminPlaintext::Refused);
+        assert_eq!(admin.sample_interval(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_non_loopback_admin_address_needs_tls_or_plaintext() {
+        let refused = with("\n[admin]\nlisten = \"0.0.0.0:7401\"\n").expect_err("not loopback");
+        let ConfigError::Invalid { field, reason } = &refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(*field, "admin.listen");
+        assert!(reason.contains("admin.tls"), "{reason}");
+        assert!(reason.contains("admin.allow_plaintext"), "{reason}");
+        let refused = with("\n[admin]\nlisten = \"10.0.0.1:7401\"\nallow_plaintext = false\n");
+        assert!(refused.is_err(), "an explicit false refuses too");
+        for allowed in [
+            "listen = \"0.0.0.0:7401\"\ntls = true",
+            "listen = \"0.0.0.0:7401\"\nallow_plaintext = true",
+            "listen = \"0.0.0.0:7401\"\nenabled = false",
+            "listen = \"[::1]:7401\"",
+        ] {
+            let config = with(&format!("\n[admin]\n{allowed}\n"));
+            assert!(config.is_ok(), "{allowed}: {config:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_scrapers_are_refused() {
+        let refused = with("\n[admin]\nscrapers = [\"prometheus\", \"ops\", \"prometheus\"]\n")
+            .expect_err("a duplicate");
+        let ConfigError::Invalid { field, reason } = &refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(*field, "admin.scrapers");
+        assert!(reason.contains("'prometheus'"), "{reason}");
+        let unknown = with("\n[admin]\nport = 7401\n");
+        assert!(unknown.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn the_log_format_defaults_to_text_and_reads_json() {
+        assert_eq!(with("").expect("a config").log.format, LogFormat::Text);
+        let json = with("\n[log]\nformat = \"json\"\n").expect("a config");
+        assert_eq!(json.log.format, LogFormat::Json);
+        assert!(with("\n[log]\nformat = \"yaml\"\n").is_err());
+        assert_eq!("json".parse::<LogFormat>(), Ok(LogFormat::Json));
+        assert_eq!("text".parse::<LogFormat>(), Ok(LogFormat::Text));
+        let unknown = "JSON".parse::<LogFormat>().expect_err("case matters");
+        assert_eq!(
+            unknown.to_string(),
+            "unknown log format 'JSON'; use text or json"
+        );
     }
 }

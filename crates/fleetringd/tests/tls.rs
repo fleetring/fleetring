@@ -19,7 +19,7 @@ use fleetringd::transport::{Backoff, replication_client};
 use fleetringd::{Config, ConfigError, Daemon, Network, StartError};
 use tonic::Code;
 
-use crate::support::Tls;
+use crate::support::{ADMIN, Tls};
 
 mod support;
 
@@ -41,13 +41,13 @@ fn config(dir: &Path, id: &str, role: &str, control: Option<SocketAddr>, tls: &s
     });
     format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
-         \n[membership]\nheartbeat_interval_ms = 100\n{tls}{control}",
+         \n[membership]\nheartbeat_interval_ms = 100\n{tls}{control}{ADMIN}",
         dir.join(id)
     )
 }
 
 async fn control_daemon(dir: &Path, tls: &Tls) -> Result<Daemon, Box<dyn Error>> {
-    let table = tls.node_table("control")?;
+    let table = tls.node_tls_table("control")?;
     Ok(Daemon::start(Config::from_toml(&config(
         dir, "control", "control", None, &table,
     ))?)
@@ -231,7 +231,7 @@ async fn a_node_certificate_for_another_id_cannot_join_heartbeat_leave_or_drain(
 async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
     let dir = tempfile::tempdir()?;
     let tls = Tls::create(dir.path())?;
-    let table = tls.node_table("solo")?;
+    let table = tls.node_tls_table("solo")?;
     let daemon = Daemon::start(Config::from_toml(&config(
         dir.path(),
         "solo",
@@ -288,7 +288,7 @@ async fn rotated_certificates_are_picked_up_without_a_restart_while_a_stream_sta
     let address = control.control_address().ok_or("no control address")?;
     let mut data = Vec::new();
     for id in ["data-1", "data-2"] {
-        let table = tls.node_table(id)?;
+        let table = tls.node_tls_table(id)?;
         let text = config(dir.path(), id, "data", Some(address), &table);
         data.push(Daemon::start(Config::from_toml(&text)?).await?);
     }

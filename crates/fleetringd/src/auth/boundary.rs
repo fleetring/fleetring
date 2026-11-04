@@ -337,6 +337,16 @@ impl Authorizer {
                 return Err(status);
             }
         };
+        let span = tracing::Span::current();
+        match &caller {
+            Caller::Node(id) => {
+                span.record("node", id.as_str());
+            }
+            Caller::Principal { name, .. } => {
+                span.record("principal", name.as_str());
+            }
+            _ => {}
+        }
         let authorized = Authorized {
             caller,
             rpc,
@@ -410,6 +420,9 @@ impl Authorized {
     /// Checks the request against its RPC's requirement, with `database` the one it names, and
     /// logs the decision.
     fn check(&self, database: Option<&DatabaseName>) -> Result<(), Status> {
+        if let Some(database) = database {
+            tracing::Span::current().record("database", database.as_str());
+        }
         match self.caller.authorize(self.rpc, database) {
             Ok(()) => {
                 audit_allowed(&self.caller, self.rpc, database);
@@ -544,6 +557,26 @@ fn audit_allowed(caller: &Caller, rpc: &Rpc, database: Option<&DatabaseName>) {
     );
 }
 
+/// Why the boundary refused a request, when its status code alone doesn't say: the trace layer
+/// reads it from the response's extensions to count the refusal by reason (ADR-0034).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The path names no RPC in [`RPCS`](crate::auth::RPCS).
+    NoRequirement,
+    /// The request carried a token this node couldn't check: its denylist is missing or stale.
+    DenylistStale,
+}
+
+impl Refusal {
+    /// The `reason` label of `fleetring_auth_refusals_total`.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NoRequirement => "no_requirement",
+            Self::DenylistStale => "denylist_stale",
+        }
+    }
+}
+
 /// The boundary's decision for `request`.
 ///
 /// # Errors
@@ -621,7 +654,22 @@ where
                 request.extensions_mut().insert(authorized);
                 Box::pin(self.inner.call(request))
             }
-            Err(status) => Box::pin(std::future::ready(Ok(status.into_http()))),
+            Err(status) => {
+                // `admit` answers `UNAVAILABLE` only for a token it can't check for want of a
+                // fresh denylist.
+                let refusal = if crate::auth::rpc_at(request.uri().path()).is_none() {
+                    Some(Refusal::NoRequirement)
+                } else if status.code() == tonic::Code::Unavailable {
+                    Some(Refusal::DenylistStale)
+                } else {
+                    None
+                };
+                let mut response = status.into_http();
+                if let Some(refusal) = refusal {
+                    response.extensions_mut().insert(refusal);
+                }
+                Box::pin(std::future::ready(Ok(response)))
+            }
         }
     }
 }
