@@ -380,6 +380,19 @@ impl ProcessFleet {
         Self::start_with(root, binary, count, "both")
     }
 
+    /// Starts a fleet of the release `binary` is, as [`ProcessFleet::start`] does. A release
+    /// before 0.4.0 has no admin listener and refuses an `[admin]` table, so its nodes get none
+    /// until [`ProcessFleet::enable_admin`] moves them to this build.
+    pub(crate) fn start_release(root: &Path, binary: &Path, count: usize) -> TestResult<Self> {
+        let printed = Command::new(binary).arg("--version").output()?;
+        let release: Release = String::from_utf8_lossy(&printed.stdout)
+            .trim()
+            .trim_start_matches("fleetringd ")
+            .parse()?;
+        let admin = release >= Release::new(0, 4, 0);
+        Self::start_as(root, binary, count, "both", admin)
+    }
+
     /// Starts a fleet as [`ProcessFleet::start`] does, with `node-1` in `first_role`: `both`, or
     /// `control` for a control node that is no member.
     pub(crate) fn start_with(
@@ -387,6 +400,18 @@ impl ProcessFleet {
         binary: &Path,
         count: usize,
         first_role: &str,
+    ) -> TestResult<Self> {
+        Self::start_as(root, binary, count, first_role, true)
+    }
+
+    /// Starts a fleet as [`ProcessFleet::start_with`] does, giving each node an admin listener
+    /// on a port of its own if `admin`.
+    fn start_as(
+        root: &Path,
+        binary: &Path,
+        count: usize,
+        first_role: &str,
+        admin: bool,
     ) -> TestResult<Self> {
         let tls = Tls::create(root)?;
         let control = format!("127.0.0.1:{}", free_port()?);
@@ -411,7 +436,11 @@ impl ProcessFleet {
             let text = format!(
                 "data_dir = {data_dir:?}\nlisten = \"{listen}\"\n{role}\n[node]\nid = \"{id}\"\n\n\
                  [membership]\nheartbeat_interval_ms = 200\n{}",
-                tls.node_table(&id)?
+                if admin {
+                    tls.node_table(&id)?
+                } else {
+                    tls.node_tls_table(&id)?
+                }
             );
             let config = dir.join("node.toml");
             fs::write(&config, text)?;
@@ -433,6 +462,18 @@ impl ProcessFleet {
             fleet.spawn(index)?;
         }
         Ok(fleet)
+    }
+
+    /// Gives node `index` an admin listener on a port of its own, as its configuration may say
+    /// once it runs this build, unless it has one: without it, every node on this machine would
+    /// take the default port.
+    pub(crate) fn enable_admin(&self, index: usize) -> TestResult {
+        let config = &self.nodes[index].config;
+        let text = fs::read_to_string(config)?;
+        if !text.contains("[admin]") {
+            fs::write(config, format!("{text}{}", crate::support::ADMIN))?;
+        }
+        Ok(())
     }
 
     /// Starts node `index` from its binary, appending its log to its log file.

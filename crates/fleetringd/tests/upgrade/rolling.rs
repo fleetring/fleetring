@@ -76,7 +76,7 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         );
         return Ok(());
     };
-    let mut fleet = ProcessFleet::start(&scratch.path().join("fleet"), &baseline, 3)?;
+    let mut fleet = ProcessFleet::start_release(&scratch.path().join("fleet"), &baseline, 3)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let client = fleet.client()?;
     let ids = ["node-1", "node-2", "node-3"];
@@ -113,6 +113,8 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         progress(&format!("upgrading {id}"));
         let bin = fleet.nodes[index].bin.clone();
         let mut restarted = false;
+        // This build's own settings, such as its admin listener, apply from its first start.
+        fleet.enable_admin(index)?;
         if has_upgrade(&bin)? {
             let upgraded = fleet
                 .command(&bin, &path)
