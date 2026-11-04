@@ -421,6 +421,7 @@ mod marks {
     use std::error::Error;
     use std::path::Path;
 
+    use fleetring_wal::Batch;
     use fleetringd::engine::{
         Database, DatabaseCapability, DatabaseEngine, EngineCapability, OpenMode, Position,
         SqliteEngine, Statement, Transaction,
@@ -523,6 +524,43 @@ mod marks {
         stage(&mut *db, "b", &Position::new([2]))?;
         assert_eq!(insert(&mut *db, 1)?, 1);
         assert_eq!(recorded(&mut *db)?.len(), 2);
+        Ok(())
+    }
+
+    /// How many WAL frames the log gained since `after`, which moves to the log's end.
+    fn frames_since(
+        db: &mut dyn Database,
+        after: &mut Option<Position>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let DatabaseCapability::FrameSource(log) = db.capability() else {
+            return Err("sqlite is a frame source".into());
+        };
+        let batch = log
+            .committed_since(after.as_ref())?
+            .ok_or("the write committed a batch")?;
+        *after = Some(batch.end.clone());
+        Ok(Batch::from_bytes(batch.payload.as_bytes())?
+            .frame_headers()
+            .count())
+    }
+
+    #[test]
+    fn a_mark_adds_one_frame_to_the_write_it_rides_on() -> TestResult {
+        let dir = TempDir::new()?;
+        let mut db = open_new(dir.path())?;
+        let mut after = None;
+        let _created = frames_since(&mut *db, &mut after)?;
+        // The first write to carry a mark also creates the table, so it is left out; from the
+        // second on, a mark is a row update on the table's one page.
+        stage(&mut *db, "s", &Position::new([1; 20]))?;
+        insert(&mut *db, 0)?;
+        let _first = frames_since(&mut *db, &mut after)?;
+        insert(&mut *db, 1)?;
+        let plain = frames_since(&mut *db, &mut after)?;
+        stage(&mut *db, "s", &Position::new([2; 20]))?;
+        insert(&mut *db, 2)?;
+        let marked = frames_since(&mut *db, &mut after)?;
+        assert_eq!(marked, plain + 1, "a mark costs one frame");
         Ok(())
     }
 

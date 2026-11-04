@@ -1,7 +1,7 @@
 ---
 id: FR-041
 title: Replicated sink positions, so a new primary resumes a change stream without duplicates
-status: todo
+status: in-progress
 priority: P2
 size: M
 milestone: M8 Access and integration
@@ -28,13 +28,13 @@ A sink's delivered position lives on the primary alone today (`<data_dir>/change
 
 ## Acceptance criteria
 
-- [ ] In `tests/sim/changes.rs`, a primary crash no longer makes the file sink on the new primary repeat records the old primary delivered; `check::change_stream_consistent` gains a duplicates bound of one batch per failover.
+- [x] In `tests/sim/changes.rs`, a primary crash no longer makes the file sink on the new primary repeat records the old primary delivered; `check::change_stream_consistent` gains a duplicates bound of one batch per failover.
   - *Refined by ADR-0028 point 6:* a failover repeats only what the old primary delivered after the newest mark that reached the write quorum. The deterministic test `a_new_primary_resumes_from_the_mark_and_repeats_one_delivery` (step 4) proves the one-batch bound for a delivery followed by a write; the simulation, where the next write may already be running when a mark is staged, checks at most two repeated records per failover (`REPEATS_PER_FAILOVER = 2`).
-- [ ] A sink's position outlives the node that recorded it: after the old primary's data directory is deleted, the new primary still resumes from the right place.
-- [ ] `status --node` shows whether a sink's position is replicated or local.
-- [ ] ADR-0028 is accepted and linked from `docs/adr/README.md`.
-- [ ] A user statement that names `_fleetring_sinks` is refused like one naming `_fleetring_cdc`, and `rows_affected` never counts mark rows.
-- [ ] The cost of a mark on the write path is measured in `docs/perf.md` beside the capture costs.
+- [x] A sink's position outlives the node that recorded it: after the old primary's data directory is deleted, the new primary still resumes from the right place.
+- [x] `status --node` shows whether a sink's position is replicated or local.
+- [x] ADR-0028 is accepted and linked from `docs/adr/README.md`.
+- [x] A user statement that names `_fleetring_sinks` is refused like one naming `_fleetring_cdc`, and `rows_affected` never counts mark rows.
+- [x] The cost of a mark on the write path is measured in `docs/perf.md` beside the capture costs.
 
 ## Implementation plan
 
@@ -185,3 +185,21 @@ Each step is about one commit (`feat(fleetringd): …`, `Refs: FR-041`). Paths a
 ## Progress
 
 - 2026-11-02: ADR-0028 proposed; implementation plan written. Waiting for the ADR's acceptance.
+- 2026-11-03: ADR-0028 accepted; implemented on the `sink-positions` branch, pending CI. ADR-0024's last consequence now points at ADR-0028.
+  - **Code:** `SinkMarks` and `Database::sink_marks` (`engine/adapter.rs`); `engine/sqlite/marks.rs` and its use in `SqliteDatabase::execute`; the actor's `SinkMarks` and `StageSinkMark` requests; `MarkHome`; the pump's `recorded_position` and `record` (`changes/pump.rs`); `ChangeSinkStatus.replicated` in the protocol; `check::change_streams_resume`, `check::REPEATS_PER_FAILOVER`, and the `marks` bench. The lexicon gained a **Mark** entry, since the plan introduced the word and the lexicon wants an entry before a type.
+  - **Tests:** `mod marks` in `tests/changes/logical.rs` (the six named tests, and `a_mark_adds_one_frame_to_the_write_it_rides_on`); `a_pump_restarted_on_the_same_node_resumes_from_the_mark`, `status_reports_where_each_sinks_position_lives`, and `an_engine_without_marks_keeps_positions_on_the_node` in `tests/changes/file.rs`; the four named tests in `tests/changes/failover.rs`; the four named unit tests in `sim/check.rs`; and the change-stream simulation, which now fails unless a new primary's stream resumed at a position.
+  - **Deviations from the plan:**
+    - **Order of commits.** The simulation's per-host check would call a resume a gap, and the cross-host check would fail a pump that still restarts from the beginning, so the checker's acceptance of a resume goes in before the pump (step 5's checks), and the call to `change_streams_resume` and the simulation's assertion come after the failover tests. Steps 2 and 3 are one commit: the actor's new requests have no caller until the pump has one.
+    - **`rows_affected` needs no subtraction.** The marks flush before `Database::execute` reads `total_changes` for its row count, as the recorder's prune does, so their rows were never in the count. `marks_never_count_in_rows_affected` pins it.
+    - **`Marks` tracks the table across rollbacks.** `created` is set only once a commit succeeded (a rolled-back transaction takes a table it created with it), through a `flushed` flag that `committed()` consumes; `a_rolled_back_write_keeps_the_mark_staged` covers it.
+    - **`marks_replicate_to_a_follower` runs on the engine**, not on `tests/changes/common.rs`'s harness, which had no replication to a follower at step 1: the primary's batch goes to `open_follower`'s copy, which is then opened as a database and read. The replication path itself is `failover.rs`.
+    - **Three nodes, not two, in `failover.rs`.** With R = 2 the write quorum is both nodes, so a lone survivor holds no quorum and its pumps deliver nothing. `Fleet` in `tests/changes/common.rs` (new: the plan assumed a harness for two replicated nodes there) runs a, b, c over real TCP, kills `a`, and serves `b` at epoch 2 with `Replication::serve_primary`; `lag_limit` is zero there.
+    - **`a_mark_behind_a_restarted_log_restarts_from_the_beginning`** checkpoints through `DatabaseHandle::checkpoint`, since `Replication::checkpoint` waits for the dead `a`, and writes once on `b` so that the log's new generation begins. That test exposed a pump loop that the plan didn't foresee: a pump already at the log's beginning whose write quorum position the log didn't hold yet (the third node still reported its old position) restarted from the beginning again at once, counting a reset each time. It now fails the attempt and backs off (`fix(fleetringd): a pump at the log's beginning backs off instead of spinning`).
+    - **`a_pump_killed_mid_stream_delivers_everything_at_least_once_after_a_restart`** (FR-039's test) found its records by index, assuming that the schema's batch is delivered on its own. A pump now opens its database to read its mark before its first delivery, so the schema batch and the first insert are often delivered together, and the index named the wrong record in about a quarter of runs. The test finds the record of 5 by its value; the mark it resumes from is still exactly the end of that record, since the pump stages it before the next write.
+    - **Timing in `pruning_waits_for_the_marks_of_every_logical_sink`.** It waited for `fast` by comparing a pump's status, whose acknowledged position is the one from its last look and can equal its delivered position while a later write is still to be delivered; on CI (ARM) it read 109 of 110 about once in a hundred runs. It now waits on what the sink holds. Its writes also come in two rounds with `fast` caught up between them, so that a release is on its way before the recorder passes 64 transactions however slow the machine, rather than relying on the release winning a race with the last write.
+    - **`pruning_waits_for_the_marks_of_every_logical_sink`** proves the primary pruned (`min(change_id) > 1` in its copy, read after it is killed), and that `slow` on the new primary starts at its replicated mark and receives every row after it.
+    - **Status.** `SinkStatus` has `home: Option<MarkHome>` and the protocol `bool replicated = 9`; the client always maps the bool to `Some`, so a node that predates the field, or a pump that hasn't opened its database yet, reads as local. `NodeStatus` carries `SinkStatus` itself, so there is no separate `replicated: bool` there. `status --node` prints `position=<hex> (replicated)` or `(local)`, in the key=value style of its other fields, not `position replicated`.
+    - **`status --node` is tested for `replicated` only** (`tests/changes/daemon.rs` runs the binary); `local` is asserted on `ChangeStreams::status` with the test-only `NoMarks` engine, because a daemon's configuration can't pick an engine without marks.
+    - **The simulation groups by sink and database**, and `change_stream_consistent` takes the `(epoch, end)` of that sink's records on all hosts as `marks`. `change_streams_resume` also treats a first record of a later epoch that starts from the log's beginning as a violation, which the plan's wording ("only when no earlier epoch delivered anything") makes the same thing.
+  - **Measurement.** The `marks` bench ran on a machine under a load average near 900, so `docs/perf.md` reports the fastest samples, finds no cost above the noise, and records the deterministic fact: a mark is one more frame. Re-measure on an idle machine.
+  - **Notes for reviewers.** A mark staged and not yet written is in memory: a database that closes idle, or is evicted, loses it, and a failover then repeats that delivery, which ADR-0028 point 6 allows. On upgrade, the per-node position files are no longer read for a SQLite database, so each stream's first start finds no mark and begins from the log's beginning once.

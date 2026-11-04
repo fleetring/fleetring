@@ -7,8 +7,10 @@
 //! WAL passes the daemon's default threshold. Capture is off, or on in one of the modes; a
 //! recorded database releases every delivered batch at once, as a sink that keeps up would, so
 //! the pruning of the change table is part of the cost. The `chain` bench measures what hashing
-//! one captured batch onto the log's hash chain costs the stream that ships it (FR-044).
-//! Numbers live in `docs/perf.md`.
+//! one captured batch onto the log's hash chain costs the stream that ships it (FR-044). The
+//! `marks` bench is the `insert` bench with a sink mark staged before every write, which is the
+//! worst case of a stream that delivers after each commit (FR-041, ADR-0028). Numbers live in
+//! `docs/perf.md`.
 
 use std::fmt;
 use std::fs;
@@ -85,6 +87,26 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// The cases the `marks` bench runs: the one-row and 100-row writes, with capture off and on.
+const MARK_CASES: &[Case] = &[
+    Case {
+        capture: Capture::Off,
+        rows: 1,
+    },
+    Case {
+        capture: Capture::On(CaptureMode::After),
+        rows: 1,
+    },
+    Case {
+        capture: Capture::Off,
+        rows: 100,
+    },
+    Case {
+        capture: Capture::On(CaptureMode::After),
+        rows: 100,
+    },
+];
+
 /// The page size the daemon gives new databases by default.
 const PAGE_SIZE: u32 = 4096;
 
@@ -98,6 +120,8 @@ struct Writer {
     db: Box<dyn Database>,
     last: Option<Position>,
     next_id: i64,
+    /// The mark staged before every write, if the case stages one.
+    mark: Option<Position>,
 }
 
 impl Writer {
@@ -123,6 +147,7 @@ impl Writer {
             db,
             last: None,
             next_id: 0,
+            mark: None,
         };
         writer.capture();
         writer
@@ -145,6 +170,12 @@ impl Writer {
                 )
             })
             .collect();
+        if let Some(mark) = &self.mark {
+            self.db
+                .sink_marks()
+                .expect("SQLite keeps sink marks")
+                .stage("sink", mark);
+        }
         self.db
             .execute(&Transaction::new(statements))
             .expect("the write commits");
@@ -178,6 +209,15 @@ impl Writer {
 #[divan::bench(args = CASES, sample_count = 40, sample_size = 5)]
 fn insert(bencher: Bencher, case: &Case) {
     let mut writer = Writer::open(case.capture);
+    bencher.bench_local(|| writer.write(case.rows));
+}
+
+/// The `insert` bench with a sink mark, a 20-byte position as the SQLite adapter's are, staged
+/// before every write, so that each write carries one row update of `_fleetring_sinks`.
+#[divan::bench(args = MARK_CASES, sample_count = 40, sample_size = 5)]
+fn marks(bencher: Bencher, case: &Case) {
+    let mut writer = Writer::open(case.capture);
+    writer.mark = Some(Position::new([7; 20]));
     bencher.bench_local(|| writer.write(case.rows));
 }
 
