@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::{Command, ControlConfig, DatabaseName, LeaseEpoch, State, apply};
@@ -77,6 +78,10 @@ pub enum Invariant {
     /// Every node call an impostor makes on a database it doesn't host is refused for its
     /// binding, or can't be checked and waits; none is served (FR-050).
     NodeCallsBound,
+    /// A copy restored from an archive holds a prefix of the database's committed writes, in
+    /// commit order, with no write that was refused or never made, and, restored to the latest
+    /// point, every write acknowledged before the archive caught up (FR-049).
+    ArchiveRestoresAcknowledgedPrefix,
 }
 
 impl fmt::Display for Invariant {
@@ -97,6 +102,7 @@ impl fmt::Display for Invariant {
             Self::LeaseEventsMatchControl => "lease events match control",
             Self::ChainAgrees => "hash chains agree",
             Self::NodeCallsBound => "node calls bound to placement",
+            Self::ArchiveRestoresAcknowledgedPrefix => "archive restores an acknowledged prefix",
         })
     }
 }
@@ -923,6 +929,85 @@ pub fn change_streams_resume(
     Ok(())
 }
 
+/// Checks a copy restored from an archive: its writes-table values, `restored`, in commit order,
+/// are the first values of `committed`, the database's values in commit order at the end of the
+/// run; each was written by some write the history records and not refused by all of its
+/// attempts; and, with `complete_before`, every write acknowledged at or before that time is
+/// among them.
+///
+/// The restore verified every batch against the hash chain, so a prefix of the committed log is
+/// what it must hold; this checks the rows say so too.
+///
+/// # Errors
+///
+/// [`Invariant::ArchiveRestoresAcknowledgedPrefix`] naming the first value that breaks it.
+pub fn archive_restores_prefix(
+    history: &History,
+    database: &DatabaseName,
+    restored: &[i64],
+    committed: &[i64],
+    complete_before: Option<Duration>,
+) -> Result<(), Violation> {
+    let violation = |detail: String| {
+        Violation::new(
+            Invariant::ArchiveRestoresAcknowledgedPrefix,
+            format!("the copy of {database} restored from its archive: {detail}"),
+        )
+    };
+    if let Some((index, (got, want))) = restored
+        .iter()
+        .zip(committed)
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        return Err(violation(format!(
+            "row {index} holds {got} where the database committed {want}"
+        )));
+    }
+    if restored.len() > committed.len() {
+        return Err(violation(format!(
+            "it holds {} rows, more than the {} the database committed",
+            restored.len(),
+            committed.len()
+        )));
+    }
+    let mut made: BTreeMap<i64, bool> = BTreeMap::new();
+    let mut acknowledged = Vec::new();
+    for record in history.records() {
+        if let Operation::Write {
+            database: target,
+            value,
+        } = record.operation()
+            && target == database
+        {
+            *made.entry(*value).or_insert(false) |= record.class() != OutcomeClass::Fail;
+            if record.class() == OutcomeClass::Ok
+                && complete_before.is_some_and(|before| record.completed_at() <= before)
+            {
+                acknowledged.push(*value);
+            }
+        }
+    }
+    for value in restored {
+        match made.get(value) {
+            None => return Err(violation(format!("it holds {value}, which no write made"))),
+            Some(false) => {
+                return Err(violation(format!(
+                    "it holds {value}, which every attempt to write was refused"
+                )));
+            }
+            Some(true) => {}
+        }
+    }
+    let held: BTreeSet<i64> = restored.iter().copied().collect();
+    if let Some(missing) = acknowledged.iter().find(|value| !held.contains(value)) {
+        return Err(violation(format!(
+            "it lacks {missing}, which was acknowledged before the archive caught up"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1288,6 +1373,48 @@ mod tests {
         assert_eq!(
             change_streams_resume(&db, &first, REPEATS_PER_FAILOVER),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_restored_copy_must_be_an_acknowledged_prefix_of_the_committed_log() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let mut history = History::default();
+        for value in 1..=4 {
+            history.push(written(value));
+        }
+        history.push((
+            Operation::Write {
+                database: db.clone(),
+                value: 9,
+            },
+            Outcome::Rejected {
+                code: tonic::Code::Unavailable,
+                message: "refused".to_owned(),
+            },
+        ));
+        let committed = [1, 2, 3, 4];
+        let check = |restored: &[i64], committed: &[i64], before| {
+            archive_restores_prefix(&history, &db, restored, committed, before)
+        };
+        assert_eq!(check(&[1, 2], &committed, None), Ok(()));
+        assert_eq!(check(&committed, &committed, Some(Duration::ZERO)), Ok(()));
+        let violated = |result: Result<(), Violation>| {
+            result.is_err_and(|violation| {
+                violation.invariant() == Invariant::ArchiveRestoresAcknowledgedPrefix
+            })
+        };
+        assert!(violated(check(&[1, 3], &committed, None)), "a gap");
+        assert!(violated(check(&[2, 1], &committed, None)), "out of order");
+        assert!(
+            violated(check(&[1, 2, 3, 4, 5], &committed, None)),
+            "past the log"
+        );
+        assert!(violated(check(&[9], &[9], None)), "a refused write");
+        assert!(violated(check(&[7], &[7], None)), "a write never made");
+        assert!(
+            violated(check(&[1, 2], &committed, Some(Duration::ZERO))),
+            "acknowledged writes missing from the latest point"
         );
     }
 }

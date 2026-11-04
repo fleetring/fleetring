@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use crate::changes::{ChangeRecord, ChangesConfig, SinkKind, database_file, unhex};
 use crate::control::ControlHandle;
 use crate::daemon::{CONTROL_DB, DATABASES_DIR};
+use crate::durability::{ArchiveConfig, ObjectStore};
 use crate::engine::{EngineConfig, Execution, Position};
 use crate::layout;
 use crate::replication::{Replication, ReplicationSettings};
@@ -153,6 +154,14 @@ impl Timings {
 
 type Configure = Box<dyn Fn(&mut Config)>;
 
+/// An archive every data host writes: its name, its shared store, and what to change in its
+/// `[[archive]]` entry.
+type ArchiveSetup = (
+    String,
+    Arc<dyn ObjectStore>,
+    Box<dyn Fn(&mut ArchiveConfig)>,
+);
+
 /// Each host's records of one sink's stream of one database, in file order.
 type HostStreams = Vec<(String, Vec<ChangeRecord>)>;
 
@@ -168,6 +177,8 @@ pub struct FleetBuilder {
     replication: Option<ReplicationSettings>,
     /// Client hosts that act as a node with that node's certificate, by name.
     impostors: BTreeMap<String, NodeId>,
+    /// The archives every data host writes.
+    archives: Vec<ArchiveSetup>,
 }
 
 impl fmt::Debug for FleetBuilder {
@@ -270,6 +281,22 @@ impl FleetBuilder {
         self
     }
 
+    /// Gives every data host an `[[archive]]` named `name`, of every database, that writes to
+    /// `store` whatever its entry says: one store outside the simulated network, which every host
+    /// shares and which survives every crash, as a bucket outlives a fleet (ADR-0029, point 16).
+    /// `configure` changes the entry, as for its pacing and retention.
+    #[must_use]
+    pub fn archive(
+        mut self,
+        name: &str,
+        store: Arc<dyn ObjectStore>,
+        configure: impl Fn(&mut ArchiveConfig) + 'static,
+    ) -> Self {
+        self.archives
+            .push((name.to_owned(), store, Box::new(configure)));
+        self
+    }
+
     /// Changes the configuration of host `name` with `configure`, after the harness fills it in.
     #[must_use]
     pub fn configure(mut self, name: &str, configure: impl Fn(&mut Config) + 'static) -> Self {
@@ -325,6 +352,20 @@ impl FleetBuilder {
             if let Some(settings) = &self.replication {
                 config.replication = ReplicationConfig::from(settings);
             }
+            if role.hosts_data() {
+                for (archive, _, configure) in &self.archives {
+                    let star =
+                        "*".parse()
+                            .map_err(|error: crate::changes::ParseMatcherError| {
+                                SimError::Invalid(error.to_string())
+                            })?;
+                    // The store stands in for the directory, which is never written.
+                    let mut entry =
+                        ArchiveConfig::directory(archive.clone(), [star], data_dir.join("archive"));
+                    configure(&mut entry);
+                    config.archive.push(entry);
+                }
+            }
             for (_, configure) in self.configure.iter().filter(|(host, _)| host == name) {
                 configure(&mut config);
             }
@@ -338,6 +379,14 @@ impl FleetBuilder {
             fleet.add_host(name, *role, config, identity, data_dir);
         }
         let data_hosts: Vec<String> = fleet.data_hosts().map(str::to_owned).collect();
+        {
+            let mut shared = fleet.shared.lock();
+            for (archive, store, _) in &self.archives {
+                shared
+                    .object_stores
+                    .insert(archive.clone(), Arc::clone(store));
+            }
+        }
         for name in data_hosts {
             fleet.add_lease_watcher(&name);
         }
@@ -513,6 +562,7 @@ impl Fleet {
             configure: Vec::new(),
             replication: None,
             impostors: BTreeMap::new(),
+            archives: Vec::new(),
         }
     }
 
@@ -591,6 +641,36 @@ impl Fleet {
     #[must_use]
     pub fn data_dir(&self, name: &str) -> Option<&Path> {
         self.host(name).map(|host| host.data_dir.as_path())
+    }
+
+    /// Returns the store the archive named `archive` writes to, if the fleet has one
+    /// ([`FleetBuilder::archive`]).
+    #[must_use]
+    pub fn object_store(&self, archive: &str) -> Option<Arc<dyn ObjectStore>> {
+        self.shared.lock().object_stores.get(archive).cloned()
+    }
+
+    /// Returns the values of `database`'s writes table in its running primary's copy, in the
+    /// order they were committed, which is the order of the table's rows.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Simulation`] if no running host serves the database or its copy can't be
+    /// read.
+    pub fn committed_values(&self, database: &DatabaseName) -> Result<Vec<i64>, SimError> {
+        let primary = self
+            .hosts
+            .iter()
+            .find(|host| {
+                self.replication(&host.name)
+                    .is_some_and(|replication| replication.primary_status(database).is_some())
+            })
+            .ok_or_else(|| SimError::Simulation(format!("no running host serves {database}")))?;
+        let dir = primary
+            .data_dir
+            .join(DATABASES_DIR)
+            .join(layout::database_dir(database));
+        written_values(&dir)
     }
 
     /// Returns the control node's log file.
@@ -1479,6 +1559,42 @@ fn read_records(path: &Path) -> Result<Vec<ChangeRecord>, Box<dyn std::error::Er
 
 /// Reads the values in the [`WRITES_TABLE`] of the SQLite copy in `dir`, from a scratch copy of
 /// its files.
+/// The values of the writes table in the copy of a database at `dir`, such as a restored copy, in
+/// the order they were committed: the order of the table's rows. The copy is read from a scratch
+/// copy of its files, so that `dir` is left as it was.
+///
+/// # Errors
+///
+/// [`SimError::Simulation`] if the copy can't be read.
+pub fn written_values(dir: &Path) -> Result<Vec<i64>, SimError> {
+    let read = || -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+        let scratch = tempfile::tempdir()?;
+        for file in ["data.db", "data.db-wal"] {
+            if dir.join(file).try_exists()? {
+                std::fs::copy(dir.join(file), scratch.path().join(file))?;
+            }
+        }
+        let connection = rusqlite::Connection::open(scratch.path().join("data.db"))?;
+        let tables: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [WRITES_TABLE],
+            |row| row.get(0),
+        )?;
+        if tables == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement =
+            connection.prepare(&format!("SELECT value FROM {WRITES_TABLE} ORDER BY rowid"))?;
+        let values = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(values)
+    };
+    read().map_err(|error| {
+        SimError::Simulation(format!("can't read the copy at {}: {error}", dir.display()))
+    })
+}
+
 fn read_rows(dir: &Path) -> Result<BTreeSet<i64>, Box<dyn std::error::Error>> {
     let database = dir.join("data.db");
     if !database.try_exists()? {
