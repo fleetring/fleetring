@@ -18,10 +18,10 @@ use super::epochs::sync_dir;
 use crate::engine::{PinnedSnapshot, Position};
 
 /// The length of a stream's checksum.
-pub(super) const CHECKSUM_LEN: usize = 16;
+pub(crate) const CHECKSUM_LEN: usize = 16;
 
 /// Reads a pinned snapshot's files as one stream.
-pub(super) struct Packer {
+pub(crate) struct Packer {
     snapshot: PinnedSnapshot,
     /// The index of the next file whose header is due.
     next_file: usize,
@@ -49,7 +49,7 @@ impl Packer {
     /// # Errors
     ///
     /// An I/O error if a file name isn't a plain name that fits the format.
-    pub(super) fn new(snapshot: PinnedSnapshot) -> io::Result<Self> {
+    pub(crate) fn new(snapshot: PinnedSnapshot) -> io::Result<Self> {
         for file in snapshot.files() {
             if !is_plain_name(file.name()) || u16::try_from(file.name().len()).is_err() {
                 return Err(invalid(format!(
@@ -70,12 +70,12 @@ impl Packer {
     }
 
     /// The position the snapshot holds everything up to.
-    pub(super) fn position(&self) -> Option<&Position> {
+    pub(crate) fn position(&self) -> Option<&Position> {
         self.snapshot.position()
     }
 
     /// How many bytes of the stream have been emitted.
-    pub(super) fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 
@@ -84,7 +84,7 @@ impl Packer {
     /// # Errors
     ///
     /// An I/O error if a file can't be read or ends before its pinned length.
-    pub(super) fn next_chunk(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) fn next_chunk(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
         let mut out = Vec::with_capacity(max);
         while out.len() < max {
             if self.header_sent < self.header.len() {
@@ -134,7 +134,7 @@ impl Packer {
     /// # Errors
     ///
     /// An I/O error if the stream isn't finished, or the files changed.
-    pub(super) fn finish(&self) -> io::Result<[u8; CHECKSUM_LEN]> {
+    pub(crate) fn finish(&self) -> io::Result<[u8; CHECKSUM_LEN]> {
         if self.remaining > 0
             || self.header_sent < self.header.len()
             || self.next_file < self.snapshot.files().len()
@@ -159,7 +159,7 @@ fn file_header(name: &str, len: u64) -> Vec<u8> {
 ///
 /// Nothing it writes is ever in a database's place: the caller moves the directory there only
 /// after [`finish`](Self::finish) succeeds, and removes it otherwise.
-pub(super) struct Unpacker {
+pub(crate) struct Unpacker {
     dir: PathBuf,
     state: State,
     names: BTreeSet<String>,
@@ -195,7 +195,7 @@ impl Unpacker {
     /// # Errors
     ///
     /// An I/O error if the directory can't be created.
-    pub(super) fn create(dir: &Path) -> io::Result<Self> {
+    pub(crate) fn create(dir: &Path) -> io::Result<Self> {
         remove_dir_if_present(dir)?;
         if let Some(parent) = dir.parent() {
             fs::create_dir_all(parent)?;
@@ -211,7 +211,7 @@ impl Unpacker {
     }
 
     /// How many bytes of the stream have arrived.
-    pub(super) fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 
@@ -221,7 +221,7 @@ impl Unpacker {
     ///
     /// An I/O error if the stream is malformed, names a file outside the directory or twice, or
     /// a file can't be written.
-    pub(super) fn write(&mut self, mut data: &[u8]) -> io::Result<()> {
+    pub(crate) fn write(&mut self, mut data: &[u8]) -> io::Result<()> {
         self.hasher.write(data);
         self.offset += u64::try_from(data.len()).unwrap_or(u64::MAX);
         while !data.is_empty() {
@@ -309,7 +309,7 @@ impl Unpacker {
     ///
     /// An I/O error of kind [`io::ErrorKind::InvalidData`] if the stream ended early or doesn't
     /// match, and another I/O error if the directory can't be synced.
-    pub(super) fn finish(self, checksum: &[u8]) -> io::Result<()> {
+    pub(crate) fn finish(self, checksum: &[u8]) -> io::Result<()> {
         if !matches!(&self.state, State::NameLen(bytes) if bytes.is_empty()) {
             return Err(invalid(
                 "the snapshot stream ended inside a file".to_owned(),
@@ -335,7 +335,7 @@ fn is_plain_name(name: &str) -> bool {
 }
 
 /// Removes `dir` and everything in it, if it exists.
-pub(super) fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
+pub(crate) fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),

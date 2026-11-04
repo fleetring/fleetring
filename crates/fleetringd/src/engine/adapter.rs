@@ -216,6 +216,22 @@ pub trait FrameSource: fmt::Debug + Send {
     ///
     /// [`EngineError::Storage`] if the log or the files can't be read.
     fn pin_snapshot(&mut self) -> Result<PinnedSnapshot, EngineError>;
+
+    /// Pins a consistent copy that holds the log up to `at` and nothing after it: a commit
+    /// boundary of the current log, or the position the current log continues from, or `None`
+    /// for the main file alone, as of the last checkpoint.
+    ///
+    /// An archive pins at a position its change stream reached, which a pump reaches only
+    /// through acknowledged batches, so the copy never holds a write no quorum acknowledged
+    /// (ADR-0029). The copy is held in place as [`pin_snapshot`](Self::pin_snapshot)'s is, and
+    /// [`FrameSourceEngine::open_follower`] opens it as a copy that the log's batches after `at`
+    /// continue.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::InvalidPosition`] if `at` isn't a commit boundary between the current
+    /// log's start and its end, and [`EngineError::Storage`] if the files can't be read.
+    fn pin_snapshot_at(&mut self, at: Option<&Position>) -> Result<PinnedSnapshot, EngineError>;
 }
 
 /// The frame-source operations that don't need an open primary.

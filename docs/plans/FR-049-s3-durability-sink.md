@@ -1,7 +1,7 @@
 ---
 id: FR-049
 title: An S3 durability sink with verifiable point-in-time restore
-status: todo
+status: in-progress
 priority: P1
 size: L
 milestone: M9 Archives and verification
