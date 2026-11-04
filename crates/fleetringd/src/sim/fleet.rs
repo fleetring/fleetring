@@ -1077,9 +1077,10 @@ impl Fleet {
     /// Checks every file sink the data hosts are configured with
     /// ([`check::change_stream_consistent`]): for each database created through the data plane,
     /// the lines each host's sink wrote are an in-order, gapless stream of writes the history
-    /// knows, with duplicates allowed and nothing refused or invented. A record that resumes at
-    /// the end of an earlier epoch's record, as a new primary's does, is not a gap. Returns how
-    /// many records were checked.
+    /// knows, with duplicates allowed and nothing refused or invented, and a stream that moved to
+    /// a new primary continued at a mark the old one replicated
+    /// ([`check::change_streams_resume`], with [`check::REPEATS_PER_FAILOVER`]). Returns how many
+    /// records were checked.
     ///
     /// # Errors
     ///
@@ -1123,6 +1124,7 @@ impl Fleet {
                 check::change_stream_consistent(&history, database, host, records, &marks)?;
                 checked += records.len();
             }
+            check::change_streams_resume(database, hosts, check::REPEATS_PER_FAILOVER)?;
         }
         Ok(checked)
     }
