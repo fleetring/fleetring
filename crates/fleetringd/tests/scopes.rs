@@ -1195,7 +1195,7 @@ mod archives {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describing_an_archive_needs_read_on_the_key() -> TestResult {
+    async fn describing_an_archive_needs_read_on_the_key_and_verifying_it_admin() -> TestResult {
         let dir = tempfile::tempdir()?;
         let archived = Archived::start(dir.path()).await?;
         let acme: DatabaseName = "tenant:acme".parse()?;
@@ -1217,6 +1217,8 @@ mod archives {
             .expect_err("no read on the database");
         assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
 
+        // Read, or the fleet scope, shows the archive, and verifying it, which builds a whole
+        // copy on the node's disk, needs admin.
         for (scopes, id) in [
             (["read:tenant:acme"], "describe-2"),
             (["fleet"], "describe-3"),
@@ -1224,11 +1226,26 @@ mod archives {
             let allowed = archived.app(&scopes, id)?;
             let described = allowed.describe_archive(&data, "backups", &acme).await?;
             assert_eq!(described.snapshots.len(), 1, "{scopes:?}");
-            let verified = allowed
+            let refused = allowed
                 .verify_archive(&data, "backups", &acme, &RestoreTarget::Latest)
-                .await?;
-            assert_eq!(verified.position, described.latest, "{scopes:?}");
+                .await
+                .expect_err("verifying needs admin");
+            assert_eq!(
+                refused.code(),
+                Code::PermissionDenied,
+                "{scopes:?}: {refused}"
+            );
+            assert_eq!(
+                refused.message(),
+                "VerifyArchive needs admin on 'tenant:acme'"
+            );
         }
+        let admin = archived.app(&["admin:tenant:acme"], "verify-1")?;
+        let described = admin.describe_archive(&data, "backups", &acme).await?;
+        let verified = admin
+            .verify_archive(&data, "backups", &acme, &RestoreTarget::Latest)
+            .await?;
+        assert_eq!(verified.position, described.latest);
         archived.stop().await;
         Ok(())
     }

@@ -100,7 +100,7 @@ The open decisions are the archive's layout in object storage, how archived log 
     | `Database.DescribeArchive` | read on the key, or cluster |
     | `Database.VerifyArchive` | read on the key, or cluster |
 
-    For `Restore` the key is the new database, which the call creates, so `admin` as for `Create`; the handler also requires `admin` on the source, because a restore copies the source's data, including history its current scopes may no longer show, into a database its caller then controls. `DescribeArchive` and `VerifyArchive` name the archived database and only read, like `Verify`.
+    For `Restore` the key is the new database, which the call creates, so `admin` as for `Create`; the handler also requires `admin` on the source, because a restore copies the source's data, including history its current scopes may no longer show, into a database its caller then controls. `DescribeArchive` and `VerifyArchive` name the archived database and only read, like `Verify`. (*Amended 2026-11-03, FR-049:* `VerifyArchive` needs admin on the database, without the fleet alternative. It builds a whole scratch copy on the answering node's disk, which a principal that may only read shouldn't be able to make a node do; and a node runs one verification or restore at a time, answering another with `UNAVAILABLE`.)
 
 ## Alternatives considered
 

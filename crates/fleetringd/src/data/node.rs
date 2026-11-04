@@ -113,6 +113,8 @@ pub(super) struct Inner {
     refusing: Mutex<BTreeSet<DatabaseName>>,
     /// Held while a drain runs, so that two never hand the same lease over.
     pub(super) draining: tokio::sync::Mutex<()>,
+    /// One permit: held while this node builds a restored or verified copy on its disk.
+    staging: tokio::sync::Semaphore,
 }
 
 /// Refuses requests for one database until it is dropped.
@@ -182,6 +184,7 @@ impl DataNode {
                 settling: watch::Sender::new(BTreeMap::new()),
                 refusing: Mutex::new(BTreeSet::new()),
                 draining: tokio::sync::Mutex::new(()),
+                staging: tokio::sync::Semaphore::new(1),
             }),
         }
     }
@@ -215,6 +218,20 @@ impl DataNode {
             })
     }
 
+    /// Holds this node's one restore or archive verification while the permit lives: each builds
+    /// a whole copy on the node's disk, so a node runs one at a time.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` while another is running, which a retry settles.
+    pub(crate) fn staging_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Status> {
+        self.inner.staging.try_acquire().map_err(|_| {
+            Status::unavailable(
+                "this node is already restoring or verifying an archive; retry when it is done",
+            )
+        })
+    }
+
     /// Builds `name`, a database the control plane has created and never leased, from the
     /// archive's copy of `source` at `target`, and serves it: restores into a staging directory,
     /// verifying every batch against the hash chain, moves the copy into place, takes the first
@@ -224,7 +241,8 @@ impl DataNode {
     /// # Errors
     ///
     /// `FAILED_PRECONDITION` if the database has a lease or this node isn't in its replica set,
-    /// or the archive can't reach the target; `DATA_LOSS` naming the object if one is missing
+    /// or the archive can't reach the target; `UNAVAILABLE` if this node is already restoring or
+    /// verifying an archive; `DATA_LOSS` naming the object if one is missing
     /// or altered; `UNAVAILABLE` if the store can't be reached; and the status of a failed
     /// control call.
     pub(crate) async fn restore(
@@ -234,6 +252,7 @@ impl DataNode {
         source: &DatabaseName,
         target: &RestoreTarget,
     ) -> Result<(Placement, Restored), Status> {
+        let _staging = self.staging_permit()?;
         let placement = self.locate(name).await?;
         let id = self.inner.id.as_str();
         if placement.epoch > 0 || placement.primary.is_some() {
