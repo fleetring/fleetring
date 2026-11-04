@@ -1,11 +1,15 @@
-//! FR-039 on the harness: a file sink on every data node, under crashes, partitions, and
-//! failovers. At the end, every node's file for the database is an in-order, gapless stream of
-//! writes the history knows, with duplicates allowed and nothing refused or invented
-//! ([`Fleet::finish`] runs [`check::change_stream_consistent`] for every file sink).
+//! FR-039 and FR-041 on the harness: a file sink on every data node, under crashes, partitions,
+//! and failovers. At the end, every node's file for the database is an in-order, gapless stream of
+//! writes the history knows, with nothing refused or invented, and each new primary's sink
+//! continues at the mark the old primary replicated rather than at the log's beginning, repeating
+//! at most [`check::REPEATS_PER_FAILOVER`] records ([`Fleet::finish`] runs
+//! [`check::change_stream_consistent`] and [`check::change_streams_resume`] for every file sink).
 //!
+//! [`check::REPEATS_PER_FAILOVER`]: fleetringd::sim::check::REPEATS_PER_FAILOVER
 //! [`check::change_stream_consistent`]: fleetringd::sim::check::change_stream_consistent
+//! [`check::change_streams_resume`]: fleetringd::sim::check::change_streams_resume
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::time::Duration;
 
@@ -117,6 +121,31 @@ fn delivered(fleet: &Fleet) -> Result<BTreeSet<i64>, Box<dyn Error>> {
     Ok(values)
 }
 
+/// How many epochs after the first began their stream on some node at a mark, a position, instead
+/// of at the log's beginning.
+fn resumes(fleet: &Fleet) -> Result<usize, Box<dyn Error>> {
+    let database = database()?;
+    // The position each node's file started its first record of each epoch from.
+    let mut firsts: BTreeMap<(u64, &str), Option<String>> = BTreeMap::new();
+    for node in DATA {
+        let dir = fleet.data_dir(node).ok_or("a data host")?.join(SINK);
+        let text = match std::fs::read_to_string(database_file(&dir, &database)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for line in text.lines() {
+            let record: fleetringd::changes::ChangeRecord = serde_json::from_str(line)?;
+            firsts.entry((record.epoch, node)).or_insert(record.start);
+        }
+    }
+    let first_epoch = firsts.keys().map(|(epoch, _)| *epoch).min();
+    Ok(firsts
+        .iter()
+        .filter(|((epoch, _), start)| Some(*epoch) > first_epoch && start.is_some())
+        .count())
+}
+
 /// A primary crash, a partition that isolates the primary, and flapping replicas, while the
 /// client writes and every node streams to its file sink.
 fn streams_survive_faults_and_failover(seed: u64) -> TestResult {
@@ -131,7 +160,7 @@ fn streams_survive_faults_and_failover(seed: u64) -> TestResult {
     let failover = timings.lease_duration + timings.failover_margin + Duration::from_secs(2);
 
     // The primary crashes mid-stream: its sink stops where it was, and the new primary's sink
-    // starts from its own position.
+    // continues at the newest mark the old primary replicated.
     fleet.crash(&first)?;
     let since = fleet.elapsed();
     await_new_primary(&mut fleet, &first, since, failover * 2)?;
@@ -179,6 +208,10 @@ fn streams_survive_faults_and_failover(seed: u64) -> TestResult {
         .collect();
     let delivered = delivered(&fleet)?;
     assert!(checked > 0, "some records were checked");
+    assert!(
+        resumes(&fleet)? >= 1,
+        "after a failover, a new primary's stream resumed at a mark"
+    );
     assert!(
         delivered.len() >= acknowledged.len() / 2,
         "the sinks delivered {} of {} acknowledged writes",
