@@ -53,6 +53,74 @@ async fn create_ledger(node: &Node) -> Result<DatabaseName, Box<dyn std::error::
     Ok(ledger)
 }
 
+/// A physical change of `ledger` at epoch 1, as a pump hands the archive's sink one.
+fn change(
+    ledger: &DatabaseName,
+    start: Option<fleetringd::engine::Position>,
+    batch: fleetringd::engine::FrameBatch,
+    chain_start: Option<ChainHash>,
+    chain_end: ChainHash,
+) -> fleetringd::changes::Change {
+    fleetringd::changes::Change {
+        database: ledger.clone(),
+        epoch: fleetring_control::LeaseEpoch::new(1),
+        start,
+        position: batch.end,
+        kind: fleetringd::changes::ChangeKind::Physical(batch.payload),
+        chain_start,
+        chain_end: Some(chain_end),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_the_primary_cant_check_that_differs_takes_a_new_base_snapshot() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let node = Node::without_streams(
+        &dir.path().join("node"),
+        Arc::new(store.clone()),
+        settings(),
+    );
+    let ledger = create_ledger(&node).await?;
+    let handle = node.registry().open(&ledger).await?;
+    let first = handle.committed_since(None).await?.ok_or("the schema")?;
+    let schema_end = first.end.clone();
+    node.execute(&ledger, insert(1)).await?;
+    let second = handle
+        .committed_since(Some(schema_end.clone()))
+        .await?
+        .ok_or("the write")?;
+    let end = second.end.clone();
+    let primary = node
+        .replication
+        .verify(&ledger, Some(end.clone()))
+        .await?
+        .hash;
+
+    // The archive's base holds a chain other than the primary's, as one derived on another
+    // lineage would.
+    let other = ChainHash::from_bytes(&[7; ChainHash::LEN]).ok_or("a hash")?;
+    let sink = node.archive.sink().sink;
+    sink.publish(change(&ledger, None, first, None, other))
+        .await?;
+    // The primary's chain doesn't hold the next delivery's start, so the archive can't check
+    // its own hash there, and its batch doesn't continue to the primary's: a new base, not a
+    // delivery refused for good.
+    sink.publish(change(&ledger, Some(schema_end), second, None, primary))
+        .await?;
+    let listing = node.listing(&ledger).await?;
+    assert!(listing.segments.is_empty(), "{listing:#?}");
+    let newest = listing
+        .snapshots
+        .iter()
+        .max_by(|a, b| a.position.cmp(&b.position))
+        .ok_or("a snapshot")?;
+    assert_eq!(newest.position.as_ref(), Some(&end));
+    assert_eq!(newest.chain, primary);
+    node.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_archive_takes_a_base_snapshot_then_uploads_one_segment_per_delivery() -> TestResult {
     let dir = tempfile::tempdir()?;
