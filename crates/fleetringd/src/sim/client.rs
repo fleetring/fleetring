@@ -28,6 +28,7 @@ use crate::sim::trace::EventKind;
 use crate::sim::workload::{
     Ack, LeaseObservation, LeaseSeen, Operation, Outcome, Step, WRITES_TABLE, Workload,
 };
+use crate::software::{running, software_to_proto};
 use crate::tls::{Authority, Identity, Security};
 use crate::transport::{Backoff, replication_client};
 
@@ -189,6 +190,7 @@ async fn execute(
                     weight: 1,
                     address: None,
                 }),
+                software: Some(software_to_proto(&running())),
             })
             .await
             .map(|response| Ack::Joined {
@@ -198,6 +200,7 @@ async fn execute(
             .heartbeat(HeartbeatRequest {
                 node_id: node.to_string(),
                 databases: Vec::new(),
+                software: Some(software_to_proto(&running())),
             })
             .await
             .map(|_| Ack::HeartbeatRecorded),

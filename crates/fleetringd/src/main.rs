@@ -118,7 +118,7 @@ enum Command {
     /// Creates, lists, writes, reads, locates, and drops databases.
     #[command(subcommand)]
     Db(DbCommand),
-    /// Drains a node.
+    /// Drains a node, or clears its draining mark.
     #[command(subcommand)]
     Node(NodeCommand),
     /// Follows the leases data nodes hold.
@@ -459,6 +459,15 @@ enum NodeCommand {
     /// failover. The node gets no new primaries afterwards, and stays a follower until it stops
     /// or restarts; stopping it then costs clients only a redirect.
     Drain {
+        /// The node's ID.
+        id: NodeId,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Clears a node's draining mark, so that it may take primaries again without a restart, as
+    /// after a drain that turned out not to be needed. Refused until every member runs a release
+    /// that supports it.
+    Undrain {
         /// The node's ID.
         id: NodeId,
         #[command(flatten)]
@@ -1085,6 +1094,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Node(NodeCommand::Drain { id, target }) => {
             let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
             format_drain(&id, &primaries)
+        }
+        Command::Node(NodeCommand::Undrain { id, target }) => {
+            target.client()?.undrain_node(&id).await.map_err(failed)?;
+            format!("{id} is no longer draining; it may take primaries again\n")
         }
         Command::Lease(LeaseCommand::Watch {
             node,
@@ -1918,6 +1931,8 @@ fn format_status(view: &MembershipView) -> String {
         if let Some(address) = member.address() {
             let _ = write!(output, " address={address}");
         }
+        // A member that reports no software runs 0.3.0 (ADR-0038).
+        let _ = write!(output, " version={}", member.running().release());
         output.push('\n');
     }
     output

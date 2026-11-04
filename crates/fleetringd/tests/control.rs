@@ -49,6 +49,7 @@ fn join_request(id: &str) -> JoinRequest {
             weight: 1,
             address: None,
         }),
+        software: None,
     }
 }
 
@@ -261,6 +262,7 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
                 epoch: 0,
                 position: vec![0, 0, 0, 1],
             }],
+            software: None,
         })
         .await?;
     assert_eq!(beat.membership_epoch, 3);
@@ -493,6 +495,7 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
             epoch: 1,
             position: vec![0, position],
         }],
+        software: None,
     };
     let locate = || async {
         control
@@ -666,6 +669,13 @@ impl Control for Redirecting {
         self.redirect()
     }
 
+    async fn undrain(
+        &self,
+        _: Request<fleetring_proto::v1::UndrainRequest>,
+    ) -> Result<Response<fleetring_proto::v1::UndrainResponse>, Status> {
+        self.redirect()
+    }
+
     async fn transfer_lease(
         &self,
         _: Request<TransferLeaseRequest>,
@@ -788,6 +798,7 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
                     id: id.clone(),
                     replicas: Vec::new(),
                     unknown_reports: fleetring_control::UnknownReports::Skip,
+                    software: None,
                 };
                 committed.push(handle.submit(action).await?);
             }
@@ -1183,6 +1194,7 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
         .heartbeat(HeartbeatRequest {
             node_id: "a".into(),
             databases: vec![status("ghost"), status("known")],
+            software: None,
         })
         .await?;
     assert_eq!(beat.unknown_databases, vec!["ghost".to_owned()]);
@@ -1518,6 +1530,7 @@ impl Bound {
                     epoch: 1,
                     position: vec![0, 1],
                 }],
+                software: None,
             })
             .await?;
         Ok(bound)
@@ -1793,5 +1806,133 @@ async fn locate_names_the_candidate_while_a_promotion_is_in_progress() -> TestRe
     assert_eq!(after.primary.as_deref(), Some(candidate.as_str()));
     assert_eq!(after.candidate, None);
     bound.stop().await;
+    Ok(())
+}
+
+/// A join request from `id` reporting `software`, or nothing, as 0.3.0 nodes send.
+fn join_with(id: &str, software: Option<fleetring_proto::v1::Software>) -> JoinRequest {
+    JoinRequest {
+        software,
+        ..join_request(id)
+    }
+}
+
+/// The software this build reports, with its version replaced.
+fn reporting(version: &str) -> fleetring_proto::v1::Software {
+    fleetring_proto::v1::Software {
+        version: version.to_owned(),
+        protocol: Some(PROTOCOL_VERSION),
+        control_format: 1,
+        features: vec!["undrain".to_owned()],
+    }
+}
+
+/// ADR-0038 over the wire: the control node records what each member runs, refuses a join two
+/// release lines away, refuses `Undrain` while a member doesn't support it without logging it,
+/// and once every member does, applies it and refuses members that lack it from then on.
+#[tokio::test]
+async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?,
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    let control = secure_client(address, &tls)?;
+    let current = fleetringd::software::VERSION;
+
+    // "old" reports nothing, as 0.3.0 does; "new" runs this build.
+    node_client(address, &tls, "old")?
+        .join(join_with("old", None))
+        .await?;
+    node_client(address, &tls, "new")?
+        .join(join_with("new", Some(reporting(current))))
+        .await?;
+    let update = control
+        .watch_membership(WatchMembershipRequest { after_epoch: 0 })
+        .await?
+        .message()
+        .await?
+        .ok_or("membership stream ended")?;
+    let reported: Vec<_> = update
+        .members
+        .iter()
+        .map(|member| {
+            member
+                .software
+                .as_ref()
+                .map(|software| software.version.as_str())
+        })
+        .collect();
+    assert_eq!(reported, [Some(current), None], "new, then old");
+
+    // Two release lines past the baseline is refused, naming both nodes: "old", or "new" when
+    // this build is older than the baseline's line.
+    let far = node_client(address, &tls, "far")?
+        .join(join_with("far", Some(reporting("0.5.0"))))
+        .await
+        .expect_err("0.5 can't run beside 0.3");
+    assert_eq!(far.code(), Code::FailedPrecondition);
+    assert!(
+        far.message()
+            .starts_with("node 'far' runs fleetringd 0.5.0, which can't run beside node '"),
+        "{far:?}"
+    );
+
+    control
+        .drain(DrainRequest {
+            node_id: "new".into(),
+        })
+        .await?;
+    let undrain = || fleetring_proto::v1::UndrainRequest {
+        node_id: "new".into(),
+    };
+    let refused = control
+        .undrain(undrain())
+        .await
+        .expect_err("old doesn't support undrain");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("can't use 'undrain' yet: node 'old' runs fleetringd 0.3.0"),
+        "{refused:?}"
+    );
+    let handle = daemon.control().ok_or("no control")?;
+    assert!(handle.state().is_draining(&"new".parse()?));
+
+    // Once "old" runs this build too, the command applies, and enables the feature for good.
+    node_client(address, &tls, "old")?
+        .join(join_with("old", Some(reporting(current))))
+        .await?;
+    control.undrain(undrain()).await?;
+    let state = handle.state();
+    assert!(!state.is_draining(&"new".parse()?));
+    assert!(state.is_enabled(fleetring_control::Feature::Undrain));
+    let rolled_back = node_client(address, &tls, "old")?
+        .join(join_with("old", None))
+        .await
+        .expect_err("a rollback below the feature is refused");
+    assert_eq!(rolled_back.code(), Code::FailedPrecondition);
+    assert!(
+        rolled_back
+            .message()
+            .contains("lacks the fleet feature 'undrain'"),
+        "{rolled_back:?}"
+    );
+
+    daemon.run_until(async {}).await;
+    // The refused command never reached the log, where a control node of an older release
+    // couldn't read it; the accepted one did.
+    let log = CommandLog::open(dir.path().join("data/control.db"), ControlConfig::new())?;
+    let undrains = log
+        .commands()?
+        .into_iter()
+        .filter(|(_, command)| matches!(command.action, Action::Undrain { .. }))
+        .count();
+    assert_eq!(undrains, 1);
     Ok(())
 }

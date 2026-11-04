@@ -117,6 +117,7 @@ fn members(epoch: u64, ids: &[&str]) -> MembershipUpdate {
                 }),
                 live: true,
                 draining: false,
+                software: None,
             })
             .collect(),
     }

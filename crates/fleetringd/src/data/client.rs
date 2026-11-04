@@ -15,7 +15,7 @@ use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest,
     DescribeArchiveRequest, DrainRequest, DropDatabaseRequest, ExecuteRequest,
     ListDatabasesRequest, LocateRequest, NodeStatusRequest, QueryRequest, RestoreLatest,
-    RestoreRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
+    RestoreRequest, UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
     WatchMembershipRequest,
 };
 use tonic::transport::Channel;
@@ -686,6 +686,21 @@ impl Client {
                 })
             })
             .collect()
+    }
+
+    /// Clears `node`'s draining mark, so that it may take leases again without a restart.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if there is no such member, `FAILED_PRECONDITION` while a member runs a release
+    /// without the `undrain` feature (ADR-0038), or the status of the last attempt.
+    pub async fn undrain_node(&self, node: &NodeId) -> Result<(), Status> {
+        self.control
+            .undrain(UndrainRequest {
+                node_id: node.to_string(),
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Records new durability settings for a database, which take effect at its next lease

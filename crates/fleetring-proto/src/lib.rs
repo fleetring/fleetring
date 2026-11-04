@@ -18,8 +18,9 @@ pub mod v1 {
 
 use v1::ProtocolVersion;
 
-/// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+/// The protocol version this build speaks. Minor 1 adds `Software` to `Join`, `Heartbeat`, and
+/// membership updates, and the `Undrain` call (ADR-0038).
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 /// The largest message a node sends or accepts: a replication batch or a snapshot chunk.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;

@@ -152,6 +152,13 @@ impl Control for StubControl {
         Err(Status::unimplemented("stub"))
     }
 
+    async fn undrain(
+        &self,
+        _request: Request<fleetring_proto::v1::UndrainRequest>,
+    ) -> Result<Response<fleetring_proto::v1::UndrainResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
     async fn transfer_lease(
         &self,
         _request: Request<TransferLeaseRequest>,
@@ -237,6 +244,7 @@ fn join_request(major: u32) -> JoinRequest {
             weight: 1,
             address: None,
         }),
+        software: None,
     }
 }
 
@@ -266,6 +274,7 @@ async fn join_and_heartbeat_over_tcp() -> TestResult {
         .heartbeat(HeartbeatRequest {
             node_id: "node-1".into(),
             databases: Vec::new(),
+            software: None,
         })
         .await?;
     assert_eq!(beat.get_ref().membership_epoch, MEMBERSHIP_EPOCH);
@@ -395,6 +404,7 @@ mod simulated {
                 .heartbeat(HeartbeatRequest {
                     node_id: "node-1".into(),
                     databases: Vec::new(),
+                    software: None,
                 })
                 .await?;
             assert_eq!(beat.get_ref().membership_epoch, MEMBERSHIP_EPOCH);

@@ -19,7 +19,7 @@ use fleetring_proto::v1::{
     LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
     MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
     RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
-    TransferLeaseRequest, WatchMembershipRequest,
+    TransferLeaseRequest, UndrainRequest, UndrainResponse, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -36,6 +36,7 @@ use crate::control::node::{ControlHandle, SubmitError};
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, revocation_from_proto, revocations_to_proto,
 };
+use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
 
 /// The stream `WatchMembership` returns.
@@ -202,6 +203,7 @@ fn submit_status(error: SubmitError) -> Status {
     match error {
         SubmitError::Stopped => Status::unavailable(error.to_string()),
         SubmitError::Storage(_) => Status::internal(error.to_string()),
+        SubmitError::Unsupported(rejection) => rejection_status(&rejection),
     }
 }
 
@@ -391,6 +393,7 @@ fn membership_update(state: &State, flags: &[MemberFlags]) -> MembershipUpdate {
                 node: Some(node_to_proto(member)),
                 live: flags.live,
                 draining: flags.draining,
+                software: member.software().map(software_to_proto),
             })
             .collect(),
     }
@@ -530,8 +533,12 @@ impl Control for ControlService {
         let peer = Peer::of(&request);
         let request = request.into_inner();
         check_protocol(request.protocol.as_ref())?;
-        let member = member_from(request.node)?;
+        let mut member = member_from(request.node)?;
         peer.check_node(member.id(), "Join")?;
+        // A node that reports nothing runs 0.3.0 (ADR-0038, point 2).
+        if let Some(software) = request.software {
+            member = member.with_software(software_from_proto(software)?);
+        }
         match self.submit(Action::Join { member }).await? {
             (
                 Applied::MemberJoined {
@@ -560,11 +567,21 @@ impl Control for ControlService {
             .into_iter()
             .map(replica_from)
             .collect::<Result<Vec<_>, _>>()?;
+        // The software goes into the log only when it corrects the record, as after the control
+        // node was upgraded beside members that joined it earlier: not once per heartbeat.
+        let software = request
+            .software
+            .map(software_from_proto)
+            .transpose()?
+            .filter(|software| {
+                self.node.state().member(&id).and_then(Member::software) != Some(software)
+            });
         let (applied, state) = self
             .submit(Action::Heartbeat {
                 id,
                 replicas,
                 unknown_reports: fleetring_control::UnknownReports::Skip,
+                software,
             })
             .await?;
         let unknown_databases = match applied {
@@ -904,6 +921,17 @@ impl Control for ControlService {
             (Applied::MemberDraining { id }, state) => Ok(Response::new(DrainResponse {
                 primaries: leases_held_by(&state, &id),
             })),
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
+    async fn undrain(
+        &self,
+        request: Request<UndrainRequest>,
+    ) -> Result<Response<UndrainResponse>, Status> {
+        let id = parse("node id", &request.get_ref().node_id)?;
+        match self.submit(Action::Undrain { id }).await? {
+            (Applied::MemberUndrained { .. }, _) => Ok(Response::new(UndrainResponse {})),
             (other, _) => Err(unexpected(&other)),
         }
     }

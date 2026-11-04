@@ -10,7 +10,7 @@ use fleetring_proto::v1::{
     LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
     PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
     RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
-    WatchMembershipRequest,
+    UndrainRequest, UndrainResponse, WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -134,6 +134,13 @@ impl Control for NoControl {
     }
 
     async fn drain(&self, _: Request<DrainRequest>) -> Result<Response<DrainResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn undrain(
+        &self,
+        _: Request<UndrainRequest>,
+    ) -> Result<Response<UndrainResponse>, Status> {
         self.refuse()
     }
 

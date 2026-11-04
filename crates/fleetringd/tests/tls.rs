@@ -79,6 +79,7 @@ fn join_request(id: &str) -> JoinRequest {
             weight: 1,
             address: None,
         }),
+        software: None,
     }
 }
 
@@ -188,6 +189,7 @@ async fn a_node_certificate_for_another_id_cannot_join_heartbeat_leave_or_drain(
         .heartbeat(HeartbeatRequest {
             node_id: "b".into(),
             databases: Vec::new(),
+            software: None,
         })
         .await
         .expect_err("wrong id");
@@ -216,6 +218,7 @@ async fn a_node_certificate_for_another_id_cannot_join_heartbeat_leave_or_drain(
         .heartbeat(HeartbeatRequest {
             node_id: "other".into(),
             databases: Vec::new(),
+            software: None,
         })
         .await?;
     other

@@ -3,7 +3,7 @@
 use fleetring::{Host, Node, NodeId, Weight, Zone};
 use serde::{Deserialize, Serialize};
 
-use crate::{DatabaseName, LeaseEpoch, Position, Timestamp};
+use crate::{DatabaseName, LeaseEpoch, Position, Software, Timestamp};
 
 /// A member's placement attributes, the ID, zone, host, and weight that the ring places by, and
 /// the address its peers reach it at.
@@ -12,6 +12,11 @@ use crate::{DatabaseName, LeaseEpoch, Position, Timestamp};
 /// a key. It is still part of the membership, so a member that rejoins with a new address bumps
 /// the membership epoch, and every node learns the address with the next membership update. It
 /// arrives inside the `Join` command, so replaying the log restores it.
+///
+/// The [`Software`] the member runs is recorded the same way: not a placement attribute, but part
+/// of the membership, so that a member that rejoins on a new release bumps the membership epoch
+/// and every node learns of it (ADR-0038). A member that reported none runs
+/// [`Software::baseline`].
 ///
 /// # Examples
 ///
@@ -38,6 +43,9 @@ pub struct Member {
     // Absent from states and logs written before members had addresses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     address: Option<String>,
+    // Absent from states and logs written before members reported their software.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    software: Option<Software>,
 }
 
 impl Member {
@@ -50,6 +58,7 @@ impl Member {
             host: None,
             weight: Weight::ONE,
             address: None,
+            software: None,
         }
     }
 
@@ -79,6 +88,27 @@ impl Member {
     pub fn with_address(mut self, address: impl Into<String>) -> Self {
         self.address = Some(address.into());
         self
+    }
+
+    /// Records the software the member runs.
+    #[must_use]
+    pub fn with_software(mut self, software: Software) -> Self {
+        self.software = Some(software);
+        self
+    }
+
+    /// Returns the software the member reported, or `None` if it reported none, as 0.3.0 nodes
+    /// don't.
+    #[must_use]
+    pub fn software(&self) -> Option<&Software> {
+        self.software.as_ref()
+    }
+
+    /// Returns the software the member runs: what it reported, or [`Software::baseline`] if it
+    /// reported nothing.
+    #[must_use]
+    pub fn running(&self) -> Software {
+        self.software.clone().unwrap_or_else(Software::baseline)
     }
 
     /// Returns the member's ID.
@@ -133,6 +163,7 @@ impl From<&Node> for Member {
             host: node.host().cloned(),
             weight: node.weight(),
             address: None,
+            software: None,
         }
     }
 }

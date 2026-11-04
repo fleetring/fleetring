@@ -4,8 +4,8 @@ use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DatabaseName, Durability, Engine, HostedReplica, LeaseEpoch, Member, Position, Revoked,
-    Timestamp,
+    DatabaseName, Durability, Engine, Feature, HostedReplica, LeaseEpoch, Member, Position,
+    Revoked, Software, Timestamp,
 };
 
 /// One change to control state, stamped with the control node's time.
@@ -73,6 +73,14 @@ pub enum Action {
         /// [`UnknownReports::Reject`], the rule they were applied with.
         #[serde(default = "UnknownReports::before_the_field")]
         unknown_reports: UnknownReports,
+        /// The software the member runs, when it differs from what control state records for
+        /// it, as after the control node was upgraded beside members that joined it earlier
+        /// (ADR-0038). Recording a change grows the membership epoch, as a join with new
+        /// software does.
+        ///
+        /// Heartbeats logged before this field existed carry none, and change no software.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        software: Option<Software>,
     },
 
     /// Records a new database.
@@ -177,6 +185,16 @@ pub enum Action {
         id: NodeId,
     },
 
+    /// Clears a member's draining mark, so that it may take leases and be a promotion's candidate
+    /// again, without a restart. Clearing the mark of a member that isn't draining changes
+    /// nothing.
+    ///
+    /// Needs [`Feature::Undrain`]: release 0.3.0 can't read this action in a log (ADR-0038).
+    Undrain {
+        /// The member's ID.
+        id: NodeId,
+    },
+
     /// Hands a database's lease from its draining holder to another replica, without waiting for
     /// the lease to expire: issues the next epoch and starts a promotion whose candidate is
     /// `target`, or, if none is named, the most advanced live replica that isn't draining.
@@ -205,6 +223,28 @@ pub enum Action {
         /// When the entry may be forgotten.
         until: Timestamp,
     },
+}
+
+impl Action {
+    /// Returns the fleet feature the action needs, if it needs one: an action that needs a
+    /// feature is accepted only once every member supports it (ADR-0038, point 4).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring_control::{Action, Feature};
+    ///
+    /// assert_eq!(Action::Undrain { id: "a".parse()? }.feature(), Some(Feature::Undrain));
+    /// assert_eq!(Action::Tick.feature(), None);
+    /// # Ok::<(), fleetring::ParseLabelError>(())
+    /// ```
+    #[must_use]
+    pub fn feature(&self) -> Option<Feature> {
+        match self {
+            Self::Undrain { .. } => Some(Feature::Undrain),
+            _ => None,
+        }
+    }
 }
 
 /// What a heartbeat does with a report for a database the control plane doesn't know.
