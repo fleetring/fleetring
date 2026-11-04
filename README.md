@@ -4,7 +4,7 @@
 
 One database per agent, tenant, or device, spread across nodes you own. FleetRing decides where each database lives, routes traffic to it, and moves it when nodes join or leave.
 
-> **Status:** early development. The placement crate is released as 0.1.0; the router, live migration, and CLI are planned. APIs will change. Not production-ready.
+> **Status:** early development. The [`fleetring`](https://crates.io/crates/fleetring) placement crate is released as 0.1.0, and `fleetringd`, the daemon that replicates, fails over, archives, and restores fleets of SQLite databases, has [a release](https://github.com/fleetring/fleetring/releases/latest) with binaries and a container image. `fleetringd` is **not production-ready**: [`docs/roadmap.md`](docs/roadmap.md) lists what has to be true before it is safe to depend on, and its configuration, protocol, and on-disk formats can still change between releases.
 
 ## Why
 
@@ -20,11 +20,27 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Cells: a directory or ring picks a region or tenant pool, and a ring inside it picks the nodes
 - Ring diffs for migration planning, fingerprints that catch diverging peers, and topology diagnostics
 
-**Planned:**
+**Available now**, in the `fleetringd` daemon, which runs fleets of SQLite databases on machines you own:
+
+- Replication and failover: the primary streams WAL frames to its followers and acknowledges a write once a quorum holds it, leases and epochs keep one writer per database, and a new or lagging follower catches up from a snapshot
+- Durability, set per database: when a write is acknowledged and how many replicas must be reachable; `node drain` hands a node's primaries over before a planned stop
+- Archives and point-in-time restore: each database's log and base snapshots go to an S3-compatible bucket or a directory, and a restore checks every batch against the log's hash chain
+- Change streams to file or webhook sinks that resume where they stopped after a failover, and `lease watch`, which follows the leases a node gains and loses
+- Security: mutual TLS with a built-in certificate authority, principals with prefix scopes and signed, revocable tokens, statements confined to their database, node calls bound to placement, and signed, attested releases
+- Operations: `db create/exec/query/locate/list/drop/verify` and `status`, with a hash-chained log that shows whether every replica holds the same history
+
+**Planned**, each tracked as a [GitHub issue](https://github.com/fleetring/fleetring/issues):
 
 - Router that works with existing libSQL and Turso clients
-- Live migration when nodes join or leave, with zero lost writes
-- CLI: `fleetring up`, `node add/remove`, `db create/locate/move`, `status`
+- Live migration when nodes join or leave, with zero lost writes, and rebalancing
+- A Raft control plane, so the control plane has no single point of failure
+- Metrics, health checks, and structured logs, and `fleetringd upgrade` with a tested rolling upgrade (both in progress)
+- Fault injection on real daemons, judged by the history checker
+- Keyed leases, Merkle anti-entropy, and cells in the daemon
+- CLI contexts and JSON output, `fleetringd dev`, a terminal UI, and a desktop app
+- Archive follow-ups: acknowledging a write once it is archived, workload-identity credentials, and Vercel Blob
+- An agent kit with an MCP server, vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
+- apt, yum, AUR, and Homebrew packages
 
 ## Install
 
@@ -85,10 +101,19 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 ## Roadmap
 
 - [x] `fleetring` ring and placement crate (0.1.0)
+- [x] `fleetringd`: replication, quorum acknowledgements, and failover (0.1.0)
+- [x] Security: mutual TLS, scopes and tokens, signed releases (0.2.0)
+- [x] Change streams and lease watch (0.2.0); streams resume after failover (0.3.0)
+- [x] Backups and point-in-time restore (0.3.0)
+- [ ] Metrics, health checks, and a tested rolling upgrade (in progress)
 - [ ] Router sidecar (libSQL/Hrana protocol)
 - [ ] Live migration
+- [ ] Raft control plane
+- [ ] Fault injection on real daemons
 - [ ] Demo: 10k agents with live rebalancing
-- [ ] Backups and point-in-time restore
+- [ ] Safe to depend on, including an outside review of the protocol and the auth design
+
+[`docs/roadmap.md`](docs/roadmap.md) explains each step and what "safe to use" means. [GitHub Issues](https://github.com/fleetring/fleetring/issues) track the work.
 
 ## Design docs
 
