@@ -2,17 +2,19 @@
 //! least once across a pump that is killed mid-stream and restarted.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fleetring::ReplicationFactor;
 use fleetring_control::LeaseEpoch;
 use fleetringd::changes::{
     Change, ChangeKind, ChangeRecord, ChangeSink, ConfiguredSink, FileSink, Format, MarkHome,
-    MemorySink, Published, RecordContent,
+    MemorySink, Published, RecordContent, SinkError,
 };
 use fleetringd::engine::{CaptureMode, RowOperation, Value};
-use fleetringd::replication::PrimaryRole;
+use fleetringd::replication::{ChainHash, PrimaryRole};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::common::{Harness, NoMarks, TestResult, every_database, guarded, insert, name};
 
@@ -350,6 +352,160 @@ async fn an_engine_without_marks_keeps_positions_on_the_node() -> TestResult {
     let position = status[0].position.clone().ok_or("a delivered position")?;
     let file = harness.root().join("changes").join("stream").join("ledger");
     assert_eq!(std::fs::read(&file)?, position.as_bytes(), "{file:?}");
+    node.kill().await;
+    Ok(())
+}
+
+/// A physical sink that records each change with the time it arrived, refuses one without the
+/// primary's chain hashes, as an archive does, so the pump retries it, and asks its pump to wait
+/// `pace` between deliveries.
+///
+/// A change from the log's beginning may lack the hash at its start: a chain built after the
+/// first write is derived from where the log's generation begins, not from the empty log.
+#[derive(Debug, Clone)]
+struct ChainedSink {
+    pace: Duration,
+    received: Arc<Mutex<Vec<(Instant, Change)>>>,
+}
+
+impl ChainedSink {
+    fn new(pace: Duration) -> Self {
+        Self {
+            pace,
+            received: Arc::default(),
+        }
+    }
+
+    fn received(&self) -> Vec<(Instant, Change)> {
+        self.received.lock().expect("sink lock").clone()
+    }
+
+    fn changes(&self) -> Vec<Change> {
+        self.received()
+            .into_iter()
+            .map(|(_, change)| change)
+            .collect()
+    }
+}
+
+impl ChangeSink for ChainedSink {
+    fn name(&self) -> &str {
+        "chained"
+    }
+
+    fn publish(&self, change: Change) -> Published {
+        if change.chain_end.is_none() || change.start.is_some() && change.chain_start.is_none() {
+            return Box::pin(std::future::ready(Err(SinkError::Failed {
+                reason: "the primary's chain isn't built yet".to_owned(),
+            })));
+        }
+        self.received
+            .lock()
+            .expect("sink lock")
+            .push((Instant::now(), change));
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn pace(&self) -> Duration {
+        self.pace
+    }
+}
+
+/// Checks that `changes` continue one another from the log's beginning, with no gap or overlap.
+fn assert_gapless(changes: &[Change]) {
+    assert_eq!(changes.first().map(|change| &change.start), Some(&None));
+    for pair in changes.windows(2) {
+        assert_eq!(
+            pair[1].start.as_ref(),
+            Some(&pair[0].position),
+            "{:?} then {:?}",
+            pair[0].position,
+            pair[1].start
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_physical_change_carries_the_chain_hash_at_both_ends() -> TestResult {
+    let harness = Harness::start().await?;
+    let sink = ChainedSink::new(Duration::ZERO);
+    let node = harness
+        .node(vec![ConfiguredSink::new(
+            sink.clone(),
+            Format::Physical,
+            every_database(),
+        )])
+        .await?;
+    let ledger = name("ledger");
+    node.create(&ledger, "CREATE TABLE t (value INTEGER NOT NULL)")
+        .await?;
+    for value in 1..=3 {
+        node.execute(&ledger, insert(value)).await?;
+    }
+    node.await_caught_up().await?;
+
+    let changes = sink.changes();
+    assert_gapless(&changes);
+    assert!(
+        matches!(changes[0].chain_start, None | Some(ChainHash::GENESIS)),
+        "a new database's log begins at the genesis hash, if the chain holds it"
+    );
+    for pair in changes.windows(2) {
+        assert_eq!(pair[1].chain_start, pair[0].chain_end);
+    }
+    let last = changes.last().ok_or("a change")?;
+    let verified = node
+        .replication
+        .verify(&ledger, Some(last.position.clone()))
+        .await?;
+    assert_eq!(last.chain_end, Some(verified.hash));
+    node.kill().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paced_sink_receives_fewer_larger_batches() -> TestResult {
+    let pace = Duration::from_millis(200);
+    let harness = Harness::start().await?;
+    let sink = ChainedSink::new(pace);
+    let node = harness
+        .node(vec![ConfiguredSink::new(
+            sink.clone(),
+            Format::Physical,
+            every_database(),
+        )])
+        .await?;
+    let ledger = name("ledger");
+    let started = Instant::now();
+    node.create(&ledger, "CREATE TABLE t (value INTEGER NOT NULL)")
+        .await?;
+    for value in 1..=50 {
+        node.execute(&ledger, insert(value)).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let writing = started.elapsed();
+    node.await_caught_up().await?;
+
+    let received = sink.received();
+    let changes = sink.changes();
+    assert_gapless(&changes);
+    assert_eq!(
+        changes.last().map(|change| change.position.clone()),
+        node.registry().open(&ledger).await?.position().await?
+    );
+    // The pump waits at least `pace` after each delivery before it reads the log again.
+    for pair in received.windows(2) {
+        let apart = pair[1].0.duration_since(pair[0].0);
+        assert!(apart >= pace, "deliveries {apart:?} apart");
+    }
+    // So the 51 writes arrive in at most one delivery per pace while they were written, plus the
+    // one in flight when they ended and the one after it, however slowly the machine wrote them.
+    let bound = usize::try_from(writing.as_millis() / pace.as_millis())? + 3;
+    assert!(
+        changes.len() <= bound,
+        "{} changes for 51 writes over {writing:?}",
+        changes.len()
+    );
     node.kill().await;
     Ok(())
 }

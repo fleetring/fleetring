@@ -404,6 +404,8 @@ async fn a_change_record_round_trips_through_json() -> TestResult {
             RowChange::new("t", RowOperation::Delete, [Column::new("rowid", 3_i64)])
                 .with_before([Column::new("blob", Value::Blob(vec![0, 7]))]),
         ]),
+        chain_start: None,
+        chain_end: None,
     };
     let record = ChangeRecord::from(&change);
     let text = serde_json::to_string(&record)?;
