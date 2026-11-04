@@ -78,6 +78,9 @@ pub struct SnapshotDescriptor {
     pub bytes: u64,
     /// The packed stream's XXH3-128 checksum, as 32 hex digits.
     pub checksum: String,
+    /// Each chunk's XXH3-128 checksum, as 32 hex digits, so that a restore names the chunk
+    /// that changed.
+    pub chunk_checksums: Vec<String>,
 }
 
 /// The error returned when an object's bytes aren't a valid object of its kind.
@@ -181,6 +184,12 @@ pub fn encode_descriptor(descriptor: &SnapshotDescriptor) -> Vec<u8> {
     serde_json::to_vec_pretty(descriptor).expect("a snapshot descriptor always serializes")
 }
 
+/// The XXH3-128 checksum of `bytes`, as 32 hex digits, as descriptors record them.
+#[must_use]
+pub fn checksum_hex(bytes: &[u8]) -> String {
+    format!("{:032x}", XxHash3_128::oneshot(bytes))
+}
+
 /// Decodes a snapshot descriptor.
 ///
 /// # Errors
@@ -269,6 +278,7 @@ mod tests {
         let mut descriptor = serde_json::json!({
             "format": 1, "database": "a", "engine": "sqlite", "epoch": 1, "position": null,
             "chain": "00", "taken_at_ms": 0, "chunks": 1, "bytes": 1, "checksum": "00",
+            "chunk_checksums": ["00"],
         });
         assert!(decode_descriptor(descriptor.to_string().as_bytes()).is_ok());
         descriptor["extra"] = serde_json::json!(1);

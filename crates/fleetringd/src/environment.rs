@@ -6,6 +6,7 @@
 //! [`Environment::simulated`] to [`Daemon::start_with`](crate::Daemon::start_with), so the same
 //! daemon code runs over turmoil's network and clock, on one deterministic thread.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::clock::{Clock, SystemClock};
 use crate::control::{ControlClient, StorageIo};
+use crate::durability::ObjectStore;
 use crate::engine::Execution;
 use crate::tls::{Conn, Raw, Security};
 use crate::transport::{Credentials, TransportConfig};
@@ -202,6 +204,8 @@ pub struct Environment {
     network: Network,
     clock: Arc<dyn Clock>,
     execution: Execution,
+    /// Object stores that replace the ones `[[archive]]` entries name, by archive name.
+    object_stores: BTreeMap<String, Arc<dyn ObjectStore>>,
 }
 
 impl Environment {
@@ -212,6 +216,7 @@ impl Environment {
             network: Network::default(),
             clock: Arc::new(SystemClock),
             execution: Execution::Threads,
+            object_stores: BTreeMap::new(),
         }
     }
 
@@ -226,6 +231,7 @@ impl Environment {
             network: Network::simulated(),
             clock: Arc::new(clock),
             execution: Execution::Inline,
+            object_stores: BTreeMap::new(),
         }
     }
 
@@ -252,6 +258,25 @@ impl Environment {
     pub fn with_execution(mut self, execution: Execution) -> Self {
         self.execution = execution;
         self
+    }
+
+    /// Writes the archive named `archive` to `store`, whatever store its `[[archive]]` entry
+    /// names: a simulation's one store that every host shares and that outlives them (ADR-0029,
+    /// point 16).
+    #[must_use]
+    pub fn with_object_store(
+        mut self,
+        archive: impl Into<String>,
+        store: Arc<dyn ObjectStore>,
+    ) -> Self {
+        self.object_stores.insert(archive.into(), store);
+        self
+    }
+
+    /// The store that replaces the one the archive named `archive` names, if any.
+    #[must_use]
+    pub fn object_store(&self, archive: &str) -> Option<Arc<dyn ObjectStore>> {
+        self.object_stores.get(archive).cloned()
     }
 
     /// Returns the network.

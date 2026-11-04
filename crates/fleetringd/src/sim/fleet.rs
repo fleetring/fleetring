@@ -440,6 +440,7 @@ fn host_config(
         },
         replication: ReplicationConfig::default(),
         changes: ChangesConfig::default(),
+        archive: Vec::new(),
         tls: None,
         insecure_plaintext: crate::Plaintext::Refused,
         principals: vec![workload_principal()],
