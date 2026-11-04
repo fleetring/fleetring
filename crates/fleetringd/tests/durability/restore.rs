@@ -281,6 +281,70 @@ async fn restoring_to_a_time_holds_no_segment_archived_after_it() -> TestResult 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_past_the_new_primarys_mark_leaves_later_points_restorable() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let root = dir.path().join("node");
+    let mut settings = settings();
+    // A snapshot after every segment, and two kept: retention runs after every delivery.
+    settings.snapshot_after_bytes = 1;
+    settings.keep_snapshots = std::num::NonZeroU32::new(2).ok_or("nonzero")?;
+
+    // The old primary archives three writes, each followed by a snapshot at its end. The mark
+    // of the last delivery is staged but never written, since no write follows it.
+    let node = Node::start(&root, Arc::new(store.clone()), settings);
+    let ledger = create_ledger(&node).await?;
+    for value in 1..=3 {
+        node.execute(&ledger, insert(value)).await?;
+        node.await_archived().await?;
+    }
+    let dead_end = node.position(&ledger).await?;
+    node.stop().await;
+
+    // The new primary takes two writes before its stream starts, so its first delivery runs
+    // from the replicated mark, before the old primary's last snapshot, past that snapshot.
+    let mut node = Node::without_streams(&root, Arc::new(store.clone()), settings);
+    node.serve(&ledger, 2)?;
+    node.execute(&ledger, insert(4)).await?;
+    let fourth = node.position(&ledger).await?.ok_or("a position")?;
+    node.execute(&ledger, insert(5)).await?;
+    node.start_streams();
+    node.await_archived().await?;
+
+    let listing = node.listing(&ledger).await?;
+    assert!(
+        listing
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.position == dead_end),
+        "the old primary's last snapshot is kept: {listing:#?}"
+    );
+    assert!(
+        !listing
+            .segments
+            .iter()
+            .any(|segment| segment.name.start == dead_end),
+        "and leads nowhere: {listing:#?}"
+    );
+    // The fourth write lies between the dead end and the new primary's snapshot: only the
+    // snapshot before the mark, and the new primary's segment from it, reach it.
+    let staging = dir.path().join("fourth");
+    let restored = restore(
+        &node,
+        &ledger,
+        &RestoreTarget::Position(fourth.clone()),
+        &staging,
+    )
+    .await?;
+    assert_eq!(restored.position, Some(fourth));
+    let (values, integrity) = rows(&staging)?;
+    assert_eq!(values, [1, 2, 3, 4]);
+    assert_eq!(integrity, "ok");
+    node.stop().await;
+    Ok(())
+}
+
 /// An archive of `ledger` with some segments, on a node that is stopped.
 async fn archived()
 -> Result<(tempfile::TempDir, MemoryStore, DatabaseName), Box<dyn std::error::Error>> {

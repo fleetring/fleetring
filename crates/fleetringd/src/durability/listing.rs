@@ -1,6 +1,8 @@
 //! A database's manifest in an archive: one `list` of its prefix, with each snapshot's
 //! descriptor read.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use fleetring_control::{DatabaseName, LeaseEpoch};
 
 use super::format::{SnapshotDescriptor, decode_descriptor};
@@ -91,8 +93,7 @@ impl Listing {
         let mut listing = Self::default();
         let prefix = keys.database();
         let objects = retrying(|| store.list(&prefix)).await?;
-        let mut snapshots: std::collections::BTreeMap<String, (bool, Vec<String>)> =
-            std::collections::BTreeMap::new();
+        let mut snapshots: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
         for object in objects {
             if let Some(name) = keys.parse_segment_key(&object.key) {
                 listing.segments.push(SegmentEntry {
@@ -173,6 +174,39 @@ impl Listing {
             .map(|segment| segment.name.archived_at_ms)
             .max();
         (furthest, at)
+    }
+
+    /// Every position a walk over the segments, of any epoch, reaches from any of `from`, the
+    /// starting positions included: where the archive's history continues from them.
+    #[must_use]
+    pub fn reachable_from(
+        &self,
+        from: impl IntoIterator<Item = Option<Position>>,
+    ) -> BTreeSet<Option<Position>> {
+        let mut next: BTreeMap<&Option<Position>, Vec<&Position>> = BTreeMap::new();
+        for segment in &self.segments {
+            if Some(&segment.name.end) > segment.name.start.as_ref() {
+                next.entry(&segment.name.start)
+                    .or_default()
+                    .push(&segment.name.end);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut frontier: Vec<Option<Position>> = Vec::new();
+        for start in from {
+            if seen.insert(start.clone()) {
+                frontier.push(start);
+            }
+        }
+        while let Some(at) = frontier.pop() {
+            for end in next.get(&at).into_iter().flatten() {
+                let end = Some((*end).clone());
+                if seen.insert(end.clone()) {
+                    frontier.push(end);
+                }
+            }
+        }
+        seen
     }
 }
 

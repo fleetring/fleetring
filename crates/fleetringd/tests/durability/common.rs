@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,14 +75,29 @@ pub(crate) fn insert(value: i64) -> Transaction {
 /// One data node with an archive.
 pub(crate) struct Node {
     pub(crate) replication: Replication,
-    pub(crate) streams: ChangeStreams,
+    /// The change streams that feed the archive, once they have started.
+    streams: Option<ChangeStreams>,
     pub(crate) archive: Archive,
+    root: PathBuf,
     _membership: ManualMembership,
 }
 
 impl Node {
     /// Starts a node over `root`, archiving every database to `store` by `settings`.
     pub(crate) fn start(
+        root: &Path,
+        store: Arc<dyn ObjectStore>,
+        settings: ArchiveSettings,
+    ) -> Self {
+        let mut node = Self::without_streams(root, store, settings);
+        node.start_streams();
+        node
+    }
+
+    /// As [`start`](Self::start), but nothing feeds the archive until
+    /// [`start_streams`](Self::start_streams): a test can write first, or hand the archive's
+    /// sink changes of its own.
+    pub(crate) fn without_streams(
         root: &Path,
         store: Arc<dyn ObjectStore>,
         settings: ArchiveSettings,
@@ -107,21 +122,26 @@ impl Node {
             },
         )
         .expect("sqlite is a frame source");
-        let streams = ChangeStreams::start(ChangeParts {
-            sinks: vec![archive.sink()],
-            replication: replication.clone(),
-            state_dir: root.join("changes"),
+        Self {
+            replication,
+            streams: None,
+            archive,
+            root: root.to_owned(),
+            _membership: manual,
+        }
+    }
+
+    /// Starts the change streams that feed the archive.
+    pub(crate) fn start_streams(&mut self) {
+        self.streams = Some(ChangeStreams::start(ChangeParts {
+            sinks: vec![self.archive.sink()],
+            replication: self.replication.clone(),
+            state_dir: self.root.join("changes"),
             settings: ChangeSettings {
                 retry_initial: Duration::from_millis(10),
                 retry_max: Duration::from_millis(100),
             },
-        });
-        Self {
-            replication,
-            streams,
-            archive,
-            _membership: manual,
-        }
+        }));
     }
 
     pub(crate) fn registry(&self) -> &Registry {
@@ -157,9 +177,10 @@ impl Node {
 
     /// Waits until the archive has everything acknowledged.
     pub(crate) async fn await_archived(&self) -> TestResult {
+        let streams = self.streams.as_ref().ok_or("the streams haven't started")?;
         if guarded(
             "the archive catching up",
-            self.streams.await_caught_up(HANG_GUARD),
+            streams.await_caught_up(HANG_GUARD),
         )
         .await?
         {
@@ -189,7 +210,9 @@ impl Node {
 
     /// Stops the streams and the node.
     pub(crate) async fn stop(self) {
-        self.streams.stop(Duration::ZERO).await;
+        if let Some(streams) = &self.streams {
+            streams.stop(Duration::ZERO).await;
+        }
         self.replication.stop();
         self.registry().close_all().await;
     }

@@ -6,12 +6,20 @@ use std::num::NonZeroU32;
 use super::listing::Listing;
 use super::store::{ObjectStore, StoreError, retrying};
 
-/// The keys retention deletes from `listing`, in the order to delete them: snapshots past the
-/// newest `keep` complete ones, descriptor first, so that a half-deleted snapshot reads as
-/// incomplete; every segment that ends at or before the oldest kept snapshot's position; and
-/// incomplete snapshots older than the oldest kept one, which no restore can use.
+/// The keys retention deletes from `listing`, in the order to delete them.
 ///
-/// Nothing a kept snapshot's path can use is deleted, so an old and a new primary pruning one
+/// Retention keeps the newest snapshots until `keep` of them are *live*: a walk over the
+/// segments, of any epoch, leads from them to the furthest point the archive holds. A snapshot
+/// that leads nowhere, as one an old primary took past the mark a new primary resumed from,
+/// is kept too but doesn't count, so the older snapshot the new primary's segments continue is
+/// kept with them. Every segment a walk from a kept snapshot reaches is kept.
+///
+/// It deletes the snapshots past the kept ones, descriptor first, so that a half-deleted
+/// snapshot reads as incomplete; every segment no kept snapshot reaches; and incomplete
+/// snapshots older than the oldest kept one, which no restore can use. While fewer than
+/// `keep` snapshots are live, it deletes nothing.
+///
+/// Nothing a kept snapshot's walk can use is deleted, so an old and a new primary pruning one
 /// archive at once never delete what the other needs.
 #[must_use]
 pub fn retention(listing: &Listing, keep: NonZeroU32) -> Vec<String> {
@@ -24,13 +32,29 @@ pub fn retention(listing: &Listing, keep: NonZeroU32) -> Vec<String> {
         ))
     });
     let keep = usize::try_from(keep.get()).unwrap_or(usize::MAX);
-    if snapshots.len() <= keep {
+    let (latest, _) = listing.latest();
+    let mut live = 0;
+    let mut kept = 0;
+    for snapshot in &snapshots {
+        if live == keep {
+            break;
+        }
+        kept += 1;
+        if listing
+            .reachable_from([snapshot.position.clone()])
+            .contains(&latest)
+        {
+            live += 1;
+        }
+    }
+    if kept == snapshots.len() {
         return Vec::new();
     }
-    let (kept, dropped) = snapshots.split_at(keep);
-    let Some(oldest) = kept.last().map(|snapshot| snapshot.position.clone()) else {
+    let (kept, dropped) = snapshots.split_at(kept);
+    let Some(oldest) = kept.iter().map(|snapshot| snapshot.position.clone()).min() else {
         return Vec::new();
     };
+    let reached = listing.reachable_from(kept.iter().map(|snapshot| snapshot.position.clone()));
     let mut keys = Vec::new();
     for snapshot in dropped {
         keys.push(snapshot.key.clone());
@@ -40,7 +64,7 @@ pub fn retention(listing: &Listing, keep: NonZeroU32) -> Vec<String> {
         listing
             .segments
             .iter()
-            .filter(|segment| Some(&segment.name.end) <= oldest.as_ref())
+            .filter(|segment| !reached.contains(&segment.name.start))
             .map(|segment| segment.key.clone()),
     );
     keys.extend(
@@ -146,5 +170,74 @@ mod tests {
         );
         let keep_all = NonZeroU32::new(3).expect("nonzero");
         assert!(retention(&listing, keep_all).is_empty());
+    }
+
+    /// A segment of epoch 2, a new primary's.
+    fn resumed(start: u8, end: u8) -> SegmentEntry {
+        let mut segment = segment(start, end);
+        segment.key = format!("e2-{start}-{end}");
+        segment.name.epoch = LeaseEpoch::new(2);
+        segment
+    }
+
+    /// Whether a restore of what `listing` keeps after retention reaches `target`.
+    fn restorable(listing: &Listing, keep: NonZeroU32, target: u8) -> bool {
+        let doomed = retention(listing, keep);
+        let kept = Listing {
+            snapshots: listing
+                .snapshots
+                .iter()
+                .filter(|snapshot| !doomed.contains(&snapshot.key))
+                .cloned()
+                .collect(),
+            segments: listing
+                .segments
+                .iter()
+                .filter(|segment| !doomed.contains(&segment.key))
+                .cloned()
+                .collect(),
+            ..Listing::default()
+        };
+        crate::durability::plan(
+            &kept,
+            &crate::durability::RestoreTarget::Position(at(target)),
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn a_snapshot_past_a_new_primarys_mark_doesnt_orphan_its_segments() {
+        // The old primary archived up to 10 and snapshotted there, then failed before the mark
+        // past 6 replicated; the new primary resumed at 6 and archived past 10 without passing
+        // through it, then took a snapshot at 12.
+        let listing = Listing {
+            snapshots: vec![snapshot(1), snapshot(10), snapshot(12)],
+            segments: vec![segment(1, 6), segment(6, 10), resumed(6, 8), resumed(8, 12)],
+            ..Listing::default()
+        };
+        let keep = NonZeroU32::new(2).expect("nonzero");
+        // The snapshot at 10 leads nowhere, so the one at 1 is kept, with every segment.
+        assert_eq!(retention(&listing, keep), Vec::<String>::new());
+        assert!(restorable(&listing, keep, 11), "a point after the dead end");
+        assert!(restorable(&listing, keep, 7));
+
+        // Once two later snapshots lead to the end, the older window goes.
+        let mut later = listing.clone();
+        later.snapshots.push(snapshot(14));
+        later.segments.push(resumed(12, 14));
+        assert_eq!(
+            retention(&later, keep),
+            [
+                "s10/snapshot.json",
+                "s10/00000000.chunk",
+                "s1/snapshot.json",
+                "s1/00000000.chunk",
+                "seg1-6",
+                "seg6-10",
+                "e2-6-8",
+                "e2-8-12"
+            ]
+        );
+        assert!(restorable(&later, keep, 13));
     }
 }
