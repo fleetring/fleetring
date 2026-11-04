@@ -410,10 +410,11 @@
       "area": "operations",
       "title": "Metrics, health and logs",
       "description": "Prometheus metrics, health and readiness endpoints on a separate admin listener, JSON logs and a span per request.",
-      "status": "planned",
+      "status": "built",
+      "since": "0.4.0",
       "ticket": "FR-063",
       "issue": 66,
-      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0034-metrics-health-and-logs.md"
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#observability"
     },
     {
       "id": "rolling-upgrade",

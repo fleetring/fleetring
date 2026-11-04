@@ -548,4 +548,24 @@ The open questions this plan raised were decided as recommended:
 
 ## Progress
 
-- Not started.
+- 2026-11-04: implemented on the `metrics` branch, steps 1 to 10, in four commits rather than ten: the source and its unit tests, the documentation, the integration and simulation tests, and the measurements. The steps share files (`daemon.rs` wires every one), and a commit per step would have left dead code that `clippy -D warnings` refuses between them.
+- Acceptance criteria, and the tests that hold them:
+  - ADR-0034 is accepted and listed (it was accepted on 2026-11-03); a dated amendment records the details below.
+  - Every family at `/metrics` on a default daemon: `the_admin_listener_defaults_to_loopback_plaintext` (the default is `127.0.0.1:7401`), `metrics_health_and_readiness_on_the_admin_listener` (a `TYPE` line per family, served on a port the test binds as 0, since a fixed port collides with tests running in parallel), `the_exposition_lists_every_family`, and `the_readme_lists_every_family`.
+  - `/healthz` and `/readyz`: `readiness_lists_every_check_of_both_roles`, `a_node_is_not_ready_until_it_joins`, `a_draining_node_is_not_ready`, and the unit tests in `observe::health`.
+  - The non-loopback validation: `a_non_loopback_admin_address_needs_tls_or_plaintext` and `a_non_loopback_admin_address_fails_validation`; `admin_tls_needs_the_node_s_certificate` covers `tls = true` without `[tls]`.
+  - TLS and scrapers: `admin_tls_requires_a_listed_scraper` (401, 403 for another principal and for a node, 200 for `prometheus`, probes without a certificate, no HTTP answer to plaintext) and `only_listed_principals_may_scrape_over_tls`.
+  - Cardinality: `two_hundred_databases_stay_within_the_series_budget` (also checks every label name against the allow-list and every closed label value against its set, `observe::closed_values`).
+  - Logs and request IDs: `json_logs_carry_the_rpc_span`, `a_request_id_reaches_the_control_plane`, `the_daemon_writes_json_lines_with_log_format_json` (the binary, with the flag and with the variable), and the `observe::request_id` and `observe::trace` unit tests.
+  - Separate registries and the simulation: `two_daemons_in_one_process_keep_separate_metrics`, `two_registries_keep_separate_counts`, and `metrics_count_the_acknowledged_writes` in the simulation suite, which otherwise passes unchanged.
+  - Documentation: `deploy/fleetringd.toml`, the README's "Observability" section, the lexicon, `docs/cli.md`, `docs/roadmap.md`, and `SECURITY.md`.
+- Deviations from the plan, and why:
+  - `prometheus-client` 0.25 (the latest; Apache-2.0 OR MIT), not 0.23. It adds `dtoa` and `prometheus-client-derive-encode` (both MIT OR Apache-2.0), and `tracing-subscriber`'s `json` feature adds `tracing-serde` (MIT); `itoa` and `parking_lot` were already in the tree. `hyper` gains its `server` feature and the crate depends on `http-body` directly; both were already in the tree.
+  - Every family is listed from the first scrape. `prometheus-client` leaves a labelled family out until it has a series, so a wrapper registers each one as always present; closed outcome and reason sets, each configured sink's series, and each control action and outcome start at 0. The RPC families get series as RPCs arrive.
+  - `Membership::start_reporting` keeps its signature; the daemon calls a crate-private `start_observed` that takes the handle, so tests that start membership by hand don't change. `ControlNode::open_with_metrics` is crate-private for the same reason. `ReplicationParts` and `ChangeParts` gain `metrics` as planned.
+  - `TraceLayer::new` is public, for the `observe` bench and for the router (FR-066).
+  - The boundary's `Refusal` extension is decided in `AuthService::call` from the path and the status `admit` returned (only a token without a fresh denylist yields `UNAVAILABLE` there), which leaves `admit` unchanged.
+  - `--log-format` before a command's name was refused by clap's `args_conflicts_with_subcommands`, as the plan's test anticipated; `main` now checks the daemon-options-with-a-subcommand conflict itself (`daemon_options_are_refused_next_to_a_subcommand`).
+  - `fleetring_denylist_age_seconds` before the first denylist is written `inf`, which is how `prometheus-client` encodes +Inf; Prometheus parses it.
+  - Every integration test's daemon gets `[admin] listen = "127.0.0.1:0"` (`support::ADMIN`, appended by `Tls::node_table`), so no test contends for 7401.
+  - Hot-path cost (open risk 3): the trace layer costs about 1.7 µs per request at info level, and 1.35 µs once `code` and `duration_ms` are recorded only when debug logging is on, which is the plan's fallback, taken. End to end that is about 2% of a `Locate` and within noise for an `Execute`; `docs/perf.md` has the numbers under "Request path". The `capture` bench doesn't reach the request path and didn't move.

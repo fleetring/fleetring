@@ -165,6 +165,8 @@ Documented in `--help` and the man page, and the same for every command:
 
 Commands log only warnings by default, to stderr; `RUST_LOG` raises it, and `-v, --verbose` is short for `RUST_LOG=fleetringd=debug`. The daemon logs at info. Log fields use lexicon names.
 
+`--log-format text|json` (or `FLEETRING_LOG_FORMAT`, or the daemon's `[log] format`) chooses the format, in that order; text is the default. JSON is one object per line, with the current span and its parents. The flag goes before or after a command's name, as a global flag; it is the one flag the daemon and the commands share.
+
 ## 14. Renames
 
 Before 1.0, a renamed flag, value, or command is a clean break: the old spelling stops working in the release that renames it, with no hidden alias and no deprecation period (ADR-0032). The old spelling fails like any unknown flag, command, or value, and the error may carry one `hint:` line naming the new spelling. The release notes list every rename under breaking changes (FR-062 keeps 0.3.0's list).

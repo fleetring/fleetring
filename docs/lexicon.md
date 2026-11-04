@@ -56,6 +56,7 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | key (for a database, in the daemon) | [database](#database) | "Key" alone is the placement key; other keys say which: private key, signing key, lease key. |
 | role (alone) | [node role](#node-role) or [replica role](#replica-role) | |
 | API key, password | [token](#token) or [certificate](#certificate) | |
+| health (for a member's liveness) | [liveness](#liveness) | `/healthz` is about the process; liveness is the control plane's view. |
 
 ## Terms
 
@@ -90,6 +91,14 @@ Where a node is dialed: `host:port`, or the IP addresses and DNS names its certi
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Member::address`, protocol `Node.address` and `Replica.address`, `[node] advertise`. **CLI:** `--address <host:port>` where a command dials one node (`status`, `lease watch`, `db exec`, `db query`); `cert node --addresses` for the names a node certificate carries; `address=` after each member in `status`.
 - **Not:** host (that is the machine label), endpoint, URL, `--node` (which takes a node ID).
+
+### Admin listener
+
+The HTTP listener a daemon serves `/metrics`, `/healthz`, and `/readyz` on, apart from the gRPC port; loopback and plaintext by default (ADR-0034).
+
+- **Applies to:** daemon, CLI.
+- **Code:** `[admin]`, `AdminConfig`, `observe::admin`. **CLI:** none.
+- **Not:** status port, management port, HTTP port, debug server.
 
 ### Archive
 
@@ -527,6 +536,14 @@ A number of replicas that must agree: the *write quorum* W acknowledges a write,
 - **Code:** `Quorums`. **CLI:** `--acks quorum`.
 - **Not:** majority (only for `acks = quorum`'s W), consensus, replica set.
 
+### Readiness
+
+Whether a node should be sent work now: `/readyz` passes when every check of its node roles passes (`joined`, `ring`, `denylist`, `draining`, `control_log`, `leader`). Health (`/healthz`) only says the process can serve.
+
+- **Applies to:** daemon, UI.
+- **Code:** `observe::health::Probes`, `Readiness`, `Check`. **CLI:** none.
+- **Not:** liveness (a member's liveness is the control plane's view; see [liveness](#liveness)), status, up.
+
 ### Replica
 
 One database's copy on one node, the primary's copy included.
@@ -559,6 +576,14 @@ R: how many replicas a database has, the primary included. A replica set with fe
 - **Code:** `ReplicationFactor`. **CLI:** `--replication-factor`; the `RF` column in `db list`.
 - **Not:** replica count, copies, redundancy.
 
+### Request ID
+
+The identifier of one request, kept from `x-request-id` or made as `<node-id>-<counter>`, carried in the `rpc` span and on the calls a node makes for the request (ADR-0034).
+
+- **Applies to:** daemon.
+- **Code:** `observe::RequestId`, `x-request-id`. **CLI:** none.
+- **Not:** trace ID (until traces are exported), correlation ID.
+
 ### Restore
 
 Building a database from an [archive](#archive) at a *restore point*: its latest point, a [position](#position), or a time (ADR-0029, point 10). A restore starts from a base [snapshot](#snapshot) and applies [segments](#segment), verifying each against the [hash chain](#hash-chain). Online, it creates a new database and never overwrites one; offline, it writes a directory with a plain SQLite database.
@@ -590,6 +615,14 @@ The placement structure over a set of nodes, with a strategy (weighted rendezvou
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::Scope`, `Scopes`. **CLI:** `--scope`, `scopes = […]` in `[[principal]]`.
 - **Not:** permission, grant (a `Grant` is a token's content), role, policy, ACL.
+
+### Scraper
+
+A principal whose client certificate may read `/metrics` on an [admin listener](#admin-listener) with TLS (`[admin] scrapers`). It has no scope on the gRPC port unless a `[[principal]]` entry gives it one (ADR-0034).
+
+- **Applies to:** daemon.
+- **Code:** `AdminConfig::scrapers`. **CLI:** `fleetringd cert client <principal>` issues its certificate.
+- **Not:** collector, exporter, monitor.
 
 ### Segment
 
