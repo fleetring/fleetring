@@ -333,7 +333,7 @@ The set of nodes that one control plane and one certificate authority govern, un
 A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The first is `undrain`.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Feature`, `Action::feature`, `State::features`, `State::check_features`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
+- **Code:** `fleetring_control::Feature`, `Action::feature`, `State::features`, `State::check_features`, `State::check_admission`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
 - **Not:** feature flag (alone), capability, cluster version, finalization.
 
 ### Fleet name

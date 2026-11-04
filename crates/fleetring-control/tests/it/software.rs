@@ -270,6 +270,60 @@ fn the_gate_check_agrees_with_apply() {
     assert_eq!(state.check_features(&undrain), Ok(()));
 }
 
+/// The control node screens commands with `check_admission` before it logs them, so it must
+/// refuse exactly what `apply` refuses for software, joins included, and pass everything else.
+#[test]
+fn the_admission_check_agrees_with_apply() {
+    let mut state = fleet(&[("a", Some(current("0.4.0"))), ("b", None)]);
+    let featureless = Software::new(release("0.4.0"), 1);
+    let cases = [
+        join("far", Some(current("0.5.0"))),
+        join("c", Some(current("0.4.2"))),
+        join("b", None),
+        join("b", Some(current("0.9.0"))),
+        Action::Undrain { id: id("a") },
+        Action::Tick,
+    ];
+    let check = |state: &State| {
+        for action in &cases {
+            let applied = run(&mut state.clone(), 1, action.clone()).map(|_| ());
+            match state.check_admission(action) {
+                Ok(()) => assert!(
+                    !matches!(
+                        applied,
+                        Err(Rejection::IncompatibleVersion { .. }
+                            | Rejection::MissingFeature { .. }
+                            | Rejection::FeatureUnsupported { .. })
+                    ),
+                    "{action:?}: {applied:?}"
+                ),
+                refused => assert_eq!(refused, applied, "{action:?}"),
+            }
+        }
+    };
+    check(&state);
+    assert!(matches!(
+        state.check_admission(&cases[0]),
+        Err(Rejection::IncompatibleVersion { .. })
+    ));
+    // Once a feature is enabled, a join without it is refused, a new member and a rollback alike.
+    run(&mut state, 2, join("b", Some(current("0.4.0")))).expect("b upgraded");
+    run(&mut state, 3, Action::Undrain { id: id("a") }).expect("undrain");
+    check(&state);
+    for node in ["c", "b"] {
+        assert!(matches!(
+            state.check_admission(&join(node, Some(featureless.clone()))),
+            Err(Rejection::MissingFeature { .. })
+        ));
+    }
+    // A heartbeat recorded software a join would refuse; rejoining on it is still admitted.
+    run(&mut state, 4, heartbeat("a", Some(current("0.9.0")))).expect("recorded");
+    assert_eq!(
+        state.check_admission(&join("a", Some(current("0.9.0")))),
+        Ok(())
+    );
+}
+
 #[test]
 fn undraining_a_member_that_is_not_draining_changes_nothing_else() {
     let mut state = fleet(&[("a", Some(current("0.4.0")))]);

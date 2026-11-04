@@ -204,7 +204,7 @@ fn submit_status(error: SubmitError) -> Status {
     match error {
         SubmitError::Stopped => Status::unavailable(error.to_string()),
         SubmitError::Storage(_) => Status::internal(error.to_string()),
-        SubmitError::Unsupported(rejection) => rejection_status(&rejection),
+        SubmitError::Refused(rejection) => rejection_status(&rejection),
     }
 }
 
