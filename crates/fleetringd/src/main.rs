@@ -15,7 +15,7 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Liveness, ReplicaRole};
-use fleetring_control::{KeyId, Millis, Timestamp, TokenId};
+use fleetring_control::{KeyId, Millis, ParseReleaseError, Release, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
 use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIFETIME, Scope};
@@ -36,8 +36,10 @@ use fleetringd::tls::{
     FleetName, Identity, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
+use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, RESTARTS_VAR, Restart};
 use fleetringd::{
     Config, Daemon, LogFormat, MembershipView, Network, NodeRole, ParseLogFormatError, Plaintext,
+    Stop,
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
@@ -127,8 +129,15 @@ enum Command {
     /// Works with archives without a fleet: restores a database from one offline.
     #[command(subcommand)]
     Archive(ArchiveCommand),
-    /// Shows the members with their liveness, the membership epoch, and the ring fingerprint, as
-    /// the control plane sees them; with `--node` or `--address`, as one data node sees them.
+    /// Installs another release of fleetringd in place of this binary, verified with cosign
+    /// against the release workflow's identity and then by checksum, and keeps this one as
+    /// `fleetringd.previous`. With `--config` naming a running node, first checks that the fleet
+    /// allows the release, then drains the node, restarts it in place, and waits until it has
+    /// rejoined and caught up.
+    Upgrade(UpgradeArgs),
+    /// Shows the members with their liveness, release, the membership epoch, and the ring
+    /// fingerprint, as the control plane sees them; with `--node` or `--address`, as one data
+    /// node sees them.
     Status {
         /// Asks this data node instead of the control plane: its membership epoch, ring
         /// fingerprint, and the databases it serves. Its address comes from the control plane's
@@ -142,6 +151,52 @@ enum Command {
         #[command(flatten)]
         target: Target,
     },
+}
+
+/// `fleetringd upgrade`'s flags (ADR-0038).
+#[derive(Debug, Args)]
+struct UpgradeArgs {
+    /// The release to install, such as 0.4.0; the newest final release by default. Naming the
+    /// installed release reinstalls it.
+    #[arg(long, value_parser = parse_release)]
+    version: Option<Release>,
+    /// Reports the installed release, the newest one, and whether the fleet allows it, and
+    /// changes nothing. Exits 1 if a newer release exists that the fleet doesn't allow.
+    #[arg(long, conflicts_with_all = ["rollback", "no_restart"])]
+    check: bool,
+    /// Replaces the binary, but leaves the running node on the release it runs.
+    #[arg(long)]
+    no_restart: bool,
+    /// Swaps the binary with the one the last upgrade replaced, `fleetringd.previous`, and
+    /// restarts the node as an upgrade does. A second rollback rolls forward again.
+    #[arg(long, conflicts_with_all = ["version", "base_url", "releases_url"])]
+    rollback: bool,
+    /// Downloads the release's files from this URL, a mirror's directory for one release as
+    /// `install.sh --base-url` takes it, instead of GitHub. Needs --version.
+    #[arg(long, env = "FLEETRING_BASE_URL", requires = "version")]
+    base_url: Option<String>,
+    /// Reads the list of releases, in the JSON GitHub's API returns, from this URL instead of
+    /// GitHub's, to find the newest release on a mirror.
+    #[arg(long, env = "FLEETRING_RELEASES_URL")]
+    releases_url: Option<String>,
+    /// How long each download, the drain, the rejoin, and the catch-up may take: `<n>m` or
+    /// `<n>s`; 5m by default.
+    #[arg(long, value_parser = parse_ttl)]
+    timeout: Option<Duration>,
+    #[command(flatten)]
+    target: Target,
+}
+
+/// How long each step of an upgrade may take unless `--timeout` says otherwise.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+fn parse_release(text: &str) -> Result<Release, String> {
+    let text = text
+        .strip_prefix("fleetringd-v")
+        .or_else(|| text.strip_prefix('v'))
+        .unwrap_or(text);
+    text.parse()
+        .map_err(|error: ParseReleaseError| error.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -854,12 +909,18 @@ fn main() -> ExitCode {
         }
     };
     let result = match (cli.command, config) {
-        (Some(command), _) => runtime.block_on(run_command(command)),
+        (Some(command), _) => runtime
+            .block_on(run_command(command))
+            .map(|()| Stopped::Exit),
         (None, Some(config)) => runtime.block_on(run_daemon(cli.daemon, config)),
         (None, None) => Err("--config is required".into()),
     };
+    // Every task, connection, and database is closed by now; the runtime's threads go too,
+    // before a restart executes the binary again.
+    runtime.shutdown_timeout(RUNTIME_GRACE);
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Stopped::Restart { exe, restarts }) => restart_in_place(&exe, restarts),
+        Ok(Stopped::Exit) => ExitCode::SUCCESS,
         Err(error) => {
             report(error.as_ref());
             ExitCode::FAILURE
@@ -920,11 +981,58 @@ fn parse_log_format(text: &str) -> Result<LogFormat, String> {
         .map_err(|error: ParseLogFormatError| error.to_string())
 }
 
-async fn run_daemon(args: DaemonArgs, config: Config) -> Result<(), Box<dyn Error>> {
+/// How long the runtime's remaining threads get to finish once the daemon has stopped.
+const RUNTIME_GRACE: Duration = Duration::from_secs(10);
+
+/// Executes `exe`, the binary the daemon started from, with the same arguments, keeping the
+/// process ID, so that systemd, a container, or a terminal sees the same process (ADR-0038).
+/// Returns only if that fails.
+#[cfg(unix)]
+fn restart_in_place(exe: &Path, restarts: u32) -> ExitCode {
+    use std::os::unix::process::CommandExt as _;
+    tracing::info!(exe = %exe.display(), "restarting in place");
+    let error = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(RESTARTS_VAR, restarts.saturating_add(1).to_string())
+        .exec();
+    report(&error);
+    ExitCode::FAILURE
+}
+
+#[cfg(not(unix))]
+fn restart_in_place(_: &Path, _: u32) -> ExitCode {
+    ExitCode::SUCCESS
+}
+
+async fn run_daemon(args: DaemonArgs, config: Config) -> Result<Stopped, Box<dyn Error>> {
     let config = args.apply(config);
+    // Read before an upgrade can replace the file: the path a restart executes again.
+    let exe = std::env::current_exe()?;
+    let data_dir = config.data_dir.clone();
+    // Listened for before the daemon logs its start, so that no signal sent once it has started
+    // finds the default action, which ends the process.
+    let signals = StopSignals::listen();
     let daemon = Daemon::start(config).await?;
-    daemon.run_until(shutdown_signal()).await;
-    Ok(())
+    let process = ProcessFile::this_process(exe.clone());
+    if let Err(error) = process.write(&data_dir) {
+        tracing::warn!(%error, "can't write the process file; `fleetringd upgrade` can't restart this node in place");
+    }
+    let (told, why) = tokio::sync::oneshot::channel();
+    daemon
+        .run_until_stop(async {
+            let stop = signals.next().await;
+            let _unheard = told.send(stop);
+            stop
+        })
+        .await;
+    process.remove(&data_dir);
+    Ok(match why.await {
+        Ok(Stop::Restart) => Stopped::Restart {
+            exe,
+            restarts: process.restarts,
+        },
+        _ => Stopped::Exit,
+    })
 }
 
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
@@ -1095,6 +1203,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
             format_drain(&id, &primaries)
         }
+        Command::Upgrade(args) => run_upgrade(args).await?,
         Command::Node(NodeCommand::Undrain { id, target }) => {
             target.client()?.undrain_node(&id).await.map_err(failed)?;
             format!("{id} is no longer draining; it may take primaries again\n")
@@ -1120,6 +1229,53 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     };
     print!("{output}");
     Ok(())
+}
+
+/// Runs `upgrade` and returns what it prints. A check that finds a newer release the fleet
+/// doesn't allow prints its report and fails.
+async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
+    let mode = if args.rollback {
+        Mode::Rollback
+    } else if args.check {
+        Mode::Check
+    } else {
+        Mode::Install
+    };
+    let node = match &args.target.config {
+        Some(path) => {
+            let config = Config::load(path)?;
+            Some(LocalNode {
+                id: config.node.id.clone(),
+                data_dir: config.data_dir.clone(),
+            })
+        }
+        None => None,
+    };
+    let fleet = if args.target.control.is_some() || args.target.config.is_some() {
+        Some(args.target.client()?)
+    } else {
+        None
+    };
+    let outcome = upgrade::run(Options {
+        mode,
+        restart: if args.no_restart {
+            Restart::No
+        } else {
+            Restart::InPlace
+        },
+        version: args.version,
+        base_url: args.base_url,
+        releases_url: args.releases_url,
+        node,
+        fleet,
+        timeout: args.timeout.unwrap_or(UPGRADE_TIMEOUT),
+    })
+    .await?;
+    if outcome.blocked {
+        print!("{}", outcome.report);
+        return Err("the fleet doesn't allow the newest release yet".into());
+    }
+    Ok(outcome.report)
 }
 
 /// The address of the data node a command asks directly: `address` as given, or the address the
@@ -1953,31 +2109,91 @@ fn report(error: &dyn Error) {
     }
 }
 
-/// Completes on Ctrl-C or, on Unix, SIGTERM.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "can't listen for Ctrl-C");
-        }
-    };
+/// How the process ends once the daemon has stopped.
+#[derive(Debug)]
+enum Stopped {
+    /// It exits.
+    Exit,
+    /// It executes this binary again, restarting in place.
+    Restart {
+        /// The binary the daemon started from.
+        exe: PathBuf,
+        /// How many times the process had restarted in place before.
+        restarts: u32,
+    },
+}
+
+/// The signals that stop the daemon, listened for from the moment this exists: SIGHUP's default
+/// action ends a process, so the listener must be in place before anyone learns the process ID
+/// from the process file.
+struct StopSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    () = ctrl_c => {}
-                    _ = terminate.recv() => {}
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    fn listen() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let listen = |kind, name| match signal(kind) {
+                Ok(signal) => Some(signal),
+                Err(error) => {
+                    tracing::error!(%error, "can't listen for {name}");
+                    None
+                }
+            };
+            Self {
+                interrupt: listen(SignalKind::interrupt(), "SIGINT"),
+                terminate: listen(SignalKind::terminate(), "SIGTERM"),
+                hangup: listen(SignalKind::hangup(), "SIGHUP"),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Completes with [`Stop::AsConfigured`] on Ctrl-C or, on Unix, SIGTERM, and with
+    /// [`Stop::Restart`] on SIGHUP, which restarts the daemon in place (ADR-0038).
+    async fn next(self) -> Stop {
+        #[cfg(unix)]
+        {
+            let Self {
+                interrupt,
+                terminate,
+                hangup,
+            } = self;
+            let received = |signal: Option<tokio::signal::unix::Signal>| async move {
+                match signal {
+                    Some(mut signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = received(interrupt) => Stop::AsConfigured,
+                () = received(terminate) => Stop::AsConfigured,
+                () = received(hangup) => {
+                    tracing::info!("SIGHUP: restarting in place");
+                    Stop::Restart
                 }
             }
-            Err(error) => {
-                tracing::error!(%error, "can't listen for SIGTERM");
-                ctrl_c.await;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(%error, "can't listen for Ctrl-C");
+                std::future::pending::<()>().await;
             }
+            Stop::AsConfigured
         }
     }
-    #[cfg(not(unix))]
-    ctrl_c.await;
 }
 
 #[cfg(test)]

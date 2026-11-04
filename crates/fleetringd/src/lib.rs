@@ -30,6 +30,7 @@ pub mod sim;
 pub mod software;
 pub mod tls;
 pub mod transport;
+pub mod upgrade;
 
 pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
@@ -38,7 +39,7 @@ pub use config::{
     NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext, PrincipalConfig,
     ReplicationConfig, TlsConfig, TokenForwarding,
 };
-pub use daemon::{Daemon, StartError};
+pub use daemon::{Daemon, StartError, Stop};
 pub use data_dir::{DataDir, DataDirError};
 pub use environment::{Environment, Network};
 pub use membership::{
@@ -134,6 +135,14 @@ const _: () = {
     assert_debug_send_sync::<ReplicationConfig>();
     assert_debug_send_sync::<Plaintext>();
     assert_debug_send_sync::<StartError>();
+    assert_debug_send_sync::<Stop>();
+    assert_debug_send_sync::<upgrade::UpgradeError>();
+    assert_debug_send_sync::<upgrade::ProcessFile>();
+    assert_debug_send_sync::<upgrade::Options>();
+    assert_debug_send_sync::<upgrade::Outcome>();
+    assert_debug_send_sync::<upgrade::Mode>();
+    assert_debug_send_sync::<upgrade::Restart>();
+    assert_debug_send_sync::<upgrade::LocalNode>();
     assert_debug_send_sync::<Stored>();
     assert_debug_send_sync::<TlsConfig>();
     assert_debug_send_sync::<tls::Accepted>();

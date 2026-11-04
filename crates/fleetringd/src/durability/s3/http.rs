@@ -25,11 +25,11 @@ use tokio_rustls::client::TlsStream;
 use super::{HttpPolicy, S3ConfigError};
 
 /// The client type the store holds.
-pub(super) type HttpClient = Client<Connector, Full<Bytes>>;
+pub(crate) type HttpClient = Client<Connector, Full<Bytes>>;
 
 /// Builds the client: TLS for `https://` with the platform's roots plus the PEM certificates in
 /// `ca`, and plain TCP for `http://` only under [`HttpPolicy::AllowHttp`].
-pub(super) fn client(ca: Option<&Path>, http: HttpPolicy) -> Result<HttpClient, S3ConfigError> {
+pub(crate) fn client(ca: Option<&Path>, http: HttpPolicy) -> Result<HttpClient, S3ConfigError> {
     let mut roots = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for error in &native.errors {
@@ -72,7 +72,7 @@ pub(super) fn client(ca: Option<&Path>, http: HttpPolicy) -> Result<HttpClient, 
 
 /// Dials a request's host: TLS for `https://`, plain TCP for `http://` when allowed.
 #[derive(Clone)]
-pub(super) struct Connector {
+pub(crate) struct Connector {
     tls: TlsConnector,
     http: HttpPolicy,
 }
@@ -128,7 +128,7 @@ impl tower::Service<Uri> for Connector {
 
 /// A connection to the store: plain TCP or TLS over it.
 #[derive(Debug)]
-pub(super) enum Stream {
+pub(crate) enum Stream {
     Plain(TokioIo<TcpStream>),
     Tls(Box<TokioIo<TlsStream<TcpStream>>>),
 }
