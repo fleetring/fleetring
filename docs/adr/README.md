@@ -43,6 +43,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0032](0032-fleet-replaces-cluster.md) | "Fleet" replaces "cluster" for the nodes one control plane and one authority govern, as a clean break in 0.3.0 with no aliases | Proposed |
 | [0033](0033-cli-tui-desktop-surfaces.md) | The CLI, a TUI, and a desktop app are separate surfaces over one client crate, with the same RPCs and the same lexicon | Proposed |
 | [0034](0034-metrics-health-and-logs.md) | Metrics, health, and readiness on a separate admin listener, with bounded labels and a span per request | Proposed |
+| [0035](0035-raft-control-group.md) | The control log is replicated by a Raft control group on openraft, with one code path from one voter to five | Proposed |
 
 ## Template
 
