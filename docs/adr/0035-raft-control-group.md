@@ -1,6 +1,6 @@
 # ADR-0035: The control log is replicated by a Raft control group on openraft, with one code path from one voter to five
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-03
 - **Related:** ADR-0017 (resolves its "Adding Raft later"), ADR-0018, ADR-0019, ADR-0020, ADR-0022 (extends point 6), ADR-0025, ADR-0026, ADR-0031; tickets FR-064
 

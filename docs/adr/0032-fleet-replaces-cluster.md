@@ -1,6 +1,6 @@
 # ADR-0032: "Fleet" replaces "cluster" for the nodes one control plane and one authority govern
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-03
 - **Related:** ADR-0006 (topology), ADR-0012 (cells), ADR-0017 (control plane), ADR-0025 and ADR-0026 (principals and scopes), ADR-0033 (surfaces); tickets FR-054, FR-056, FR-059; [lexicon](../lexicon.md)
 

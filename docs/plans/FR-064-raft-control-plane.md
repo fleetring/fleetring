@@ -679,6 +679,16 @@ ADR-0020's rules hold: one seed drives turmoil, the workload, and now openraft's
 - `docs/adr/README.md`: ADR-0035's status once accepted; `docs/adr/0017-control-state-machine.md`: a status note "Adding Raft later: resolved by ADR-0035" (status line only, per the README's rules).
 - This plan's Progress section.
 
+## Owner decisions (2026-11-03)
+
+The open questions this plan raised were decided as recommended:
+
+- A control node waiting to join trusts any node certificate of the fleet until it is added. Accepted and documented; certificates that mark a node as a control node are a follow-up ticket.
+- The protocol minor version: whichever of FR-064 and FR-066 lands first takes 1.1, the other 1.2.
+- `set-voters` may shrink the group to one voter, with a CLI warning.
+- Control-group scenarios add at most 3 minutes to the fixed-seed simulation job; heavy scenarios run on one seed there, and the nightly sweep covers the rest.
+- `commands_v1` is kept in 0.4 and dropped or compacted in the release after.
+
 ## Open risks
 
 - **openraft's API between 0.9 patch releases.** The plan pins one 0.9.x with `=`. openraft 0.10 changes storage and runtime traits; upgrading is its own ticket.

@@ -811,6 +811,14 @@ Do this step only once FR-064 (#67) has merged; FR-065 is complete without it.
 
 Covered by step 10: the harness README, `CONTRIBUTING.md`, `docs/roadmap.md`, and the lexicon. `docs/adr/README.md` lists ADR-0036 with the plan's branch; its status moves to Accepted when the owner accepts it. `SECURITY.md` doesn't change: the harness adds no surface to the daemon.
 
+## Owner decisions (2026-11-03)
+
+The open questions this plan raised were decided as recommended:
+
+- Failing nightly runs don't file issues automatically: the job summary and artifacts are enough, and issues are filed by hand.
+- Clock skew is injected on the control node only in v1; data-node and control-group skew come with FR-064.
+- If `libfaketime` doesn't move Rust's clock in containers, fall back to `unshare --time`, recorded as an amendment to ADR-0036, not a clock hook in the daemon.
+
 ## Open risks
 
 - **`libfaketime` and Rust's clock calls.** Rust's `SystemTime::now` calls glibc's `clock_gettime`, which `libfaketime` intercepts when preloaded, but glibc may answer through the vDSO without the symbol lookup in some builds. Step 6's skew must be confirmed working on the first real run: the control node's logged command stamps (`RUST_LOG=fleetringd::control=debug` in a local run) must move by the offset. If they don't, the fallback is to skew the container's clock namespace with `unshare --time` from the harness, which needs no daemon change either; record the switch in ADR-0036 as an amendment.

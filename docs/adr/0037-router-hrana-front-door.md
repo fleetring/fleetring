@@ -1,6 +1,6 @@
 # ADR-0037: The router is a Hrana-over-HTTP front door that authenticates each request and runs it in a session on its database's primary
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-03)
 - **Date:** 2026-11-03
 - **Related:** ADR-0016 (engine adapters), ADR-0018 (leases, epochs, quorums), ADR-0019 (gRPC; the `Database` service is v0.1-only), ADR-0023 (durability), ADR-0025 (principals and scopes), ADR-0026 (amends point 4), ADR-0031 (node calls bound to placement), ADR-0033 (surfaces); tickets FR-061, FR-066
 
