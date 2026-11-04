@@ -547,7 +547,7 @@ message RestoreLatest {}
 // What a restore rebuilds.
 message RestorePoint {
   oneof point {
-    // The furthest point the archive holds.
+    // The furthest point a walk of the archive's segments reaches, preferring the newest epoch.
     RestoreLatest latest = 1;
     // Exactly the log up to a position, which must be a transaction boundary.
     bytes position = 2;
