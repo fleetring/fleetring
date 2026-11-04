@@ -437,7 +437,7 @@ The right of one node to write one database at one lease epoch, granted and rene
 A member removing itself from the fleet's membership, as a node does when it shuts down with `on_shutdown = "leave"`. An operator with the fleet scope makes the same call to remove another member.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Control.Leave`. **CLI:** `on_shutdown = "leave"`; "left the fleet" in logs. No command removes another member yet; when one is added, it is `fleetringd node remove <node-id>`.
+- **Code:** `Control.Leave`, `Client::remove_node`. **CLI:** `on_shutdown = "leave"`; "left the fleet" in logs; `fleetringd node remove <node-id>` removes another member, refusing a live one unless `--force`.
 - **Not:** depart, departure (FR-038's title keeps it), decommission, deregister, kick.
 
 ### Liveness
@@ -725,7 +725,7 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 Moving a node to another [release](#release): verify the release's signature and checksum, swap the binary atomically, and restart the node in place after a [drain](#drain), within the fleet's window of release lines (ADR-0038). A *rolling upgrade* moves a fleet one node at a time.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetringd upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`; `SIGHUP` restarts a daemon in place.
+- **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetringd upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`, `--software`; `SIGHUP` restarts a daemon in place.
 - **Not:** update, self-update, patch (a patch is one kind of release).
 
 ### Weight
