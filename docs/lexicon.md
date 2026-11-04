@@ -93,10 +93,10 @@ Where a node is dialed: `host:port`, or the IP addresses and DNS names its certi
 
 ### Archive
 
-A database's history kept for recovery: a physical [change stream](#change-stream) plus base [snapshots](#snapshot), written as immutable objects to an object store, with point-in-time restore (ADR-0029). Separate from replicas: replicas give availability, an archive gives recovery. *Planned* (FR-049).
+A database's history kept for recovery: a physical [change stream](#change-stream) plus base [snapshots](#snapshot), written as immutable objects to an object store, with point-in-time [restore](#restore) (ADR-0029, FR-049). Separate from replicas: replicas give availability, an archive gives recovery. Its objects are [segments](#segment), and each base snapshot's *chunks* and *descriptor*; an object's name is its *object key* ([key](#key)).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `[[archive]]` in config, `ObjectStore`, `S3Store`. **CLI:** *planned*.
+- **Code:** `[[archive]]` in config, `durability::Archive`, `ArchiveConfig`, `ArchiveKeys`, `ObjectStore`, `S3Store`, `DirectoryStore`, `MemoryStore`. **CLI:** `--archive <name>` on `db restore`, `db archive show`, `db archive verify`, and `archive restore`.
 - **Not:** backup (as the mechanism's name), dump, export, durability sink. ADR-0016, point 3, says "durability sink" for the same idea; the ADR is accepted and keeps its words, and everything else says archive.
 
 ### Audit line
@@ -559,6 +559,14 @@ R: how many replicas a database has, the primary included. A replica set with fe
 - **Code:** `ReplicationFactor`. **CLI:** `--replication-factor`; the `RF` column in `db list`.
 - **Not:** replica count, copies, redundancy.
 
+### Restore
+
+Building a database from an [archive](#archive) at a *restore point*: its latest point, a [position](#position), or a time (ADR-0029, point 10). A restore starts from a base [snapshot](#snapshot) and applies [segments](#segment), verifying each against the [hash chain](#hash-chain). Online, it creates a new database and never overwrites one; offline, it writes a directory with a plain SQLite database.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `durability::restore_into`, `RestoreTarget`, `Restored`, `RestorePlan`; protocol `Database.Restore`, `RestorePoint`. **CLI:** `db restore`, `archive restore`, `--at-position`, `--at-time`.
+- **Not:** recover (that is what a failover does), import, rollback, rewind.
+
 ### Ring
 
 The placement structure over a set of nodes, with a strategy (weighted rendezvous by default, or a vnode ring), a seed, and a fingerprint. One per cell; one per fleet when there are no cells.
@@ -585,10 +593,10 @@ The placement structure over a set of nodes, with a strategy (weighted rendezvou
 
 ### Segment
 
-One immutable archive object holding a run of delivered batches between two positions (ADR-0029).
+One immutable archive object holding a run of delivered batches between two positions (ADR-0029): one delivery of an archive's change stream, with the hash chain at both ends.
 
-- **Applies to:** daemon.
-- **Code:** *planned*. **CLI:** *planned*.
+- **Applies to:** daemon, CLI.
+- **Code:** `durability::SegmentName`, `SegmentHeader`, `encode_segment`; objects under `<prefix>/<db>/segments/`. **CLI:** `segments` in `db archive show` and in a restore's report.
 - **Not:** WAL file, log file, chunk, part.
 
 ### Sink
@@ -604,7 +612,7 @@ Where a [change stream](#change-stream) delivers: a `file`, a `webhook`, or an a
 A consistent copy of state at one point. Always say which: a *database snapshot* seeds or re-seeds a replica (FR-032); a *base snapshot* starts an archive's restore chain (ADR-0029); a *control snapshot* compacts the control log. The leases a node holds when a `WatchLeases` stream opens aren't a snapshot; they are its *held leases*.
 
 - **Applies to:** daemon, UI.
-- **Code:** `engine::DatabaseSnapshot`, `Replication.Snapshot` (whose messages, `SnapshotRequest` and `SnapshotChunk`, only ever carry a database snapshot); the control log's `snapshots` table and its "control snapshot" errors; protocol `HeldLeases` for the leases. **CLI:** none yet.
+- **Code:** `engine::DatabaseSnapshot`, `Replication.Snapshot` (whose messages, `SnapshotRequest` and `SnapshotChunk`, only ever carry a database snapshot); `durability::SnapshotDescriptor`, `SnapshotEntry`, and protocol `ArchivedSnapshot` for base snapshots; the control log's `snapshots` table and its "control snapshot" errors; protocol `HeldLeases` for the leases. **CLI:** `snapshots` in `db archive show`, and `snapshot` in a restore's report, both base snapshots.
 - **Not:** backup, dump, image, checkpoint.
 
 ### Spec
