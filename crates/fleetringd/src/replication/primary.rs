@@ -1015,21 +1015,11 @@ async fn load_chain(
                     Some(EngineError::InvalidPosition { .. })
                 ) =>
             {
-                LogRead::Restarted(
-                    handle
-                        .committed_since(None)
-                        .await
-                        .map_err(|error| error.to_string())?,
-                )
+                LogRead::Restarted(log_from_its_start(handle).await?)
             }
             Err(error) => return Err(error.to_string()),
         },
-        None => LogRead::Restarted(
-            handle
-                .committed_since(None)
-                .await
-                .map_err(|error| error.to_string())?,
-        ),
+        None => LogRead::Restarted(log_from_its_start(handle).await?),
     };
     let recovered = chain::recover(engine, recorded, position.as_ref(), read)
         .map_err(|error| error.to_string())?;
@@ -1041,6 +1031,24 @@ async fn load_chain(
         tracing::info!(database = %primary.name, anchor = ?chain.anchor().position(), "no chain record fits the log; the chain is derived from where the log begins");
     }
     Ok(chain)
+}
+
+/// The current log as a chain derived from where it begins hashes it: read back from the batch's
+/// own start, as [`verify`] reads it, so that bytes before that position, such as a generation's
+/// header, are in neither.
+async fn log_from_its_start(handle: &DatabaseHandle) -> Result<Option<FrameBatch>, String> {
+    let Some(whole) = handle
+        .committed_since(None)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let tail = handle
+        .committed_since(Some(whole.start.clone()))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(tail.or(Some(whole)))
 }
 
 /// Reports the chain at `at`, or at the log's end, recomputed from the log on disk.
