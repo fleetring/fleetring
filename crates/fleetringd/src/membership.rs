@@ -58,6 +58,25 @@ const STALE_REPLIES: u32 = 2;
 /// lasts.
 const STALLED_HEARTBEATS: u32 = 3;
 
+/// The least time a join, a heartbeat, or the opening of the membership stream waits for an
+/// answer, however short the heartbeat interval is.
+///
+/// Each of them is one logged command (or a read beside one) and a reply, and the control node
+/// syncs its log before it answers. On a loaded machine a sync outlasts a test-sized interval:
+/// 50 ms is shorter than one on a busy Windows runner. A call given up at the interval costs the
+/// control node nothing, since it logs the command either way, but its answer is thrown away, so
+/// a node whose every call takes longer than its interval hears nothing: no denylist, no
+/// membership change, for as long as the slowness lasts. Half a second is ten of the shortest
+/// intervals the tests use and shorter than any interval a deployment would pick (the default is
+/// one second), so a stalled connection is still noticed within a few heartbeats.
+const REPLY_FLOOR: Duration = Duration::from_millis(500);
+
+/// How long a join, a heartbeat, or the opening of the membership stream waits for the control
+/// plane's answer: the heartbeat `interval`, but never less than [`REPLY_FLOOR`].
+fn reply_limit(interval: Duration) -> Duration {
+    interval.max(REPLY_FLOOR)
+}
+
 /// The membership one node knows: the epoch, the members with their liveness, and the ring.
 ///
 /// Views are immutable; a change publishes a new one.
@@ -189,6 +208,7 @@ impl Membership {
                 member,
                 client: client.clone(),
                 interval,
+                limit: reply_limit(interval),
                 databases: Box::new(databases),
                 unknown: std::collections::BTreeSet::new(),
                 denylist: membership.denylist.clone(),
@@ -591,6 +611,8 @@ struct Heartbeats {
     member: Member,
     client: ControlClient,
     interval: Duration,
+    /// How long a join or heartbeat waits for its answer; see [`reply_limit`].
+    limit: Duration,
     databases: Box<dyn DatabaseStatuses>,
     /// The reported databases the control plane said it doesn't know, as of the last reply.
     unknown: std::collections::BTreeSet<String>,
@@ -606,7 +628,7 @@ impl Heartbeats {
             node_id: id.to_owned(),
             databases: self.databases.statuses(),
         };
-        let result = timeout(self.interval, self.client.heartbeat(request)).await;
+        let result = timeout(self.limit, self.client.heartbeat(request)).await;
         if let Ok(Ok(response)) = &result {
             let unknown: std::collections::BTreeSet<String> =
                 response.unknown_databases.iter().cloned().collect();
@@ -644,7 +666,7 @@ async fn heartbeat_loop(
     loop {
         ticks.tick().await;
         if !joined {
-            match timeout(interval, heartbeats.client.join(join.clone())).await {
+            match timeout(heartbeats.limit, heartbeats.client.join(join.clone())).await {
                 Ok(Ok(response)) => {
                     tracing::info!(node = %id, epoch = response.membership_epoch, "joined the fleet");
                     heartbeats
@@ -737,7 +759,8 @@ async fn watch_loop(
         // Ask for the whole membership every time, so a reopened stream starts with the current
         // liveness too.
         let request = WatchMembershipRequest { after_epoch: 0 };
-        let reopen_now = match timeout(interval, client.watch_membership(request)).await {
+        let opened = timeout(reply_limit(interval), client.watch_membership(request)).await;
+        let reopen_now = match opened {
             Ok(Ok(mut stream)) => loop {
                 tokio::select! {
                     biased;
@@ -913,5 +936,14 @@ mod tests {
         drop(publisher);
         assert_eq!(membership.changed().await.map(|_| ()), Some(()));
         assert!(membership.changed().await.is_none());
+    }
+
+    #[test]
+    fn a_call_waits_for_an_answer_at_least_the_floor() {
+        let limit = |millis| reply_limit(Duration::from_millis(millis));
+        assert_eq!(limit(1), REPLY_FLOOR);
+        assert_eq!(limit(50), REPLY_FLOOR);
+        assert_eq!(limit(500), REPLY_FLOOR);
+        assert_eq!(limit(1_000), Duration::from_secs(1));
     }
 }

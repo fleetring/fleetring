@@ -65,6 +65,6 @@ harness = false
 divan.workspace = true
 hyper = { version = "1", features = ["server", "http1"] }
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "test-util"] }
 tokio-stream = "0.1"
 
