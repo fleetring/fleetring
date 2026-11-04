@@ -1,0 +1,50 @@
+# Rebuild fleetring.dev when something it shows changes here. The site reads the latest releases,
+# docs/capabilities.json and docs/lexicon.md when it builds, so a new release or a change to either
+# file only needs a fresh build: this job POSTs to the site's Cloudflare Workers Builds deploy
+# hook. The hook URL is the repository secret SITE_DEPLOY_HOOK; without it the job does nothing.
+#
+# The release workflow creates each fleetringd release with GITHUB_TOKEN, which triggers no
+# `release` event, so its completion is watched through `workflow_run`. A release published by
+# hand (the crate's) arrives as `release`.
+name: Site
+
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - docs/capabilities.json
+      - docs/lexicon.md
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: site-deploy-hook
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    name: rebuild fleetring.dev
+    # a Release run from a tag that succeeded; manual dry runs publish nothing, so they skip
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: call the deploy hook
+        env:
+          HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "SITE_DEPLOY_HOOK is not set; skipping the site rebuild."
+            exit 0
+          fi
+          curl --fail --silent --show-error --max-time 30 --retry 3 --retry-all-errors \
+            --request POST --output /dev/null "$HOOK"
+          echo "Asked Cloudflare to rebuild fleetring.dev."
