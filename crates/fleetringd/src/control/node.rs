@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
 use crate::control::log::{CommandLog, LogError, LogIndex, Recovered};
+use crate::observe::ControlMetrics;
+use crate::observe::codes::action_label;
 
 /// How many commands the control node applies between snapshots, by default.
 const DEFAULT_SNAPSHOT_EVERY: NonZeroU64 = NonZeroU64::new(1_000).expect("1000 is nonzero");
@@ -215,6 +217,21 @@ impl ControlHandle {
     pub fn watch(&self) -> watch::Receiver<Arc<State>> {
         self.state.clone()
     }
+
+    /// Whether the writer still takes commands: `false` once it stopped, after a shutdown or a
+    /// storage failure.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.mailbox.is_closed()
+    }
+
+    /// How many commands wait for the writer.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.mailbox
+            .max_capacity()
+            .saturating_sub(self.mailbox.capacity())
+    }
 }
 
 /// A running control node: its writer and a handle to it.
@@ -246,12 +263,27 @@ impl ControlNode {
         options: ControlOptions,
         clock: impl Clock + 'static,
     ) -> Result<Self, OpenError> {
+        Self::open_with_metrics(path, options, clock, ControlMetrics::default()).await
+    }
+
+    /// Opens the control node as [`ControlNode::open`] does, counting every command it logs in
+    /// `metrics`, and timing every group's write.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError`] if the log can't be opened or recovered, or the writer can't start.
+    pub(crate) async fn open_with_metrics(
+        path: impl Into<PathBuf>,
+        options: ControlOptions,
+        clock: impl Clock + 'static,
+        metrics: ControlMetrics,
+    ) -> Result<Self, OpenError> {
         let path = path.into();
         let clock: Box<dyn Clock> = Box::new(clock);
         let (mailbox, inbox) = mpsc::channel(options.mailbox.get());
         match options.storage_io {
             StorageIo::Inline => {
-                let (writer, state, recovered) = Writer::open(path, options, clock)?;
+                let (writer, state, recovered) = Writer::open(path, options, clock, metrics)?;
                 tokio::spawn(async move { writer.run(inbox).await });
                 Ok(Self::started(mailbox, state, recovered))
             }
@@ -259,7 +291,7 @@ impl ControlNode {
                 let (ready, opened) = oneshot::channel();
                 thread::Builder::new()
                     .name("fleetring-control".into())
-                    .spawn(move || match Writer::open(path, options, clock) {
+                    .spawn(move || match Writer::open(path, options, clock, metrics) {
                         Ok((writer, state, recovered)) => {
                             if ready.send(Ok((state, recovered))).is_ok() {
                                 writer.run_blocking(inbox);
@@ -326,6 +358,7 @@ struct Writer {
     snapshot_every: NonZeroU64,
     clock: Box<dyn Clock>,
     publish: watch::Sender<Arc<State>>,
+    metrics: ControlMetrics,
 }
 
 /// What the writer does after handling one piece of mail.
@@ -339,6 +372,7 @@ impl Writer {
         path: PathBuf,
         options: ControlOptions,
         clock: Box<dyn Clock>,
+        metrics: ControlMetrics,
     ) -> Result<(Self, watch::Receiver<Arc<State>>, RecoverySummary), OpenError> {
         let log = CommandLog::open(path, options.config)?;
         if log.genesis() != options.config {
@@ -367,7 +401,11 @@ impl Writer {
             snapshot_every: options.snapshot_every,
             clock,
             publish,
+            metrics,
         };
+        writer
+            .metrics
+            .recovered(last_index.get(), snapshot.map_or(0, LogIndex::get));
         Ok((writer, watcher, summary))
     }
 
@@ -436,11 +474,17 @@ impl Writer {
             commands.push((index, Command::new(self.clock.now(), action)));
             replies.push(reply);
         }
-        if !commands.is_empty()
-            && let Err(error) = self
-                .log
+        let started = tokio::time::Instant::now();
+        let written = if commands.is_empty() {
+            Ok(())
+        } else {
+            self.log
                 .append_all(commands.iter().map(|(index, command)| (*index, command)))
-        {
+        };
+        if !commands.is_empty() && written.is_ok() {
+            self.metrics.log_written(started.elapsed());
+        }
+        if let Err(error) = written {
             tracing::error!(error = %error, "control log write failed; stopping the writer");
             // The first waiter learns why; the rest see the writer stop.
             if let Some(reply) = replies.into_iter().next() {
@@ -464,7 +508,14 @@ impl Writer {
     /// Applies the command logged at `index`, publishes the state, and snapshots when one is due.
     fn apply_logged(&mut self, index: LogIndex, command: Command) -> Committed {
         self.last_index = index;
+        let action = action_label(&command.action);
         let outcome = apply(&mut self.state, command.clone());
+        let label = if outcome.is_ok() {
+            "applied"
+        } else {
+            "rejected"
+        };
+        self.metrics.command(index.get(), action, label);
         let state = if outcome.is_ok() {
             let state = Arc::new(self.state.clone());
             self.publish.send_replace(Arc::clone(&state));
@@ -475,7 +526,10 @@ impl Writer {
         };
         if index.get().is_multiple_of(self.snapshot_every.get()) {
             match self.log.save_snapshot(index, &self.state) {
-                Ok(()) => tracing::debug!(index = index.get(), "control snapshot saved"),
+                Ok(()) => {
+                    self.metrics.snapshot_saved(index.get());
+                    tracing::debug!(index = index.get(), "control snapshot saved");
+                }
                 // The log alone still recovers everything; the next snapshot tries again.
                 Err(error) => tracing::warn!(error = %error, "can't save a control snapshot"),
             }

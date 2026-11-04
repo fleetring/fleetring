@@ -21,6 +21,7 @@ pub mod engine;
 mod environment;
 mod layout;
 mod membership;
+pub mod observe;
 mod publisher;
 mod registry;
 pub mod replication;
@@ -31,8 +32,9 @@ pub mod transport;
 
 pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
-    Config, ConfigError, ControlSettings, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION,
-    MembershipSettings, NodeConfig, NodeRole, OnShutdown, Plaintext, PrincipalConfig,
+    AdminConfig, AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, ControlSettings,
+    HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LogConfig, LogFormat, MembershipSettings,
+    NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext, PrincipalConfig,
     ReplicationConfig, TlsConfig, TokenForwarding,
 };
 pub use daemon::{Daemon, StartError};
@@ -50,6 +52,13 @@ pub use registry::Registry;
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
+    assert_debug_send_sync::<AdminConfig>();
+    assert_debug_send_sync::<AdminListener>();
+    assert_debug_send_sync::<AdminPlaintext>();
+    assert_debug_send_sync::<AdminTls>();
+    assert_debug_send_sync::<LogConfig>();
+    assert_debug_send_sync::<LogFormat>();
+    assert_debug_send_sync::<ParseLogFormatError>();
     assert_debug_send_sync::<auth::Action>();
     assert_debug_send_sync::<auth::BearerToken>();
     assert_debug_send_sync::<auth::Binding>();
@@ -110,6 +119,16 @@ const _: () = {
     assert_debug_send_sync::<MembershipSettings>();
     assert_debug_send_sync::<MembershipTasks>();
     assert_debug_send_sync::<MembershipView>();
+    assert_debug_send_sync::<observe::ChangeMetrics>();
+    assert_debug_send_sync::<observe::ControlMetrics>();
+    assert_debug_send_sync::<observe::FamilySpec>();
+    assert_debug_send_sync::<observe::Kind>();
+    assert_debug_send_sync::<observe::MembershipMetrics>();
+    assert_debug_send_sync::<observe::Metrics>();
+    assert_debug_send_sync::<observe::NodeInfo>();
+    assert_debug_send_sync::<observe::ReplicationMetrics>();
+    assert_debug_send_sync::<observe::RequestId>();
+    assert_debug_send_sync::<observe::TraceLayer>();
     assert_debug_send_sync::<OnShutdown>();
     assert_debug_send_sync::<ReplicationConfig>();
     assert_debug_send_sync::<Plaintext>();

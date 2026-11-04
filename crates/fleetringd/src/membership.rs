@@ -46,6 +46,7 @@ use tonic::{Code, Status};
 use crate::auth::Denylist;
 use crate::control::{ControlClient, member_from, node_to_proto};
 use crate::data::convert::revocations_from_proto;
+use crate::observe::MembershipMetrics;
 use crate::{MembershipSettings, OnShutdown};
 
 /// How many heartbeat replies in a row may report a later membership epoch than the published one
@@ -199,6 +200,24 @@ impl Membership {
         settings: &MembershipSettings,
         databases: impl DatabaseStatuses,
     ) -> (Self, MembershipTasks) {
+        Self::start_observed(
+            member,
+            client,
+            settings,
+            databases,
+            MembershipMetrics::default(),
+        )
+    }
+
+    /// Starts membership as [`Membership::start_reporting`] does, counting and timing every
+    /// heartbeat in `metrics`.
+    pub(crate) fn start_observed(
+        member: Member,
+        client: ControlClient,
+        settings: &MembershipSettings,
+        databases: impl DatabaseStatuses,
+        metrics: MembershipMetrics,
+    ) -> (Self, MembershipTasks) {
         let (membership, publisher) = Self::unstarted();
         let interval = settings.heartbeat_interval();
         let id = member.id().to_string();
@@ -212,6 +231,7 @@ impl Membership {
                 databases: Box::new(databases),
                 unknown: std::collections::BTreeSet::new(),
                 denylist: membership.denylist.clone(),
+                metrics,
             },
             Arc::clone(&resubscribe),
             membership.updates.clone(),
@@ -618,6 +638,8 @@ struct Heartbeats {
     unknown: std::collections::BTreeSet<String>,
     /// Where each reply's denylist goes.
     denylist: Denylist,
+    /// Where heartbeats are counted and timed.
+    metrics: MembershipMetrics,
 }
 
 impl Heartbeats {
@@ -628,7 +650,12 @@ impl Heartbeats {
             node_id: id.to_owned(),
             databases: self.databases.statuses(),
         };
+        let sent = tokio::time::Instant::now();
         let result = timeout(self.limit, self.client.heartbeat(request)).await;
+        match &result {
+            Ok(Ok(_)) => self.metrics.recorded(sent.elapsed()),
+            _ => self.metrics.failed(),
+        }
         if let Ok(Ok(response)) = &result {
             let unknown: std::collections::BTreeSet<String> =
                 response.unknown_databases.iter().cloned().collect();

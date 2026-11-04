@@ -20,10 +20,12 @@ fleetring = { path = "../fleetring", features = ["serde"] }
 fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
 fleetring-proto = { version = "0.0.0", path = "../fleetring-proto" }
 fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }
+http-body = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+prometheus-client = "0.25"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ring = "0.17"
 rusqlite = { workspace = true, features = ["functions", "hooks"] }
@@ -41,7 +43,7 @@ toml = "1.1.8"
 tonic = "0.14"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 turmoil = { version = "0.7", optional = true }

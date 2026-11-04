@@ -27,6 +27,9 @@ const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// The ALPN protocol every connection negotiates.
 const ALPN_H2: &[u8] = b"h2";
 
+/// The ALPN protocol the admin listener negotiates (ADR-0034).
+const ALPN_HTTP1: &[u8] = b"http/1.1";
+
 /// The error returned when an identity can't be loaded.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -101,6 +104,9 @@ pub(crate) struct Loaded {
     subject: SubjectUri,
     peer: Peer,
     server: Arc<ServerConfig>,
+    /// The admin listener's: the same certificate, asking for a client certificate without
+    /// requiring one, over HTTP/1.1.
+    admin_server: Arc<ServerConfig>,
     client: Arc<ClientConfig>,
     /// The trusted authorities' Ed25519 keys, which sign the bearer tokens nodes accept.
     token_keys: Vec<VerifyingKey>,
@@ -147,6 +153,15 @@ impl Loaded {
             .with_client_cert_verifier(verifier)
             .with_single_cert(chain.clone(), private_key.clone_key())?;
         server.alpn_protocols = vec![ALPN_H2.to_vec()];
+        let admin_verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::clone(&roots), provider())
+                .allow_unauthenticated()
+                .build()?;
+        let mut admin_server = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(admin_verifier)
+            .with_single_cert(chain.clone(), private_key.clone_key())?;
+        admin_server.alpn_protocols = vec![ALPN_HTTP1.to_vec()];
         let mut client = ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_root_certificates(Arc::clone(&roots))
@@ -156,6 +171,7 @@ impl Loaded {
             subject,
             peer,
             server: Arc::new(server),
+            admin_server: Arc::new(admin_server),
             client: Arc::new(client),
             token_keys,
             stamp,
@@ -178,6 +194,10 @@ impl Loaded {
 
     pub(crate) fn server_config(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.server)
+    }
+
+    pub(crate) fn admin_server_config(&self) -> Arc<ServerConfig> {
+        Arc::clone(&self.admin_server)
     }
 
     pub(crate) fn client_config(&self) -> Arc<ClientConfig> {

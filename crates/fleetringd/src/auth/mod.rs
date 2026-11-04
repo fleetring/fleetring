@@ -14,6 +14,7 @@ mod scope;
 mod token;
 
 pub use binding::{BINDING_KEY, Binding, BindingDenied, Unbound, refused_binding};
+pub(crate) use boundary::Refusal;
 pub use boundary::{
     AUTHORIZATION, AuthLayer, AuthService, Authorized, Authorizer, BoxStream, STREAM_RECHECK,
     authorized, require_database,

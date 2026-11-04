@@ -676,6 +676,7 @@ impl Follow {
                     };
                     let reply = match applied {
                         Applied::Done(Ok(end), links) => {
+                            inner.metrics.batch_applied();
                             let log_start = returned.log_start();
                             follower = Some(returned);
                             position = Some(end);

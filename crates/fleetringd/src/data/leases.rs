@@ -120,6 +120,7 @@ mod tests {
             execution: Execution::Inline,
             state_dir: dir.join("state"),
             settings: ReplicationSettings::new(),
+            metrics: crate::observe::ReplicationMetrics::default(),
         };
         Replication::start(parts, |sink| {
             Registry::new(engine, sink, dir.join("databases"), EngineConfig::new())

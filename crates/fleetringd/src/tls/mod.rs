@@ -28,6 +28,7 @@ pub use authority::{
     DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME, Issued, Validity,
 };
 pub use conn::{Accepted, Conn, HandshakeError, Raw};
+pub(crate) use conn::{HANDSHAKE_TIMEOUT, peer_of};
 pub use identity::{Identity, IdentityError};
 pub use names::{FleetName, NameError, Principal, SubjectUri};
 

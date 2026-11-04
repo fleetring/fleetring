@@ -1339,6 +1339,7 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
             }
             let Shipped { batch, chain } = shipped;
             let end = batch.end.clone();
+            let bytes = batch.payload.len();
             let shipped = message(Message::Batch(proto::Batch {
                 epoch: primary.role.epoch.get(),
                 start: sent.clone().map(Position::into_bytes).unwrap_or_default(),
@@ -1349,6 +1350,7 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
             if outgoing.send(shipped).await.is_err() {
                 return stream_failed("stream closed");
             }
+            inner.metrics.batch_sent(bytes);
             sent = Some(end.clone());
             in_flight.push_back(end);
         }
@@ -1461,6 +1463,7 @@ async fn reseed(
     in_flight: usize,
 ) -> StreamEnd {
     primary.needs_snapshot(node);
+    inner.metrics.reseed();
     tracing::info!(database = %primary.name, follower = %node, "the log can't catch the follower up; re-seeding it from a snapshot");
     let request = message(Message::Reseed(proto::Reseed {
         epoch: primary.role.epoch.get(),

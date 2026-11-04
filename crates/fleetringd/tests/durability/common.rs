@@ -141,6 +141,7 @@ impl Node {
                 retry_initial: Duration::from_millis(10),
                 retry_max: Duration::from_millis(100),
             },
+            metrics: fleetringd::observe::ChangeMetrics::default(),
         }));
     }
 
@@ -254,6 +255,7 @@ pub(crate) fn start_replication(
                 retry_interval: Duration::from_millis(50),
                 ..ReplicationSettings::new()
             },
+            metrics: fleetringd::observe::ReplicationMetrics::default(),
         },
         move |sink| Registry::new(registry_engine, sink, databases, config),
     )

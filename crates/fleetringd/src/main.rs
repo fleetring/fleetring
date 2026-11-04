@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Acks, DatabaseName, Liveness, ReplicaRole};
 use fleetring_control::{KeyId, Millis, Timestamp, TokenId};
@@ -28,15 +29,19 @@ use fleetringd::durability::{
     ArchiveKeys, RestoreTarget, build_store, finish_offline, restore_into,
 };
 use fleetringd::engine::{Execution, Position, Rows, SqliteEngine, Statement, Value};
+use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
     FleetName, Identity, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
-use fleetringd::{Config, Daemon, MembershipView, Network, NodeRole, Plaintext};
+use fleetringd::{
+    Config, Daemon, LogFormat, MembershipView, Network, NodeRole, ParseLogFormatError, Plaintext,
+};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// The environment variable that names a directory with `ca.crt`, `client.crt`, and
 /// `client.key`, and the `client.<principal>.crt` and `.key` files `--as` picks from. It supplies
@@ -46,6 +51,12 @@ const TLS_DIR_VAR: &str = "FLEETRING_TLS_DIR";
 /// The environment variable that holds a bearer token, used when `--token` isn't given.
 const TOKEN_VAR: &str = "FLEETRING_TOKEN";
 
+/// The environment variable that chooses the log format when `--log-format` isn't given.
+const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
+
+/// The exit code for a usage error, as clap's own.
+const USAGE_ERROR: u8 = 2;
+
 /// How many random bytes a token's ID holds.
 const TOKEN_ID_BYTES: usize = 16;
 
@@ -53,16 +64,16 @@ const TOKEN_ID_BYTES: usize = 16;
 ///
 /// With `--config`, runs the daemon. The subcommands talk to a running fleet.
 #[derive(Debug, Parser)]
-#[command(
-    version,
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
-)]
+#[command(version, subcommand_negates_reqs = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     #[command(flatten)]
     daemon: DaemonArgs,
+    /// Writes log lines as `text` or `json`. Overrides FLEETRING_LOG_FORMAT and the config file's
+    /// `[log] format`.
+    #[arg(long, global = true, value_parser = parse_log_format)]
+    log_format: Option<LogFormat>,
 }
 
 /// Runs the daemon.
@@ -793,18 +804,39 @@ fn hex(text: &str) -> Result<Vec<u8>, String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Err(error) = cli.check() {
+        error.exit();
+    }
+    // The daemon reads its configuration before logging starts, since it may name the format.
+    let config = match (&cli.command, &cli.daemon.config) {
+        (None, Some(path)) => match Config::load(path) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                report(&error);
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+    let variable = std::env::var(LOG_FORMAT_VAR).ok();
+    let format = match log_format(cli.log_format, variable.as_deref(), config.as_ref()) {
+        Ok(format) => format,
+        Err(value) => {
+            eprintln!("fleetringd: invalid {LOG_FORMAT_VAR} '{value}'; use text or json");
+            return ExitCode::from(USAGE_ERROR);
+        }
+    };
     // The daemon logs at info; a command prints its result and logs only warnings.
     let default_filter = if cli.command.is_some() {
         "warn"
     } else {
         "info"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
+    if let Err(error) = log_subscriber(format, filter, std::io::stderr).try_init() {
+        report(&error);
+        return ExitCode::FAILURE;
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -812,9 +844,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = match cli.command {
-        Some(command) => runtime.block_on(run_command(command)),
-        None => runtime.block_on(run_daemon(cli.daemon)),
+    let result = match (cli.command, config) {
+        (Some(command), _) => runtime.block_on(run_command(command)),
+        (None, Some(config)) => runtime.block_on(run_daemon(cli.daemon, config)),
+        (None, None) => Err("--config is required".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -825,9 +858,61 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn Error>> {
-    let path = args.config.clone().ok_or("--config is required")?;
-    let config = args.apply(Config::load(&path)?);
+impl Cli {
+    /// Refuses the daemon's options next to a subcommand. `--log-format` is the one option both
+    /// take, which is why clap's own conflict rule, which would refuse it too, isn't used.
+    ///
+    /// # Errors
+    ///
+    /// A usage error naming the conflict.
+    fn check(&self) -> Result<(), clap::Error> {
+        let daemon = &self.daemon;
+        let given = daemon.config.is_some()
+            || daemon.node_id.is_some()
+            || daemon.data_dir.is_some()
+            || daemon.listen.is_some()
+            || daemon.advertise.is_some()
+            || daemon.control.is_some()
+            || daemon.role.is_some()
+            || daemon.insecure_plaintext;
+        if self.command.is_some() && given {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                "the daemon's options can't be used with a subcommand; put a command's options \
+                 after its name",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The log format: `--log-format`, else `FLEETRING_LOG_FORMAT`, else the daemon's `[log]
+/// format`, else text.
+///
+/// # Errors
+///
+/// The variable's value if it names no format.
+fn log_format(
+    flag: Option<LogFormat>,
+    variable: Option<&str>,
+    config: Option<&Config>,
+) -> Result<LogFormat, String> {
+    if let Some(format) = flag {
+        return Ok(format);
+    }
+    if let Some(value) = variable {
+        return value.parse().map_err(|_| value.to_owned());
+    }
+    Ok(config.map_or(LogFormat::Text, |config| config.log.format))
+}
+
+fn parse_log_format(text: &str) -> Result<LogFormat, String> {
+    text.parse()
+        .map_err(|error: ParseLogFormatError| error.to_string())
+}
+
+async fn run_daemon(args: DaemonArgs, config: Config) -> Result<(), Box<dyn Error>> {
+    let config = args.apply(config);
     let daemon = Daemon::start(config).await?;
     daemon.run_until(shutdown_signal()).await;
     Ok(())
@@ -1883,6 +1968,112 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_format_is_accepted_before_and_after_a_subcommand() {
+        for words in [
+            &[
+                "fleetringd",
+                "--log-format",
+                "json",
+                "status",
+                "--control",
+                "127.0.0.1:1",
+            ][..],
+            &[
+                "fleetringd",
+                "status",
+                "--control",
+                "127.0.0.1:1",
+                "--log-format",
+                "json",
+            ],
+            &[
+                "fleetringd",
+                "--log-format",
+                "json",
+                "--config",
+                "fleetring.toml",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(words).expect("the flag parses");
+            assert_eq!(cli.log_format, Some(LogFormat::Json), "{words:?}");
+        }
+        let cli = Cli::try_parse_from(["fleetringd", "--config", "fleetring.toml"])
+            .expect("no flag parses");
+        assert_eq!(cli.log_format, None);
+    }
+
+    #[test]
+    fn daemon_options_are_refused_next_to_a_subcommand() {
+        for words in [
+            &["fleetringd", "--config", "fleetring.toml", "status"][..],
+            &["fleetringd", "--control", "127.0.0.1:7400", "status"],
+            &[
+                "fleetringd",
+                "--insecure-plaintext",
+                "db",
+                "list",
+                "--control",
+                "127.0.0.1:1",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(words).expect("clap parses it");
+            let refused = cli.check().expect_err("a daemon option and a subcommand");
+            assert_eq!(refused.kind(), ErrorKind::ArgumentConflict, "{words:?}");
+        }
+        for words in [
+            &["fleetringd", "status", "--control", "127.0.0.1:7400"][..],
+            &[
+                "fleetringd",
+                "--log-format",
+                "text",
+                "status",
+                "--control",
+                "127.0.0.1:7400",
+            ],
+            &[
+                "fleetringd",
+                "--config",
+                "fleetring.toml",
+                "--log-format",
+                "json",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(words).expect("clap parses it");
+            assert!(cli.check().is_ok(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_log_format_is_refused() {
+        let refused = Cli::try_parse_from(["fleetringd", "--log-format", "yaml", "status"])
+            .expect_err("yaml isn't a format");
+        assert!(
+            refused.to_string().contains("use text or json"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn the_flag_beats_the_variable_which_beats_the_config_file() {
+        let config = Config::from_toml(
+            "data_dir = \"/tmp/fleetring-test\"\nlisten = \"127.0.0.1:7400\"\n\n\
+             [node]\nid = \"n1\"\n\n[log]\nformat = \"json\"\n",
+        )
+        .expect("a config");
+        assert_eq!(log_format(None, None, None), Ok(LogFormat::Text));
+        assert_eq!(log_format(None, None, Some(&config)), Ok(LogFormat::Json));
+        assert_eq!(
+            log_format(None, Some("text"), Some(&config)),
+            Ok(LogFormat::Text)
+        );
+        assert_eq!(
+            log_format(Some(LogFormat::Json), Some("text"), None),
+            Ok(LogFormat::Json)
+        );
+        assert_eq!(log_format(None, Some("xml"), None), Err("xml".to_owned()));
+    }
 
     #[test]
     fn parameters_infer_their_type_unless_prefixed() {

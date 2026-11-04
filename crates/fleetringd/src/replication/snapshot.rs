@@ -32,6 +32,7 @@ use super::follower::{admit, blocking, record_anchor, seeded_chain};
 use super::primary::{self, held};
 use super::{Inner, SeedError};
 use crate::engine::{EngineCapability, Execution, Position};
+use crate::observe::ReplicationMetrics;
 use crate::transport::replication_client;
 
 /// The largest snapshot chunk the `Snapshot` RPC sends.
@@ -96,6 +97,7 @@ pub(super) async fn serve(
     tokio::spawn(send_chunks(
         packer,
         chain,
+        inner.metrics.clone(),
         inner.execution,
         inner.settings.open_timeout,
         chunks,
@@ -109,6 +111,7 @@ pub(super) async fn serve(
 async fn send_chunks(
     mut packer: Packer,
     chain: Option<ChainHash>,
+    metrics: ReplicationMetrics,
     execution: Execution,
     limit: std::time::Duration,
     chunks: mpsc::Sender<Result<SnapshotChunk, Status>>,
@@ -167,8 +170,11 @@ async fn send_chunks(
         if !matches!(
             time::timeout(limit, chunks.send(Ok(chunk))).await,
             Ok(Ok(()))
-        ) || last
-        {
+        ) {
+            return;
+        }
+        if last {
+            metrics.snapshot_sent();
             return;
         }
     }

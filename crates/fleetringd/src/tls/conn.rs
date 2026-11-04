@@ -7,16 +7,17 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use rustls_pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tonic::transport::server::Connected;
 
-use crate::tls::names::SubjectUri;
+use crate::tls::names::{FleetName, SubjectUri};
 use crate::tls::{Peer, Security};
 
 /// How long a handshake may take before the connection is dropped. It bounds what a peer that
 /// connects and goes silent can hold.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connection as the network delivers it, before any TLS.
 #[derive(Debug)]
@@ -179,34 +180,7 @@ impl Security {
                     .map_err(|_| HandshakeError::Timeout)?
                     .map_err(HandshakeError::Tls)?;
                 let certificates = stream.get_ref().1.peer_certificates().unwrap_or_default();
-                let end_entity = certificates
-                    .first()
-                    .ok_or_else(|| HandshakeError::Subject {
-                        reason: "no certificate".to_owned(),
-                    })?;
-                let subject = SubjectUri::of_certificate(end_entity).map_err(|error| {
-                    HandshakeError::Subject {
-                        reason: error.to_string(),
-                    }
-                })?;
-                if subject.fleet() != loaded.fleet() {
-                    return Err(HandshakeError::Subject {
-                        reason: format!(
-                            "fleet '{}' is not this fleet '{}'",
-                            subject.fleet(),
-                            loaded.fleet()
-                        ),
-                    });
-                }
-                let peer = match subject {
-                    SubjectUri::Node { id, .. } => Peer::Node(id),
-                    SubjectUri::Principal { name, .. } => Peer::Principal(name),
-                    other => {
-                        return Err(HandshakeError::Subject {
-                            reason: format!("{other} is an authority"),
-                        });
-                    }
-                };
+                let peer = peer_of(certificates, loaded.fleet())?;
                 Ok(Accepted {
                     conn: Conn::Tls(Box::new(TlsStream::Server(stream))),
                     peer,
@@ -232,6 +206,39 @@ impl Security {
                 Ok(Conn::Tls(Box::new(TlsStream::Client(stream))))
             }
         }
+    }
+}
+
+/// The node or principal a peer's verified certificate chain names, if it is one of `fleet`'s.
+///
+/// # Errors
+///
+/// [`HandshakeError::Subject`] if there is no certificate, or its subject isn't a node or a
+/// principal of `fleet`.
+pub(crate) fn peer_of(
+    certificates: &[CertificateDer<'_>],
+    fleet: &FleetName,
+) -> Result<Peer, HandshakeError> {
+    let end_entity = certificates
+        .first()
+        .ok_or_else(|| HandshakeError::Subject {
+            reason: "no certificate".to_owned(),
+        })?;
+    let subject =
+        SubjectUri::of_certificate(end_entity).map_err(|error| HandshakeError::Subject {
+            reason: error.to_string(),
+        })?;
+    if subject.fleet() != fleet {
+        return Err(HandshakeError::Subject {
+            reason: format!("fleet '{}' is not this fleet '{fleet}'", subject.fleet()),
+        });
+    }
+    match subject {
+        SubjectUri::Node { id, .. } => Ok(Peer::Node(id)),
+        SubjectUri::Principal { name, .. } => Ok(Peer::Principal(name)),
+        other => Err(HandshakeError::Subject {
+            reason: format!("{other} is an authority"),
+        }),
     }
 }
 

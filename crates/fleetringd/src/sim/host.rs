@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use crate::clock::SimClock;
 use crate::control::ControlHandle;
 use crate::durability::ObjectStore;
+use crate::observe::Metrics;
 use crate::replication::Replication;
 use crate::sim::seeds::millis;
 use crate::sim::trace::{Event, EventKind, Trace};
@@ -47,6 +48,8 @@ pub(super) struct Running {
     pub(super) control: Option<ControlHandle>,
     pub(super) membership: Option<Membership>,
     pub(super) replication: Option<Replication>,
+    /// This incarnation's metrics: a restarted host starts counting from zero.
+    pub(super) metrics: Metrics,
 }
 
 impl Shared {
@@ -109,6 +112,7 @@ pub(super) async fn run_host(
             control: daemon.control(),
             membership: membership.clone(),
             replication: daemon.replication(),
+            metrics: daemon.metrics().clone(),
         },
     );
     shared.record(&name, EventKind::Started);

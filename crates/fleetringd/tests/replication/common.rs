@@ -395,6 +395,7 @@ pub(crate) fn start_node(
             execution: Execution::Threads,
             state_dir: root.join("replication"),
             settings,
+            metrics: fleetringd::observe::ReplicationMetrics::default(),
         },
         move |sink| Registry::new(registry_engine, sink, databases, config),
     )

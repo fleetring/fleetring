@@ -139,6 +139,12 @@ pub(crate) async fn drain(node: &DataNode, settings: DrainSettings) -> DrainRepo
         let Ok((database, outcome)) = joined else {
             continue;
         };
+        let counted = if matches!(outcome, Ok(Some(_))) {
+            "completed"
+        } else {
+            "failed"
+        };
+        node.metrics().transfer(counted);
         match outcome {
             Ok(to) => {
                 match &to {
