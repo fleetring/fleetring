@@ -8,6 +8,7 @@
 
 mod executor;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 
 use self::executor::{Executor, OpenRequest};
+use crate::changes::MarkHome;
 use crate::engine::{
     CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot,
     EngineError, Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode,
@@ -39,6 +41,8 @@ pub(crate) enum Request {
     CommittedBetween(Option<Position>, Position, Reply<Option<FrameBatch>>),
     RowChanges(Option<Position>, Position, Reply<Vec<RowChange>>),
     ReleaseChanges(Position, Reply<()>),
+    SinkMarks(Reply<Option<BTreeMap<String, Position>>>),
+    StageSinkMark(String, Position, Reply<MarkHome>),
     Checkpoint(Reply<CheckpointMarker>),
     Snapshot(PathBuf, Reply<DatabaseSnapshot>),
     PinSnapshot(Reply<PinnedSnapshot>),
@@ -73,6 +77,12 @@ impl Request {
             Self::ReleaseChanges(_, reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::SinkMarks(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::StageSinkMark(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
             Self::Checkpoint(reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -100,6 +110,8 @@ impl fmt::Debug for Request {
             Self::CommittedBetween(..) => "CommittedBetween",
             Self::RowChanges(..) => "RowChanges",
             Self::ReleaseChanges(..) => "ReleaseChanges",
+            Self::SinkMarks(_) => "SinkMarks",
+            Self::StageSinkMark(..) => "StageSinkMark",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Snapshot(..) => "Snapshot",
             Self::PinSnapshot(_) => "PinSnapshot",
@@ -307,6 +319,34 @@ impl DatabaseHandle {
     /// [`DatabaseError`] if the database is closed.
     pub(crate) async fn release_changes(&self, before: Position) -> Result<(), DatabaseError> {
         self.call(|reply| Request::ReleaseChanges(before, reply))
+            .await
+    }
+
+    /// Every sink mark the database holds, by sink name, or `None` if its engine can't keep marks
+    /// inside the database (ADR-0028).
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] if the database is closed or the marks can't be read.
+    pub(crate) async fn sink_marks(
+        &self,
+    ) -> Result<Option<BTreeMap<String, Position>>, DatabaseError> {
+        self.call(Request::SinkMarks).await
+    }
+
+    /// Stages `delivered` as `sink`'s mark, which the database's next write transaction records,
+    /// and says where the position is kept: [`MarkHome::Local`], with nothing staged, if the
+    /// engine can't keep marks (ADR-0028).
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] if the database is closed.
+    pub(crate) async fn stage_sink_mark(
+        &self,
+        sink: String,
+        delivered: Position,
+    ) -> Result<MarkHome, DatabaseError> {
+        self.call(|reply| Request::StageSinkMark(sink, delivered, reply))
             .await
     }
 
@@ -655,6 +695,30 @@ impl Actor {
                 let result = self
                     .call(move |database| {
                         Ok(logical_changes(database, "releasing row changes")?.release(&before)?)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::SinkMarks(reply) => {
+                let result = self
+                    .call(|database| {
+                        database
+                            .sink_marks()
+                            .map(|marks| marks.marks())
+                            .transpose()
+                            .map_err(DatabaseError::from)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::StageSinkMark(sink, delivered, reply) => {
+                let result = self
+                    .call(move |database| match database.sink_marks() {
+                        Some(marks) => {
+                            marks.stage(&sink, &delivered);
+                            Ok(MarkHome::Replicated)
+                        }
+                        None => Ok(MarkHome::Local),
                     })
                     .await;
                 let _ = reply.send(result);

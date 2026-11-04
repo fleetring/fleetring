@@ -17,14 +17,27 @@
 //!
 //! [`ChangeStreams`] starts one pump per sink and database this node is primary for. A pump
 //! follows the database's primary through a [`PrimaryFeed`](crate::replication) and keeps a
-//! durable position, the last batch end it delivered, in `<data_dir>/changes/<sink>/<database>`.
-//! Whenever the write quorum's position passes it, the pump reads the log from its position up
-//! to the quorum's position as one batch, through the registry, and publishes it; then records
-//! the new position. The pump holds one batch at a time: however far a sink falls behind, nothing
+//! durable position, the last batch end it delivered. Whenever the write quorum's position
+//! passes it, the pump reads the log from its position up to the quorum's position as one batch,
+//! through the registry, and publishes it; then records the new position. The pump holds one
+//! batch at a time: however far a sink falls behind, nothing
 //! is buffered in memory, and the log is read again when the sink is ready. A lagging sink keeps
 //! its primary from checkpointing, as a lagging follower does, until it has been behind for the
 //! replication settings' `lag_limit`; after that the log may restart past it, and the pump then
 //! restarts from the log's beginning and counts a reset in its status.
+//!
+//! # Where positions live
+//!
+//! When the database's engine can keep sink marks ([`SinkMarks`](crate::engine::SinkMarks),
+//! ADR-0028), a pump keeps its position as a mark inside the database: after each delivery it
+//! stages the batch's end, and the database's next write transaction records it, so the mark
+//! replicates with the data. A pump reads the mark when it starts, on a restart and on a
+//! promoted follower alike, and continues from there if the log still continues from it, or from
+//! the log's beginning, counting a reset, if not. A failover then repeats only what the old
+//! primary delivered after the newest mark that reached the write quorum. An engine that can't
+//! keep marks gets the pump a file on this node, `<data_dir>/changes/<sink>/<database>`, as
+//! before, and a failover repeats everything since the last checkpoint. The node's status says
+//! which ([`MarkHome`]).
 //!
 //! Delivery is at least once: a sink that fails is retried with backoff and nothing is skipped,
 //! and a restart delivers again anything whose position wasn't recorded. A sink receives a
@@ -71,6 +84,16 @@ pub use self::matcher::{CaptureRules, DatabaseMatcher, DatabaseMatchers, ParseMa
 pub use self::memory::MemorySink;
 pub use self::record::{ChangeRecord, NotHex, ParseRecordError, RecordContent, hex, unhex};
 pub use self::webhook::{InvalidUrlError, WebhookSettings, WebhookSink};
+
+/// Where a sink's delivered position is kept (ADR-0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkHome {
+    /// Inside the database, replicated with it.
+    Replicated,
+    /// In a file on this node only, because the engine can't keep marks.
+    Local,
+}
 
 /// One acknowledged batch of a database, as a sink receives it.
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +228,9 @@ pub struct SinkStatus {
     pub database: DatabaseName,
     /// The last position the sink took, or `None` if it took nothing yet.
     pub position: Option<Position>,
+    /// Where the position is kept: in the database, replicated with it, or on this node only.
+    /// `None` until the pump has opened its database.
+    pub home: Option<MarkHome>,
     /// The write quorum's position, which the sink is behind if it differs.
     pub acknowledged: Option<Position>,
     /// How many batches the primary has published since the sink's position, as far as it
@@ -306,6 +332,7 @@ impl ChangeStreams {
                     sink: sink.clone(),
                     database: database.clone(),
                     position: state.position.clone(),
+                    home: state.home,
                     acknowledged: state.acknowledged.clone(),
                     backlog: state.backlog,
                     failures: state.failures,
@@ -543,6 +570,7 @@ const _: () = {
     assert_debug_send_sync::<DatabaseMatchers>();
     assert_debug_send_sync::<FileSink>();
     assert_debug_send_sync::<Format>();
+    assert_debug_send_sync::<MarkHome>();
     assert_debug_send_sync::<MemorySink>();
     assert_debug_send_sync::<SinkConfig>();
     assert_debug_send_sync::<SinkError>();

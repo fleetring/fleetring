@@ -4,14 +4,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use fleetring::ReplicationFactor;
+use fleetring_control::LeaseEpoch;
 use fleetringd::changes::{
-    Change, ChangeKind, ChangeRecord, ChangeSink, ConfiguredSink, FileSink, Format, Published,
-    RecordContent,
+    Change, ChangeKind, ChangeRecord, ChangeSink, ConfiguredSink, FileSink, Format, MarkHome,
+    MemorySink, Published, RecordContent,
 };
-use fleetringd::engine::{RowOperation, Value};
+use fleetringd::engine::{CaptureMode, RowOperation, Value};
+use fleetringd::replication::PrimaryRole;
 use tokio::sync::Notify;
 
-use crate::common::{Harness, TestResult, every_database, guarded, insert, name};
+use crate::common::{Harness, NoMarks, TestResult, every_database, guarded, insert, name};
 
 /// The records in `path`, in file order.
 pub(crate) fn records(path: &Path) -> Result<Vec<ChangeRecord>, Box<dyn std::error::Error>> {
@@ -181,7 +184,14 @@ async fn a_pump_killed_mid_stream_delivers_everything_at_least_once_after_a_rest
     once.dedup();
     assert_eq!(once, (1..=20).collect::<Vec<_>>());
     let resumed = &after[before.len()];
-    assert_eq!(resumed.start.as_deref(), Some(before[5].position.as_str()));
+    // The record of 5, found by its value: whether the schema's batch was delivered on its own or
+    // together with the first insert depends on how quickly the pump started, so the records'
+    // indices are not fixed.
+    let of_five = before
+        .iter()
+        .find(|record| inserted(std::slice::from_ref(record)) == [5])
+        .ok_or("a record that inserted 5")?;
+    assert_eq!(resumed.start.as_deref(), Some(of_five.position.as_str()));
     assert_eq!(resumed.epoch, 2);
     match &resumed.content {
         RecordContent::Logical { rows } => assert_eq!(rows.len(), 15),
@@ -215,6 +225,131 @@ async fn a_physical_sink_receives_the_opaque_payload() -> TestResult {
             ChangeKind::Logical(_) => panic!("a physical sink"),
         }
     }
+    node.kill().await;
+    Ok(())
+}
+
+/// Each change in `sink` that carries rows, in delivery order.
+fn row_changes(sink: &MemorySink) -> Vec<Change> {
+    sink.changes()
+        .into_iter()
+        .filter(|change| matches!(&change.kind, ChangeKind::Logical(rows) if !rows.is_empty()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pump_restarted_on_the_same_node_resumes_from_the_mark() -> TestResult {
+    let harness = Harness::start().await?;
+    let first = MemorySink::new("stream");
+    let node = harness
+        .node(vec![ConfiguredSink::new(
+            first.clone(),
+            Format::Logical,
+            every_database(),
+        )])
+        .await?;
+    let ledger = name("ledger");
+    node.create(&ledger, "CREATE TABLE t (value INTEGER NOT NULL)")
+        .await?;
+    node.await_caught_up().await?;
+    // Each write carries the mark of the delivery before it: the third write records the end of
+    // the second change, and the last delivery's mark is staged with no write to record it.
+    for value in 1..=2 {
+        node.execute(&ledger, insert(value)).await?;
+        node.await_caught_up().await?;
+    }
+    let delivered = row_changes(&first);
+    assert_eq!(delivered.len(), 2, "{delivered:?}");
+    node.kill().await;
+
+    let second = MemorySink::new("stream");
+    let node = harness
+        .node(vec![ConfiguredSink::new(
+            second.clone(),
+            Format::Logical,
+            every_database(),
+        )])
+        .await?;
+    node.replication.serve_primary(
+        ledger.clone(),
+        PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(2)),
+    )?;
+    node.await_caught_up().await?;
+    let resumed = second.changes();
+    assert_eq!(resumed.len(), 1, "one change repeated: {resumed:?}");
+    assert_eq!(
+        resumed[0].start.as_ref(),
+        Some(&delivered[0].position),
+        "the stream resumes from the mark, the end of the first insert"
+    );
+    assert_eq!(resumed[0].position, delivered[1].position);
+    node.kill().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_where_each_sinks_position_lives() -> TestResult {
+    let ledger = name("ledger");
+    for (kept, expected) in [
+        (Kept::InDatabase, MarkHome::Replicated),
+        (Kept::OnNode, MarkHome::Local),
+    ] {
+        let harness = Harness::start().await?;
+        let sinks = vec![ConfiguredSink::new(
+            MemorySink::new("stream"),
+            Format::Logical,
+            every_database(),
+        )];
+        let node = match kept {
+            Kept::InDatabase => harness.node(sinks).await?,
+            Kept::OnNode => {
+                harness
+                    .node_on(NoMarks::new(), sinks, CaptureMode::default())
+                    .await?
+            }
+        };
+        node.create(&ledger, "CREATE TABLE t (value INTEGER NOT NULL)")
+            .await?;
+        node.execute(&ledger, insert(1)).await?;
+        node.await_caught_up().await?;
+        let status = node.streams.status();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].home, Some(expected), "{status:?}");
+        node.kill().await;
+    }
+    Ok(())
+}
+
+/// Where a test's engine keeps sink positions.
+#[derive(Debug, Clone, Copy)]
+enum Kept {
+    InDatabase,
+    OnNode,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_without_marks_keeps_positions_on_the_node() -> TestResult {
+    let harness = Harness::start().await?;
+    let node = harness
+        .node_on(
+            NoMarks::new(),
+            vec![ConfiguredSink::new(
+                MemorySink::new("stream"),
+                Format::Logical,
+                every_database(),
+            )],
+            CaptureMode::default(),
+        )
+        .await?;
+    let ledger = name("ledger");
+    node.create(&ledger, "CREATE TABLE t (value INTEGER NOT NULL)")
+        .await?;
+    node.execute(&ledger, insert(1)).await?;
+    node.await_caught_up().await?;
+    let status = node.streams.status();
+    let position = status[0].position.clone().ok_or("a delivered position")?;
+    let file = harness.root().join("changes").join("stream").join("ledger");
+    assert_eq!(std::fs::read(&file)?, position.as_bytes(), "{file:?}");
     node.kill().await;
     Ok(())
 }

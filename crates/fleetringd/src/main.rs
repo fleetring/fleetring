@@ -18,6 +18,7 @@ use fleetring_control::{KeyId, Millis, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
 use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIFETIME, Scope};
+use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
     Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo, Verification,
@@ -1398,9 +1399,13 @@ fn format_node_status(status: &NodeStatus) -> String {
             .acknowledged
             .as_ref()
             .map_or_else(|| "none".to_owned(), ToString::to_string);
+        let kept = match sink.home {
+            Some(MarkHome::Replicated) => "replicated",
+            _ => "local",
+        };
         let _ = write!(
             output,
-            "  {} {} position={position} acknowledged={acknowledged} backlog={} failures={} resets={}",
+            "  {} {} position={position} ({kept}) acknowledged={acknowledged} backlog={} failures={} resets={}",
             sink.sink, sink.database, sink.backlog, sink.failures, sink.resets
         );
         if let Some(error) = &sink.last_error {

@@ -431,6 +431,14 @@ Whether a member is `live` (its last heartbeat is within the heartbeat timeout) 
 - **Code:** `Liveness::Live`, `Liveness::Down`, protocol `Member.live`. **CLI:** `live` or `down` after each member in `status`, and after each replica in `db locate`.
 - **Not:** up, alive, healthy, dead, failed, unreachable (fine in prose about a network).
 
+### Mark
+
+A [sink](#sink)'s delivered [position](#position), kept inside the database so that it replicates with the data and a new primary resumes the change stream where the old one stopped (FR-041, ADR-0028). A sink whose engine can't keep marks keeps its position in a file on the node instead, and `status --node` says which.
+
+- **Applies to:** daemon, CLI.
+- **Code:** `SinkMarks`, `MarkHome`, the `_fleetring_sinks` table. **CLI:** `replicated` or `local` after a sink's position in `status --node`.
+- **Not:** checkpoint (that is the log's, see [checkpoint](#checkpoint)), high-water mark, cursor, offset.
+
 ### Member
 
 A node as the fleet's membership records it: its ID, placement attributes, address, liveness, and whether it is draining. "Member" is the record; "node" is the process.
