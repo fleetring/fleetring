@@ -46,6 +46,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0035](0035-raft-control-group.md) | The control log is replicated by a Raft control group on openraft, with one code path from one voter to five | Accepted |
 | [0036](0036-fault-injection-on-real-daemons.md) | Fault injection on real daemons: an in-repo harness runs five daemons in containers with partitions, kills, pauses, and clock skew, judged by the history checker | Accepted |
 | [0037](0037-router-hrana-front-door.md) | The router is a Hrana-over-HTTP front door that authenticates each request and runs it in a session on its database's primary (amends 0026, point 4, for sessions) | Accepted |
+| [0038](0038-version-compatibility-and-upgrades.md) | A fleet runs two adjacent release lines at once, gates new control commands as fleet features, and upgrades a node with a verified, atomic binary swap | Accepted |
 
 ## Template
 
