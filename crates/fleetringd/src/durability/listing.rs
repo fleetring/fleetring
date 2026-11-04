@@ -9,7 +9,7 @@ use super::format::{SnapshotDescriptor, decode_descriptor};
 use super::keys::{ArchiveKeys, SegmentName, SnapshotObject};
 use super::store::{ObjectStore, StoreError, retrying};
 use crate::changes::unhex;
-use crate::engine::Position;
+use crate::engine::{EngineKind, Position};
 use crate::replication::ChainHash;
 
 /// What an archive holds for one database.
@@ -80,7 +80,8 @@ pub struct SegmentEntry {
 
 impl Listing {
     /// Lists `database`'s objects under `keys`, and reads each snapshot's descriptor, retrying
-    /// each call that fails for a reason that may pass.
+    /// each call that fails for a reason that may pass. A descriptor of another database, or of
+    /// a snapshot another engine than `engine` took, is damaged.
     ///
     /// # Errors
     ///
@@ -89,6 +90,7 @@ impl Listing {
         store: &dyn ObjectStore,
         keys: &ArchiveKeys,
         database: &DatabaseName,
+        engine: EngineKind,
     ) -> Result<Self, StoreError> {
         let mut listing = Self::default();
         let prefix = keys.database();
@@ -137,7 +139,7 @@ impl Listing {
                 });
                 continue;
             };
-            match checked(&bytes, database, position.as_ref(), epoch) {
+            match checked(&bytes, database, engine, position.as_ref(), epoch) {
                 Ok((descriptor, chain)) => listing.snapshots.push(SnapshotEntry {
                     id,
                     key,
@@ -211,10 +213,11 @@ impl Listing {
 }
 
 /// The descriptor in `bytes` and its chain, if it reads as the descriptor of `database`'s
-/// snapshot at `position` and `epoch`.
+/// snapshot at `position` and `epoch`, taken by `engine`.
 fn checked(
     bytes: &[u8],
     database: &DatabaseName,
+    engine: EngineKind,
     position: Option<&Position>,
     epoch: LeaseEpoch,
 ) -> Result<(SnapshotDescriptor, ChainHash), String> {
@@ -223,6 +226,12 @@ fn checked(
         return Err(format!(
             "it describes database `{}`, not `{database}`",
             descriptor.database
+        ));
+    }
+    if descriptor.engine != engine.to_string() {
+        return Err(format!(
+            "a {} engine took it, not {engine}",
+            descriptor.engine
         ));
     }
     let described = descriptor

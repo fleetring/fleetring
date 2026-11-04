@@ -12,7 +12,7 @@ use fleetringd::durability::{
     Archive, ArchiveConfig, ArchiveError, ArchiveParts, DirectoryStore, FaultyStore, Listing,
     MemoryStore, ObjectStore, RestoreTarget, decode_segment, plan,
 };
-use fleetringd::engine::{Execution, MemoryEngine};
+use fleetringd::engine::{EngineKind, Execution, MemoryEngine};
 use fleetringd::replication::ChainHash;
 
 use crate::common::{Node, TestResult, insert, name, settings, start_replication};
@@ -247,7 +247,13 @@ async fn a_failing_store_delays_the_archive_but_never_a_write() -> TestResult {
         }
     }
     node.await_archived().await?;
-    let listing = Listing::read(&inner, &node.archive.keys(&ledger), &ledger).await?;
+    let listing = Listing::read(
+        &inner,
+        &node.archive.keys(&ledger),
+        &ledger,
+        EngineKind::Sqlite,
+    )
+    .await?;
     assert_one_path(&listing, node.position(&ledger).await?.as_ref());
     node.stop().await;
     Ok(())

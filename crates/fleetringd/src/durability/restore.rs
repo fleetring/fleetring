@@ -118,7 +118,7 @@ pub async fn restore_into(
             format!("{} exists", staging.display()),
         )));
     }
-    let listing = Listing::read(store, keys, database).await?;
+    let listing = Listing::read(store, keys, database, engine.kind()).await?;
     let plan = plan(&listing, target)?;
     let built = build(store, keys, database, engine, &plan, staging, execution).await;
     if built.is_err() {

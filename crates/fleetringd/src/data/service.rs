@@ -269,11 +269,16 @@ impl Database for DatabaseService {
         require_database(&request, &name)?;
         let archive = self.node.archive(&request.get_ref().archive)?;
         let store = archive.store();
-        let listing = Listing::read(store.as_ref(), &archive.keys(&name), &name)
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!("can't list archive `{}`: {error}", archive.name()))
-            })?;
+        let listing = Listing::read(
+            store.as_ref(),
+            &archive.keys(&name),
+            &name,
+            self.node.replication().engine().kind(),
+        )
+        .await
+        .map_err(|error| {
+            Status::unavailable(format!("can't list archive `{}`: {error}", archive.name()))
+        })?;
         let (latest, latest_ms) = listing.latest();
         let mut snapshots: Vec<ArchivedSnapshot> = listing
             .snapshots

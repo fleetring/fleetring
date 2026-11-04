@@ -10,10 +10,10 @@ use fleetring_control::DatabaseName;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::durability::{
     ArchiveKeys, Listing, MemoryStore, ObjectEntry, ObjectStore, PlanError, RestoreError,
-    RestoreTarget, Restored, StoreError, StoreFuture, decode_segment, encode_segment,
-    finish_offline, restore_into,
+    RestoreTarget, Restored, StoreError, StoreFuture, decode_segment, encode_descriptor,
+    encode_segment, finish_offline, restore_into,
 };
-use fleetringd::engine::{Execution, Position};
+use fleetringd::engine::{EngineKind, Execution, Position};
 use tokio::sync::watch;
 
 use crate::common::{Node, TestResult, insert, name, settings, sqlite};
@@ -173,7 +173,13 @@ async fn restoring_to_a_position_holds_exactly_the_writes_before_it() -> TestRes
     }
     store.release();
     node.await_archived().await?;
-    let listing = Listing::read(&store, &node.archive.keys(&ledger), &ledger).await?;
+    let listing = Listing::read(
+        &store,
+        &node.archive.keys(&ledger),
+        &ledger,
+        EngineKind::Sqlite,
+    )
+    .await?;
     let inside = |position: &Position| {
         listing.segments.iter().any(|segment| {
             segment.name.start.as_ref() < Some(position) && *position < segment.name.end
@@ -384,7 +390,13 @@ async fn restore_from(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tampered_segment_is_refused_as_data_loss() -> TestResult {
     let (dir, store, ledger) = archived().await?;
-    let listing = Listing::read(&store, &ArchiveKeys::new("fleetring", &ledger), &ledger).await?;
+    let listing = Listing::read(
+        &store,
+        &ArchiveKeys::new("fleetring", &ledger),
+        &ledger,
+        EngineKind::Sqlite,
+    )
+    .await?;
     let segment = listing.segments.last().ok_or("a segment")?.key.clone();
     let original = store.get(&segment).await?.ok_or("the segment")?;
 
@@ -434,9 +446,46 @@ async fn a_tampered_segment_is_refused_as_data_loss() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_another_engine_took_is_never_used() -> TestResult {
+    let (dir, store, ledger) = archived().await?;
+    let keys = ArchiveKeys::new("fleetring", &ledger);
+    let listing = Listing::read(&store, &keys, &ledger, EngineKind::Sqlite).await?;
+    let snapshot = listing.snapshots.first().ok_or("a snapshot")?;
+    let mut descriptor = snapshot.descriptor.clone();
+    descriptor.engine = "memory".to_owned();
+    store
+        .put(&snapshot.key, encode_descriptor(&descriptor))
+        .await?;
+
+    let listing = Listing::read(&store, &keys, &ledger, EngineKind::Sqlite).await?;
+    assert!(listing.snapshots.is_empty(), "{listing:#?}");
+    assert!(
+        listing
+            .damaged
+            .iter()
+            .any(|damaged| damaged.key == snapshot.key && damaged.reason.contains("memory")),
+        "{listing:#?}"
+    );
+    let staging = dir.path().join("restored");
+    let refused = restore_from(&store, &ledger, &staging).await;
+    assert!(
+        matches!(&refused, Err(RestoreError::Plan(PlanError::NoSnapshot))),
+        "{refused:?}"
+    );
+    assert!(!staging.exists());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_missing_snapshot_chunk_is_refused_as_data_loss() -> TestResult {
     let (dir, store, ledger) = archived().await?;
-    let listing = Listing::read(&store, &ArchiveKeys::new("fleetring", &ledger), &ledger).await?;
+    let listing = Listing::read(
+        &store,
+        &ArchiveKeys::new("fleetring", &ledger),
+        &ledger,
+        EngineKind::Sqlite,
+    )
+    .await?;
     let chunk = listing.snapshots[0]
         .chunks
         .first()
