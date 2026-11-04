@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/fleetring/fleetring/blob/main/docs/capabilities.schema.json",
+  "title": "FleetRing capabilities",
+  "description": "What FleetRing can do, what is built and what is planned. fleetring.dev reads docs/capabilities.json at build time, so a pull request that adds or ships a capability updates it. The site shows a built capability as Released once the latest published release of its component is at least its `since`, and as Planned until then, so publishing a release needs no edit here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "areas", "capabilities"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "format": { "const": 1, "description": "The version of this file's shape. Changes only with the site's reader." },
+    "areas": {
+      "description": "The groups the site shows capabilities in, in page order.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 40 }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/capability" }
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "component", "area", "title", "description", "status", "docs"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Stable and unique; the site links to it. Never reuse one." },
+        "component": { "enum": ["fleetring", "fleetringd"], "description": "Whose release `since` counts: the placement crate on crates.io, or the daemon's fleetringd-v* releases." },
+        "area": { "type": "string", "description": "One of the `areas` ids." },
+        "title": { "type": "string", "minLength": 1, "maxLength": 60, "description": "A few words, in lexicon terms." },
+        "description": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 220,
+          "description": "One plain sentence for users, in lexicon terms (fleet, never cluster). No version numbers, no invented figures, no exclamation marks, and none of: simply, just, magic, blazing."
+        },
+        "status": { "enum": ["built", "planned"], "description": "built: merged on main. planned: designed or ticketed, not built." },
+        "since": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "For built capabilities: the release of `component` it first ships in. For work merged after the latest release, the next version." },
+        "ticket": { "type": "string", "pattern": "^FR-\\d{3,}$", "description": "The FR number. Omit only when no ticket exists yet; then `docs` links the roadmap epic." },
+        "issue": { "type": "integer", "minimum": 1, "description": "The GitHub issue, when the ticket is one." },
+        "docs": { "type": "string", "pattern": "^https://", "description": "Where to read more: an ADR, a README section, a plan, or the issue." }
+      },
+      "if": { "properties": { "status": { "const": "built" } } },
+      "then": { "required": ["since"] },
+      "else": { "not": { "required": ["since"] } }
+    }
+  }
+}
