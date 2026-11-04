@@ -90,8 +90,14 @@ id = "node-1"
 # [[changes.sink]]
 # Change streams (FR-039): each entry sends every acknowledged batch of the databases it names
 # to a sink, beside replication and never in a write's acknowledgement path. Delivery is at least
-# once, in commit order, resuming after a restart from the position kept under
-# `<data_dir>/changes/<name>/`; `status --node` shows each sink's position and backlog.
+# once, in commit order. A sink's position is kept inside the database (FR-041), so it replicates
+# with the data and survives failover: a new primary resumes where the old one stopped, and
+# repeats at most the last couple of batches. An engine that can't keep it there keeps it under
+# `<data_dir>/changes/<name>/` on that node alone. `status --node` shows each sink's position,
+# whether it is replicated or local, and its backlog.
+#
+# Configure the same sinks on every node that may become a database's primary, as `[[principal]]`
+# must be: a sink configured only on the old primary isn't fed by the new one.
 #
 # `name`       1 to 64 lowercase letters, digits, `-`, or `_`; unique
 # `kind`       "file"     appends one JSON line per batch to `<path>/<database>.ndjson`
@@ -106,8 +112,9 @@ id = "node-1"
 #                         columns an update changed
 #              A database named by several logical sinks records in the strongest mode asked for.
 #              Row changes are recorded in the database itself, in the reserved table
-#              `_fleetring_cdc`, which replicates with the data; statements that name anything
-#              beginning with `_fleetring_` are refused.
+#              `_fleetring_cdc`, which replicates with the data, and the sinks' positions in
+#              `_fleetring_sinks`; statements that name anything beginning with `_fleetring_`
+#              are refused.
 # `databases`  exact names or prefixes ending in `*`; `["*"]` streams every database
 #
 # name = "archive"

@@ -88,7 +88,7 @@ M7 to M12 are also GitHub milestones, with the outcome as the description.
 | [FR-038](FR-038-graceful-departure.md) | Graceful departure: drain a node's primaries before it leaves | P1 | M | FR-031 | done |
 | [FR-039](FR-039-change-streams.md) | Change streams: a sink trait that sends each database's changes elsewhere | P2 | L | FR-030 | done |
 | [FR-040](https://github.com/fleetring/fleetring/issues/53) | Turso adapter: a self-replicating engine whose change stream reads `turso_cdc` | P2 | L | FR-039 | todo |
-| [FR-041](https://github.com/fleetring/fleetring/issues/49) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | todo |
+| [FR-041](https://github.com/fleetring/fleetring/issues/49) | Replicated sink positions, so a new primary resumes a change stream without duplicates | P2 | M | FR-039 | in-progress |
 | [FR-042](FR-042-lease-watch.md) | `WatchLeases`: a stream of the leases this node gains and loses | P2 | M | FR-031, FR-037 | done |
 | [FR-043](https://github.com/fleetring/fleetring/issues/50) | Keyed leases: acquire, renew, release, and watch a lease on any key | P2 | L | FR-042, FR-029, FR-047 | todo |
 | [FR-044](FR-044-hash-chained-log.md) | A hash-chained replication log, so replicas can prove they share a prefix | P2 | L | FR-030, FR-032 | done |

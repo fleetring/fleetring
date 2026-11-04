@@ -103,6 +103,22 @@ FR-039's logical change capture (ADR-0024), from `cargo bench -p fleetringd --be
 - **What changed from the first measurement.** The first numbers (2.2× on one row, 3.7× on 100 rows) were dominated by the actor re-reading and re-checksumming the whole WAL after every commit, which capture tripled in size; `fleetring-wal` now reads only the tail after the position it already has, which cut the capture-off write from 142 µs to 82 µs as well. The change table also lost its index: `change_id`s are contiguous and `start` never decreases along them, so range bounds are a binary search of point lookups, and a captured transaction dirties one page, not two.
 - The slowest samples (several milliseconds) are the checkpoints. Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
 
+### Sink marks
+
+FR-041's sink marks (ADR-0028), from `cargo bench -p fleetringd --bench capture -- marks`, measured 2026-11-03 on the same laptop (Rust 1.99.1, release profile) while the machine was heavily loaded by other builds (load average near 900), so only the fastest sample of each case is comparable; medians ran two to five times higher and moved between runs.
+
+- **Setup:** the `insert` cases above, with a 20-byte sink mark staged before every write, which is the worst case: a stream that delivers after each commit. The write that carries it upserts one row of `_fleetring_sinks` before the transaction's own statements. Logical capture off and in `after`, 1 and 100 rows. Fastest of 300 samples, over four runs, with the same case of `insert` beside it.
+
+| Transaction | Capture | `insert` | `marks` |
+|---|---|---|---|
+| 1 row | off | 80 µs | 73 µs |
+| 1 row | `after` | 86 µs | 128 µs |
+| 100 rows | off | 173 µs | 161 µs |
+| 100 rows | `after` | 410 µs | 401 µs |
+
+- **A mark is one more frame.** The row lives on the table's single leaf page, so the transaction dirties one more 4 KiB page, which is one more frame in the log, in the batch shipped to followers, and in the fsync (`a_mark_adds_one_frame_to_the_write_it_rides_on`). That is the same fixed cost a captured transaction pays for its change-table page, 10 µs when measured on an idle machine under [Change capture](#change-capture); the noise here, with `marks` faster than `insert` in three of four cases, is larger than that, so treat the table as "no cost visible at this noise" rather than a measurement of it, and re-measure on an idle machine.
+- **Only the writes that follow a delivery pay it.** A pump stages a mark after each delivery and the next write records it, so a database with idle streams pays nothing, and one that is written faster than its sinks deliver pays one page per delivery, not per write.
+
 ## Hash chain
 
 FR-044's hash chain over the replication log, from `cargo bench -p fleetringd --bench capture -- chain`, measured 2026-10-29 on an Apple M1 Max laptop (macOS, Rust 1.99.1, release profile) while other builds shared the machine, so these are the medians of 100 samples rather than idle-machine numbers.
