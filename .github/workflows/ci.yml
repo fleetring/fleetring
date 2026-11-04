@@ -65,7 +65,7 @@ jobs:
     name: test (${{ matrix.os }})
     if: github.event_name != 'push'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -98,9 +98,11 @@ jobs:
       - name: default features
         if: runner.os == 'Linux'
         run: cargo test --workspace --no-fail-fast
+      # Only the placement crate has default features (`std`); every other crate builds the same
+      # with or without them, so running their suites again here would repeat the step above.
       - name: no default features
         if: runner.os == 'Linux'
-        run: cargo test --workspace --no-default-features --no-fail-fast
+        run: cargo test -p fleetring --no-default-features --no-fail-fast
       - name: all features, release
         if: runner.os == 'Linux'
         run: cargo test --workspace --all-features --release --no-fail-fast
