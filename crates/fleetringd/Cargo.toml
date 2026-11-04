@@ -54,6 +54,11 @@ twox-hash = { workspace = true, features = ["alloc", "xxhash3_128"] }
 x509-parser = "0.18"
 zeroize = "1"
 
+# `fleetringd upgrade` restarts a running daemon in place with SIGHUP (ADR-0038). rustix is
+# already in the tree, through tempfile.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+
 [features]
 # The simulation harness (`fleetringd::sim`): the daemon over turmoil's simulated network and
 # clock (ADR-0020).

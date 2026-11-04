@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::{
-    Acks, Action, Applied, DatabaseName, Durability, Engine, HostedReplica, Lease, LeaseEpoch,
-    Liveness, Member, Millis, Position, Rejection, ReplicaRole, Revoked, State,
+    Acks, Action, Applied, DatabaseName, Durability, Engine, Feature, HostedReplica, Lease,
+    LeaseEpoch, Liveness, Member, Millis, Position, Rejection, ReplicaRole, Revoked, Software,
+    State,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
@@ -363,14 +364,18 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
     })
 }
 
-/// What a membership update says about a member besides its attributes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a membership update says about a member besides its attributes, which changes without
+/// the membership epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MemberFlags {
     live: bool,
     draining: bool,
+    /// The software it runs, which never changes the epoch (ADR-0038).
+    software: Option<Software>,
 }
 
-/// Whether each member is live as of the state's time, and whether it is draining, in ID order.
+/// Whether each member is live as of the state's time, whether it is draining, and what it runs,
+/// in ID order.
 fn member_flags(state: &State) -> Vec<MemberFlags> {
     let now = state.now();
     state
@@ -378,11 +383,12 @@ fn member_flags(state: &State) -> Vec<MemberFlags> {
         .map(|member| MemberFlags {
             live: state.liveness(member.id(), now) == Some(Liveness::Live),
             draining: state.is_draining(member.id()),
+            software: member.software().cloned(),
         })
         .collect()
 }
 
-/// The membership as of the state's time.
+/// The membership as of the state's time, with the fleet features enabled.
 fn membership_update(state: &State, flags: &[MemberFlags]) -> MembershipUpdate {
     MembershipUpdate {
         membership_epoch: state.membership_epoch().get(),
@@ -393,8 +399,12 @@ fn membership_update(state: &State, flags: &[MemberFlags]) -> MembershipUpdate {
                 node: Some(node_to_proto(member)),
                 live: flags.live,
                 draining: flags.draining,
-                software: member.software().map(software_to_proto),
+                software: flags.software.as_ref().map(software_to_proto),
             })
+            .collect(),
+        features: state
+            .features()
+            .map(|feature| feature.as_str().to_owned())
             .collect(),
     }
 }
@@ -599,30 +609,33 @@ impl Control for ControlService {
     }
 
     /// Sends the membership once its epoch passes `after_epoch`, then again whenever the epoch
-    /// grows or a member's liveness or draining changes. Liveness is judged at the time of the
-    /// last applied command, so it changes only as commands, such as other members' heartbeats,
-    /// arrive.
+    /// grows, a member's liveness, draining, or software changes, or a fleet feature is enabled.
+    /// Liveness is judged at the time of the last applied command, so it changes only as
+    /// commands, such as other members' heartbeats, arrive.
     async fn watch_membership(
         &self,
         request: Request<WatchMembershipRequest>,
     ) -> Result<Response<Self::WatchMembershipStream>, Status> {
         let caller = authorized(&request)?.clone();
         let after_epoch = request.into_inner().after_epoch;
-        // The epoch and flags the watcher holds: none until the first state is seen.
-        let mut held: Option<(u64, Vec<MemberFlags>)> = None;
+        // What the watcher holds: none until the first state is seen.
+        let mut held: Option<(u64, Vec<MemberFlags>, Vec<Feature>)> = None;
         let updates = WatchStream::new(self.node.watch()).filter_map(move |state| {
             let epoch = state.membership_epoch().get();
             let flags = member_flags(&state);
-            // Epochs only grow, and members change only with the epoch, so a higher epoch or new
-            // flags are a change the watcher hasn't seen.
+            let features: Vec<Feature> = state.features().collect();
+            // Epochs only grow, and members' attributes change only with the epoch, so a higher
+            // epoch, new flags, or new features are a change the watcher hasn't seen.
             let send = match &held {
                 None => epoch > after_epoch,
-                Some((held_epoch, held_flags)) => {
-                    epoch > (*held_epoch).max(after_epoch) || flags != *held_flags
+                Some((held_epoch, held_flags, held_features)) => {
+                    epoch > (*held_epoch).max(after_epoch)
+                        || flags != *held_flags
+                        || features != *held_features
                 }
             };
             let update = send.then(|| Ok(membership_update(&state, &flags)));
-            held = Some((epoch, flags));
+            held = Some((epoch, flags, features));
             update
         });
         Ok(Response::new(caller.guard(Box::pin(updates))))

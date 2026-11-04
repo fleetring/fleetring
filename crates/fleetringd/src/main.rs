@@ -120,7 +120,7 @@ enum Command {
     /// Creates, lists, writes, reads, locates, and drops databases.
     #[command(subcommand)]
     Db(DbCommand),
-    /// Drains a node, or clears its draining mark.
+    /// Drains a node, clears its draining mark, or removes it from the fleet.
     #[command(subcommand)]
     Node(NodeCommand),
     /// Follows the leases data nodes hold.
@@ -183,6 +183,11 @@ struct UpgradeArgs {
     /// `<n>s`; 5m by default.
     #[arg(long, value_parser = parse_ttl)]
     timeout: Option<Duration>,
+    /// Prints what this binary runs, as one JSON object (its release, protocol, control-log
+    /// format, and fleet features), and changes nothing. An upgrade asks a release's binary this
+    /// before it installs it, to check the fleet's features.
+    #[arg(long, exclusive = true)]
+    software: bool,
     #[command(flatten)]
     target: Target,
 }
@@ -525,6 +530,22 @@ enum NodeCommand {
     Undrain {
         /// The node's ID.
         id: NodeId,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Removes a member that is gone for good from the fleet, as a node that leaves on shutdown
+    /// does, so that its release no longer holds the fleet back. Refuses a live member unless
+    /// `--force`; a live node joins again at its next heartbeat anyway. Asks first on a terminal.
+    Remove {
+        /// The node's ID.
+        id: NodeId,
+        /// Removes the member even though it is live.
+        #[arg(long)]
+        force: bool,
+        /// Removes without asking. Without it, the command asks first on a terminal, and
+        /// refuses elsewhere.
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         target: Target,
     },
@@ -1204,6 +1225,33 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             format_drain(&id, &primaries)
         }
         Command::Upgrade(args) => run_upgrade(args).await?,
+        Command::Node(NodeCommand::Remove {
+            id,
+            force,
+            yes,
+            target,
+        }) => {
+            let client = target.client()?;
+            let view = client.status().await.map_err(failed)?;
+            let Some((_, liveness)) = view.members().find(|(member, _)| member.id() == &id) else {
+                return Err(format!("no member of the fleet has the node ID '{id}'").into());
+            };
+            if liveness == Liveness::Live && !force {
+                return Err(format!(
+                    "node '{id}' is live; stop it first, or pass --force (a live node joins \
+                     again at its next heartbeat)"
+                )
+                .into());
+            }
+            if !yes {
+                confirm_remove(&id)?;
+            }
+            let epoch = client.remove_node(&id).await.map_err(failed)?;
+            format!(
+                "removed {id} from the fleet at membership epoch {}\n",
+                epoch.get()
+            )
+        }
         Command::Node(NodeCommand::Undrain { id, target }) => {
             target.client()?.undrain_node(&id).await.map_err(failed)?;
             format!("{id} is no longer draining; it may take primaries again\n")
@@ -1234,6 +1282,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
 /// Runs `upgrade` and returns what it prints. A check that finds a newer release the fleet
 /// doesn't allow prints its report and fails.
 async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
+    if args.software {
+        return Ok(format!("{}\n", fleetringd::software::running_json()));
+    }
     let mode = if args.rollback {
         Mode::Rollback
     } else if args.check {
@@ -1814,6 +1865,27 @@ fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
         Ok(())
     } else {
         Err(format!("not dropping {name}").into())
+    }
+}
+
+fn confirm_remove(id: &NodeId) -> Result<(), Box<dyn Error>> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err(format!("pass --yes to remove {id} without a prompt").into());
+    }
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "remove {id} from the fleet? Its replicas are placed elsewhere. [y/N] "
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    stdin.lock().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        Err(format!("not removing {id}").into())
     }
 }
 

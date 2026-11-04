@@ -231,6 +231,10 @@ message Member {
 message MembershipUpdate {
   uint64 membership_epoch = 1;
   repeated Member members = 2;
+  // The fleet features the fleet has enabled for good, by name (ADR-0038): a node whose release
+  // lacks one can't join, so `fleetringd upgrade` refuses to install such a release. Empty from a
+  // control node that predates the field.
+  repeated string features = 3;
 }
 
 message CreateDatabaseRequest {

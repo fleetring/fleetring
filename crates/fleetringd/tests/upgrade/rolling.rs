@@ -24,8 +24,8 @@ use fleetring::NodeId;
 
 use crate::common::{
     Defect, ProcessFleet, ReleaseServer, TestResult, check_history, create_history_database,
-    current, fake_cosign, path_with, printed, progress, wait_for_members, write_release,
-    write_until,
+    current, fake_cosign, path_with, printed, progress, wait_for_members, wait_for_reported,
+    write_release, write_until,
 };
 
 /// The previous release's binary, from the environment, or `None` to skip.
@@ -171,7 +171,9 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
             assert!(!refused.status.success(), "{}", printed(&refused));
         }
     }
-    runtime.block_on(wait_for_members(&client, &ids, Some(&current())))?;
+    // Every member reports this build: the control node, restarted on it, learned the others' from
+    // their heartbeats.
+    runtime.block_on(wait_for_reported(&client, &ids, &current()))?;
     // Every member supports `undrain` now, so the fleet accepts it, and enables it for good.
     let undrained = fleet
         .command(&this_build, &path)
@@ -204,10 +206,12 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     stop.store(true, Ordering::SeqCst);
     let history = runtime.block_on(writer)?;
     progress(&format!(
-        "{} writes acknowledged, {} retried, {} refused cleanly and resent, {} reads",
+        "{} writes acknowledged, {} retried, {} refused cleanly and resent (at most {} in a row), \
+         {} reads",
         history.acknowledged.len(),
         history.retried,
         history.refused,
+        history.longest_refusal,
         history.reads
     ));
     runtime.block_on(check_history(&client, &name, &history))?;

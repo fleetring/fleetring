@@ -695,6 +695,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rusqlite",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

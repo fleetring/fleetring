@@ -1,6 +1,7 @@
 //! Extracting the new binary and swapping it in atomically, keeping the previous one (ADR-0038,
 //! point 7).
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,54 @@ pub(crate) fn version_of(path: &Path) -> Result<Release, UpgradeError> {
                 text.trim()
             ),
         })
+}
+
+/// What a binary says it runs: its release and the fleet features it supports, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reported {
+    pub(crate) release: Release,
+    pub(crate) features: BTreeSet<String>,
+}
+
+impl Reported {
+    /// What this binary runs.
+    pub(crate) fn this_binary() -> Self {
+        let software = crate::software::running();
+        Self {
+            release: software.release().clone(),
+            features: software
+                .features()
+                .map(|feature| feature.as_str().to_owned())
+                .collect(),
+        }
+    }
+}
+
+/// What the binary at `path` runs, from `--version` and `upgrade --software`. A binary without
+/// `upgrade --software`, such as 0.3.0, supports no fleet features.
+///
+/// # Errors
+///
+/// [`UpgradeError::Binary`] if it doesn't run or doesn't say its version.
+pub(crate) fn software_of(path: &Path) -> Result<Reported, UpgradeError> {
+    /// `upgrade --software`'s output; the other fields are ignored.
+    #[derive(serde::Deserialize)]
+    struct Printed {
+        version: String,
+        #[serde(default)]
+        features: Vec<String>,
+    }
+    let release = version_of(path)?;
+    let features = Command::new(path)
+        .args(["upgrade", "--software"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Printed>(&output.stdout).ok())
+        .filter(|printed| printed.version == release.to_string())
+        .map(|printed| printed.features.into_iter().collect())
+        .unwrap_or_default();
+    Ok(Reported { release, features })
 }
 
 #[cfg(unix)]

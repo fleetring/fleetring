@@ -35,6 +35,21 @@ pub fn running() -> Software {
     )
 }
 
+/// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
+/// release, the protocol, the control-log format, and the fleet features, so that an upgrade can
+/// ask a binary it hasn't installed yet what it supports.
+#[must_use]
+pub fn running_json() -> String {
+    let software = running();
+    serde_json::json!({
+        "version": software.release().to_string(),
+        "protocol": format!("{}.{}", PROTOCOL_VERSION.major, PROTOCOL_VERSION.minor),
+        "control_format": software.control_format(),
+        "features": software.features().map(Feature::as_str).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 /// The protocol form of `software`, which speaks this build's protocol version.
 pub(crate) fn software_to_proto(software: &Software) -> proto::Software {
     proto::Software {

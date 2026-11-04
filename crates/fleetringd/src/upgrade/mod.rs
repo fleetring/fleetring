@@ -18,7 +18,7 @@ mod release;
 mod verify;
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::NodeId;
@@ -27,9 +27,10 @@ use tonic::Status;
 
 pub use process::{PROCESS_FILE, ProcessFile, RESTARTS_VAR};
 
+use crate::MembershipView;
 use crate::data::Client;
 use crate::engine::Position;
-use crate::upgrade::install::{Installed, check_binary, extract, version_of};
+use crate::upgrade::install::{Installed, Reported, check_binary, extract, software_of};
 use crate::upgrade::release::{BUNDLE, SUMS, Source, archive_name};
 use crate::upgrade::verify::{Cosign, check_sum};
 
@@ -125,6 +126,19 @@ pub enum UpgradeError {
         member: NodeId,
         /// That member's release.
         member_release: Release,
+    },
+    /// The release lacks a fleet feature the fleet has enabled, so the fleet would refuse the
+    /// node, or a control node on it couldn't read the control log.
+    #[error(
+        "the fleet doesn't allow fleetringd {release}: it lacks the fleet feature '{feature}' \
+         this fleet uses, so the fleet would refuse the node\n  hint: install a release that \
+         supports it; a fleet never gives up a feature it has used"
+    )]
+    MissingFeature {
+        /// The release asked for.
+        release: Release,
+        /// The enabled feature it lacks.
+        feature: String,
     },
     /// The binary's directory can't be written.
     #[error(
@@ -266,7 +280,7 @@ pub async fn run(options: Options) -> Result<Outcome, UpgradeError> {
 pub struct Outcome {
     /// What it prints.
     pub report: String,
-    /// Whether a check found a newer release the fleet doesn't allow.
+    /// Whether a check found that the fleet doesn't allow the release.
     pub blocked: bool,
 }
 
@@ -275,6 +289,13 @@ impl Outcome {
         Self {
             report,
             blocked: false,
+        }
+    }
+
+    fn blocked(report: String) -> Self {
+        Self {
+            report,
+            blocked: true,
         }
     }
 }
@@ -302,15 +323,27 @@ fn source(options: &Options) -> Result<Source, UpgradeError> {
     )
 }
 
-/// Every member the fleet's window refuses `release` beside: the first one found, in ID order.
-async fn check_fleet(
-    fleet: &Client,
+/// What the fleet allows: its members' releases and the fleet features it has enabled, from the
+/// control plane, if there is one to ask.
+async fn fleet_view(options: &Options) -> Result<Option<MembershipView>, UpgradeError> {
+    match &options.fleet {
+        Some(fleet) => Ok(Some(fleet.status().await?)),
+        None => Ok(None),
+    }
+}
+
+/// Checks that `release` runs beside every member but `node`, the one being upgraded, which
+/// leaves its own release behind.
+///
+/// # Errors
+///
+/// [`UpgradeError::Forbidden`] naming the first member, in ID order, it can't run beside.
+fn check_window(
+    view: &MembershipView,
     node: Option<&NodeId>,
     release: &Release,
 ) -> Result<(), UpgradeError> {
-    let view = fleet.status().await?;
     for (member, _) in view.members() {
-        // The node being upgraded leaves its own release behind.
         if Some(member.id()) == node {
             continue;
         }
@@ -326,22 +359,53 @@ async fn check_fleet(
     Ok(())
 }
 
+/// Checks that `software` supports every fleet feature the fleet has enabled: the fleet refuses
+/// a node, or a control node can't read the log, otherwise.
+///
+/// # Errors
+///
+/// [`UpgradeError::MissingFeature`] naming the first feature it lacks.
+fn check_features(view: &MembershipView, software: &Reported) -> Result<(), UpgradeError> {
+    match view
+        .features()
+        .iter()
+        .find(|feature| !software.features.contains(*feature))
+    {
+        Some(feature) => Err(UpgradeError::MissingFeature {
+            release: software.release.clone(),
+            feature: feature.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 async fn check(options: &Options) -> Result<Outcome, UpgradeError> {
     let source = source(options)?;
     let installed = this_release();
     let available = target_release(options, &source).await?;
     let mut report = format!("installed: {installed}\navailable: {available}\n");
-    let newer = available > installed;
-    if !newer && options.version.is_none() {
+    if available <= installed && options.version.is_none() {
         report.push_str("fleetringd is up to date\n");
         return Ok(Outcome::done(report));
     }
-    let Some(fleet) = &options.fleet else {
+    let Some(view) = fleet_view(options).await? else {
         report.push_str("fleet: not checked; pass --config or --control to check it\n");
         return Ok(Outcome::done(report));
     };
     let node = options.node.as_ref().map(|node| &node.id);
-    match check_fleet(fleet, node, &available).await {
+    let mut verdict = check_window(&view, node, &available);
+    if verdict.is_ok() && !view.features().is_empty() {
+        // What a release supports is known only to its binary, so the check fetches it, and
+        // verifies it as an upgrade would, into a scratch directory.
+        let software = if available == installed {
+            Reported::this_binary()
+        } else {
+            let scratch = scratch()?;
+            software_of(&fetch(&source, &available, scratch.path()).await?)?
+        };
+        verdict = check_features(&view, &software);
+    }
+    match verdict {
         Ok(()) => {
             let _ = writeln!(report, "fleet: allows {available}");
             Ok(Outcome::done(report))
@@ -356,13 +420,47 @@ async fn check(options: &Options) -> Result<Outcome, UpgradeError> {
                 "fleet: doesn't allow {available}: node '{member}' runs {member_release}, and a \
                  fleet runs at most two adjacent release lines at once"
             );
-            Ok(Outcome {
+            Ok(Outcome::blocked(report))
+        }
+        Err(UpgradeError::MissingFeature { feature, .. }) => {
+            let _ = writeln!(
                 report,
-                blocked: newer,
-            })
+                "fleet: doesn't allow {available}: it lacks the fleet feature '{feature}' this \
+                 fleet uses"
+            );
+            Ok(Outcome::blocked(report))
         }
         Err(other) => Err(other),
     }
+}
+
+fn scratch() -> Result<tempfile::TempDir, UpgradeError> {
+    tempfile::tempdir().map_err(|source| UpgradeError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })
+}
+
+/// Downloads `release` into `scratch`, verifies its signature and checksum, and extracts its
+/// binary, which says it is `release`. Returns the binary's path.
+async fn fetch(
+    source: &Source,
+    release: &Release,
+    scratch: &Path,
+) -> Result<PathBuf, UpgradeError> {
+    // Verification needs cosign; find it before downloading anything.
+    let verifier = Cosign::find()?;
+    let target = crate::software::TARGET;
+    let archive_file = archive_name(release, target);
+    let sums = source.download(release, SUMS, scratch).await?;
+    let bundle = source.download(release, BUNDLE, scratch).await?;
+    let archive = source.download(release, &archive_file, scratch).await?;
+    verifier.verify(&sums, &bundle)?;
+    check_sum(&sums, &archive_file, &archive)?;
+    let binary = scratch.join("fleetringd");
+    extract(&archive, release, target, &binary)?;
+    check_binary(&binary, release)?;
+    Ok(binary)
 }
 
 async fn install(options: &Options, installed: &Installed) -> Result<Outcome, UpgradeError> {
@@ -381,29 +479,16 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
         )));
     }
     let running = running_daemon(options, installed)?;
-    if let Some(fleet) = &options.fleet {
-        check_fleet(fleet, options.node.as_ref().map(|node| &node.id), &release).await?;
+    let view = fleet_view(options).await?;
+    if let Some(view) = &view {
+        check_window(view, options.node.as_ref().map(|node| &node.id), &release)?;
     }
     installed.check_writable()?;
-    // Verification needs cosign; find it before downloading anything.
-    let verifier = Cosign::find()?;
-
-    let scratch = tempfile::tempdir().map_err(|source| UpgradeError::Io {
-        path: std::env::temp_dir(),
-        source,
-    })?;
-    let target = crate::software::TARGET;
-    let archive_file = archive_name(&release, target);
-    let sums = source.download(&release, SUMS, scratch.path()).await?;
-    let bundle = source.download(&release, BUNDLE, scratch.path()).await?;
-    let archive = source
-        .download(&release, &archive_file, scratch.path())
-        .await?;
-    verifier.verify(&sums, &bundle)?;
-    check_sum(&sums, &archive_file, &archive)?;
-    let binary = scratch.path().join("fleetringd");
-    extract(&archive, &release, target, &binary)?;
-    check_binary(&binary, &release)?;
+    let scratch = scratch()?;
+    let binary = fetch(&source, &release, scratch.path()).await?;
+    if let Some(view) = &view {
+        check_features(view, &software_of(&binary)?)?;
+    }
     installed.replace_with(&binary)?;
 
     let mut report = format!(
@@ -412,7 +497,7 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
         installed.path().display(),
         installed.previous().display()
     );
-    report.push_str(&restart(options, running, &release).await?);
+    report.push_str(&restart(options, installed, running, &release).await?);
     Ok(Outcome::done(report))
 }
 
@@ -426,10 +511,12 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
     if !previous.is_file() {
         return Err(UpgradeError::NoPrevious { path: previous });
     }
-    let release = version_of(&previous)?;
+    let software = software_of(&previous)?;
+    let release = software.release.clone();
     let running = running_daemon(options, installed)?;
-    if let Some(fleet) = &options.fleet {
-        check_fleet(fleet, options.node.as_ref().map(|node| &node.id), &release).await?;
+    if let Some(view) = fleet_view(options).await? {
+        check_window(&view, options.node.as_ref().map(|node| &node.id), &release)?;
+        check_features(&view, &software)?;
     }
     let current = this_release();
     installed.roll_back()?;
@@ -438,7 +525,7 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
         installed.path().display(),
         previous.display()
     );
-    report.push_str(&restart(options, running, &release).await?);
+    report.push_str(&restart(options, installed, running, &release).await?);
     Ok(Outcome::done(report))
 }
 
@@ -478,6 +565,7 @@ fn running_daemon(
 /// Restarts the running node, if asked to and there is one, and says what happened.
 async fn restart(
     options: &Options,
+    installed: &Installed,
     running: Option<Option<ProcessFile>>,
     release: &Release,
 ) -> Result<String, UpgradeError> {
@@ -513,20 +601,64 @@ async fn restart(
         });
     };
     let mut report = String::new();
-    let moved = drain(fleet, &node.id, options.timeout).await?;
-    let _ = writeln!(report, "drained {}: {moved}", node.id);
-    process::restart(daemon.pid)?;
-    wait_for_restart(&node.data_dir, &daemon, options.timeout).await?;
-    let _ = writeln!(
-        report,
-        "restarted {} in place (pid {})",
-        node.id, daemon.pid
-    );
+    // A node that runs the control role alone isn't a member: it has no primaries to drain and
+    // no replicas to catch up, and it is back once the control plane answers again.
+    let member = fleet
+        .status()
+        .await?
+        .members()
+        .any(|(member, _)| member.id() == &node.id);
+    if member {
+        let moved = drain(fleet, &node.id, options.timeout).await?;
+        let _ = writeln!(report, "drained {}: {moved}", node.id);
+    }
+    // The download and the drain took a while: the daemon may have stopped, or its supervisor
+    // may have restarted it, meanwhile. Signal the daemon that runs now, if one does.
+    let Some(Some(now)) = running_daemon(options, installed)? else {
+        return Err(UpgradeError::Restart {
+            reason: format!(
+                "node {} stopped while it was upgraded; start it to run {release}",
+                node.id
+            ),
+        });
+    };
+    if now != daemon && now.version == release.to_string() {
+        let _ = writeln!(
+            report,
+            "{} was restarted meanwhile, on {release} (pid {})",
+            node.id, now.pid
+        );
+    } else {
+        process::restart(now.pid)?;
+        wait_for_restart(&node.data_dir, &now, options.timeout).await?;
+        let _ = writeln!(report, "restarted {} in place (pid {})", node.id, now.pid);
+    }
+    if !member {
+        wait_for_control(fleet, options.timeout).await?;
+        let _ = writeln!(report, "the control plane answers again on {release}");
+        return Ok(report);
+    }
     wait_for_rejoin(fleet, &node.id, release, options.timeout).await?;
     let _ = writeln!(report, "{} rejoined the fleet on {release}", node.id);
     let caught_up = catch_up(fleet, &node.id, options.timeout).await?;
     let _ = writeln!(report, "{} caught up: {caught_up}", node.id);
     Ok(report)
+}
+
+/// Waits until the control plane answers, as after a control-only node restarted.
+async fn wait_for_control(fleet: &Client, limit: Duration) -> Result<(), UpgradeError> {
+    let answered = tokio::time::timeout(limit, async {
+        while fleet.status().await.is_err() {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await;
+    answered.map_err(|_| UpgradeError::Restart {
+        reason: format!(
+            "the control plane didn't answer within {}s of the restart; its log says why",
+            limit.as_secs()
+        ),
+    })
 }
 
 /// Drains `node` and waits, within `limit`, until it is primary for nothing. A database it

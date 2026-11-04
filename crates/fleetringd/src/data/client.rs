@@ -13,7 +13,7 @@ use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::restore_point::Point;
 use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest,
-    DescribeArchiveRequest, DrainRequest, DropDatabaseRequest, ExecuteRequest,
+    DescribeArchiveRequest, DrainRequest, DropDatabaseRequest, ExecuteRequest, LeaveRequest,
     ListDatabasesRequest, LocateRequest, NodeStatusRequest, QueryRequest, RestoreLatest,
     RestoreRequest, UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
     WatchMembershipRequest,
@@ -686,6 +686,23 @@ impl Client {
                 })
             })
             .collect()
+    }
+
+    /// Removes `node` from the fleet, as a node that leaves on shutdown does, and returns the
+    /// membership epoch after it: for a member that is gone for good. A live node that is removed
+    /// joins again at its next heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if there is no such member, or the status of the failed control call.
+    pub async fn remove_node(&self, node: &NodeId) -> Result<Epoch, Status> {
+        let response = self
+            .control
+            .leave(LeaveRequest {
+                node_id: node.to_string(),
+            })
+            .await?;
+        Ok(Epoch::new(response.membership_epoch))
     }
 
     /// Clears `node`'s draining mark, so that it may take leases again without a restart.
