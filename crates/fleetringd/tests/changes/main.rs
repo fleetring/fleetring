@@ -3,6 +3,7 @@
 
 mod common;
 mod daemon;
+mod failover;
 mod file;
 mod isolation;
 mod logical;
