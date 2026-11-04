@@ -13,9 +13,10 @@ use crate::{DatabaseName, LeaseEpoch, Position, Software, Timestamp};
 /// the membership epoch, and every node learns the address with the next membership update. It
 /// arrives inside the `Join` command, so replaying the log restores it.
 ///
-/// The [`Software`] the member runs is recorded the same way: not a placement attribute, but part
-/// of the membership, so that a member that rejoins on a new release bumps the membership epoch
-/// and every node learns of it (ADR-0038). A member that reported none runs
+/// The [`Software`] the member runs is recorded with it too, but unlike the address it never
+/// changes the membership epoch: a control node of a release that ignores it, such as 0.3.0
+/// after a rollback, must replay the log to the same epoch (ADR-0038). The control node sends a
+/// membership update when it changes all the same. A member that reported none runs
 /// [`Software::baseline`].
 ///
 /// # Examples
@@ -88,6 +89,17 @@ impl Member {
     pub fn with_address(mut self, address: impl Into<String>) -> Self {
         self.address = Some(address.into());
         self
+    }
+
+    /// Returns whether `other` has the same ID, placement attributes, and address: everything
+    /// but the software, which never changes the membership epoch.
+    #[must_use]
+    pub fn same_attributes(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.zone == other.zone
+            && self.host == other.host
+            && self.weight == other.weight
+            && self.address == other.address
     }
 
     /// Records the software the member runs.

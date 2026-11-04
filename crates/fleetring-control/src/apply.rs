@@ -532,9 +532,12 @@ fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
     if recorded != Some(member.software()) {
         check_software(state, &id, &member.running())?;
     }
+    // Software isn't compared: a rejoin on a new release with the same attributes keeps the
+    // membership epoch, so that a control node of a release that ignores software, such as
+    // 0.3.0 after a rollback, replays the log to the same epoch (ADR-0038, point 2).
     let kind = match state.members.get(&id) {
         None => JoinKind::New,
-        Some(entry) if entry.member == member => JoinKind::Rejoined,
+        Some(entry) if entry.member.same_attributes(&member) => JoinKind::Rejoined,
         Some(_) => JoinKind::Updated,
     };
     let membership_epoch = if kind == JoinKind::Rejoined {
@@ -630,12 +633,8 @@ fn heartbeat(
         return Err(Rejection::UnknownMember { id });
     };
     // A heartbeat is never refused for its software: that would make a live node look down. It
-    // only corrects the record, which grows the membership epoch as a join would.
+    // only corrects the record, and leaves the membership epoch as it is, as a join does.
     let software = software.filter(|software| entry.member.software() != Some(software));
-    let membership_epoch = match software {
-        Some(_) => next_membership_epoch(state.membership_epoch)?,
-        None => state.membership_epoch,
-    };
     let mut seen = BTreeSet::new();
     let mut unknown = Vec::new();
     for replica in &replicas {
@@ -670,7 +669,6 @@ fn heartbeat(
     if let Some(software) = software {
         entry.member = entry.member.clone().with_software(software);
     }
-    state.membership_epoch = membership_epoch;
     Ok(Applied::HeartbeatRecorded { id, unknown })
 }
 
