@@ -367,6 +367,17 @@ impl Inner {
         let computed = ChainHash::chain(self.frame_source()?, held, start.as_ref(), &batch)
             .map_err(|error| failed(format!("can't hash the batch: {error}")))?;
         if computed != chain_end {
+            if chain_start.is_none() {
+                // The primary's chain doesn't hold the start, so the archive's hash there went
+                // unchecked: it is the one that differs, as a chain derived past the mark, or
+                // one the primary pruned, can. Start a new base at the batch's end, as for any
+                // other mismatch at the start, rather than refuse every delivery from here on.
+                tracing::warn!(archive = %self.name, %database, ?start, archived = %held, end = %position, primary = %chain_end, "the archive's chain doesn't continue to the primary's; taking a new base snapshot");
+                return self
+                    .snapshot(&mut state, &keys, &database, epoch, &position, chain_end)
+                    .await
+                    .map_err(failed);
+            }
             tracing::error!(archive = %self.name, %database, ?start, end = %position, %computed, primary = %chain_end, "a delivered batch doesn't hash to the primary's chain; not archiving it");
             return Err(failed(format!(
                 "the batch to {position} hashes to {computed}, not to the primary's {chain_end}"
