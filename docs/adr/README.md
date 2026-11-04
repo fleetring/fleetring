@@ -42,6 +42,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0031](0031-node-calls-bound-to-placement.md) | Node-to-node calls are bound to placement: a node acts only on databases placed on it, at epochs control state gives it | Accepted |
 | [0032](0032-fleet-replaces-cluster.md) | "Fleet" replaces "cluster" for the nodes one control plane and one authority govern, as a clean break in 0.3.0 with no aliases | Proposed |
 | [0033](0033-cli-tui-desktop-surfaces.md) | The CLI, a TUI, and a desktop app are separate surfaces over one client crate, with the same RPCs and the same lexicon | Proposed |
+| [0034](0034-metrics-health-and-logs.md) | Metrics, health, and readiness on a separate admin listener, with bounded labels and a span per request | Proposed |
 
 ## Template
 
