@@ -22,7 +22,7 @@ Engines replicate in different ways. In WAL mode, SQLite writes each transaction
    - a **batch payload**: opaque bytes that the engine produces and applies.
 
    SQLite's WAL generations, offsets, and salts stay inside the SQLite adapter.
-3. **Durability sinks are separate from replicas.** Replicas give availability and failover; a durability sink, such as S3 snapshots and log archiving for point-in-time restore, gives backups. Sinks get their own trait later (MVP step 5), so "replicas plus S3", "S3 only", or an engine's own S3 mode can plug in without changing replication.
+3. **Durability sinks are separate from replicas.** Replicas give availability and failover; a durability sink, such as S3 snapshots and log archiving for point-in-time restore, gives backups. Sinks get their own trait later (MVP step 5), so "replicas plus S3", "S3 only", or an engine's own S3 mode can plug in without changing replication. (*Amended 2026-11-03, FR-049:* [ADR-0029](0029-s3-durability-sink.md) builds them as archives, fed by a physical change stream, and puts the plug-in point at the object store rather than at a sink trait of their own.)
 
 ### The SQLite adapter (v0.1)
 

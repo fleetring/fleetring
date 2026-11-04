@@ -23,7 +23,7 @@ Every simulation run checked against the guarantees each database promises, and 
 - FR-035 configurable durability: `acks`, `min_replicas`, per database (ADR-0023; done).
 - FR-037 `db list`, `db drop`, per-node status (in progress).
 - FR-038: drain a node's primaries before it leaves on a planned stop.
-- FR-049 backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029).
+- [FR-049](https://github.com/fleetring/fleetring/issues/52) backups: S3-compatible base snapshots plus log archiving for point-in-time restore (MVP step 5), as an archive, separate from replicas (ADR-0016, point 3, which calls it a durability sink; ADR-0029; [plan](plans/FR-049-s3-durability-sink.md)). Archives write verifiable segments and base snapshots to S3 or a directory; `db restore` builds a new database from one, and `archive restore` a plain SQLite file with no fleet (in review).
 - Control log compaction and bounded control snapshot retention, in FR-064 (E5).
 - [FR-063](https://github.com/fleetring/fleetring/issues/66): metrics (Prometheus) on a separate admin listener, health and readiness endpoints, JSON logs, and a tracing span per request (ADR-0034, proposed; [plan](plans/FR-063-metrics-health-readiness.md)).
 

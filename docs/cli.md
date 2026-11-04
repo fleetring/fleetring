@@ -24,6 +24,7 @@ fleetringd context use home
   | `set-<field>` | change one setting (`db set-durability`) | no |
   | `watch` | follow a stream until interrupted | no |
   | `verify` | check, and report only | no |
+  | `restore` | build a new item from an archive, never over an existing one | no |
   | `drain` | move work off, keeping data | asks |
   | `drop`, `remove`, `revoke` | delete for good | asks |
 

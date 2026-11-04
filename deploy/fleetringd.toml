@@ -132,6 +132,62 @@ id = "node-1"
 # timeout_ms = 5000      # how long one request may take
 # retries = 5            # retries before the change is handed back and retried later
 
+# [[archive]]
+# Archives (FR-049, ADR-0029): each entry writes the databases it names to an object store
+# outside the fleet, for point-in-time restore. Each primary uploads one immutable segment per
+# delivery of acknowledged batches, carrying the hash chain at both ends, and base snapshots;
+# a restore verifies every batch against the chain. The archive's recovery point is its lag,
+# which `status --node` shows as its backlog; no write waits for it. Archives run on frame-source
+# engines (SQLite). Configure the same entries on every node that may become a primary: a new
+# primary continues the archive from the mark the old one replicated.
+#
+# `name`                  1 to 64 lowercase letters, digits, `-`, or `_`; unique among sinks
+#                         and archives, since positions are kept by name
+# `databases`             exact names or prefixes ending in `*`
+# `store`                 "s3"         an S3-compatible bucket: AWS S3, MinIO, Cloudflare R2, Garage
+#                         "directory"  a local directory, such as a mounted volume
+# `prefix`                the key prefix every object is under: "fleetring" by default
+# `segment_interval_ms`   the least time between two segments of a database: 10000
+# `snapshot_interval_ms`  how old the newest base snapshot may get: 86400000 (a day)
+# `snapshot_after_bytes`  how many bytes of segments bring a new base snapshot: 1073741824
+# `keep_snapshots`        how many base snapshots, with the segments that continue them, to keep: 7
+#
+# For S3:
+# `bucket`, `region`      required
+# `endpoint`              "https://s3.<region>.amazonaws.com" by default
+# `path_style`            false; true puts the bucket in the path, as MinIO needs
+# `credentials`           "env" (the default) reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
+#                         optionally AWS_SESSION_TOKEN at start; "file" reads `credentials_file`,
+#                         a TOML file with `access_key_id`, `secret_access_key`, and optionally
+#                         `session_token` that only its owner may read, re-read when it changes
+# `ca`                    a PEM bundle of extra authorities, for a private endpoint
+# `allow_http`            false; true permits an http:// endpoint, for a local MinIO only
+#
+# An archive holds every row of the databases it names, unencrypted: give the bucket the care
+# the nodes' disks get. Restore with `fleetringd db restore <new> --archive <name> --from <db>`,
+# or offline, with no fleet, with `fleetringd archive restore --config <this file> ...`.
+#
+# name = "backups"
+# databases = ["*"]
+# store = "s3"
+# bucket = "fleetring-backups"
+# region = "eu-west-1"
+# endpoint = "https://s3.eu-west-1.amazonaws.com"
+# path_style = false
+# prefix = "fleetring"
+# credentials = "file"
+# credentials_file = "/etc/fleetring/s3.toml"
+# segment_interval_ms = 10000
+# snapshot_interval_ms = 86400000
+# snapshot_after_bytes = 1073741824
+# keep_snapshots = 7
+#
+# [[archive]]
+# name = "local"
+# databases = ["ledger"]
+# store = "directory"
+# path = "/backups/fleetring"
+
 # Principals: what each client certificate may do (ADR-0025). Every connection carries a
 # certificate, and a principal (`cert client <name>`) may do only what its scopes allow; one this
 # file doesn't list may do nothing with its certificate alone. Keep the list identical on every
