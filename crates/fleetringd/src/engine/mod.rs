@@ -15,6 +15,7 @@ mod config;
 mod memory;
 mod pinned;
 mod position;
+mod schema;
 mod sqlite;
 mod statement;
 
@@ -31,6 +32,10 @@ pub use memory::MemoryEngine;
 pub use pinned::{PinnedSnapshot, SnapshotFile, SnapshotGuard};
 pub use position::{
     CheckpointMarker, DatabaseSnapshot, FrameBatch, Payload, Position, ReplicaPosition,
+};
+pub use schema::{
+    Internal, MAX_COUNT_LIMIT, MAX_SCHEMA_OBJECTS, ObjectKind, RowCount, Schema, SchemaObject,
+    SchemaRequest,
 };
 pub use sqlite::{InvalidPageSizeError, SqliteEngine, SqliteFollower};
 pub use statement::{Executed, Rows, Statement, Transaction, Value};
@@ -52,6 +57,12 @@ const _: () = {
     assert_debug_send_sync::<Execution>();
     assert_debug_send_sync::<FrameBatch>();
     assert_debug_send_sync::<InvalidPageSizeError>();
+    assert_debug_send_sync::<Internal>();
+    assert_debug_send_sync::<ObjectKind>();
+    assert_debug_send_sync::<RowCount>();
+    assert_debug_send_sync::<Schema>();
+    assert_debug_send_sync::<SchemaObject>();
+    assert_debug_send_sync::<SchemaRequest>();
     assert_debug_send_sync::<MemoryEngine>();
     assert_debug_send_sync::<OpenMode>();
     assert_debug_send_sync::<ParseCaptureModeError>();

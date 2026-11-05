@@ -25,6 +25,7 @@ mod changes;
 mod follower;
 mod marks;
 mod pins;
+mod schema;
 #[cfg(test)]
 mod tests;
 
@@ -53,8 +54,8 @@ use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
     DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
     FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode,
-    PinnedSnapshot, Position, RowChange, Rows, SinkMarks, SnapshotFile, Statement, Transaction,
-    Value,
+    PinnedSnapshot, Position, RowChange, Rows, Schema, SchemaRequest, SinkMarks, SnapshotFile,
+    Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -468,6 +469,11 @@ impl Database for SqliteDatabase {
             out.push(values);
         }
         Ok(Rows { columns, rows: out })
+    }
+
+    fn schema(&mut self, request: &SchemaRequest) -> Result<Schema, EngineError> {
+        // The adapter's own statements, on the read connection, with the user confinement off.
+        schema::read(&self.reader, request)
     }
 
     fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {
