@@ -325,10 +325,10 @@ A number that only grows, used to order and fence. Always say which one:
 
 ### Expiry
 
-*Planned* (FR-070 phase 3). The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). The control node's own clock stamps the command that drops it.
+The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). A duration is turned into a time by the control node before it logs the command, at least a minute ahead. The control node's sweep stamps the command that drops it with its own clock, so a control node whose clock runs ahead expires databases early by as much. Before the primary deletes its copy, it flushes the database's change streams, its [archive](#archive) included, for up to 30 seconds.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Metadata::expires_at`, `Action::ExpireDatabase`, `Feature::Expiry`. **CLI:** *planned* `--expires-in`, `--expires-at`, `db set-expiry`.
+- **Code:** `Metadata::expires_at`, `Action::ExpireDatabase`, `Feature::Expiry`, `control::MIN_EXPIRY`, `data::Expiry`, `ChangeStreams::flush_database`. **CLI:** `--expires-in`, `--expires-at` on `db create` and `db restore`, `db set-expiry`; `expires` in `db show`.
 - **Not:** TTL (fine in prose for the duration), retention (an archive's), lifetime (a token's), deadline.
 
 ### Failover
@@ -365,7 +365,7 @@ The set of nodes that one control plane and one certificate authority govern, un
 
 ### Fleet feature
 
-A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (*planned*: a command that sets or changes an expiry, and the one that expires a database), ADR-0041.
+A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (a command that sets or changes an expiry, and the one that expires a database), ADR-0041.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetring_control::Feature`, `Action::features`, `State::features`, `State::check_features`, `State::check_admission`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
@@ -520,7 +520,7 @@ A node as the fleet's membership records it: its ID, placement attributes, addre
 Database metadata: a database's [description](#description), [labels](#label), [creator](#creator), creation time, and [expiry](#expiry), kept in control state with a version that grows with every update (ADR-0041). Updates are patches applied in log order; `--if-version` makes one conditional. A creation or update with metadata is a [fleet feature](#fleet-feature), `metadata`.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Metadata`, `MetadataSpec`, `MetadataChange`, `Feature::Metadata`; protocol `DatabaseMetadata`, `CreateDatabaseWithMetadata`, `UpdateDatabase`. **CLI:** `db show`, `db set-description`, `db set-labels`; `metadata` in `db show --json`.
+- **Code:** `fleetring_control::Metadata`, `MetadataSpec`, `MetadataChange`, `Feature::Metadata`; protocol `DatabaseMetadata`, `CreateDatabaseWithMetadata`, `UpdateDatabase`. **CLI:** `db show`, `db set-description`, `db set-labels`, `db set-expiry`; `metadata` in `db show --json`.
 - **Not:** annotations, properties, attributes.
 
 ### Node

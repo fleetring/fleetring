@@ -21,7 +21,7 @@ fleetringd context use home
   | `list` | every item the caller may see, as a table | no |
   | `show` | one item in detail: `db show` (`db locate` predates this rule and stays) | no |
   | `create`, `add`, `issue`, `init` | make something new | no |
-  | `set-<field>` | change one setting (`db set-durability`, `db set-description`, `db set-labels`) | no |
+  | `set-<field>` | change one setting (`db set-durability`, `db set-description`, `db set-labels`, `db set-expiry`) | no |
   | `watch` | follow a stream until interrupted | no |
   | `verify` | check, and report only | no |
   | `restore` | build a new item from an archive, never over an existing one | no |
@@ -39,7 +39,7 @@ fleetringd context use home
 - **One flag, one kind of value, everywhere.** `--node` takes a node ID in every command; an address is `--address <host:port>`. A command that dials one node takes either: `--node` looks the address up in the control plane's membership, and `--address` needs nothing else.
 - **Short flags** only for the universal ones: `-h`, `-V`, `-o`, `-q`, `-v`. No other single letters, so they never collide.
 - **Booleans** are presence flags (`--yes`, `--insecure-plaintext`). A `--no-<x>` form exists only when the default is on.
-- **Durations** are `<n>d`, `<n>h`, `<n>m`, or `<n>s`, as `--ttl` already takes them. Sizes are bytes with an optional `KiB`, `MiB`, or `GiB`.
+- **Durations** are `<n>d`, `<n>h`, `<n>m`, or `<n>s`, as `--ttl` and `--expires-in` take them. Times are RFC 3339, as `--expires-at` and `--at-time` take them. Sizes are bytes with an optional `KiB`, `MiB`, or `GiB`.
 - **Lists** repeat the flag (`--scope read:a --scope write:b`); a comma-separated list is accepted only where values never hold commas.
 
 ## 3. Configuration and precedence
