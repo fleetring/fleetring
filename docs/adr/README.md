@@ -50,7 +50,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0039](0039-dev-mode.md) | Dev mode is the normal daemon on loopback, with a local authority and an admin principal it creates once and reuses | Accepted |
 | [0040](0040-raft-control-group-versions-and-dev-mode.md) | The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends 0035) | Proposed |
 | [0041](0041-agent-kit-metadata-expiry-and-mcp.md) | Databases carry a description, labels, a creator, and an expiry in control state, gated as fleet features and expired by stamped commands; `db show` adds the schema through the engine adapter; `fleetringd mcp` acts on them as one principal | Accepted |
-| [0042](0042-no-deletion-by-absence.md) | A data node deletes a copy only after it saw the database's drop, told by the control node that applied it, and keeps every other copy the control plane doesn't know as an orphan for an operator to remove | Proposed |
+| [0042](0042-no-deletion-by-absence.md) | A data node deletes a copy only after it saw the database's drop, told by the control node that applied it, and keeps every other copy the control plane doesn't know as an orphan for an operator to remove | Accepted |
 
 ## Template
 

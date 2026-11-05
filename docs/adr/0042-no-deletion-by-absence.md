@@ -1,6 +1,6 @@
 # ADR-0042: A data node deletes a copy only after it saw the database's drop, and keeps every other copy as an orphan
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-05)
 - **Date:** 2026-11-05
 - **Related:** ADR-0017 (control state machine), ADR-0018 (leases, epochs, quorums), ADR-0022 (failover), ADR-0025 and ADR-0026 (principals and scopes), ADR-0031 (node calls bound to placement), ADR-0038 (versions and fleet features), ADR-0040 (Raft amendments), ADR-0041 (expiry; amendment 7); tickets FR-077 (#105, part 1), FR-070 (#76)
 
