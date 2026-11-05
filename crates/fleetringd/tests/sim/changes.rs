@@ -48,6 +48,12 @@ fn fleet(seed: u64, timings: Timings) -> Result<Fleet, Box<dyn Error>> {
                 url: None,
                 timeout_ms: 1_000,
                 retries: 1,
+                ca: None,
+                cert: None,
+                key: None,
+                token_file: None,
+                token_env: None,
+                allow_http: false,
             });
         });
     }

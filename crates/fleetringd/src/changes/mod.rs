@@ -84,7 +84,10 @@ pub use self::file::{FileSink, database_file};
 pub use self::matcher::{CaptureRules, DatabaseMatcher, DatabaseMatchers, ParseMatcherError};
 pub use self::memory::MemorySink;
 pub use self::record::{ChangeRecord, NotHex, ParseRecordError, RecordContent, hex, unhex};
-pub use self::webhook::{InvalidUrlError, WebhookSettings, WebhookSink};
+pub use self::webhook::{
+    ClientCertificate, InvalidUrlError, TokenSource, WebhookConfigError, WebhookSecurity,
+    WebhookSettings, WebhookSink,
+};
 
 /// Where a sink's delivered position is kept (ADR-0028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +539,7 @@ async fn supervise(
 /// # Errors
 ///
 /// [`BuildSinkError`] if the configuration lacks what the kind needs, which
-/// [`ChangesConfig::validate`] rules out first, or names a URL the sink can't use.
+/// [`ChangesConfig::validate`] rules out first, or names a URL, authority, certificate, or token the sink can't use.
 pub fn build_sink(
     config: &SinkConfig,
     execution: Execution,
@@ -556,7 +559,12 @@ pub fn build_sink(
                 timeout: Duration::from_millis(config.timeout_ms),
                 retries: config.retries,
             };
-            Arc::new(WebhookSink::new(&config.name, url, settings)?)
+            Arc::new(WebhookSink::new(
+                &config.name,
+                url,
+                settings,
+                &config.webhook_security(),
+            )?)
         }
     };
     Ok(ConfiguredSink {
@@ -578,9 +586,9 @@ pub enum BuildSinkError {
         /// The setting.
         field: &'static str,
     },
-    /// The webhook URL is invalid.
+    /// The webhook can't be built: its URL is invalid, or its TLS or token can't be set up.
     #[error(transparent)]
-    Url(#[from] InvalidUrlError),
+    Webhook(#[from] WebhookConfigError),
 }
 
 const _: () = {
@@ -592,6 +600,7 @@ const _: () = {
     assert_debug_send_sync::<ChangeParts>();
     assert_debug_send_sync::<ChangeRecord>();
     assert_debug_send_sync::<ChangeSettings>();
+    assert_debug_send_sync::<ClientCertificate>();
     assert_debug_send_sync::<ChangeStreams>();
     assert_debug_send_sync::<ChangesConfig>();
     assert_debug_send_sync::<ConfiguredSink>();
@@ -605,6 +614,9 @@ const _: () = {
     assert_debug_send_sync::<SinkError>();
     assert_debug_send_sync::<SinkKind>();
     assert_debug_send_sync::<SinkStatus>();
+    assert_debug_send_sync::<TokenSource>();
+    assert_debug_send_sync::<WebhookConfigError>();
+    assert_debug_send_sync::<WebhookSecurity>();
     assert_debug_send_sync::<WebhookSettings>();
     assert_debug_send_sync::<WebhookSink>();
 };

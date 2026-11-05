@@ -7,6 +7,8 @@ mod failover;
 mod file;
 mod isolation;
 mod logical;
+#[path = "../support/receiver.rs"]
+mod receiver;
 #[path = "../support/mod.rs"]
 mod support;
 mod webhook;

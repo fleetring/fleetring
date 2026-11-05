@@ -4,8 +4,12 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::changes::{CaptureRules, DatabaseMatcher, DatabaseMatchers};
+use crate::changes::{
+    CaptureRules, ClientCertificate, DatabaseMatcher, DatabaseMatchers, TokenSource,
+    WebhookSecurity,
+};
 use crate::config::ConfigError;
+use crate::durability::HttpPolicy;
 use crate::engine::CaptureMode;
 
 /// The longest sink name, so that it always fits a path component.
@@ -26,7 +30,12 @@ const NAME_LEN: usize = 64;
 /// name = "hooks"
 /// kind = "webhook"
 /// databases = ["*"]
-/// url = "http://127.0.0.1:8080/changes"
+/// url = "https://hooks.example.com/changes"
+/// # ca = "/etc/fleetring/hooks-ca.crt"        # trust this authority as well as the platform's
+/// # cert = "/etc/fleetring/hooks-client.crt"  # mutual TLS: present this certificate...
+/// # key = "/etc/fleetring/hooks-client.key"   # ...with this key
+/// # token_file = "/etc/fleetring/hooks.token" # or token_env = "HOOKS_TOKEN"
+/// # allow_http = true                         # only to POST to an http:// url
 /// timeout_ms = 5000
 /// retries = 5
 /// ```
@@ -100,6 +109,29 @@ pub struct SinkConfig {
     /// handed back to the pump, which retries it again later.
     #[serde(default = "default_retries")]
     pub retries: u32,
+    /// For a webhook sink: a PEM bundle of authorities to trust as well as the platform's
+    /// roots, for a receiver with a private certificate.
+    #[serde(default)]
+    pub ca: Option<PathBuf>,
+    /// For a webhook sink: the PEM certificate chain to present to the receiver (mutual TLS).
+    /// Needs `key`.
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
+    /// For a webhook sink: the PEM private key of `cert`. Needs `cert`.
+    #[serde(default)]
+    pub key: Option<PathBuf>,
+    /// For a webhook sink: a file holding a bearer token to send as `Authorization: Bearer
+    /// <token>`, which only its owner may read. At most one of `token_file` and `token_env`.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// For a webhook sink: the environment variable holding the bearer token. At most one of
+    /// `token_file` and `token_env`.
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// For a webhook sink: whether an `http://` `url` is allowed, so that changes leave the node
+    /// unencrypted. Without it only `https://` is.
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -129,26 +161,106 @@ impl SinkConfig {
                 self.name
             )));
         }
+        let webhook_fields = [
+            ("url", self.url.is_some()),
+            ("ca", self.ca.is_some()),
+            ("cert", self.cert.is_some()),
+            ("key", self.key.is_some()),
+            ("token_file", self.token_file.is_some()),
+            ("token_env", self.token_env.is_some()),
+            ("allow_http", self.allow_http),
+        ];
         match self.kind {
-            SinkKind::File if self.path.is_none() => {
-                Err(invalid(format!("file sink `{}` needs a `path`", self.name)))
+            SinkKind::File => {
+                if self.path.is_none() {
+                    return Err(invalid(format!("file sink `{}` needs a `path`", self.name)));
+                }
+                if let Some((field, _)) = webhook_fields.iter().find(|(_, set)| *set) {
+                    return Err(invalid(format!(
+                        "file sink `{}` takes no `{field}`",
+                        self.name
+                    )));
+                }
+                Ok(())
             }
-            SinkKind::File if self.url.is_some() => {
-                Err(invalid(format!("file sink `{}` takes no `url`", self.name)))
+            SinkKind::Webhook => self.validate_webhook(),
+        }
+    }
+
+    fn validate_webhook(&self) -> Result<(), ConfigError> {
+        let name = &self.name;
+        let Some(url) = &self.url else {
+            return Err(invalid(format!("webhook sink `{name}` needs a `url`")));
+        };
+        if self.path.is_some() {
+            return Err(invalid(format!("webhook sink `{name}` takes no `path`")));
+        }
+        if self.timeout_ms == 0 {
+            return Err(invalid(format!(
+                "webhook sink `{name}` needs a `timeout_ms` of at least 1"
+            )));
+        }
+        if url.starts_with("http://") {
+            if !self.allow_http {
+                return Err(invalid(format!(
+                    "webhook sink `{name}` has a plain http `url`, `{url}`, which needs \
+                     `allow_http = true`"
+                )));
             }
-            SinkKind::Webhook if self.url.is_none() => Err(invalid(format!(
-                "webhook sink `{}` needs a `url`",
-                self.name
-            ))),
-            SinkKind::Webhook if self.path.is_some() => Err(invalid(format!(
-                "webhook sink `{}` takes no `path`",
-                self.name
-            ))),
-            SinkKind::Webhook if self.timeout_ms == 0 => Err(invalid(format!(
-                "webhook sink `{}` needs a `timeout_ms` of at least 1",
-                self.name
-            ))),
-            _ => Ok(()),
+        } else if !url.starts_with("https://") {
+            return Err(invalid(format!(
+                "webhook sink `{name}` has `url` `{url}`, which isn't an https:// URL"
+            )));
+        }
+        match (&self.cert, &self.key) {
+            (Some(_), None) => {
+                return Err(invalid(format!(
+                    "webhook sink `{name}` has a `cert` but no `key`; mutual TLS needs both"
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(invalid(format!(
+                    "webhook sink `{name}` has a `key` but no `cert`; mutual TLS needs both"
+                )));
+            }
+            _ => {}
+        }
+        if self.token_file.is_some() && self.token_env.is_some() {
+            return Err(invalid(format!(
+                "webhook sink `{name}` sets both `token_file` and `token_env`; use one"
+            )));
+        }
+        if self.token_env.as_deref().is_some_and(str::is_empty) {
+            return Err(invalid(format!(
+                "webhook sink `{name}` has an empty `token_env`"
+            )));
+        }
+        Ok(())
+    }
+
+    /// How a webhook sink secures its connection, for a webhook sink that
+    /// [`validate`](ChangesConfig::validate) accepted.
+    #[must_use]
+    pub fn webhook_security(&self) -> WebhookSecurity {
+        WebhookSecurity {
+            http: if self.allow_http {
+                HttpPolicy::AllowHttp
+            } else {
+                HttpPolicy::HttpsOnly
+            },
+            ca: self.ca.clone(),
+            client_certificate: match (&self.cert, &self.key) {
+                (Some(certificate), Some(key)) => Some(ClientCertificate {
+                    certificate: certificate.clone(),
+                    key: key.clone(),
+                }),
+                _ => None,
+            },
+            token: match (&self.token_file, &self.token_env) {
+                (Some(path), _) => Some(TokenSource::File(path.clone())),
+                (None, Some(variable)) => Some(TokenSource::Environment(variable.clone())),
+                (None, None) => None,
+            },
         }
     }
 
@@ -174,7 +286,7 @@ fn invalid(reason: String) -> ConfigError {
 pub enum SinkKind {
     /// One append-only NDJSON file per database, under `path`.
     File,
-    /// An HTTP POST of each change as JSON to `url`.
+    /// An HTTP POST of each change as JSON to `url`, over TLS unless `allow_http` says otherwise.
     Webhook,
 }
 

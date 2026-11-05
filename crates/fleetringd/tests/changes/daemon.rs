@@ -38,13 +38,24 @@ name = \"hooks\"
 kind = \"webhook\"
 databases = [\"*\"]
 url = \"http://127.0.0.1:8080/changes\"
+allow_http = true
 timeout_ms = 1000
 retries = 2
+
+[[changes.sink]]
+name = \"secure\"
+kind = \"webhook\"
+databases = [\"*\"]
+url = \"https://hooks.example.com/changes\"
+ca = \"/etc/fleetring/hooks-ca.crt\"
+cert = \"/etc/fleetring/hooks.crt\"
+key = \"/etc/fleetring/hooks.key\"
+token_env = \"HOOKS_TOKEN\"
 "
     );
     let config = Config::from_toml(&text)?;
     let sinks = &config.changes.sink;
-    assert_eq!(sinks.len(), 2);
+    assert_eq!(sinks.len(), 3);
     assert_eq!(
         (sinks[0].kind, sinks[0].format),
         (SinkKind::File, Format::Physical)
@@ -54,6 +65,9 @@ retries = 2
         (SinkKind::Webhook, Format::Logical)
     );
     assert_eq!((sinks[1].timeout_ms, sinks[1].retries), (1000, 2));
+    assert!(sinks[1].allow_http);
+    assert!(!sinks[2].allow_http);
+    assert_eq!(sinks[2].token_env.as_deref(), Some("HOOKS_TOKEN"));
     let rules = config.changes.capture_rules();
     assert_eq!(
         rules.mode_for(&name("anything")),
@@ -80,6 +94,38 @@ retries = 2
         (
             "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]",
             "needs a `url`",
+        ),
+        (
+            "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]\nurl = \"http://x/y\"",
+            "`url`, `http://x/y`, which needs `allow_http = true`",
+        ),
+        (
+            "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]\nurl = \"ftp://x/y\"",
+            "isn't an https:// URL",
+        ),
+        (
+            "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]\nurl = \"https://x/y\"\ncert = \"/c\"",
+            "`cert` but no `key`",
+        ),
+        (
+            "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]\nurl = \"https://x/y\"\nkey = \"/k\"",
+            "`key` but no `cert`",
+        ),
+        (
+            "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]\nurl = \"https://x/y\"\ntoken_file = \"/t\"\ntoken_env = \"T\"",
+            "both `token_file` and `token_env`",
+        ),
+        (
+            "name = \"a\"\nkind = \"webhook\"\ndatabases = [\"*\"]\nurl = \"https://x/y\"\ntoken_env = \"\"",
+            "empty `token_env`",
+        ),
+        (
+            "name = \"a\"\nkind = \"file\"\ndatabases = [\"*\"]\npath = \"/x\"\nallow_http = true",
+            "takes no `allow_http`",
+        ),
+        (
+            "name = \"a\"\nkind = \"file\"\ndatabases = [\"*\"]\npath = \"/x\"\ntoken_file = \"/t\"",
+            "takes no `token_file`",
         ),
         (
             "name = \"a\"\nkind = \"kafka\"\ndatabases = [\"*\"]",

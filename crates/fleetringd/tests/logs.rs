@@ -16,15 +16,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use fleetring::ReplicationFactor;
-use fleetring_control::DatabaseName;
+use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::{Acks, CreateDatabaseRequest, CreateRequest, Engine, ExecuteRequest};
+use fleetringd::changes::{
+    Change, ChangeKind, ChangeSink as _, TokenSource, WebhookSecurity, WebhookSettings, WebhookSink,
+};
 use fleetringd::data::Client;
+use fleetringd::durability::HttpPolicy;
+use fleetringd::engine::Position;
 use fleetringd::observe::log_subscriber;
 use fleetringd::transport::database_client;
 use fleetringd::{Config, Daemon, LogFormat};
 
+use crate::receiver::{ClientAuth, Receiver};
 use crate::support::Tls;
 
+#[path = "support/receiver.rs"]
+mod receiver;
 mod support;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -248,5 +256,127 @@ async fn json_logs_carry_the_rpc_span() -> TestResult {
     );
     assert_eq!(rpc["span"]["code"], serde_json::json!("ok"), "{rpc}");
     assert!(rpc["spans"].is_array(), "{rpc}");
+    Ok(())
+}
+
+/// A change with nothing in it, which a webhook still POSTs.
+fn empty_change() -> Result<Change, Box<dyn Error>> {
+    Ok(Change {
+        database: "ledger".parse()?,
+        epoch: LeaseEpoch::new(1),
+        start: None,
+        position: Position::new(vec![1]),
+        kind: ChangeKind::Logical(Vec::new()),
+        chain_start: None,
+        chain_end: None,
+    })
+}
+
+/// A file only its owner may read, holding `text`.
+fn private_file(path: &Path, text: &str) -> Result<(), Box<dyn Error>> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// A receiver presenting a certificate `tls`'s authority issued.
+async fn receiver_of(tls: &Tls) -> Result<Receiver, Box<dyn Error>> {
+    Receiver::start(
+        &tls.issue_node("receiver")?,
+        tls.authority().certificate_pem(),
+        ClientAuth::None,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_never_logs_its_bearer_token() -> TestResult {
+    lines();
+    const TOKEN: &str = "log-token-5e0b7c2d91";
+    let dir = tempfile::tempdir()?;
+    let trusted = Tls::create(&dir.path().join("trusted"))?;
+    let stranger = Tls::create(&dir.path().join("stranger"))?;
+    let token_file = dir.path().join("hooks.token");
+    private_file(&token_file, TOKEN)?;
+    let secure = WebhookSecurity {
+        ca: Some(trusted.dir().join("ca.crt")),
+        token: Some(TokenSource::File(token_file.clone())),
+        ..WebhookSecurity::default()
+    };
+    let settings = WebhookSettings {
+        timeout: Duration::from_secs(5),
+        retries: 2,
+    };
+
+    // A delivery that succeeds, one the sink doesn't trust (which retries, logging each
+    // attempt), and a token configured for plain http (which warns).
+    let good = receiver_of(&trusted).await?;
+    WebhookSink::new("hooks-ok", good.url(), settings, &secure)?
+        .publish(empty_change()?)
+        .await?;
+    let untrusted = receiver_of(&stranger).await?;
+    let failing = WebhookSink::new("hooks-bad", untrusted.url(), settings, &secure)?;
+    assert!(failing.publish(empty_change()?).await.is_err());
+    WebhookSink::new(
+        "hooks-http",
+        "http://127.0.0.1:9/x",
+        settings,
+        &WebhookSecurity {
+            http: HttpPolicy::AllowHttp,
+            token: Some(TokenSource::File(token_file.clone())),
+            ..WebhookSecurity::default()
+        },
+    )?;
+    let seen = good.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].authorization.as_deref(),
+        Some("Bearer log-token-5e0b7c2d91"),
+        "the token was sent"
+    );
+
+    // The retries and the warning were logged, and no line says the token or its header.
+    let all: Vec<String> = objects()?.iter().map(ToString::to_string).collect();
+    let mine = |sink: &str| {
+        all.iter()
+            .filter(|line| line.contains(&format!("\"sink\":\"{sink}\"")))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        mine("hooks-bad")
+            .iter()
+            .any(|line| line.contains("webhook request failed")),
+        "the failed attempts are logged: {:?}",
+        mine("hooks-bad")
+    );
+    assert!(
+        mine("hooks-http")
+            .iter()
+            .any(|line| line.contains("plain http")),
+        "the plaintext token is warned about: {:?}",
+        mine("hooks-http")
+    );
+    for line in &all {
+        let lower = line.to_lowercase();
+        assert!(
+            !lower.contains(&TOKEN.to_lowercase()),
+            "the token is in a log line: {line}"
+        );
+        // Other tests' daemons log to the same subscriber, so look for the header only in the
+        // lines these sinks wrote.
+        if lower.contains("hooks-") {
+            assert!(
+                !lower.contains("authorization"),
+                "the header is in a log line: {line}"
+            );
+        }
+    }
     Ok(())
 }
