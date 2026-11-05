@@ -550,6 +550,18 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md"
     },
     {
+      "id": "database-schema",
+      "component": "fleetringd",
+      "area": "access",
+      "title": "Schema in db show",
+      "description": "db show lists a database’s tables, views, indexes, triggers and virtual tables with their definitions and row counts capped at a limit, read from its primary with read access.",
+      "status": "built",
+      "since": "0.6.0",
+      "ticket": "FR-070",
+      "issue": 76,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md"
+    },
+    {
       "id": "agent-kit",
       "component": "fleetringd",
       "area": "access",
