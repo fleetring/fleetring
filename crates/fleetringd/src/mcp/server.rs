@@ -897,6 +897,28 @@ mod tests {
         Ok(())
     }
 
+    /// The golden file of the server's instructions, which a model reads as it reads tool
+    /// descriptions: fixed text, changed only deliberately, with `UPDATE_GOLDEN=1`.
+    const INSTRUCTIONS_GOLDEN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp/instructions.txt"
+    );
+
+    #[test]
+    fn instructions_match_the_golden_file() -> Result<(), Box<dyn std::error::Error>> {
+        let text = format!("{INSTRUCTIONS}\n");
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(INSTRUCTIONS_GOLDEN, &text)?;
+        }
+        let golden = std::fs::read_to_string(INSTRUCTIONS_GOLDEN)?;
+        assert_eq!(
+            text, golden,
+            "the instructions changed; regenerate {INSTRUCTIONS_GOLDEN} with UPDATE_GOLDEN=1 and \
+             review the diff"
+        );
+        Ok(())
+    }
+
     #[test]
     fn tool_descriptions_are_static() -> Result<(), Box<dyn std::error::Error>> {
         // Two servers with different principals list the same bytes: nothing about a fleet,
