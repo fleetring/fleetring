@@ -5,11 +5,22 @@ use std::fmt;
 use std::str::FromStr;
 
 use fleetring_control::{
-    DatabaseName, Description, LabelKey, LabelValue, Labels, ParseLabelError, Timestamp,
-    parse_label,
+    DatabaseName, Description, FORBIDDEN_FORMAT_CHARACTERS, LabelKey, LabelValue, Labels,
+    ParseLabelError, Timestamp, parse_label,
 };
 
 use crate::data::client::Location;
+
+/// Whether `character` is one a person can't see where it is printed: a format character
+/// (Unicode `Cf`, by the fixed table a description refuses, which takes in the bidirectional
+/// controls and the zero-width characters) or the line or paragraph separator. A new database
+/// name refuses them, and text output escapes them (ADR-0041, amendment 5).
+pub(crate) fn is_invisible(character: char) -> bool {
+    matches!(character, '\u{2028}' | '\u{2029}')
+        || FORBIDDEN_FORMAT_CHARACTERS
+            .iter()
+            .any(|(first, last)| (*first..=*last).contains(&character))
+}
 
 /// Whether a listing includes each database's description text. Listings leave it out by
 /// default, since a kibibyte times many databases adds up.

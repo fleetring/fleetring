@@ -63,6 +63,7 @@ pub use client::{
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};
+pub(crate) use metadata::is_invisible;
 pub use metadata::{
     Descriptions, LabelRequirement, ListFilter, Listing, MetadataView, NewMetadata,
 };
