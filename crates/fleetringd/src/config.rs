@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use fleetring::{Host, NodeId, Weight, Zone};
+use fleetring::{Host, NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
@@ -48,7 +48,8 @@ use crate::tls::Principal;
 /// The `[tls]` table names the node's certificate, key, and trusted authorities; see
 /// [`TlsConfig`]. The `[control]` table also holds the control node's timings; see [`ControlSettings`]. The
 /// `[membership]` table sets how often a data node sends heartbeats; see [`MembershipSettings`].
-/// The `[replication]` table paces replication; see [`ReplicationConfig`]. The `[changes]`
+/// The `[replication]` table paces replication, and sets the replication factor and durability
+/// of databases created without them; see [`ReplicationConfig`]. The `[changes]`
 /// table lists the sinks that receive each database's changes; see [`ChangesConfig`]. Each
 /// `[[archive]]` entry writes databases to an object store; see [`ArchiveConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -505,14 +506,17 @@ impl Default for MembershipSettings {
     }
 }
 
-/// The `[replication]` table: how a data node paces and bounds replication, and the durability
-/// the control node gives databases created without explicit settings (ADR-0023).
+/// The `[replication]` table: how a data node paces and bounds replication, and the replication
+/// factor and durability the control node gives databases created without explicit settings
+/// (ADR-0023, ADR-0039).
 ///
-/// Every field is optional; the pacing defaults are those of [`ReplicationSettings::new`], and
-/// the durability defaults are `quorum` with `min_replicas` at the write quorum W.
+/// Every field is optional; the pacing defaults are those of [`ReplicationSettings::new`], the
+/// replication factor is 3, and the durability defaults are `quorum` with `min_replicas` at the
+/// write quorum W.
 ///
 /// ```toml
 /// [replication]
+/// replication_factor = 3             # replicas, the primary included; the default for new databases
 /// acks = "quorum"                    # or "all", or "local"; the default for new databases
 /// min_replicas = 2                   # the default floor on reachable replicas; W if unset
 /// max_in_flight = 8                  # batches in flight to one follower
@@ -527,6 +531,10 @@ impl Default for MembershipSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReplicationConfig {
+    /// The replication factor a database is created with unless its creation names one: 3 by
+    /// default, and 1 in the configuration `fleetringd dev` writes. The control node resolves it
+    /// before it logs the creation, so the log always holds an explicit factor. At least 1.
+    pub replication_factor: ReplicationFactor,
     /// The acknowledgement mode a database is created with unless its creation names one.
     pub acks: Acks,
     /// The floor on reachable replicas a database is created with unless its creation names
@@ -582,6 +590,7 @@ impl From<&ReplicationSettings> for ReplicationConfig {
     fn from(settings: &ReplicationSettings) -> Self {
         let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         Self {
+            replication_factor: ReplicationFactor::default(),
             acks: Acks::Quorum,
             min_replicas: None,
             max_in_flight: settings.max_in_flight,
@@ -970,6 +979,21 @@ mod tests {
         assert!(reason.contains("'prometheus'"), "{reason}");
         let unknown = with("\n[admin]\nport = 7401\n");
         assert!(unknown.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn the_default_replication_factor_is_three_and_at_least_one() {
+        let defaults = with("").expect("a minimal config");
+        assert_eq!(defaults.replication.replication_factor.get(), 3);
+        let one = with("\n[replication]\nreplication_factor = 1\n").expect("a factor of 1");
+        assert_eq!(one.replication.replication_factor, ReplicationFactor::ONE);
+        let zero = with("\n[replication]\nreplication_factor = 0\n").expect_err("a factor of 0");
+        let message = zero.to_string();
+        assert!(matches!(zero, ConfigError::Parse(_)), "{message}");
+        assert!(message.contains("replication_factor"), "{message}");
+        assert!(message.contains("nonzero replication factor"), "{message}");
+        let large = with("\n[replication]\nreplication_factor = 256\n");
+        assert!(large.is_err(), "a factor above 255: {large:?}");
     }
 
     #[test]

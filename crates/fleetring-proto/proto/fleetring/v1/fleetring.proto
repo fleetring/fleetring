@@ -242,6 +242,8 @@ message MembershipUpdate {
 
 message CreateDatabaseRequest {
   string database = 1;
+  // Replicas, the primary included; 0 for the fleet's default, which the control node fills in
+  // before it logs the creation. Control nodes before 0.5.0 refuse 0.
   uint32 replication_factor = 2;
   Engine engine = 3;
   // The acknowledgement mode; unspecified for the fleet's default.

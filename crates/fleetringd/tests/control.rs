@@ -133,12 +133,17 @@ async fn delaying_proxy(
 
 /// Serves `node` on a random local port.
 async fn serve(node: ControlHandle) -> Result<SocketAddr, Box<dyn Error>> {
+    serve_service(ControlService::new(node)).await
+}
+
+/// Serves `service` on a random local port.
+async fn serve_service(service: ControlService) -> Result<SocketAddr, Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(
         tonic::transport::Server::builder()
             .layer(AuthLayer::new(Authorizer::plaintext()))
-            .add_service(control_server(ControlService::new(node)))
+            .add_service(control_server(service))
             .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
     );
     Ok(address)
@@ -330,17 +335,21 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
         .await
         .expect_err("invalid id");
     assert_eq!(invalid.code(), Code::InvalidArgument, "{invalid}");
-    let zero = control
+    let large = control
         .create_database(CreateDatabaseRequest {
-            database: "tenant:zero".into(),
-            replication_factor: 0,
+            database: "tenant:large".into(),
+            replication_factor: 256,
             engine: Engine::Unspecified.into(),
             acks: Acks::Unspecified.into(),
             min_replicas: 0,
         })
         .await
-        .expect_err("zero replicas");
-    assert_eq!(zero.code(), Code::InvalidArgument, "{zero}");
+        .expect_err("more than 255 replicas");
+    assert_eq!(large.code(), Code::InvalidArgument, "{large}");
+    assert_eq!(
+        large.message(),
+        "invalid replication factor 256: expected 1 to 255, or 0 for the fleet's default"
+    );
 
     let before = daemon.control().ok_or("no control handle")?.state();
     daemon.run_until(async {}).await;
@@ -759,6 +768,128 @@ async fn the_client_follows_leader_redirects_without_the_caller_noticing() -> Te
     assert_eq!(fresh.leader(), leader.to_string());
     assert_eq!(first_calls.load(Ordering::SeqCst), 2);
     node.shutdown().await;
+    Ok(())
+}
+
+/// A creation request for `database` with `replication_factor` replicas, 0 for the fleet's
+/// default, and every other setting the fleet's default.
+fn create_request(database: &str, replication_factor: u32) -> CreateDatabaseRequest {
+    CreateDatabaseRequest {
+        database: database.into(),
+        replication_factor,
+        engine: Engine::Sqlite.into(),
+        acks: Acks::Unspecified.into(),
+        min_replicas: 0,
+    }
+}
+
+/// The replication factor of every database creation in the log at `path`, by name, in log
+/// order.
+fn logged_factors(path: &Path) -> Result<Vec<(String, u8)>, Box<dyn Error>> {
+    let log = CommandLog::open(path, ControlConfig::new())?;
+    Ok(log
+        .commands()?
+        .into_iter()
+        .filter_map(|(_, command)| match command.action {
+            Action::CreateDatabase {
+                name,
+                replication_factor,
+                ..
+            } => Some((name.to_string(), replication_factor.get())),
+            _ => None,
+        })
+        .collect())
+}
+
+/// A creation that names no replication factor gets the control node's default, filled in
+/// before the command is logged: the log holds the factor itself, so it replays to the same
+/// state whatever the default is later, on any release. An explicit factor wins, and one larger
+/// than the fleet is accepted, since nodes may join later (ADR-0039).
+#[tokio::test]
+async fn a_creation_without_a_replication_factor_logs_the_fleets_default() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cases = [
+        // A three-node fleet with the built-in default, 3.
+        (None, &["a", "b", "c"][..], 3),
+        // A dev node: one member, and a default of 1.
+        (Some(fleetring::ReplicationFactor::ONE), &["dev"][..], 1),
+    ];
+    for (index, (default, members, expected)) in cases.into_iter().enumerate() {
+        let path = dir.path().join(format!("control-{index}.db"));
+        let node =
+            ControlNode::open(&path, ControlOptions::default(), TickClock::default()).await?;
+        let mut service = ControlService::new(node.handle());
+        if let Some(default) = default {
+            service = service.with_default_replication_factor(default);
+        }
+        let control = client(serve_service(service).await?);
+        for id in members {
+            control.join(join_request(id)).await?;
+        }
+
+        let created = control.create_database(create_request("notes", 0)).await?;
+        let placement = created.placement.ok_or("no placement")?;
+        assert_eq!(placement.replication_factor, expected);
+        assert_eq!(placement.replicas.len(), members.len());
+        let pinned = control.create_database(create_request("pinned", 2)).await?;
+        assert_eq!(
+            pinned.placement.ok_or("no placement")?.replication_factor,
+            2
+        );
+        // Larger than the fleet: accepted, with as many replicas as there are members.
+        let wide = control.create_database(create_request("wide", 5)).await?;
+        let wide = wide.placement.ok_or("no placement")?;
+        assert_eq!(wide.replication_factor, 5);
+        assert_eq!(wide.replicas.len(), members.len());
+
+        let published = node.handle().state();
+        node.shutdown().await;
+        assert_eq!(
+            logged_factors(&path)?,
+            [
+                ("notes".to_owned(), u8::try_from(expected)?),
+                ("pinned".to_owned(), 2),
+                ("wide".to_owned(), 5),
+            ],
+            "default {default:?}"
+        );
+        let (replayed, _) = replay(&CommandLog::open(&path, ControlConfig::new())?)?;
+        assert_eq!(replayed, *published);
+    }
+    Ok(())
+}
+
+/// The `[replication] replication_factor` of a control node's configuration is the default it
+/// creates databases with.
+#[tokio::test]
+async fn the_replication_table_sets_the_control_nodes_default_replication_factor() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[replication]\n\
+         replication_factor = 2\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
+    );
+    let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.control_address().ok_or("no control address")?;
+    for id in ["a", "b"] {
+        node_client(address, &tls, id)?
+            .join(join_request(id))
+            .await?;
+    }
+    let created = secure_client(address, &tls)?
+        .create_database(create_request("notes", 0))
+        .await?;
+    assert_eq!(
+        created.placement.ok_or("no placement")?.replication_factor,
+        2
+    );
+    let notes: fleetring_control::DatabaseName = "notes".parse()?;
+    let state = daemon.control().ok_or("no control handle")?.state();
+    let database = state.database(&notes).ok_or("no database")?;
+    assert_eq!(database.replication_factor().get(), 2);
+    daemon.run_until(std::future::ready(())).await;
     Ok(())
 }
 

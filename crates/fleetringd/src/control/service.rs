@@ -87,18 +87,20 @@ impl DurabilityDefaults {
 #[derive(Debug, Clone)]
 pub struct ControlService {
     node: ControlHandle,
+    replication_factor: ReplicationFactor,
     defaults: DurabilityDefaults,
     clock: Arc<dyn Clock>,
     dev: DevMode,
 }
 
 impl ControlService {
-    /// Serves the control node behind `node`, creating databases with the default durability
-    /// unless a creation says otherwise.
+    /// Serves the control node behind `node`, creating databases with three replicas and the
+    /// default durability unless a creation says otherwise.
     #[must_use]
     pub fn new(node: ControlHandle) -> Self {
         Self {
             node,
+            replication_factor: ReplicationFactor::default(),
             defaults: DurabilityDefaults::new(),
             clock: Arc::new(SystemClock),
             dev: DevMode::Off,
@@ -118,6 +120,39 @@ impl ControlService {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Creates databases whose creation names no replication factor with `replication_factor`
+    /// replicas: the control node's `[replication] replication_factor` (ADR-0039). The factor is
+    /// filled in before the creation is logged, so the log never depends on this setting.
+    #[must_use]
+    pub fn with_default_replication_factor(
+        mut self,
+        replication_factor: ReplicationFactor,
+    ) -> Self {
+        self.replication_factor = replication_factor;
+        self
+    }
+
+    /// The replication factor a creation asks for: `requested`, or the fleet's default when it
+    /// is 0.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` if `requested` is above 255.
+    fn replication_factor(&self, requested: u32) -> Result<ReplicationFactor, Status> {
+        if requested == 0 {
+            return Ok(self.replication_factor);
+        }
+        u8::try_from(requested)
+            .ok()
+            .and_then(ReplicationFactor::new)
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "invalid replication factor {requested}: expected 1 to 255, or 0 for the \
+                     fleet's default"
+                ))
+            })
     }
 
     /// Creates databases whose creation names no durability with `defaults`.
@@ -661,15 +696,9 @@ impl Control for ControlService {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let request = request.into_inner();
-        let replication_factor = u8::try_from(request.replication_factor)
-            .ok()
-            .and_then(ReplicationFactor::new)
-            .ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "invalid replication factor {}: expected 1 to 255",
-                    request.replication_factor
-                ))
-            })?;
+        // Resolved here, before the command is stamped and logged, so the log holds the factor
+        // itself and replays the same whatever the configuration says later (ADR-0039).
+        let replication_factor = self.replication_factor(request.replication_factor)?;
         let engine = engine_from(request.engine)?;
         let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
         let action = Action::CreateDatabase {
@@ -679,9 +708,24 @@ impl Control for ControlService {
             durability: Some(durability),
         };
         match self.submit(action).await? {
-            (Applied::DatabaseCreated { .. }, state) => Ok(Response::new(CreateDatabaseResponse {
-                placement: Some(placement(&state, &name)?),
-            })),
+            (Applied::DatabaseCreated { .. }, state) => {
+                let placement = placement(&state, &name)?;
+                let replicas = placement.replicas.len();
+                if replicas < usize::from(replication_factor.get()) {
+                    // Accepted all the same: the fleet may still be growing, and placement
+                    // fills the replica set as members join (ADR-0039).
+                    tracing::warn!(
+                        database = %name,
+                        replication_factor = replication_factor.get(),
+                        replicas,
+                        "the database has fewer replicas than its replication factor until more \
+                         data nodes join"
+                    );
+                }
+                Ok(Response::new(CreateDatabaseResponse {
+                    placement: Some(placement),
+                }))
+            }
             (other, _) => Err(unexpected(&other)),
         }
     }
