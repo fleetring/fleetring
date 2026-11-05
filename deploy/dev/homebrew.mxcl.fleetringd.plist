@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The launchd agent `brew services start fleetringd` installs from homebrew-service.rb: a dev
+  mode node (ADR-0039) that runs at login, as the user, with everything in ~/.fleetring.
+
+  Without Homebrew, copy it to ~/Library/LaunchAgents/, change the binary's path to where
+  fleetringd is installed (install.sh puts it in /usr/local/bin as root, ~/.local/bin otherwise)
+  and the log paths, then run:
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/homebrew.mxcl.fleetringd.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>homebrew.mxcl.fleetringd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/fleetringd/bin/fleetringd</string>
+    <string>dev</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/opt/homebrew/var/log/fleetringd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/homebrew/var/log/fleetringd.log</string>
+</dict>
+</plist>
