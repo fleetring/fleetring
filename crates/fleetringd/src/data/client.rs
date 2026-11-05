@@ -33,6 +33,7 @@ use crate::data::convert::{
 use crate::data::metadata::{
     Descriptions, Expiry, ExpiryRequest, ListFilter, Listing, MetadataView, NewMetadata,
 };
+use crate::data::node::BEING_DROPPED;
 use crate::data::redirect::primary_hint;
 use crate::data::schema::SchemaView;
 use crate::durability::RestoreTarget;
@@ -568,14 +569,15 @@ impl Client {
                 ))
             })?,
         };
-        let created = self
-            .following(start, |mut client| {
+        let created = retrying_while_dropping(name, || {
+            self.following(start.clone(), |mut client| {
                 let request = CreateRequest {
                     database: name.to_string(),
                 };
                 async move { client.create(request).await }
             })
-            .await?;
+        })
+        .await?;
         location(placement_of(created.placement)?)
     }
 
@@ -644,8 +646,8 @@ impl Client {
             })?,
         };
         let point = restore_point(target);
-        let restored = self
-            .following(start, |mut client| {
+        let restored = retrying_while_dropping(name, || {
+            self.following(start.clone(), |mut client| {
                 let request = RestoreRequest {
                     database: name.to_string(),
                     archive: archive.to_owned(),
@@ -654,7 +656,8 @@ impl Client {
                 };
                 async move { client.restore(request).await }
             })
-            .await?;
+        })
+        .await?;
         Ok(Restoration {
             location: location(placement_of(restored.placement)?)?,
             position: optional_position(restored.position),
@@ -1310,6 +1313,40 @@ fn refuses_fleet_default(status: &Status) -> bool {
         && status
             .message()
             .starts_with("invalid replication factor 0: expected 1 to 255")
+}
+
+/// How long a creation or restore is retried while its node is still deleting a dropped
+/// database of the same name: the node's flush limit, a renewal interval for it to notice the
+/// drop, and a margin.
+const DROPPING_RETRY_LIMIT: Duration = Duration::from_secs(45);
+
+/// The longest wait between two of those retries.
+const DROPPING_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// Calls `call` until it succeeds, fails for another reason, or [`DROPPING_RETRY_LIMIT`] passes,
+/// while its node answers that a dropped database named `name` is still being flushed and
+/// deleted there ([`BEING_DROPPED`]), with backoff.
+async fn retrying_while_dropping<T, F, Fut>(name: &DatabaseName, call: F) -> Result<T, Status>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, Status>>,
+{
+    let deadline = tokio::time::Instant::now() + DROPPING_RETRY_LIMIT;
+    let mut wait = Duration::from_millis(100);
+    loop {
+        match call().await {
+            Err(status)
+                if status.code() == Code::Unavailable
+                    && status.message().ends_with(BEING_DROPPED)
+                    && tokio::time::Instant::now() + wait < deadline =>
+            {
+                tracing::debug!(database = %name, retry_in = ?wait, "a dropped database of the name is still being deleted");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(DROPPING_RETRY_MAX);
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// What a metadata call answers when the control node runs a release without database

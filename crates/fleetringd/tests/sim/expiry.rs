@@ -5,8 +5,9 @@
 //! The control node crashes and restarts before the first expiry passes, and the primary of one
 //! expiring database crashes before its expiry and comes back after it. By the end:
 //!
-//! - every database whose expiry passed is gone from control state and from every host's disk,
-//!   the crashed primary's copy included;
+//! - every database whose expiry passed is gone from control state (a follower whose primary
+//!   crashed before it noticed the drop may keep its copy until it restarts: ADR-0041,
+//!   amendment 6);
 //! - none was dropped before its expiry by the simulated clock: every `ExpireDatabase` in the
 //!   log is stamped at or after the expiry its database was created with, and nothing else
 //!   dropped one;
@@ -59,17 +60,12 @@ fn primary(fleet: &Fleet, database: &DatabaseName) -> Option<String> {
     (lease.epoch() == database.epoch()).then(|| lease.holder().to_string())
 }
 
-/// Whether some data host still has a copy of `database`, or a record of its epochs.
+/// Whether some data host has a copy of `database`.
 fn on_some_disk(fleet: &Fleet, database: &str) -> bool {
     DATA.iter().any(|host| {
-        fleet.data_dir(host).is_some_and(|dir| {
-            dir.join("databases").join(database).exists()
-                || dir
-                    .join("replication")
-                    .join("epochs")
-                    .join(database)
-                    .exists()
-        })
+        fleet
+            .data_dir(host)
+            .is_some_and(|dir| dir.join("databases").join(database).exists())
     })
 }
 
@@ -114,7 +110,7 @@ fn expiries(seed: u64) -> TestResult {
     fleet.restart(CONTROL)?;
 
     // The primary of the third expiring database crashes before its expiry, and comes back
-    // after it: it deletes its copy when it recovers.
+    // after it.
     let (crashing, _) = EXPIRING[2];
     let crashing_name: DatabaseName = crashing.parse()?;
     fleet.run_until(
@@ -133,36 +129,17 @@ fn expiries(seed: u64) -> TestResult {
     fleet.run_for(Duration::from_secs(1))?;
     fleet.restart(&primary)?;
 
-    // A follower of the database whose primary crashed before it noticed the drop has no
-    // stream to end; it checks once the control plane has called the database unknown for
-    // longer than the flush limit.
-    let gone = fleet.run_until(
+    // Followers of a database whose primary crashed before it noticed the drop keep their
+    // copies until they restart (ADR-0041, amendment 6), so only control state is checked here.
+    fleet.run_until(
         Duration::from_secs(90),
-        "every expired database gone from control state and every disk",
+        "every expired database gone from control state",
         |fleet| {
             EXPIRING
                 .iter()
-                .all(|(database, _)| dropped(fleet, database) && !on_some_disk(fleet, database))
+                .all(|(database, _)| dropped(fleet, database))
         },
-    );
-    if gone.is_err() {
-        for (database, _) in EXPIRING {
-            let left: Vec<&str> = DATA
-                .iter()
-                .copied()
-                .filter(|host| {
-                    fleet
-                        .data_dir(host)
-                        .is_some_and(|dir| dir.join("databases").join(database).exists())
-                })
-                .collect();
-            eprintln!(
-                "{database}: dropped {}, copies on {left:?}",
-                dropped(&fleet, database)
-            );
-        }
-    }
-    gone?;
+    )?;
     assert!(!dropped(&fleet, KEPT), "{KEPT} expires in an hour");
     assert!(on_some_disk(&fleet, KEPT));
     fleet.await_workloads(Duration::from_secs(60))?;

@@ -105,18 +105,21 @@ impl Fleet {
             control_tables,
             membership_settings,
             fleetringd::Environment::production(),
+            &fleetringd::Environment::production(),
         )
         .await
     }
 
     /// Starts the fleet as [`Fleet::start_configured`] does, with the control daemon in
-    /// `control_environment`, as one whose clock a test moves.
+    /// `control_environment`, as one whose clock a test moves, and each data daemon in
+    /// `data_environment`.
     async fn start_in(
         dir: &Path,
         control_settings: &str,
         control_tables: &str,
         membership_settings: &str,
         control_environment: fleetringd::Environment,
+        data_environment: &fleetringd::Environment,
     ) -> Result<Self, Box<dyn Error>> {
         let tls = Tls::create(dir)?;
         let control_text = format!(
@@ -132,7 +135,9 @@ impl Fleet {
                 "{}{control_settings}",
                 config_with(dir, &tls, id, "data", Some(address), membership_settings)?
             );
-            data.push(Daemon::start(Config::from_toml(&text)?).await?);
+            data.push(
+                Daemon::start_with(Config::from_toml(&text)?, data_environment.clone()).await?,
+            );
         }
         let fleet = Self { control, data, tls };
         fleet.converge().await?;
@@ -3257,7 +3262,15 @@ mod expiry {
         let dir = tempfile::tempdir()?;
         let clock = JumpingClock::default();
         let environment = fleetringd::Environment::production().with_clock(clock.clone());
-        let fleet = Fleet::start_in(dir.path(), "", "", "", environment).await?;
+        let fleet = Fleet::start_in(
+            dir.path(),
+            "",
+            "",
+            "",
+            environment,
+            &fleetringd::Environment::production(),
+        )
+        .await?;
         let client = fleet.client()?;
         let scratch = name("scratch")?;
         let kept = name("kept")?;
@@ -3443,6 +3456,120 @@ mod expiry {
             })
             .ok_or("no update setting the expiry")?;
         assert!(created < leased && leased < expiry_set, "{logged:?}");
+        Ok(())
+    }
+
+    /// A store whose every `put` hangs, so that a dropped database's flush runs to its limit.
+    #[derive(Debug, Default)]
+    struct HangingStore(fleetringd::durability::MemoryStore);
+
+    impl fleetringd::durability::ObjectStore for HangingStore {
+        fn put(&self, _: &str, _: Vec<u8>) -> fleetringd::durability::StoreFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+
+        fn get(&self, key: &str) -> fleetringd::durability::StoreFuture<'_, Option<Vec<u8>>> {
+            self.0.get(key)
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+        ) -> fleetringd::durability::StoreFuture<'_, Vec<fleetringd::durability::ObjectEntry>>
+        {
+            self.0.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> fleetringd::durability::StoreFuture<'_, ()> {
+            self.0.delete(key)
+        }
+    }
+
+    async fn insert_note(client: &Client, database: &DatabaseName, n: i64) -> TestResult {
+        client
+            .execute(
+                database,
+                Statement::with_params("INSERT INTO notes (n) VALUES (?1)", [Value::Integer(n)]),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A name created again right after its database was dropped gets a new, empty database:
+    /// the node still flushing the old copy makes the creation wait, and the old copy's deletion
+    /// never takes the new database's files, on its primary or on its followers (ADR-0041,
+    /// amendment 6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_name_created_again_right_after_a_drop_starts_empty() -> TestResult {
+        const LIMIT: Duration = Duration::from_secs(3);
+        let dir = tempfile::tempdir()?;
+        // Every data node archives to a store that never answers, so a dropped copy is held for
+        // the whole flush limit.
+        let table = format!(
+            "\n[[archive]]\nname = \"{ARCHIVE}\"\ndatabases = [\"*\"]\nstore = \"directory\"\n\
+             path = {:?}\nsegment_interval_ms = 50\n",
+            dir.path().join("archive")
+        );
+        let data_environment = fleetringd::Environment::production()
+            .with_object_store(ARCHIVE, Arc::new(HangingStore::default()))
+            .with_drop_flush_limit(LIMIT);
+        let fleet = Fleet::start_in(
+            dir.path(),
+            "",
+            "",
+            &table,
+            fleetringd::Environment::production(),
+            &data_environment,
+        )
+        .await?;
+        let client = fleet.client()?;
+        let reused = name("reused")?;
+        client.create_database(&reused, three()?).await?;
+        client
+            .execute(
+                &reused,
+                Statement::new("CREATE TABLE notes (n INTEGER NOT NULL)"),
+            )
+            .await?;
+        for n in 1..=3 {
+            insert_note(&client, &reused, n).await?;
+        }
+        wait_until("every node holds a copy", async || {
+            every_node_has(dir.path(), "reused")
+        })
+        .await?;
+
+        // Dropped, and at once created again under the same name, on the same nodes.
+        client.drop_database(&reused).await?;
+        client.create_database(&reused, three()?).await?;
+        client
+            .execute(
+                &reused,
+                Statement::new("CREATE TABLE notes (n INTEGER NOT NULL)"),
+            )
+            .await?;
+        for n in [100, 101] {
+            insert_note(&client, &reused, n).await?;
+        }
+
+        // Past the old copy's flush and deletion, the new database holds its own rows and no
+        // old one, on its primary and on every follower.
+        tokio::time::sleep(LIMIT + Duration::from_secs(3)).await;
+        let rows = client
+            .query(&reused, Statement::new("SELECT n FROM notes ORDER BY n"))
+            .await?;
+        assert_eq!(
+            rows.rows,
+            vec![vec![Value::Integer(100)], vec![Value::Integer(101)]]
+        );
+        wait_until("every copy holding the new rows alone", async || {
+            DATA.iter().all(|id| {
+                super::notes_in(&super::database_file(dir.path(), id, "reused"))
+                    .is_ok_and(|values| values == [100, 101])
+            })
+        })
+        .await?;
+        fleet.stop().await;
         Ok(())
     }
 }
