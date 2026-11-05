@@ -350,13 +350,13 @@ pub(super) async fn check_promote(
     Err(refuse(inner, Some(database), denied))
 }
 
-/// Checks a `DropCopy` naming `database` at `epoch` against control state, whoever made it: the
-/// drop stands only if control state no longer holds the database, or holds a newer one of the
-/// name at a lower epoch (ADR-0042). A node certificate is refused with the binding; a plaintext
-/// caller with `FAILED_PRECONDITION`.
-///
-/// Control state that was lost or replaced confirms any drop, so the notice is what proves one:
-/// only a control node that dropped the database sends it.
+/// Checks a `DropCopy` naming `database` at `epoch`, whoever made it (ADR-0042): the drop stands
+/// only if `epoch` is exactly the highest epoch this node's copy recorded, so the notice names
+/// this copy's incarnation, and control state no longer holds the database, or holds a newer one
+/// of the name at a lower epoch. A live database's control epoch equals its copies' highest, and
+/// a database created again under the name restarts its epochs, so neither a forged notice nor a
+/// late one for an earlier incarnation passes. A node certificate is refused with the binding;
+/// a plaintext caller with `FAILED_PRECONDITION`.
 pub(super) async fn check_drop(
     inner: &Inner,
     database: &DatabaseName,
@@ -364,11 +364,13 @@ pub(super) async fn check_drop(
     caller: Option<&NodeId>,
 ) -> Result<(), Status> {
     let lease_epoch = LeaseEpoch::new(epoch);
-    match inner.authority.holders(database).await {
-        Ok(holders) if holders.epoch < lease_epoch => return Ok(()),
-        Ok(_) => {}
-        Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
-        Err(status) => return Err(status),
+    if inner.epochs.highest(database) == Some(epoch) {
+        match inner.authority.holders(database).await {
+            Ok(holders) if holders.epoch < lease_epoch => return Ok(()),
+            Ok(_) => {}
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
+            Err(status) => return Err(status),
+        }
     }
     let reason = Unbound::NotDropped {
         database: database.clone(),

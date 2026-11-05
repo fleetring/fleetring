@@ -312,6 +312,11 @@ impl DataNode {
             .unwrap_or(Fate::Kept)
     }
 
+    /// Holds `name` against a create, a restore, or an orphan removal while the guard lives.
+    pub(super) async fn lock_name(&self, name: &DatabaseName) -> impl Drop + '_ {
+        self.inner.creating.lock(name).await
+    }
+
     /// Deletes this node's orphan copy of `name` at an operator's request (ADR-0042), and
     /// returns the highest epoch it had recorded.
     ///
