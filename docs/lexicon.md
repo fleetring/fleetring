@@ -252,6 +252,14 @@ The set of revoked tokens and signing keys the control plane keeps and publishes
 - **Code:** `Revocations`, `Revoked`, protocol `Revocation`. **CLI:** `fleetringd token revoke`.
 - **Not:** blocklist, blacklist, revocation list, CRL.
 
+### Dev mode
+
+One node on loopback, with a local [authority](#authority) and an `admin` [principal](#principal) with every [scope](#scope), that `fleetringd dev` creates once in `~/.fleetring` and reuses, for development only (ADR-0039). It is the normal daemon with `dev = true` in its configuration, which keeps every address on loopback; `status` prints `dev mode` for it.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `dev::DevMode`, `dev::prepare`, protocol `MembershipUpdate.dev_mode`. **CLI:** `fleetringd dev [--data-dir <dir>] [--port <n>]`; `dev = true` in config; `~/.fleetring/env`.
+- **Not:** local mode, sandbox, playground, standalone, single-node mode (a fleet of one node needn't be dev mode).
+
 ### Directory
 
 In cells: the explicit rules, by longest prefix or exact key, that pick a key's cell before the ring does, for residency and pinning (ADR-0012). Elsewhere the word means a filesystem directory (`--dir`, `data_dir`).

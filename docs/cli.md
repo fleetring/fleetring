@@ -29,7 +29,7 @@ fleetringd context use home
   | `undrain` | clear a drain mark, so the node takes work again | no |
   | `drop`, `remove`, `revoke` | delete for good | asks |
 
-- **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request.
+- **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, `dev`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request. `dev` is the daemon too, run from a directory it prepares (ADR-0039), so it sits beside `--config` rather than under a noun.
 - **Arguments** are for the thing the command acts on (`db drop <database>`); everything else is a flag. At most one positional kind per command, plus SQL and its parameters for `db exec` and `db query`.
 - **No aliases.** A command or flag has one spelling; a rename replaces it outright ([renames](#14-renames)).
 
@@ -183,8 +183,8 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | `noun verb` structure | Yes: `db create`, `node drain`, `cert init`, `token issue`, `lease watch`. | Done (FR-062) |
 | Names from the lexicon | Yes: `--fleet`, the `fleet` scope, and "fleet" in help and logs. | Done (FR-059, FR-062) |
 | One flag, one kind of value | Yes: `--node` takes a node ID in `db list`, `status`, `lease watch`, `db exec`, and `db query`; `--address` takes `host:port`; `cert node --addresses` takes the addresses a node is dialed at. | Done (FR-062) |
-| Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key` (`FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`); `--token` has `FLEETRING_TOKEN`. No context step. | FR-056 |
-| Contexts | None; every command takes `--control` or `--config`, and TLS flags. | FR-056 |
+| Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key` (`FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`); `--token` has `FLEETRING_TOKEN`; `--control`, then `--config`, then `FLEETRING_CONTROL` for the control address. No context step. | FR-056 |
+| Contexts | None; every command takes `--control`, `--config`, or `FLEETRING_CONTROL`, and TLS flags. `fleetringd dev` writes `<dir>/env`, which sets the variables for its node until it can write a `dev` context instead (ADR-0039). | FR-056 |
 | `--json` / `-o` with stable fields | None; human output only. | FR-056 |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
 | Quiet when piped | Commands print no progress or colour; logs are warnings only. No `--quiet`. | FR-056 |

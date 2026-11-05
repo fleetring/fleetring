@@ -17,6 +17,7 @@ use serde::Deserialize;
 use crate::auth::Scopes;
 use crate::changes::ChangesConfig;
 use crate::control::DurabilityDefaults;
+use crate::dev::{self, DevMode};
 use crate::durability::ArchiveConfig;
 use crate::engine::EngineConfig;
 use crate::replication::ReplicationSettings;
@@ -88,6 +89,10 @@ pub struct Config {
     /// line.
     #[serde(default)]
     pub insecure_plaintext: Plaintext,
+    /// Whether this is a dev mode node (ADR-0039): `dev = true` keeps every address on loopback
+    /// and the control node reports it. `fleetringd dev` writes it.
+    #[serde(default)]
+    pub dev: DevMode,
     /// The principals client certificates may name, with what each may do (ADR-0025). A
     /// principal not listed may do nothing with a certificate alone. Keep the list identical on
     /// every node.
@@ -790,11 +795,13 @@ impl Config {
     /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
     /// below the lease duration, or a `[[changes.sink]]` or `[[archive]]` entry is invalid, or two
     /// share a name, or `[admin] listen` isn't a loopback address while neither `admin.tls` nor
-    /// `admin.allow_plaintext` is set, or `[admin] scrapers` names a principal twice.
+    /// `admin.allow_plaintext` is set, or `[admin] scrapers` names a principal twice, or, with
+    /// `dev = true`, an address isn't loopback, the role isn't `both`, or plaintext is allowed.
     ///
     /// Whether the daemon has an identity is checked when it starts, because the environment
     /// may supply one; see [`Daemon::start_with`](crate::Daemon::start_with).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        dev::validate(self)?;
         if self.role == NodeRole::Data && self.control.address.is_none() {
             return Err(ConfigError::Missing {
                 field: "control.address",

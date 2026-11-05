@@ -25,6 +25,7 @@ use fleetringd::data::{
     ArchiveDescription, Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo,
     Verification,
 };
+use fleetringd::dev::{self, DevError, DevMode, Prepared};
 use fleetringd::durability::{
     ArchiveKeys, RestoreTarget, build_store, finish_offline, restore_into,
 };
@@ -52,6 +53,10 @@ const TLS_DIR_VAR: &str = "FLEETRING_TLS_DIR";
 
 /// The environment variable that holds a bearer token, used when `--token` isn't given.
 const TOKEN_VAR: &str = "FLEETRING_TOKEN";
+
+/// The environment variable that names the control node's address, used when neither
+/// `--control` nor `--config` is given. Dev mode's environment file sets it (ADR-0039).
+const CONTROL_VAR: &str = "FLEETRING_CONTROL";
 
 /// The environment variable that chooses the log format when `--log-format` isn't given.
 const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
@@ -110,6 +115,11 @@ struct DaemonArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Runs one node for development, on loopback only, with a local authority and an admin
+    /// principal that every command can act as (ADR-0039). The first run creates them, with the
+    /// node's configuration, in the directory; later runs reuse them. Load `<dir>/env` in another
+    /// terminal to point the commands at the node. Not for production.
+    Dev(DevArgs),
     /// Creates the fleet's certificate authority and issues node and client certificates.
     #[command(subcommand)]
     Cert(CertCommand),
@@ -151,6 +161,20 @@ enum Command {
         #[command(flatten)]
         target: Target,
     },
+}
+
+/// `fleetringd dev`'s flags (ADR-0039).
+#[derive(Debug, Args)]
+struct DevArgs {
+    /// The directory that holds the authority, the certificates, the configuration, and the
+    /// databases; `~/.fleetring` by default.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// The loopback port the node serves on, 7400 by default; the admin listener takes the next
+    /// one. Only the first run chooses it: later runs read it from `<dir>/fleetringd.toml`, and
+    /// refuse a different one.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 /// `fleetringd upgrade`'s flags (ADR-0038).
@@ -578,7 +602,8 @@ struct SqlArgs {
 #[derive(Debug, Args)]
 struct Target {
     /// The control node's address, `host:port`: the node that runs the control role, not any node
-    /// in the fleet. A data-only node answers with the control node's address.
+    /// in the fleet. A data-only node answers with the control node's address. Defaults to
+    /// `FLEETRING_CONTROL` when neither this nor `--config` is given.
     #[arg(long, conflicts_with = "config")]
     control: Option<String>,
     /// A daemon's configuration file, to take the control node's address from.
@@ -741,7 +766,10 @@ impl Target {
                 .control_target()
                 .ok_or("the configuration names no control address; pass --control")?
                 .to_string(),
-            (None, None) => return Err("pass --control or --config".into()),
+            (None, None) => std::env::var(CONTROL_VAR)
+                .ok()
+                .filter(|control| !control.is_empty())
+                .ok_or_else(|| format!("pass --control or --config, or set {CONTROL_VAR}"))?,
         };
         Ok(Client::new(control, self.tls.network()?))
     }
@@ -887,24 +915,67 @@ fn hex(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// What the process runs: a command, or the daemon.
+#[derive(Debug)]
+enum Run {
+    /// A command that talks to a fleet, or works offline.
+    Command(Command),
+    /// The daemon, from a configuration file or from dev mode's directory.
+    Daemon {
+        args: DaemonArgs,
+        config: Box<Config>,
+        /// Set in dev mode: the prepared directory, for the banner.
+        dev: Option<Box<Prepared>>,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(error) = cli.check() {
         error.exit();
     }
-    // The daemon reads its configuration before logging starts, since it may name the format.
-    let config = match (&cli.command, &cli.daemon.config) {
-        (None, Some(path)) => match Config::load(path) {
-            Ok(config) => Some(config),
+    let Cli {
+        command,
+        daemon,
+        log_format: format_flag,
+    } = cli;
+    // The daemon reads its configuration before logging starts, since it may name the format;
+    // dev mode prepares its directory first, since the configuration is in it.
+    let run = match (command, daemon.config.clone()) {
+        (Some(Command::Dev(args)), _) => match prepare_dev(&args) {
+            Ok(prepared) => Run::Daemon {
+                args: daemon,
+                config: Box::new(prepared.config().clone()),
+                dev: Some(Box::new(prepared)),
+            },
             Err(error) => {
                 report(&error);
                 return ExitCode::FAILURE;
             }
         },
-        _ => None,
+        (Some(command), _) => Run::Command(command),
+        (None, Some(path)) => match Config::load(path) {
+            Ok(config) => Run::Daemon {
+                args: daemon,
+                config: Box::new(config),
+                dev: None,
+            },
+            Err(error) => {
+                report(&error);
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => {
+            eprintln!("fleetringd: --config is required");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match &run {
+        Run::Daemon { config, .. } => Some(config.as_ref()),
+        Run::Command(_) => None,
     };
     let variable = std::env::var(LOG_FORMAT_VAR).ok();
-    let format = match log_format(cli.log_format, variable.as_deref(), config.as_ref()) {
+    let format = match log_format(format_flag, variable.as_deref(), config) {
         Ok(format) => format,
         Err(value) => {
             eprintln!("fleetringd: invalid {LOG_FORMAT_VAR} '{value}'; use text or json");
@@ -912,10 +983,9 @@ fn main() -> ExitCode {
         }
     };
     // The daemon logs at info; a command prints its result and logs only warnings.
-    let default_filter = if cli.command.is_some() {
-        "warn"
-    } else {
-        "info"
+    let default_filter = match run {
+        Run::Command(_) => "warn",
+        Run::Daemon { .. } => "info",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
     if let Err(error) = log_subscriber(format, filter, std::io::stderr).try_init() {
@@ -929,12 +999,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = match (cli.command, config) {
-        (Some(command), _) => runtime
+    let result = match run {
+        Run::Command(command) => runtime
             .block_on(run_command(command))
             .map(|()| Stopped::Exit),
-        (None, Some(config)) => runtime.block_on(run_daemon(cli.daemon, config)),
-        (None, None) => Err("--config is required".into()),
+        Run::Daemon { args, config, dev } => {
+            runtime.block_on(run_daemon(args, *config, dev.map(|prepared| *prepared)))
+        }
     };
     // Every task, connection, and database is closed by now; the runtime's threads go too,
     // before a restart executes the binary again.
@@ -1025,7 +1096,20 @@ fn restart_in_place(_: &Path, _: u32) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run_daemon(args: DaemonArgs, config: Config) -> Result<Stopped, Box<dyn Error>> {
+/// Prepares dev mode's directory: creates what it lacks, and loads its configuration.
+fn prepare_dev(args: &DevArgs) -> Result<Prepared, DevError> {
+    let dir = match &args.data_dir {
+        Some(dir) => dir.clone(),
+        None => dev::default_dir()?,
+    };
+    dev::prepare(&dir, args.port, SystemClock.now())
+}
+
+async fn run_daemon(
+    args: DaemonArgs,
+    config: Config,
+    dev: Option<Prepared>,
+) -> Result<Stopped, Box<dyn Error>> {
     let config = args.apply(config);
     // Read before an upgrade can replace the file: the path a restart executes again.
     let exe = std::env::current_exe()?;
@@ -1034,6 +1118,12 @@ async fn run_daemon(args: DaemonArgs, config: Config) -> Result<Stopped, Box<dyn
     // finds the default action, which ends the process.
     let signals = StopSignals::listen();
     let daemon = Daemon::start(config).await?;
+    if let Some(prepared) = &dev {
+        eprint!(
+            "\n{}\n",
+            prepared.banner(daemon.listen_address(), daemon.admin_address())
+        );
+    }
     let process = ProcessFile::this_process(exe.clone());
     if let Err(error) = process.write(&data_dir) {
         tracing::warn!(%error, "can't write the process file; `fleetringd upgrade` can't restart this node in place");
@@ -1058,6 +1148,7 @@ async fn run_daemon(args: DaemonArgs, config: Config) -> Result<Stopped, Box<dyn
 
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     let output = match command {
+        Command::Dev(_) => return Err("fleetringd dev runs the daemon, not a command".into()),
         Command::Cert(command) => run_cert(command)?,
         Command::Token(command) => run_token(command).await?,
         Command::Status {
@@ -2138,7 +2229,12 @@ fn format_status(view: &MembershipView) -> String {
     let fingerprint = view
         .fingerprint()
         .map_or_else(|| "none".to_owned(), |fingerprint| fingerprint.to_string());
-    let mut output = format!(
+    let mut output = String::new();
+    if view.dev_mode() == DevMode::On {
+        output.push_str("dev mode: one node on loopback, for development only\n");
+    }
+    let _ = write!(
+        output,
         "membership epoch: {}\nring fingerprint: {fingerprint}\nmembers:\n",
         view.epoch().get()
     );
@@ -2346,6 +2442,23 @@ mod tests {
             let cli = Cli::try_parse_from(words).expect("clap parses it");
             assert!(cli.check().is_ok(), "{words:?}");
         }
+    }
+
+    #[test]
+    fn dev_takes_a_directory_and_a_port_and_no_daemon_options() {
+        let cli = Cli::try_parse_from(["fleetringd", "dev", "--data-dir", "d", "--port", "7410"])
+            .expect("dev parses");
+        assert!(cli.check().is_ok());
+        let Some(Command::Dev(args)) = cli.command else {
+            panic!("not dev: {:?}", cli.command);
+        };
+        assert_eq!(args.data_dir, Some(PathBuf::from("d")));
+        assert_eq!(args.port, Some(7410));
+        let cli = Cli::try_parse_from(["fleetringd", "--listen", "0.0.0.0:7400", "dev"])
+            .expect("clap parses it");
+        let refused = cli.check().expect_err("a daemon option beside dev");
+        assert_eq!(refused.kind(), ErrorKind::ArgumentConflict);
+        assert!(Cli::try_parse_from(["fleetringd", "dev", "--listen", "0.0.0.0:7400"]).is_err());
     }
 
     #[test]

@@ -22,6 +22,11 @@ role = "both"
 # authenticated or encrypted, so this is for local experiments only.
 # insecure_plaintext = true
 
+# Dev mode (ADR-0039), which `fleetringd dev` writes into its own configuration: the daemon then
+# refuses any listen, advertise, control, or admin address that isn't loopback, any role but
+# `both`, and plaintext. Never set it on a node of a real fleet.
+# dev = true
+
 [tls]
 # Every connection is mutual TLS (ADR-0025). The node presents the certificate `cert` with its key,
 # and trusts the authority certificates in `ca`; clients and other nodes must present certificates

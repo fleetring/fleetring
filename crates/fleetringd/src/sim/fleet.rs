@@ -492,6 +492,7 @@ fn host_config(
         archive: Vec::new(),
         tls: None,
         insecure_plaintext: crate::Plaintext::Refused,
+        dev: crate::dev::DevMode::Off,
         principals: vec![workload_principal()],
         // The admin listener doesn't start on a simulated network; the sampler runs on its clock.
         admin: crate::AdminConfig::default(),

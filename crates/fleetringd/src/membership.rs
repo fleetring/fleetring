@@ -46,6 +46,7 @@ use tonic::{Code, Status};
 use crate::auth::Denylist;
 use crate::control::{ControlClient, member_from, node_to_proto};
 use crate::data::convert::revocations_from_proto;
+use crate::dev::DevMode;
 use crate::observe::MembershipMetrics;
 use crate::software::{running, software_from_proto, software_to_proto};
 use crate::{MembershipSettings, OnShutdown};
@@ -95,6 +96,8 @@ pub struct MembershipView {
     draining: Vec<NodeId>,
     /// The fleet features enabled for good.
     features: Vec<String>,
+    /// Whether the control node runs in dev mode.
+    dev: DevMode,
 }
 
 impl MembershipView {
@@ -478,6 +481,7 @@ impl Publisher {
     fn apply(&self, update: MembershipUpdate) {
         let epoch = Epoch::new(update.membership_epoch);
         let features = update.features.clone();
+        let dev = DevMode::from(update.dev_mode);
         let (members, draining) = match members_from(update) {
             Ok(members) => members,
             Err(status) => {
@@ -499,6 +503,7 @@ impl Publisher {
                 members,
                 draining,
                 features,
+                dev,
                 ..MembershipView::clone(&previous)
             }
         } else {
@@ -506,6 +511,7 @@ impl Publisher {
                 Some(view) => MembershipView {
                     previous_ring: previous.ring.clone(),
                     features,
+                    dev,
                     ..view
                 },
                 None => return,
@@ -532,10 +538,15 @@ impl MembershipView {
     pub(crate) fn from_update(update: MembershipUpdate) -> Result<Self, tonic::Status> {
         let epoch = Epoch::new(update.membership_epoch);
         let features = update.features.clone();
+        let dev = DevMode::from(update.dev_mode);
         let (members, draining) = members_from(update)
             .map_err(|status| tonic::Status::internal(format!("invalid membership: {status}")))?;
         rebuild(epoch, members, draining)
-            .map(|view| MembershipView { features, ..view })
+            .map(|view| MembershipView {
+                features,
+                dev,
+                ..view
+            })
             .ok_or_else(|| tonic::Status::internal("the membership can't form a ring"))
     }
 }
@@ -552,6 +563,13 @@ impl MembershipView {
     #[must_use]
     pub fn features(&self) -> &[String] {
         &self.features
+    }
+
+    /// Returns whether the control node runs in dev mode (ADR-0039): one node on loopback, for
+    /// development only. Off from a control node that predates the field.
+    #[must_use]
+    pub fn dev_mode(&self) -> DevMode {
+        self.dev
     }
 }
 
@@ -615,6 +633,7 @@ fn rebuild(
                 members,
                 draining,
                 features: Vec::new(),
+                dev: DevMode::Off,
             })
         }
         Err(error) => {
@@ -885,6 +904,7 @@ mod tests {
                 })
                 .collect(),
             features: Vec::new(),
+            dev_mode: false,
         }
     }
 

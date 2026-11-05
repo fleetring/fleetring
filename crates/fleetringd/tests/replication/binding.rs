@@ -121,6 +121,7 @@ fn members(epoch: u64, ids: &[&str]) -> MembershipUpdate {
             })
             .collect(),
         features: Vec::new(),
+        dev_mode: false,
     }
 }
 
