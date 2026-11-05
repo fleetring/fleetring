@@ -13,7 +13,7 @@ fleetringd token revoke --token-id 3q2-…
 fleetringd context use home
 ```
 
-- **Nouns** are lexicon terms, singular: `db`, `node`, `cert`, `token`, `lease`, `context`, `sink`, `archive`. `db` is the one abbreviation, and stays because it is short and universal.
+- **Nouns** are lexicon terms, singular: `db`, `node`, `cert`, `token`, `lease`, `context`, `sink`, `archive`, `orphan`. `db` is the one abbreviation, and stays because it is short and universal.
 - **Verbs** come from a small set, reused across nouns:
 
   | Verb | Means | Destructive |
@@ -116,7 +116,7 @@ fleetringd: database 'notes' doesn't exist on fleet 'home'
 
 ## 7. Confirmation and `--yes`
 
-- **Destructive commands ask first** on a terminal: dropping a database, removing a member, revoking every token of a signing key, re-initializing an authority. The prompt names what will be lost: `drop database 'notes' and every replica's copy? type the name to confirm:`. Irreversible actions ask for the name typed, not `y`.
+- **Destructive commands ask first** on a terminal: dropping a database, removing a member, removing an orphan copy, revoking every token of a signing key, re-initializing an authority. The prompt names what will be lost: `drop database 'notes' and every replica's copy? type the name to confirm:`. Irreversible actions ask for the name typed, not `y`.
 - **`--yes` skips the question.** Without a terminal and without `--yes`, the command refuses with exit code 2 and says to pass `--yes`.
 - **`--dry-run`** shows what would change, where the command can know: a drain lists the databases it would hand over.
 - **Drain asks too** when the node holds a database's only replica, since that database is then unavailable until the node returns. FR-055 adds the warning, and FR-056 the question.
@@ -185,12 +185,12 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | One flag, one kind of value | Yes: `--node` takes a node ID in `db list`, `status`, `lease watch`, `db exec`, and `db query`; `--address` takes `host:port`; `cert node --addresses` takes the addresses a node is dialed at. | Done (FR-062) |
 | Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key` (`FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`); `--token` has `FLEETRING_TOKEN`; `--control`, then `--config`, then `FLEETRING_CONTROL` for the control address. No context step. | FR-056 |
 | Contexts | None; every command takes `--control`, `--config`, or `FLEETRING_CONTROL`, and TLS flags. `fleetringd dev` writes `<dir>/env`, which sets the variables for its node until it can write a `dev` context instead (ADR-0039). | FR-056 |
-| `--json` / `-o` with stable fields | `db show` takes `-o table\|json` and `--json`, printing one object with `database`, `placement`, `metadata`, `schema`, and `schema_unavailable` (ADR-0041); every other command prints for people only. | FR-056 |
+| `--json` / `-o` with stable fields | `db show` takes `-o table\|json` and `--json`, printing one object with `database`, `placement`, `metadata`, `schema`, and `schema_unavailable` (ADR-0041); `orphan list` prints `{"orphans": [{"node", "database", "epoch", "bytes"}]}` (ADR-0042); every other command prints for people only, `status --node` included. | FR-056 |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
 | Quiet when piped | Commands print no progress or colour; logs are warnings only. No `--quiet`. | FR-056 |
 | `NO_COLOR` | Results have no colour. Log lines on stderr use ANSI colour, honour `NO_COLOR`, but don't check for a terminal. | FR-056 |
 | Errors with the next step | `fleetringd: <error>` with `caused by:` lines; some say what to pass (`pass --control or --config`). `hint:` lines when `--node` is given an address, and when a fleet with a member that lacks `metadata` refuses `--description` or `--label`. | FR-056 |
-| Confirmation and `--yes` | `db drop` asks on a terminal and refuses elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask; the draining node logs `no other replica; the database is unavailable until this node returns` for a database that has none (FR-055). | FR-056 |
+| Confirmation and `--yes` | `db drop`, `node remove`, and `orphan remove` ask on a terminal and refuse elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask; the draining node logs `no other replica; the database is unavailable until this node returns` for a database that has none (FR-055). | FR-056 |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | FR-056 |
 | Completions and man pages | None. | FR-056 |
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin (`db create`, `db restore`, `db set-description`); nothing else reads `-`. `mcp` speaks the Model Context Protocol on stdin and stdout, so stdout carries JSON-RPC messages and nothing else, and its logs go to stderr like every command's. | FR-056 |
