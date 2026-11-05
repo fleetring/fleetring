@@ -866,6 +866,10 @@ fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
         // Each reads a count from the header and has no setter; a value means nothing, so it is
         // refused rather than ignored.
         "page_count" | "freelist_count" => value.is_none(),
+        // Reads the connection's count of commits by other connections and has no setter. FTS5
+        // runs it while a statement steps, to learn whether its cached index structure is stale,
+        // so refusing it would refuse every later write to and search of a full-text table.
+        "data_version" => value.is_none(),
         // Lists the options SQLite was built with and reads nothing of the database.
         "compile_options" => value.is_none(),
         _ => false,

@@ -152,6 +152,7 @@ fn pragmas_that_change_the_database_are_refused() -> TestResult {
         "PRAGMA trusted_schema = 1",
         "PRAGMA query_only = 0",
         "PRAGMA journal_size_limit = -1",
+        "PRAGMA data_version = 1",
         "PRAGMA main.Journal_Mode = OFF",
     ] {
         let message =
@@ -200,6 +201,7 @@ fn introspection_pragmas_still_work() -> TestResult {
         "PRAGMA page_count",
         "PRAGMA PAGE_SIZE",
         "PRAGMA main.freelist_count",
+        "PRAGMA data_version",
         "PRAGMA compile_options",
         "SELECT name FROM pragma_table_info('t')",
     ] {
@@ -450,6 +452,36 @@ fn reserved_objects_are_never_shown() -> TestResult {
         }
         assert_eq!(object(&schema, "t")?.rows, Some(RowCount::Exact(2)));
     }
+    Ok(())
+}
+
+#[test]
+fn fts5_tables_take_writes_and_searches_in_later_statements() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // FTS5 runs `PRAGMA data_version` while a statement steps, under the confinement, once the
+    // table was created by an earlier transaction.
+    exec(&mut db, "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")?;
+    exec(
+        &mut db,
+        "CREATE VIRTUAL TABLE notes_fts USING fts5(body, content = 'notes', content_rowid = 'id')",
+    )?;
+    exec(
+        &mut db,
+        "CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN \
+         INSERT INTO notes_fts (rowid, body) VALUES (new.id, new.body); END",
+    )?;
+    exec(&mut db, "INSERT INTO notes VALUES (1, 'alpha beta'), (2, 'gamma')")?;
+    exec(&mut db, "CREATE VIRTUAL TABLE docs USING fts5(body)")?;
+    exec(&mut db, "INSERT INTO docs VALUES ('alpha')")?;
+
+    let found = query(
+        &mut db,
+        "SELECT rowid FROM notes_fts WHERE notes_fts MATCH 'alpha' ORDER BY bm25(notes_fts)",
+    )?;
+    assert_eq!(found.rows, [[Value::Integer(1)]]);
+    let docs = query(&mut db, "SELECT rowid FROM docs WHERE docs MATCH 'alpha'")?;
+    assert_eq!(docs.rows, [[Value::Integer(1)]]);
     Ok(())
 }
 
