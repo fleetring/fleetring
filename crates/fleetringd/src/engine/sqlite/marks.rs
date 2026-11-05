@@ -65,6 +65,11 @@ impl Marks {
         }
     }
 
+    /// Whether any mark is staged, for the next write transaction to record.
+    pub(super) fn is_staged(&self) -> bool {
+        !self.staged.is_empty()
+    }
+
     /// Inside an open write transaction: creates the table if needed and upserts every staged
     /// mark. Returns how many rows it wrote.
     pub(super) fn flush(&mut self, writer: &Connection) -> Result<u64, EngineError> {

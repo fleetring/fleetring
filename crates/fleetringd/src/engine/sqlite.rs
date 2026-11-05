@@ -11,10 +11,15 @@
 //! Row changes for logical change streams are recorded by the `changes` module, in a change
 //! table inside the database (FR-039, ADR-0024), and the positions that change sinks have been
 //! delivered up to by the `marks` module, in a second table, so that they replicate with the data
-//! (FR-041, ADR-0028). Names beginning with `_fleetring_` are reserved for them, and
-//! `_fleetring_cdc` and `_fleetring_sinks` are the tables: a user statement that reads, writes, calls, creates, alters, or drops anything so named is
-//! refused as a statement error, on both connections, so that neither the table nor the
-//! recorder's triggers can be read, forged, or broken from outside.
+//! (FR-041, ADR-0028). Names beginning with `_fleetring_`, in any ASCII case, are reserved for
+//! them, and `_fleetring_cdc` and `_fleetring_sinks` are the tables: a user statement that reads,
+//! writes, calls, creates, alters, or drops anything so named is refused as a statement error, on
+//! both connections, so that neither the table nor the recorder's triggers can be read, forged,
+//! or broken from outside. Nor can a user statement create, rename into, or put a trigger on
+//! anything in the reserved namespace: one that changes the namespace in any way is refused and
+//! its transaction rolled back. The adapter, in turn, never adopts an object there that it didn't
+//! create: it refuses to record changes or sink marks in a database that holds one (the
+//! `reserved` module).
 //!
 //! User statements are confined to the database they name. One that attaches or detaches a
 //! database, loads an extension, or runs a pragma other than read-only introspection is refused
@@ -25,6 +30,7 @@ mod changes;
 mod follower;
 mod marks;
 mod pins;
+mod reserved;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -50,6 +56,7 @@ pub use follower::SqliteFollower;
 use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX};
 use self::marks::Marks;
 use self::pins::Pins;
+use self::reserved::{Reserved, is_reserved};
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
     DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
@@ -223,6 +230,8 @@ struct SqliteDatabase {
     recorder: Option<Recorder>,
     /// The sink marks staged for the next write transaction.
     marks: Marks,
+    /// The reserved part of the write connection's schema, which user statements may not change.
+    reserved: Reserved,
 }
 
 impl SqliteDatabase {
@@ -288,6 +297,7 @@ impl SqliteDatabase {
             end: None,
             recorder: None,
             marks: Marks::default(),
+            reserved: Reserved::default(),
         })
     }
 
@@ -296,10 +306,18 @@ impl SqliteDatabase {
     }
 
     fn run_statements(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
+        self.reserved.remember(&self.writer)?;
         for statement in transaction.statements() {
             {
                 let _user = UserStatement::enter(&self.writing);
                 run(&self.writer, statement, &self.writing)?;
+            }
+            // The authorizer sees a renamed table's old name only, so a rename into the reserved
+            // namespace shows only in the schema it leaves behind.
+            if self.reserved.changed(&self.writer)? {
+                return Err(EngineError::Statement {
+                    message: Refusal::Reserved.to_string(),
+                });
             }
             if self.writing.defines_program.swap(false, Ordering::Relaxed) {
                 refuse_programs_on_reserved_names(&self.writer)?;
@@ -314,13 +332,33 @@ impl SqliteDatabase {
         Ok(())
     }
 
-    fn roll_back(&self) {
+    fn roll_back(&mut self) {
+        self.reserved.forget();
         if self.writer.is_autocommit() {
             return;
         }
         if let Err(error) = self.writer.execute_batch("ROLLBACK") {
             tracing::error!(path = %self.path.display(), %error, "rollback failed");
         }
+    }
+
+    /// Fails if the reserved namespace holds an object the adapter didn't create. Called before
+    /// the adapter records changes or reads or writes sink marks, whose statements run with the
+    /// confinement clear and would otherwise adopt it, firing any trigger on it unconfined.
+    fn refuse_foreign_objects(&mut self) -> Result<(), EngineError> {
+        let Some(foreign) = self.reserved.foreign(&self.writer)? else {
+            return Ok(());
+        };
+        tracing::warn!(
+            path = %self.path.display(),
+            kind = %foreign.kind,
+            object = %foreign.name,
+            reason = foreign.reason,
+            "a foreign object in the reserved namespace stops change recording and sink marks"
+        );
+        Err(EngineError::Statement {
+            message: foreign.to_string(),
+        })
     }
 
     /// Reads every commit after `after`, as [`read_wal_file`] describes, and remembers where the
@@ -401,6 +439,13 @@ impl Database for SqliteDatabase {
         self.writer
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(classify)?;
+        // Before the adapter touches its own tables, which a foreign object would subvert.
+        if (self.marks.is_staged() || self.recorder.is_some())
+            && let Err(error) = self.refuse_foreign_objects()
+        {
+            self.roll_back();
+            return Err(error);
+        }
         // Staged sink marks go in first, ahead of any prune the recorder does, so that no copy
         // holds a prune without the marks that justify it. They come before the row count below
         // starts, so `rows_affected` never counts them.
@@ -655,6 +700,7 @@ impl LogicalChanges for SqliteDatabase {
             }
             return Ok(());
         }
+        self.refuse_foreign_objects()?;
         // The first recorded transaction starts where the log ends now.
         let _primed = self.read_wal(None)?;
         self.recorder = Some(Recorder::install(&self.writer, mode)?);
@@ -685,6 +731,7 @@ impl LogicalChanges for SqliteDatabase {
 
 impl SinkMarks for SqliteDatabase {
     fn marks(&mut self) -> Result<BTreeMap<String, Position>, EngineError> {
+        self.refuse_foreign_objects()?;
         Ok(Marks::read(&self.writer)?
             .into_iter()
             .map(|(sink, position)| (sink, Position::from(position)))
@@ -874,9 +921,11 @@ fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
         // setter.
         "table_info" | "table_xinfo" | "index_list" | "index_info" | "index_xinfo"
         | "foreign_key_list" => true,
-        // `foreign_key_check` takes a table and only reads rows. `integrity_check` and
-        // `quick_check` take a table or an error limit and only read pages.
-        "foreign_key_check" | "integrity_check" | "quick_check" => true,
+        // `integrity_check` and `quick_check` take a table or an error limit and only read pages.
+        // `foreign_key_check` isn't here: it reads the parent tables of the table it checks
+        // without the authorizer seeing them, so a user table declaring a foreign key to a
+        // reserved table would make it report which of that table's rows exist.
+        "integrity_check" | "quick_check" => true,
         // Each reads a header field. With a value, `user_version`, `application_id`, and
         // `schema_version` write the header, the last also invalidating the schema; `page_size`
         // would change the page size the adapter chose.
@@ -923,7 +972,6 @@ fn refuse_programs_on_reserved_names(conn: &Connection) -> Result<(), EngineErro
 
 /// Whether `action` names something the adapter reserves.
 fn names_reserved(action: &AuthAction<'_>) -> bool {
-    let reserved = |name: &str| name.starts_with(RESERVED_PREFIX);
     match *action {
         AuthAction::CreateIndex {
             index_name,
@@ -940,7 +988,7 @@ fn names_reserved(action: &AuthAction<'_>) -> bool {
         | AuthAction::DropTempIndex {
             index_name,
             table_name,
-        } => reserved(index_name) || reserved(table_name),
+        } => is_reserved(index_name) || is_reserved(table_name),
         AuthAction::CreateTrigger {
             trigger_name,
             table_name,
@@ -956,11 +1004,11 @@ fn names_reserved(action: &AuthAction<'_>) -> bool {
         | AuthAction::DropTempTrigger {
             trigger_name,
             table_name,
-        } => reserved(trigger_name) || reserved(table_name),
+        } => is_reserved(trigger_name) || is_reserved(table_name),
         AuthAction::CreateView { view_name }
         | AuthAction::CreateTempView { view_name }
         | AuthAction::DropView { view_name }
-        | AuthAction::DropTempView { view_name } => reserved(view_name),
+        | AuthAction::DropTempView { view_name } => is_reserved(view_name),
         AuthAction::CreateTable { table_name }
         | AuthAction::CreateTempTable { table_name }
         | AuthAction::DropTable { table_name }
@@ -972,9 +1020,9 @@ fn names_reserved(action: &AuthAction<'_>) -> bool {
         | AuthAction::AlterTable { table_name, .. }
         | AuthAction::Analyze { table_name }
         | AuthAction::CreateVtable { table_name, .. }
-        | AuthAction::DropVtable { table_name, .. } => reserved(table_name),
-        AuthAction::Reindex { index_name } => reserved(index_name),
-        AuthAction::Function { function_name } => reserved(function_name),
+        | AuthAction::DropVtable { table_name, .. } => is_reserved(table_name),
+        AuthAction::Reindex { index_name } => is_reserved(index_name),
+        AuthAction::Function { function_name } => is_reserved(function_name),
         _ => false,
     }
 }
