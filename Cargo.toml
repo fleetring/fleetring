@@ -18,6 +18,9 @@ blake3 = "1.7"
 dhat = "0.3"
 divan = "0.1"
 proptest = { version = "1", default-features = false, features = ["std"] }
+# The MCP server (ADR-0041 point 9): pinned exactly, so every upgrade is a deliberate change; only
+# the server, the stdio transport, and the tool macros, without `default` (and so without base64).
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io", "macros"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = "1"

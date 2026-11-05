@@ -37,10 +37,12 @@ use fleetringd::engine::{
     Execution, Internal, MAX_COUNT_LIMIT, Position, Rows, SchemaRequest, SqliteEngine, Statement,
     Value,
 };
+use fleetringd::mcp::{self, Access, McpSettings};
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{
     DatabaseReport, MetadataReport, expiry_text, printable, render_archived_metadata, render_text,
+    schema_unavailable,
 };
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
@@ -157,6 +159,13 @@ enum Command {
     /// allows the release, then drains the node, restarts it in place, and waits until it has
     /// rejoined and caught up.
     Upgrade(UpgradeArgs),
+    /// Serves the Model Context Protocol on stdin and stdout, so that an agent's MCP client can
+    /// create, find, use, describe, and drop databases, acting as the one principal these
+    /// credentials name and within its scopes (ADR-0041). It reads the same flags and variables
+    /// as every other command, never credentials from the client, and runs until the client
+    /// closes stdin. stdout carries the protocol alone; logs go to stderr.
+    #[command(after_long_help = MCP_HELP)]
+    Mcp(McpArgs),
     /// Shows the members with their liveness, release, the membership epoch, and the ring
     /// fingerprint, as the control plane sees them; with `--node` or `--address`, as one data
     /// node sees them.
@@ -174,6 +183,35 @@ enum Command {
         target: Target,
     },
 }
+
+/// `fleetringd mcp`'s flags (ADR-0041, point 9).
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Offers only the tools that read: db_list, db_show, and query. The principal's scopes
+    /// still bound what they read.
+    #[arg(long)]
+    read_only: bool,
+    /// The most bytes one result's JSON holds, with an optional KiB or MiB: from 64KiB to
+    /// 4MiB. Rows, listed databases, and schema objects past it are left out, and the result
+    /// says so.
+    #[arg(long, value_parser = parse_result_size, default_value = "256KiB")]
+    max_result_bytes: usize,
+    #[command(flatten)]
+    target: Target,
+}
+
+/// What `fleetringd mcp --help` adds below the flags: how an MCP client starts the server.
+const MCP_HELP: &str = "\
+An MCP client starts the server as a command. With a scoped token and dev mode's
+certificates, a client configuration (Claude Code's .mcp.json, Cursor's mcp.json) reads:
+
+  {\"mcpServers\": {\"fleetring\": {\"command\": \"fleetringd\", \"args\": [\"mcp\"],
+    \"env\": {\"FLEETRING_CONTROL\": \"127.0.0.1:7400\",
+            \"FLEETRING_TLS_DIR\": \"/home/me/.fleetring/tls\",
+            \"FLEETRING_AS\": \"agent-42\", \"FLEETRING_TOKEN\": \"<token>\"}}}}
+
+The token is a secret: keep the file private. Give an agent a token scoped to its own
+prefix (token issue --scope admin:agent-42-*), never the admin certificate.";
 
 /// `fleetringd dev`'s flags (ADR-0039).
 #[derive(Debug, Args)]
@@ -1083,6 +1121,38 @@ fn parse_ttl(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// A size in bytes, with an optional `KiB`, `MiB`, or `GiB`.
+fn parse_size(text: &str) -> Result<usize, String> {
+    let invalid = || format!("'{text}' isn't a size: expected bytes, or <n>KiB, <n>MiB, or <n>GiB");
+    let (digits, unit) = match text.find(|character: char| !character.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, ""),
+    };
+    let count: usize = digits.parse().map_err(|_| invalid())?;
+    let unit: usize = match unit {
+        "" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        _ => return Err(invalid()),
+    };
+    count
+        .checked_mul(unit)
+        .ok_or_else(|| format!("'{text}' is too large a size"))
+}
+
+/// `--max-result-bytes`: a size from 64 KiB to 4 MiB.
+fn parse_result_size(text: &str) -> Result<usize, String> {
+    let size = parse_size(text)?;
+    if !(mcp::MIN_MAX_RESULT_BYTES..=mcp::MAX_MAX_RESULT_BYTES).contains(&size) {
+        return Err(format!(
+            "'{text}' is outside 64KiB to 4MiB: a result must hold a database's metadata, and \
+             a client takes a few MiB at most"
+        ));
+    }
+    Ok(size)
+}
+
 fn parse_role(text: &str) -> Result<NodeRole, String> {
     match text {
         "both" => Ok(NodeRole::Both),
@@ -1427,6 +1497,30 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             }
             None => format_status(&target.client()?.status().await.map_err(failed)?),
         },
+        Command::Mcp(McpArgs {
+            read_only,
+            max_result_bytes,
+            target,
+        }) => {
+            let client = target.client()?;
+            // The principal the credentials name, read as `db show` reads it, so that only its
+            // own descriptions are trusted.
+            let principal = target
+                .tls
+                .principal()
+                .and_then(|principal| principal.parse().ok());
+            let settings = McpSettings {
+                access: if read_only {
+                    Access::ReadOnly
+                } else {
+                    Access::ReadWrite
+                },
+                max_result_bytes,
+                principal,
+            };
+            mcp::serve(client, settings).await?;
+            String::new()
+        }
         Command::Db(DbCommand::Create {
             name,
             replication_factor,
@@ -2834,20 +2928,6 @@ fn shown(name: &impl std::fmt::Display) -> String {
 
 /// How many rows `db show` counts in each table before it says "more than" (ADR-0041, point 6).
 const SCHEMA_COUNT_LIMIT: u64 = 10_000;
-
-/// Why a database's schema is unavailable, when `status` says the primary can't give it now and
-/// the rest of `db show` still stands: the primary runs a release without the call, or its
-/// engine can't describe itself (`UNIMPLEMENTED`), or it has no primary to ask yet or is
-/// failing over. `None` for any other failure, which `db show` reports as an error.
-fn schema_unavailable(status: &tonic::Status) -> Option<String> {
-    match status.code() {
-        tonic::Code::Unimplemented => Some(status.message().to_owned()),
-        tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
-            Some(status.message().to_owned())
-        }
-        _ => None,
-    }
-}
 
 /// A failed call as one readable line: what kind of failure, and the server's message.
 fn failed(status: tonic::Status) -> Box<dyn Error> {

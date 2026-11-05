@@ -22,6 +22,7 @@ pub mod engine;
 mod environment;
 mod https;
 mod layout;
+pub mod mcp;
 mod membership;
 pub mod observe;
 mod publisher;
@@ -121,6 +122,9 @@ const _: () = {
     assert_debug_send_sync::<data::LeaseUpdate>();
     assert_debug_send_sync::<data::LeaseUpdates>();
     assert_debug_send_sync::<data::Location>();
+    assert_debug_send_sync::<mcp::Access>();
+    assert_debug_send_sync::<mcp::McpError>();
+    assert_debug_send_sync::<mcp::McpSettings>();
     assert_debug_send_sync::<data::NodeStatus>();
     assert_debug_send_sync::<data::ReplicaInfo>();
     assert_debug_send_sync::<data::SchemaView>();

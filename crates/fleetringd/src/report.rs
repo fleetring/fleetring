@@ -261,8 +261,23 @@ impl MetadataReport {
     }
 }
 
+/// Why a database's schema is unavailable, when `status` says the primary can't give it now and
+/// the rest of the report still stands: the primary runs a release without the call, or its
+/// engine can't describe itself (`UNIMPLEMENTED`), or it has no primary to ask yet or is failing
+/// over (`FAILED_PRECONDITION`, `UNAVAILABLE`; ADR-0041, amendment 6). `None` for any other
+/// failure, which fails the report.
+#[must_use]
+pub fn schema_unavailable(status: &tonic::Status) -> Option<String> {
+    match status.code() {
+        tonic::Code::Unimplemented | tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
+            Some(status.message().to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// `at` in RFC 3339, UTC, to the millisecond.
-fn rfc3339(at: Timestamp) -> String {
+pub(crate) fn rfc3339(at: Timestamp) -> String {
     i128::from(at.as_millis())
         .checked_mul(1_000_000)
         .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())

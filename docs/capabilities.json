@@ -586,11 +586,23 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md"
     },
     {
+      "id": "mcp-server",
+      "component": "fleetringd",
+      "area": "access",
+      "title": "MCP server for agents",
+      "description": "fleetringd mcp lets an agent create, find, query, describe and drop databases over stdio as one principal, with text others wrote returned only in fields marked by author.",
+      "status": "built",
+      "since": "0.6.0",
+      "ticket": "FR-070",
+      "issue": 76,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#mcp-server"
+    },
+    {
       "id": "agent-kit",
       "component": "fleetringd",
       "area": "access",
-      "title": "Agent kit with an MCP server",
-      "description": "An MCP server and a skill, so agents can find, use and clean up their own databases.",
+      "title": "Agent skill and quickstart",
+      "description": "A skill with tested SQL patterns and a quickstart, so agents can find, use and clean up their own databases.",
       "status": "planned",
       "ticket": "FR-070",
       "issue": 76,

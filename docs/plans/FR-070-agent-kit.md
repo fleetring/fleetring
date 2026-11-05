@@ -1356,3 +1356,10 @@ Reply "ADR-0041 as recommended" to take all six. Otherwise, give the number and 
   - durations resolve against the control plane's time;
   - a restore's expiry is set afterwards;
   - `SECURITY.md` notes that principal names are visible.
+- 2026-11-05: phase 6 built, its expiry arguments waiting for phase 3. Where it departs from 6.3:
+  - a failed tool call's `{"error": …}` is the result's text block, with no `structuredContent`, which ADR-0041 point 9 requires to match the tool's output schema;
+  - `ServerHandler` is written by hand over a fixed tool table rather than with `#[tool_router]`, so malformed arguments stay a JSON-RPC `invalid_params` error, which rmcp's router would turn into a tool error;
+  - each result's text block escapes control and invisible characters as JSON `\u` escapes, so it parses to exactly the structured content;
+  - a statement's own error message goes in `detail`, marked untrusted, and internal errors' messages aren't sent;
+  - `fit` drops entries in one pass, and a cut listing's `next_after` is the last database kept;
+  - `--max-result-bytes` is at least 64 KiB, and every call has a 60 s timeout.

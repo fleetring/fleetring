@@ -30,6 +30,8 @@ jiff = { version = "0.2", default-features = false, features = ["std"] }
 prometheus-client = "0.25"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ring = "0.17"
+# Kept behind `fleetringd::mcp` alone (ADR-0041 point 9).
+rmcp.workspace = true
 rusqlite = { workspace = true, features = ["functions", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"
@@ -83,6 +85,6 @@ harness = false
 divan.workspace = true
 hyper = { version = "1", features = ["server", "http1"] }
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "test-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "test-util"] }
 tokio-stream = "0.1"
 
