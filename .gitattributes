@@ -2,3 +2,5 @@
 # on every OS.
 *.json text eol=lf
 *.lock text eol=lf
+# Golden text fixtures are compared byte for byte too.
+crates/fleetringd/tests/fixtures/** text eol=lf
