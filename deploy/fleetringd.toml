@@ -68,7 +68,7 @@ id = "node-1"
 
 # [replication]
 # The replication factor and durability a database gets when `db create` names none (ADR-0023,
-# ADR-0039). Each database keeps the settings it was created with; `db set-durability` changes
+# ADR-0039). Each database keeps the settings it was created with; `db edit --acks` changes
 # its durability from its next epoch on. The control node reads these; a data node ignores them.
 #
 # `replication_factor` is how many replicas a database has, the primary included: 3 by default,

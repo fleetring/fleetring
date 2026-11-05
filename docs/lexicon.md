@@ -268,7 +268,7 @@ The set of revoked tokens and signing keys the control plane keeps and publishes
 Free text, at most 1 KiB, saying what a database holds and how it was set up; part of its [metadata](#metadata) (ADR-0041). Tab and line feed are allowed; other control characters, invisible format characters, and the line and paragraph separators are refused. It records who last set it (`description_by`), and text output marks one written by another principal, or by nobody that can be named, as untrusted.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Description`, `DescriptionChange`, protocol `DatabaseMetadata.description`. **CLI:** `--description` on `db create` and `db restore`, `db set-description`; `description:` in `db show`.
+- **Code:** `fleetring_control::Description`, `DescriptionChange`, protocol `DatabaseMetadata.description`. **CLI:** `--description` on `db create`, `db restore`, and `db edit`; `--clear-description`; `description:` in `db show`.
 - **Not:** comment, note, summary.
 
 ### Dev mode
@@ -300,7 +300,7 @@ Marking a member as draining: it gets no new leases and is never a promotion's c
 A database's acknowledgement mode and replica floor together (ADR-0023). The *replica floor* (`min_replicas`) is how many replicas, the primary included, must be reachable for a write to run.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Durability`, `Acks`, `min_replicas`. **CLI:** `fleetringd db set-durability`, `--acks`, `--min-replicas`.
+- **Code:** `Durability`, `Acks`, `min_replicas`. **CLI:** `fleetringd db edit`, `--acks`, `--min-replicas`.
 - **Not:** consistency, safety level, replication mode.
 
 ### Engine
@@ -328,7 +328,7 @@ A number that only grows, used to order and fence. Always say which one:
 The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). A duration is turned into a time by the control node before it logs the command, at least a minute ahead. The control node's sweep stamps the command that drops it with its own clock, so a control node whose clock runs ahead expires databases early by as much. Before the primary deletes its copy, it flushes the database's change streams, its [archive](#archive) included, for up to 30 seconds. A replica that misses the drop keeps its copy as an [orphan](#orphan).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Metadata::expires_at`, `Action::ExpireDatabase`, `Feature::Expiry`, `control::MIN_EXPIRY`, `data::Expiry`, `ChangeStreams::flush_database`. **CLI:** `--expires-in`, `--expires-at` on `db create` and `db restore`, `db set-expiry`; `expires` in `db show`.
+- **Code:** `Metadata::expires_at`, `Action::ExpireDatabase`, `Feature::Expiry`, `control::MIN_EXPIRY`, `data::Expiry`, `ChangeStreams::flush_database`. **CLI:** `--expires-in`, `--expires-at` on `db create`, `db restore`, and `db edit`; `--clear-expiry`; `expires` in `db show`.
 - **Not:** TTL (fine in prose for the duration), retention (an archive's), lifetime (a token's), deadline.
 
 ### Failover
@@ -456,7 +456,7 @@ The placement key: in the placement crate, the opaque bytes that name a placeabl
 A `key=value` pair on a database, by the Kubernetes rules, for finding it again: `db list --label purpose=memory`. At most 32 per database; keys under `fleetring.dev/` are reserved. Part of its [metadata](#metadata) (ADR-0041). *Placement label* is the qualified name for a [zone](#zone) or [host](#host), and the placement crate's `label` module names validated identifiers (ADR-0005); say which.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `LabelKey`, `LabelValue`, `Labels`, `data::LabelRequirement`, protocol `Label`. **CLI:** `--label` on `db create`, `db restore`, `db list`, and `db set-labels`; `labels:` in `db show`.
+- **Code:** `LabelKey`, `LabelValue`, `Labels`, `data::LabelRequirement`, protocol `Label`. **CLI:** `--label` on `db create`, `db restore`, `db list`, and `db edit`; `--remove-label`; `labels:` in `db show`.
 - **Not:** tag, annotation, attribute.
 
 ### Leader
@@ -520,7 +520,7 @@ A node as the fleet's membership records it: its ID, placement attributes, addre
 Database metadata: a database's [description](#description), [labels](#label), [creator](#creator), creation time, and [expiry](#expiry), kept in control state with a version that grows with every update (ADR-0041). Updates are patches applied in log order; `--if-version` makes one conditional. A creation or update with metadata is a [fleet feature](#fleet-feature), `metadata`.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Metadata`, `MetadataSpec`, `MetadataChange`, `Feature::Metadata`; protocol `DatabaseMetadata`, `CreateDatabaseWithMetadata`, `UpdateDatabase`. **CLI:** `db show`, `db set-description`, `db set-labels`, `db set-expiry`; `metadata` in `db show --json`.
+- **Code:** `fleetring_control::Metadata`, `MetadataSpec`, `MetadataChange`, `Feature::Metadata`; protocol `DatabaseMetadata`, `CreateDatabaseWithMetadata`, `UpdateDatabase`. **CLI:** `db show`, `db edit`; `metadata` in `db show --json`.
 - **Not:** annotations, properties, attributes.
 
 ### Node

@@ -19,9 +19,9 @@ fleetringd context use home
   | Verb | Means | Destructive |
   |---|---|---|
   | `list` | every item the caller may see, as a table | no |
-  | `show` | one item in detail: `db show` (`db locate` predates this rule and stays) | no |
+  | `show` | one item in detail: `db show`, placement included (`db locate` predates this rule and stays, for placement alone) | no |
   | `create`, `add`, `issue`, `init` | make something new | no |
-  | `set-<field>` | change one setting (`db set-durability`, `db set-description`, `db set-labels`, `db set-expiry`) | no |
+  | `edit` | change an item's settings, any number at once (`db edit`: description, labels, expiry, durability) | no |
   | `watch` | follow a stream until interrupted | no |
   | `verify` | check, and report only | no |
   | `restore` | build a new item from an archive, never over an existing one | no |
@@ -172,6 +172,8 @@ Commands log only warnings by default, to stderr; `RUST_LOG` raises it, and `-v,
 
 Before 1.0, a renamed flag, value, or command is a clean break: the old spelling stops working in the release that renames it, with no hidden alias and no deprecation period (ADR-0032). The old spelling fails like any unknown flag, command, or value, and the error may carry one `hint:` line naming the new spelling. The release notes list every rename under breaking changes (FR-062 keeps 0.3.0's list).
 
+0.6.0 removes `db set-description`, `db set-labels`, `db set-expiry`, and `db set-durability` in favour of `db edit` (FR-076); each fails like an unknown command, with a `hint:` line naming `db edit` and the flags that replace it (`--remove` is now `--remove-label`, and `--never` is `--clear-expiry`).
+
 How renames work after 1.0 is decided with 1.0's compatibility promise.
 
 ## Where `fleetringd` stands
@@ -193,7 +195,7 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | Confirmation and `--yes` | `db drop`, `node remove`, and `orphan remove` ask on a terminal and refuse elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask; the draining node logs `no other replica; the database is unavailable until this node returns` for a database that has none (FR-055). | FR-056 |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | FR-056 |
 | Completions and man pages | None. | FR-056 |
-| Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin (`db create`, `db restore`, `db set-description`); nothing else reads `-`. `mcp` speaks the Model Context Protocol on stdin and stdout, so stdout carries JSON-RPC messages and nothing else, and its logs go to stderr like every command's. | FR-056 |
+| Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin (`db create`, `db restore`, `db edit`); nothing else reads `-`. `mcp` speaks the Model Context Protocol on stdin and stdout, so stdout carries JSON-RPC messages and nothing else, and its logs go to stderr like every command's. | FR-056 |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | FR-056 |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0. | Done |
 | `upgrade` | `upgrade` installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place; `--check` changes nothing and exits 1 when the fleet doesn't allow the release, by its window or its enabled features; `node remove` takes out a member that is gone for good; `--timeout` bounds each step, 5m by default (ADR-0038). | Done (FR-054) |
