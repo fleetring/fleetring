@@ -101,8 +101,7 @@ pub enum Unbound {
         /// The database.
         database: DatabaseName,
     },
-    /// The receiving node's copy isn't at the epoch, or control state still holds the database
-    /// at it or later.
+    /// Control state still holds the database at the epoch or later.
     NotDropped {
         /// The database.
         database: DatabaseName,
@@ -173,7 +172,7 @@ impl fmt::Display for Unbound {
             Self::NotDropped { database, epoch } => {
                 write!(
                     f,
-                    "database '{database}' at epoch {epoch} isn't a dropped copy here"
+                    "database '{database}' isn't dropped at epoch {epoch}: control state holds it"
                 )
             }
         }
@@ -305,8 +304,8 @@ mod tests {
                     database: db.clone(),
                     epoch,
                 },
-                "Fence refused for node 'a': database 'tenant:acme' at epoch 7 isn't a dropped \
-                 copy here",
+                "Fence refused for node 'a': database 'tenant:acme' isn't dropped at epoch 7: \
+                 control state holds it",
                 "dropped",
             ),
         ];
