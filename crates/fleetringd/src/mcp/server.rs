@@ -228,11 +228,19 @@ fn output<T: JsonSchema + 'static>() -> Arc<JsonObject> {
 }
 
 /// `schema` with the line breaks of the doc comments its descriptions come from joined into
-/// spaces, so each description reads as one paragraph.
+/// spaces, so each description reads as one paragraph, and without the unsigned integer
+/// formats (`uint8`, `uint64`) JSON Schema doesn't define, which clients' validators warn
+/// about; `minimum` and `maximum` already bound those integers.
 fn unwrapped(schema: &JsonObject) -> Arc<JsonObject> {
     fn join(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Object(object) => {
+                object.retain(|key, value| {
+                    key != "format"
+                        || !value
+                            .as_str()
+                            .is_some_and(|format| format.starts_with("uint"))
+                });
                 for (key, value) in object.iter_mut() {
                     match value {
                         serde_json::Value::String(text) if key == "description" => {
