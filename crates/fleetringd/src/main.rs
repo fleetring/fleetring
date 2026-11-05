@@ -37,7 +37,9 @@ use fleetringd::tls::{
     FleetName, Identity, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
-use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, RESTARTS_VAR, Restart};
+#[cfg(unix)]
+use fleetringd::upgrade::RESTARTS_VAR;
+use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, Restart};
 use fleetringd::{
     Config, Daemon, LogFormat, MembershipView, Network, NodeRole, ParseLogFormatError, Plaintext,
     Stop,
