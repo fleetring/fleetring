@@ -1020,9 +1020,12 @@ mod tests {
         .expect("an authority")
         .write(&tls)
         .expect("written");
+        // The path goes inside TOML strings, so it is escaped as one (Windows' backslashes).
+        let quoted = toml_string(&dir.display().to_string());
+        let escaped = &quoted[1..quoted.len() - 1];
         let config = generated()
             .replace("dev = true\n", "")
-            .replace("/tmp/fleetring-dev", &dir.display().to_string());
+            .replace("/tmp/fleetring-dev", escaped);
         fs::write(dir.join(CONFIG_FILE), config).expect("a config");
         dir
     }
@@ -1154,7 +1157,10 @@ mod tests {
         );
         assert!(banner.contains("address    127.0.0.1:17400"), "{banner}");
         assert!(
-            banner.contains(&format!(". {}", dir.join(ENV_FILE).display())),
+            banner.contains(&format!(
+                ". {}",
+                shell_quote(&dir.join(ENV_FILE).display().to_string())
+            )),
             "{banner}"
         );
         assert!(
