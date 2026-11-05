@@ -582,7 +582,9 @@ fn removing_a_member_that_is_gone_unblocks_the_fleet() -> TestResult {
     let runtime = tokio::runtime::Runtime::new()?;
     let client = fleet.client()?;
     runtime.block_on(wait_for_members(&client, &["node-1", "node-2"], None))?;
-    // "old" joins as 0.3.0 does, reporting nothing, and is never heard from again.
+    // "old" joins on the line before this build's, without the `undrain` feature, and is never
+    // heard from again.
+    let behind = line_behind().to_string();
     let old = fleet
         .tls
         .node_network("old")?
@@ -596,13 +598,19 @@ fn removing_a_member_that_is_gone_unblocks_the_fleet() -> TestResult {
             weight: 1,
             address: None,
         }),
-        software: None,
+        software: Some(fleetring_proto::v1::Software {
+            version: behind.clone(),
+            protocol: Some(fleetring_proto::PROTOCOL_VERSION),
+            control_format: 1,
+            features: Vec::new(),
+        }),
     }))?;
 
     let blocked = node_command(&fleet, &["undrain", "node-2"])?;
     assert_eq!(blocked.status.code(), Some(1), "{}", printed(&blocked));
     assert!(
-        String::from_utf8_lossy(&blocked.stderr).contains("node 'old' runs fleetringd 0.3.0"),
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains(&format!("node 'old' runs fleetringd {behind}")),
         "{}",
         printed(&blocked)
     );

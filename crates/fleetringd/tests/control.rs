@@ -1394,7 +1394,10 @@ async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResul
     let joined = tls
         .node_network("b")?
         .control_client(address.to_string())
-        .join(join_request("b"))
+        .join(join_with(
+            "b",
+            Some(reporting(fleetringd::software::VERSION)),
+        ))
         .await?;
     assert_eq!(joined.revocations.len(), 2);
 
@@ -1958,6 +1961,27 @@ fn reporting(version: &str) -> fleetring_proto::v1::Software {
     }
 }
 
+/// `version` without any fleet feature: a member that can run beside this build but can't act on
+/// a command a feature gates.
+fn featureless(version: &str) -> fleetring_proto::v1::Software {
+    fleetring_proto::v1::Software {
+        features: Vec::new(),
+        ..reporting(version)
+    }
+}
+
+/// The first release of the line before this build's, which may run beside it (ADR-0038).
+fn previous_line() -> fleetring_control::Release {
+    let (major, minor) = fleetringd::software::release().line();
+    fleetring_control::Release::new(major, minor.saturating_sub(1), 0)
+}
+
+/// The first release of the line after this build's: two lines past [`previous_line`].
+fn next_line() -> fleetring_control::Release {
+    let (major, minor) = fleetringd::software::release().line();
+    fleetring_control::Release::new(major, minor + 1, 0)
+}
+
 /// ADR-0038 over the wire: the control node records what each member runs, refuses a join two
 /// release lines away, refuses `Undrain` while a member doesn't support it without logging it,
 /// and once every member does, applies it and refuses members that lack it from then on.
@@ -1974,10 +1998,12 @@ async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResu
     let address = daemon.control_address().ok_or("no control address")?;
     let control = secure_client(address, &tls)?;
     let current = fleetringd::software::VERSION;
+    let previous = previous_line().to_string();
+    let next = next_line().to_string();
 
-    // "old" reports nothing, as 0.3.0 does; "new" runs this build.
+    // "old" runs the line before this build's without the feature; "new" runs this build.
     node_client(address, &tls, "old")?
-        .join(join_with("old", None))
+        .join(join_with("old", Some(featureless(&previous))))
         .await?;
     node_client(address, &tls, "new")?
         .join(join_with("new", Some(reporting(current))))
@@ -1998,18 +2024,23 @@ async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResu
                 .map(|software| software.version.as_str())
         })
         .collect();
-    assert_eq!(reported, [Some(current), None], "new, then old");
+    assert_eq!(
+        reported,
+        [Some(current), Some(previous.as_str())],
+        "new, then old"
+    );
 
     // Two release lines past the baseline is refused, naming both nodes: "old", or "new" when
     // this build is older than the baseline's line.
     let far = node_client(address, &tls, "far")?
-        .join(join_with("far", Some(reporting("0.5.0"))))
+        .join(join_with("far", Some(reporting(&next))))
         .await
-        .expect_err("0.5 can't run beside 0.3");
+        .expect_err("two lines past old");
     assert_eq!(far.code(), Code::FailedPrecondition);
     assert!(
-        far.message()
-            .starts_with("node 'far' runs fleetringd 0.5.0, which can't run beside node '"),
+        far.message().starts_with(&format!(
+            "node 'far' runs fleetringd {next}, which can't run beside node '"
+        )),
         "{far:?}"
     );
 
@@ -2027,9 +2058,9 @@ async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResu
         .expect_err("old doesn't support undrain");
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert!(
-        refused
-            .message()
-            .contains("can't use 'undrain' yet: node 'old' runs fleetringd 0.3.0"),
+        refused.message().contains(&format!(
+            "can't use 'undrain' yet: node 'old' runs fleetringd {previous}"
+        )),
         "{refused:?}"
     );
     let handle = daemon.control().ok_or("no control")?;
@@ -2044,7 +2075,7 @@ async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResu
     assert!(!state.is_draining(&"new".parse()?));
     assert!(state.is_enabled(fleetring_control::Feature::Undrain));
     let rolled_back = node_client(address, &tls, "old")?
-        .join(join_with("old", None))
+        .join(join_with("old", Some(featureless(&previous))))
         .await
         .expect_err("a rollback below the feature is refused");
     assert_eq!(rolled_back.code(), Code::FailedPrecondition);
@@ -2108,8 +2139,9 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
     };
     let current = fleetringd::software::running();
 
-    // "old" reports nothing, as 0.3.0 does; "new" runs this build.
-    handle.submit(join("old", None)?).await?;
+    // "old" runs the line before this build's without the feature; "new" runs this build.
+    let old = Software::new(previous_line(), 1);
+    handle.submit(join("old", Some(old.clone()))?).await?;
     handle.submit(join("new", Some(current.clone()))?).await?;
     // A node on another major is refused at every retry, as its heartbeat loop sends them.
     let far = Software::new("9.0.0".parse()?, 1);
@@ -2117,7 +2149,7 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
         let refused = handle
             .submit(join("far", Some(far.clone()))?)
             .await
-            .expect_err("9.0 can't run beside 0.3");
+            .expect_err("9.0 can't run beside this build's line");
         assert!(
             matches!(
                 &refused,
@@ -2134,7 +2166,7 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
         .submit(Action::Undrain { id: "new".parse()? })
         .await?;
     let featureless = Software::new(fleetringd::software::release(), 1);
-    for refused in [join("late", Some(featureless))?, join("old", None)?] {
+    for refused in [join("late", Some(featureless))?, join("old", Some(old))?] {
         let refused = handle.submit(refused).await.expect_err("lacks undrain");
         assert!(
             matches!(
