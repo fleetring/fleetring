@@ -594,10 +594,10 @@ The ordered list of distinct nodes that hold a key's replicas: the first R nodes
 
 ### Replication factor
 
-R: how many replicas a database has, the primary included. A replica set with fewer than R nodes is *under-replicated*.
+R: how many replicas a database has, the primary included. A replica set with fewer than R nodes is *under-replicated*. Set per database at creation; a creation that names none takes the fleet's default, 3 unless the control node's configuration says otherwise, and 1 in dev mode (ADR-0039).
 
 - **Applies to:** crate, daemon, CLI, UI.
-- **Code:** `ReplicationFactor`. **CLI:** `--replication-factor`; the `RF` column in `db list`.
+- **Code:** `ReplicationFactor`. **CLI:** `--replication-factor`; the `RF` column in `db list`; config `[replication] replication_factor`, the fleet's default.
 - **Not:** replica count, copies, redundancy.
 
 ### Request ID

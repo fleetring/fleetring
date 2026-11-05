@@ -1,6 +1,6 @@
 # ADR-0039: Dev mode is the normal daemon on loopback, with a local authority and an admin principal it creates once
 
-- **Status:** Accepted (2026-11-04)
+- **Status:** Accepted (2026-11-04); the default replication factor left for a follow-up is taken by the [amendment](#amendment-2026-11-04-91-a-fleet-default-replication-factor) below
 - **Date:** 2026-11-04
 - **Related:** ADR-0025 (principals and scopes), ADR-0034 (admin listener), ADR-0038 (upgrades); tickets FR-068, FR-056, FR-060
 
@@ -39,7 +39,7 @@ Shortcuts that would get there fast all weaken something: plaintext (`--insecure
 - **Plaintext dev mode.** No certificates to create, but clients would never exercise TLS or scopes, and a dev node reachable over the network would accept anything. Rejected.
 - **Client commands falling back to `~/.fleetring` when no TLS flags are given.** No file to load, but it is an implicit identity that changes what a command does depending on what lies in the home directory, and it would have to be undone when contexts arrive. The environment file is explicit and needs no code in the commands beyond `FLEETRING_CONTROL`. Rejected.
 - **Checking loopback in `fleetringd dev` only.** Weaker: `fleetringd --config ~/.fleetring/fleetringd.toml --listen 0.0.0.0:7400` would bypass it. Rejected for point 3.
-- **A dev-mode default replication factor of 1 on the control node.** Would let `db create notes` work without `--replication-factor 1`, but changes what a creation request without a factor means on the wire. Left for a follow-up; the quickstart passes the flag, and the same command works against a fleet.
+- **A dev-mode default replication factor of 1 on the control node.** Would let `db create notes` work without `--replication-factor 1`, but changes what a creation request without a factor means on the wire. Left for a follow-up; the quickstart passes the flag, and the same command works against a fleet. (*Amended 2026-11-04, #91:* taken as a fleet-wide default that dev mode sets to 1, resolved before the creation is logged; see the amendment below.)
 
 ## Consequences
 
@@ -47,3 +47,15 @@ Shortcuts that would get there fast all weaken something: plaintext (`--insecure
 - `ca.key` and the admin key sit unencrypted in the data directory. That is acceptable only because the node is loopback-only and single-user; `SECURITY.md` says dev mode is for local development only.
 - A single node holds one copy of each database: a disk failure loses it, and `--replication-factor` above 1 leaves writes unable to reach their quorum.
 - FR-056 replaces the environment file with a context, and FR-060 packages `deploy/dev/`'s service definitions (a Homebrew `service do` block and a systemd user unit).
+
+## Amendment (2026-11-04, #91): a fleet default replication factor
+
+`db create` asked for three replicas unless told otherwise, so on a dev node every database it created without `--replication-factor 1` was placed and then refused every write as `UNAVAILABLE`. An agent or an application creating databases on its own (FR-070) wouldn't know to pass the flag. The alternative this ADR left for a follow-up is taken, as a fleet-wide setting rather than a dev-mode branch.
+
+1. **The fleet's default is the control node's `[replication] replication_factor`.** It is 3 unless set, and at least 1: a 0 fails to load, naming the field. It sits beside `acks` and `min_replicas`, which are already the control node's defaults for a creation that names none (ADR-0023). `fleetringd dev` writes `replication_factor = 1` into the configuration of point 2. Nothing branches on dev mode; any fleet may set the field.
+2. **The default is resolved before the creation is logged.** A `CreateDatabaseRequest` whose `replication_factor` is 0, which every earlier release refused, asks for the fleet's default. The `Create` handler fills it in before the command is stamped and logged, as it fills in durability, so the logged `CreateDatabase` always carries an explicit factor. `apply` doesn't change; a log replays to the same state on every release and whatever the setting says later; and the command is no fleet feature (ADR-0038, point 4), since a member or control node on 0.4.0 reads it as it always has.
+3. **Clients ask for the default by leaving the factor out.** `db create` and `db restore` send 0 when `--replication-factor` is absent, and `DatabaseSpec::default()` does the same for code using the client; an explicit factor wins. A control node before 0.5.0 refuses 0 with `invalid replication factor 0`, and the client then sends 3, the factor the commands asked for before, so a new client works against an old control node during a rolling upgrade. An old client sends 3 itself and keeps getting 3.
+4. **A factor larger than the fleet's data nodes is accepted, with a warning.** A fleet may be growing, or have a member down, and placement already places a database on as many nodes as it can when the ring has fewer than R; the replica set fills as nodes join. Refusing would fail creations that are fine a minute later, and would make a creation's outcome depend on the membership at that moment. So the creation stands, the control node logs a warning, and `db create` and `db restore` print one on stderr that names both numbers and says whether writes reach their floor meanwhile: `warning: notes has a replication factor of 3, but the fleet has 1 data node: its writes fail until 1 more joins, or create it with a smaller --replication-factor`. A refusal could be added later in the handler, before logging, without changing the log.
+5. **`status` against a dev node doesn't warn about its ring.** A node or client building the ring from a membership update that says dev mode doesn't log the ring's diagnostics (`ring has 1 node but replicates 3 ways`): they judge the ring's own factor, 3, not the factors databases were created with, and one node is what dev mode is. Every other fleet logs them as before.
+
+Consequences: the quickstart drops `--replication-factor 1`, and the same `db create notes` gives one replica on a dev node and three on a default fleet. A dev directory written by a build of `main` from before this amendment has no `replication_factor` and keeps the default of 3 until the line is added; no release wrote one.
