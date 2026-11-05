@@ -273,8 +273,21 @@ pub struct ParseFeatureError {
     name: String,
 }
 
+/// The fleet features the 0.5 release line decodes, and so the only names a stored [`Software`]
+/// writes in its `features` field (ADR-0041, amendment 1).
+///
+/// 0.5 decodes `features` strictly: one name it doesn't know fails the whole control log or
+/// snapshot, even before any command uses the feature. Every other name goes in
+/// `newer_features`, which 0.5 ignores. Releases from 0.6 on decode both fields and keep names
+/// they don't know, so this list is frozen at the 0.5 line's set and later lines never extend it.
+const FEATURES_THE_0_5_LINE_DECODES: [Feature; 1] = [Feature::Undrain];
+
 /// What a member runs: its release, the newest control-log format it reads, and the fleet
 /// features it supports.
+///
+/// A member may also report feature names this release doesn't know, from a newer release. They
+/// are kept, so that they survive the control log and snapshots, but this release never counts
+/// them as supported.
 ///
 /// # Examples
 ///
@@ -287,11 +300,65 @@ pub struct ParseFeatureError {
 /// assert_eq!(Software::baseline().release(), &Release::new(0, 3, 0));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "SoftwareRecord", into = "SoftwareRecord")]
 pub struct Software {
     release: Release,
     control_format: u32,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     features: BTreeSet<Feature>,
+    unknown_features: BTreeSet<Box<str>>,
+}
+
+/// [`Software`] as the control log and snapshots store it.
+///
+/// `features` holds only names in [`FEATURES_THE_0_5_LINE_DECODES`], exactly as 0.5 wrote it,
+/// and `newer_features` every other name, sorted. Both are read the same way: a name this
+/// release knows is a feature, and any other is kept as an unknown name.
+#[derive(Serialize, Deserialize)]
+struct SoftwareRecord {
+    release: Release,
+    control_format: u32,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    features: BTreeSet<String>,
+    // Absent from states and logs written before 0.6.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    newer_features: BTreeSet<String>,
+}
+
+impl From<SoftwareRecord> for Software {
+    fn from(record: SoftwareRecord) -> Self {
+        let mut software = Self::new(record.release, record.control_format);
+        for name in record.features.into_iter().chain(record.newer_features) {
+            match name.parse() {
+                Ok(feature) => {
+                    software.features.insert(feature);
+                }
+                Err(ParseFeatureError { name }) => {
+                    software.unknown_features.insert(name.into_boxed_str());
+                }
+            }
+        }
+        software
+    }
+}
+
+impl From<Software> for SoftwareRecord {
+    fn from(software: Software) -> Self {
+        let (old, newer): (Vec<Feature>, Vec<Feature>) = software
+            .features
+            .into_iter()
+            .partition(|feature| FEATURES_THE_0_5_LINE_DECODES.contains(feature));
+        let name = |feature: Feature| feature.as_str().to_owned();
+        Self {
+            release: software.release,
+            control_format: software.control_format,
+            features: old.into_iter().map(name).collect(),
+            newer_features: newer
+                .into_iter()
+                .map(name)
+                .chain(software.unknown_features.into_iter().map(String::from))
+                .collect(),
+        }
+    }
 }
 
 impl Software {
@@ -306,6 +373,7 @@ impl Software {
             release,
             control_format,
             features: BTreeSet::new(),
+            unknown_features: BTreeSet::new(),
         }
     }
 
@@ -344,6 +412,14 @@ impl Software {
     #[must_use]
     pub fn supports(&self, feature: Feature) -> bool {
         self.features.contains(&feature)
+    }
+
+    /// Returns the feature names the member reported that this release doesn't know, in order.
+    ///
+    /// A newer member reports them; they are kept so that they survive the control log and
+    /// snapshots, and never count as supported features here.
+    pub fn unknown_features(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.unknown_features.iter().map(AsRef::as_ref)
     }
 }
 
@@ -402,6 +478,64 @@ mod tests {
         assert!(!current.runs_beside(&release("0.2.0")));
         assert!(!current.runs_beside(&release("0.6.0")));
         assert!(!release("1.0.0").runs_beside(&release("0.9.0")));
+    }
+
+    #[test]
+    fn stored_software_keeps_names_the_0_5_line_cannot_decode_out_of_features() {
+        let software = Feature::ALL
+            .into_iter()
+            .fold(Software::new(release("0.6.0"), 1), Software::with_feature);
+        let stored = serde_json::to_string(&software).expect("serializes");
+        assert_eq!(
+            stored,
+            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["expiry","metadata"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Software>(&stored).expect("decodes"),
+            software
+        );
+
+        // Software of the 0.5 line, and of 0.3.0 with no features, is stored as it was.
+        let old = Software::new(release("0.5.0"), 1).with_feature(Feature::Undrain);
+        let stored = r#"{"release":"0.5.0","control_format":1,"features":["undrain"]}"#;
+        assert_eq!(serde_json::to_string(&old).expect("serializes"), stored);
+        assert_eq!(
+            serde_json::from_str::<Software>(stored).expect("decodes"),
+            old
+        );
+        let stored = r#"{"release":"0.3.0","control_format":1}"#;
+        assert_eq!(
+            serde_json::to_string(&Software::baseline()).expect("serializes"),
+            stored
+        );
+    }
+
+    #[test]
+    fn unknown_feature_names_round_trip_and_are_never_supported() {
+        // A newer release's names, in either field, as a release after this one might write.
+        let stored = r#"{"release":"0.7.0","control_format":2,"features":["undrain","future-x"],"newer_features":["metadata","future-y"]}"#;
+        let software: Software = serde_json::from_str(stored).expect("decodes");
+        assert!(software.supports(Feature::Undrain));
+        assert!(software.supports(Feature::Metadata));
+        assert!(!software.supports(Feature::Expiry));
+        assert_eq!(
+            software.unknown_features().collect::<Vec<_>>(),
+            ["future-x", "future-y"]
+        );
+        assert_eq!(
+            software.features().collect::<Vec<_>>(),
+            [Feature::Undrain, Feature::Metadata]
+        );
+
+        let rewritten = serde_json::to_string(&software).expect("serializes");
+        assert_eq!(
+            rewritten,
+            r#"{"release":"0.7.0","control_format":2,"features":["undrain"],"newer_features":["future-x","future-y","metadata"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Software>(&rewritten).expect("decodes"),
+            software
+        );
     }
 
     #[test]

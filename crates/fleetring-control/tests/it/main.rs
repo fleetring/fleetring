@@ -6,5 +6,6 @@ mod durability;
 mod metadata;
 mod properties;
 mod replay;
+mod rollback;
 mod scenarios;
 mod software;
