@@ -39,8 +39,8 @@ pub enum Binding {
     HolderOrCandidate,
     /// The caller is a follower this primary streams the database to.
     Follower,
-    /// Control state no longer holds the database at the request's epoch: it was dropped, and
-    /// any database of the name now is a newer one at a lower epoch (ADR-0042).
+    /// The request's epoch is the receiving node's copy's own highest epoch, and control state
+    /// no longer holds the database at it: that copy's database was dropped (ADR-0042).
     Dropped,
 }
 
