@@ -181,11 +181,34 @@ pub enum DevError {
     #[error(
         "{dir} holds certificates but no authority (ca.crt and ca.key), and dev mode never \
          creates an authority beside certificates another one issued; restore them, or remove \
-         {dir} to start over"
+         {dir} to start over with a new authority, after which every certificate and token the \
+         old one issued stops working (the databases are kept)"
     )]
     NoAuthority {
         /// The TLS directory.
         dir: PathBuf,
+    },
+    /// The authority in the directory is another fleet's.
+    #[error(
+        "{path} is the authority of the fleet '{fleet}', not dev mode's, and dev mode issues \
+         nothing from another fleet's authority; pass another --data-dir"
+    )]
+    ForeignAuthority {
+        /// The authority certificate.
+        path: PathBuf,
+        /// The fleet it names.
+        fleet: String,
+    },
+    /// The directory holds something dev mode never writes, and so isn't a dev directory.
+    #[error(
+        "{dir} isn't a dev mode directory: it holds {entry}, which dev mode never writes, so \
+         `fleetringd dev` won't touch it; pass an empty or new --data-dir"
+    )]
+    NotDevDir {
+        /// The directory.
+        dir: PathBuf,
+        /// The first entry dev mode doesn't recognize.
+        entry: PathBuf,
     },
     /// A certificate has expired.
     #[error(
@@ -384,18 +407,60 @@ pub fn default_dir() -> Result<PathBuf, DevError> {
 /// file missing is completed only where that is safe. The CLI's environment file is rewritten
 /// from the configuration every time, so it follows an edited port.
 ///
+/// It refuses a directory that isn't dev mode's before it writes anything: one whose
+/// `fleetringd.toml` lacks `dev = true`, one without that file that holds anything but `tls/`,
+/// `data/`, `changes/`, and `env` (what a partial dev state leaves), one whose `tls/` holds a
+/// file dev mode never writes, and one whose authority is another fleet's.
+///
 /// On Unix, directories are created `0700` and private keys `0600`.
 ///
 /// # Errors
 ///
-/// [`DevError`] if `port` is 0 or 65535, a file can't be read or written, the state is
-/// incomplete in a way that can't be completed safely, a certificate expired, or the
-/// configuration is invalid, isn't a dev mode one, or disagrees with `port`.
+/// [`DevError`] if `port` is 0 or 65535, a file can't be read or written, the directory isn't
+/// dev mode's, the state is incomplete in a way that can't be completed safely, a certificate
+/// expired, or the configuration is invalid, isn't a dev mode one, or disagrees with `port`.
 pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared, DevError> {
     if let Some(port) = port {
         check_port(port)?;
     }
+    // Everything that could refuse the directory is checked before anything is written to it,
+    // so a directory that isn't dev mode's is left exactly as it was.
+    let path = dir.join(CONFIG_FILE);
+    let existing = check_existing(dir, &path, port)?;
     let tls = dir.join(TLS_DIR);
+    let loaded = match pair(&tls, "ca")? {
+        Pair::Present => {
+            let authority = Authority::load(&tls)?;
+            if authority.fleet().as_str() != FLEET {
+                return Err(DevError::ForeignAuthority {
+                    path: tls.join("ca.crt"),
+                    fleet: authority.fleet().to_string(),
+                });
+            }
+            Some(authority)
+        }
+        Pair::Absent => {
+            for stem in [node_stem(), client_stem()] {
+                for extension in ["crt", "key"] {
+                    if exists(&tls.join(format!("{stem}.{extension}")))? {
+                        return Err(DevError::NoAuthority { dir: tls });
+                    }
+                }
+            }
+            None
+        }
+    };
+    let node_stem = node_stem();
+    let client_stem = client_stem();
+    let node = pair(&tls, &node_stem)?;
+    let client = pair(&tls, &client_stem)?;
+    if node == Pair::Present {
+        check_unexpired(&tls.join(format!("{node_stem}.crt")), now)?;
+    }
+    if client == Pair::Present {
+        check_unexpired(&tls.join(format!("{client_stem}.crt")), now)?;
+    }
+
     for path in [
         dir.to_owned(),
         tls.clone(),
@@ -405,16 +470,9 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
         create_private_dir(&path)?;
     }
     let mut created = Vec::new();
-    let authority = match pair(&tls, "ca")? {
-        Pair::Present => Authority::load(&tls)?,
-        Pair::Absent => {
-            for stem in [node_stem(), client_stem()] {
-                for extension in ["crt", "key"] {
-                    if exists(&tls.join(format!("{stem}.{extension}")))? {
-                        return Err(DevError::NoAuthority { dir: tls });
-                    }
-                }
-            }
+    let authority = match loaded {
+        Some(authority) => authority,
+        None => {
             let authority =
                 Authority::create(name(FLEET)?, Validity::new(now, DEFAULT_AUTHORITY_LIFETIME))?;
             authority.write(&tls)?;
@@ -423,49 +481,28 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
         }
     };
     let leaf = Validity::new(now, LEAF_LIFETIME);
-    let node_stem = node_stem();
-    match pair(&tls, &node_stem)? {
-        Pair::Present => check_unexpired(&tls.join(format!("{node_stem}.crt")), now)?,
-        Pair::Absent => {
-            let names: Vec<String> = LOOPBACK_NAMES.iter().map(|&name| name.to_owned()).collect();
-            authority
-                .issue_node(&name(NODE)?, &names, leaf)?
-                .write(&tls, &node_stem)?;
-            created.push(Created::NodeCertificate);
+    if node == Pair::Absent {
+        let names: Vec<String> = LOOPBACK_NAMES.iter().map(|&name| name.to_owned()).collect();
+        authority
+            .issue_node(&name(NODE)?, &names, leaf)?
+            .write(&tls, &node_stem)?;
+        created.push(Created::NodeCertificate);
+    }
+    if client == Pair::Absent {
+        authority
+            .issue_client(&name(PRINCIPAL)?, leaf)?
+            .write(&tls, &client_stem)?;
+        created.push(Created::AdminCertificate);
+    }
+    let config = match existing {
+        Some(config) => config,
+        None => {
+            let text = config_text(dir, port.unwrap_or(DEFAULT_PORT))?;
+            write_new(&path, &text)?;
+            created.push(Created::Config);
+            load_dev_config(&path, port)?
         }
-    }
-    let client_stem = client_stem();
-    match pair(&tls, &client_stem)? {
-        Pair::Present => check_unexpired(&tls.join(format!("{client_stem}.crt")), now)?,
-        Pair::Absent => {
-            authority
-                .issue_client(&name(PRINCIPAL)?, leaf)?
-                .write(&tls, &client_stem)?;
-            created.push(Created::AdminCertificate);
-        }
-    }
-    let path = dir.join(CONFIG_FILE);
-    if !exists(&path)? {
-        let text = config_text(dir, port.unwrap_or(DEFAULT_PORT))?;
-        write_new(&path, &text)?;
-        created.push(Created::Config);
-    }
-    let config = Config::load(&path).map_err(|source| DevError::Config {
-        path: path.clone(),
-        source,
-    })?;
-    if config.dev != DevMode::On {
-        return Err(DevError::NotDev { path });
-    }
-    if let Some(port) = port
-        && config.listen.port() != port
-    {
-        return Err(DevError::PortMismatch {
-            path,
-            listen: config.listen,
-            port,
-        });
-    }
+    };
     let Some(control) = config.control_target() else {
         return Err(DevError::NoPort { path });
     };
@@ -480,6 +517,94 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
         config,
         created,
     })
+}
+
+/// The entries a dev directory may hold before it has a configuration: what an interrupted or
+/// partly removed dev mode state leaves.
+const PARTIAL_ENTRIES: [&str; 4] = [TLS_DIR, DATA_DIR, CHANGES_DIR, ENV_FILE];
+
+/// The files dev mode writes into its TLS directory, and the only ones it may hold.
+const TLS_FILES: [&str; 6] = [
+    "ca.crt",
+    "ca.key",
+    "node.dev.crt",
+    "node.dev.key",
+    "client.admin.crt",
+    "client.admin.key",
+];
+
+/// Checks, without writing anything, that `dir` is dev mode's: its configuration, if it has
+/// one, says `dev = true` and agrees with `port`, which it then returns; without one, it holds
+/// nothing but a partial dev state.
+fn check_existing(dir: &Path, path: &Path, port: Option<u16>) -> Result<Option<Config>, DevError> {
+    if exists(path)? {
+        let config = load_dev_config(path, port)?;
+        if config.control_target().is_none() {
+            return Err(DevError::NoPort {
+                path: path.to_owned(),
+            });
+        }
+        check_entries(&dir.join(TLS_DIR), &TLS_FILES, dir)?;
+        return Ok(Some(config));
+    }
+    check_entries(dir, &PARTIAL_ENTRIES, dir)?;
+    check_entries(&dir.join(TLS_DIR), &TLS_FILES, dir)?;
+    Ok(None)
+}
+
+/// Refuses `within` if it holds an entry `allowed` doesn't list. A missing directory holds
+/// nothing.
+fn check_entries(within: &Path, allowed: &[&str], dir: &Path) -> Result<(), DevError> {
+    let entries = match fs::read_dir(within) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DevError::File {
+                action: "read",
+                path: within.to_owned(),
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| DevError::File {
+            action: "read",
+            path: within.to_owned(),
+            source,
+        })?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| allowed.contains(&name)) {
+            return Err(DevError::NotDevDir {
+                dir: dir.to_owned(),
+                entry: entry.path(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Loads the configuration at `path`, and refuses one that isn't dev mode's or listens on
+/// another port than `port`.
+fn load_dev_config(path: &Path, port: Option<u16>) -> Result<Config, DevError> {
+    let config = Config::load(path).map_err(|source| DevError::Config {
+        path: path.to_owned(),
+        source,
+    })?;
+    if config.dev != DevMode::On {
+        return Err(DevError::NotDev {
+            path: path.to_owned(),
+        });
+    }
+    if let Some(port) = port
+        && config.listen.port() != port
+    {
+        return Err(DevError::PortMismatch {
+            path: path.to_owned(),
+            listen: config.listen,
+            port,
+        });
+    }
+    Ok(config)
 }
 
 fn check_port(port: u16) -> Result<(), DevError> {
@@ -529,7 +654,8 @@ fn pair(dir: &Path, stem: &str) -> Result<Pair, DevError> {
         if stem == "ca" {
             format!(
                 "dev mode never replaces an authority: restore the missing file, or remove {} \
-                 to start over",
+                 to start over with a new authority, after which every certificate and token the \
+                 old one issued stops working (the databases are kept)",
                 dir.display()
             )
         } else {
@@ -863,6 +989,89 @@ mod tests {
         fs::write(&path, text.replace("dev = true\n", "")).expect("edited");
         let error = prepare(&dir, None, NOW).expect_err("not dev");
         assert!(matches!(error, DevError::NotDev { .. }), "{error}");
+    }
+
+    /// Every entry under `dir`, with its length and modification time.
+    fn listing(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_owned()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).expect("a directory") {
+                let path = entry.expect("an entry").path();
+                let metadata = fs::metadata(&path).expect("metadata");
+                if metadata.is_dir() {
+                    pending.push(path.clone());
+                }
+                found.push((path, metadata.len(), metadata.modified().expect("an mtime")));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// A real node's directory: its own configuration, and its fleet's authority beside it.
+    fn real_node_dir(root: &Path) -> PathBuf {
+        let dir = root.join("node");
+        let tls = dir.join(TLS_DIR);
+        Authority::create(
+            "home".parse().expect("a fleet"),
+            Validity::new(NOW, DEFAULT_AUTHORITY_LIFETIME),
+        )
+        .expect("an authority")
+        .write(&tls)
+        .expect("written");
+        let config = generated()
+            .replace("dev = true\n", "")
+            .replace("/tmp/fleetring-dev", &dir.display().to_string());
+        fs::write(dir.join(CONFIG_FILE), config).expect("a config");
+        dir
+    }
+
+    #[test]
+    fn a_real_nodes_directory_is_refused_before_anything_is_written() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = real_node_dir(root.path());
+        let before = listing(&dir);
+        let error = prepare(&dir, None, NOW).expect_err("not dev");
+        assert!(matches!(error, DevError::NotDev { .. }), "{error}");
+        assert_eq!(listing(&dir), before, "the directory changed");
+
+        // Without its configuration, the authority's fleet gives it away.
+        fs::remove_file(dir.join(CONFIG_FILE)).expect("removed");
+        let before = listing(&dir);
+        let error = prepare(&dir, Some(17_400), NOW).expect_err("another fleet");
+        assert!(
+            matches!(error, DevError::ForeignAuthority { .. }),
+            "{error}"
+        );
+        assert_eq!(listing(&dir), before, "the directory changed");
+    }
+
+    #[test]
+    fn a_directory_with_anything_but_a_partial_dev_state_is_refused() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("other");
+        fs::create_dir_all(dir.join(TLS_DIR)).expect("a directory");
+        fs::write(dir.join(TLS_DIR).join("node.node-1.key"), "").expect("a file");
+        let before = listing(&dir);
+        let error = prepare(&dir, None, NOW).expect_err("a stranger's tls");
+        assert!(matches!(error, DevError::NotDevDir { .. }), "{error}");
+        assert!(error.to_string().contains("node.node-1.key"), "{error}");
+        assert_eq!(listing(&dir), before, "the directory changed");
+
+        fs::remove_dir_all(dir.join(TLS_DIR)).expect("removed");
+        fs::write(dir.join("notes.db"), "").expect("a file");
+        let error = prepare(&dir, None, NOW).expect_err("a stranger's file");
+        assert!(matches!(error, DevError::NotDevDir { .. }), "{error}");
+
+        // What a partial dev state leaves is completed.
+        fs::remove_file(dir.join("notes.db")).expect("removed");
+        for sub in [DATA_DIR, CHANGES_DIR] {
+            fs::create_dir_all(dir.join(sub)).expect("a directory");
+        }
+        fs::write(dir.join(ENV_FILE), "").expect("a file");
+        let completed = prepare(&dir, Some(17_400), NOW).expect("a partial dev state");
+        assert_eq!(completed.created().len(), 4);
     }
 
     fn generated() -> String {
