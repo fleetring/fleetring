@@ -19,9 +19,9 @@ fleetringd context use home
   | Verb | Means | Destructive |
   |---|---|---|
   | `list` | every item the caller may see, as a table | no |
-  | `show` | one item in detail (`db locate` predates this rule and stays) | no |
+  | `show` | one item in detail: `db show` (`db locate` predates this rule and stays) | no |
   | `create`, `add`, `issue`, `init` | make something new | no |
-  | `set-<field>` | change one setting (`db set-durability`) | no |
+  | `set-<field>` | change one setting (`db set-durability`, `db set-description`, `db set-labels`) | no |
   | `watch` | follow a stream until interrupted | no |
   | `verify` | check, and report only | no |
   | `restore` | build a new item from an archive, never over an existing one | no |
@@ -29,7 +29,7 @@ fleetringd context use home
   | `undrain` | clear a drain mark, so the node takes work again | no |
   | `drop`, `remove`, `revoke` | delete for good | asks |
 
-- **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, `dev`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request. `dev` is the daemon too, run from a directory it prepares (ADR-0039), so it sits beside `--config` rather than under a noun.
+- **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, `dev`, *planned* `mcp`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request. `dev` is the daemon too, run from a directory it prepares (ADR-0039), so it sits beside `--config` rather than under a noun. `mcp` (FR-070) is a long-running process that speaks the Model Context Protocol on stdio as one principal, as the router speaks its protocol (ADR-0037, ADR-0041 point 8), so it acts on many nouns and belongs under none.
 - **Arguments** are for the thing the command acts on (`db drop <database>`); everything else is a flag. At most one positional kind per command, plus SQL and its parameters for `db exec` and `db query`.
 - **No aliases.** A command or flag has one spelling; a rename replaces it outright ([renames](#14-renames)).
 
@@ -185,15 +185,15 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | One flag, one kind of value | Yes: `--node` takes a node ID in `db list`, `status`, `lease watch`, `db exec`, and `db query`; `--address` takes `host:port`; `cert node --addresses` takes the addresses a node is dialed at. | Done (FR-062) |
 | Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key` (`FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`); `--token` has `FLEETRING_TOKEN`; `--control`, then `--config`, then `FLEETRING_CONTROL` for the control address. No context step. | FR-056 |
 | Contexts | None; every command takes `--control`, `--config`, or `FLEETRING_CONTROL`, and TLS flags. `fleetringd dev` writes `<dir>/env`, which sets the variables for its node until it can write a `dev` context instead (ADR-0039). | FR-056 |
-| `--json` / `-o` with stable fields | None; human output only. | FR-056 |
+| `--json` / `-o` with stable fields | `db show` takes `-o table\|json` and `--json`, printing one object with `database`, `placement`, and `metadata` (ADR-0041); every other command prints for people only. | FR-056 |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
 | Quiet when piped | Commands print no progress or colour; logs are warnings only. No `--quiet`. | FR-056 |
 | `NO_COLOR` | Results have no colour. Log lines on stderr use ANSI colour, honour `NO_COLOR`, but don't check for a terminal. | FR-056 |
-| Errors with the next step | `fleetringd: <error>` with `caused by:` lines; some say what to pass (`pass --control or --config`). One `hint:` line so far, when `--node` is given an address. | FR-056 |
+| Errors with the next step | `fleetringd: <error>` with `caused by:` lines; some say what to pass (`pass --control or --config`). `hint:` lines when `--node` is given an address, and when a fleet with a member that lacks `metadata` refuses `--description` or `--label`. | FR-056 |
 | Confirmation and `--yes` | `db drop` asks on a terminal and refuses elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask; the draining node logs `no other replica; the database is unavailable until this node returns` for a database that has none (FR-055). | FR-056 |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | FR-056 |
 | Completions and man pages | None. | FR-056 |
-| Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. No `-` for stdin. | FR-056 |
+| Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin (`db create`, `db restore`, `db set-description`); nothing else reads `-`. | FR-056 |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | FR-056 |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0. | Done |
 | `upgrade` | `upgrade` installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place; `--check` changes nothing and exits 1 when the fleet doesn't allow the release, by its window or its enabled features; `node remove` takes out a member that is gone for good; `--timeout` bounds each step, 5m by default (ADR-0038). | Done (FR-054) |
