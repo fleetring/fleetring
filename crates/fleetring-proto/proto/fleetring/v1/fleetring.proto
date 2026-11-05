@@ -235,6 +235,9 @@ message MembershipUpdate {
   // lacks one can't join, so `fleetringd upgrade` refuses to install such a release. Empty from a
   // control node that predates the field.
   repeated string features = 3;
+  // Set when the control node runs in dev mode (ADR-0039): one node on loopback with a local
+  // authority, for development only. Unset by a control node that predates the field.
+  bool dev_mode = 4;
 }
 
 message CreateDatabaseRequest {

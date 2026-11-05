@@ -37,6 +37,7 @@ use crate::control::node::{ControlHandle, SubmitError};
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, revocation_from_proto, revocations_to_proto,
 };
+use crate::dev::DevMode;
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
 
@@ -88,6 +89,7 @@ pub struct ControlService {
     node: ControlHandle,
     defaults: DurabilityDefaults,
     clock: Arc<dyn Clock>,
+    dev: DevMode,
 }
 
 impl ControlService {
@@ -99,7 +101,15 @@ impl ControlService {
             node,
             defaults: DurabilityDefaults::new(),
             clock: Arc::new(SystemClock),
+            dev: DevMode::Off,
         }
+    }
+
+    /// Tells every membership watcher whether this control node runs in dev mode (ADR-0039).
+    #[must_use]
+    pub fn with_dev_mode(mut self, dev: DevMode) -> Self {
+        self.dev = dev;
+        self
     }
 
     /// Reads the time from `clock`, which bounds how long a token's revocation is kept; the
@@ -388,8 +398,9 @@ fn member_flags(state: &State) -> Vec<MemberFlags> {
         .collect()
 }
 
-/// The membership as of the state's time, with the fleet features enabled.
-fn membership_update(state: &State, flags: &[MemberFlags]) -> MembershipUpdate {
+/// The membership as of the state's time, with the fleet features enabled, and whether this is
+/// a dev mode control node.
+fn membership_update(state: &State, flags: &[MemberFlags], dev: DevMode) -> MembershipUpdate {
     MembershipUpdate {
         membership_epoch: state.membership_epoch().get(),
         members: state
@@ -406,6 +417,7 @@ fn membership_update(state: &State, flags: &[MemberFlags]) -> MembershipUpdate {
             .features()
             .map(|feature| feature.as_str().to_owned())
             .collect(),
+        dev_mode: dev == DevMode::On,
     }
 }
 
@@ -620,6 +632,7 @@ impl Control for ControlService {
         let after_epoch = request.into_inner().after_epoch;
         // What the watcher holds: none until the first state is seen.
         let mut held: Option<(u64, Vec<MemberFlags>, Vec<Feature>)> = None;
+        let dev = self.dev;
         let updates = WatchStream::new(self.node.watch()).filter_map(move |state| {
             let epoch = state.membership_epoch().get();
             let flags = member_flags(&state);
@@ -634,7 +647,7 @@ impl Control for ControlService {
                         || features != *held_features
                 }
             };
-            let update = send.then(|| Ok(membership_update(&state, &flags)));
+            let update = send.then(|| Ok(membership_update(&state, &flags, dev)));
             held = Some((epoch, flags, features));
             update
         });

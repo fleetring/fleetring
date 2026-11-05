@@ -19,6 +19,7 @@ use crate::control::{
     NoControl, OpenError,
 };
 use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSettings};
+use crate::dev::DevMode;
 use crate::durability::{Archive, ArchiveError, ArchiveParts, build_store};
 use crate::engine::{DatabaseEngine, Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
@@ -252,6 +253,7 @@ impl Daemon {
                 ControlService::new(role.node.handle())
                     .with_durability_defaults(config.replication.durability_defaults())
                     .with_clock(environment.clock())
+                    .with_dev_mode(config.dev)
             }),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
@@ -321,6 +323,12 @@ impl Daemon {
                 .map_or_else(|| "off".to_owned(), |admin| admin.address().to_string()),
             "fleetringd started",
         );
+        if config.dev == DevMode::On {
+            tracing::warn!(
+                "dev mode: one node on loopback, with its authority's key beside it; for \
+                 development only (ADR-0039)",
+            );
+        }
         Ok(Self {
             config,
             data_dir,
