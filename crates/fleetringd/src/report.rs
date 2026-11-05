@@ -433,16 +433,7 @@ fn render_metadata(
         "created: {}",
         metadata.created_at.as_deref().unwrap_or("unknown")
     )?;
-    match (&metadata.expires_at, metadata.expires_in_ms) {
-        (Some(at), Some(ms)) if ms >= 0 => {
-            writeln!(out, "expires: {at} (in {})", duration(ms.unsigned_abs()))?;
-        }
-        (Some(at), Some(ms)) => {
-            writeln!(out, "expires: {at} ({} ago)", duration(ms.unsigned_abs()))?;
-        }
-        (Some(at), None) => writeln!(out, "expires: {at}")?,
-        (None, _) => writeln!(out, "expires: never")?,
-    }
+    writeln!(out, "expires: {}", expiry_text(metadata))?;
     writeln!(out, "version: {}", metadata.version)
 }
 
@@ -588,6 +579,24 @@ pub fn render_archived_metadata(
             labels.join(", ")
         }
     )
+}
+
+/// A database's expiry as text output prints it: the time and how long until it, such as
+/// `2026-11-05T10:00:00Z (in 23h 59m)`; once it has passed, how long ago, while the control
+/// plane drops the database; and `never` for a database without one.
+#[must_use]
+pub fn expiry_text(metadata: &MetadataReport) -> String {
+    match (&metadata.expires_at, metadata.expires_in_ms) {
+        (Some(at), Some(ms)) if ms >= 0 => format!("{at} (in {})", duration(ms.unsigned_abs())),
+        (Some(at), Some(ms)) => {
+            format!(
+                "{at} (expired {} ago, dropping)",
+                duration(ms.unsigned_abs())
+            )
+        }
+        (Some(at), None) => at.clone(),
+        (None, _) => "never".to_owned(),
+    }
 }
 
 /// `ms` as days, hours, minutes, and seconds, largest first, at most two of them.

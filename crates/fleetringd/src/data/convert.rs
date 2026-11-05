@@ -2,6 +2,7 @@
 
 use std::fmt::Display;
 use std::str::FromStr;
+use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,13 +12,15 @@ use fleetring_control::{
     Labels, LeaseEpoch, Liveness, Metadata, MetadataChange, ReplicaRole, Revocations, Revoked,
     Timestamp,
 };
+use fleetring_proto::v1::metadata_spec::Expiry as SpecExpiry;
 use fleetring_proto::v1::update_database_request::Description as DescriptionUpdate;
+use fleetring_proto::v1::update_database_request::Expiry as ExpiryUpdate;
 use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
 
 use crate::changes::{MarkHome, SinkStatus};
 use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
-use crate::data::metadata::{Descriptions, MetadataView, NewMetadata};
+use crate::data::metadata::{Descriptions, Expiry, ExpiryRequest, MetadataView, NewMetadata};
 use crate::data::schema::SchemaView;
 use crate::durability::ArchivedMetadata;
 use crate::engine::{
@@ -270,7 +273,33 @@ fn set_description(text: &str) -> Result<Description, Status> {
     })
 }
 
-/// The patch an update asks for.
+/// `duration` in whole milliseconds, as the protocol carries it; the longest it can carry if it
+/// is longer.
+fn duration_to_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The expiry a creation asks for, as the request carries it: still a duration if it names
+/// one, for the control node to resolve.
+pub(crate) fn spec_expiry_from_proto(spec: &proto::MetadataSpec) -> Option<Expiry> {
+    spec.expiry.map(|expiry| match expiry {
+        SpecExpiry::ExpiresAtMs(at) => Expiry::At(Timestamp::from_millis(at)),
+        SpecExpiry::ExpiresInMs(ms) => Expiry::In(Duration::from_millis(ms)),
+    })
+}
+
+/// What an update asks for its expiry, as the request carries it.
+pub(crate) fn expiry_request_from_proto(request: &proto::UpdateDatabaseRequest) -> ExpiryRequest {
+    match request.expiry {
+        None | Some(ExpiryUpdate::ClearExpiry(false)) => ExpiryRequest::Keep,
+        Some(ExpiryUpdate::ExpiresAtMs(at)) => ExpiryRequest::At(Timestamp::from_millis(at)),
+        Some(ExpiryUpdate::ExpiresInMs(ms)) => ExpiryRequest::In(Duration::from_millis(ms)),
+        Some(ExpiryUpdate::ClearExpiry(true)) => ExpiryRequest::Clear,
+    }
+}
+
+/// The patch an update asks for, and what it asks for the expiry, which the control node
+/// resolves against its time before it fills in the patch's.
 ///
 /// # Errors
 ///
@@ -278,7 +307,7 @@ fn set_description(text: &str) -> Result<Description, Status> {
 /// removed; or a patch that changes nothing.
 pub(crate) fn change_from_proto(
     request: &proto::UpdateDatabaseRequest,
-) -> Result<MetadataChange, Status> {
+) -> Result<(MetadataChange, ExpiryRequest), Status> {
     let description = match &request.description {
         None | Some(DescriptionUpdate::ClearDescription(false)) => DescriptionChange::Keep,
         Some(DescriptionUpdate::SetDescription(text)) => {
@@ -313,29 +342,46 @@ pub(crate) fn change_from_proto(
         remove_labels,
         ..MetadataChange::default()
     };
-    if change.is_empty() {
+    let expiry = expiry_request_from_proto(request);
+    if change.is_empty() && expiry.is_keep() {
         return Err(Status::invalid_argument(
-            "the update changes nothing: set or clear the description, or set or remove a label",
+            "the update changes nothing: set or clear the description or the expiry, or set or \
+             remove a label",
         ));
     }
-    Ok(change)
+    Ok((change, expiry))
 }
 
-/// The update request that applies `change` to `database`, at `if_version` if given.
+/// The update request that applies `change` to `database`, with the expiry as `expiry` says,
+/// at `if_version` if given. `change`'s own expiry, an absolute time or a clearing, is sent when
+/// `expiry` keeps it.
 ///
 /// # Errors
 ///
-/// `INVALID_ARGUMENT` for a change the protocol can't carry yet: one to the expiry.
+/// `INVALID_ARGUMENT` if both `change` and `expiry` change the expiry.
 pub(crate) fn change_to_proto(
     database: &DatabaseName,
     change: &MetadataChange,
+    expiry: ExpiryRequest,
     if_version: Option<u64>,
 ) -> Result<proto::UpdateDatabaseRequest, Status> {
-    if change.touches_expiry() {
+    if change.touches_expiry() && !expiry.is_keep() {
         return Err(Status::invalid_argument(
-            "this release can't change a database's expiry",
+            "the update changes the expiry twice",
         ));
     }
+    let expiry = match expiry {
+        ExpiryRequest::Keep => ExpiryRequest::from(change.expiry),
+        asked => asked,
+    };
+    let expiry = match expiry {
+        ExpiryRequest::Keep => None,
+        ExpiryRequest::At(at) => Some(ExpiryUpdate::ExpiresAtMs(at.as_millis())),
+        ExpiryRequest::In(duration) => {
+            Some(ExpiryUpdate::ExpiresInMs(duration_to_millis(duration)))
+        }
+        ExpiryRequest::Clear => Some(ExpiryUpdate::ClearExpiry(true)),
+    };
     let description = match &change.description {
         DescriptionChange::Set(text) => {
             Some(DescriptionUpdate::SetDescription(text.as_str().to_owned()))
@@ -355,6 +401,7 @@ pub(crate) fn change_to_proto(
             .iter()
             .map(ToString::to_string)
             .collect(),
+        expiry,
         if_version,
     })
 }
@@ -368,6 +415,10 @@ pub(crate) fn new_metadata_to_proto(metadata: &NewMetadata) -> proto::MetadataSp
             .map(|text| text.as_str().to_owned())
             .unwrap_or_default(),
         labels: labels_to_proto(&metadata.labels),
+        expiry: metadata.expiry.map(|expiry| match expiry {
+            Expiry::At(at) => SpecExpiry::ExpiresAtMs(at.as_millis()),
+            Expiry::In(duration) => SpecExpiry::ExpiresInMs(duration_to_millis(duration)),
+        }),
     }
 }
 
@@ -809,7 +860,7 @@ mod tests {
         };
         assert!(change_from_proto(&empty_text).is_err());
 
-        let change = change_from_proto(&proto::UpdateDatabaseRequest {
+        let (change, _) = change_from_proto(&proto::UpdateDatabaseRequest {
             description: Some(DescriptionUpdate::SetDescriptionWithoutAuthor(
                 "restored".to_owned(),
             )),
@@ -820,9 +871,49 @@ mod tests {
             change.description,
             DescriptionChange::SetWithoutAuthor(_)
         ));
-        let sent = change_to_proto(&database, &change, Some(3)).expect("no expiry");
-        assert_eq!(change_from_proto(&sent).expect("valid"), change);
+        let sent =
+            change_to_proto(&database, &change, ExpiryRequest::Keep, Some(3)).expect("no expiry");
+        assert_eq!(
+            change_from_proto(&sent).expect("valid"),
+            (change, ExpiryRequest::Keep)
+        );
         assert_eq!(sent.if_version, Some(3));
+    }
+
+    #[test]
+    fn expiries_round_trip_and_an_expiry_alone_is_a_change() {
+        let database: DatabaseName = "notes".parse().expect("name");
+        let in_a_day = Duration::from_secs(86_400);
+        for expiry in [
+            ExpiryRequest::At(Timestamp::from_millis(1_000)),
+            ExpiryRequest::In(in_a_day),
+            ExpiryRequest::Clear,
+        ] {
+            let sent = change_to_proto(&database, &MetadataChange::default(), expiry, None)
+                .expect("an expiry alone");
+            let (change, received) = change_from_proto(&sent).expect("an expiry is a change");
+            assert!(change.is_empty(), "{change:?}");
+            assert_eq!(received, expiry);
+        }
+        // A patch's own expiry travels as an absolute time.
+        let set = MetadataChange {
+            expiry: fleetring_control::ExpiryChange::Set(Timestamp::from_millis(9)),
+            ..MetadataChange::default()
+        };
+        let sent = change_to_proto(&database, &set, ExpiryRequest::Keep, None).expect("valid");
+        assert_eq!(sent.expiry, Some(ExpiryUpdate::ExpiresAtMs(9)), "{sent:?}");
+        let twice =
+            change_to_proto(&database, &set, ExpiryRequest::Clear, None).expect_err("two expiries");
+        assert_eq!(twice.code(), tonic::Code::InvalidArgument);
+
+        let metadata = NewMetadata {
+            expiry: Some(Expiry::In(in_a_day)),
+            ..NewMetadata::default()
+        };
+        assert_eq!(
+            spec_expiry_from_proto(&new_metadata_to_proto(&metadata)),
+            Some(Expiry::In(in_a_day))
+        );
     }
 
     #[test]

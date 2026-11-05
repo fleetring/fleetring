@@ -204,7 +204,8 @@ impl ControlClient {
         .await
     }
 
-    /// Creates a database with a description or labels. Sent once per leader, not retried.
+    /// Creates a database with a description, labels, or an expiry. Sent once per leader, not
+    /// retried.
     ///
     /// # Errors
     ///
@@ -221,8 +222,8 @@ impl ControlClient {
         .await
     }
 
-    /// Changes a database's description or labels. Sent once per leader, not retried: a retry
-    /// after a lost reply would apply the patch again at the next version.
+    /// Changes a database's description, labels, or expiry. Sent once per leader, not retried: a
+    /// retry after a lost reply would apply the patch again at the next version.
     ///
     /// # Errors
     ///

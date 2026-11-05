@@ -380,3 +380,96 @@ async fn a_webhook_never_logs_its_bearer_token() -> TestResult {
     }
     Ok(())
 }
+
+/// A store whose every `put` hangs, as an unreachable bucket can.
+#[derive(Debug, Default)]
+struct HangingStore(fleetringd::durability::MemoryStore);
+
+impl fleetringd::durability::ObjectStore for HangingStore {
+    fn put(&self, _: &str, _: Vec<u8>) -> fleetringd::durability::StoreFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+
+    fn get(&self, key: &str) -> fleetringd::durability::StoreFuture<'_, Option<Vec<u8>>> {
+        self.0.get(key)
+    }
+
+    fn list(
+        &self,
+        prefix: &str,
+    ) -> fleetringd::durability::StoreFuture<'_, Vec<fleetringd::durability::ObjectEntry>> {
+        self.0.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> fleetringd::durability::StoreFuture<'_, ()> {
+        self.0.delete(key)
+    }
+}
+
+/// A dropped database's primary flushes its change streams before it deletes its copy, for a
+/// bounded time (ADR-0041, point 4): with an archive whose store never answers, the copy is
+/// deleted once the limit passes, and the node says the archive holds the database only as of
+/// its last archived segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_that_times_out_still_deletes_the_copy() -> TestResult {
+    const LIMIT: Duration = Duration::from_secs(1);
+    lines();
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let id = "flusher";
+    // Paths go through `{:?}`, which escapes a Windows path's backslashes for TOML.
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"both\"\n\n[node]\nid = \"{id}\"\n\n\
+         [membership]\nheartbeat_interval_ms = 100\n{}\n[[archive]]\nname = \"backups\"\n\
+         databases = [\"*\"]\nstore = \"directory\"\npath = {:?}\nsegment_interval_ms = 3600000\n",
+        dir.path().join(id),
+        tls.node_table(id)?,
+        dir.path().join("archive"),
+    );
+    let environment = fleetringd::Environment::production()
+        .with_object_store("backups", Arc::new(HangingStore::default()))
+        .with_drop_flush_limit(LIMIT);
+    let daemon = Daemon::start_with(Config::from_toml(&text)?, environment).await?;
+    let membership = daemon.membership().ok_or("no membership")?;
+    tokio::time::timeout(
+        HANG_GUARD,
+        membership.wait_for(|view| view.ring().is_some()),
+    )
+    .await?
+    .ok_or("membership stopped")?;
+    let client = client(&daemon, &tls)?;
+    let doomed: DatabaseName = "doomed".parse()?;
+    client
+        .create_database(&doomed, ReplicationFactor::ONE)
+        .await?;
+    client
+        .execute(
+            &doomed,
+            fleetringd::engine::Statement::new("CREATE TABLE t (x)"),
+        )
+        .await?;
+    let copy = dir.path().join(id).join("databases").join("doomed");
+    assert!(copy.exists());
+
+    let dropping = tokio::time::Instant::now();
+    client.drop_database(&doomed).await?;
+    eventually("the copy deleted", || Ok(!copy.exists())).await?;
+    let took = dropping.elapsed();
+    assert!(
+        took >= LIMIT,
+        "deleted after {took:?}, before the flush gave up"
+    );
+    eventually("the flush's warning", || {
+        Ok(objects()?.iter().any(|object| {
+            object["level"] == serde_json::json!("WARN")
+                && object["fields"]["database"] == serde_json::json!("doomed")
+                && object["fields"]["limit_ms"] == serde_json::json!(1_000)
+                && object["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("didn't catch up in time"))
+        }))
+    })
+    .await?;
+    daemon.run_until(async {}).await;
+    Ok(())
+}

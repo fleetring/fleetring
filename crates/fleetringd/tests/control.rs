@@ -2243,13 +2243,14 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
 }
 
 /// The writer screens every command that needs any fleet feature, not only `undrain`: a
-/// metadata command a member can't act on is refused before it is logged, so a control node of
-/// the previous line, after a rollback, never meets one it can't decode (ADR-0041, point 3).
-/// This build doesn't report `expiry` yet, so a fleet of it refuses an expiry too.
+/// metadata or expiry command a member can't act on is refused before it is logged, so a
+/// control node of the previous line, after a rollback, never meets one it can't decode
+/// (ADR-0041, point 3). This build reports `expiry`, so a fleet of it takes an expiry.
 #[tokio::test]
 async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
     use fleetring_control::{
-        Engine, Feature, Labels, MetadataChange, MetadataSpec, Rejection, Software, parse_label,
+        Engine, ExpiryChange, Feature, Labels, MetadataChange, MetadataSpec, Rejection, Software,
+        parse_label,
     };
     use fleetringd::control::SubmitError;
 
@@ -2285,55 +2286,71 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
         if_version: None,
     };
 
-    // "old" runs the line before this build's, which knows no metadata.
+    let expiring = MetadataSpec {
+        expires_at: Some(Timestamp::MAX),
+        ..MetadataSpec::default()
+    };
+    let extend = Action::UpdateDatabase {
+        name: "plain".parse()?,
+        change: MetadataChange {
+            expiry: ExpiryChange::Set(Timestamp::MAX),
+            ..MetadataChange::default()
+        },
+        by: None,
+        if_version: None,
+    };
+    let refused_for = |refused: &SubmitError, feature: Feature| {
+        matches!(
+            refused,
+            SubmitError::Refused(Rejection::FeatureUnsupported {
+                feature: lacking,
+                id,
+                ..
+            }) if *lacking == feature && id.as_str() == "old"
+        )
+    };
+
+    // "old" runs the line before this build's, which knows neither metadata nor expiry. A
+    // command with an expiry needs both, and names the first one the member lacks.
     let old = Software::new(previous_line(), 1).with_feature(Feature::Undrain);
     let current = fleetringd::software::running();
     handle.submit(join("old", old)?).await?;
     handle.submit(join("new", current.clone())?).await?;
     handle.submit(create("plain", None)?).await?;
-    for refused in [create("labelled", Some(labelled.clone()))?, label.clone()] {
+    for refused in [
+        create("labelled", Some(labelled.clone()))?,
+        label.clone(),
+        create("expiring", Some(expiring.clone()))?,
+        extend.clone(),
+    ] {
         let refused = handle
             .submit(refused)
             .await
             .expect_err("old lacks metadata");
-        assert!(
-            matches!(
-                &refused,
-                SubmitError::Refused(Rejection::FeatureUnsupported {
-                    feature: Feature::Metadata,
-                    id,
-                    ..
-                }) if id.as_str() == "old"
-            ),
-            "{refused:?}"
-        );
+        assert!(refused_for(&refused, Feature::Metadata), "{refused:?}");
     }
 
-    // Once every member runs this build, metadata applies, and an expiry is still refused.
-    handle.submit(join("old", current)?).await?;
+    // A member that reports metadata but not expiry, as the release before this phase did:
+    // metadata applies, and an expiry is refused for want of `expiry` alone.
+    let without_expiry = Software::new(previous_line(), 1)
+        .with_feature(Feature::Undrain)
+        .with_feature(Feature::Metadata);
+    handle.submit(join("old", without_expiry)?).await?;
     handle.submit(create("labelled", Some(labelled))?).await?;
     handle.submit(label).await?;
-    let expiring = MetadataSpec {
-        expires_at: Some(Timestamp::MAX),
-        ..MetadataSpec::default()
-    };
-    let refused = handle
-        .submit(create("expiring", Some(expiring))?)
-        .await
-        .expect_err("this build doesn't report expiry");
-    assert!(
-        matches!(
-            &refused,
-            SubmitError::Refused(Rejection::FeatureUnsupported {
-                feature: Feature::Expiry,
-                ..
-            })
-        ),
-        "{refused:?}"
-    );
+    for refused in [create("expiring", Some(expiring.clone()))?, extend.clone()] {
+        let refused = handle.submit(refused).await.expect_err("old lacks expiry");
+        assert!(refused_for(&refused, Feature::Expiry), "{refused:?}");
+    }
+    assert!(!handle.state().is_enabled(Feature::Expiry));
+
+    // Once every member runs this build, which reports `expiry`, an expiry applies.
+    handle.submit(join("old", current)?).await?;
+    handle.submit(create("expiring", Some(expiring))?).await?;
+    handle.submit(extend).await?;
     let published = handle.state();
     assert!(published.is_enabled(Feature::Metadata));
-    assert!(!published.is_enabled(Feature::Expiry));
+    assert!(published.is_enabled(Feature::Expiry));
     node.shutdown().await;
 
     let log = CommandLog::open(&path, ControlConfig::new())?;
@@ -2348,8 +2365,8 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
         .collect();
     assert_eq!(
         gated.len(),
-        2,
-        "only the accepted metadata commands: {gated:?}"
+        4,
+        "only the accepted metadata and expiry commands: {gated:?}"
     );
     let (replayed, outcomes) = replay(&log)?;
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
@@ -2446,6 +2463,7 @@ mod metadata {
             metadata: Some(MetadataSpec {
                 description: description.to_owned(),
                 labels,
+                expiry: None,
             }),
         }
     }
@@ -2507,6 +2525,7 @@ mod metadata {
                 set_labels: vec![label("purpose", "task")],
                 remove_labels: vec!["agent".to_owned()],
                 if_version: None,
+                expiry: None,
             })
             .await?
             .metadata
@@ -2980,6 +2999,466 @@ mod metadata {
         let control = secure_client(address, &tls)?;
         assert_eq!(locate(&control, "notes").await?, Some(before));
         restarted.run_until(async {}).await;
+        Ok(())
+    }
+}
+
+/// Database expiry through the control service, its sweep, and its time (ADR-0041, point 4;
+/// FR-070 phase 3). Each test runs a control node, its service, and, where it says so, its
+/// failover timer and expiry sweep on this test's paused Tokio clock, with the service served
+/// in memory, so that a minute passes at once and nothing else moves time.
+mod expiry {
+    use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use fleetring_control::{
+        Action, ControlConfig, DatabaseName, Engine, Member, MetadataSpec, Millis, Rejection,
+        Timestamp,
+    };
+    use fleetring_proto::v1::metadata_spec::Expiry as SpecExpiry;
+    use fleetring_proto::v1::update_database_request::Expiry as ExpiryUpdate;
+    use fleetring_proto::v1::{
+        CreateDatabaseWithMetadataRequest, LocateRequest, MetadataSpec as ProtoSpec,
+        UpdateDatabaseRequest,
+    };
+    use fleetringd::Network;
+    use fleetringd::auth::{AuthLayer, Authorizer};
+    use fleetringd::clock::SimClock;
+    use fleetringd::control::{
+        CommandLog, ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService,
+        Failover, FailoverSettings, MIN_EXPIRY, StorageIo, rejection_status,
+    };
+    use fleetringd::transport::control_server;
+    use tokio_stream::StreamExt as _;
+    use tonic::Code;
+
+    use super::{TestResult, create_request};
+
+    /// Where the tests' clocks start: 2026-11-05T00:00:00Z.
+    const BASE: Timestamp = Timestamp::from_millis(1_793_836_800_000);
+
+    /// Whether a plane runs its failover timer and expiry sweep.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Timer {
+        Running,
+        Stopped,
+    }
+
+    /// A control node with one member running this build, its service served in memory, and,
+    /// if started, its failover timer and expiry sweep.
+    struct Plane {
+        node: Option<ControlNode>,
+        failover: Option<Failover>,
+        client: ControlClient,
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Plane {
+        /// A plane whose control node and sweep read `clock`, and whose service reads
+        /// `service_clock`.
+        async fn start(
+            clock: SimClock,
+            service_clock: SimClock,
+            timer: Timer,
+        ) -> Result<Self, Box<dyn Error>> {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("control.db");
+            let options =
+                ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
+            let node = ControlNode::open(&path, options, clock).await?;
+            let handle = node.handle();
+            handle
+                .submit(Action::Join {
+                    member: Member::new("data-1".parse()?)
+                        .with_software(fleetringd::software::running()),
+                })
+                .await?;
+            // Ticks only keep the state's time moving, which expiry doesn't need: few of them
+            // keep the log, which syncs each, short.
+            let failover = match timer {
+                Timer::Running => Some(Failover::start(
+                    handle.clone(),
+                    Arc::new(clock),
+                    Network::default(),
+                    FailoverSettings::new().with_tick_interval(Duration::from_secs(10)),
+                )),
+                Timer::Stopped => None,
+            };
+            let service = ControlService::new(handle).with_clock(Arc::new(service_clock));
+            Ok(Self {
+                node: Some(node),
+                failover,
+                client: serve_in_memory(service),
+                path,
+                _dir: dir,
+            })
+        }
+
+        /// A plane whose every part reads one clock, starting at [`BASE`].
+        async fn on_one_clock(timer: Timer) -> Result<Self, Box<dyn Error>> {
+            let clock = SimClock::new(BASE);
+            Self::start(clock, clock, timer).await
+        }
+
+        fn handle(&self) -> Result<ControlHandle, Box<dyn Error>> {
+            Ok(self.node.as_ref().ok_or("stopped")?.handle())
+        }
+
+        /// Stops the plane and returns every command its log holds, in log order.
+        async fn stop(mut self) -> Result<Vec<(Timestamp, Action)>, Box<dyn Error>> {
+            if let Some(failover) = self.failover.take() {
+                failover.stop().await;
+            }
+            if let Some(node) = self.node.take() {
+                node.shutdown().await;
+            }
+            let log = CommandLog::open(&self.path, ControlConfig::new())?;
+            Ok(log
+                .commands()?
+                .into_iter()
+                .map(|(_, command)| (command.at, command.action))
+                .collect())
+        }
+    }
+
+    /// Serves `service` over in-memory connections, behind a plaintext request boundary, and
+    /// returns a client for it: no socket, so nothing waits on the operating system while time
+    /// is paused.
+    fn serve_in_memory(service: ControlService) -> ControlClient {
+        let (connections, incoming) =
+            tokio::sync::mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let incoming =
+            tokio_stream::wrappers::UnboundedReceiverStream::new(incoming).map(Ok::<_, io::Error>);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .layer(AuthLayer::new(Authorizer::plaintext()))
+                .add_service(control_server(service))
+                .serve_with_incoming(incoming),
+        );
+        ControlClient::with_connector("memory:0", move |_| {
+            let connections = connections.clone();
+            Ok(tonic::transport::Endpoint::from_static("http://memory:0")
+                .connect_with_connector_lazy(tower::service_fn(move |_| {
+                    let (client, server) = tokio::io::duplex(1 << 16);
+                    let sent = connections.send(server);
+                    async move {
+                        sent.map_err(|_| io::Error::other("the in-memory server stopped"))?;
+                        Ok::<_, io::Error>(hyper_util::rt::TokioIo::new(client))
+                    }
+                })))
+        })
+    }
+
+    fn expiring(database: &str, expiry: SpecExpiry) -> CreateDatabaseWithMetadataRequest {
+        CreateDatabaseWithMetadataRequest {
+            database: Some(create_request(database, 1)),
+            metadata: Some(ProtoSpec {
+                expiry: Some(expiry),
+                ..ProtoSpec::default()
+            }),
+        }
+    }
+
+    fn millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Creates `database` expiring `expires_in` from now through the service, and returns its
+    /// expiry.
+    async fn create_expiring_in(
+        client: &ControlClient,
+        database: &str,
+        expires_in: Duration,
+    ) -> Result<u64, Box<dyn Error>> {
+        let created = client
+            .create_database_with_metadata(expiring(
+                database,
+                SpecExpiry::ExpiresInMs(millis(expires_in)),
+            ))
+            .await?;
+        Ok(created
+            .placement
+            .and_then(|placement| placement.metadata)
+            .and_then(|metadata| metadata.expires_at_ms)
+            .ok_or("no expiry")?)
+    }
+
+    /// Creates `count` databases expiring at `expires_at`, straight through the writer.
+    async fn create_expiring_at(
+        handle: &ControlHandle,
+        count: u64,
+        expires_at: Timestamp,
+    ) -> TestResult {
+        for k in 0..count {
+            let created = handle
+                .submit(Action::CreateDatabase {
+                    name: format!("scratch-{k:03}").parse()?,
+                    replication_factor: fleetring::ReplicationFactor::ONE,
+                    engine: Engine::Sqlite,
+                    durability: None,
+                    metadata: Some(MetadataSpec {
+                        expires_at: Some(expires_at),
+                        ..MetadataSpec::default()
+                    }),
+                })
+                .await?;
+            assert!(created.outcome().is_ok(), "{:?}", created.outcome());
+        }
+        Ok(())
+    }
+
+    fn set_expiry(database: &str, expiry: ExpiryUpdate) -> UpdateDatabaseRequest {
+        UpdateDatabaseRequest {
+            database: database.to_owned(),
+            expiry: Some(expiry),
+            ..UpdateDatabaseRequest::default()
+        }
+    }
+
+    /// The database's expiry, `Ok(None)` without one, or the status `Locate` answers.
+    async fn expiry_of(
+        client: &ControlClient,
+        database: &str,
+    ) -> Result<Option<u64>, tonic::Status> {
+        let placement = client
+            .locate(LocateRequest {
+                database: database.to_owned(),
+            })
+            .await?
+            .placement;
+        Ok(placement
+            .and_then(|placement| placement.metadata)
+            .and_then(|metadata| metadata.expires_at_ms))
+    }
+
+    /// Every `ExpireDatabase` in `commands`, with its stamp.
+    fn expirations(commands: &[(Timestamp, Action)]) -> Vec<(Timestamp, String)> {
+        commands
+            .iter()
+            .filter_map(|(at, action)| match action {
+                Action::ExpireDatabase { name } => Some((*at, name.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_database_is_dropped_by_the_control_node() -> TestResult {
+        let plane = Plane::on_one_clock(Timer::Running).await?;
+        let expires_at =
+            create_expiring_in(&plane.client, "scratch", Duration::from_secs(61)).await?;
+        assert_eq!(expires_at, BASE.as_millis() + 61_000);
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            expiry_of(&plane.client, "scratch").await?,
+            Some(expires_at),
+            "not yet"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let gone = expiry_of(&plane.client, "scratch")
+            .await
+            .expect_err("expired");
+        assert_eq!(gone.code(), Code::NotFound, "{gone}");
+
+        let expired = expirations(&plane.stop().await?);
+        assert_eq!(expired.len(), 1, "{expired:?}");
+        let (at, name) = &expired[0];
+        assert_eq!(name, "scratch");
+        assert!(at.as_millis() >= expires_at, "{at} < {expires_at}");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expiry_under_a_minute_is_refused() -> TestResult {
+        let plane = Plane::on_one_clock(Timer::Stopped).await?;
+        let minimum = Duration::from_millis(MIN_EXPIRY.get());
+        let short = plane
+            .client
+            .create_database_with_metadata(expiring(
+                "short",
+                SpecExpiry::ExpiresInMs(millis(minimum) - 1),
+            ))
+            .await
+            .expect_err("under a minute");
+        assert_eq!(short.code(), Code::InvalidArgument, "{short}");
+        assert_eq!(short.message(), "expiry must be at least 1m from now");
+        let early = plane
+            .client
+            .create_database_with_metadata(expiring(
+                "early",
+                SpecExpiry::ExpiresAtMs(BASE.as_millis() + 30_000),
+            ))
+            .await
+            .expect_err("an absolute time under a minute ahead");
+        assert_eq!(early.code(), Code::InvalidArgument, "{early}");
+        let state = plane.handle()?.state();
+        assert!(state.database(&"short".parse()?).is_none());
+        assert!(state.database(&"early".parse()?).is_none());
+
+        // A minute exactly is enough, as a duration or as a time.
+        let expires_at = create_expiring_in(&plane.client, "minute", minimum).await?;
+        assert_eq!(expires_at, BASE.as_millis() + MIN_EXPIRY.get());
+        let refused = plane
+            .client
+            .update_database(set_expiry(
+                "minute",
+                ExpiryUpdate::ExpiresInMs(millis(minimum) - 1),
+            ))
+            .await
+            .expect_err("an update under a minute");
+        assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+        plane
+            .client
+            .update_database(set_expiry(
+                "minute",
+                ExpiryUpdate::ExpiresAtMs(BASE.as_millis() + MIN_EXPIRY.get()),
+            ))
+            .await?;
+        plane.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn extending_an_expiry_keeps_the_database() -> TestResult {
+        let plane = Plane::on_one_clock(Timer::Running).await?;
+        create_expiring_in(&plane.client, "task", Duration::from_secs(61)).await?;
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        let extended = plane
+            .client
+            .update_database(set_expiry("task", ExpiryUpdate::ExpiresInMs(300_000)))
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        let new_expiry = BASE.as_millis() + 50_000 + 300_000;
+        assert_eq!(extended.expires_at_ms, Some(new_expiry));
+        assert_eq!(extended.version, 2);
+
+        // Past the old expiry, it stays; past the new one, it goes.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(expiry_of(&plane.client, "task").await?, Some(new_expiry));
+        tokio::time::sleep(Duration::from_secs(250)).await;
+        let gone = expiry_of(&plane.client, "task").await.expect_err("expired");
+        assert_eq!(gone.code(), Code::NotFound, "{gone}");
+        assert_eq!(expirations(&plane.stop().await?).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_an_expiry_keeps_the_database() -> TestResult {
+        let plane = Plane::on_one_clock(Timer::Running).await?;
+        create_expiring_in(&plane.client, "memory", Duration::from_secs(61)).await?;
+        let cleared = plane
+            .client
+            .update_database(set_expiry("memory", ExpiryUpdate::ClearExpiry(true)))
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(cleared.expires_at_ms, None);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(expiry_of(&plane.client, "memory").await?, None);
+        assert!(expirations(&plane.stop().await?).is_empty());
+        Ok(())
+    }
+
+    /// An expiry extended through the service after the sweep looked wins: the sweep's
+    /// command, judged at its own stamp, finds the database not expired and leaves it.
+    #[tokio::test(start_paused = true)]
+    async fn an_extension_wins_over_a_stale_sweep() -> TestResult {
+        let plane = Plane::on_one_clock(Timer::Stopped).await?;
+        let handle = plane.handle()?;
+        create_expiring_in(&plane.client, "task", Duration::from_secs(61)).await?;
+        tokio::time::sleep(Duration::from_secs(62)).await;
+        // What a sweep reads now.
+        let task: DatabaseName = "task".parse()?;
+        let due = handle
+            .state()
+            .expired_databases(BASE.saturating_add(Millis::new(62_000)));
+        assert_eq!(due, std::slice::from_ref(&task));
+        // The agent extends it before the sweep's command is logged.
+        plane
+            .client
+            .update_database(set_expiry("task", ExpiryUpdate::ExpiresInMs(3_600_000)))
+            .await?;
+        let committed = handle.submit(Action::ExpireDatabase { name: task }).await?;
+        assert!(
+            matches!(committed.outcome(), Err(Rejection::NotExpired { .. })),
+            "{:?}",
+            committed.outcome()
+        );
+        assert!(expiry_of(&plane.client, "task").await?.is_some());
+        plane.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_expires_at_most_64_databases_per_second() -> TestResult {
+        const DATABASES: u64 = 150;
+        let plane = Plane::on_one_clock(Timer::Running).await?;
+        let handle = plane.handle()?;
+        create_expiring_at(&handle, DATABASES, BASE.saturating_add(Millis::new(61_000))).await?;
+        tokio::time::sleep(Duration::from_secs(70)).await;
+        assert_eq!(handle.state().databases().count(), 0);
+
+        // A sweep's commands share its stamp: at most 64 of them, so 150 take three sweeps, a
+        // second apart.
+        let expired = expirations(&plane.stop().await?);
+        assert_eq!(expired.len(), usize::try_from(DATABASES)?);
+        let mut per_sweep: BTreeMap<Timestamp, usize> = BTreeMap::new();
+        for (at, _) in &expired {
+            *per_sweep.entry(*at).or_default() += 1;
+        }
+        let counts: Vec<usize> = per_sweep.values().copied().collect();
+        assert_eq!(counts, [64, 64, 22], "{per_sweep:?}");
+        let stamps: Vec<u64> = per_sweep.keys().map(|at| at.as_millis()).collect();
+        assert!(
+            stamps.windows(2).all(|pair| pair[1] - pair[0] >= 1_000),
+            "one sweep a second: {stamps:?}"
+        );
+        // In the order the state lists them: by expiry, then by name.
+        let names: Vec<&String> = expired.iter().map(|(_, name)| name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        Ok(())
+    }
+
+    /// After a failover from a control node whose clock ran ahead, the control plane's time is
+    /// ahead of this node's clock. A duration resolves against the later of the two, so it
+    /// doesn't land behind the time `apply` judges by.
+    #[tokio::test(start_paused = true)]
+    async fn a_duration_resolves_against_the_control_planes_time_when_it_is_ahead() -> TestResult {
+        let ahead = SimClock::new(BASE.saturating_add(Millis::new(300_000)));
+        let behind = SimClock::new(BASE);
+        let plane = Plane::start(ahead, behind, Timer::Stopped).await?;
+        let control_time = plane.handle()?.state().now();
+        assert_eq!(control_time.as_millis(), BASE.as_millis() + 300_000);
+
+        let expires_at =
+            create_expiring_in(&plane.client, "scratch", Duration::from_secs(120)).await?;
+        assert_eq!(expires_at, control_time.as_millis() + 120_000);
+        plane.stop().await?;
+        Ok(())
+    }
+
+    /// The control plane's time moving past an expiry before it is logged is retryable: a retry
+    /// resolves the duration against the newer time.
+    #[test]
+    fn expiry_passed_is_retryable() -> TestResult {
+        let status = rejection_status(&Rejection::ExpiryPassed {
+            database: "scratch".parse()?,
+            expires_at: BASE,
+        });
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "the control plane's time moved past the requested expiry; retry"
+        );
         Ok(())
     }
 }

@@ -99,12 +99,32 @@ impl Fleet {
         control_tables: &str,
         membership_settings: &str,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::start_in(
+            dir,
+            control_settings,
+            control_tables,
+            membership_settings,
+            fleetringd::Environment::production(),
+        )
+        .await
+    }
+
+    /// Starts the fleet as [`Fleet::start_configured`] does, with the control daemon in
+    /// `control_environment`, as one whose clock a test moves.
+    async fn start_in(
+        dir: &Path,
+        control_settings: &str,
+        control_tables: &str,
+        membership_settings: &str,
+        control_environment: fleetringd::Environment,
+    ) -> Result<Self, Box<dyn Error>> {
         let tls = Tls::create(dir)?;
         let control_text = format!(
             "{}\n[control]\n{control_settings}\n{control_tables}",
             config(dir, &tls, "control", "control", None)?
         );
-        let control = Daemon::start(Config::from_toml(&control_text)?).await?;
+        let control =
+            Daemon::start_with(Config::from_toml(&control_text)?, control_environment).await?;
         let address = control.control_address().ok_or("no control address")?;
         let mut data = Vec::new();
         for id in DATA {
@@ -822,6 +842,7 @@ async fn metadata_is_unchanged_by_a_failover() -> TestResult {
             &NewMetadata {
                 description: Some("Orders for tenant acme.\nTable: orders.".parse()?),
                 labels: Labels::try_from_pairs([parse_label("purpose=memory")?])?,
+                ..NewMetadata::default()
             },
         )
         .await?;
@@ -2741,6 +2762,7 @@ mod archives {
                     labels: fleetring_control::Labels::try_from_pairs([
                         fleetring_control::parse_label("purpose=restore")?,
                     ])?,
+                    ..fleetringd::data::NewMetadata::default()
                 },
                 ARCHIVE,
                 &ledger,
@@ -2771,6 +2793,7 @@ mod archives {
                 parse_label("purpose=ledger")?,
                 parse_label("team=billing")?,
             ])?,
+            ..NewMetadata::default()
         })
     }
 
@@ -2907,6 +2930,7 @@ mod archives {
         let flags = NewMetadata {
             description: Some("Mine.".parse()?),
             labels: Labels::try_from_pairs([parse_label("purpose=scratch")?])?,
+            ..NewMetadata::default()
         };
         let restored = name("restored")?;
         let restoration = client
@@ -3126,6 +3150,299 @@ mod archives {
             .collect::<Result<Vec<i64>, _>>()?;
         assert_eq!(rows, (1..=5).collect::<Vec<_>>());
         fleet.stop().await;
+        Ok(())
+    }
+}
+
+/// FR-070 phase 3: expired databases leave the data nodes, the last writes of a dropped database
+/// reach its archive, and a restore's expiry is set only after the restore (ADR-0041, points 4
+/// and 10).
+mod expiry {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use fleetring_control::{Action, ControlConfig, DatabaseName, ExpiryChange, Millis, Timestamp};
+    use fleetringd::clock::{Clock, SystemClock};
+    use fleetringd::control::CommandLog;
+    use fleetringd::data::{Client, DatabaseSpec, Expiry, NewMetadata, RestoredExpiry};
+    use fleetringd::durability::RestoreTarget;
+    use fleetringd::engine::{Statement, Value};
+    use tonic::Code;
+
+    use super::archives::{ARCHIVE, archived_fleet, create_archived};
+    use super::{
+        DATA, Fleet, HANG_GUARD, TestResult, every_node_has, name, no_node_has, three, wait_until,
+    };
+
+    /// The system clock moved forward by however far the test has advanced it: a control node
+    /// whose clock jumps ahead, which expires at once every database due within the jump.
+    #[derive(Debug, Clone, Default)]
+    struct JumpingClock(Arc<AtomicU64>);
+
+    impl JumpingClock {
+        fn jump(&self, by: Duration) {
+            let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+            self.0.fetch_add(by, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for JumpingClock {
+        fn now(&self) -> Timestamp {
+            SystemClock
+                .now()
+                .saturating_add(Millis::new(self.0.load(Ordering::SeqCst)))
+        }
+    }
+
+    fn expiring_in(expires_in: Duration) -> NewMetadata {
+        NewMetadata {
+            expiry: Some(Expiry::In(expires_in)),
+            ..NewMetadata::default()
+        }
+    }
+
+    async fn insert(client: &Client, database: &DatabaseName, x: i64) -> TestResult {
+        client
+            .execute(
+                database,
+                Statement::with_params("INSERT INTO t (x) VALUES (?1)", [Value::Integer(x)]),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn values(
+        client: &Client,
+        database: &DatabaseName,
+    ) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+        let rows = client
+            .query(database, Statement::new("SELECT x FROM t ORDER BY x"))
+            .await?;
+        Ok(rows
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Integer(x)) => Some(*x),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Every action the control log in `dir` holds about `database`, in log order.
+    fn logged_about(
+        dir: &Path,
+        database: &DatabaseName,
+    ) -> Result<Vec<Action>, Box<dyn std::error::Error>> {
+        let log = CommandLog::open(dir.join("control").join("control.db"), ControlConfig::new())?;
+        Ok(log
+            .commands()?
+            .into_iter()
+            .map(|(_, command)| command.action)
+            .filter(|action| match action {
+                Action::CreateDatabase { name, .. }
+                | Action::UpdateDatabase { name, .. }
+                | Action::ExpireDatabase { name } => name == database,
+                Action::AcquireLease {
+                    database: leased, ..
+                } => leased == database,
+                _ => false,
+            })
+            .collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_databases_replicas_delete_their_copies() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let clock = JumpingClock::default();
+        let environment = fleetringd::Environment::production().with_clock(clock.clone());
+        let fleet = Fleet::start_in(dir.path(), "", "", "", environment).await?;
+        let client = fleet.client()?;
+        let scratch = name("scratch")?;
+        let kept = name("kept")?;
+        let spec = DatabaseSpec::new(three()?);
+        client
+            .create_database_with_metadata(&scratch, spec, &expiring_in(Duration::from_secs(60)))
+            .await?;
+        client
+            .create_database_with_metadata(&kept, spec, &expiring_in(Duration::from_secs(3_600)))
+            .await?;
+        for database in [&scratch, &kept] {
+            client
+                .execute(
+                    database,
+                    Statement::new("CREATE TABLE t (x INTEGER NOT NULL)"),
+                )
+                .await?;
+            insert(&client, database, 1).await?;
+        }
+        wait_until("every node holds both databases", async || {
+            every_node_has(dir.path(), "scratch") && every_node_has(dir.path(), "kept")
+        })
+        .await?;
+
+        // The control node's clock passes the first expiry: its sweep drops the database, and
+        // every data node deletes its copy within a renewal interval or a stream's end.
+        clock.jump(Duration::from_secs(61));
+        wait_until("no node holds scratch", async || {
+            no_node_has(dir.path(), "scratch")
+        })
+        .await?;
+        let gone = client.locate(&scratch).await.expect_err("expired");
+        assert_eq!(gone.code(), Code::NotFound, "{gone}");
+        for id in DATA {
+            let replication = fleet
+                .data_daemon(id)?
+                .replication()
+                .ok_or("no replication")?;
+            assert_eq!(replication.serving(&scratch), None, "{id} serves scratch");
+        }
+        assert!(every_node_has(dir.path(), "kept"));
+        let kept_until = client
+            .locate(&kept)
+            .await?
+            .metadata
+            .and_then(|metadata| metadata.expires_at)
+            .ok_or("kept has no expiry")?;
+        assert!(kept_until > clock.now(), "kept expires later");
+        fleet.stop().await;
+
+        let expired: Vec<Action> = logged_about(dir.path(), &scratch)?
+            .into_iter()
+            .filter(|action| matches!(action, Action::ExpireDatabase { .. }))
+            .collect();
+        assert_eq!(expired.len(), 1, "{expired:?}");
+        Ok(())
+    }
+
+    /// A dropped database's primary flushes its archive before it deletes its copy, so writes
+    /// still waiting for an hourly segment reach the archive, and a restore brings them back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_databases_last_writes_reach_its_archive() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let table = format!(
+            "\n[[archive]]\nname = \"{ARCHIVE}\"\ndatabases = [\"*\"]\nstore = \"directory\"\n\
+             path = {:?}\nsegment_interval_ms = 3600000\n",
+            dir.path().join("archive")
+        );
+        let fleet = Fleet::start_configured(dir.path(), "", "", &table).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        let location = client.create_database(&ledger, three()?).await?;
+        client
+            .execute(
+                &ledger,
+                Statement::new("CREATE TABLE t (x INTEGER NOT NULL)"),
+            )
+            .await?;
+        let primary = location.primary.ok_or("no primary")?;
+        let streams = fleet
+            .data_daemon(primary.as_str())?
+            .change_streams()
+            .ok_or("no change streams")?;
+        // The first delivery puts the base snapshot; the next segment would wait an hour.
+        wait_until("the base snapshot", async || {
+            streams
+                .status()
+                .iter()
+                .any(|status| status.database == ledger && status.position.is_some())
+        })
+        .await?;
+        for x in 1..=5 {
+            insert(&client, &ledger, x).await?;
+        }
+
+        client.drop_database(&ledger).await?;
+        wait_until("no node holds ledger", async || {
+            no_node_has(dir.path(), "ledger")
+        })
+        .await?;
+        let revived = name("revived")?;
+        client
+            .restore_database(
+                &revived,
+                DatabaseSpec::new(three()?),
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await?;
+        assert_eq!(values(&client, &revived).await?, [1, 2, 3, 4, 5]);
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// A restore's expiry is set with an update once `Restore` has returned, never with the
+    /// creation, so a short one can't drop the database while it is being restored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_expiry_on_restore_is_set_only_after_the_restore() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived(&fleet, &client, &ledger, 3).await?;
+
+        let copy = name("copy")?;
+        let asked = SystemClock.now();
+        let restored = tokio::time::timeout(
+            HANG_GUARD,
+            client.restore_database_with_metadata(
+                &copy,
+                DatabaseSpec::new(three()?),
+                &expiring_in(Duration::from_secs(60)),
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            ),
+        )
+        .await??;
+        assert!(restored.location.primary.is_some());
+        // The restore itself set no expiry, and it is now set as `db restore` sets it, after
+        // the archive's description and labels.
+        assert_eq!(
+            client
+                .locate(&copy)
+                .await?
+                .metadata
+                .and_then(|m| m.expires_at),
+            None
+        );
+        let expiry = client
+            .set_restored_expiry(&copy, Some(Expiry::In(Duration::from_secs(60))))
+            .await;
+        let RestoredExpiry::Set(expires_at) = expiry else {
+            return Err(format!("no expiry was set: {expiry:?}").into());
+        };
+        assert!(
+            expires_at >= asked.saturating_add(Millis::new(60_000)),
+            "{expires_at} is a minute from when the restore returned"
+        );
+        assert_eq!(values(&client, &copy).await?, [1, 2, 3]);
+        fleet.stop().await;
+
+        // The creation carried no expiry; the update that set it came after the restoring node
+        // took the new database's first lease, which ends the restore.
+        let logged = logged_about(dir.path(), &copy)?;
+        let created = logged
+            .iter()
+            .position(|action| {
+                matches!(action, Action::CreateDatabase { metadata, .. }
+                    if metadata.as_ref().is_none_or(|spec| spec.expires_at.is_none()))
+            })
+            .ok_or("no creation without an expiry")?;
+        let leased = logged
+            .iter()
+            .position(|action| matches!(action, Action::AcquireLease { .. }))
+            .ok_or("no lease")?;
+        let expiry_set = logged
+            .iter()
+            .position(|action| {
+                matches!(action, Action::UpdateDatabase { change, .. }
+                    if matches!(change.expiry, ExpiryChange::Set(_)))
+            })
+            .ok_or("no update setting the expiry")?;
+        assert!(created < leased && leased < expiry_set, "{logged:?}");
         Ok(())
     }
 }

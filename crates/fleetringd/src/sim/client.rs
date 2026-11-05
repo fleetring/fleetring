@@ -16,7 +16,7 @@ use fleetring_proto::v1::{
 use crate::auth::refused_binding;
 use crate::control::ControlClient;
 use crate::control::rejection_status;
-use crate::data::{Client, DatabaseSpec, LeaseUpdate};
+use crate::data::{Client, DatabaseSpec, Expiry, LeaseUpdate, NewMetadata};
 use crate::engine::{Statement, Value};
 use crate::environment::Network;
 use crate::replication::LeaseChange;
@@ -253,6 +253,11 @@ async fn execute(
             replication_factor,
             durability,
         } => create(data, database, *replication_factor, *durability).await,
+        Operation::CreateExpiring {
+            database,
+            replication_factor,
+            expires_in,
+        } => create_expiring(data, database, *replication_factor, *expires_in).await,
         Operation::Write { database, value } => data
             .execute(
                 database,
@@ -295,6 +300,51 @@ async fn create(
         .ok_or_else(|| tonic::Status::invalid_argument("invalid replication factor"))?;
     let spec = DatabaseSpec::new(replication_factor).with_acks(durability.acks());
     let location = match client.create_database_with(database, spec).await {
+        Ok(location) => location,
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            client.locate(database).await?
+        }
+        Err(status) => return Err(status),
+    };
+    let primary = location
+        .primary
+        .ok_or_else(|| tonic::Status::internal("created without a primary"))?;
+    client
+        .execute(
+            database,
+            Statement::new(format!(
+                "CREATE TABLE IF NOT EXISTS {WRITES_TABLE} (value INTEGER NOT NULL)"
+            )),
+        )
+        .await?;
+    Ok(Ack::Opened {
+        primary,
+        epoch: location.epoch,
+        durability: DurabilityMode::from(location.durability.acks()),
+    })
+}
+
+/// Creates `database` expiring `expires_in` after the control node takes the creation, opens it
+/// on its primary, and creates its [`WRITES_TABLE`].
+async fn create_expiring(
+    client: &Client,
+    database: &DatabaseName,
+    replication_factor: u32,
+    expires_in: Duration,
+) -> Result<Ack, tonic::Status> {
+    let replication_factor = u8::try_from(replication_factor)
+        .ok()
+        .and_then(ReplicationFactor::new)
+        .ok_or_else(|| tonic::Status::invalid_argument("invalid replication factor"))?;
+    let metadata = NewMetadata {
+        expiry: Some(Expiry::In(expires_in)),
+        ..NewMetadata::default()
+    };
+    let spec = DatabaseSpec::new(replication_factor);
+    let location = match client
+        .create_database_with_metadata(database, spec, &metadata)
+        .await
+    {
         Ok(location) => location,
         Err(status) if status.code() == tonic::Code::AlreadyExists => {
             client.locate(database).await?

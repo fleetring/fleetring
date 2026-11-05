@@ -175,6 +175,11 @@ impl Node {
         self.replication.registry()
     }
 
+    /// The change streams that feed the archive.
+    pub(crate) fn streams(&self) -> Result<&ChangeStreams, Box<dyn Error>> {
+        Ok(self.streams.as_ref().ok_or("the streams haven't started")?)
+    }
+
     /// Creates `database` with one replica, serves it as primary at epoch 1, and runs `schema`.
     pub(crate) async fn create(&self, database: &DatabaseName, schema: &str) -> TestResult {
         guarded("creating the database", self.registry().create(database)).await??;

@@ -12,6 +12,15 @@
 //! 3. **Candidates.** For each promotion in progress it tells the candidate through the
 //!    candidate's `Replication.Promote`, at once and then again every notify interval until the
 //!    promotion completes or is replaced. The candidate fences, catches up, and completes it.
+//! 4. **Expired databases.** A task of its own, started and stopped with the timer, so that
+//!    expiries never delay a tick, a promotion, or a candidate's notice (ADR-0041, point 4).
+//!    Once a second it asks the state which databases' expiries have passed by this node's clock
+//!    ([`State::expired_databases`]) and submits [`Action::ExpireDatabase`] for at most
+//!    [`MAX_EXPIRIES_PER_SWEEP`] of them, all at once, so the writer logs them in one group.
+//!    `apply` judges each one at its own stamp, so an expiry extended after the sweep looked
+//!    wins, and an expired database is dropped as `DropDatabase` drops it. A command refused or
+//!    rejected is skipped; only a stopped control node ends the task. Expiry doesn't depend on
+//!    leases, so it waits for no settling.
 //!
 //! A control node that has just started gives primaries one lease duration plus the failover
 //! margin to renew before it starts any promotion: leases look expired after an outage only
@@ -24,13 +33,20 @@ use std::time::Duration;
 
 use fleetring_control::{Action, Applied, DatabaseName, LeaseEpoch, Millis, State, Timestamp};
 use fleetring_proto::v1::PromoteRequest;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
 use crate::clock::Clock;
-use crate::control::node::ControlHandle;
+use crate::control::node::{Committed, ControlHandle, SubmitError};
 use crate::environment::Network;
 use crate::transport::{Peers, replication_client};
+
+/// How often the expiry sweep looks for databases whose expiry has passed.
+const EXPIRY_SWEEP: Duration = Duration::from_secs(1);
+
+/// The most `ExpireDatabase` commands one sweep submits, so that a burst of expiries, as after a
+/// control node was down, is spread over several sweeps.
+pub(crate) const MAX_EXPIRIES_PER_SWEEP: usize = 64;
 
 /// How the failover timer paces itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,15 +84,16 @@ impl Default for FailoverSettings {
     }
 }
 
-/// The running failover timer of a control node. Dropping it stops it.
+/// The running failover timer of a control node, with its expiry sweep. Dropping it stops both.
 #[derive(Debug)]
 pub struct Failover {
     task: JoinHandle<()>,
+    sweep: JoinHandle<()>,
 }
 
 impl Failover {
-    /// Starts the timer for the control node behind `handle`, reading time from `clock` and
-    /// reaching candidates over `network`.
+    /// Starts the timer and the expiry sweep for the control node behind `handle`, reading time
+    /// from `clock` and reaching candidates over `network`.
     ///
     /// # Panics
     ///
@@ -88,22 +105,114 @@ impl Failover {
         network: Network,
         settings: FailoverSettings,
     ) -> Self {
+        let sweep = spawn_expiry_sweep(handle.clone(), Arc::clone(&clock));
         let task = tokio::spawn(run(handle, clock, network, settings));
-        Self { task }
+        Self { task, sweep }
     }
 
-    /// Stops the timer and waits for it to end.
+    /// Stops the timer and the sweep, and waits for them to end.
     pub async fn stop(mut self) {
         self.task.abort();
-        // Aborted, so it can only end cancelled.
+        self.sweep.abort();
+        // Aborted, so each can only end cancelled.
         let _stopped = (&mut self.task).await;
+        let _swept = (&mut self.sweep).await;
     }
 }
 
 impl Drop for Failover {
     fn drop(&mut self) {
         self.task.abort();
+        self.sweep.abort();
     }
+}
+
+/// Starts the expiry sweep for the control node behind `handle`, reading time from `clock`:
+/// every [`EXPIRY_SWEEP`], it expires the databases whose expiry has passed, as
+/// [`sweep`] does. The task ends once the control node stops.
+pub(crate) fn spawn_expiry_sweep(handle: ControlHandle, clock: Arc<dyn Clock>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sweeps = tokio::time::interval(EXPIRY_SWEEP);
+        sweeps.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            sweeps.tick().await;
+            let due = handle.state().expired_databases(clock.now());
+            if sweep(&handle, due).await == Sweep::Stop {
+                return;
+            }
+        }
+    })
+}
+
+/// Whether the expiry sweep goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// It sweeps again at its next interval.
+    Continue,
+    /// The control node has stopped, so it ends.
+    Stop,
+}
+
+/// Submits [`Action::ExpireDatabase`] for each of the first [`MAX_EXPIRIES_PER_SWEEP`] databases
+/// of `due`, all at once, so that the writer logs them in one group, and logs what became of
+/// each.
+///
+/// `due` is what the state said had expired when the sweep looked; `apply` judges each command
+/// again at its own stamp, so a database whose expiry was extended or cleared since is rejected
+/// as not expired and kept.
+pub(crate) async fn sweep(handle: &ControlHandle, due: Vec<DatabaseName>) -> Sweep {
+    let mut submitted = JoinSet::new();
+    for name in due.into_iter().take(MAX_EXPIRIES_PER_SWEEP) {
+        let handle = handle.clone();
+        submitted.spawn(async move {
+            let result = handle
+                .submit(Action::ExpireDatabase { name: name.clone() })
+                .await;
+            (name, result)
+        });
+    }
+    let mut next = Sweep::Continue;
+    while let Some(joined) = submitted.join_next().await {
+        let Ok((name, result)) = joined else {
+            continue;
+        };
+        if expired(&name, result) == Sweep::Stop {
+            next = Sweep::Stop;
+        }
+    }
+    next
+}
+
+/// Logs what became of the expiry of `database`, and says whether the sweep goes on: it stops
+/// only with the control node. A command refused before it was logged, or rejected by `apply`,
+/// is skipped, and a storage failure is retried at the next sweep.
+pub(crate) fn expired(database: &DatabaseName, result: Result<Committed, SubmitError>) -> Sweep {
+    match result {
+        Ok(committed) => match committed.outcome() {
+            Ok(Applied::DatabaseExpired {
+                database,
+                epoch,
+                expires_at,
+            }) => {
+                tracing::info!(database = %database, epoch = epoch.get(), %expires_at, "database expired");
+            }
+            Ok(other) => {
+                tracing::debug!(database = %database, ?other, "an expiry had an unexpected outcome");
+            }
+            // Extended or cleared since the sweep looked, or dropped meanwhile.
+            Err(rejection) => {
+                tracing::debug!(database = %database, %rejection, "the database didn't expire");
+            }
+        },
+        Err(SubmitError::Refused(rejection)) => {
+            tracing::debug!(database = %database, %rejection, "the expiry was refused; skipped");
+        }
+        Err(SubmitError::Storage(error)) => {
+            tracing::warn!(database = %database, %error, "can't log an expiry; the next sweep tries again");
+        }
+        Err(SubmitError::Stopped) => return Sweep::Stop,
+    }
+    Sweep::Continue
 }
 
 async fn run(
@@ -235,4 +344,106 @@ fn notify_candidates(
 
 fn millis(duration: Duration) -> Millis {
     Millis::new(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use fleetring_control::{
+        ControlConfig, Engine, ExpiryChange, Feature, Member, MetadataChange, MetadataSpec,
+        Rejection, Release,
+    };
+
+    use super::*;
+    use crate::clock::SimClock;
+    use crate::control::{ControlNode, ControlOptions, StorageIo};
+
+    const BASE: Timestamp = Timestamp::from_millis(1_000_000);
+
+    async fn node(dir: &std::path::Path) -> ControlNode {
+        let options = ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
+        let node = ControlNode::open(dir.join("control.db"), options, SimClock::new(BASE))
+            .await
+            .expect("a new log opens");
+        let member =
+            Member::new("data-1".parse().expect("an id")).with_software(crate::software::running());
+        node.handle()
+            .submit(Action::Join { member })
+            .await
+            .expect("the join commits");
+        node
+    }
+
+    async fn create_expiring(handle: &ControlHandle, name: &str, expires_at: Timestamp) {
+        let created = handle
+            .submit(Action::CreateDatabase {
+                name: name.parse().expect("a name"),
+                replication_factor: fleetring::ReplicationFactor::ONE,
+                engine: Engine::Sqlite,
+                durability: None,
+                metadata: Some(MetadataSpec {
+                    expires_at: Some(expires_at),
+                    ..MetadataSpec::default()
+                }),
+            })
+            .await
+            .expect("the creation commits");
+        assert!(created.outcome().is_ok(), "{:?}", created.outcome());
+    }
+
+    /// A command refused before it is logged, as one needing a feature a member lacks, is
+    /// skipped; so is one `apply` rejects. Only a stopped control node ends the sweep.
+    #[test]
+    fn a_refused_expiry_does_not_stop_the_sweep() {
+        let database: DatabaseName = "scratch".parse().expect("a name");
+        let refused = SubmitError::Refused(Rejection::FeatureUnsupported {
+            feature: Feature::Expiry,
+            id: "old".parse().expect("an id"),
+            release: Release::new(0, 5, 0),
+        });
+        assert_eq!(expired(&database, Err(refused)), Sweep::Continue);
+        assert_eq!(expired(&database, Err(SubmitError::Stopped)), Sweep::Stop);
+    }
+
+    /// The sweep submits what it read; a database extended since is rejected as not expired
+    /// and kept, and the sweep goes on to expire the others.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_expires_what_is_due_and_keeps_what_was_extended_since() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let node = node(dir.path()).await;
+        let handle = node.handle();
+        let expires_at = BASE.saturating_add(Millis::new(61_000));
+        for name in ["a", "b", "c"] {
+            create_expiring(&handle, name, expires_at).await;
+        }
+        tokio::time::sleep(Duration::from_secs(62)).await;
+        let due = handle
+            .state()
+            .expired_databases(BASE.saturating_add(Millis::new(62_000)));
+        assert_eq!(due.len(), 3);
+        let extend = Action::UpdateDatabase {
+            name: "b".parse().expect("a name"),
+            change: MetadataChange {
+                expiry: ExpiryChange::Set(BASE.saturating_add(Millis::new(3_600_000))),
+                ..MetadataChange::default()
+            },
+            by: None,
+            if_version: None,
+        };
+        let extended = handle.submit(extend).await.expect("the update commits");
+        assert!(extended.outcome().is_ok(), "{:?}", extended.outcome());
+
+        assert_eq!(sweep(&handle, due).await, Sweep::Continue);
+        let state = handle.state();
+        let left: Vec<&str> = state
+            .databases()
+            .map(|database| database.name().as_str())
+            .collect();
+        assert_eq!(left, ["b"]);
+        // A sweep after the control node stopped ends.
+        node.shutdown().await;
+        assert_eq!(
+            sweep(&handle, vec!["b".parse().expect("a name")]).await,
+            Sweep::Stop
+        );
+    }
 }

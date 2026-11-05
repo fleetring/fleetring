@@ -25,25 +25,16 @@ pub fn release() -> Release {
         .expect("the crate's version is a valid release")
 }
 
-/// Fleet features the control crate knows but this build doesn't carry out yet, so it doesn't
-/// report them. A release reports a feature only once it acts on every command the feature
-/// covers (ADR-0041, point 3).
-///
-/// `expiry`: `apply` decides `ExpireDatabase`, but nothing submits one until the control node's
-/// expiry sweep exists (FR-070 phase 3, which removes this list).
-const NOT_YET_REPORTED: [Feature; 1] = [Feature::Expiry];
-
 /// Returns the software this build runs: its release, the control-log format it reads, and every
-/// fleet feature it carries out.
+/// fleet feature it knows. A release reports a feature only once it acts on every command the
+/// feature covers (ADR-0041, point 3); this one carries out all of them, `expiry` included, since
+/// its control node sweeps expired databases.
 #[must_use]
 pub fn running() -> Software {
-    Feature::ALL
-        .into_iter()
-        .filter(|feature| !NOT_YET_REPORTED.contains(feature))
-        .fold(
-            Software::new(release(), FORMAT_VERSION),
-            Software::with_feature,
-        )
+    Feature::ALL.into_iter().fold(
+        Software::new(release(), FORMAT_VERSION),
+        Software::with_feature,
+    )
 }
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
@@ -99,28 +90,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn this_build_reports_every_feature_it_carries_out() {
+    fn this_build_reports_a_release_with_every_feature() {
         let software = running();
         assert_eq!(software.release().to_string(), VERSION);
-        assert!(software.supports(Feature::Undrain));
-        assert!(software.supports(Feature::Metadata));
-        // Nothing sweeps expired databases until FR-070 phase 3, so `expiry` isn't reported:
-        // a fleet could otherwise enable it with no node that ever expires a database.
-        assert!(!software.supports(Feature::Expiry));
         assert!(
             Feature::ALL
                 .into_iter()
-                .all(|feature| software.supports(feature) != NOT_YET_REPORTED.contains(&feature))
+                .all(|feature| software.supports(feature))
         );
         assert_eq!(
             software_from_proto(software_to_proto(&software)).expect("valid"),
             software
         );
+        // Stored, `expiry` and `metadata` go where the 0.5 line doesn't look, so a rollback
+        // still decodes a member's record (ADR-0041, amendment 1).
+        let stored = serde_json::to_value(&software).expect("serializes");
+        assert_eq!(stored["features"], serde_json::json!(["undrain"]));
+        assert_eq!(
+            stored["newer_features"],
+            serde_json::json!(["expiry", "metadata"])
+        );
+        // `upgrade --software` lists `expiry` now that the control node sweeps expired
+        // databases (ADR-0041, point 3).
         let printed: serde_json::Value =
             serde_json::from_str(&running_json()).expect("upgrade --software prints JSON");
         assert_eq!(
             printed["features"],
-            serde_json::json!(["undrain", "metadata"])
+            serde_json::json!(["undrain", "metadata", "expiry"])
         );
     }
 

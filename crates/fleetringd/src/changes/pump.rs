@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use fleetring_control::{DatabaseName, LeaseEpoch};
+use tokio::sync::watch;
 use tokio::time;
 
 use crate::DatabaseError;
@@ -28,6 +29,9 @@ pub(super) struct PumpContext {
     pub(super) metrics: ChangeMetrics,
     /// The streams, which release delivered row changes once every logical sink has them.
     pub(super) streams: Weak<super::Inner>,
+    /// Set once the pump must deliver what is acknowledged at once, whatever the sink's pace:
+    /// its database was dropped, and its copy is about to be deleted.
+    pub(super) cut: watch::Receiver<bool>,
 }
 
 /// A pump's progress, as the node's status reports it.
@@ -108,10 +112,15 @@ pub(super) async fn run(ctx: PumpContext) {
                             streams.release(&database);
                         }
                         backoff = ctx.settings.retry_initial;
-                        // A paced sink takes what was acknowledged meanwhile as one batch.
+                        // A paced sink takes what was acknowledged meanwhile as one batch, unless
+                        // the stream is being flushed.
                         let pace = ctx.sink.pace();
-                        if !pace.is_zero() {
-                            time::sleep(pace).await;
+                        if !pace.is_zero() && !*ctx.cut.borrow() {
+                            let mut cut = ctx.cut.clone();
+                            tokio::select! {
+                                () = time::sleep(pace) => {}
+                                _ = cut.wait_for(|cut| *cut) => {}
+                            }
                             if !feed.is_current() {
                                 break;
                             }
