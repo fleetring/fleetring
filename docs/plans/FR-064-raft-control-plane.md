@@ -9,6 +9,8 @@ depends_on: [FR-027, FR-028, FR-031, FR-050, FR-054, FR-063, FR-068]
 adrs: [ADR-0017, ADR-0018, ADR-0020, ADR-0022, ADR-0031, ADR-0034, ADR-0035, ADR-0038, ADR-0039, ADR-0040]
 ---
 
+> **Paused (2026-11-04).** The design (ADR-0040) is reviewed and its findings are closed, but the build waits until the MVP work (#91, the agent kit FR-070, the router FR-066) lands. A single control node is enough for development, home labs, and small fleets watched by their operators; the "no single point of failure" criterion (roadmap E5) still needs this plan before FleetRing is called safe to depend on.
+
 # FR-064: A Raft control plane: three or five control nodes on openraft
 
 ## Context
