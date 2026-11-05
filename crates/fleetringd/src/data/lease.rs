@@ -28,7 +28,7 @@
 //!   plane whether the database still exists; if not, it deletes its copy too. A node that was
 //!   away makes the same check for every database it has a record of when it recovers. A
 //!   follower whose primary went down before it noticed the drop has no stream to end, and
-//!   keeps its copy until it restarts (ADR-0041, amendment 6).
+//!   keeps its copy until it restarts (ADR-0041, amendment 7).
 //! - **After a restart**, the node asks the control plane about every database it has an epoch
 //!   record for, and leads each one whose lease it holds at once, rather than when the first
 //!   request arrives. The same pass reads its copies' positions, so its heartbeats report them.
@@ -327,7 +327,7 @@ async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSe
                 if created_again(node, &database).await {
                     // Not proof of a drop: an empty or recreated control state looks the same.
                     // The copy stays, an orphan a creation here refuses until an operator
-                    // removes it (ADR-0041, amendment 6).
+                    // removes it (ADR-0041, amendment 7).
                     tracing::warn!(database = %database, epoch = epoch.get(), "the control plane's database of this name has never been leased; this node's copy from the earlier one is kept as an orphan");
                 } else {
                     tracing::warn!(database = %database, epoch = epoch.get(), %status, "lost the lease");

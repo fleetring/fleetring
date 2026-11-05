@@ -296,7 +296,7 @@ impl DataNode {
     /// of an earlier database of the name that it didn't see dropped: an orphan. A node deletes
     /// a copy only after it saw the drop itself ([`Retiring`]); a control plane whose `name` is
     /// new says nothing about what became of the old one, since an empty, older, or recreated
-    /// control state says the same (ADR-0041, amendment 6).
+    /// control state says the same (ADR-0041, amendment 7).
     ///
     /// # Errors
     ///
