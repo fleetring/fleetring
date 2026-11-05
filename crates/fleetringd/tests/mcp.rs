@@ -373,8 +373,7 @@ async fn an_agent_scoped_to_its_prefix_manages_its_databases_and_nothing_else() 
         ]
     );
 
-    // 1. Create, with a description and a label.
-    // FR-070 phase 3 (expiry): add `"expires_in": "2h"` here, and check the expiry it reports.
+    // 1. Create, with a description, a label, and an expiry.
     let created = mcp
         .ok(
             "db_create",
@@ -382,10 +381,19 @@ async fn an_agent_scoped_to_its_prefix_manages_its_databases_and_nothing_else() 
                 "name": "agent-42-notes",
                 "description": "Memory for agent 42.\nTables: notes.",
                 "labels": {"purpose": "memory"},
+                "expires_in": "2h",
                 "replication_factor": 1,
             }),
         )
         .await?;
+    let expires_in = created["metadata"]["expires_in_ms"]
+        .as_i64()
+        .ok_or("no expiry")?;
+    assert!(
+        (7_000_000..=7_200_000).contains(&expires_in),
+        "{expires_in} ms"
+    );
+    assert!(created["metadata"]["expires_at"].is_string(), "{created}");
     assert_eq!(created["database"], "agent-42-notes");
     assert_eq!(created["metadata"]["created_by"], AGENT);
     assert_eq!(
@@ -463,6 +471,15 @@ async fn an_agent_scoped_to_its_prefix_manages_its_databases_and_nothing_else() 
         json!({"agent": "42", "purpose": "memory"})
     );
     assert_eq!(updated["metadata"]["version"], version + 1);
+    assert_eq!(
+        updated["metadata"]["expires_at"], shown["metadata"]["expires_at"],
+        "a label change leaves the expiry"
+    );
+    let listed = mcp.ok("db_list", json!({"prefix": "agent-42-"})).await?;
+    assert_eq!(
+        listed["databases"][0]["expires_at"],
+        shown["metadata"]["expires_at"]
+    );
     let stale = mcp
         .failed(
             "db_update",
@@ -1089,6 +1106,92 @@ async fn stdout_carries_only_protocol() -> TestResult {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn db_update_sets_extends_and_clears_the_expiry() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let node = Node::start(dir.path()).await?;
+    let mut mcp = node.mcp(&[]).await?;
+    let created = mcp
+        .ok(
+            "db_create",
+            json!({"name": "agent-42-scratch", "replication_factor": 1}),
+        )
+        .await?;
+    assert_eq!(
+        created["metadata"],
+        Value::Null,
+        "a plain creation has no metadata"
+    );
+
+    let set = mcp
+        .ok(
+            "db_update",
+            json!({"name": "agent-42-scratch", "expires_in": "1d"}),
+        )
+        .await?;
+    let day = set["metadata"]["expires_in_ms"]
+        .as_i64()
+        .ok_or("no expiry")?;
+    assert!((86_000_000..=86_400_000).contains(&day), "{day} ms");
+
+    let at = "2100-01-01T00:00:00Z";
+    let extended = mcp
+        .ok(
+            "db_update",
+            json!({"name": "agent-42-scratch", "expires_at": at}),
+        )
+        .await?;
+    assert_eq!(extended["metadata"]["expires_at"], at);
+    let shown = mcp
+        .ok(
+            "db_show",
+            json!({"name": "agent-42-scratch", "schema": false}),
+        )
+        .await?;
+    assert_eq!(shown["metadata"]["expires_at"], at);
+
+    let cleared = mcp
+        .ok(
+            "db_update",
+            json!({"name": "agent-42-scratch", "expires_in": "never"}),
+        )
+        .await?;
+    assert_eq!(cleared["metadata"]["expires_at"], Value::Null);
+    assert_eq!(cleared["metadata"]["expires_in_ms"], Value::Null);
+
+    // Malformed expiries are refused before anything is sent; one under a minute is refused by
+    // the control node, which judges it by its own clock.
+    for arguments in [
+        json!({"name": "agent-42-scratch", "expires_in": "2 hours"}),
+        json!({"name": "agent-42-scratch", "expires_in": "0s"}),
+        json!({"name": "agent-42-scratch", "expires_at": "tomorrow"}),
+        json!({"name": "agent-42-scratch", "expires_in": "1h", "expires_at": at}),
+    ] {
+        mcp.invalid("db_update", arguments).await?;
+    }
+    mcp.invalid(
+        "db_create",
+        json!({"name": "agent-42-never", "expires_in": "never"}),
+    )
+    .await?;
+    let soon = mcp
+        .failed(
+            "db_update",
+            json!({"name": "agent-42-scratch", "expires_in": "30s"}),
+        )
+        .await?;
+    assert_eq!(soon["code"], "invalid_argument", "{soon}");
+    assert!(
+        soon["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("at least 1m")),
+        "{soon}"
+    );
+    mcp.close().await?;
     node.stop().await;
     Ok(())
 }
