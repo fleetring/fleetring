@@ -16,6 +16,7 @@ This section describes `fleetringd` as built today. Every security ticket update
 
 - **Database contents:** each replica's SQLite files under its `data_dir`, unencrypted.
 - **The replication log and its hash chain:** each replica's log, with one BLAKE3 hash per transaction that commits every byte before it (ADR-0016 point 12).
+- **Change streams** (FR-039): every change a `[[changes.sink]]` names, as row changes (with values under `capture = "after"` or `"full"`) or opaque batches, delivered to a file or a webhook, and the bearer token and client key a webhook presents.
 - **Archives** (FR-049): every row of the databases an `[[archive]]` names, as base snapshots and log segments in an object store, unencrypted, and the static S3 keys that write them.
 - **The control log:** the control node's command log and control snapshot (one SQLite database): membership, databases, epochs, leases, and token revocations. It holds no key material.
 - **The authority key** (`ca.key`): issues every node and client certificate and signs every token. It belongs on no node.
@@ -38,6 +39,10 @@ This section describes `fleetringd` as built today. Every security ticket update
 ### Archives
 
 An archive holds every row of the databases it names, and their history back to its oldest base snapshot, unencrypted, in a store outside the fleet: whoever can read the bucket or directory can read the data, and whoever can write it can delete it. Give the bucket the care the nodes' disks get, with keys that may write only under the archive's prefix, and versioning or object lock if deletes must be recoverable. The S3 keys come from the environment or from a file only its owner may read (the daemon refuses one others can read), are held in memory that is zeroed when dropped, and are never logged or printed. Every segment and snapshot chunk carries a checksum, and a restore recomputes the hash chain over every batch it applies, so an object that was altered or lost fails the restore as data loss, naming it, rather than restoring a wrong copy; like the chain itself, this detects corruption and truncation, not a writer with the keys who rewrites segments and their hashes consistently. Restoring needs `admin` on the source database as well as on the new one, since a restore copies history its caller's scopes may no longer show.
+
+### Change streams
+
+A file sink writes the rows of the databases it names, unencrypted, where its `path` says: give that directory the care the nodes' disks get. A webhook sink sends the same rows to another machine, so it is TLS by default (FR-073): an `https://` `url` is dialled over TLS 1.2 or 1.3, verified against the platform's root certificates and any extra authority in `ca`, and a certificate it doesn't trust is a failed delivery that is retried, never one that falls back to plaintext or drops the change. Plaintext is an explicit opt-in: an `http://` `url` fails configuration validation unless that sink sets `allow_http = true`, and the daemon warns at start if such a sink also sends a token. A receiver that requires client authentication gets a client certificate (`cert` and `key`) and a bearer token (`token_file` or `token_env`, never the configuration file). The token file must be readable by its owner only, which the daemon enforces; the token and the key are held in memory that is zeroed when dropped (rustls keeps its own copy of the key while the sink runs), are kept out of `Debug` output, and are never logged: no span or event carries the `Authorization` header. A token is read once, when the sink starts, so rotating it takes a restart. What the receiver does with a change, and whether it dedups the at-least-once repeats a failover can cause, is the receiver's business.
 
 ### The admin listener
 

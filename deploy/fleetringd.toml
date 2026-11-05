@@ -101,7 +101,8 @@ id = "node-1"
 #
 # `name`       1 to 64 lowercase letters, digits, `-`, or `_`; unique
 # `kind`       "file"     appends one JSON line per batch to `<path>/<database>.ndjson`
-#              "webhook"  POSTs each batch as JSON to `url`, retrying 5xx with backoff
+#              "webhook"  POSTs each batch as JSON to `url`, over TLS, retrying 5xx and
+#                         connection and TLS failures with backoff; see the example below
 # `format`     "logical"  (the default) the rows each transaction inserted, updated, or deleted;
 #                         schema changes aren't included
 #              "physical" the opaque batch, for a mirror or an archive the same engine applies
@@ -128,9 +129,31 @@ id = "node-1"
 # name = "hooks"
 # kind = "webhook"
 # databases = ["*"]
-# url = "http://127.0.0.1:8080/changes"
+# url = "https://hooks.example.com/changes"
 # timeout_ms = 5000      # how long one request may take
 # retries = 5            # retries before the change is handed back and retried later
+#
+# A webhook is HTTPS. It trusts the platform's root certificates, as `[[archive]]` does, and
+# `ca` adds the authorities in a PEM bundle to them for a receiver with a private certificate.
+# A certificate it doesn't trust is a failed delivery: the change is retried with backoff and
+# never dropped or skipped.
+# ca = "/etc/fleetring/hooks-ca.crt"
+#
+# Mutual TLS, for a receiver that asks for a client certificate: a PEM chain and its key,
+# both or neither.
+# cert = "/etc/fleetring/hooks-client.crt"
+# key = "/etc/fleetring/hooks-client.key"
+#
+# A bearer token, sent as `Authorization: Bearer <token>` on every request. It is never in this
+# file: name a file only its owner may read (the daemon refuses one others can read), or an
+# environment variable. At most one. It is read once, when the sink starts, so a new token takes
+# a restart. It is zeroed in memory when dropped and never logged.
+# token_file = "/etc/fleetring/hooks.token"
+# token_env = "HOOKS_TOKEN"
+#
+# `http://` urls are refused, since every change would leave the node in plaintext, unless the
+# sink says so. Use it for a receiver on the same machine, and never with a token.
+# allow_http = true
 
 # [[archive]]
 # Archives (FR-049, ADR-0029): each entry writes the databases it names to an object store
