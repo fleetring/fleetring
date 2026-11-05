@@ -262,6 +262,7 @@ impl Daemon {
                     .with_durability_defaults(config.replication.durability_defaults())
                     .with_clock(environment.clock())
                     .with_dev_mode(config.dev)
+                    .with_network(network.clone())
             }),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),

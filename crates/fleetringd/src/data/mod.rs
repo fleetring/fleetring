@@ -28,13 +28,14 @@
 //!   so nothing commits. One that committed on the primary without reaching its quorum fails
 //!   with `ABORTED`, since it may still replicate later.
 //! - **Dropping** is a control command: `Control.DropDatabase` removes the database from the
-//!   control plane at its current epoch, and so does an expiry once it passes. The primary
-//!   learns of it when its next lease renewal is refused as an unknown database, within one
-//!   renewal interval, and stops serving it; it flushes the database's change streams, its
-//!   archive included, for a bounded time, then deletes its copy. Its streams end, and each
-//!   follower whose stream ends asks the control plane whether the database still exists.
-//!   Every replica then closes its copy through its registry and deletes the files. A write to a
-//!   dropped database fails with `NOT_FOUND`.
+//!   control plane at its current epoch, and so does an expiry once it passes. The control node
+//!   that applied it tells each replica through `Replication.DropCopy` (ADR-0042). The primary
+//!   stops serving the database, flushes its change streams, its archive included, for a
+//!   bounded time, then deletes its copy; every other replica closes its copy through its
+//!   registry and deletes the files. A replica deletes a copy only on that notice: one the
+//!   control plane merely doesn't know, as after `control.db` was lost, is kept as an orphan
+//!   for an operator to remove with `fleetringd orphan remove`. A write to a dropped database
+//!   fails with `NOT_FOUND`.
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
 //! - **Metadata:** a database may carry a description, labels, and an expiry in control state
@@ -63,10 +64,11 @@ mod redirect;
 mod schema;
 mod service;
 
+pub(crate) use client::unknown_call;
 pub use client::{
     ArchiveDescription, ArchiveVerification, ArchivedSnapshot, Client, DatabaseSpec,
-    DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus, ReplicaInfo, Restoration,
-    RestoredExpiry, ServedDatabase, Verification, Written,
+    DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus, Orphan, ReplicaInfo,
+    Restoration, RestoredExpiry, ServedDatabase, Verification, Written,
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{DROP_FLUSH_LIMIT, LeaseKeeper, LeaseSettings};

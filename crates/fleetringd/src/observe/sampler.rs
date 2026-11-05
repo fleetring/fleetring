@@ -93,6 +93,7 @@ fn data_sample(sources: &Sources, membership: &Membership) -> DataSample {
             }
         }
         sample.open = replication.registry().open_count();
+        sample.orphaned = replication.orphan_count();
         let served: Vec<_> = replication.served().borrow().keys().cloned().collect();
         sample.leases_held = served.len();
         for database in &served {

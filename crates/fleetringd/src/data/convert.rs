@@ -19,7 +19,7 @@ use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as K
 use tonic::Status;
 
 use crate::changes::{MarkHome, SinkStatus};
-use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
+use crate::data::client::{LeaseUpdate, Location, NodeStatus, Orphan, ReplicaInfo, ServedDatabase};
 use crate::data::metadata::{Descriptions, Expiry, ExpiryRequest, MetadataView, NewMetadata};
 use crate::data::schema::SchemaView;
 use crate::durability::ArchivedMetadata;
@@ -661,12 +661,24 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
+    let orphans = response
+        .orphans
+        .into_iter()
+        .map(|orphan| {
+            Ok(Orphan {
+                database: parse_reply("database name", &orphan.database)?,
+                epoch: LeaseEpoch::new(orphan.epoch),
+                bytes: orphan.bytes,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
     Ok(NodeStatus {
         node: parse_reply("node id", &response.node_id)?,
         membership_epoch: Epoch::new(response.membership_epoch),
         fingerprint: response.ring_fingerprint.map(Fingerprint::new),
         databases,
         sinks,
+        orphans,
     })
 }
 

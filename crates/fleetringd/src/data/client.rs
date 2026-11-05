@@ -17,8 +17,9 @@ use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest,
     CreateDatabaseWithMetadataRequest, CreateRequest, DescribeArchiveRequest, DrainRequest,
     DropDatabaseRequest, ExecuteRequest, LeaveRequest, ListDatabasesRequest, LocateRequest,
-    NodeStatusRequest, QueryRequest, RestoreLatest, RestoreRequest, UndrainRequest,
-    VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest, WatchMembershipRequest,
+    NodeStatusRequest, QueryRequest, RemoveOrphanRequest, RestoreLatest, RestoreRequest,
+    UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
+    WatchMembershipRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status, Streaming};
@@ -200,6 +201,22 @@ pub struct NodeStatus {
     pub databases: Vec<ServedDatabase>,
     /// Each change sink's progress on each database the node feeds it (FR-039).
     pub sinks: Vec<SinkStatus>,
+    /// The orphan copies it keeps, in name order (ADR-0042); none from a node that predates
+    /// them, which never keeps one.
+    pub orphans: Vec<Orphan>,
+}
+
+/// A copy a data node keeps, closed, as an orphan (ADR-0042): the control plane didn't know its
+/// database, or held it only at a lower epoch, and the node saw no drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Orphan {
+    /// The database the copy is of.
+    pub database: DatabaseName,
+    /// The highest epoch the copy recorded.
+    pub epoch: LeaseEpoch,
+    /// The size of its files on disk, in bytes.
+    pub bytes: u64,
 }
 
 /// A database one node serves, as primary or follower.
@@ -780,8 +797,9 @@ impl Client {
         })
     }
 
-    /// Drops a database for good, and returns the epoch it was at. Its primary stops serving it
-    /// within one lease renewal, and every replica deletes its copy once it learns of the drop.
+    /// Drops a database for good, and returns the epoch it was at. The control node tells every
+    /// replica, which deletes its copy, the primary after flushing its change streams; a replica
+    /// that misses the notice keeps its copy as an orphan (ADR-0042).
     ///
     /// # Errors
     ///
@@ -1033,6 +1051,37 @@ impl Client {
             .await?
             .into_inner();
         node_status(response)
+    }
+
+    /// Deletes the orphan copy of `name` that the data node at `address` (`host:port`) keeps
+    /// (ADR-0042), and returns the highest epoch the copy had recorded. It needs the `fleet`
+    /// scope.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if the node holds no copy of `name`; `FAILED_PRECONDITION` if it serves or
+    /// follows the name, or is retiring a copy of it; `UNIMPLEMENTED` if the node runs a
+    /// release that keeps no orphans; and `UNAVAILABLE` if it can't be reached.
+    pub async fn remove_orphan(
+        &self,
+        address: &str,
+        name: &DatabaseName,
+    ) -> Result<LeaseEpoch, Status> {
+        let response = self
+            .database(address)?
+            .remove_orphan(RemoveOrphanRequest {
+                database: name.to_string(),
+            })
+            .await
+            .map_err(|status| {
+                if unknown_call(&status) {
+                    Status::unimplemented(WITHOUT_ORPHANS)
+                } else {
+                    status
+                }
+            })?
+            .into_inner();
+        Ok(LeaseEpoch::new(response.epoch))
     }
 
     /// Follows the leases the data node at `address` (`host:port`) holds: the first update holds
@@ -1379,6 +1428,10 @@ where
 /// metadata (ADR-0041, point 13).
 const WITHOUT_METADATA: &str =
     "the control plane runs a release without database metadata; upgrade it first";
+
+/// What `RemoveOrphan` answers when the node runs a release that predates orphans (ADR-0042).
+const WITHOUT_ORPHANS: &str =
+    "the node runs an older fleetringd, which keeps no orphans: it deleted such copies instead";
 
 /// Whether `status` is a node refusing a call it doesn't serve: `UNIMPLEMENTED`, or, from a
 /// release whose request boundary refuses every call its scope table doesn't list,

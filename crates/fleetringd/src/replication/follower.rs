@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fleetring::NodeId;
-use fleetring_control::DatabaseName;
+use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::replicate_message::Message;
 use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
-    FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest, PromoteResponse,
-    ReplicateAck, ReplicateMessage, SnapshotChunk, SnapshotRequest,
+    DropCopyRequest, DropCopyResponse, FenceRequest, FenceResponse, FetchRequest, FetchResponse,
+    PromoteRequest, PromoteResponse, ReplicateAck, ReplicateMessage, SnapshotChunk,
+    SnapshotRequest,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::Stream;
@@ -511,6 +512,18 @@ impl Replication for ReplicationService {
         }
         failover::promote_rpc(&self.inner, request)?;
         Ok(Response::new(PromoteResponse {}))
+    }
+
+    async fn drop_copy(
+        &self,
+        request: Request<DropCopyRequest>,
+    ) -> Result<Response<DropCopyResponse>, Status> {
+        let caller = calling_node(&Peer::of(&request), "DropCopy")?;
+        let request = request.into_inner();
+        let name = parse_database(&request.database)?;
+        binding::check_drop(&self.inner, &name, request.epoch, caller.as_ref()).await?;
+        failover::drop_rpc(&self.inner, name, LeaseEpoch::new(request.epoch));
+        Ok(Response::new(DropCopyResponse {}))
     }
 
     async fn snapshot(

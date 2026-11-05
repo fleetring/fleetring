@@ -11,8 +11,8 @@ use std::time::Duration;
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::replication_server::Replication as ReplicationRpc;
 use fleetring_proto::v1::{
-    FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest, PromoteResponse,
-    ReplicateMessage, SnapshotChunk, SnapshotRequest,
+    DropCopyRequest, DropCopyResponse, FenceRequest, FenceResponse, FetchRequest, FetchResponse,
+    PromoteRequest, PromoteResponse, ReplicateMessage, SnapshotChunk, SnapshotRequest,
 };
 use fleetringd::engine::{Statement, Transaction, Value};
 use fleetringd::replication::{PrimaryRole, ReplicationService, ReplicationSettings, SeedError};
@@ -277,6 +277,13 @@ impl ReplicationRpc for Tamper {
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
         self.inner.promote(request).await
+    }
+
+    async fn drop_copy(
+        &self,
+        request: Request<DropCopyRequest>,
+    ) -> Result<Response<DropCopyResponse>, Status> {
+        self.inner.drop_copy(request).await
     }
 
     async fn snapshot(

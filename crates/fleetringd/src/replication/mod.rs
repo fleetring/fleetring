@@ -134,6 +134,7 @@ use fleetring_proto::v1::replication_server::ReplicationServer;
 use fleetring_proto::v1::{DatabaseStatus, ReplicaRole};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tonic::Status;
 
 use self::chain::Chains;
 use self::epochs::Epochs;
@@ -154,6 +155,7 @@ use crate::{Membership, Registry};
 pub(crate) use self::archive::{Packer, Unpacker, remove_dir_if_present};
 pub use self::binding::{EpochAuthority, EpochHolders, HoldersFuture};
 pub use self::chain::{ChainHash, ParseChainHashError};
+pub(crate) use self::failover::DropNotice;
 pub use self::failover::{Fenced, PromotionRequest};
 pub use self::follower::ReplicationService;
 
@@ -448,6 +450,14 @@ struct Inner {
     chains: Chains,
     /// Promotions the control node asked this node to carry out.
     promotions: watch::Sender<BTreeMap<DatabaseName, PromotionRequest>>,
+    /// The drops control nodes told this node of, each with the epoch the database was dropped
+    /// at and how many notices have arrived (see [`drops`]).
+    ///
+    /// [`drops`]: Replication::drops
+    drops: watch::Sender<BTreeMap<DatabaseName, DropNotice>>,
+    /// The copies this node keeps, closed, as orphans, each with the highest epoch it recorded
+    /// (ADR-0042). Streams, fences, fetches, and promotions naming one are refused.
+    orphans: Mutex<BTreeMap<DatabaseName, LeaseEpoch>>,
     /// How many streams have ended, by the database they followed. A stream that ends may mean
     /// the database was dropped; the node asks the control plane (see [`ended_streams`]).
     ///
@@ -523,6 +533,8 @@ impl Replication {
             epochs: Epochs::new(state_dir.join("epochs")),
             chains: Chains::new(state_dir.join("epochs")),
             promotions: watch::Sender::new(BTreeMap::new()),
+            drops: watch::Sender::new(BTreeMap::new()),
+            orphans: Mutex::default(),
             ended: watch::Sender::new(BTreeMap::new()),
             served: watch::Sender::new(BTreeMap::new()),
             registry: OnceLock::new(),
@@ -567,6 +579,13 @@ impl Replication {
     /// a dropped database's streams end and are never reopened.
     pub(crate) fn ended_streams(&self) -> watch::Receiver<BTreeMap<DatabaseName, u64>> {
         self.inner.ended.subscribe()
+    }
+
+    /// The drops control nodes have told this node of through `DropCopy`, each confirmed with
+    /// control state when it arrived (ADR-0042). A watcher that sees a notice's count grow acts
+    /// on it.
+    pub(crate) fn drops(&self) -> watch::Receiver<BTreeMap<DatabaseName, DropNotice>> {
+        self.inner.drops.subscribe()
     }
 
     /// The `Replication` gRPC server, with FleetRing's message limits, for the node's router.
@@ -970,10 +989,14 @@ impl Replication {
 impl DatabaseStatuses for Replication {
     fn statuses(&self) -> Vec<DatabaseStatus> {
         let mut statuses: BTreeMap<DatabaseName, DatabaseStatus> = BTreeMap::new();
+        let orphans = self.inner.lock_orphans().clone();
         for (name, slot) in self.inner.lock_followers().iter() {
             let (Some(position), _) = slot.positions() else {
                 continue;
             };
+            if orphans.contains_key(name) {
+                continue;
+            }
             statuses.insert(
                 name.clone(),
                 DatabaseStatus {
@@ -1256,6 +1279,28 @@ impl Inner {
 
     fn lock_refusals(&self) -> MutexGuard<'_, BTreeMap<Option<DatabaseName>, u64>> {
         self.refusals.lock().expect("replication lock poisoned")
+    }
+
+    fn lock_orphans(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, LeaseEpoch>> {
+        self.orphans.lock().expect("replication lock poisoned")
+    }
+
+    /// Refuses a call that would open, follow, fence, or promote `database` while this node
+    /// keeps its copy as an orphan: the copy stays as it is until an operator removes it.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` naming the orphan and the command that removes it.
+    fn check_not_orphan(&self, database: &DatabaseName) -> Result<(), Status> {
+        let Some(epoch) = self.lock_orphans().get(database).copied() else {
+            return Ok(());
+        };
+        let node = &self.node;
+        Err(Status::failed_precondition(format!(
+            "{database} has an orphan copy on node {node} from epoch {}, which this node keeps \
+             closed; `fleetringd orphan remove {database} --node {node}` deletes it",
+            epoch.get()
+        )))
     }
 
     /// Counts one more call refused for failing its binding, naming `database` if it named one.

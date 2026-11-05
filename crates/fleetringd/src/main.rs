@@ -26,7 +26,7 @@ use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
     ArchiveDescription, Client, DatabaseSpec, Expiry, ExpiryRequest, LabelRequirement, LeaseUpdate,
-    ListFilter, Location, MetadataView, NewMetadata, NodeStatus, ReplicaInfo, Restoration,
+    ListFilter, Location, MetadataView, NewMetadata, NodeStatus, Orphan, ReplicaInfo, Restoration,
     RestoredExpiry, Verification, restored_metadata,
 };
 use fleetringd::dev::{self, DevError, DevMode, Prepared};
@@ -150,6 +150,10 @@ enum Command {
     /// Follows the leases data nodes hold.
     #[command(subcommand)]
     Lease(LeaseCommand),
+    /// Lists and removes orphans: copies a data node keeps, closed, because the control plane
+    /// didn't know their databases, or held them only at a lower epoch, and the node saw no drop.
+    #[command(subcommand)]
+    Orphan(OrphanCommand),
     /// Works with archives without a fleet: restores a database from one offline.
     #[command(subcommand)]
     Archive(ArchiveCommand),
@@ -372,6 +376,46 @@ enum LeaseCommand {
         /// The address of the data node to follow, `host:port`. Nothing else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
+        #[command(flatten)]
+        target: Target,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OrphanCommand {
+    /// Lists the orphans each data node keeps, with the epoch each copy recorded and its size;
+    /// with `--node` or `--address`, one node's.
+    List {
+        /// The data node to ask. Its address comes from the control plane's membership, so
+        /// `--control` or `--config` is needed too.
+        #[arg(long, conflicts_with = "address")]
+        node: Option<NodeId>,
+        /// The address of the data node to ask, `host:port`. Nothing else is needed.
+        #[arg(long, conflicts_with_all = ["control", "config"])]
+        address: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Deletes a data node's orphan copy of a database, for good: its files and its epochs.
+    /// Refuses a name the node serves, follows, or is retiring. Needs the `fleet` scope. Asks
+    /// first on a terminal.
+    Remove {
+        /// The database the orphan copy is of.
+        name: DatabaseName,
+        /// The data node that keeps the orphan. Its address comes from the control plane's
+        /// membership, so `--control` or `--config` is needed too.
+        #[arg(long, required_unless_present = "address", conflicts_with = "address")]
+        node: Option<NodeId>,
+        /// The address of the data node that keeps the orphan, `host:port`. Nothing else is
+        /// needed.
+        #[arg(long, conflicts_with_all = ["control", "config"])]
+        address: Option<String>,
+        /// Deletes without asking. Without it, the command asks first on a terminal, and
+        /// refuses elsewhere.
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         target: Target,
     },
@@ -688,7 +732,8 @@ enum DbCommand {
     /// Shows and verifies a database's archive.
     #[command(subcommand)]
     Archive(DbArchiveCommand),
-    /// Drops a database for good: every replica deletes its copy.
+    /// Drops a database for good: every replica that is up deletes its copy, and one that is
+    /// down or unreachable keeps it as an orphan for `orphan remove`.
     Drop {
         /// The database's name.
         name: DatabaseName,
@@ -1885,6 +1930,46 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             target.client()?.undrain_node(&id).await.map_err(failed)?;
             format!("{id} is no longer draining; it may take primaries again\n")
         }
+        Command::Orphan(OrphanCommand::List {
+            node,
+            address,
+            output,
+            target,
+        }) => {
+            let orphans = list_orphans(node.as_ref(), address, &target).await?;
+            match output.format() {
+                OutputFormat::Json => format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&orphans_json(&orphans))?
+                ),
+                OutputFormat::Table => format_orphans(&orphans),
+            }
+        }
+        Command::Orphan(OrphanCommand::Remove {
+            name,
+            node,
+            address,
+            yes,
+            target,
+        }) => {
+            let address = node_address(node.as_ref(), address, &target)
+                .await?
+                .ok_or("pass --node or --address")?;
+            let label = node.map_or_else(|| address.clone(), |node| node.to_string());
+            if !yes {
+                confirm_remove_orphan(&name, &label)?;
+            }
+            let client = Client::new(address.clone(), target.tls.network()?);
+            let epoch = client
+                .remove_orphan(&address, &name)
+                .await
+                .map_err(failed)?;
+            format!(
+                "removed the orphan copy of {} from epoch {} on {label}\n",
+                shown(&name),
+                epoch.get()
+            )
+        }
         Command::Lease(LeaseCommand::Watch {
             node,
             address,
@@ -2565,6 +2650,143 @@ fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn confirm_remove_orphan(name: &DatabaseName, node: &str) -> Result<(), Box<dyn Error>> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err(format!(
+            "pass --yes to delete the orphan copy of {} without a prompt",
+            shown(name)
+        )
+        .into());
+    }
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "delete the orphan copy of {} on {node}? Its files go for good; copy them first to keep \
+         them. [y/N] ",
+        shown(name)
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    stdin.lock().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        Err(format!("not deleting the orphan copy of {}", shown(name)).into())
+    }
+}
+
+/// The orphans `orphan list` reports, each with the node that keeps it, in node and then name
+/// order: one node's, if `node` or `address` names it, or every member's otherwise. A member that
+/// can't be asked is named on stderr and skipped.
+async fn list_orphans(
+    node: Option<&NodeId>,
+    address: Option<String>,
+    target: &Target,
+) -> Result<Vec<(String, Orphan)>, Box<dyn Error>> {
+    let network = target.tls.network()?;
+    let nodes: Vec<(String, String)> = match (node, address) {
+        (Some(node), _) => vec![(
+            node.to_string(),
+            member_address(&target.client()?, node).await?,
+        )],
+        (None, Some(address)) => vec![(address.clone(), address)],
+        (None, None) => {
+            let view = target.client()?.status().await.map_err(failed)?;
+            view.members()
+                .filter_map(|(member, _)| {
+                    Some((member.id().to_string(), member.address()?.to_owned()))
+                })
+                .collect()
+        }
+    };
+    let asked_one = nodes.len() == 1;
+    let mut orphans = Vec::new();
+    for (label, address) in nodes {
+        let client = Client::new(address.clone(), network.clone());
+        match client.node_status(&address).await {
+            Ok(status) => {
+                let label = if asked_one {
+                    status.node.to_string()
+                } else {
+                    label
+                };
+                orphans.extend(
+                    status
+                        .orphans
+                        .into_iter()
+                        .map(|orphan| (label.clone(), orphan)),
+                );
+            }
+            Err(status) if asked_one => return Err(failed(status)),
+            Err(status) => eprintln!("fleetringd: can't ask {label}: {}", status.message()),
+        }
+    }
+    Ok(orphans)
+}
+
+/// `orphan list --json`: `{"orphans": [{"node", "database", "epoch", "bytes"}]}`.
+fn orphans_json(orphans: &[(String, Orphan)]) -> serde_json::Value {
+    let listed: Vec<serde_json::Value> = orphans
+        .iter()
+        .map(|(node, orphan)| {
+            serde_json::json!({
+                "node": node,
+                "database": orphan.database.as_str(),
+                "epoch": orphan.epoch.get(),
+                "bytes": orphan.bytes,
+            })
+        })
+        .collect();
+    serde_json::json!({ "orphans": listed })
+}
+
+/// `orphan list`'s table: one row per orphan, under `NODE`, `DATABASE`, `EPOCH`, and `BYTES`.
+fn format_orphans(orphans: &[(String, Orphan)]) -> String {
+    if orphans.is_empty() {
+        return "no orphans\n".to_owned();
+    }
+    let header = ["NODE", "DATABASE", "EPOCH", "BYTES"];
+    let rows: Vec<[String; 4]> = orphans
+        .iter()
+        .map(|(node, orphan)| {
+            [
+                node.clone(),
+                shown(&orphan.database),
+                orphan.epoch.get().to_string(),
+                orphan.bytes.to_string(),
+            ]
+        })
+        .collect();
+    let mut widths = header.map(str::len);
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut output = String::new();
+    let mut line = |cells: [&str; 4]| {
+        let mut text = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            if index > 0 {
+                text.push_str("  ");
+            }
+            text.push_str(cell);
+            if index + 1 < cells.len() {
+                text.push_str(&" ".repeat(widths[index].saturating_sub(cell.chars().count())));
+            }
+        }
+        output.push_str(&text);
+        output.push('\n');
+    };
+    line(header);
+    for row in &rows {
+        line([&row[0], &row[1], &row[2], &row[3]]);
+    }
+    output
+}
+
 fn confirm_remove(id: &NodeId) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
@@ -2793,6 +3015,18 @@ fn format_node_status(status: &NodeStatus) -> String {
             "  {} {role} epoch={} position={position}",
             shown(&database.database),
             database.epoch.get(),
+        );
+    }
+    if !status.orphans.is_empty() {
+        output.push_str("orphans:\n");
+    }
+    for orphan in &status.orphans {
+        let _ = writeln!(
+            output,
+            "  {} epoch={} bytes={} (closed; `fleetringd orphan remove` deletes it)",
+            shown(&orphan.database),
+            orphan.epoch.get(),
+            orphan.bytes,
         );
     }
     if !status.sinks.is_empty() {
@@ -3360,6 +3594,31 @@ mod tests {
             printed.ends_with("database 'a\\u{202E}b' doesn't exist"),
             "{printed}"
         );
+    }
+
+    #[test]
+    fn orphan_remove_needs_a_node_and_orphan_list_prints_a_table_or_json() {
+        let control = ["--control", "127.0.0.1:7400"];
+        let remove = ["fleetringd", "orphan", "remove", "notes"];
+        assert!(Cli::try_parse_from([&remove[..], &control[..]].concat()).is_err());
+        let cli = Cli::try_parse_from([&remove[..], &["--node", "data-1"], &control[..]].concat())
+            .expect("orphan remove parses");
+        let Some(Command::Orphan(OrphanCommand::Remove {
+            name, node, yes, ..
+        })) = cli.command
+        else {
+            panic!("not orphan remove: {:?}", cli.command);
+        };
+        assert_eq!(name.as_str(), "notes");
+        assert_eq!(node.map(|node| node.to_string()).as_deref(), Some("data-1"));
+        assert!(!yes);
+        assert!(
+            Cli::try_parse_from(["fleetringd", "orphan", "list", "--json", "--control", "x:1"])
+                .is_ok()
+        );
+
+        assert_eq!(format_orphans(&[]), "no orphans\n");
+        assert_eq!(orphans_json(&[]), serde_json::json!({ "orphans": [] }));
     }
 
     #[test]

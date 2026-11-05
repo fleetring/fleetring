@@ -350,6 +350,39 @@ pub(super) async fn check_promote(
     Err(refuse(inner, Some(database), denied))
 }
 
+/// Checks a `DropCopy` naming `database` at `epoch` against control state, whoever made it: the
+/// drop stands only if control state no longer holds the database, or holds a newer one of the
+/// name at a lower epoch (ADR-0042). A node certificate is refused with the binding; a plaintext
+/// caller with `FAILED_PRECONDITION`.
+///
+/// Control state that was lost or replaced confirms any drop, so the notice is what proves one:
+/// only a control node that dropped the database sends it.
+pub(super) async fn check_drop(
+    inner: &Inner,
+    database: &DatabaseName,
+    epoch: u64,
+    caller: Option<&NodeId>,
+) -> Result<(), Status> {
+    let lease_epoch = LeaseEpoch::new(epoch);
+    match inner.authority.holders(database).await {
+        Ok(holders) if holders.epoch < lease_epoch => return Ok(()),
+        Ok(_) => {}
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
+        Err(status) => return Err(status),
+    }
+    let reason = Unbound::NotDropped {
+        database: database.clone(),
+        epoch: lease_epoch,
+    };
+    match caller {
+        Some(caller) => {
+            let denied = BindingDenied::new("DropCopy", caller.clone(), reason);
+            Err(refuse(inner, Some(database), denied))
+        }
+        None => Err(Status::failed_precondition(reason.to_string())),
+    }
+}
+
 /// Checks a `Snapshot` that `caller` asks this node for, of `database` at `epoch`: this node
 /// serves the database at `epoch`, and the caller is a follower it streams the database to
 /// under its current ring, or a replica control state places the database on now, which a

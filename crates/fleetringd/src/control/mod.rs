@@ -12,6 +12,8 @@
 //! - [`Failover`] ticks the state machine on a timer, starts promotions for expired leases, and
 //!   tells each promotion's candidate (ADR-0018). Beside it, a sweep of its own drops databases
 //!   whose expiry has passed (ADR-0041, point 4).
+//! - Drop notices tell the replicas of a database the control node dropped or expired, so that
+//!   they delete their copies (ADR-0042).
 //! - [`NoControl`] is what a node that runs no control plane serves in the service's place: every
 //!   call fails with `FAILED_PRECONDITION` and names the control node.
 
@@ -20,6 +22,7 @@ mod client;
 mod failover;
 mod log;
 mod node;
+mod notices;
 mod redirect;
 mod service;
 

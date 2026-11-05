@@ -129,6 +129,7 @@ const _: () = {
     assert_debug_send_sync::<data::ReplicaInfo>();
     assert_debug_send_sync::<data::SchemaView>();
     assert_debug_send_sync::<data::ServedDatabase>();
+    assert_debug_send_sync::<data::Orphan>();
     assert_debug_send_sync::<data::Verification>();
     assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<dev::Created>();
