@@ -28,6 +28,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Change streams to file or webhook sinks that resume where they stopped after a failover, and `lease watch`, which follows the leases a node gains and loses
 - Security: mutual TLS with a built-in certificate authority, principals with prefix scopes and signed, revocable tokens, statements confined to their database, node calls bound to placement, and signed, attested releases
 - Operations: `db create/exec/query/locate/list/drop/verify` and `status`, with a hash-chained log that shows whether every replica holds the same history
+- `fleetringd dev`: one command for a local node on a laptop, over the same TLS and scopes as a fleet
 
 **Planned**, each tracked as a [GitHub issue](https://github.com/fleetring/fleetring/issues):
 
@@ -37,7 +38,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Metrics, health checks, and structured logs, and `fleetringd upgrade` with a tested rolling upgrade (both in progress)
 - Fault injection on real daemons, judged by the history checker
 - Keyed leases, Merkle anti-entropy, and cells in the daemon
-- CLI contexts and JSON output, `fleetringd dev`, a terminal UI, and a desktop app
+- CLI contexts and JSON output, a terminal UI, and a desktop app
 - Archive follow-ups: acknowledging a write once it is archived, workload-identity credentials, and Vercel Blob
 - An agent kit with an MCP server, vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
 - apt, yum, AUR, and Homebrew packages
@@ -87,6 +88,28 @@ gh attestation verify fleetringd-<version>-<target>.tar.gz --repo fleetring/flee
 # The container image was too.
 gh attestation verify oci://ghcr.io/fleetring/fleetringd:<version> --repo fleetring/fleetring
 ```
+
+## Quickstart
+
+Five minutes on a laptop, with no certificates or configuration to write. Install `fleetringd` (above), then start a dev mode node: one node on loopback, with its own authority and an admin certificate, kept in `~/.fleetring` and reused on every start ([ADR-0039](docs/adr/0039-dev-mode.md)):
+
+```sh
+fleetringd dev
+```
+
+It prints where it listens and the line that points the commands at it. In another terminal:
+
+```sh
+. ~/.fleetring/env                       # FLEETRING_CONTROL, FLEETRING_TLS_DIR, FLEETRING_AS
+fleetringd status                        # starts with "dev mode: one node on loopback, ..."
+fleetringd db create notes --replication-factor 1
+fleetringd db exec notes "CREATE TABLE note (body TEXT)"
+fleetringd db exec notes "INSERT INTO note VALUES (?)" "hello"
+fleetringd db query notes "SELECT body FROM note"
+tail -f ~/.fleetring/changes/notes.ndjson   # the change stream: one JSON line per transaction
+```
+
+Run another `db exec` and watch its row arrive in the `tail`. Ctrl-C stops the node, and the next `fleetringd dev` picks up the same databases. A dev node holds one copy of each database, so give each `--replication-factor 1`; the same commands and the same client code run against a fleet, given its address and certificates. Dev mode is for development only: it listens on loopback alone and keeps its authority's key in `~/.fleetring` ([SECURITY.md](SECURITY.md#dev-mode)). [`deploy/dev/`](deploy/dev/) has a Homebrew service block and a systemd user unit that run it at login.
 
 ## The placement crate
 
