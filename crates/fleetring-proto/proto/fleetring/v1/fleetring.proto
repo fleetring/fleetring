@@ -536,8 +536,8 @@ service Replication {
   // Binding: candidate.
   rpc Promote(PromoteRequest) returns (PromoteResponse);
   // The control node that dropped or expired a database tells each replica, so that it deletes
-  // its copy (ADR-0042). The replica asks control state first, and deletes only a copy at or
-  // below the drop's epoch of a database control state no longer holds at that epoch.
+  // its copy (ADR-0042). The replica deletes its copy only if the epoch is the copy's own
+  // highest epoch, and control state no longer holds the database at that epoch.
   // Scope: node.
   // Binding: dropped.
   rpc DropCopy(DropCopyRequest) returns (DropCopyResponse);
