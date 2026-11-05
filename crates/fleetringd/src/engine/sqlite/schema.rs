@@ -16,9 +16,10 @@ use crate::engine::{
 };
 
 /// The most rows one schema request scans across all its tables. The per-table cap bounds one
-/// table; this bounds a database of many large tables, so that counting never keeps the
-/// database's thread from its writes for long. Tables left once it is spent get no count.
-const SCAN_BUDGET: u64 = 10 * MAX_COUNT_LIMIT;
+/// table; this bounds a database of many large tables. The database's thread does the counting,
+/// so a write queued behind the request waits for it: at about a million rows a second or
+/// better, this keeps that to a second at most. Tables left once it is spent get no count.
+const SCAN_BUDGET: u64 = 1_000_000;
 
 /// What SQLite's catalog says about one object, before its definition is read.
 #[derive(Debug)]
