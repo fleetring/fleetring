@@ -102,14 +102,14 @@ It prints where it listens and the line that points the commands at it. In anoth
 ```sh
 . ~/.fleetring/env                       # FLEETRING_CONTROL, FLEETRING_TLS_DIR, FLEETRING_AS
 fleetringd status                        # starts with "dev mode: one node on loopback, ..."
-fleetringd db create notes --replication-factor 1
+fleetringd db create notes               # one replica, a dev node's default
 fleetringd db exec notes "CREATE TABLE note (body TEXT)"
 fleetringd db exec notes "INSERT INTO note VALUES (?)" "hello"
 fleetringd db query notes "SELECT body FROM note"
 tail -f ~/.fleetring/changes/notes.ndjson   # the change stream: one JSON line per transaction
 ```
 
-Run another `db exec` and watch its row arrive in the `tail`. Ctrl-C stops the node, and the next `fleetringd dev` picks up the same databases. A dev node holds one copy of each database, so give each `--replication-factor 1`; the same commands and the same client code run against a fleet, given its address and certificates. Dev mode is for development only: it listens on loopback alone and keeps its authority's key in `~/.fleetring` ([SECURITY.md](SECURITY.md#dev-mode)). [`deploy/dev/`](deploy/dev/) has a Homebrew service block and a systemd user unit that run it at login.
+Run another `db exec` and watch its row arrive in the `tail`. Ctrl-C stops the node, and the next `fleetringd dev` picks up the same databases. A dev node holds one copy of each database: its configuration makes 1 the default replication factor, so `db create` needs no `--replication-factor`, and the same commands and the same client code run against a fleet, given its address and certificates, where the default is 3. Dev mode is for development only: it listens on loopback alone and keeps its authority's key in `~/.fleetring` ([SECURITY.md](SECURITY.md#dev-mode)). [`deploy/dev/`](deploy/dev/) has a Homebrew service block and a systemd user unit that run it at login.
 
 ## The placement crate
 
