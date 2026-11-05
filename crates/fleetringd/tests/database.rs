@@ -3524,7 +3524,12 @@ mod expiry {
         .await?;
         let client = fleet.client()?;
         let reused = name("reused")?;
-        client.create_database(&reused, three()?).await?;
+        let location = client.create_database(&reused, three()?).await?;
+        let primary = location.primary.ok_or("no primary")?;
+        let old_primary = fleet
+            .data_daemon(primary.as_str())?
+            .listen_address()
+            .to_string();
         client
             .execute(
                 &reused,
@@ -3539,8 +3544,17 @@ mod expiry {
         })
         .await?;
 
-        // Dropped, and at once created again under the same name, on the same nodes.
+        // Dropped; once the primary has seen the drop and begun flushing its copy, created again
+        // under the same name, on the same nodes.
         client.drop_database(&reused).await?;
+        let at_old_primary = fleet.client()?.with_entry(old_primary);
+        wait_until("the primary seeing the drop", async || {
+            at_old_primary
+                .query(&reused, Statement::new("SELECT 1"))
+                .await
+                .is_err_and(|status| status.code() == Code::NotFound)
+        })
+        .await?;
         client.create_database(&reused, three()?).await?;
         client
             .execute(
@@ -3569,6 +3583,249 @@ mod expiry {
             })
         })
         .await?;
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// Where a [`switching_proxy`] sends new connections.
+    #[derive(Debug, Clone)]
+    struct Switch(Arc<std::sync::Mutex<std::net::SocketAddr>>);
+
+    impl Switch {
+        fn set(&self, target: std::net::SocketAddr) {
+            *self.0.lock().expect("switch lock") = target;
+        }
+
+        fn get(&self) -> std::net::SocketAddr {
+            *self.0.lock().expect("switch lock")
+        }
+    }
+
+    /// Forwards every TCP connection to whatever the returned switch names when it arrives, so
+    /// that data nodes keep one control address while the control daemon behind it is
+    /// replaced. Returns the address to dial.
+    async fn switching_proxy(
+        target: std::net::SocketAddr,
+    ) -> Result<(std::net::SocketAddr, Switch), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let switch = Switch(Arc::new(std::sync::Mutex::new(target)));
+        let routes = switch.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let target = routes.get();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        Ok((address, switch))
+    }
+
+    /// A control daemon and three data daemons that reach it through a [`switching_proxy`].
+    async fn proxied_fleet(dir: &Path) -> Result<(Fleet, Switch), Box<dyn std::error::Error>> {
+        let tls = super::Tls::create(dir)?;
+        let control_text = format!(
+            "{}\n[control]\n",
+            super::config(dir, &tls, "control", "control", None)?
+        );
+        let control =
+            fleetringd::Daemon::start(fleetringd::Config::from_toml(&control_text)?).await?;
+        let (proxy, switch) =
+            switching_proxy(control.control_address().ok_or("no control address")?).await?;
+        let mut data = Vec::new();
+        for id in DATA {
+            let text = super::config(dir, &tls, id, "data", Some(proxy))?;
+            data.push(fleetringd::Daemon::start(fleetringd::Config::from_toml(&text)?).await?);
+        }
+        let fleet = Fleet { control, data, tls };
+        fleet.converge().await?;
+        Ok((fleet, switch))
+    }
+
+    /// Replaces the fleet's control plane with one whose state was built from nothing, as after
+    /// `control.db` was lost or replaced: it knows the data nodes and holds `databases` as new
+    /// databases of their names, never leased. The data nodes reach it through `switch`.
+    async fn replace_control_plane(
+        fleet: Fleet,
+        switch: &Switch,
+        dir: &Path,
+        databases: &[(&str, u8)],
+    ) -> Result<Fleet, Box<dyn std::error::Error>> {
+        let Fleet { control, data, tls } = fleet;
+        let config = control.config().clone();
+        control.run_until(async {}).await;
+        let data_dir = dir.join("control");
+        std::fs::remove_dir_all(&data_dir)?;
+        std::fs::create_dir_all(&data_dir)?;
+        let node = fleetringd::control::ControlNode::open(
+            data_dir.join("control.db"),
+            fleetringd::control::ControlOptions::new(config.control.control_config()),
+            SystemClock,
+        )
+        .await?;
+        let handle = node.handle();
+        for daemon in &data {
+            let member = fleetring_control::Member::new(daemon.config().node.id.clone())
+                .with_address(daemon.listen_address().to_string())
+                .with_software(fleetringd::software::running());
+            handle.submit(Action::Join { member }).await?;
+        }
+        for (database, replicas) in databases {
+            let created = handle
+                .submit(Action::CreateDatabase {
+                    name: database.parse()?,
+                    replication_factor: fleetring::ReplicationFactor::new(*replicas)
+                        .ok_or("zero replicas")?,
+                    engine: fleetring_control::Engine::Sqlite,
+                    durability: None,
+                    metadata: None,
+                })
+                .await?;
+            assert!(created.outcome().is_ok(), "{:?}", created.outcome());
+        }
+        node.shutdown().await;
+        let control = fleetringd::Daemon::start(config).await?;
+        switch.set(control.control_address().ok_or("no control address")?);
+        Ok(Fleet { control, data, tls })
+    }
+
+    /// The node holding a copy of `database`, and the copy's rows, read from its files.
+    fn copies(dir: &Path, database: &str) -> Vec<(&'static str, Vec<i64>)> {
+        DATA.iter()
+            .filter_map(|id| {
+                let rows = super::notes_in(&super::database_file(dir, id, database)).ok()?;
+                Some((*id, rows))
+            })
+            .collect()
+    }
+
+    /// A primary whose control plane comes back without its database, and with a new database
+    /// of the name, as after `control.db` was lost and the operator ran `db create` again,
+    /// keeps its copy: a database of the name that was never leased isn't a record of a drop.
+    /// The creation on that node is refused, naming the orphan, and nothing is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_the_node_did_not_see_dropped_is_kept_and_named() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let solo = name("solo")?;
+        let location = client
+            .create_database(&solo, fleetring::ReplicationFactor::ONE)
+            .await?;
+        let primary = location.primary.ok_or("no primary")?;
+        client
+            .execute(
+                &solo,
+                Statement::new("CREATE TABLE notes (n INTEGER NOT NULL)"),
+            )
+            .await?;
+        for n in 1..=3 {
+            insert_note(&client, &solo, n).await?;
+        }
+        let before = copies(dir.path(), "solo");
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0].0, primary.as_str());
+        assert_eq!(before[0].1, [1, 2, 3]);
+
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[("solo", 1)]).await?;
+        let client = fleet.client()?;
+        // The old primary's next renewal is refused as stale; it demotes and keeps its copy.
+        let replication = fleet
+            .data_daemon(primary.as_str())?
+            .replication()
+            .ok_or("no replication")?;
+        wait_until("the old primary demoting", async || {
+            replication.serving(&solo).is_none()
+        })
+        .await?;
+        let refused = client
+            .create_database(&solo, fleetring::ReplicationFactor::ONE)
+            .await
+            .expect_err("an orphan is there");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused.message().contains(&format!(
+                "solo has a copy on node {primary} from epoch 1 that the control plane doesn't know"
+            )),
+            "{refused}"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(copies(dir.path(), "solo"), before, "nothing was deleted");
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// A follower holding a copy of a database it didn't see dropped refuses a creation of the
+    /// name that lands on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_follower_refuses_a_creation_over_a_copy_it_did_not_see_dropped() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let trio = name("trio")?;
+        let location = client.create_database(&trio, three()?).await?;
+        let primary = location.primary.clone().ok_or("no primary")?;
+        let follower = location
+            .followers()
+            .next()
+            .ok_or("no follower")?
+            .node
+            .clone();
+        let follower_address = super::follower_address(&location)?;
+        client
+            .execute(
+                &trio,
+                Statement::new("CREATE TABLE notes (n INTEGER NOT NULL)"),
+            )
+            .await?;
+        for n in 1..=3 {
+            insert_note(&client, &trio, n).await?;
+        }
+        wait_until("every node holding the rows", async || {
+            copies(dir.path(), "trio")
+                .iter()
+                .filter(|(_, rows)| *rows == [1, 2, 3])
+                .count()
+                == DATA.len()
+        })
+        .await?;
+
+        // The primary stops for good, handing its lease to a follower as it leaves, while the
+        // control plane still has the database: every remaining copy is kept.
+        let mut fleet = fleet;
+        let index = fleet
+            .data
+            .iter()
+            .position(|daemon| daemon.config().node.id.as_str() == primary.as_str())
+            .ok_or("no primary daemon")?;
+        fleet.data.remove(index).run_until(async {}).await;
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[("trio", 3)]).await?;
+
+        let refused = fleet
+            .client()?
+            .with_entry(follower_address)
+            .create_database(&trio, three()?)
+            .await
+            .expect_err("an orphan is there");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused
+                .message()
+                .contains(&format!("trio has a copy on node {follower} from epoch "))
+                && refused
+                    .message()
+                    .contains("that the control plane doesn't know"),
+            "{refused}"
+        );
+        assert!(
+            copies(dir.path(), "trio")
+                .iter()
+                .any(|(id, rows)| *id == follower.as_str() && *rows == [1, 2, 3]),
+            "the follower's copy is kept"
+        );
         fleet.stop().await;
         Ok(())
     }
