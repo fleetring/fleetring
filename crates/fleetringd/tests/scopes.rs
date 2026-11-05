@@ -1060,6 +1060,466 @@ async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> 
     Ok(())
 }
 
+/// How many requests `daemon` refused for a scope or a binding: `PERMISSION_DENIED`, whatever
+/// the requirement was, `fleet` included.
+fn scope_refusals(daemon: &Daemon) -> Result<u64, Box<dyn Error>> {
+    let text = daemon.metrics().encode();
+    let line = text
+        .lines()
+        .find(|line| {
+            line.starts_with("fleetring_auth_refusals_total{") && line.contains("reason=\"scope\"")
+        })
+        .ok_or("no count of scope refusals")?;
+    let (_, value) = line.rsplit_once(' ').ok_or("a sample without a value")?;
+    Ok(value.parse()?)
+}
+
+/// ADR-0041 point 5, over the real gRPC path: a principal whose only scope is
+/// `admin:agent-42-*`, and no `fleet`, creates, describes, labels, uses, finds, shows, and drops
+/// its own databases, and is refused everything else. No call it makes for that needs `fleet`:
+/// neither daemon refuses anything during it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult {
+    use fleetring_control::{Labels, MetadataChange, parse_label};
+    use fleetringd::data::{ListFilter, NewMetadata};
+
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let control = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "control",
+        "control",
+        None,
+    )?)?)
+    .await?;
+    let address = control.control_address().ok_or("no control address")?;
+    let data = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "data-1",
+        "data",
+        Some(address),
+    )?)?)
+    .await?;
+    let control_target = address.to_string();
+
+    // The operator creates a database outside the agent's prefix, with the label the agent
+    // will look for.
+    let admin = Client::new(control_target.clone(), network(&tls, "tester")?);
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match admin.status().await {
+                Ok(view) if view.members().len() == 1 => return Ok::<_, tonic::Status>(()),
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await??;
+    let memory = || Labels::try_from_pairs([parse_label("purpose=memory")?]);
+    let notes: DatabaseName = "notes".parse()?;
+    admin
+        .create_database_with_metadata(
+            &notes,
+            DatabaseSpec::new(ReplicationFactor::ONE),
+            &NewMetadata {
+                description: Some("The operator's notes.".parse()?),
+                labels: memory()?,
+            },
+        )
+        .await?;
+
+    let signer = tls.authority().token_signer()?;
+    let token = token(
+        &signer,
+        "app",
+        &["admin:agent-42-*"],
+        "agent-42",
+        Duration::from_secs(3600),
+    )?;
+    let agent = Client::new(
+        control_target.clone(),
+        with_token(network(&tls, "app")?, &token)?,
+    );
+    let before = (scope_refusals(&control)?, scope_refusals(&data)?);
+
+    // Everything the agent does with its own databases.
+    let own: DatabaseName = "agent-42-notes".parse()?;
+    let created = agent
+        .create_database_with_metadata(
+            &own,
+            DatabaseSpec::new(ReplicationFactor::ONE),
+            &NewMetadata {
+                description: Some("Memory for agent 42.".parse()?),
+                labels: memory()?,
+            },
+        )
+        .await?;
+    let metadata = created.metadata.ok_or("no metadata")?;
+    assert_eq!(metadata.created_by.as_deref(), Some("app"));
+    assert_eq!(metadata.description_by.as_deref(), Some("app"));
+    agent
+        .execute(&own, Statement::new("CREATE TABLE t (v INTEGER)"))
+        .await?;
+    agent.execute(&own, write_one()).await?;
+    assert_eq!(agent.query(&own, read_one()).await?.rows.len(), 1);
+    let updated = agent
+        .update_database(
+            &own,
+            &MetadataChange {
+                set_labels: Labels::try_from_pairs([parse_label("task=7")?])?,
+                ..MetadataChange::default()
+            },
+            Some(1),
+        )
+        .await?;
+    assert_eq!(updated.version, 2);
+    let shown = agent.locate(&own).await?.metadata.ok_or("no metadata")?;
+    assert_eq!(shown, updated);
+    assert_eq!(shown.label("task"), Some("7"));
+    let listed = |filter: ListFilter| {
+        let agent = agent.clone();
+        async move {
+            Ok::<_, Box<dyn Error>>(
+                agent
+                    .list_databases_where(&filter)
+                    .await?
+                    .databases
+                    .into_iter()
+                    .map(|location| location.database.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let by_label = listed(ListFilter {
+        labels: vec!["purpose=memory".parse()?],
+        ..ListFilter::default()
+    })
+    .await?;
+    assert_eq!(by_label, ["agent-42-notes"], "notes is outside the scope");
+    assert_eq!(listed(ListFilter::default()).await?, ["agent-42-notes"]);
+    agent.drop_database(&own).await?;
+    assert_eq!(
+        (scope_refusals(&control)?, scope_refusals(&data)?),
+        before,
+        "the agent's own work needs no scope it lacks"
+    );
+
+    // Everything else is refused, before it touches any state.
+    let denied = |status: tonic::Status, what: &str| {
+        assert_eq!(status.code(), Code::PermissionDenied, "{what}: {status}");
+        status.message().to_owned()
+    };
+    for other in ["agent-420-x", "agent-43-x", "agent-42"] {
+        let refused = agent
+            .create_database_with_metadata(
+                &other.parse()?,
+                DatabaseSpec::new(ReplicationFactor::ONE),
+                &NewMetadata {
+                    labels: memory()?,
+                    ..NewMetadata::default()
+                },
+            )
+            .await
+            .expect_err("outside the prefix");
+        assert_eq!(
+            denied(refused, other),
+            format!("CreateDatabaseWithMetadata needs admin on '{other}'")
+        );
+    }
+    let relabel = MetadataChange {
+        set_labels: Labels::try_from_pairs([parse_label("owner=agent-42")?])?,
+        ..MetadataChange::default()
+    };
+    let refused = agent
+        .update_database(&notes, &relabel, None)
+        .await
+        .expect_err("not the agent's");
+    assert_eq!(
+        denied(refused, "update"),
+        "UpdateDatabase needs admin on 'notes'"
+    );
+    denied(
+        agent
+            .drop_database(&notes)
+            .await
+            .expect_err("not the agent's"),
+        "drop",
+    );
+    denied(
+        agent.locate(&notes).await.expect_err("not the agent's"),
+        "locate",
+    );
+    let refusals = before.0 + 6;
+    tokio::time::timeout(HANG_GUARD, async {
+        while scope_refusals(&control)? < refusals {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, Box<dyn Error>>(())
+    })
+    .await??;
+    assert_eq!(
+        (scope_refusals(&control)?, scope_refusals(&data)?),
+        (refusals, before.1)
+    );
+    let untouched = admin.locate(&notes).await?.metadata.ok_or("no metadata")?;
+    assert_eq!(untouched.version, 1);
+
+    data.run_until(async {}).await;
+    control.run_until(async {}).await;
+    Ok(())
+}
+
+/// The same agent through the command line: `db create --description --label`, `db show`,
+/// `db set-labels`, `db set-description`, `db list --label`, and `db drop`, with a token whose
+/// only scope is `admin:agent-42-*`; and `token issue` warns about a prefix without a separator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let node = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "node-1",
+        "both",
+        None,
+    )?)?)
+    .await?;
+    let control = node
+        .control_address()
+        .ok_or("no control address")?
+        .to_string();
+    let tls_dir = tls.dir().to_owned();
+    let tls_text = tls_dir.to_str().ok_or("a non-UTF-8 path")?;
+    let target = ["--control", control.as_str()];
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let output = fleetringd(&tls_dir, &[], &[&["status"][..], &target].concat()).await?;
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("node-1")
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    // The operator's database, with the label the agent looks for.
+    succeeded(
+        &fleetringd(
+            &tls_dir,
+            &[],
+            &[
+                &[
+                    "db",
+                    "create",
+                    "notes",
+                    "--replication-factor",
+                    "1",
+                    "--label",
+                    "purpose=memory",
+                ][..],
+                &target,
+            ]
+            .concat(),
+        )
+        .await?,
+        "operator creates notes",
+    )?;
+
+    succeeded(
+        &fleetringd(&tls_dir, &[], &["cert", "client", "app", "--dir", tls_text]).await?,
+        "cert client",
+    )?;
+    let issue = |scope: &'static str| {
+        let tls_dir = tls_dir.clone();
+        async move {
+            fleetringd(
+                &tls_dir,
+                &[],
+                &[
+                    "token",
+                    "issue",
+                    "--principal",
+                    "app",
+                    "--scope",
+                    scope,
+                    "--ttl",
+                    "1h",
+                    "--dir",
+                    tls_dir.to_str().ok_or("a non-UTF-8 path")?,
+                ],
+            )
+            .await
+        }
+    };
+    let loose = issue("admin:agent-42*").await?;
+    succeeded(&loose, "token issue")?;
+    let warned = String::from_utf8_lossy(&loose.stderr);
+    assert!(
+        warned.contains(
+            "warning: the scope admin:agent-42* also covers databases such as agent-420…; end \
+             the prefix with a separator, such as admin:agent-42-*"
+        ),
+        "{warned}"
+    );
+    let issued = issue("admin:agent-42-*").await?;
+    let token = succeeded(&issued, "token issue")?.trim().to_owned();
+    let quiet = String::from_utf8_lossy(&issued.stderr);
+    assert!(!quiet.contains("warning"), "{quiet}");
+
+    let app_cert = tls_dir.join("client.app.crt");
+    let app_key = tls_dir.join("client.app.key");
+    let as_app = [
+        "--cert",
+        app_cert.to_str().ok_or("a non-UTF-8 path")?,
+        "--key",
+        app_key.to_str().ok_or("a non-UTF-8 path")?,
+    ];
+    let agent = |words: Vec<&str>| {
+        let tls_dir = tls_dir.clone();
+        let args: Vec<String> = [&words[..], &target, &as_app]
+            .concat()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let token = token.clone();
+        async move {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            fleetringd(&tls_dir, &[("FLEETRING_TOKEN", token.as_str())], &args).await
+        }
+    };
+
+    let created = agent(vec![
+        "db",
+        "create",
+        "agent-42-notes",
+        "--replication-factor",
+        "1",
+        "--description",
+        "Memory for agent 42.\nTables: facts.",
+        "--label",
+        "purpose=memory",
+        "--label",
+        "agent=42",
+    ])
+    .await?;
+    let created = succeeded(&created, "agent creates its database")?;
+    assert!(
+        created.contains("labels: agent=42, purpose=memory"),
+        "{created}"
+    );
+    assert!(created.contains("creator: app"), "{created}");
+
+    let shown = succeeded(
+        &agent(vec!["db", "show", "agent-42-notes", "--json"]).await?,
+        "db show --json",
+    )?;
+    let shown: serde_json::Value = serde_json::from_str(&shown)?;
+    assert_eq!(shown["database"], "agent-42-notes");
+    assert_eq!(shown["placement"]["replication_factor"], 1);
+    let metadata = &shown["metadata"];
+    assert_eq!(
+        metadata["description"],
+        "Memory for agent 42.\nTables: facts."
+    );
+    assert_eq!(metadata["description_by"], "app");
+    assert_eq!(metadata["created_by"], "app");
+    assert_eq!(metadata["labels"]["purpose"], "memory");
+    assert_eq!(metadata["labels"]["agent"], "42");
+    assert!(metadata["expires_at"].is_null());
+    assert_eq!(metadata["version"], 1);
+    let text = succeeded(
+        &agent(vec!["db", "show", "agent-42-notes"]).await?,
+        "db show",
+    )?;
+    assert!(
+        text.contains(
+            "description:\n  | Memory for agent 42.\n  | Tables: facts.\ndescription by: app (you)\n"
+        ),
+        "{text}"
+    );
+
+    let relabelled = succeeded(
+        &agent(vec![
+            "db",
+            "set-labels",
+            "agent-42-notes",
+            "--label",
+            "task=7",
+            "--remove",
+            "agent",
+            "--if-version",
+            "1",
+        ])
+        .await?,
+        "db set-labels",
+    )?;
+    assert_eq!(
+        relabelled,
+        "labels of agent-42-notes: purpose=memory, task=7; metadata version 2\n"
+    );
+    let stale = agent(vec![
+        "db",
+        "set-description",
+        "agent-42-notes",
+        "--description",
+        "lost",
+        "--if-version",
+        "1",
+    ])
+    .await?;
+    failed_with(
+        &stale,
+        "a stale --if-version",
+        "the database's metadata changed since version 1; read it again with fleetringd db show",
+    );
+    succeeded(
+        &agent(vec![
+            "db",
+            "set-description",
+            "agent-42-notes",
+            "--description",
+            "Memory, version 2.",
+            "--if-version",
+            "2",
+        ])
+        .await?,
+        "db set-description",
+    )?;
+
+    let listed = succeeded(
+        &agent(vec!["db", "list", "--label", "purpose=memory"]).await?,
+        "db list --label",
+    )?;
+    let names: Vec<&str> = listed
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| !name.ends_with(';') && name.parse::<u64>().is_err())
+        .collect();
+    assert_eq!(names, ["agent-42-notes"], "{listed}");
+
+    failed_with(
+        &agent(vec![
+            "db",
+            "create",
+            "agent-420",
+            "--label",
+            "purpose=memory",
+        ])
+        .await?,
+        "outside the prefix",
+        "CreateDatabaseWithMetadata needs admin on 'agent-420'",
+    );
+    succeeded(
+        &agent(vec!["db", "drop", "agent-42-notes", "--yes"]).await?,
+        "db drop",
+    )?;
+
+    node.run_until(async {}).await;
+    Ok(())
+}
+
 /// FR-049: restoring from and describing archives.
 mod archives {
     use super::*;

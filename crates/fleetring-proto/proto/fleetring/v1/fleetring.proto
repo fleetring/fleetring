@@ -146,6 +146,17 @@ service Control {
   // so a revocation reaches every live node within one heartbeat interval.
   // Scope: fleet.
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  // Creates a database with a description or labels (ADR-0041); needs the `metadata` fleet
+  // feature, and refuses a request without metadata. A control node that predates it answers
+  // UNIMPLEMENTED, so a creation never loses its metadata to an older node. The control node
+  // records the caller as the creator.
+  // Scope: admin on the database.
+  rpc CreateDatabaseWithMetadata(CreateDatabaseWithMetadataRequest) returns (CreateDatabaseResponse);
+  // Changes a database's description or labels with a patch; needs the `metadata` fleet feature.
+  // The control node records the caller as the description's author when the description
+  // changes.
+  // Scope: admin on the database.
+  rpc UpdateDatabase(UpdateDatabaseRequest) returns (UpdateDatabaseResponse);
 }
 
 message JoinRequest {
@@ -286,10 +297,25 @@ message LocateRequest {
   string database = 1;
 }
 
-message ListDatabasesRequest {}
+// Every filter is optional; a control node that predates them ignores them and lists every
+// database the caller may read, so a client applies them again to the reply.
+message ListDatabasesRequest {
+  // Label requirements, all of which must hold: "key=value", or "key" for "has the key".
+  repeated string labels = 1;
+  // Only databases whose names start with this.
+  string prefix = 2;
+  // Include each database's description text; listings leave it out by default.
+  bool descriptions = 3;
+  // Only databases after this name, exclusive, in name order: `next_after` of an earlier page.
+  string after = 4;
+  // At most this many databases; 0 for no limit.
+  uint32 limit = 5;
+}
 
 message ListDatabasesResponse {
   repeated Placement databases = 1;
+  // The last name listed, when more databases follow it; empty when nothing follows.
+  string next_after = 2;
 }
 
 message LocateResponse {
@@ -316,6 +342,65 @@ message Placement {
   // The node carrying out the promotion to `epoch`, while one is in progress (FR-050). Unset
   // otherwise, and from a control node that predates the field.
   optional string candidate = 10;
+  // The database's metadata (ADR-0041). Unset for a database without any, and from a control
+  // node that predates the field.
+  DatabaseMetadata metadata = 11;
+}
+
+// A database label (ADR-0041 point 1): Kubernetes key and value rules.
+message Label {
+  string key = 1;
+  string value = 2;
+}
+
+// A database's metadata (ADR-0041). Unset in a Placement for a database without any, and from a
+// control node that predates the field.
+message DatabaseMetadata {
+  // Empty when the database has none, or when a listing left descriptions out.
+  string description = 1;
+  // The principal that last set the description; unset if unknown.
+  optional string description_by = 2;
+  // Sorted by key.
+  repeated Label labels = 3;
+  optional string created_by = 4;
+  optional uint64 created_at_ms = 5;
+  // Milliseconds since the Unix epoch, by the control node's clock.
+  optional uint64 expires_at_ms = 6;
+  uint64 version = 7;
+}
+
+message MetadataSpec {
+  string description = 1;
+  repeated Label labels = 2;
+  // Field numbers 3 and 4 are reserved for an expiry (FR-070 phase 3).
+}
+
+// A creation with metadata. A new RPC rather than new CreateDatabaseRequest fields, so that a
+// control node that predates it refuses it (UNIMPLEMENTED) instead of creating the database
+// without the metadata (ADR-0041 point 2).
+message CreateDatabaseWithMetadataRequest {
+  CreateDatabaseRequest database = 1;
+  MetadataSpec metadata = 2;
+}
+
+message UpdateDatabaseRequest {
+  string database = 1;
+  oneof description {
+    string set_description = 2;
+    bool clear_description = 3;
+    // Sets the description with no author, whoever the caller is: a restored description
+    // (ADR-0041 point 10). Readers treat it as untrusted.
+    string set_description_without_author = 10;
+  }
+  repeated Label set_labels = 4;
+  repeated string remove_labels = 5;
+  // Field numbers 6, 7, and 8 are reserved for an expiry (FR-070 phase 3).
+  // The update applies only if the metadata is at this version; ABORTED otherwise.
+  optional uint64 if_version = 9;
+}
+
+message UpdateDatabaseResponse {
+  DatabaseMetadata metadata = 1;
 }
 
 // One member of a database's replica set, as the control plane knows it.

@@ -610,6 +610,20 @@ impl Control for Redirecting {
         self.redirect()
     }
 
+    async fn create_database_with_metadata(
+        &self,
+        _: Request<fleetring_proto::v1::CreateDatabaseWithMetadataRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn update_database(
+        &self,
+        _: Request<fleetring_proto::v1::UpdateDatabaseRequest>,
+    ) -> Result<Response<fleetring_proto::v1::UpdateDatabaseResponse>, Status> {
+        self.redirect()
+    }
+
     async fn drop_database(
         &self,
         _: Request<DropDatabaseRequest>,
@@ -2341,4 +2355,560 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
     assert_eq!(replayed, *published);
     Ok(())
+}
+
+/// Database metadata over the wire (ADR-0041, FR-070 phase 2).
+mod metadata {
+    use std::error::Error;
+    use std::net::SocketAddr;
+    use std::path::Path;
+
+    use fleetring_control::{Action, ControlConfig, Feature};
+    use fleetring_proto::v1::update_database_request::Description;
+    use fleetring_proto::v1::{
+        CreateDatabaseWithMetadataRequest, DatabaseMetadata, Label, ListDatabasesRequest,
+        LocateRequest, MetadataSpec, UpdateDatabaseRequest,
+    };
+    use fleetringd::control::{CommandLog, ControlClient};
+    use fleetringd::{Config, Daemon};
+    use tonic::Code;
+
+    use super::{
+        TestResult, create_request, join_with, node_client, previous_line, reporting, secure_client,
+    };
+    use crate::support::Tls;
+
+    /// This build's software, as a member running it reports it: `metadata` among its features.
+    fn this_build() -> fleetring_proto::v1::Software {
+        let running = fleetringd::software::running();
+        fleetring_proto::v1::Software {
+            features: running
+                .features()
+                .map(|feature| feature.as_str().to_owned())
+                .collect(),
+            ..reporting(fleetringd::software::VERSION)
+        }
+    }
+
+    /// The configuration of a control daemon in `dir`, served over TLS. Paths go through `{:?}`,
+    /// which escapes a Windows path's backslashes for TOML.
+    fn control_config(dir: &Path, tls: &Tls) -> Result<String, Box<dyn Error>> {
+        Ok(format!(
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \
+             \"control-1\"\n{}",
+            dir.join("data"),
+            tls.node_table("control-1")?,
+        ))
+    }
+
+    /// A control daemon in `dir`, served over TLS.
+    async fn control_daemon(dir: &Path, tls: &Tls) -> Result<Daemon, Box<dyn Error>> {
+        Ok(Daemon::start(Config::from_toml(&control_config(dir, tls)?)?).await?)
+    }
+
+    /// A control daemon whose fleet has one member, `data-1`, running this build, and a client
+    /// acting as the principal `tester`.
+    async fn fleet(dir: &Path) -> Result<(Daemon, ControlClient, Tls), Box<dyn Error>> {
+        let tls = Tls::create(dir)?;
+        let daemon = control_daemon(dir, &tls).await?;
+        let address = daemon.control_address().ok_or("no control address")?;
+        join(address, &tls, "data-1", this_build()).await?;
+        let control = secure_client(address, &tls)?;
+        Ok((daemon, control, tls))
+    }
+
+    async fn join(
+        address: SocketAddr,
+        tls: &Tls,
+        id: &str,
+        software: fleetring_proto::v1::Software,
+    ) -> TestResult {
+        node_client(address, tls, id)?
+            .join(join_with(id, Some(software)))
+            .await?;
+        Ok(())
+    }
+
+    fn label(key: &str, value: &str) -> Label {
+        Label {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn with_metadata(
+        database: &str,
+        description: &str,
+        labels: Vec<Label>,
+    ) -> CreateDatabaseWithMetadataRequest {
+        CreateDatabaseWithMetadataRequest {
+            database: Some(create_request(database, 1)),
+            metadata: Some(MetadataSpec {
+                description: description.to_owned(),
+                labels,
+            }),
+        }
+    }
+
+    async fn locate(
+        control: &ControlClient,
+        database: &str,
+    ) -> Result<Option<DatabaseMetadata>, Box<dyn Error>> {
+        Ok(control
+            .locate(LocateRequest {
+                database: database.to_owned(),
+            })
+            .await?
+            .placement
+            .ok_or("no placement")?
+            .metadata)
+    }
+
+    fn keys(metadata: &DatabaseMetadata) -> Vec<String> {
+        metadata
+            .labels
+            .iter()
+            .map(|label| format!("{}={}", label.key, label.value))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn metadata_round_trips_through_create_update_and_locate() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (daemon, control, _tls) = fleet(dir.path()).await?;
+
+        let created = control
+            .create_database_with_metadata(with_metadata(
+                "notes",
+                "Memory for agent 42.\nTables: facts.",
+                vec![label("purpose", "memory"), label("agent", "42")],
+            ))
+            .await?
+            .placement
+            .ok_or("no placement")?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(created.description, "Memory for agent 42.\nTables: facts.");
+        assert_eq!(created.description_by.as_deref(), Some("tester"));
+        assert_eq!(created.created_by.as_deref(), Some("tester"));
+        assert!(created.created_at_ms.is_some());
+        assert_eq!(created.expires_at_ms, None);
+        assert_eq!(created.version, 1);
+        assert_eq!(
+            keys(&created),
+            ["agent=42", "purpose=memory"],
+            "sorted by key"
+        );
+
+        let updated = control
+            .update_database(UpdateDatabaseRequest {
+                database: "notes".to_owned(),
+                description: Some(Description::SetDescription("Version 2.".to_owned())),
+                set_labels: vec![label("purpose", "task")],
+                remove_labels: vec!["agent".to_owned()],
+                if_version: None,
+            })
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(updated.version, 2);
+        assert_eq!(updated.description, "Version 2.");
+        assert_eq!(keys(&updated), ["purpose=task"]);
+        assert_eq!(updated.created_at_ms, created.created_at_ms);
+        assert_eq!(locate(&control, "notes").await?, Some(updated.clone()));
+
+        // A listing leaves the text out unless asked, and keeps the rest.
+        let listed = |descriptions| ListDatabasesRequest {
+            descriptions,
+            ..ListDatabasesRequest::default()
+        };
+        let brief = control.list_databases(listed(false)).await?.databases;
+        let brief = brief
+            .first()
+            .and_then(|placement| placement.metadata.clone())
+            .ok_or("no metadata")?;
+        assert_eq!(brief.description, "");
+        assert_eq!(brief.description_by.as_deref(), Some("tester"));
+        assert_eq!(keys(&brief), ["purpose=task"]);
+        let full = control.list_databases(listed(true)).await?.databases;
+        assert_eq!(
+            full.first()
+                .and_then(|placement| placement.metadata.as_ref()),
+            Some(&updated)
+        );
+
+        // Clearing the description clears its author; a restored description has none.
+        let cleared = control
+            .update_database(UpdateDatabaseRequest {
+                database: "notes".to_owned(),
+                description: Some(Description::ClearDescription(true)),
+                ..UpdateDatabaseRequest::default()
+            })
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(
+            (cleared.description.as_str(), cleared.description_by),
+            ("", None)
+        );
+        let restored = control
+            .update_database(UpdateDatabaseRequest {
+                database: "notes".to_owned(),
+                description: Some(Description::SetDescriptionWithoutAuthor(
+                    "From the archive.".to_owned(),
+                )),
+                ..UpdateDatabaseRequest::default()
+            })
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(restored.description, "From the archive.");
+        assert_eq!(restored.description_by, None);
+        daemon.run_until(async {}).await;
+        Ok(())
+    }
+
+    /// The creator is recorded on a plain creation only once `metadata` is enabled, so the first
+    /// ordinary creation after an upgrade doesn't enable it (ADR-0041, point 3).
+    #[tokio::test]
+    async fn a_plain_creation_records_the_creator_once_metadata_is_enabled() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (daemon, control, _tls) = fleet(dir.path()).await?;
+        let handle = daemon.control().ok_or("no control")?;
+
+        control.create_database(create_request("before", 1)).await?;
+        assert_eq!(locate(&control, "before").await?, None);
+        assert!(!handle.state().is_enabled(Feature::Metadata));
+
+        control
+            .create_database_with_metadata(with_metadata("labelled", "", vec![label("a", "b")]))
+            .await?;
+        assert!(handle.state().is_enabled(Feature::Metadata));
+        let labelled = locate(&control, "labelled").await?.ok_or("no metadata")?;
+        assert_eq!(labelled.description_by, None, "no description, no author");
+
+        control.create_database(create_request("after", 1)).await?;
+        let after = locate(&control, "after").await?.ok_or("no metadata")?;
+        assert_eq!(after.created_by.as_deref(), Some("tester"));
+        assert_eq!((after.description.as_str(), after.labels.len()), ("", 0));
+        assert_eq!(after.version, 1);
+        assert_eq!(locate(&control, "before").await?, None, "unchanged");
+        daemon.run_until(async {}).await;
+        Ok(())
+    }
+
+    /// A creation or an update with metadata, in a fleet where a member runs the previous line,
+    /// is refused before it is logged, naming the member, and nothing is created or changed; a
+    /// plain creation still works (ADR-0041, point 3; ADR-0038, point 4).
+    #[tokio::test]
+    async fn a_creation_with_metadata_is_refused_in_a_mixed_fleet() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
+        let daemon = control_daemon(dir.path(), &tls).await?;
+        let address = daemon.control_address().ok_or("no control address")?;
+        let previous = previous_line().to_string();
+        join(address, &tls, "old", reporting(&previous)).await?;
+        join(address, &tls, "new", this_build()).await?;
+        let control = secure_client(address, &tls)?;
+        let names_old = |status: &tonic::Status| {
+            assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+            assert!(
+                status.message().contains(&format!(
+                    "can't use 'metadata' yet: node 'old' runs fleetringd {previous}"
+                )),
+                "{status:?}"
+            );
+        };
+
+        let refused = control
+            .create_database_with_metadata(with_metadata("notes", "x", Vec::new()))
+            .await
+            .expect_err("old lacks metadata");
+        names_old(&refused);
+        let missing = control
+            .locate(LocateRequest {
+                database: "notes".to_owned(),
+            })
+            .await
+            .expect_err("never created");
+        assert_eq!(missing.code(), Code::NotFound);
+
+        control.create_database(create_request("plain", 1)).await?;
+        let refused = control
+            .update_database(UpdateDatabaseRequest {
+                database: "plain".to_owned(),
+                set_labels: vec![label("purpose", "memory")],
+                ..UpdateDatabaseRequest::default()
+            })
+            .await
+            .expect_err("old lacks metadata");
+        names_old(&refused);
+        assert_eq!(locate(&control, "plain").await?, None);
+        let handle = daemon.control().ok_or("no control")?;
+        assert!(!handle.state().is_enabled(Feature::Metadata));
+
+        daemon.run_until(async {}).await;
+        let log = CommandLog::open(dir.path().join("data/control.db"), ControlConfig::new())?;
+        let logged: Vec<Action> = log
+            .commands()?
+            .into_iter()
+            .map(|(_, command)| command.action)
+            .collect();
+        assert!(
+            logged.iter().all(|action| action.features().is_empty()),
+            "no refused command is logged: {logged:?}"
+        );
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|action| matches!(action, Action::CreateDatabase { .. }))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_update_with_a_stale_version_is_aborted() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (daemon, control, _tls) = fleet(dir.path()).await?;
+        control
+            .create_database_with_metadata(with_metadata("notes", "v1", Vec::new()))
+            .await?;
+        let rewrite = |text: &str, if_version| UpdateDatabaseRequest {
+            database: "notes".to_owned(),
+            description: Some(Description::SetDescription(text.to_owned())),
+            if_version: Some(if_version),
+            ..UpdateDatabaseRequest::default()
+        };
+        control.update_database(rewrite("v2", 1)).await?;
+        let stale = control
+            .update_database(rewrite("lost", 1))
+            .await
+            .expect_err("version 1 is gone");
+        assert_eq!(stale.code(), Code::Aborted, "{stale:?}");
+        assert_eq!(
+            stale.message(),
+            "metadata of database 'notes' is at version 2, not 1"
+        );
+        let now = locate(&control, "notes").await?.ok_or("no metadata")?;
+        assert_eq!((now.description.as_str(), now.version), ("v2", 2));
+        daemon.run_until(async {}).await;
+        Ok(())
+    }
+
+    /// The names a listing returns, and the name the next page starts after.
+    async fn list(
+        control: &ControlClient,
+        request: ListDatabasesRequest,
+    ) -> Result<(Vec<String>, String), Box<dyn Error>> {
+        let response = control.list_databases(request).await?;
+        let names = response
+            .databases
+            .into_iter()
+            .map(|placement| placement.database)
+            .collect();
+        Ok((names, response.next_after))
+    }
+
+    fn labelled(labels: &[&str]) -> ListDatabasesRequest {
+        ListDatabasesRequest {
+            labels: labels.iter().map(|text| (*text).to_owned()).collect(),
+            ..ListDatabasesRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_filters_by_label_and_prefix_and_pages() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (daemon, control, _tls) = fleet(dir.path()).await?;
+        for (name, purpose) in [
+            ("agent-1-a", "memory"),
+            ("agent-1-b", "task"),
+            ("agent-2-a", "memory"),
+            ("other", "cache"),
+        ] {
+            control
+                .create_database_with_metadata(with_metadata(
+                    name,
+                    "",
+                    vec![label("purpose", purpose)],
+                ))
+                .await?;
+        }
+        control.create_database(create_request("notes", 1)).await?;
+
+        let (memory, _) = list(&control, labelled(&["purpose=memory"])).await?;
+        assert_eq!(memory, ["agent-1-a", "agent-2-a"]);
+        let (any_purpose, _) = list(&control, labelled(&["purpose"])).await?;
+        assert_eq!(
+            any_purpose,
+            ["agent-1-a", "agent-1-b", "agent-2-a", "other"]
+        );
+        let (both, _) = list(&control, labelled(&["purpose=memory", "purpose=task"])).await?;
+        assert!(both.is_empty(), "every requirement must hold: {both:?}");
+        let (agent_1, _) = list(
+            &control,
+            ListDatabasesRequest {
+                prefix: "agent-1-".to_owned(),
+                ..labelled(&[])
+            },
+        )
+        .await?;
+        assert_eq!(agent_1, ["agent-1-a", "agent-1-b"]);
+
+        let mut pages = Vec::new();
+        let mut after = String::new();
+        loop {
+            let (page, next) = list(
+                &control,
+                ListDatabasesRequest {
+                    after: after.clone(),
+                    limit: 2,
+                    ..labelled(&[])
+                },
+            )
+            .await?;
+            pages.push(page);
+            if next.is_empty() {
+                break;
+            }
+            after = next;
+        }
+        assert_eq!(
+            pages,
+            [
+                vec!["agent-1-a", "agent-1-b"],
+                vec!["agent-2-a", "notes"],
+                vec!["other"],
+            ]
+        );
+
+        let bad = control
+            .list_databases(labelled(&["-bad"]))
+            .await
+            .expect_err("an invalid key");
+        assert_eq!(bad.code(), Code::InvalidArgument);
+        daemon.run_until(async {}).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_descriptions_and_invalid_labels_are_refused() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (daemon, control, _tls) = fleet(dir.path()).await?;
+        control
+            .create_database_with_metadata(with_metadata("notes", "kept", Vec::new()))
+            .await?;
+        let before = locate(&control, "notes").await?;
+
+        let too_many: Vec<Label> = (0..33).map(|n| label(&format!("k{n}"), "v")).collect();
+        let descriptions = [
+            "x".repeat(1_025),
+            "ab\x1b[2J".to_owned(),
+            "zero\u{200B}width".to_owned(),
+            "tag\u{E0041}".to_owned(),
+            "line\u{2028}separator".to_owned(),
+        ];
+        let label_sets = [
+            vec![label("-bad", "x")],
+            vec![label("fleetring.dev/x", "y")],
+            too_many,
+        ];
+        let mut refusals = Vec::new();
+        for description in &descriptions {
+            let created = control
+                .create_database_with_metadata(with_metadata("new", description, Vec::new()))
+                .await;
+            refusals.push(created.map(|_| ()));
+            let updated = control
+                .update_database(UpdateDatabaseRequest {
+                    database: "notes".to_owned(),
+                    description: Some(Description::SetDescription(description.clone())),
+                    ..UpdateDatabaseRequest::default()
+                })
+                .await;
+            refusals.push(updated.map(|_| ()));
+        }
+        for labels in &label_sets {
+            let created = control
+                .create_database_with_metadata(with_metadata("new", "", labels.clone()))
+                .await;
+            refusals.push(created.map(|_| ()));
+            let updated = control
+                .update_database(UpdateDatabaseRequest {
+                    database: "notes".to_owned(),
+                    set_labels: labels.clone(),
+                    ..UpdateDatabaseRequest::default()
+                })
+                .await;
+            refusals.push(updated.map(|_| ()));
+        }
+        for refused in refusals {
+            let status = refused.expect_err("invalid metadata");
+            assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        }
+
+        // An update that would leave a database with more than 32 labels.
+        let full: Vec<Label> = (0..32).map(|n| label(&format!("k{n}"), "v")).collect();
+        control
+            .create_database_with_metadata(with_metadata("full", "", full))
+            .await?;
+        let over = control
+            .update_database(UpdateDatabaseRequest {
+                database: "full".to_owned(),
+                set_labels: vec![label("one", "more")],
+                ..UpdateDatabaseRequest::default()
+            })
+            .await
+            .expect_err("33 labels");
+        assert_eq!(over.code(), Code::InvalidArgument, "{over:?}");
+
+        let missing = control
+            .locate(LocateRequest {
+                database: "new".to_owned(),
+            })
+            .await
+            .expect_err("nothing created");
+        assert_eq!(missing.code(), Code::NotFound);
+        assert_eq!(locate(&control, "notes").await?, before, "nothing changed");
+        let full = locate(&control, "full").await?.ok_or("no metadata")?;
+        assert_eq!((full.labels.len(), full.version), (32, 1));
+        daemon.run_until(async {}).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_survives_a_control_node_restart() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
+        let config = control_config(dir.path(), &tls)?;
+        let daemon = Daemon::start(Config::from_toml(&config)?).await?;
+        let address = daemon.control_address().ok_or("no control address")?;
+        join(address, &tls, "data-1", this_build()).await?;
+        let control = secure_client(address, &tls)?;
+        control
+            .create_database_with_metadata(with_metadata(
+                "notes",
+                "Memory.",
+                vec![label("purpose", "memory")],
+            ))
+            .await?;
+        control
+            .update_database(UpdateDatabaseRequest {
+                database: "notes".to_owned(),
+                set_labels: vec![label("agent", "42")],
+                ..UpdateDatabaseRequest::default()
+            })
+            .await?;
+        let before = locate(&control, "notes").await?.ok_or("no metadata")?;
+        daemon.run_until(async {}).await;
+
+        let restarted = Daemon::start(Config::from_toml(&config)?).await?;
+        let address = restarted.control_address().ok_or("no control address")?;
+        let control = secure_client(address, &tls)?;
+        assert_eq!(locate(&control, "notes").await?, Some(before));
+        restarted.run_until(async {}).await;
+        Ok(())
+    }
 }

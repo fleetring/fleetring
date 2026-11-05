@@ -8,19 +8,21 @@ use std::sync::Arc;
 use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::{
     Acks, Action, Applied, DatabaseName, Durability, Engine, Feature, HostedReplica, Lease,
-    LeaseEpoch, Liveness, Member, Millis, Position, Rejection, ReplicaRole, Revoked, Software,
-    State,
+    LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName, Rejection,
+    ReplicaRole, Revoked, Software, State,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     self as proto, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    MembershipUpdate, Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
-    TransferLeaseRequest, UndrainRequest, UndrainResponse, WatchMembershipRequest,
+    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
+    DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest,
+    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Placement,
+    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
+    RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
+    UndrainRequest, UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse,
+    WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -35,8 +37,10 @@ use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
 use crate::data::convert::{
-    acks_from_proto, acks_to_proto, revocation_from_proto, revocations_to_proto,
+    acks_from_proto, acks_to_proto, change_from_proto, description_from_proto, labels_from_proto,
+    metadata_to_proto, revocation_from_proto, revocations_to_proto,
 };
+use crate::data::{Descriptions, LabelRequirement};
 use crate::dev::DevMode;
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
@@ -189,6 +193,54 @@ impl ControlService {
             .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
+    /// What a creation asks for, resolved before the command is stamped and logged, so the log
+    /// holds the factor and durability themselves and replays the same whatever the
+    /// configuration says later (ADR-0039).
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for an invalid name, factor, engine, or durability.
+    fn creation(
+        &self,
+        request: &CreateDatabaseRequest,
+    ) -> Result<(DatabaseName, ReplicationFactor, Engine, Durability), Status> {
+        let name: DatabaseName = parse("database name", &request.database)?;
+        let replication_factor = self.replication_factor(request.replication_factor)?;
+        let engine = engine_from(request.engine)?;
+        let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
+        Ok((name, replication_factor, engine, durability))
+    }
+
+    /// Submits a creation and answers with the new database's placement.
+    async fn create(
+        &self,
+        name: DatabaseName,
+        replication_factor: ReplicationFactor,
+        action: Action,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        match self.submit(action).await? {
+            (Applied::DatabaseCreated { .. }, state) => {
+                let placement = placement(&state, &name, Descriptions::Include)?;
+                let replicas = placement.replicas.len();
+                if replicas < usize::from(replication_factor.get()) {
+                    // Accepted all the same: the fleet may still be growing, and placement
+                    // fills the replica set as members join (ADR-0039).
+                    tracing::warn!(
+                        database = %name,
+                        replication_factor = replication_factor.get(),
+                        replicas,
+                        "the database has fewer replicas than its replication factor until more \
+                         data nodes join"
+                    );
+                }
+                Ok(Response::new(CreateDatabaseResponse {
+                    placement: Some(placement),
+                }))
+            }
+            (other, _) => Err(unexpected(&other)),
+        }
+    }
+
     async fn submit(&self, action: Action) -> Result<(Applied, Arc<State>), Status> {
         let committed = self.node.submit(action).await.map_err(submit_status)?;
         let (outcome, state) = committed.into_parts();
@@ -206,9 +258,12 @@ impl ControlService {
 ///   ([`missing_database`]).
 /// - `ALREADY_EXISTS`: the database exists, or the member is already fenced.
 /// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, a join that
-///   would make an invalid ring, or durability settings that don't fit the replication factor.
+///   would make an invalid ring, durability settings that don't fit the replication factor, or
+///   an update that would leave too many labels.
+/// - `ABORTED`: a conditional metadata update whose version no longer holds.
+/// - `UNAVAILABLE`: an expiry the control plane's time passed meanwhile, which a retry resolves.
 /// - `FAILED_PRECONDITION`: anything that depends on the current state: liveness, leases, epochs,
-///   promotions, and exhausted counters.
+///   promotions, fleet features, and exhausted counters.
 #[must_use]
 pub fn rejection_status(rejection: &Rejection) -> Status {
     let message = rejection.to_string();
@@ -226,7 +281,15 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
         }
         Rejection::InvalidTopology { .. }
         | Rejection::DuplicateReport { .. }
-        | Rejection::InvalidDurability { .. } => Status::invalid_argument(message),
+        | Rejection::InvalidDurability { .. }
+        | Rejection::TooManyLabels { .. } => Status::invalid_argument(message),
+        // Another update landed first; the caller reads the metadata again (ADR-0041, point 2).
+        Rejection::MetadataConflict { .. } => Status::aborted(message),
+        // The service resolved the expiry against an older time than the command was stamped
+        // with; a retry resolves it against the newer one (ADR-0041, point 4).
+        Rejection::ExpiryPassed { .. } => {
+            Status::unavailable("the control plane's time moved past the requested expiry; retry")
+        }
         _ => Status::failed_precondition(message),
     }
 }
@@ -351,7 +414,14 @@ fn lease_response(database: &DatabaseName, lease: &Lease) -> LeaseResponse {
 /// older epoch than the database's, and nobody holds the new one yet. The placement names the
 /// promotion's candidate instead, so that a replica can check a fence or a stream from it
 /// (ADR-0031).
-fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
+///
+/// The placement carries the database's metadata, if it has any, with its description text as
+/// `descriptions` says.
+fn placement(
+    state: &State,
+    name: &DatabaseName,
+    descriptions: Descriptions,
+) -> Result<Placement, Status> {
     let database = state.database(name).ok_or_else(|| {
         rejection_status(&Rejection::UnknownDatabase {
             database: name.clone(),
@@ -406,6 +476,9 @@ fn placement(state: &State, name: &DatabaseName) -> Result<Placement, Status> {
         acks: acks_to_proto(durability.acks()).into(),
         min_replicas: u32::from(durability.min_replicas()),
         candidate,
+        metadata: database
+            .metadata()
+            .map(|metadata| metadata_to_proto(metadata, descriptions)),
     })
 }
 
@@ -467,6 +540,16 @@ fn leases_held_by(state: &State, id: &fleetring::NodeId) -> Vec<String> {
         })
         .map(|database| database.name().to_string())
         .collect()
+}
+
+/// The principal that made `request`, as control state records it: a database's creator or a
+/// description's author. It comes from the request boundary's caller, never from the request's
+/// fields (ADR-0041, point 1); `None` for a node and for an anonymous caller.
+fn creator<T>(request: &Request<T>) -> Option<PrincipalName> {
+    match authorized(request).ok()?.caller() {
+        Caller::Principal { name, .. } => Some(PrincipalName::from(name)),
+        Caller::Node(_) | Caller::Anonymous => None,
+    }
 }
 
 /// The node `request` comes from, if a node certificate made it: the binding checks are for
@@ -695,36 +778,90 @@ impl Control for ControlService {
     ) -> Result<Response<CreateDatabaseResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
-        let request = request.into_inner();
-        // Resolved here, before the command is stamped and logged, so the log holds the factor
-        // itself and replays the same whatever the configuration says later (ADR-0039).
-        let replication_factor = self.replication_factor(request.replication_factor)?;
-        let engine = engine_from(request.engine)?;
-        let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
+        let (name, replication_factor, engine, durability) = self.creation(request.get_ref())?;
+        // A plain creation records its creator only once the fleet has enabled `metadata`, so
+        // the first ordinary creation after an upgrade doesn't enable it and close the rollback
+        // window (ADR-0041, point 3). The feature is enabled for good, so once it is, no member
+        // can lack it.
+        let metadata = self
+            .node
+            .state()
+            .is_enabled(Feature::Metadata)
+            .then(|| MetadataSpec {
+                created_by: creator(&request),
+                ..MetadataSpec::default()
+            });
         let action = Action::CreateDatabase {
             name: name.clone(),
             replication_factor,
             engine,
             durability: Some(durability),
-            metadata: None,
+            metadata,
+        };
+        self.create(name, replication_factor, action).await
+    }
+
+    /// Creates a database with a description or labels, recording the caller as its creator.
+    /// A fleet with a member that lacks `metadata` refuses it before it is logged (ADR-0041,
+    /// point 3).
+    async fn create_database_with_metadata(
+        &self,
+        request: Request<CreateDatabaseWithMetadataRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        let database = request
+            .get_ref()
+            .database
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("missing database"))?;
+        let name: DatabaseName = parse("database name", &database.database)?;
+        require_database(&request, &name)?;
+        let (name, replication_factor, engine, durability) = self.creation(database)?;
+        let metadata = request.get_ref().metadata.clone().unwrap_or_default();
+        let spec = MetadataSpec {
+            description: description_from_proto(&metadata.description)?,
+            labels: labels_from_proto(&metadata.labels)?,
+            created_by: creator(&request),
+            ..MetadataSpec::default()
+        };
+        if !spec.is_explicit() {
+            return Err(Status::invalid_argument(
+                "the creation carries no description or labels; use CreateDatabase for a \
+                 database without metadata",
+            ));
+        }
+        let action = Action::CreateDatabase {
+            name: name.clone(),
+            replication_factor,
+            engine,
+            durability: Some(durability),
+            metadata: Some(spec),
+        };
+        self.create(name, replication_factor, action).await
+    }
+
+    /// Patches a database's description or labels, recording the caller as the description's
+    /// author when the description changes, and answers with the metadata after it.
+    async fn update_database(
+        &self,
+        request: Request<UpdateDatabaseRequest>,
+    ) -> Result<Response<UpdateDatabaseResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let change = change_from_proto(request.get_ref())?;
+        let action = Action::UpdateDatabase {
+            name: name.clone(),
+            change,
+            by: creator(&request),
+            if_version: request.get_ref().if_version,
         };
         match self.submit(action).await? {
-            (Applied::DatabaseCreated { .. }, state) => {
-                let placement = placement(&state, &name)?;
-                let replicas = placement.replicas.len();
-                if replicas < usize::from(replication_factor.get()) {
-                    // Accepted all the same: the fleet may still be growing, and placement
-                    // fills the replica set as members join (ADR-0039).
-                    tracing::warn!(
-                        database = %name,
-                        replication_factor = replication_factor.get(),
-                        replicas,
-                        "the database has fewer replicas than its replication factor until more \
-                         data nodes join"
-                    );
-                }
-                Ok(Response::new(CreateDatabaseResponse {
-                    placement: Some(placement),
+            (Applied::DatabaseUpdated { .. }, state) => {
+                let metadata = state
+                    .database(&name)
+                    .and_then(|database| database.metadata())
+                    .ok_or_else(|| Status::internal("the update left no metadata"))?;
+                Ok(Response::new(UpdateDatabaseResponse {
+                    metadata: Some(metadata_to_proto(metadata, Descriptions::Include)),
                 }))
             }
             (other, _) => Err(unexpected(&other)),
@@ -803,22 +940,62 @@ impl Control for ControlService {
         require_database(&request, &name)?;
         let state = self.node.state();
         Ok(Response::new(LocateResponse {
-            placement: Some(placement(&state, &name)?),
+            placement: Some(placement(&state, &name, Descriptions::Include)?),
         }))
     }
 
+    /// Lists the databases the caller may read, in name order, and then only those the
+    /// request's prefix, labels, and `after` admit, up to its limit. The filters apply after the
+    /// scope's, so they never reveal a database, or a label, the caller may not read.
     async fn list_databases(
         &self,
         request: Request<ListDatabasesRequest>,
     ) -> Result<Response<ListDatabasesResponse>, Status> {
         let caller = authorized(&request)?;
+        let filter = request.get_ref();
+        let requirements = filter
+            .labels
+            .iter()
+            .map(|text| {
+                text.parse::<LabelRequirement>().map_err(|error| {
+                    Status::invalid_argument(format!("invalid label requirement '{text}': {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let descriptions = if filter.descriptions {
+            Descriptions::Include
+        } else {
+            Descriptions::Omit
+        };
+        let limit = match filter.limit {
+            0 => usize::MAX,
+            limit => usize::try_from(limit).unwrap_or(usize::MAX),
+        };
         let state = self.node.state();
-        let databases = state
+        let mut admitted = state
             .databases()
             .filter(|database| caller.sees(AuthAction::Read, database.name()))
-            .map(|database| placement(&state, database.name()))
+            .filter(|database| database.name().as_str().starts_with(&filter.prefix))
+            .filter(|database| {
+                let labels = database.metadata().map(|metadata| metadata.labels());
+                requirements
+                    .iter()
+                    .all(|requirement| labels.is_some_and(|labels| requirement.matches(labels)))
+            })
+            .filter(|database| database.name().as_str() > filter.after.as_str());
+        let databases = admitted
+            .by_ref()
+            .take(limit)
+            .map(|database| placement(&state, database.name(), descriptions))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Response::new(ListDatabasesResponse { databases }))
+        let next_after = match (admitted.next(), databases.last()) {
+            (Some(_), Some(last)) => last.database.clone(),
+            _ => String::new(),
+        };
+        Ok(Response::new(ListDatabasesResponse {
+            databases,
+            next_after,
+        }))
     }
 
     /// Bound to `self`: FR-046's certificate check, then `apply`, which grants a lease only to a

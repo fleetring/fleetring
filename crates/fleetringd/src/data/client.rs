@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{
-    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, ReplicaRole,
+    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, MetadataChange, ReplicaRole,
 };
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::restore_point::Point;
 use fleetring_proto::v1::{
-    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest, CreateRequest,
-    DescribeArchiveRequest, DrainRequest, DropDatabaseRequest, ExecuteRequest, LeaveRequest,
-    ListDatabasesRequest, LocateRequest, NodeStatusRequest, QueryRequest, RestoreLatest,
-    RestoreRequest, UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
-    WatchMembershipRequest,
+    self as proto, ChangeDurabilityRequest, CreateDatabaseRequest,
+    CreateDatabaseWithMetadataRequest, CreateRequest, DescribeArchiveRequest, DrainRequest,
+    DropDatabaseRequest, ExecuteRequest, LeaveRequest, ListDatabasesRequest, LocateRequest,
+    NodeStatusRequest, QueryRequest, RestoreLatest, RestoreRequest, UndrainRequest,
+    VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest, WatchMembershipRequest,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status, Streaming};
@@ -25,9 +25,10 @@ use crate::MembershipView;
 use crate::changes::SinkStatus;
 use crate::control::ControlClient;
 use crate::data::convert::{
-    acks_from_proto, acks_to_proto, lease_update_from_proto, location, node_status,
-    params_to_proto, rows_from_proto,
+    acks_from_proto, acks_to_proto, change_to_proto, lease_update_from_proto, location,
+    metadata_view, new_metadata_to_proto, node_status, params_to_proto, rows_from_proto,
 };
+use crate::data::metadata::{Descriptions, ListFilter, Listing, MetadataView, NewMetadata};
 use crate::data::redirect::primary_hint;
 use crate::durability::RestoreTarget;
 use crate::engine::{Position, Rows, Statement};
@@ -63,6 +64,9 @@ pub struct Location {
     /// The durability settings in effect: its acknowledgement mode and its floor on reachable
     /// replicas (ADR-0023).
     pub durability: Durability,
+    /// Its description, labels, and creator (ADR-0041), or `None` for a database without
+    /// metadata, or from a control node that predates it.
+    pub metadata: Option<MetadataView>,
 }
 
 /// What to create a database with: optionally, its replication factor and its durability
@@ -483,10 +487,44 @@ impl Client {
         name: &DatabaseName,
         spec: DatabaseSpec,
     ) -> Result<Location, Status> {
-        let placement = self.place(name, spec).await?;
+        let placement = self.place(name, spec, None).await?;
+        self.open_on_primary(name, &placement).await
+    }
+
+    /// Creates a SQLite database as `spec` says with a description, labels, or both, and opens
+    /// it on its primary; see [`Client::create_database`]. The control node records the caller
+    /// as the creator. With no metadata, this is [`Client::create_database_with`].
+    ///
+    /// The creation goes through `CreateDatabaseWithMetadata`, which a control node without
+    /// database metadata refuses, so a database is never created without the metadata asked
+    /// for.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::create_database_with`]; `FAILED_PRECONDITION` while a member of the fleet
+    /// lacks the `metadata` feature, naming it, or when the control node runs a release without
+    /// database metadata; and `INVALID_ARGUMENT` for a description or labels it refuses.
+    pub async fn create_database_with_metadata(
+        &self,
+        name: &DatabaseName,
+        spec: DatabaseSpec,
+        metadata: &NewMetadata,
+    ) -> Result<Location, Status> {
+        let metadata = (!metadata.is_empty()).then_some(metadata);
+        let placement = self.place(name, spec, metadata).await?;
+        self.open_on_primary(name, &placement).await
+    }
+
+    /// Asks the first live member of `placement`'s replica set, or the entry node, to become the
+    /// new database's primary and create it.
+    async fn open_on_primary(
+        &self,
+        name: &DatabaseName,
+        placement: &proto::Placement,
+    ) -> Result<Location, Status> {
         let start = match &self.entry {
             Some(entry) => entry.clone(),
-            None => first_candidate(&placement).ok_or_else(|| {
+            None => first_candidate(placement).ok_or_else(|| {
                 Status::unavailable(format!(
                     "no member of the replica set of {name} has an address"
                 ))
@@ -523,7 +561,34 @@ impl Client {
         source: &DatabaseName,
         target: &RestoreTarget,
     ) -> Result<Restoration, Status> {
-        let placement = self.place(name, spec).await?;
+        self.restore_database_with_metadata(
+            name,
+            spec,
+            &NewMetadata::default(),
+            archive,
+            source,
+            target,
+        )
+        .await
+    }
+
+    /// Restores as [`Client::restore_database`] does, and creates the new database with
+    /// `metadata`, as [`Client::create_database_with_metadata`] does, before the restore runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::restore_database`] and [`Client::create_database_with_metadata`].
+    pub async fn restore_database_with_metadata(
+        &self,
+        name: &DatabaseName,
+        spec: DatabaseSpec,
+        metadata: &NewMetadata,
+        archive: &str,
+        source: &DatabaseName,
+        target: &RestoreTarget,
+    ) -> Result<Restoration, Status> {
+        let metadata = (!metadata.is_empty()).then_some(metadata);
+        let placement = self.place(name, spec, metadata).await?;
         let start = match &self.entry {
             Some(entry) => entry.clone(),
             None => first_candidate(&placement).ok_or_else(|| {
@@ -750,19 +815,97 @@ impl Client {
         location(self.placement(name).await?)
     }
 
-    /// Lists where every database lives, in name order. Retried.
+    /// Lists where every database the caller may read lives, in name order, without
+    /// descriptions. Retried.
     ///
     /// # Errors
     ///
     /// The status of the last attempt, or `INTERNAL` if a reply is invalid.
     pub async fn list_databases(&self) -> Result<Vec<Location>, Status> {
-        self.control
-            .list_databases(ListDatabasesRequest {})
+        Ok(self
+            .list_databases_where(&ListFilter::default())
             .await?
+            .databases)
+    }
+
+    /// Lists the databases the caller may read that `filter` admits, in name order, one page at
+    /// a time: pass the page's `next_after` as the next filter's `after`. Retried.
+    ///
+    /// The control node filters among the databases the caller may read; a control node that
+    /// predates the filters returns them all, so the client applies them again to the reply.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for a label requirement the control node refuses, the status of the
+    /// last attempt, or `INTERNAL` if a reply is invalid.
+    pub async fn list_databases_where(&self, filter: &ListFilter) -> Result<Listing, Status> {
+        let response = self
+            .control
+            .list_databases(ListDatabasesRequest {
+                labels: filter.labels.iter().map(ToString::to_string).collect(),
+                prefix: filter.prefix.clone().unwrap_or_default(),
+                descriptions: filter.descriptions == Descriptions::Include,
+                after: filter
+                    .after
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                limit: filter.limit.unwrap_or(0),
+            })
+            .await?;
+        let next_after = if response.next_after.is_empty() {
+            None
+        } else {
+            Some(
+                response
+                    .next_after
+                    .parse::<DatabaseName>()
+                    .map_err(|error| {
+                        Status::internal(format!("the reply has an invalid next_after: {error}"))
+                    })?,
+            )
+        };
+        let databases = response
             .databases
             .into_iter()
             .map(location)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut listing = filter.apply(databases);
+        if listing.next_after.is_none() {
+            listing.next_after = next_after;
+        }
+        Ok(listing)
+    }
+
+    /// Changes `name`'s description or labels with `change`, a patch: what it doesn't name
+    /// stays as it is. With `if_version`, the change applies only if the metadata is still at
+    /// that version. The control node records the caller as the description's author when the
+    /// description changes. Sent once per leader, not retried. Returns the metadata after the
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if there is no such database; `ABORTED` if the metadata isn't at
+    /// `if_version`; `INVALID_ARGUMENT` for a change that changes nothing, sets and removes one
+    /// key, leaves more than 32 labels, or touches the expiry; `FAILED_PRECONDITION` while a
+    /// member lacks the `metadata` feature, or when the control node runs a release without
+    /// database metadata; or the status of the failed control call.
+    pub async fn update_database(
+        &self,
+        name: &DatabaseName,
+        change: &MetadataChange,
+        if_version: Option<u64>,
+    ) -> Result<MetadataView, Status> {
+        let request = change_to_proto(name, change, if_version)?;
+        let response = self
+            .control
+            .update_database(request)
+            .await
+            .map_err(without_metadata)?;
+        response
+            .metadata
+            .map(metadata_view)
+            .ok_or_else(|| Status::internal("the reply has no metadata"))
     }
 
     /// Asks the data node at `address` (`host:port`) what it knows on its own: its membership
@@ -922,17 +1065,33 @@ impl Client {
     /// A control node before 0.5.0 refuses a request that leaves the replication factor to the
     /// fleet, as it refuses any factor of 0; the request is then sent again with 3, the factor
     /// commands asked for before the fleet had a default of its own.
+    ///
+    /// With `metadata`, the creation goes through `CreateDatabaseWithMetadata`, which only
+    /// control nodes that accept a factor of 0 know.
     async fn place(
         &self,
         name: &DatabaseName,
         spec: DatabaseSpec,
+        metadata: Option<&NewMetadata>,
     ) -> Result<proto::Placement, Status> {
         let mut request = spec.to_request(name);
-        let mut created = self.control.create_database(request.clone()).await;
-        if request.replication_factor == 0 && created.as_ref().is_err_and(refuses_fleet_default) {
-            request.replication_factor = u32::from(ReplicationFactor::default().get());
-            created = self.control.create_database(request).await;
-        }
+        let created = if let Some(metadata) = metadata {
+            self.control
+                .create_database_with_metadata(CreateDatabaseWithMetadataRequest {
+                    database: Some(request),
+                    metadata: Some(new_metadata_to_proto(metadata)),
+                })
+                .await
+                .map_err(without_metadata)
+        } else {
+            let mut created = self.control.create_database(request.clone()).await;
+            if request.replication_factor == 0 && created.as_ref().is_err_and(refuses_fleet_default)
+            {
+                request.replication_factor = u32::from(ReplicationFactor::default().get());
+                created = self.control.create_database(request).await;
+            }
+            created
+        };
         match created {
             Ok(response) => placement_of(response.placement),
             Err(status) if status.code() == Code::AlreadyExists => {
@@ -1021,6 +1180,32 @@ fn refuses_fleet_default(status: &Status) -> bool {
             .starts_with("invalid replication factor 0: expected 1 to 255")
 }
 
+/// What a metadata call answers when the control node runs a release without database
+/// metadata (ADR-0041, point 13).
+const WITHOUT_METADATA: &str =
+    "the control plane runs a release without database metadata; upgrade it first";
+
+/// Whether `status` is a node refusing a call it doesn't serve: `UNIMPLEMENTED`, or, from a
+/// release whose request boundary refuses every call its scope table doesn't list,
+/// `PERMISSION_DENIED` saying the call has no scope requirement.
+pub(crate) fn unknown_call(status: &Status) -> bool {
+    match status.code() {
+        Code::Unimplemented => true,
+        Code::PermissionDenied => status.message().ends_with(" has no scope requirement"),
+        _ => false,
+    }
+}
+
+/// Turns a refusal of a metadata call by a control node that doesn't know it into
+/// `FAILED_PRECONDITION` saying so; any other status passes unchanged.
+fn without_metadata(status: Status) -> Status {
+    if unknown_call(&status) {
+        Status::failed_precondition(WITHOUT_METADATA)
+    } else {
+        status
+    }
+}
+
 fn placement_of(placement: Option<proto::Placement>) -> Result<proto::Placement, Status> {
     placement.ok_or_else(|| Status::internal("the reply has no placement"))
 }
@@ -1079,6 +1264,23 @@ mod tests {
         assert!(!refuses_fleet_default(&current));
         let other = Status::failed_precondition("invalid replication factor 0: expected 1 to 255");
         assert!(!refuses_fleet_default(&other));
+    }
+
+    #[test]
+    fn a_control_node_without_metadata_is_named_as_such() {
+        // What 0.5.0's request boundary answers for a call its table doesn't list.
+        let boundary = Status::permission_denied(
+            "/fleetring.v1.Control/CreateDatabaseWithMetadata has no scope requirement",
+        );
+        let unimplemented = Status::unimplemented("");
+        for refused in [boundary, unimplemented] {
+            let status = without_metadata(refused);
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(status.message(), WITHOUT_METADATA);
+        }
+        let scope =
+            Status::permission_denied("CreateDatabaseWithMetadata needs admin on 'agent-420'");
+        assert_eq!(without_metadata(scope).code(), Code::PermissionDenied);
     }
 
     #[test]

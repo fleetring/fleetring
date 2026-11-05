@@ -71,6 +71,16 @@ impl BearerToken {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// The principal the token's `sub` claim names, read without verifying the token: who a
+    /// client holding it acts as, for its own display. Nodes verify every token they are sent;
+    /// nothing may be authorized by this. `None` for text that isn't a token.
+    #[must_use]
+    pub fn claimed_principal(&self) -> Option<Principal> {
+        let payload = self.0.split('.').nth(1)?;
+        let claims: Claims = decode_json(payload).ok()?;
+        claims.sub.parse().ok()
+    }
 }
 
 impl fmt::Debug for BearerToken {
@@ -566,6 +576,11 @@ mod tests {
         assert_eq!(header.kid, signer.key_id().as_str());
         assert_eq!(header.alg, "EdDSA");
         assert_eq!(signer.key_id().as_str().len(), 16);
+        assert_eq!(
+            issued.claimed_principal().map(|p| p.to_string()).as_deref(),
+            Some("app")
+        );
+        assert_eq!(BearerToken::new("not.a token").claimed_principal(), None);
     }
 
     #[test]

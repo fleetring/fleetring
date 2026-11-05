@@ -3,18 +3,21 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{
-    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, ReplicaRole, Revocations,
-    Revoked, Timestamp,
+    Acks, DatabaseName, Description, DescriptionChange, Durability, Engine, LabelKey, LabelValue,
+    Labels, LeaseEpoch, Liveness, Metadata, MetadataChange, ReplicaRole, Revocations, Revoked,
+    Timestamp,
 };
+use fleetring_proto::v1::update_database_request::Description as DescriptionUpdate;
 use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
 
 use crate::changes::{MarkHome, SinkStatus};
 use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
+use crate::data::metadata::{Descriptions, MetadataView, NewMetadata};
 use crate::engine::{Position, Rows, Statement, Value};
 use crate::replication::{LeaseChange, LeaseEvent};
 
@@ -151,6 +154,197 @@ pub(crate) fn durability_of(
         .unwrap_or_else(|| Durability::new(acks, replication_factor))
 }
 
+/// The protocol form of `metadata`, with its description text or without it.
+pub(crate) fn metadata_to_proto(
+    metadata: &Metadata,
+    descriptions: Descriptions,
+) -> proto::DatabaseMetadata {
+    let description = match descriptions {
+        Descriptions::Include => metadata
+            .description()
+            .map(|text| text.as_str().to_owned())
+            .unwrap_or_default(),
+        Descriptions::Omit => String::new(),
+    };
+    proto::DatabaseMetadata {
+        description,
+        description_by: metadata.description_by().map(ToString::to_string),
+        labels: labels_to_proto(metadata.labels()),
+        created_by: metadata.created_by().map(ToString::to_string),
+        created_at_ms: metadata.created_at().map(Timestamp::as_millis),
+        expires_at_ms: metadata.expires_at().map(Timestamp::as_millis),
+        version: metadata.version(),
+    }
+}
+
+/// The metadata a reply carries, as the client reports it.
+pub(crate) fn metadata_view(metadata: proto::DatabaseMetadata) -> MetadataView {
+    let mut labels: Vec<(String, String)> = metadata
+        .labels
+        .into_iter()
+        .map(|label| (label.key, label.value))
+        .collect();
+    labels.sort();
+    MetadataView {
+        description: (!metadata.description.is_empty()).then_some(metadata.description),
+        description_by: metadata.description_by,
+        labels,
+        created_by: metadata.created_by,
+        created_at: metadata.created_at_ms.map(Timestamp::from_millis),
+        expires_at: metadata.expires_at_ms.map(Timestamp::from_millis),
+        version: metadata.version,
+    }
+}
+
+/// The labels a request carries, or `INVALID_ARGUMENT` naming the label at fault. A repeated
+/// key keeps its last value.
+pub(crate) fn labels_from_proto(labels: &[proto::Label]) -> Result<Labels, Status> {
+    let pairs = labels
+        .iter()
+        .map(|label| {
+            let invalid = |error: &dyn Display| {
+                Status::invalid_argument(format!(
+                    "invalid label '{}={}': {error}",
+                    label.key, label.value
+                ))
+            };
+            let key: LabelKey = label.key.parse().map_err(|error| invalid(&error))?;
+            let value: LabelValue = label.value.parse().map_err(|error| invalid(&error))?;
+            Ok((key, value))
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Labels::try_from_pairs(pairs).map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+/// `labels` as the protocol sends them, sorted by key.
+pub(crate) fn labels_to_proto(labels: &Labels) -> Vec<proto::Label> {
+    labels
+        .iter()
+        .map(|(key, value)| proto::Label {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+        .collect()
+}
+
+/// The description a request carries: `None` for the empty text, which is no description.
+pub(crate) fn description_from_proto(text: &str) -> Result<Option<Description>, Status> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse()
+        .map(Some)
+        .map_err(|error| Status::invalid_argument(format!("invalid description: {error}")))
+}
+
+/// A description an update sets, which mustn't be empty: clearing one is its own change.
+fn set_description(text: &str) -> Result<Description, Status> {
+    description_from_proto(text)?.ok_or_else(|| {
+        Status::invalid_argument("the description is empty; clear it with clear_description")
+    })
+}
+
+/// The patch an update asks for.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for an invalid description, label, or label key; a key both set and
+/// removed; or a patch that changes nothing.
+pub(crate) fn change_from_proto(
+    request: &proto::UpdateDatabaseRequest,
+) -> Result<MetadataChange, Status> {
+    let description = match &request.description {
+        None | Some(DescriptionUpdate::ClearDescription(false)) => DescriptionChange::Keep,
+        Some(DescriptionUpdate::SetDescription(text)) => {
+            DescriptionChange::Set(set_description(text)?)
+        }
+        Some(DescriptionUpdate::SetDescriptionWithoutAuthor(text)) => {
+            DescriptionChange::SetWithoutAuthor(set_description(text)?)
+        }
+        Some(DescriptionUpdate::ClearDescription(true)) => DescriptionChange::Clear,
+    };
+    let set_labels = labels_from_proto(&request.set_labels)?;
+    let remove_labels = request
+        .remove_labels
+        .iter()
+        .map(|key| {
+            key.parse::<LabelKey>().map_err(|error| {
+                Status::invalid_argument(format!("invalid label key '{key}': {error}"))
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if let Some(key) = remove_labels
+        .iter()
+        .find(|key| set_labels.get(key).is_some())
+    {
+        return Err(Status::invalid_argument(format!(
+            "the label '{key}' is both set and removed"
+        )));
+    }
+    let change = MetadataChange {
+        description,
+        set_labels,
+        remove_labels,
+        ..MetadataChange::default()
+    };
+    if change.is_empty() {
+        return Err(Status::invalid_argument(
+            "the update changes nothing: set or clear the description, or set or remove a label",
+        ));
+    }
+    Ok(change)
+}
+
+/// The update request that applies `change` to `database`, at `if_version` if given.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for a change the protocol can't carry yet: one to the expiry.
+pub(crate) fn change_to_proto(
+    database: &DatabaseName,
+    change: &MetadataChange,
+    if_version: Option<u64>,
+) -> Result<proto::UpdateDatabaseRequest, Status> {
+    if change.touches_expiry() {
+        return Err(Status::invalid_argument(
+            "this release can't change a database's expiry",
+        ));
+    }
+    let description = match &change.description {
+        DescriptionChange::Set(text) => {
+            Some(DescriptionUpdate::SetDescription(text.as_str().to_owned()))
+        }
+        DescriptionChange::SetWithoutAuthor(text) => Some(
+            DescriptionUpdate::SetDescriptionWithoutAuthor(text.as_str().to_owned()),
+        ),
+        DescriptionChange::Clear => Some(DescriptionUpdate::ClearDescription(true)),
+        _ => None,
+    };
+    Ok(proto::UpdateDatabaseRequest {
+        database: database.to_string(),
+        description,
+        set_labels: labels_to_proto(&change.set_labels),
+        remove_labels: change
+            .remove_labels
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        if_version,
+    })
+}
+
+/// The metadata a creation asks for, as the protocol sends it.
+pub(crate) fn new_metadata_to_proto(metadata: &NewMetadata) -> proto::MetadataSpec {
+    proto::MetadataSpec {
+        description: metadata
+            .description
+            .as_ref()
+            .map(|text| text.as_str().to_owned())
+            .unwrap_or_default(),
+        labels: labels_to_proto(&metadata.labels),
+    }
+}
+
 /// The location a placement describes.
 pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> {
     let engine = match proto::Engine::try_from(placement.engine) {
@@ -214,6 +408,7 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         replicas,
         replication_factor,
         durability,
+        metadata: placement.metadata.map(metadata_view),
     })
 }
 
@@ -405,6 +600,81 @@ pub(crate) fn lease_update_from_proto(update: proto::LeaseUpdate) -> Result<Leas
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn label(key: &str, value: &str) -> proto::Label {
+        proto::Label {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn labels_round_trip_sorted() {
+        let sent = [
+            label("zone", "b"),
+            label("app.example.com/tier", ""),
+            label("a", "1"),
+        ];
+        let labels = labels_from_proto(&sent).expect("valid labels");
+        let keys: Vec<String> = labels_to_proto(&labels)
+            .into_iter()
+            .map(|label| label.key)
+            .collect();
+        assert_eq!(keys, ["a", "app.example.com/tier", "zone"]);
+        assert_eq!(
+            labels_from_proto(&labels_to_proto(&labels)).expect("valid"),
+            labels
+        );
+        for bad in [
+            label("-bad", "x"),
+            label("fleetring.dev/x", "y"),
+            label("a", "b c"),
+        ] {
+            let refused = labels_from_proto(std::slice::from_ref(&bad)).expect_err("invalid");
+            assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+            assert!(
+                refused
+                    .message()
+                    .contains(&format!("'{}={}'", bad.key, bad.value)),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_that_sets_and_removes_one_key_or_changes_nothing_is_refused() {
+        let database: DatabaseName = "notes".parse().expect("name");
+        let request = |set: Vec<proto::Label>, remove: &[&str]| proto::UpdateDatabaseRequest {
+            database: database.to_string(),
+            set_labels: set,
+            remove_labels: remove.iter().map(|key| (*key).to_owned()).collect(),
+            ..proto::UpdateDatabaseRequest::default()
+        };
+        let both = change_from_proto(&request(vec![label("a", "1")], &["a"])).expect_err("both");
+        assert!(both.message().contains("both set and removed"), "{both:?}");
+        let nothing = change_from_proto(&request(Vec::new(), &[])).expect_err("empty");
+        assert_eq!(nothing.code(), tonic::Code::InvalidArgument);
+        let empty_text = proto::UpdateDatabaseRequest {
+            description: Some(DescriptionUpdate::SetDescription(String::new())),
+            ..request(Vec::new(), &[])
+        };
+        assert!(change_from_proto(&empty_text).is_err());
+
+        let change = change_from_proto(&proto::UpdateDatabaseRequest {
+            description: Some(DescriptionUpdate::SetDescriptionWithoutAuthor(
+                "restored".to_owned(),
+            )),
+            ..request(vec![label("b", "2")], &["a"])
+        })
+        .expect("a valid patch");
+        assert!(matches!(
+            change.description,
+            DescriptionChange::SetWithoutAuthor(_)
+        ));
+        let sent = change_to_proto(&database, &change, Some(3)).expect("no expiry");
+        assert_eq!(change_from_proto(&sent).expect("valid"), change);
+        assert_eq!(sent.if_version, Some(3));
+    }
 
     #[test]
     fn lease_updates_round_trip_and_an_unknown_kind_is_refused() {

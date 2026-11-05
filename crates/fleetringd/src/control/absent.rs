@@ -5,12 +5,13 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
-    RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
-    UndrainRequest, UndrainResponse, WatchMembershipRequest,
+    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
+    DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest,
+    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, LocateRequest, LocateResponse, PromotionResponse, RecordFencedRequest,
+    RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse,
+    StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
+    UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -66,6 +67,20 @@ impl Control for NoControl {
         &self,
         _: Request<CreateDatabaseRequest>,
     ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn create_database_with_metadata(
+        &self,
+        _: Request<CreateDatabaseWithMetadataRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn update_database(
+        &self,
+        _: Request<UpdateDatabaseRequest>,
+    ) -> Result<Response<UpdateDatabaseResponse>, Status> {
         self.refuse()
     }
 

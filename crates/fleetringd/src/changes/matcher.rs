@@ -43,6 +43,15 @@ impl DatabaseMatcher {
             Rule::Prefix(prefix) => name.as_str().starts_with(prefix),
         }
     }
+
+    /// The bytes a name must start with, for a rule ending in `*`; `None` for an exact name.
+    #[must_use]
+    pub fn prefix(&self) -> Option<&str> {
+        match &self.rule {
+            Rule::Exact(_) => None,
+            Rule::Prefix(prefix) => Some(prefix),
+        }
+    }
 }
 
 /// The error returned for a rule that names nothing.

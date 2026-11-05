@@ -9,12 +9,13 @@ use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest,
-    LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest, LocateResponse,
-    MembershipUpdate, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
-    TransferLeaseRequest, UndrainRequest, UndrainResponse, WatchMembershipRequest,
+    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
+    DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest,
+    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
+    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, PromotionResponse,
+    RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest,
+    RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest, UndrainRequest,
+    UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
@@ -36,9 +37,10 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 ///   go straight to X.
 /// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `list_databases`,
 ///   `renew_lease`, `record_fenced`, `drain`, and opening `watch_membership`) retry transient
-///   failures with [`retry`]. `create_database`, `drop_database`, `acquire_lease`, `leave`,
-///   `start_promotion`, `complete_promotion`, and `transfer_lease` are sent once per leader,
-///   because a lost reply would make a retry fail as already done.
+///   failures with [`retry`]. `create_database`, `create_database_with_metadata`,
+///   `update_database`, `drop_database`, `acquire_lease`, `leave`, `start_promotion`,
+///   `complete_promotion`, and `transfer_lease` are sent once per leader, because a lost reply
+///   would make a retry fail as already done, or apply a patch twice.
 ///
 /// Cloning is cheap; clones share the current leader and connections.
 #[derive(Clone)]
@@ -202,6 +204,41 @@ impl ControlClient {
         .await
     }
 
+    /// Creates a database with a description or labels. Sent once per leader, not retried.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached. A
+    /// control node that predates the call refuses it.
+    pub async fn create_database_with_metadata(
+        &self,
+        request: CreateDatabaseWithMetadataRequest,
+    ) -> Result<CreateDatabaseResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.create_database_with_metadata(request).await }
+        })
+        .await
+    }
+
+    /// Changes a database's description or labels. Sent once per leader, not retried: a retry
+    /// after a lost reply would apply the patch again at the next version.
+    ///
+    /// # Errors
+    ///
+    /// The status the control node returned, or `UNAVAILABLE` if it couldn't be reached. A
+    /// control node that predates the call refuses it.
+    pub async fn update_database(
+        &self,
+        request: UpdateDatabaseRequest,
+    ) -> Result<UpdateDatabaseResponse, Status> {
+        self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.update_database(request).await }
+        })
+        .await
+    }
+
     /// Records new durability settings for a database. Sent once per leader, not retried.
     ///
     /// # Errors
@@ -244,8 +281,11 @@ impl ControlClient {
         &self,
         request: ListDatabasesRequest,
     ) -> Result<ListDatabasesResponse, Status> {
-        self.retrying(|mut client| async move { client.list_databases(request).await })
-            .await
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.list_databases(request).await }
+        })
+        .await
     }
 
     /// Finds where a database lives. Retried.

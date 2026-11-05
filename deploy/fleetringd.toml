@@ -258,7 +258,9 @@ id = "node-1"
 # exact database name or a prefix ending in `*`; `write` implies `read`, `admin` implies both,
 # and `stream` stands alone. `fleet` allows the operations that name no database: membership,
 # draining, revoking tokens. The table of what each RPC needs is in the daemon README, under
-# "Principals and scopes".
+# "Principals and scopes". A prefix is bytes: `admin:agent-42*` also covers `agent-420`, so end
+# each prefix with a separator (`admin:agent-42-*`); the daemon logs a warning at start for one
+# that doesn't.
 #
 # An application usually connects with its own certificate and a short-lived token instead:
 #

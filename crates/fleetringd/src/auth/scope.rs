@@ -171,6 +171,40 @@ impl Scope {
             Rule::Fleet => false,
         }
     }
+
+    /// A warning for a prefix that ends without a separator, or `None` (ADR-0041, point 5).
+    ///
+    /// A pattern ending in `*` matches every name that starts with the bytes before it, so
+    /// `admin:agent-42*` covers `agent-420` as well as `agent-42-notes`. The warning names such a
+    /// database and the scope with a separator; a prefix that ends in anything but an ASCII
+    /// letter or digit, an exact name, `*` alone, and `fleet` draw none.
+    ///
+    /// ```
+    /// use fleetringd::auth::Scope;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let loose: Scope = "admin:agent-42*".parse()?;
+    /// let warning = loose.separator_warning().ok_or("a warning")?;
+    /// assert!(warning.contains("agent-420"), "{warning}");
+    /// let separated: Scope = "admin:agent-42-*".parse()?;
+    /// assert_eq!(separated.separator_warning(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn separator_warning(&self) -> Option<String> {
+        let Rule::Databases { action, pattern } = &self.rule else {
+            return None;
+        };
+        let prefix = pattern.prefix()?;
+        if !prefix.bytes().last()?.is_ascii_alphanumeric() {
+            return None;
+        }
+        Some(format!(
+            "the scope {self} also covers databases such as {prefix}0…; end the prefix with a \
+             separator, such as {action}:{prefix}-*"
+        ))
+    }
 }
 
 impl fmt::Display for Scope {
@@ -308,6 +342,11 @@ impl Scopes {
     pub fn len(&self) -> usize {
         self.scopes.len()
     }
+
+    /// Each scope's [`Scope::separator_warning`], in order.
+    pub fn separator_warnings(&self) -> impl Iterator<Item = String> + '_ {
+        self.scopes.iter().filter_map(Scope::separator_warning)
+    }
 }
 
 impl FromIterator<Scope> for Scopes {
@@ -337,6 +376,31 @@ mod tests {
 
     fn scopes(texts: &[&str]) -> Scopes {
         texts.iter().map(|text| scope(text)).collect()
+    }
+
+    #[test]
+    fn a_prefix_without_a_separator_draws_a_warning() {
+        assert_eq!(
+            scope("admin:agent-42*").separator_warning().as_deref(),
+            Some(
+                "the scope admin:agent-42* also covers databases such as agent-420…; end the \
+                 prefix with a separator, such as admin:agent-42-*"
+            )
+        );
+        assert!(scope("read:Tenant*").separator_warning().is_some());
+        for quiet in [
+            "admin:agent-42-*",
+            "write:tenant:acme/*",
+            "read:*",
+            "admin:agent-42",
+            "fleet",
+        ] {
+            assert_eq!(scope(quiet).separator_warning(), None, "{quiet}");
+        }
+        let warned: Vec<String> = scopes(&["admin:a*", "read:b-*", "write:c*"])
+            .separator_warnings()
+            .collect();
+        assert_eq!(warned.len(), 2, "{warned:?}");
     }
 
     #[test]

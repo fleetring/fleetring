@@ -714,6 +714,84 @@ async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> Tes
     Ok(())
 }
 
+/// A database's metadata lives in control state, so a failover, which moves the lease and
+/// nothing else, leaves it as it was (ADR-0041).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_is_unchanged_by_a_failover() -> TestResult {
+    use fleetring_control::{Labels, MetadataChange, parse_label};
+    use fleetringd::data::NewMetadata;
+
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start_with(dir.path(), FAST_LEASES).await?;
+    let client = fleet.client()?;
+    let acme = name("acme")?;
+    let created = client
+        .create_database_with_metadata(
+            &acme,
+            DatabaseSpec::new(three()?),
+            &NewMetadata {
+                description: Some("Orders for tenant acme.\nTable: orders.".parse()?),
+                labels: Labels::try_from_pairs([parse_label("purpose=memory")?])?,
+            },
+        )
+        .await?;
+    let old = created.primary.clone().ok_or("no primary")?;
+    client
+        .update_database(
+            &acme,
+            &MetadataChange {
+                set_labels: Labels::try_from_pairs([parse_label("tier=gold")?])?,
+                ..MetadataChange::default()
+            },
+            Some(1),
+        )
+        .await?;
+    client
+        .execute(&acme, Statement::new("CREATE TABLE t (x)"))
+        .await?;
+    let before = client.locate(&acme).await?.metadata;
+    let labels = before.as_ref().map(|metadata| metadata.labels.clone());
+    assert_eq!(
+        labels,
+        Some(vec![
+            ("purpose".to_owned(), "memory".to_owned()),
+            ("tier".to_owned(), "gold".to_owned()),
+        ])
+    );
+
+    let Fleet {
+        control,
+        mut data,
+        tls,
+    } = fleet;
+    let index = data
+        .iter()
+        .position(|daemon| daemon.config().node.id == old)
+        .ok_or("primary isn't a data daemon")?;
+    data.remove(index).run_until(async {}).await;
+    let written = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client
+                .execute(&acme, Statement::new("INSERT INTO t VALUES (1)"))
+                .await
+            {
+                Ok(written) => return Ok(written),
+                Err(status) if matches!(status.code(), Code::Unavailable | Code::Aborted) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+    })
+    .await??;
+    assert_ne!(written.primary.as_ref(), Some(&old));
+    let after = client.locate(&acme).await?;
+    assert!(after.epoch.get() >= 2, "epoch {}", after.epoch.get());
+    assert_eq!(after.metadata, before);
+    Fleet { control, data, tls }.stop().await;
+    Ok(())
+}
+
 /// Waits until `condition` holds, polling every 20 ms, or fails after the hang guard.
 async fn wait_until(what: &str, mut condition: impl AsyncFnMut() -> bool) -> TestResult {
     let waited = tokio::time::timeout(HANG_GUARD, async {
@@ -2546,6 +2624,37 @@ mod archives {
             .await?;
         assert!(retried.location.primary.is_some());
         assert_eq!(values(&client, &name("fresh")?).await?, [1, 2, 3]);
+
+        // A restore may give the new database a description and labels, which its creation
+        // records (FR-070 phase 2; phase 5 adds the archive's own).
+        let described = name("described")?;
+        client
+            .restore_database_with_metadata(
+                &described,
+                DatabaseSpec::new(three()?),
+                &fleetringd::data::NewMetadata {
+                    description: Some("Restored from ledger.".parse()?),
+                    labels: fleetring_control::Labels::try_from_pairs([
+                        fleetring_control::parse_label("purpose=restore")?,
+                    ])?,
+                },
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await?;
+        let metadata = client
+            .locate(&described)
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(
+            metadata.description.as_deref(),
+            Some("Restored from ledger.")
+        );
+        assert_eq!(metadata.label("purpose"), Some("restore"));
+        assert_eq!(metadata.created_by.as_deref(), Some("tester"));
+        assert_eq!(values(&client, &described).await?, [1, 2, 3]);
         fleet.stop().await;
         Ok(())
     }

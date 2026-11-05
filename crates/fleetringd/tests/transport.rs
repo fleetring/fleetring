@@ -75,6 +75,20 @@ impl Control for StubControl {
         Err(Status::unimplemented("stub"))
     }
 
+    async fn create_database_with_metadata(
+        &self,
+        _request: Request<fleetring_proto::v1::CreateDatabaseWithMetadataRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn update_database(
+        &self,
+        _request: Request<fleetring_proto::v1::UpdateDatabaseRequest>,
+    ) -> Result<Response<fleetring_proto::v1::UpdateDatabaseResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
     async fn drop_database(
         &self,
         _request: Request<DropDatabaseRequest>,
