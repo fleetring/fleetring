@@ -336,11 +336,13 @@ fn start_bytes(start: Option<fleetring_wal::Position>) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// The tables the user owns: everything but SQLite's and the adapter's.
+/// The tables the user owns: everything but SQLite's and the adapter's, and but virtual tables
+/// and their shadow tables. A virtual table can't carry triggers, and its shadow tables hold the
+/// module's own storage, such as an FTS5 index, whose rows aren't the user's.
 fn user_tables(conn: &Connection) -> Result<Vec<String>, EngineError> {
     let mut statement = conn
         .prepare(
-            "SELECT name FROM main.sqlite_master WHERE type = 'table'
+            "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'
              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE ?1 ESCAPE '\\'
              ORDER BY name",
         )
