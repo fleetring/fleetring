@@ -479,7 +479,8 @@ impl MetadataChange {
 
 - `a_creation_with_metadata_records_it_with_the_creator_and_time`
 - `a_creation_without_metadata_serializes_as_before`: an `Action::CreateDatabase` with `metadata: None` and the `Database` it creates have no `metadata` key in their JSON. Compare against a JSON string copied from a 0.5.0 state, checked in as a constant.
-- `a_mixed_fleet_refuses_metadata_and_changes_nothing`: one member on `Software::baseline()`; `FeatureUnsupported { feature: Metadata, .. }`; the state equals its clone from before.
+- `a_mixed_fleet_refuses_metadata_and_changes_nothing`: one member on the previous line, `Software::new(Release::new(0, 5, 0), 1)` with `undrain` (0.3.0 can't run beside 0.6); `FeatureUnsupported { feature: Metadata, .. }` from `check_features`, `check_admission`, and `apply`; the state equals its clone from before.
+- `a_fleet_without_expiry_takes_metadata_and_refuses_an_expiry`: every member reports `metadata` but not `expiry`, as this build does.
 - `the_first_creation_with_metadata_enables_the_feature`, and an expiry enables `expiry` too.
 - `updates_patch_labels_in_log_order`: two updates setting different keys both land; for the same key, the later one wins.
 - `removals_apply_before_sets`
@@ -499,23 +500,36 @@ impl MetadataChange {
   - `Mixed` is today's behaviour.
   - `Current` makes every `Join` report `Software::new(Release::new(0, 6, 0), 1)` with every feature in `Feature::ALL`.
 - Add `pub(crate) fn record_with(ops: &[Op], mix: SoftwareMix)`; `record` calls it with `Mixed`.
-- In `action()`:
-  - `1 | 8` creations with `b % 8 == 6` carry a `MetadataSpec`: labels `purpose=memory` or `purpose=task` by `a % 2`; a description when `a % 3 == 0`; an expiry of `state.now() + (u64::from(op.a) * 200)` ms when `a % 4 == 1` (sometimes 0 ms ahead, so `ExpiryPassed` occurs); `created_by` `agent-1`.
-  - `8 if b % 10 == 1` → `UpdateDatabase`: set or remove one label by `a % 2`; set the expiry when `a % 5 == 0`; `if_version: Some(…)` when `a % 3 == 0`, from the database's current version or one off.
-  - `8 if b % 10 == 6` → `ExpireDatabase { name: database }`.
+- In `action()`, and only in the `Current` mix: in `Mixed`, a fleet with no members passes every feature gate, so one metadata command would enable the feature and refuse every later join, and the rest of the log would test nothing.
+  - `1 | 8` creations with `b % 4 == 2` carry a `MetadataSpec`: labels `purpose=memory` or `purpose=task` by `a % 2`; a description when `a % 3 == 0`; an expiry of `state.now() + (u64::from(op.a / 4 % 4) * 4_000)` ms when `a % 2 == 1` (0 ms ahead a quarter of the time, so `ExpiryPassed` occurs); `created_by` `agent-1`.
+  - `8 if b % 10 == 1` → `UpdateDatabase`: set or remove one label by `a % 2`; set the expiry to `state.now() + (u64::from(op.b / 10 % 4) * 3_000)` ms when `a % 5 == 0`; `if_version: Some(…)` when `a % 3 == 0`, from the database's current version or one off.
+  - `8 if b % 10 == 6` → `ExpireDatabase`: for even `a`, the first of `state.expired_databases(state.now())`, as the sweep would pick; otherwise `database`.
+
+  The selectors are denser than a first draft's (`b % 8 == 6`, `a % 4 == 1`, an offset of `a * 200` ms that was never 0), which left the fixed log with too few metadata creations and no `ExpiryPassed`.
 
 **`tests/it/replay.rs`:**
 
 - Add `replaying_a_log_with_metadata_and_expiry_gives_identical_states`, which runs the three existing checks (from scratch, from midway snapshots, through serialization) on `record_with(&fixed_ops(0xA6E7, LOG_LEN), SoftwareMix::Current)`.
-- Extend `the_generated_log_exercises_every_kind_of_change` with a `Current`-mix run that asserts `updated`, `expired`, and "created with metadata" outcomes occur. Detect the last by checking `state.database(..).metadata()` after a `DatabaseCreated`.
+- Extend `the_generated_log_exercises_every_kind_of_change` with a `Current`-mix run that asserts `updated`, `expired`, "created with metadata", `MetadataConflict`, `ExpiryPassed`, and `NotExpired` outcomes occur. Detect "created with metadata" by checking `state.database(..).metadata()` after a `DatabaseCreated`.
+- Add `a_log_replayed_without_metadata_matches_until_metadata_is_first_used`: the `Current` log, decoded without `metadata` fields as the previous line decodes it, reaches the same state up to the first command that needs `metadata`.
 
 `properties.rs` keeps passing unchanged.
+
+### 1.8 Stored software the previous line can read (ADR-0041, amendment 1)
+
+- `Software` serializes through a record: `features` holds only `FEATURES_THE_0_5_LINE_DECODES` (`undrain`, frozen), and `newer_features` every other name. Decoding reads both; unknown names are kept as opaque strings (`Software::unknown_features`) and never supported. `State.features` stays strict.
+- **Tests:**
+  - `software.rs` unit tests: the stored shape, 0.5 and 0.3 software stored as before, and an unknown name round-trips.
+  - `tests/it/rollback.rs`: this build's join, heartbeat, and snapshot decode with 0.5.0's own definitions of the changed types, copied from the tag; the pre-amendment shape fails there; unknown names round-trip through the log and snapshots; screening ignores unknown names.
+  - `fleetringd/tests/control.rs`: `a_metadata_command_a_member_lacks_is_never_logged`.
 
 ### Phase 1 acceptance
 
 - All gates green.
-- The replay tests pass with metadata and expiry.
-- No behaviour in `fleetringd` changes.
+- The replay tests pass with metadata and expiry, and without the metadata fields up to the first metadata command.
+- A control node of the 0.5 line decodes this build's log and snapshots while no command has used `metadata` or `expiry` (`rollback.rs`).
+- The writer refuses, before logging, every command that needs a feature a member lacks.
+- No other behaviour in `fleetringd` changes.
 - `fleetringd upgrade --software` lists `metadata` and not `expiry`.
 
 ---

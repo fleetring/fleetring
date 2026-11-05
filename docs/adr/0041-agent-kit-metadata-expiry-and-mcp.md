@@ -424,7 +424,7 @@ The **fleet feature** entry lists `metadata` and `expiry`.
   - `QueryRequest.max_rows` and `QueryResponse.truncated`;
   - `RestoreResponse.archived_metadata`.
 - **Labels on the wire are `repeated Label { key, value }`,** sorted by key, not a protobuf `map`. prost generates a map as a `HashMap`, which the workspace's lints ban, and the order would be unstable.
-- **The protocol minor version** moves to the next free number when phase 1 merges. FR-064 and FR-066 claim the others in merge order, as their plans already agree.
+- **The protocol minor version** moves to the next free number when phase 1 merges. FR-064 and FR-066 claim the others in merge order, as their plans already agree. (*Amended 2026-11-05, amendment 2:* it moves in the plan's phase 2, the first to change the protocol.)
 - **Older nodes:**
   - an old control node ignores the new listing fields, which the client applies again;
   - it answers `CreateDatabaseWithMetadata` and `UpdateDatabase` with `UNIMPLEMENTED`, which the CLI and the MCP server report as `the control plane runs a release without database metadata; upgrade it first`;
@@ -516,3 +516,15 @@ Decided on 2026-11-05: the owner took every recommendation below.
 6. **Multi-statement `exec` before FR-066.**
    - **TL;DR:** wait for `Database.Session` (recommended); or add `repeated statements` to `ExecuteRequest` now, which an older data node would ignore and run only `sql`, so it would need a protocol gate of its own.
    - **Recommendation:** wait.
+
+## Amendments
+
+**2026-11-05, during the plan's phase 1, before it merged.**
+
+1. **A member's feature list is stored so that the previous line can read it.** 0.5 decodes `Software.features` strictly: one name it doesn't know fails the whole control log or snapshot. Phase 1 reports `metadata`, so as soon as a member running it joined or sent a heartbeat, a control node rolled back to 0.5 couldn't load its state, although nobody had used the feature. Point 3 and ADR-0038 point 4 promise that a rollback stays possible until a new command is first used. The same gap would have opened with every new feature.
+   - **The encoding.** A stored `Software` writes, in its existing `features` field, only the names the 0.5 line decodes: a fixed list in `fleetring-control`, `undrain`. Every other name goes in a new field, `newer_features`, a sorted list of strings. 0.5's `Software`, `Member`, `MemberEntry`, `State`, `Command`, and `Action` have no `deny_unknown_fields`, so 0.5 ignores the new field, and a member there supports exactly `undrain`, the truth as far as 0.5 can act on it.
+   - **Decoding from 0.6 on** reads both fields. A name this release knows is a feature, wherever it appears; any other is kept as an opaque string, so a newer release's names survive the log and snapshots, and is never counted as supported, so the feature gate refuses what this release can't act on.
+   - **Later lines never extend the list.** It is frozen at the 0.5 line's set: every line from 0.6 on reads both fields and keeps names it doesn't know, so a new feature's name in `newer_features` reaches any release in the rollback window intact.
+   - **Enabled features stay strict.** `State.features` still decodes only known names. A release that doesn't know an enabled feature mustn't run the fleet, so its control node fails to load rather than drop it, as point 3 and ADR-0038 point 4 intend.
+   - Tests decode this build's join, heartbeat, and snapshot with 0.5.0's own definitions of the changed types (`rollback.rs` in `fleetring-control`'s tests), round-trip an unknown name, and check that screening ignores unknown names.
+2. **The protocol minor version moves in phase 2** (point 13), the first phase that changes the protocol. Phase 1 changes control state only.
