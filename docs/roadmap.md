@@ -55,7 +55,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 - [FR-066](https://github.com/fleetring/fleetring/issues/69): the router (MVP step 4), the libSQL/Hrana front door, so existing libSQL and Turso clients work unchanged. The first enforcement point for auth, forwarding each caller's token (ADR-0037, accepted; [plan](plans/FR-066-router.md)). FR-061, the Rails adapter ([#63](https://github.com/fleetring/fleetring/issues/63)), waits for it.
 - The Rust client that embeds the ring and skips the hop.
 - The MCP server for agents (MVP step 6): `memory.write`, `memory.search`, `db.query`, `db.fork`.
-- FR-039 change streams: a sink trait to Kafka, Pub/Sub, webhooks, or analytics stores. File and webhook sinks are done (0.2.0), and streams resume after a failover (FR-041, 0.3.0); further sinks are open.
+- FR-039 change streams: a sink trait to Kafka, Pub/Sub, webhooks, or analytics stores. File and webhook sinks are done (0.2.0), streams resume after a failover (FR-041, 0.3.0), and webhooks speak HTTPS with optional mutual TLS and a bearer token (FR-073, 0.5.0); further sinks are open.
 - Framework adapters: a middleware that maps a request to its tenant's database (Axum/Tower first; the libSQL client covers Node and Python through the router).
 
 ### E8. Packaging, docs, and examples
