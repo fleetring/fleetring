@@ -3853,11 +3853,12 @@ mod orphans {
     use std::time::Duration;
 
     use fleetring::ReplicationFactor;
+    use fleetring_proto::v1::DropCopyRequest;
     use fleetringd::auth::Grant;
     use fleetringd::clock::{Clock as _, SystemClock};
     use fleetringd::data::Client;
     use fleetringd::engine::Statement;
-    use fleetringd::transport::Credentials;
+    use fleetringd::transport::{Credentials, replication_client};
     use tonic::Code;
 
     use super::archives::ARCHIVE;
@@ -4250,6 +4251,90 @@ mod orphans {
         for id in DATA {
             assert!(orphans_of(&fleet, id).await?.is_empty(), "{id}");
         }
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// Sends `DropCopy` for `database` at each of `epochs` to every data daemon, as the node
+    /// `data-1`'s certificate, as a stolen node key or a control node retrying late would, and
+    /// checks that each node refuses it for its binding.
+    async fn drop_copy_refused_everywhere(
+        fleet: &Fleet,
+        database: &str,
+        epochs: &[u64],
+    ) -> TestResult {
+        let sender = fleet.tls.node_network("data-1")?;
+        for id in DATA {
+            let address = fleet.data_daemon(id)?.listen_address().to_string();
+            for epoch in epochs {
+                let refused = replication_client(sender.channel(&address)?)
+                    .drop_copy(DropCopyRequest {
+                        database: database.to_owned(),
+                        epoch: *epoch,
+                    })
+                    .await
+                    .expect_err("not a drop of this copy");
+                assert_eq!(refused.code(), Code::PermissionDenied, "{id}: {refused}");
+                assert_eq!(
+                    refused
+                        .metadata()
+                        .get("fleetring-binding")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("dropped"),
+                    "{id}: {refused}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A drop notice for a live database is refused, whatever epoch it names: the one its copies
+    /// are at, since control state still holds the database there, or any other, since it names
+    /// no copy's incarnation. Nothing is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forged_drop_notice_deletes_no_live_database() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = Fleet::start(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "live", three()?).await?;
+        let before = copies(dir.path(), "live");
+
+        drop_copy_refused_everywhere(&fleet, "live", &[0, 1, 2, u64::MAX]).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(copies(dir.path(), "live"), before, "nothing was deleted");
+        insert_note(&client, &name("live")?, 4).await?;
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// A notice for a dropped database that arrives again after the name was created again, as
+    /// a control node's late retry would, deletes neither the new primary's copy nor its
+    /// followers', and the honest notice before it deleted the old copies at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drop_notice_replayed_after_recreation_deletes_nothing() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = Fleet::start(dir.path()).await?;
+        let client = fleet.client()?;
+        let reused = name("reused")?;
+        create_noted(dir.path(), &client, "reused", three()?).await?;
+        let dropped = client.drop_database(&reused).await?;
+        assert_eq!(dropped.get(), 1);
+        wait_until("every old copy deleted", async || {
+            copies(dir.path(), "reused").is_empty()
+        })
+        .await?;
+
+        // The new database restarts at epoch 1, the epoch the old one was dropped at.
+        create_noted(dir.path(), &client, "reused", three()?).await?;
+        let location = client.locate(&reused).await?;
+        assert_eq!(location.epoch.get(), 1);
+        let before = copies(dir.path(), "reused");
+        assert_eq!(before.len(), DATA.len(), "{before:?}");
+
+        drop_copy_refused_everywhere(&fleet, "reused", &[1, 2]).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(copies(dir.path(), "reused"), before, "nothing was deleted");
+        insert_note(&client, &reused, 4).await?;
         fleet.stop().await;
         Ok(())
     }

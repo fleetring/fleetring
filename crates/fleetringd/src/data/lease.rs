@@ -463,8 +463,8 @@ async fn settle(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) {
 }
 
 /// Deletes the copy of `database` this node led at `epoch` until it was dropped at `dropped`,
-/// unless the node has since come to serve the name at another epoch, or seen one past
-/// `dropped`: that copy is a newer database's, and stays.
+/// unless the node has since come to serve the name at another epoch, or its copy's highest
+/// epoch is no longer `dropped`: that copy is a newer database's, and stays.
 async fn discard_retired(
     node: &DataNode,
     database: &DatabaseName,
@@ -475,9 +475,7 @@ async fn discard_retired(
     let newer = replication
         .serving(database)
         .is_some_and(|role| role.epoch != epoch)
-        || replication
-            .highest_epoch(database)
-            .is_some_and(|highest| highest > dropped);
+        || replication.highest_epoch(database) != Some(dropped);
     if newer {
         tracing::warn!(database = %database, epoch = epoch.get(), "the name serves a newer database here; the dropped copy's deletion leaves it alone");
         return;
@@ -543,22 +541,26 @@ async fn keep_orphan(node: &DataNode, database: &DatabaseName, why: &'static str
 /// Acts on a drop a control node told this node of (ADR-0042): deletes this node's copy of
 /// `database`, after flushing its change streams if this node serves it.
 ///
-/// The copy is deleted only if its highest epoch is at most `epoch`, the one the database was
-/// dropped at, and only while control state still agrees: it holds no database of the name, or
-/// one at a lower epoch. It is asked again here, since a database of the name may have been
-/// created and leased since the notice arrived. A control plane that can't be reached leaves the
-/// copy, which becomes an orphan the usual way.
+/// The copy is deleted only if its highest epoch is exactly `epoch`, the one the database was
+/// dropped at, so the notice names this copy's incarnation, and only while control state still
+/// agrees: it holds no database of the name, or one at a lower epoch. Both are judged again
+/// here, under the name's lock, since a database of the name may have been created and leased
+/// since the notice arrived. A control plane that can't be reached leaves the copy, which
+/// becomes an orphan the usual way.
 async fn drop_seen(
     node: &DataNode,
     database: &DatabaseName,
     epoch: LeaseEpoch,
     dropped: &mpsc::UnboundedSender<Dropped>,
 ) {
+    // No create, restore, or orphan removal of the name runs while the notice is judged and
+    // acted on, so the copy judged is the copy deleted.
+    let _name = node.lock_name(database).await;
     let Some(highest) = node.replication().highest_epoch(database) else {
         return;
     };
-    if highest > epoch {
-        tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), "a drop notice names an older database than this node's copy; kept the copy");
+    if highest != epoch {
+        tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), "a drop notice names another incarnation than this node's copy; kept the copy");
         return;
     }
     match node.locate(database).await {
