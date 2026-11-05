@@ -25,9 +25,9 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Replication and failover: the primary streams WAL frames to its followers and acknowledges a write once a quorum holds it, leases and epochs keep one writer per database, and a new or lagging follower catches up from a snapshot
 - Durability, set per database: when a write is acknowledged and how many replicas must be reachable; `node drain` hands a node's primaries over before a planned stop
 - Archives and point-in-time restore: each database's log and base snapshots go to an S3-compatible bucket or a directory, and a restore checks every batch against the log's hash chain
-- Change streams to file or webhook sinks that resume where they stopped after a failover, and `lease watch`, which follows the leases a node gains and loses
+- Change streams to file or webhook sinks (over HTTPS, with optional client certificates or bearer tokens) that resume where they stopped after a failover, and `lease watch`, which follows the leases a node gains and loses
 - Security: mutual TLS with a built-in certificate authority, principals with prefix scopes and signed, revocable tokens, statements confined to their database, node calls bound to placement, and signed, attested releases
-- Operations: `db create/exec/query/locate/list/drop/verify` and `status`, with a hash-chained log that shows whether every replica holds the same history
+- Operations: `db create/exec/query/locate/list/drop/verify` and `status`, with a hash-chained log that shows whether every replica holds the same history; Prometheus metrics, health and readiness probes, request IDs, and JSON logs; `fleetringd upgrade`, verified with cosign, with rollback and a tested rolling upgrade
 - `fleetringd dev`: one command for a local node on a laptop, over the same TLS and scopes as a fleet
 
 **Planned**, each tracked as a [GitHub issue](https://github.com/fleetring/fleetring/issues):
@@ -35,7 +35,6 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Router that works with existing libSQL and Turso clients
 - Live migration when nodes join or leave, with zero lost writes, and rebalancing
 - A Raft control plane, so the control plane has no single point of failure
-- Metrics, health checks, and structured logs, and `fleetringd upgrade` with a tested rolling upgrade (both in progress)
 - Fault injection on real daemons, judged by the history checker
 - Keyed leases, Merkle anti-entropy, and cells in the daemon
 - CLI contexts and JSON output, a terminal UI, and a desktop app
@@ -56,7 +55,7 @@ The `fleetringd` daemon ships as one binary. Each `fleetringd` release has three
   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh
   # A given version, somewhere else:
   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
-    | sh -s -- --version 0.4.0 --prefix /opt/fleetring
+    | sh -s -- --version 0.5.0 --prefix /opt/fleetring
   ```
 
 - **Docker**, for `linux/amd64` and `linux/arm64`. The image runs a one-node fleet from [`deploy/fleetringd.toml`](deploy/fleetringd.toml) as a non-root user, with its databases in the `/data` volume:
@@ -129,6 +128,7 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 - [x] Change streams and lease watch (0.2.0); streams resume after failover (0.3.0)
 - [x] Backups and point-in-time restore (0.3.0)
 - [x] Metrics, health checks, and a tested rolling upgrade (0.4.0)
+- [x] `fleetringd dev`, a one-command local node, and webhook sinks over HTTPS (0.5.0)
 - [ ] Router sidecar (libSQL/Hrana protocol)
 - [ ] Live migration
 - [ ] Raft control plane
