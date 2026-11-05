@@ -23,7 +23,8 @@ use crate::changes::MarkHome;
 use crate::engine::{
     CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot,
     EngineError, Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode,
-    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Shape, Statement, Transaction,
+    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Shape,
+    Statement, Transaction,
 };
 use crate::publisher::{
     Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
@@ -36,6 +37,7 @@ pub(crate) enum Request {
     Ready(Reply<()>),
     Execute(Transaction, Reply<(Executed, Option<Acknowledgement>)>),
     Query(Statement, Reply<Rows>),
+    Schema(SchemaRequest, Reply<Schema>),
     Position(Reply<Option<Position>>),
     CommittedSince(Option<Position>, Reply<Option<FrameBatch>>),
     CommittedBetween(Option<Position>, Position, Reply<Option<FrameBatch>>),
@@ -61,6 +63,9 @@ impl Request {
                 let _ = reply.send(Err(error));
             }
             Self::Query(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Schema(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::Position(reply) => {
@@ -109,6 +114,7 @@ impl fmt::Debug for Request {
             Self::Ready(_) => "Ready",
             Self::Execute(..) => "Execute",
             Self::Query(..) => "Query",
+            Self::Schema(..) => "Schema",
             Self::Position(_) => "Position",
             Self::CommittedSince(..) => "CommittedSince",
             Self::CommittedBetween(..) => "CommittedBetween",
@@ -294,6 +300,18 @@ impl DatabaseHandle {
     pub async fn query(&self, statement: Statement) -> Result<Rows, DatabaseError> {
         let permit = self.reserve().await.ok_or_else(|| self.closed())?;
         self.query_reserved(permit, statement).await
+    }
+
+    /// The database's schema, as the engine reports it (ADR-0041, point 6), read on the read
+    /// path against the latest commit.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] if the database is closed or the engine can't report its schema; an
+    /// engine that can't describe itself fails with [`EngineError::Unsupported`].
+    pub async fn schema(&self, request: SchemaRequest) -> Result<Schema, DatabaseError> {
+        let permit = self.reserve().await.ok_or_else(|| self.closed())?;
+        self.schema_reserved(permit, request).await
     }
 
     /// The position just past the last committed transaction, or `None` for an empty log.
@@ -496,6 +514,16 @@ impl DatabaseHandle {
     ) -> Result<Rows, DatabaseError> {
         let (reply, result) = oneshot::channel();
         permit.send(Request::Query(statement, reply));
+        self.await_reply(result).await
+    }
+
+    pub(crate) async fn schema_reserved(
+        &self,
+        permit: mpsc::Permit<'_, Request>,
+        request: SchemaRequest,
+    ) -> Result<Schema, DatabaseError> {
+        let (reply, result) = oneshot::channel();
+        permit.send(Request::Schema(request, reply));
         self.await_reply(result).await
     }
 
@@ -715,6 +743,12 @@ impl Actor {
             Request::Query(statement, reply) => {
                 let result = self
                     .call(move |database| Ok(database.query(&statement)?))
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::Schema(request, reply) => {
+                let result = self
+                    .call(move |database| Ok(database.schema(&request)?))
                     .await;
                 let _ = reply.send(result);
             }

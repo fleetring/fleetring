@@ -18,7 +18,11 @@ use tonic::Status;
 use crate::changes::{MarkHome, SinkStatus};
 use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
 use crate::data::metadata::{Descriptions, MetadataView, NewMetadata};
-use crate::engine::{Position, Rows, Statement, Value};
+use crate::data::schema::SchemaView;
+use crate::engine::{
+    EngineKind, Internal, MAX_COUNT_LIMIT, ObjectKind, Position, RowCount, Rows, Schema,
+    SchemaObject, SchemaRequest, Statement, Value,
+};
 use crate::replication::{LeaseChange, LeaseEvent};
 
 /// Parses `text` as `field`, or answers `INVALID_ARGUMENT`.
@@ -345,18 +349,141 @@ pub(crate) fn new_metadata_to_proto(metadata: &NewMetadata) -> proto::MetadataSp
     }
 }
 
-/// The location a placement describes.
-pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> {
-    let engine = match proto::Engine::try_from(placement.engine) {
-        // SQLite is the only engine so far, and an unset engine means it.
-        Ok(proto::Engine::Sqlite | proto::Engine::Unspecified) => Engine::Sqlite,
-        Err(_) => {
+/// The engine request a `Schema` call asks for, with its count limit clamped to
+/// [`MAX_COUNT_LIMIT`].
+pub(crate) fn schema_request_from_proto(request: &proto::SchemaRequest) -> SchemaRequest {
+    SchemaRequest {
+        count_limit: request.count_limit.min(MAX_COUNT_LIMIT),
+        internal: if request.include_internal {
+            Internal::Show
+        } else {
+            Internal::Hide
+        },
+    }
+}
+
+/// The `Schema` call for `database` that asks for `request`.
+pub(crate) fn schema_request_to_proto(
+    database: &DatabaseName,
+    request: &SchemaRequest,
+) -> proto::SchemaRequest {
+    proto::SchemaRequest {
+        database: database.to_string(),
+        count_limit: request.count_limit,
+        include_internal: request.internal == Internal::Show,
+    }
+}
+
+/// The reply to a `Schema` call: `schema`, as the primary `primary` answered it at `epoch`.
+pub(crate) fn schema_to_proto(
+    schema: Schema,
+    engine: EngineKind,
+    primary: &NodeId,
+    epoch: LeaseEpoch,
+) -> proto::SchemaResponse {
+    proto::SchemaResponse {
+        engine: match engine {
+            EngineKind::Sqlite => proto::Engine::Sqlite,
+            _ => proto::Engine::Unspecified,
+        }
+        .into(),
+        objects: schema
+            .objects
+            .into_iter()
+            .map(schema_object_to_proto)
+            .collect(),
+        truncated: schema.truncated,
+        primary: primary.to_string(),
+        epoch: epoch.get(),
+    }
+}
+
+fn schema_object_to_proto(object: SchemaObject) -> proto::SchemaObject {
+    let kind = match object.kind {
+        ObjectKind::Table => proto::SchemaObjectKind::Table,
+        ObjectKind::VirtualTable => proto::SchemaObjectKind::VirtualTable,
+        ObjectKind::View => proto::SchemaObjectKind::View,
+        ObjectKind::Index => proto::SchemaObjectKind::Index,
+        ObjectKind::Trigger => proto::SchemaObjectKind::Trigger,
+    };
+    let (rows, rows_at_least) = match object.rows {
+        Some(RowCount::Exact(rows)) => (Some(rows), false),
+        Some(RowCount::AtLeast(rows)) => (Some(rows), true),
+        None => (None, false),
+    };
+    proto::SchemaObject {
+        kind: kind.into(),
+        name: object.name,
+        table: object.table.unwrap_or_default(),
+        definition: object.definition.unwrap_or_default(),
+        rows,
+        rows_at_least,
+    }
+}
+
+/// The schema a `Schema` reply holds.
+pub(crate) fn schema_from_proto(response: proto::SchemaResponse) -> Result<SchemaView, Status> {
+    let objects = response
+        .objects
+        .into_iter()
+        .map(schema_object_from_proto)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SchemaView {
+        engine: engine_from_reply(response.engine)?,
+        schema: Schema {
+            objects,
+            truncated: response.truncated,
+        },
+        primary: parse_reply("primary", &response.primary).ok(),
+        epoch: LeaseEpoch::new(response.epoch),
+    })
+}
+
+fn schema_object_from_proto(object: proto::SchemaObject) -> Result<SchemaObject, Status> {
+    let kind = match proto::SchemaObjectKind::try_from(object.kind) {
+        Ok(proto::SchemaObjectKind::Table) => ObjectKind::Table,
+        Ok(proto::SchemaObjectKind::VirtualTable) => ObjectKind::VirtualTable,
+        Ok(proto::SchemaObjectKind::View) => ObjectKind::View,
+        Ok(proto::SchemaObjectKind::Index) => ObjectKind::Index,
+        Ok(proto::SchemaObjectKind::Trigger) => ObjectKind::Trigger,
+        Ok(proto::SchemaObjectKind::Unspecified) | Err(_) => {
             return Err(Status::internal(format!(
-                "the reply has an unknown engine {}",
-                placement.engine
+                "the reply has an unknown schema object kind {}",
+                object.kind
             )));
         }
     };
+    let non_empty = |text: String| (!text.is_empty()).then_some(text);
+    let rows = object.rows.map(|rows| {
+        if object.rows_at_least {
+            RowCount::AtLeast(rows)
+        } else {
+            RowCount::Exact(rows)
+        }
+    });
+    Ok(SchemaObject {
+        kind,
+        name: object.name,
+        table: non_empty(object.table),
+        definition: non_empty(object.definition),
+        rows,
+    })
+}
+
+/// The engine a reply names.
+fn engine_from_reply(engine: i32) -> Result<Engine, Status> {
+    match proto::Engine::try_from(engine) {
+        // SQLite is the only engine so far, and an unset engine means it.
+        Ok(proto::Engine::Sqlite | proto::Engine::Unspecified) => Ok(Engine::Sqlite),
+        Err(_) => Err(Status::internal(format!(
+            "the reply has an unknown engine {engine}"
+        ))),
+    }
+}
+
+/// The location a placement describes.
+pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> {
+    let engine = engine_from_reply(placement.engine)?;
     let primary: Option<NodeId> = placement
         .primary
         .as_deref()
@@ -726,5 +853,74 @@ mod tests {
         let refused = super::statement("SELECT ?".into(), vec![proto::Value { value: None }])
             .expect_err("a parameter without a value");
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn a_schema_round_trips_and_a_count_limit_is_clamped() {
+        let object = |kind, name: &str, table: Option<&str>, rows| SchemaObject {
+            kind,
+            name: name.to_owned(),
+            table: table.map(str::to_owned),
+            definition: table.map(|_| format!("CREATE ... {name}")),
+            rows,
+        };
+        let schema = Schema {
+            objects: vec![
+                object(ObjectKind::Table, "facts", None, Some(RowCount::Exact(0))),
+                object(ObjectKind::Index, "facts_v", Some("facts"), None),
+                object(ObjectKind::Trigger, "facts_ai", Some("facts"), None),
+                object(ObjectKind::View, "v", None, None),
+                object(
+                    ObjectKind::VirtualTable,
+                    "docs",
+                    None,
+                    Some(RowCount::AtLeast(5)),
+                ),
+            ],
+            truncated: true,
+        };
+        let primary: NodeId = "data-1".parse().expect("a node ID");
+        let wire = schema_to_proto(
+            schema.clone(),
+            EngineKind::Sqlite,
+            &primary,
+            LeaseEpoch::new(4),
+        );
+        assert_eq!(wire.engine, i32::from(proto::Engine::Sqlite));
+        assert_eq!((wire.primary.as_str(), wire.epoch), ("data-1", 4));
+        let view = schema_from_proto(wire).expect("a valid reply");
+        assert_eq!(view.schema, schema);
+        assert_eq!(view.primary, Some(primary));
+        assert_eq!(view.epoch, LeaseEpoch::new(4));
+
+        let name: DatabaseName = "notes".parse().expect("a name");
+        let asked = SchemaRequest {
+            count_limit: u64::MAX,
+            internal: Internal::Show,
+        };
+        let wire = schema_request_to_proto(&name, &asked);
+        assert_eq!(wire.database, "notes");
+        assert_eq!(
+            schema_request_from_proto(&wire),
+            SchemaRequest {
+                count_limit: MAX_COUNT_LIMIT,
+                internal: Internal::Show,
+            }
+        );
+        let hidden = schema_request_from_proto(&proto::SchemaRequest::default());
+        assert_eq!(hidden.internal, Internal::Hide);
+    }
+
+    #[test]
+    fn a_schema_object_of_an_unknown_kind_is_refused() {
+        let reply = proto::SchemaResponse {
+            objects: vec![proto::SchemaObject {
+                kind: 99,
+                ..proto::SchemaObject::default()
+            }],
+            ..proto::SchemaResponse::default()
+        };
+        let refused = schema_from_proto(reply).expect_err("an unknown kind");
+        assert_eq!(refused.code(), tonic::Code::Internal);
     }
 }

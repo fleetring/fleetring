@@ -120,6 +120,7 @@ const _: () = {
     assert_debug_send_sync::<data::Location>();
     assert_debug_send_sync::<data::NodeStatus>();
     assert_debug_send_sync::<data::ReplicaInfo>();
+    assert_debug_send_sync::<data::SchemaView>();
     assert_debug_send_sync::<data::ServedDatabase>();
     assert_debug_send_sync::<data::Verification>();
     assert_debug_send_sync::<data::Written>();
@@ -128,6 +129,8 @@ const _: () = {
     assert_debug_send_sync::<report::MetadataReport>();
     assert_debug_send_sync::<report::PlacementReport>();
     assert_debug_send_sync::<report::ReplicaReport>();
+    assert_debug_send_sync::<report::SchemaObjectReport>();
+    assert_debug_send_sync::<report::SchemaReport>();
     assert_debug_send_sync::<dev::DevError>();
     assert_debug_send_sync::<dev::DevMode>();
     assert_debug_send_sync::<dev::Prepared>();

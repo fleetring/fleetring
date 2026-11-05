@@ -275,6 +275,11 @@ pub const RPCS: &[Rpc] = &[
         Binding::None,
     ),
     rpc(
+        "/fleetring.v1.Database/Schema",
+        Requirement::Database(Action::Read),
+        Binding::None,
+    ),
+    rpc(
         "/fleetring.v1.Database/Create",
         Requirement::Database(Action::Admin),
         Binding::None,

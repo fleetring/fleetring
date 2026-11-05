@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use fleetring::ReplicationFactor;
 use fleetring_control::{Acks, DatabaseName, Durability, LeaseEpoch, Liveness, ReplicaRole};
-use fleetring_proto::v1::ExecuteRequest;
+use fleetring_proto::v1::{self as proto, ExecuteRequest};
 use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, LeaseUpdates, Location, primary_hint};
-use fleetringd::engine::{Statement, Value};
+use fleetringd::engine::{Internal, ObjectKind, RowCount, SchemaRequest, Statement, Value};
 use fleetringd::replication::{LeaseChange, LeaseEvent};
 use fleetringd::transport::database_client;
 use fleetringd::{Config, Daemon, Network};
@@ -501,6 +501,96 @@ async fn a_request_to_a_follower_is_redirected_to_the_primary() -> TestResult {
         .query(&acme, Statement::new("SELECT x FROM t"))
         .await?;
     assert_eq!(rows.rows, vec![vec![Value::Integer(7)]]);
+
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_schema_is_served_by_the_primary_and_redirected_from_followers() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(dir.path()).await?;
+    let client = fleet.client()?;
+    let acme = name("acme")?;
+    let location = client.create_database(&acme, three()?).await?;
+    let primary = location.primary.clone().ok_or("no primary")?;
+    let primary_address = fleet
+        .data_daemon(primary.as_str())?
+        .listen_address()
+        .to_string();
+    let follower = follower_address(&location)?;
+
+    // DDL the caller just ran shows at once: the primary answers, not a follower that may lag.
+    for sql in [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, topic TEXT, body TEXT)",
+        "CREATE INDEX notes_topic ON notes (topic)",
+        "CREATE TRIGGER notes_seen AFTER INSERT ON notes BEGIN SELECT 1; END",
+        "CREATE VIEW recent AS SELECT body FROM notes ORDER BY id DESC",
+        "INSERT INTO notes (topic, body) VALUES ('a', 'x'), ('b', 'y'), ('c', 'z')",
+    ] {
+        client.execute(&acme, Statement::new(sql)).await?;
+    }
+    let request = |count_limit| SchemaRequest {
+        count_limit,
+        internal: Internal::Hide,
+    };
+
+    // Sent straight to a follower, the call is answered with the primary's address.
+    let mut raw = database_client(network(&fleet.tls)?.channel(&follower)?);
+    let redirect = raw
+        .schema(proto::SchemaRequest {
+            database: acme.to_string(),
+            count_limit: 10,
+            include_internal: false,
+        })
+        .await
+        .expect_err("a follower doesn't answer");
+    assert_eq!(redirect.code(), Code::Unavailable, "{redirect}");
+    assert_eq!(primary_hint(&redirect), Some(primary_address));
+
+    // A client that starts at the follower follows the redirect.
+    let via_follower = fleet.client()?.with_entry(follower);
+    for asking in [&client, &via_follower] {
+        let view = asking.schema(&acme, request(10)).await?;
+        assert_eq!(view.primary.as_ref(), Some(&primary));
+        assert_eq!(view.epoch, location.epoch);
+        assert!(!view.schema.truncated);
+        let objects: Vec<(ObjectKind, &str)> = view
+            .schema
+            .objects
+            .iter()
+            .map(|object| (object.kind, object.name.as_str()))
+            .collect();
+        assert_eq!(
+            objects,
+            [
+                (ObjectKind::Table, "notes"),
+                (ObjectKind::Index, "notes_topic"),
+                (ObjectKind::Trigger, "notes_seen"),
+                (ObjectKind::View, "recent"),
+            ]
+        );
+        assert_eq!(view.schema.objects[0].rows, Some(RowCount::Exact(3)));
+        assert!(
+            view.schema.objects[1]
+                .definition
+                .as_deref()
+                .is_some_and(|sql| sql.starts_with("CREATE INDEX notes_topic")),
+            "{:?}",
+            view.schema.objects[1]
+        );
+    }
+    // The cap holds through the wire: the count stops at the limit.
+    let capped = via_follower.schema(&acme, request(2)).await?;
+    assert_eq!(capped.schema.objects[0].rows, Some(RowCount::AtLeast(2)));
+    let uncounted = client.schema(&acme, request(0)).await?;
+    assert_eq!(uncounted.schema.objects[0].rows, None);
+
+    let missing = client
+        .schema(&name("missing")?, request(10))
+        .await
+        .expect_err("no such database");
+    assert_eq!(missing.code(), Code::NotFound, "{missing}");
 
     fleet.stop().await;
     Ok(())
