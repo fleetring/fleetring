@@ -609,3 +609,47 @@ fn identifiers_with_quotes_are_counted_safely() -> TestResult {
     assert_eq!(object(&schema, "we\"ird")?.rows, Some(RowCount::Exact(2)));
     Ok(())
 }
+
+#[test]
+fn a_query_stops_at_its_row_limit_and_says_so() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(&dir.path().join("a"))?;
+    exec(&mut db, "INSERT INTO t VALUES (2), (3)")?;
+    let all = "SELECT v FROM t ORDER BY v";
+    let limited = |max: u32| -> Result<Statement, Box<dyn Error>> {
+        let max = std::num::NonZeroU32::new(max).ok_or("a limit of 0")?;
+        Ok(Statement::new(all).with_max_rows(max))
+    };
+
+    let rows = db.query(&limited(2)?)?;
+    assert_eq!(rows.rows, [[Value::Integer(1)], [Value::Integer(2)]]);
+    assert!(rows.truncated, "a third row exists");
+    let rows = db.query(&limited(3)?)?;
+    assert_eq!(rows.rows.len(), 3);
+    assert!(!rows.truncated, "exactly the limit isn't truncated");
+    let rows = query(&mut db, all)?;
+    assert_eq!(rows.rows.len(), 3);
+    assert!(!rows.truncated);
+    Ok(())
+}
+
+#[test]
+fn a_second_statement_is_refused_and_nothing_runs() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(&dir.path().join("a"))?;
+    let message = refusal(exec(
+        &mut db,
+        "INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)",
+    ))?;
+    assert_eq!(
+        message,
+        "a call runs one statement; send each in a call of its own"
+    );
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
+    let message = refusal(query(&mut db, "SELECT 1; SELECT 2"))?;
+    assert_eq!(
+        message,
+        "a call runs one statement; send each in a call of its own"
+    );
+    Ok(())
+}
