@@ -50,8 +50,8 @@
 //!   [`Software::baseline`], release 0.3.0. A join is refused when its release line is more than
 //!   one line from any member's, or when it lacks an enabled feature (ADR-0038).
 //! - **Features** gate commands that not every member can read or act on: such a command is
-//!   accepted only once every member supports its [`Feature`], and the first one accepted
-//!   enables the feature for good.
+//!   accepted only once every member supports each [`Feature`] it needs, and never by a fleet
+//!   without members; the first one accepted enables its features for good.
 //! - **Revocations** list token and key IDs, never credentials, each until a time after which it
 //!   is forgotten; ticks and revocations forget the entries the time has passed (ADR-0025).
 //! - **Metadata** (ADR-0041): a database may carry a [`Description`], [`Labels`], its creator

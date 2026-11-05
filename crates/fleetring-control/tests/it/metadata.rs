@@ -795,3 +795,60 @@ fn a_stamp_that_goes_backwards_never_expires_early() {
     );
     assert_eq!(state.now(), at(10_000));
 }
+
+/// With no members, no feature can be shown to be supported, so a command that needs one is
+/// refused rather than enabling it: enabling `expiry`, which no release reports yet, would refuse
+/// every later join, this build's included (ADR-0041, amendment 3).
+#[test]
+fn a_fleet_without_members_enables_no_feature() {
+    let mut state = State::new(config());
+    let before = state.clone();
+    let expiring = create_with_metadata("scratch", expiring_at(90_000));
+    let refused = Rejection::FeatureWithoutMembers {
+        feature: Feature::Metadata,
+    };
+    assert_eq!(state.check_admission(&expiring), Err(refused.clone()));
+    assert_eq!(run(&mut state, 1, expiring), Err(refused));
+    assert_eq!(state, before);
+    assert_eq!(state.features().count(), 0);
+
+    // A plain creation needs no feature, and a member of this build joins afterwards.
+    run(&mut state, 1, create("plain", 1)).expect("create");
+    let member = Member::new(id("a")).with_software(current_software());
+    run(&mut state, 2, Action::Join { member }).expect("join");
+    run(&mut state, 3, update("plain", set_expiry(90_000))).expect("now it applies");
+    assert!(state.is_enabled(Feature::Expiry));
+}
+
+/// The rule changes no replay of an older log: before it, the only gated action was `Undrain`,
+/// which names a member, so in a fleet without members it was rejected anyway and changed
+/// nothing.
+#[test]
+fn an_undrain_in_a_fleet_without_members_changed_nothing_before_the_rule_either() {
+    let mut state = State::new(config());
+    run(&mut state, 0, create("plain", 1)).expect("create");
+    let before = state.clone();
+    for stamp in [0, 5_000] {
+        let refused = run(&mut state, stamp, Action::Undrain { id: id("a") });
+        assert_eq!(
+            refused,
+            Err(Rejection::FeatureWithoutMembers {
+                feature: Feature::Undrain
+            })
+        );
+        assert_eq!(state, before);
+    }
+
+    // Past the gate, as before the rule, the transition itself rejects it: with `undrain`
+    // enabled and every member gone, the gate passes and the member is unknown.
+    let member = Member::new(id("a")).with_software(current_software());
+    run(&mut state, 1, Action::Join { member }).expect("join");
+    run(&mut state, 1, Action::Undrain { id: id("a") }).expect("undrain");
+    run(&mut state, 1, Action::Leave { id: id("a") }).expect("leave");
+    let before = state.clone();
+    assert_eq!(
+        run(&mut state, 2, Action::Undrain { id: id("a") }),
+        Err(Rejection::UnknownMember { id: id("a") })
+    );
+    assert_eq!(state, before);
+}

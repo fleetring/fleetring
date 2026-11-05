@@ -70,12 +70,15 @@ pub(crate) fn software_to_proto(software: &Software) -> proto::Software {
         features: software
             .features()
             .map(|feature| feature.as_str().to_owned())
+            .chain(software.unknown_features().map(str::to_owned))
             .collect(),
     }
 }
 
-/// The software a node reported. Features this build doesn't know are left out: the node is
-/// newer, and no command this build applies needs them.
+/// The software a node reported. Feature names this build doesn't know are kept as given, as
+/// the control log keeps them, so the software a member reported and the software recorded for
+/// it compare equal; they never count as supported, since no command this build applies needs
+/// them.
 ///
 /// # Errors
 ///
@@ -85,14 +88,10 @@ pub(crate) fn software_from_proto(software: proto::Software) -> Result<Software,
         .version
         .parse()
         .map_err(|error| Status::invalid_argument(format!("invalid software version: {error}")))?;
-    Ok(software
-        .features
-        .iter()
-        .filter_map(|name| name.parse().ok())
-        .fold(
-            Software::new(release, software.control_format),
-            Software::with_feature,
-        ))
+    Ok(software.features.iter().fold(
+        Software::new(release, software.control_format),
+        |software, name| software.with_feature_name(name),
+    ))
 }
 
 #[cfg(test)]
@@ -126,17 +125,56 @@ mod tests {
     }
 
     #[test]
-    fn unknown_features_are_ignored_and_bad_versions_refused() {
+    fn unknown_features_are_kept_unsupported_and_bad_versions_refused() {
         let mut reported = software_to_proto(&running());
         reported.features.push("teleport".to_owned());
+        let software = software_from_proto(reported.clone()).expect("valid");
         assert_eq!(
-            software_from_proto(reported.clone()).expect("valid"),
-            running()
+            software.unknown_features().collect::<Vec<_>>(),
+            ["teleport"]
+        );
+        assert!(
+            Feature::ALL
+                .into_iter()
+                .all(|feature| software.supports(feature) == running().supports(feature))
+        );
+        assert_eq!(
+            software.features().collect::<Vec<_>>(),
+            running().features().collect::<Vec<_>>()
         );
         reported.version = "next".to_owned();
         assert_eq!(
             software_from_proto(reported).expect_err("invalid").code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    /// A newer member's feature names survive the protocol both ways, so the software it reports
+    /// equals the software the control log records for it, and a rejoin on the same software
+    /// takes the rejoin path.
+    #[test]
+    fn unknown_feature_names_round_trip_through_the_protocol() {
+        let reported = proto::Software {
+            version: "0.7.0".to_owned(),
+            protocol: Some(PROTOCOL_VERSION),
+            control_format: 2,
+            features: vec![
+                "undrain".to_owned(),
+                "future-x".to_owned(),
+                "metadata".to_owned(),
+            ],
+        };
+        let software = software_from_proto(reported).expect("valid");
+        assert_eq!(
+            software.unknown_features().collect::<Vec<_>>(),
+            ["future-x"]
+        );
+        let again = software_to_proto(&software);
+        assert_eq!(again.features, ["undrain", "metadata", "future-x"]);
+        assert_eq!(software_from_proto(again).expect("valid"), software);
+
+        let stored = serde_json::to_string(&software).expect("serializes");
+        let recorded: Software = serde_json::from_str(&stored).expect("decodes");
+        assert_eq!(recorded, software);
     }
 }

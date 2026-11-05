@@ -553,6 +553,15 @@ pub enum Rejection {
         release: Release,
     },
 
+    /// The command needs a fleet feature that isn't enabled, and no member has joined yet, so
+    /// no member can be shown to support it. Enabling it then would refuse every later join of
+    /// a release that doesn't report it.
+    #[error("the fleet can't use '{feature}' yet: no member has joined")]
+    FeatureWithoutMembers {
+        /// The feature the command needs.
+        feature: Feature,
+    },
+
     /// A revocation would be forgotten at once: the token it names has already expired.
     #[error("revocation of {revoked} ends at {until}, which has passed")]
     RevocationPassed {
