@@ -89,8 +89,10 @@ service Control {
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
   // Scope: admin on the database.
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
-  // Removes a database for good: its record, lease, and any promotion. Its replicas close and
-  // delete their copies once they learn of it; `Locate` answers NOT_FOUND from then on.
+  // Removes a database for good: its record, lease, and any promotion. The control node tells
+  // its replicas through `Replication.DropCopy`, and each closes and deletes its copy; one that
+  // misses the notice keeps its copy as an orphan (ADR-0042). `Locate` answers NOT_FOUND from
+  // then on.
   // Scope: admin on the database.
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
   // Records new durability settings for a database, which take effect at its next lease
@@ -533,6 +535,12 @@ service Replication {
   // Scope: node.
   // Binding: candidate.
   rpc Promote(PromoteRequest) returns (PromoteResponse);
+  // The control node that dropped or expired a database tells each replica, so that it deletes
+  // its copy (ADR-0042). The replica asks control state first, and deletes only a copy at or
+  // below the drop's epoch of a database control state no longer holds at that epoch.
+  // Scope: node.
+  // Binding: dropped.
+  rpc DropCopy(DropCopyRequest) returns (DropCopyResponse);
 }
 
 message ReplicateMessage {
@@ -626,6 +634,14 @@ message PromoteRequest {
 
 message PromoteResponse {}
 
+message DropCopyRequest {
+  string database = 1;
+  // The epoch the database was at when it was dropped.
+  uint64 epoch = 2;
+}
+
+message DropCopyResponse {}
+
 message SnapshotRequest {
   string database = 1;
   uint64 epoch = 2;
@@ -659,7 +675,7 @@ service Database {
   // Scope: admin on the database.
   rpc Create(CreateRequest) returns (CreateResponse);
   // What this node knows on its own, without asking the control plane: its membership epoch and
-  // ring fingerprint, and the databases it serves with their roles.
+  // ring fingerprint, the databases it serves with their roles, and the orphan copies it keeps.
   // Scope: read or stream per database listed, or fleet.
   rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
   // The leases this node holds, as the node itself sees them (FR-042): first every database it
@@ -695,6 +711,30 @@ service Database {
   // UNIMPLEMENTED.
   // Scope: read on the database.
   rpc Schema(SchemaRequest) returns (SchemaResponse);
+  // Deletes this node's orphan copy of a database: one it kept, closed, because the control
+  // plane didn't know the database or held it only at a lower epoch, and no drop was seen
+  // (ADR-0042). Refused for a name the node serves, follows, or is dropping.
+  // Scope: fleet.
+  rpc RemoveOrphan(RemoveOrphanRequest) returns (RemoveOrphanResponse);
+}
+
+message RemoveOrphanRequest {
+  string database = 1;
+}
+
+message RemoveOrphanResponse {
+  // The highest epoch the removed copy had recorded.
+  uint64 epoch = 1;
+}
+
+// A copy this node keeps, closed, because the control plane didn't know its database or held it
+// only at a lower epoch, and the node saw no drop (ADR-0042).
+message OrphanStatus {
+  string database = 1;
+  // The highest epoch the copy has recorded.
+  uint64 epoch = 2;
+  // The size of the copy's files on disk.
+  uint64 bytes = 3;
 }
 
 // What kind of object a schema entry is (ADR-0041 point 6).
@@ -895,6 +935,9 @@ message NodeStatusResponse {
   // Each change sink's progress on each database this node feeds it, in sink and database
   // order (FR-039).
   repeated ChangeSinkStatus sinks = 5;
+  // The orphan copies this node keeps, in name order (ADR-0042). Empty from a node that
+  // predates the field, which never keeps one.
+  repeated OrphanStatus orphans = 6;
 }
 
 // One change sink's progress on one database.

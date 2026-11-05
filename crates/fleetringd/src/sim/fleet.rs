@@ -1508,6 +1508,13 @@ impl Fleet {
             )
             .into());
         }
+        check::copies_kept_until_dropped(&log, &self.history(), |node, database| {
+            self.data_dir(node).is_some_and(|dir| {
+                dir.join(crate::daemon::DATABASES_DIR)
+                    .join(crate::layout::database_dir(database))
+                    .exists()
+            })
+        })?;
         let trace = self.trace();
         let history = self.history();
         check::lease_events_match_control(&history, log.lease_holders())?;

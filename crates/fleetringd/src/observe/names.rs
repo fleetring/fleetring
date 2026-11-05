@@ -231,6 +231,13 @@ pub const FAMILIES: &[FamilySpec] = &[
          factor",
     ),
     family(
+        "fleetring_databases_orphaned",
+        Gauge,
+        &[],
+        "Copies this node keeps, closed, as orphans: the control plane didn't know their \
+         databases, and no drop was seen",
+    ),
+    family(
         "fleetring_leases_held",
         Gauge,
         &[],

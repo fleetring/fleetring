@@ -51,6 +51,27 @@ pub struct PromotionRequest {
     pub replication_factor: ReplicationFactor,
 }
 
+/// A drop a control node told this node of through `DropCopy` (ADR-0042).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DropNotice {
+    /// The epoch the database was at when it was dropped.
+    pub(crate) epoch: LeaseEpoch,
+    /// How many notices of a drop of the name have arrived since this node started, so that a
+    /// watcher tells a new one from one it acted on.
+    pub(crate) count: u64,
+}
+
+/// A copy this node keeps as an orphan (ADR-0042), as [`Replication::orphans`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Orphan {
+    /// The database the copy is of.
+    pub(crate) database: DatabaseName,
+    /// The highest epoch the copy recorded.
+    pub(crate) epoch: LeaseEpoch,
+    /// The size of its files on disk.
+    pub(crate) bytes: u64,
+}
+
 /// What a fenced replica reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -116,6 +137,7 @@ pub(super) async fn fence(
             inner.engine.kind()
         )));
     }
+    inner.check_not_orphan(database)?;
     step_down(inner, database, epoch).await;
     let slot = inner.slot(database);
     let _exclusive = exclusive(inner, &slot).await?;
@@ -176,6 +198,7 @@ pub(super) async fn fetch_rpc(
     request: FetchRequest,
 ) -> Result<FetchResponse, Status> {
     let name = parse_name(&request.database)?;
+    inner.check_not_orphan(&name)?;
     let record = inner.epochs.record(&name);
     if inner.epochs.highest(&name) != Some(request.epoch) {
         return Err(Status::failed_precondition(format!(
@@ -226,6 +249,7 @@ pub(super) fn promote_rpc(inner: &Inner, request: PromoteRequest) -> Result<(), 
         .ok()
         .and_then(ReplicationFactor::new)
         .ok_or_else(|| Status::invalid_argument("invalid replication factor"))?;
+    inner.check_not_orphan(&name)?;
     let epoch = LeaseEpoch::new(request.epoch);
     if inner
         .epochs
@@ -248,6 +272,18 @@ pub(super) fn promote_rpc(inner: &Inner, request: PromoteRequest) -> Result<(), 
     Ok(())
 }
 
+/// The `DropCopy` RPC, once its binding has confirmed the drop with control state: queues the
+/// drop for the node's lease keeper, which deletes the copy (ADR-0042).
+pub(super) fn drop_rpc(inner: &Inner, database: DatabaseName, epoch: LeaseEpoch) {
+    inner.drops.send_modify(|drops| {
+        let notice = drops
+            .entry(database)
+            .or_insert(DropNotice { epoch, count: 0 });
+        notice.epoch = epoch;
+        notice.count += 1;
+    });
+}
+
 /// Admits a stream that opens at `epoch` from `primary`: refuses an older epoch, or another node
 /// than the epoch's recorded holder, and steps down as primary for a newer one.
 pub(super) async fn admit_stream(
@@ -256,6 +292,7 @@ pub(super) async fn admit_stream(
     epoch: u64,
     primary: Option<&NodeId>,
 ) -> Result<(), Status> {
+    inner.check_not_orphan(database)?;
     if inner
         .epochs
         .highest(database)
@@ -753,8 +790,77 @@ impl Replication {
         };
         drop(exclusive);
         inner.lock_followers().remove(database);
-        tracing::info!(database = %database, "discarded the dropped database");
+        inner.lock_orphans().remove(database);
+        tracing::info!(database = %database, "discarded the database's copy");
         deleted.and(forgotten)
+    }
+
+    /// Keeps this node's copy of `database` as an orphan (ADR-0042): stops serving it as
+    /// primary, ends any stream following it, and closes it, but keeps its files and its epochs.
+    /// From then on, streams, fences, fetches, and promotions naming it are refused, until
+    /// [`discard`](Self::discard) deletes it.
+    ///
+    /// Returns the highest epoch the copy recorded if it has just become an orphan, and `None`
+    /// if it was one already, or if this node has no record of the database.
+    pub(crate) async fn orphan(&self, database: &DatabaseName) -> Option<LeaseEpoch> {
+        let inner = &self.inner;
+        let epoch = self.highest_epoch(database)?;
+        {
+            let mut orphans = inner.lock_orphans();
+            if orphans.contains_key(database) {
+                return None;
+            }
+            orphans.insert(database.clone(), epoch);
+        }
+        let removed = inner.withdraw_primary(database);
+        drop(removed);
+        let slot = inner.slot_if_any(database);
+        // The stream holding the copy ends first; one that opens later is refused.
+        let exclusive = match &slot {
+            Some(slot) => Some(exclusive(inner, slot).await),
+            None => None,
+        };
+        inner.registry().close(database).await;
+        drop(exclusive);
+        inner.lock_followers().remove(database);
+        Some(epoch)
+    }
+
+    /// Whether this node keeps its copy of `database` as an orphan.
+    pub(crate) fn is_orphan(&self, database: &DatabaseName) -> bool {
+        self.inner.lock_orphans().contains_key(database)
+    }
+
+    /// How many copies this node keeps as orphans.
+    pub(crate) fn orphan_count(&self) -> usize {
+        self.inner.lock_orphans().len()
+    }
+
+    /// The copies this node keeps as orphans, in name order, each with its epoch and the size of
+    /// its files on disk.
+    pub(crate) async fn orphans(&self) -> Vec<Orphan> {
+        let listed: Vec<(DatabaseName, LeaseEpoch)> = self
+            .inner
+            .lock_orphans()
+            .iter()
+            .map(|(database, epoch)| (database.clone(), *epoch))
+            .collect();
+        let registry = self.inner.registry().clone();
+        blocking(self.inner.execution, move || {
+            listed
+                .into_iter()
+                .map(|(database, epoch)| {
+                    let bytes = size_on_disk(&registry.location(&database));
+                    Orphan {
+                        database,
+                        epoch,
+                        bytes,
+                    }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Every database this node has an epoch record for, in name order: those it leads or led,
@@ -787,4 +893,20 @@ impl Replication {
             }
         }
     }
+}
+
+/// The total size of the files under `path`, or 0 for what can't be read.
+fn size_on_disk(path: &std::path::Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| size_on_disk(&entry.path()))
+            .fold(0, u64::saturating_add)
+    })
 }

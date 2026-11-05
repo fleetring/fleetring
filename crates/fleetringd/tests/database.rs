@@ -3461,7 +3461,7 @@ mod expiry {
 
     /// A store whose every `put` hangs, so that a dropped database's flush runs to its limit.
     #[derive(Debug, Default)]
-    struct HangingStore(fleetringd::durability::MemoryStore);
+    pub(super) struct HangingStore(fleetringd::durability::MemoryStore);
 
     impl fleetringd::durability::ObjectStore for HangingStore {
         fn put(&self, _: &str, _: Vec<u8>) -> fleetringd::durability::StoreFuture<'_, ()> {
@@ -3485,7 +3485,11 @@ mod expiry {
         }
     }
 
-    async fn insert_note(client: &Client, database: &DatabaseName, n: i64) -> TestResult {
+    pub(super) async fn insert_note(
+        client: &Client,
+        database: &DatabaseName,
+        n: i64,
+    ) -> TestResult {
         client
             .execute(
                 database,
@@ -3589,7 +3593,7 @@ mod expiry {
 
     /// Where a [`switching_proxy`] sends new connections.
     #[derive(Debug, Clone)]
-    struct Switch(Arc<std::sync::Mutex<std::net::SocketAddr>>);
+    pub(super) struct Switch(Arc<std::sync::Mutex<std::net::SocketAddr>>);
 
     impl Switch {
         fn set(&self, target: std::net::SocketAddr) {
@@ -3624,8 +3628,11 @@ mod expiry {
         Ok((address, switch))
     }
 
-    /// A control daemon and three data daemons that reach it through a [`switching_proxy`].
-    async fn proxied_fleet(dir: &Path) -> Result<(Fleet, Switch), Box<dyn std::error::Error>> {
+    /// A control daemon and three data daemons that reach it through a [`switching_proxy`]. The
+    /// data daemons refresh their sampled gauges every 100 ms.
+    pub(super) async fn proxied_fleet(
+        dir: &Path,
+    ) -> Result<(Fleet, Switch), Box<dyn std::error::Error>> {
         let tls = super::Tls::create(dir)?;
         let control_text = format!(
             "{}\n[control]\n",
@@ -3638,7 +3645,10 @@ mod expiry {
         let mut data = Vec::new();
         for id in DATA {
             let text = super::config(dir, &tls, id, "data", Some(proxy))?;
-            data.push(fleetringd::Daemon::start(fleetringd::Config::from_toml(&text)?).await?);
+            let mut config = fleetringd::Config::from_toml(&text)?;
+            config.admin.sample_interval_ms =
+                std::num::NonZeroU64::new(100).ok_or("a zero interval")?;
+            data.push(fleetringd::Daemon::start(config).await?);
         }
         let fleet = Fleet { control, data, tls };
         fleet.converge().await?;
@@ -3648,7 +3658,7 @@ mod expiry {
     /// Replaces the fleet's control plane with one whose state was built from nothing, as after
     /// `control.db` was lost or replaced: it knows the data nodes and holds `databases` as new
     /// databases of their names, never leased. The data nodes reach it through `switch`.
-    async fn replace_control_plane(
+    pub(super) async fn replace_control_plane(
         fleet: Fleet,
         switch: &Switch,
         dir: &Path,
@@ -3693,7 +3703,7 @@ mod expiry {
     }
 
     /// The node holding a copy of `database`, and the copy's rows, read from its files.
-    fn copies(dir: &Path, database: &str) -> Vec<(&'static str, Vec<i64>)> {
+    pub(super) fn copies(dir: &Path, database: &str) -> Vec<(&'static str, Vec<i64>)> {
         DATA.iter()
             .filter_map(|id| {
                 let rows = super::notes_in(&super::database_file(dir, id, database)).ok()?;
@@ -3749,7 +3759,9 @@ mod expiry {
         assert!(
             refused.message().contains(&format!(
                 "solo has a copy on node {primary} from epoch 1 that the control plane doesn't know"
-            )),
+            )) && refused
+                .message()
+                .contains(&format!("`fleetringd orphan remove solo --node {primary}`")),
             "{refused}"
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3826,6 +3838,418 @@ mod expiry {
                 .any(|(id, rows)| *id == follower.as_str() && *rows == [1, 2, 3]),
             "the follower's copy is kept"
         );
+        fleet.stop().await;
+        Ok(())
+    }
+}
+
+/// FR-077 part 1: a data node deletes a copy only after it saw the database's drop; every other
+/// copy the control plane doesn't know is kept as an orphan (ADR-0042).
+mod orphans {
+    use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use fleetring::ReplicationFactor;
+    use fleetringd::auth::Grant;
+    use fleetringd::clock::{Clock as _, SystemClock};
+    use fleetringd::data::Client;
+    use fleetringd::engine::Statement;
+    use fleetringd::transport::Credentials;
+    use tonic::Code;
+
+    use super::archives::ARCHIVE;
+    use super::expiry::{HangingStore, copies, insert_note, proxied_fleet, replace_control_plane};
+    use super::{DATA, Fleet, TestResult, name, network, three, wait_until};
+
+    /// What a node reports as orphans: each database with its epoch, in name order.
+    type Reported = Vec<(String, u64)>;
+
+    /// The orphans data daemon `id` reports in its node status.
+    async fn orphans_of(fleet: &Fleet, id: &str) -> Result<Reported, Box<dyn Error>> {
+        let address = fleet.data_daemon(id)?.listen_address().to_string();
+        let status = Client::new(address.clone(), network(&fleet.tls)?)
+            .node_status(&address)
+            .await?;
+        assert!(
+            status.orphans.iter().all(|orphan| orphan.bytes > 0),
+            "{:?}",
+            status.orphans
+        );
+        Ok(status
+            .orphans
+            .iter()
+            .map(|orphan| (orphan.database.to_string(), orphan.epoch.get()))
+            .collect())
+    }
+
+    /// The `fleetring_databases_orphaned` gauge data daemon `id` exposes.
+    fn orphaned_gauge(fleet: &Fleet, id: &str) -> Result<Option<f64>, Box<dyn Error>> {
+        let text = fleet.data_daemon(id)?.metrics().encode();
+        Ok(text
+            .lines()
+            .find(|line| line.starts_with("fleetring_databases_orphaned"))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok()))
+    }
+
+    /// Whether every data daemon reports exactly `expected`'s orphans, and counts them.
+    async fn reports(fleet: &Fleet, expected: &BTreeMap<&str, Reported>) -> bool {
+        for id in DATA {
+            let wanted = expected.get(id).cloned().unwrap_or_default();
+            let counted = u32::try_from(wanted.len()).map(f64::from).ok();
+            if !orphans_of(fleet, id).await.is_ok_and(|got| got == wanted)
+                || orphaned_gauge(fleet, id).ok().flatten() != counted
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Creates `database` with `replicas` replicas, a `notes` table, and the rows 1 to 3, and
+    /// waits until each replica's files hold them.
+    async fn create_noted(
+        dir: &Path,
+        client: &Client,
+        database: &str,
+        replicas: ReplicationFactor,
+    ) -> TestResult {
+        let named = name(database)?;
+        client.create_database(&named, replicas).await?;
+        client
+            .execute(
+                &named,
+                Statement::new("CREATE TABLE notes (n INTEGER NOT NULL)"),
+            )
+            .await?;
+        for n in 1..=3 {
+            insert_note(client, &named, n).await?;
+        }
+        let wanted = usize::from(replicas.get());
+        wait_until("every replica holding the rows", async || {
+            copies(dir, database)
+                .iter()
+                .filter(|(_, rows)| *rows == [1, 2, 3])
+                .count()
+                == wanted
+        })
+        .await
+    }
+
+    /// The orphans each node should report once the control plane forgets `databases`: one per
+    /// copy on its disk, at epoch 1.
+    fn every_copy(dir: &Path, databases: &[&str]) -> BTreeMap<&'static str, Reported> {
+        let mut expected: BTreeMap<&'static str, Reported> = BTreeMap::new();
+        for database in databases {
+            for (id, _) in copies(dir, database) {
+                expected
+                    .entry(id)
+                    .or_default()
+                    .push(((*database).to_owned(), 1));
+            }
+        }
+        for reported in expected.values_mut() {
+            reported.sort();
+        }
+        expected
+    }
+
+    /// A fleet whose control plane comes back empty, as after `control.db` was lost or a node was
+    /// pointed at the wrong fleet, deletes nothing: every primary's renewal and every follower's
+    /// ended stream find the database unknown, and each node keeps its copies as orphans,
+    /// reports them in its node status, and counts them, across a restart too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_control_plane_leaves_every_copy_as_an_orphan() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "trio", three()?).await?;
+        create_noted(dir.path(), &client, "solo", ReplicationFactor::ONE).await?;
+        let before = (copies(dir.path(), "trio"), copies(dir.path(), "solo"));
+        let expected = every_copy(dir.path(), &["solo", "trio"]);
+        assert_eq!(expected.len(), DATA.len(), "{expected:?}");
+
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[]).await?;
+        wait_until("every node reporting its copies as orphans", async || {
+            reports(&fleet, &expected).await
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = (copies(dir.path(), "trio"), copies(dir.path(), "solo"));
+        assert_eq!(after, before, "nothing was deleted");
+        for id in DATA {
+            let replication = fleet
+                .data_daemon(id)?
+                .replication()
+                .ok_or("no replication")?;
+            for database in ["trio", "solo"] {
+                assert_eq!(replication.serving(&name(database)?), None, "{id}");
+            }
+        }
+
+        // The recovery pass after a restart finds the same, and keeps the same.
+        let Fleet { control, data, tls } = fleet;
+        let mut restarted = Vec::new();
+        for daemon in data {
+            let config = daemon.config().clone();
+            daemon.run_until(async {}).await;
+            restarted.push(fleetringd::Daemon::start(config).await?);
+        }
+        let fleet = Fleet {
+            control,
+            data: restarted,
+            tls,
+        };
+        wait_until("every restarted node reporting its orphans", async || {
+            reports(&fleet, &expected).await
+        })
+        .await?;
+        let after = (copies(dir.path(), "trio"), copies(dir.path(), "solo"));
+        assert_eq!(after, before, "nothing was deleted after the restart");
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// A primary whose renewal is answered `NOT_FOUND` stops serving and keeps its copy as an
+    /// orphan, which a creation of the name on it refuses, naming the command that removes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renewal_answered_not_found_keeps_the_copy() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "solo", ReplicationFactor::ONE).await?;
+        let solo = name("solo")?;
+        let primary = client.locate(&solo).await?.primary.ok_or("no primary")?;
+        let before = copies(dir.path(), "solo");
+
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[]).await?;
+        let replication = fleet
+            .data_daemon(primary.as_str())?
+            .replication()
+            .ok_or("no replication")?;
+        wait_until("the primary keeping its copy as an orphan", async || {
+            replication.serving(&solo).is_none()
+                && orphans_of(&fleet, primary.as_str())
+                    .await
+                    .is_ok_and(|orphans| orphans == [("solo".to_owned(), 1)])
+        })
+        .await?;
+        assert_eq!(copies(dir.path(), "solo"), before, "the copy is kept");
+
+        // The name is free in the control plane, but not on the node holding the orphan.
+        let refused = fleet
+            .client()?
+            .create_database(&solo, ReplicationFactor::ONE)
+            .await
+            .expect_err("an orphan is there");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused
+                .message()
+                .contains(&format!("`fleetringd orphan remove solo --node {primary}`")),
+            "{refused}"
+        );
+        assert_eq!(copies(dir.path(), "solo"), before, "the copy is kept");
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// Followers whose streams end and find the control plane's database of the name at a lower
+    /// epoch, as after `control.db` was replaced and the operator created the name again, keep
+    /// their copies as orphans.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_follower_whose_stream_ends_at_a_lower_epoch_keeps_its_copy() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "trio", three()?).await?;
+        let trio = name("trio")?;
+        let location = client.locate(&trio).await?;
+        let followers: Vec<String> = location
+            .followers()
+            .map(|follower| follower.node.to_string())
+            .collect();
+        assert_eq!(followers.len(), 2);
+        let before = copies(dir.path(), "trio");
+
+        // The new control plane holds a never-leased database of the name, at epoch 0.
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[("trio", 3)]).await?;
+        let expected = every_copy(dir.path(), &["trio"]);
+        wait_until("every node keeping its copy as an orphan", async || {
+            reports(&fleet, &expected).await
+        })
+        .await?;
+        for follower in &followers {
+            assert_eq!(
+                orphans_of(&fleet, follower).await?,
+                [("trio".to_owned(), 1)],
+                "{follower}"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(copies(dir.path(), "trio"), before, "nothing was deleted");
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// `RemoveOrphan` deletes exactly the orphan it names and nothing else; it refuses a name the
+    /// node serves, a name it holds no copy of, and a caller without the `fleet` scope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_an_orphan_deletes_that_copy_alone_and_needs_the_fleet_scope() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "trio", three()?).await?;
+        create_noted(
+            dir.path(),
+            &client,
+            "duo",
+            ReplicationFactor::new(2).ok_or("zero")?,
+        )
+        .await?;
+        let expected = every_copy(dir.path(), &["duo", "trio"]);
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[]).await?;
+        wait_until("every node reporting its orphans", async || {
+            reports(&fleet, &expected).await
+        })
+        .await?;
+        let (node, _) = copies(dir.path(), "duo")
+            .first()
+            .cloned()
+            .ok_or("no copy of duo")?;
+        let address = fleet.data_daemon(node)?.listen_address().to_string();
+        let admin = Client::new(address.clone(), network(&fleet.tls)?);
+
+        // A database the new control plane created is served, not an orphan.
+        let client = fleet.client()?;
+        let fresh = name("fresh")?;
+        client.create_database(&fresh, three()?).await?;
+        let served = admin
+            .remove_orphan(&address, &fresh)
+            .await
+            .expect_err("served");
+        assert_eq!(served.code(), Code::FailedPrecondition, "{served}");
+        let absent = admin
+            .remove_orphan(&address, &name("never")?)
+            .await
+            .expect_err("no copy");
+        assert_eq!(absent.code(), Code::NotFound, "{absent}");
+
+        // Admin on every database isn't enough: removing an orphan is a fleet operation.
+        let signer = fleet.tls.authority().token_signer()?;
+        let now = SystemClock.now();
+        let token = signer.issue(&Grant {
+            principal: "tester".parse()?,
+            scopes: ["admin:*".parse()?].into_iter().collect(),
+            id: "no-fleet".parse()?,
+            not_before: now,
+            expires_at: now.saturating_add(fleetring_control::Millis::new(600_000)),
+        })?;
+        let scoped = Client::new(
+            address.clone(),
+            network(&fleet.tls)?.with_credentials(Credentials::bearer(&token)?),
+        );
+        let duo = name("duo")?;
+        let denied = scoped
+            .remove_orphan(&address, &duo)
+            .await
+            .expect_err("needs fleet");
+        assert_eq!(denied.code(), Code::PermissionDenied, "{denied}");
+
+        // The orphan goes, and only it.
+        let epoch = admin.remove_orphan(&address, &duo).await?;
+        assert_eq!(epoch.get(), 1);
+        assert!(
+            copies(dir.path(), "duo").iter().all(|(id, _)| *id != node),
+            "the orphan's files are gone"
+        );
+        let mut left = expected.clone();
+        if let Some(reported) = left.get_mut(node) {
+            reported.retain(|(database, _)| database != "duo");
+        }
+        left.retain(|_, reported| !reported.is_empty());
+        wait_until("the other orphans still reported", async || {
+            reports(&fleet, &left).await
+        })
+        .await?;
+        assert_eq!(copies(dir.path(), "trio").len(), DATA.len());
+        assert_eq!(
+            copies(dir.path(), "duo").len(),
+            1,
+            "the other node's orphan"
+        );
+        let again = admin
+            .remove_orphan(&address, &duo)
+            .await
+            .expect_err("removed already");
+        assert_eq!(again.code(), Code::NotFound, "{again}");
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// A dropped database's primary refuses to remove its copy as an orphan while it flushes the
+    /// copy's change streams, and deletes the copy itself once they are flushed, because the
+    /// control node told it of the drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_being_retired_is_not_an_orphan_to_remove() -> TestResult {
+        // Long enough that a loaded runner still asks while the flush runs.
+        const LIMIT: Duration = Duration::from_secs(10);
+        let dir = tempfile::tempdir()?;
+        let table = format!(
+            "\n[[archive]]\nname = \"{ARCHIVE}\"\ndatabases = [\"*\"]\nstore = \"directory\"\n\
+             path = {:?}\nsegment_interval_ms = 50\n",
+            dir.path().join("archive")
+        );
+        let data_environment = fleetringd::Environment::production()
+            .with_object_store(ARCHIVE, Arc::new(HangingStore::default()))
+            .with_drop_flush_limit(LIMIT);
+        let fleet = Fleet::start_in(
+            dir.path(),
+            "",
+            "",
+            &table,
+            fleetringd::Environment::production(),
+            &data_environment,
+        )
+        .await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "doomed", three()?).await?;
+        let doomed = name("doomed")?;
+        let primary = client.locate(&doomed).await?.primary.ok_or("no primary")?;
+        let address = fleet
+            .data_daemon(primary.as_str())?
+            .listen_address()
+            .to_string();
+        let at_primary = Client::new(address.clone(), network(&fleet.tls)?);
+
+        // The primary keeps its copy open while it flushes, but answers no request for it.
+        client.drop_database(&doomed).await?;
+        let through_primary = fleet.client()?.with_entry(address.clone());
+        wait_until("the primary stopping", async || {
+            through_primary
+                .query(&doomed, Statement::new("SELECT 1"))
+                .await
+                .is_err_and(|status| status.code() == Code::NotFound)
+        })
+        .await?;
+        let retiring = at_primary
+            .remove_orphan(&address, &doomed)
+            .await
+            .expect_err("being retired");
+        assert_eq!(retiring.code(), Code::FailedPrecondition, "{retiring}");
+        assert!(retiring.message().contains("being retired"), "{retiring}");
+
+        // The drop was told, so every copy goes, the primary's once its flush times out.
+        wait_until("every copy deleted", async || {
+            copies(dir.path(), "doomed").is_empty()
+        })
+        .await?;
+        for id in DATA {
+            assert!(orphans_of(&fleet, id).await?.is_empty(), "{id}");
+        }
         fleet.stop().await;
         Ok(())
     }

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use fleetring_proto::v1::replication_server::Replication as ReplicationRpc;
 use fleetring_proto::v1::{
-    FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest, PromoteResponse,
-    ReplicateAck, ReplicateMessage, SnapshotRequest,
+    DropCopyRequest, DropCopyResponse, FenceRequest, FenceResponse, FetchRequest, FetchResponse,
+    PromoteRequest, PromoteResponse, ReplicateAck, ReplicateMessage, SnapshotRequest,
 };
 use fleetringd::engine::Position;
 use fleetringd::replication::ReplicationService;
@@ -149,6 +149,13 @@ impl ReplicationRpc for Proxy {
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
         self.inner.promote(request).await
+    }
+
+    async fn drop_copy(
+        &self,
+        request: Request<DropCopyRequest>,
+    ) -> Result<Response<DropCopyResponse>, Status> {
+        self.inner.drop_copy(request).await
     }
 }
 

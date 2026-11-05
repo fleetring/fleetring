@@ -21,6 +21,8 @@
 //! - [`chains_agree`] once replicas converge and at the end, over the hash chains of every
 //!   running replica the primary counts as following its log
 //!   ([`Fleet::check_chains`](crate::sim::Fleet::check_chains)).
+//! - [`copies_kept_until_dropped`] at the end, over the data hosts' disks, the control log, and
+//!   what the lease watchers saw (ADR-0042).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,7 +30,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{Command, ControlConfig, DatabaseName, LeaseEpoch, State, apply};
+use fleetring_control::{Action, Command, ControlConfig, DatabaseName, LeaseEpoch, State, apply};
 
 use crate::MembershipView;
 use crate::changes::{ChangeRecord, RecordContent, unhex};
@@ -82,6 +84,9 @@ pub enum Invariant {
     /// commit order, with no write that was refused or never made, and, restored to the latest
     /// point, every write acknowledged before the archive caught up (FR-049).
     ArchiveRestoresAcknowledgedPrefix,
+    /// No node deletes a copy of a database the control log never dropped or expired: every
+    /// node that served such a database still holds a copy of it (ADR-0042).
+    CopiesKeptUntilDropped,
 }
 
 impl fmt::Display for Invariant {
@@ -103,6 +108,7 @@ impl fmt::Display for Invariant {
             Self::ChainAgrees => "hash chains agree",
             Self::NodeCallsBound => "node calls bound to placement",
             Self::ArchiveRestoresAcknowledgedPrefix => "archive restores an acknowledged prefix",
+            Self::CopiesKeptUntilDropped => "copies kept until dropped",
         })
     }
 }
@@ -216,6 +222,48 @@ pub fn ring_converged<'a>(
 
 /// Who held each database's lease at each epoch: what control granted, by database and epoch.
 pub type LeaseHolders = BTreeMap<(DatabaseName, LeaseEpoch), NodeId>;
+
+/// Checks that no node deleted a copy of a database the control log never dropped or expired
+/// (ADR-0042): every node its lease watcher in `history` saw serving such a database still holds
+/// a copy of it, as `has_copy` finds on its disk. A node deletes a copy only after it saw the
+/// database's drop, so a copy that goes missing without one was deleted by absence.
+///
+/// # Errors
+///
+/// [`Invariant::CopiesKeptUntilDropped`] naming the first node whose copy is gone.
+pub fn copies_kept_until_dropped(
+    log: &ControlLog,
+    history: &History,
+    has_copy: impl Fn(&str, &DatabaseName) -> bool,
+) -> Result<(), Violation> {
+    let dropped: BTreeSet<&DatabaseName> = log
+        .commands()
+        .iter()
+        .filter_map(|command| match &command.action {
+            Action::DropDatabase { name } | Action::ExpireDatabase { name } => Some(name),
+            _ => None,
+        })
+        .collect();
+    let served: BTreeSet<(&str, &DatabaseName)> = history
+        .lease_observations()
+        .iter()
+        .filter(|observation| observation.is_holding())
+        .map(|observation| (observation.node(), observation.database()))
+        .collect();
+    for (node, database) in served {
+        if dropped.contains(database) || has_copy(node, database) {
+            continue;
+        }
+        return Err(Violation::new(
+            Invariant::CopiesKeptUntilDropped,
+            format!(
+                "{node} served {database} and no longer has a copy of it, though the control log \
+                 never dropped it"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// What [`control_log_replays`] read from a control log.
 #[derive(Debug, Clone, PartialEq, Eq)]

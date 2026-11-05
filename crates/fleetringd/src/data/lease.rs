@@ -8,27 +8,30 @@
 //!   node can be granted a newer epoch meanwhile (point 6). Safety never depends on this timer:
 //!   followers fenced at a newer epoch refuse the old primary's batches, so it can't acknowledge
 //!   a write however long it takes to notice.
-//! - **Dropped databases.** A renewal refused as an unknown database means the database was
-//!   dropped, by `db drop` or because its expiry passed. One refused because the name now
-//!   belongs to a database that has never been leased isn't: control state that was lost or
-//!   replaced looks the same, so the node demotes and keeps its copy, an orphan that a creation
-//!   or restore of the name on this node refuses, naming it. After a drop, the primary stops
-//!   serving within one renewal interval, so it admits no write after that. Before it deletes
-//!   its copy, it flushes the database's change streams, its
-//!   archive included, for up to [`DROP_FLUSH_LIMIT`] (ADR-0041, point 4): every stream
-//!   delivers what the copy acknowledged, and an archive puts its open segment at once, so the
-//!   archive holds every acknowledged write. A flush that runs out of time, or a primary that is
-//!   down when the drop happens, leaves the archive as of its last archived segment, and the
-//!   writes acknowledged after it are lost with the copy; without an archive, the copy is all
-//!   there was. The flush runs beside the renewals, so it never holds up another database's
-//!   lease. Until the copy is deleted, the node refuses to create or restore a database of the
-//!   same name with `UNAVAILABLE`, which clients retry, and the deletion leaves the copy alone
-//!   if the node serves the name at another epoch by then. The primary's streams to its
-//!   followers end once the copy is deleted, and a follower whose stream ends asks the control
-//!   plane whether the database still exists; if not, it deletes its copy too. A node that was
-//!   away makes the same check for every database it has a record of when it recovers. A
-//!   follower whose primary went down before it noticed the drop has no stream to end, and
-//!   keeps its copy until it restarts (ADR-0041, amendment 7).
+//! - **Dropped databases.** A node deletes a copy only when it saw the database's drop itself
+//!   (ADR-0042): the control node that dropped or expired the database tells each replica
+//!   through `Replication.DropCopy`, and the replica deletes its copy once control state agrees
+//!   that it no longer holds the database at that epoch. Absence alone is never a drop: control
+//!   state that was lost, replaced, or rolled back, or a node pointed at another fleet, says
+//!   the same. So a renewal refused as an unknown database, a renewal refused because the name
+//!   now belongs to a database that has never been leased, a follower whose stream ends and
+//!   finds the database gone or at a lower epoch, and a recovery pass that finds the same, each
+//!   keep the copy as an **orphan**: closed, neither served nor replicated, logged at warn once,
+//!   listed in `status --node`, and counted in `fleetring_databases_orphaned`. A creation or
+//!   restore of the name on the node refuses it, naming it, and `fleetringd orphan remove`
+//!   deletes it.
+//! - **Retiring.** A primary that stops serving because the control plane no longer knows its
+//!   database, by a notice or a refused renewal, admits no write after that. It flushes the
+//!   database's change streams, its archive included, for up to [`DROP_FLUSH_LIMIT`] (ADR-0041,
+//!   point 4): every stream delivers what the copy acknowledged, and an archive puts its open
+//!   segment at once, so the archive holds every acknowledged write. A flush that runs out of
+//!   time, or a primary that is down when the drop happens, leaves the archive as of its last
+//!   archived segment. The flush runs beside the renewals, so it never holds up another
+//!   database's lease. Then the copy is deleted if a drop notice arrived, before or during the
+//!   flush, and kept as an orphan otherwise. Until then, the node refuses to create or restore
+//!   a database of the same name with `UNAVAILABLE`, which clients retry, and the deletion
+//!   leaves the copy alone if the node serves the name at another epoch by then. A node that
+//!   was down when the drop happened gets no notice, and keeps its copy as an orphan.
 //! - **After a restart**, the node asks the control plane about every database it has an epoch
 //!   record for, and leads each one whose lease it holds at once, rather than when the first
 //!   request arrives. The same pass reads its copies' positions, so its heartbeats report them.
@@ -62,7 +65,7 @@ use tonic::{Code, Status};
 use crate::changes::{Flushed, HeldStreams};
 use crate::control::missing_database;
 use crate::data::drain::DrainSettings;
-use crate::data::node::{DataNode, HeldLease, Retiring};
+use crate::data::node::{DataNode, Fate, HeldLease, Retiring};
 use crate::engine::Position;
 use crate::replication::{Fenced, PromotionRequest, Replication};
 
@@ -138,10 +141,15 @@ async fn run(node: DataNode, settings: LeaseSettings) {
     // The drain this node runs because the membership says it is draining, until the membership
     // says otherwise, as after it joins again.
     let mut draining: Option<AbortOnDrop> = None;
-    // Dropped databases the renewals found, each flushed and deleted in a task of its own, so
-    // that a slow flush holds up no renewal. The tasks are aborted when the keeper stops, as at
-    // shutdown: a copy whose flush or deletion was cut short stays on disk until the node's
-    // next start, whose recovery pass finds the database gone and deletes it, unflushed.
+    let mut drops = node.replication().drops();
+    // A notice that arrived before the keeper started is acted on too.
+    drops.mark_changed();
+    let mut seen_drops: BTreeMap<DatabaseName, u64> = BTreeMap::new();
+    // Databases this node stopped serving because the control plane no longer knows them, each
+    // flushed, then deleted or kept, in a task of its own, so that a slow flush holds up no
+    // renewal. The tasks are aborted when the keeper stops, as at shutdown: a copy whose flush or
+    // deletion was cut short stays on disk, and the next start's recovery pass keeps it as an
+    // orphan.
     let (dropped_found, mut dropped) = mpsc::unbounded_channel::<Dropped>();
     let mut retiring = JoinSet::new();
     let mut ticks = tokio::time::interval(settings.renew_interval);
@@ -187,6 +195,22 @@ async fn run(node: DataNode, settings: LeaseSettings) {
             Some(_) = retiring.join_next() => {}
             Some(_) = restarting.join_next() => {}
             Some(_) = checking.join_next() => {}
+            changed = drops.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let notices = drops.borrow_and_update().clone();
+                for (database, notice) in notices {
+                    if seen_drops.insert(database.clone(), notice.count) == Some(notice.count) {
+                        continue;
+                    }
+                    let node = node.clone();
+                    let dropped_found = dropped_found.clone();
+                    checking.spawn(async move {
+                        drop_seen(&node, &database, notice.epoch, &dropped_found).await;
+                    });
+                }
+            }
             changed = ended.changed() => {
                 if changed.is_err() {
                     return;
@@ -198,7 +222,7 @@ async fn run(node: DataNode, settings: LeaseSettings) {
                     }
                     let node = node.clone();
                     checking.spawn(async move {
-                        discard_if_dropped(&node, &database).await;
+                        keep_if_unknown(&node, &database).await;
                     });
                 }
             }
@@ -243,8 +267,9 @@ fn is_settled(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) -> bo
 }
 
 /// Learns which of the databases this node has records of it holds the lease on, and leads
-/// them; reads its copies' positions for its heartbeats. Returns `false` if the control plane
-/// couldn't be reached, so the pass runs again.
+/// them; reads its copies' positions for its heartbeats; and keeps as an orphan each copy whose
+/// database the control plane doesn't know, or holds only at a lower epoch (ADR-0042). Returns
+/// `false` if the control plane couldn't be reached, so the pass runs again.
 ///
 /// Each database starts serving in a task of its own on `restarting`, since it waits for its
 /// followers first, and the lease keeper goes on renewing and promoting meanwhile.
@@ -253,20 +278,20 @@ async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
     let databases = replication.recorded_databases().await;
     replication.recover_positions(&databases).await;
     for name in &databases {
-        if node.held(name).is_some() {
+        if node.held(name).is_some() || replication.is_orphan(name) {
             continue;
         }
         let placement = match node.locate(name).await {
             Ok(placement) => placement,
             Err(status) if is_unreachable(&status) => return false,
             Err(status) if missing_database(&status).is_some() => {
-                discard(node, name).await;
+                keep_orphan(node, name, UNKNOWN).await;
                 continue;
             }
             Err(_) => continue,
         };
         if is_past_incarnation(node, name, &placement) {
-            discard(node, name).await;
+            keep_orphan(node, name, OLDER).await;
             continue;
         }
         if placement.primary.as_deref() != Some(node.id().as_str()) {
@@ -292,7 +317,8 @@ async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
 }
 
 /// Renews every lease the node holds, each within `limit`, and stops serving each one the control
-/// plane says is gone. A dropped one goes to `dropped`, to be flushed and deleted.
+/// plane says is gone. One the control plane doesn't know goes to `dropped`, to be flushed, and
+/// then kept as an orphan unless a drop notice arrives (ADR-0042).
 async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSender<Dropped>) {
     let mut renewals = JoinSet::new();
     for (database, lease) in node.held_leases() {
@@ -320,19 +346,21 @@ async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSe
         match renewed {
             Ok(Ok(_)) => {}
             Ok(Err(status)) if missing_database(&status).is_some() => {
-                tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped");
-                stop_dropped(node, &database, epoch, dropped).await;
+                // Not proof of a drop: an empty, older, or foreign control state answers the
+                // same. Only a drop notice deletes the copy (ADR-0042).
+                tracing::info!(database = %database, epoch = epoch.get(), "the control plane doesn't know the database; stopped serving it");
+                stop_serving(node, &database, epoch, Fate::Kept, dropped).await;
             }
             Ok(Err(status)) if is_lost(&status) => {
                 if created_again(node, &database).await {
-                    // Not proof of a drop: an empty or recreated control state looks the same.
-                    // The copy stays, an orphan a creation here refuses until an operator
-                    // removes it (ADR-0041, amendment 7).
-                    tracing::warn!(database = %database, epoch = epoch.get(), "the control plane's database of this name has never been leased; this node's copy from the earlier one is kept as an orphan");
+                    // Not proof of a drop either: an empty or recreated control state looks the
+                    // same. The copy stays, an orphan a creation here refuses (ADR-0042).
+                    demote(node, &database, epoch).await;
+                    keep_orphan(node, &database, NEVER_LEASED).await;
                 } else {
                     tracing::warn!(database = %database, epoch = epoch.get(), %status, "lost the lease");
+                    demote(node, &database, epoch).await;
                 }
-                demote(node, &database, epoch).await;
             }
             Ok(Err(status)) => {
                 tracing::debug!(database = %database, %status, "can't renew the lease; still serving");
@@ -344,18 +372,20 @@ async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSe
     }
 }
 
-/// Stops serving `database`, whose lease at `epoch` belongs to a dropped database, and hands
-/// it to `dropped`, to be flushed and deleted.
-async fn stop_dropped(
+/// Stops serving `database`, whose lease at `epoch` belongs to a database the control plane no
+/// longer knows, and hands it to `dropped`, to be flushed and then settled by `fate`, or by a
+/// drop notice that arrives meanwhile.
+async fn stop_serving(
     node: &DataNode,
     database: &DatabaseName,
     epoch: LeaseEpoch,
+    fate: Fate,
     dropped: &mpsc::UnboundedSender<Dropped>,
 ) {
     // Both taken before serving stops: the streams of a database the node no longer serves stop
     // as soon as they notice, and the name must never be free for a new database while the old
     // copy is still here.
-    let retiring = node.begin_retiring(database);
+    let retiring = node.begin_retiring(database, fate);
     let streams = node.change_streams().hold(database);
     if node.forget(database, epoch) {
         let found = Dropped {
@@ -365,10 +395,16 @@ async fn stop_dropped(
             _retiring: retiring,
         };
         if let Err(unsent) = dropped.send(found) {
-            // The keeper has stopped; the copy goes without a flush.
-            let Dropped { epoch, streams, .. } = unsent.0;
+            // The keeper has stopped; the copy is settled without a flush.
+            let Dropped {
+                epoch,
+                streams,
+                _retiring,
+                ..
+            } = unsent.0;
             drop(streams);
-            discard_retired(node, database, epoch).await;
+            settle(node, database, epoch).await;
+            drop(_retiring);
         }
     }
 }
@@ -383,8 +419,9 @@ async fn created_again(node: &DataNode, database: &DatabaseName) -> bool {
     )
 }
 
-/// Deletes the copy of a database this node stopped serving because it was dropped, once its
-/// change streams have delivered what the copy acknowledged, or once `limit` passes.
+/// Settles the copy of a database this node stopped serving because the control plane no longer
+/// knows it, once its change streams have delivered what the copy acknowledged, or once `limit`
+/// passes: deletes it if its drop was seen, and keeps it as an orphan otherwise.
 async fn retire(node: &DataNode, dropped: Dropped, limit: Duration) {
     let Dropped {
         database,
@@ -394,34 +431,53 @@ async fn retire(node: &DataNode, dropped: Dropped, limit: Duration) {
     } = dropped;
     match node.change_streams().flush_database(&database, limit).await {
         Flushed::Delivered => {
-            tracing::info!(database = %database, "flushed the dropped database's change streams");
+            tracing::info!(database = %database, "flushed the database's change streams");
         }
         Flushed::TimedOut => {
             tracing::warn!(
                 database = %database,
                 limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
-                "the dropped database's change streams didn't catch up in time; its archive \
-                 holds it as of its last archived segment"
+                "the database's change streams didn't catch up in time; its archive holds it \
+                 as of its last archived segment"
             );
         }
     }
     drop(streams);
-    discard_retired(node, &database, epoch).await;
+    settle(node, &database, epoch).await;
     // Only now may a new database take the name here.
     drop(_retiring);
 }
 
-/// Deletes the copy of `database` this node led at `epoch` until it was dropped, unless the node
-/// has since come to serve the name at another epoch, or seen a newer one: that copy is a newer
-/// database's, and stays.
-async fn discard_retired(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) {
+/// Deletes the copy of `database` this node led at `epoch` if its drop was seen, and keeps it as
+/// an orphan otherwise. A notice that arrives while the orphan is being kept still deletes it.
+///
+/// The drop's epoch may be past the lease's, as when a promotion to a newer epoch had begun
+/// when the database was dropped, and fenced this copy at it; the copy goes all the same.
+async fn settle(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) {
+    if node.fate(database) == Fate::Kept {
+        keep_orphan(node, database, UNKNOWN).await;
+    }
+    if let Fate::Deleted { epoch: dropped } = node.fate(database) {
+        discard_retired(node, database, epoch, epoch.max(dropped)).await;
+    }
+}
+
+/// Deletes the copy of `database` this node led at `epoch` until it was dropped at `dropped`,
+/// unless the node has since come to serve the name at another epoch, or seen one past
+/// `dropped`: that copy is a newer database's, and stays.
+async fn discard_retired(
+    node: &DataNode,
+    database: &DatabaseName,
+    epoch: LeaseEpoch,
+    dropped: LeaseEpoch,
+) {
     let replication = node.replication();
     let newer = replication
         .serving(database)
         .is_some_and(|role| role.epoch != epoch)
         || replication
             .highest_epoch(database)
-            .is_some_and(|highest| highest > epoch);
+            .is_some_and(|highest| highest > dropped);
     if newer {
         tracing::warn!(database = %database, epoch = epoch.get(), "the name serves a newer database here; the dropped copy's deletion leaves it alone");
         return;
@@ -436,21 +492,105 @@ async fn demote(node: &DataNode, database: &DatabaseName, epoch: LeaseEpoch) {
     }
 }
 
-/// Asks the control plane whether `database` still exists, and discards this node's copy if it
-/// doesn't, or if the copy belongs to a database that was dropped and created again under the
-/// name. A control plane that can't be reached, or any other failure, leaves the copy alone: the
-/// next ended stream or recovery pass asks again.
-async fn discard_if_dropped(node: &DataNode, database: &DatabaseName) {
+/// Asks the control plane whether `database` still exists, after a stream following it ended,
+/// and keeps this node's copy as an orphan if it doesn't, or if the control plane holds the name
+/// only at a lower epoch (ADR-0042). A control plane that can't be reached, or any other
+/// failure, leaves the copy as it is: the next ended stream or recovery pass asks again.
+async fn keep_if_unknown(node: &DataNode, database: &DatabaseName) {
+    if node.replication().is_orphan(database) {
+        return;
+    }
     match node.locate(database).await {
         Ok(placement) if is_past_incarnation(node, database, &placement) => {
-            discard(node, database).await;
+            keep_orphan(node, database, OLDER).await;
         }
         Ok(_) => {}
-        Err(status) if missing_database(&status).is_some() => discard(node, database).await,
+        Err(status) if missing_database(&status).is_some() => {
+            keep_orphan(node, database, UNKNOWN).await;
+        }
         Err(status) => {
             tracing::debug!(database = %database, %status, "can't ask whether the database still exists");
         }
     }
+}
+
+/// Why a copy was kept as an orphan: the control plane doesn't know its database.
+const UNKNOWN: &str =
+    "the control plane doesn't know the database, and no control node said it dropped it";
+
+/// Why a copy was kept as an orphan: the control plane holds the name at a lower epoch.
+const OLDER: &str = "the control plane holds the name only at a lower epoch than this copy's";
+
+/// Why a copy was kept as an orphan: the control plane's database of the name was never leased.
+const NEVER_LEASED: &str =
+    "the control plane's database of this name has never been leased, so it isn't this copy's";
+
+/// Keeps this node's copy of `database` as an orphan, closed, and logs it at warn the first time,
+/// saying `why` (ADR-0042).
+async fn keep_orphan(node: &DataNode, database: &DatabaseName, why: &'static str) {
+    node.forget_any(database);
+    if let Some(epoch) = node.replication().orphan(database).await {
+        tracing::warn!(
+            database = %database,
+            epoch = epoch.get(),
+            node = %node.id(),
+            reason = why,
+            "kept this node's copy as an orphan, closed; `fleetringd orphan remove` deletes it"
+        );
+    }
+}
+
+/// Acts on a drop a control node told this node of (ADR-0042): deletes this node's copy of
+/// `database`, after flushing its change streams if this node serves it.
+///
+/// The copy is deleted only if its highest epoch is at most `epoch`, the one the database was
+/// dropped at, and only while control state still agrees: it holds no database of the name, or
+/// one at a lower epoch. It is asked again here, since a database of the name may have been
+/// created and leased since the notice arrived. A control plane that can't be reached leaves the
+/// copy, which becomes an orphan the usual way.
+async fn drop_seen(
+    node: &DataNode,
+    database: &DatabaseName,
+    epoch: LeaseEpoch,
+    dropped: &mpsc::UnboundedSender<Dropped>,
+) {
+    let Some(highest) = node.replication().highest_epoch(database) else {
+        return;
+    };
+    if highest > epoch {
+        tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), "a drop notice names an older database than this node's copy; kept the copy");
+        return;
+    }
+    match node.locate(database).await {
+        Ok(placement) if placement.epoch < epoch.get() => {}
+        Err(status) if missing_database(&status).is_some() => {}
+        Ok(_) => {
+            tracing::info!(database = %database, epoch = epoch.get(), "the control plane holds the name at the dropped epoch again; kept the copy");
+            return;
+        }
+        Err(status) => {
+            tracing::info!(database = %database, epoch = epoch.get(), %status, "can't confirm a drop notice with the control plane; kept the copy");
+            return;
+        }
+    }
+    if node.confirm_drop(database, epoch) {
+        tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; its copy goes once its change streams are flushed");
+        return;
+    }
+    if let Some(lease) = node.held_leases().get(database).copied() {
+        tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; stopped serving it");
+        stop_serving(
+            node,
+            database,
+            lease.epoch,
+            Fate::Deleted { epoch },
+            dropped,
+        )
+        .await;
+        return;
+    }
+    tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; deleting this node's copy");
+    discard(node, database).await;
 }
 
 /// Whether this node's copy of `database` comes from a database that was dropped and created
@@ -462,8 +602,8 @@ fn is_past_incarnation(node: &DataNode, database: &DatabaseName, placement: &Pla
         .is_some_and(|highest| placement.epoch < highest.get())
 }
 
-/// Removes every trace of `database`, which the control plane no longer knows: the lease this
-/// node holds on it, its streams, its files, and its epochs.
+/// Removes every trace of `database`, whose drop this node saw: the lease this node holds on it,
+/// its streams, its files, and its epochs.
 async fn discard(node: &DataNode, database: &DatabaseName) {
     node.forget_any(database);
     if let Err(error) = node.replication().discard(database).await {

@@ -11,14 +11,14 @@ use fleetring_proto::v1::replication_server::Replication;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, Batch, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
-    FenceRequest, FenceResponse, FetchRequest, FetchResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
-    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Node, PromoteRequest,
-    PromoteResponse, PromotionResponse, ProtocolVersion, RecordFencedRequest, RecordFencedResponse,
-    RenewLeaseRequest, ReplicateAck, ReplicateMessage, ReplicateOpen, RevokeTokenRequest,
-    RevokeTokenResponse, SnapshotChunk, SnapshotRequest, StartPromotionRequest,
-    TransferLeaseRequest, WatchMembershipRequest,
+    CreateDatabaseResponse, DrainRequest, DrainResponse, DropCopyRequest, DropCopyResponse,
+    DropDatabaseRequest, DropDatabaseResponse, FenceRequest, FenceResponse, FetchRequest,
+    FetchResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse,
+    LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse, LocateRequest,
+    LocateResponse, MembershipUpdate, Node, PromoteRequest, PromoteResponse, PromotionResponse,
+    ProtocolVersion, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, ReplicateAck,
+    ReplicateMessage, ReplicateOpen, RevokeTokenRequest, RevokeTokenResponse, SnapshotChunk,
+    SnapshotRequest, StartPromotionRequest, TransferLeaseRequest, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use fleetringd::transport::{
@@ -244,6 +244,13 @@ impl Replication for StubReplication {
         &self,
         _request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn drop_copy(
+        &self,
+        _request: Request<DropCopyRequest>,
+    ) -> Result<Response<DropCopyResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }

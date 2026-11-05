@@ -39,6 +39,9 @@ pub enum Binding {
     HolderOrCandidate,
     /// The caller is a follower this primary streams the database to.
     Follower,
+    /// Control state no longer holds the database at the request's epoch: it was dropped, and
+    /// any database of the name now is a newer one at a lower epoch (ADR-0042).
+    Dropped,
 }
 
 impl Binding {
@@ -54,6 +57,7 @@ impl Binding {
             Self::Candidate => "candidate",
             Self::HolderOrCandidate => "holder or candidate",
             Self::Follower => "follower",
+            Self::Dropped => "dropped",
         }
     }
 }
@@ -97,6 +101,13 @@ pub enum Unbound {
         /// The database.
         database: DatabaseName,
     },
+    /// Control state still holds the database at the epoch, or a newer one.
+    NotDropped {
+        /// The database.
+        database: DatabaseName,
+        /// The epoch.
+        epoch: LeaseEpoch,
+    },
 }
 
 impl Unbound {
@@ -109,6 +120,7 @@ impl Unbound {
             Self::NotHolder { .. } => Binding::Holder,
             Self::NotCandidate { .. } => Binding::Candidate,
             Self::NotFollower { .. } => Binding::Follower,
+            Self::NotDropped { .. } => Binding::Dropped,
         }
     }
 
@@ -120,7 +132,8 @@ impl Unbound {
             Self::NotReplica { database }
             | Self::NotHolder { database, .. }
             | Self::NotCandidate { database, .. }
-            | Self::NotFollower { database } => Some(database),
+            | Self::NotFollower { database }
+            | Self::NotDropped { database, .. } => Some(database),
         }
     }
 
@@ -128,7 +141,9 @@ impl Unbound {
     #[must_use]
     pub fn epoch(&self) -> Option<LeaseEpoch> {
         match self {
-            Self::NotHolder { epoch, .. } | Self::NotCandidate { epoch, .. } => Some(*epoch),
+            Self::NotHolder { epoch, .. }
+            | Self::NotCandidate { epoch, .. }
+            | Self::NotDropped { epoch, .. } => Some(*epoch),
             Self::OtherNode { .. } | Self::NotReplica { .. } | Self::NotFollower { .. } => None,
         }
     }
@@ -153,6 +168,12 @@ impl fmt::Display for Unbound {
             }
             Self::NotFollower { database } => {
                 write!(f, "not a follower of database '{database}' on this node")
+            }
+            Self::NotDropped { database, epoch } => {
+                write!(
+                    f,
+                    "database '{database}' isn't dropped at epoch {epoch}: control state holds it"
+                )
             }
         }
     }
@@ -278,6 +299,15 @@ mod tests {
                 "Fence refused for node 'a': not a follower of database 'tenant:acme' on this node",
                 "follower",
             ),
+            (
+                Unbound::NotDropped {
+                    database: db.clone(),
+                    epoch,
+                },
+                "Fence refused for node 'a': database 'tenant:acme' isn't dropped at epoch 7: \
+                 control state holds it",
+                "dropped",
+            ),
         ];
         for (reason, message, binding) in cases {
             let denied = BindingDenied::new("Fence", node("a"), reason);
@@ -317,6 +347,7 @@ mod tests {
             Binding::Candidate,
             Binding::HolderOrCandidate,
             Binding::Follower,
+            Binding::Dropped,
         ]
         .iter()
         .map(ToString::to_string)
@@ -330,7 +361,8 @@ mod tests {
                 "holder",
                 "candidate",
                 "holder or candidate",
-                "follower"
+                "follower",
+                "dropped"
             ]
         );
     }

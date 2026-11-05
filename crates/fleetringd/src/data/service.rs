@@ -8,9 +8,10 @@ use fleetring_proto::v1::restore_point::Point;
 use fleetring_proto::v1::{
     ArchivedSnapshot, ChangeSinkStatus, CreateRequest, CreateResponse, DescribeArchiveRequest,
     DescribeArchiveResponse, ExecuteRequest, ExecuteResponse, NodeStatusRequest,
-    NodeStatusResponse, QueryRequest, QueryResponse, RestorePoint, RestoreRequest, RestoreResponse,
-    SchemaRequest, SchemaResponse, VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest,
-    VerifyResponse, WatchLeasesRequest,
+    NodeStatusResponse, OrphanStatus, QueryRequest, QueryResponse, RemoveOrphanRequest,
+    RemoveOrphanResponse, RestorePoint, RestoreRequest, RestoreResponse, SchemaRequest,
+    SchemaResponse, VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest, VerifyResponse,
+    WatchLeasesRequest,
 };
 use tonic::{Code, Request, Response, Status};
 
@@ -253,8 +254,9 @@ impl Database for DatabaseService {
         }))
     }
 
-    /// Answers from this node alone: its published membership view and the databases its
-    /// replication serves or follows, as its heartbeats report them.
+    /// Answers from this node alone: its published membership view, the databases its
+    /// replication serves or follows, as its heartbeats report them, and the orphan copies it
+    /// keeps (ADR-0042), each shown if the caller may read a database of its name.
     async fn node_status(
         &self,
         request: Request<NodeStatusRequest>,
@@ -286,6 +288,17 @@ impl Database for DatabaseService {
                 replicated: status.home == Some(MarkHome::Replicated),
             })
             .collect();
+        let orphans = replication
+            .orphans()
+            .await
+            .into_iter()
+            .filter(|orphan| caller.sees(Action::Read, &orphan.database))
+            .map(|orphan| OrphanStatus {
+                database: orphan.database.to_string(),
+                epoch: orphan.epoch.get(),
+                bytes: orphan.bytes,
+            })
+            .collect();
         Ok(Response::new(NodeStatusResponse {
             node_id: self.node.id().to_string(),
             membership_epoch: view.epoch().get(),
@@ -301,7 +314,19 @@ impl Database for DatabaseService {
                 })
                 .collect(),
             sinks,
+            orphans,
         }))
+    }
+
+    /// Deletes this node's orphan copy of a database at an operator's request (ADR-0042). The
+    /// request boundary has checked the `fleet` scope.
+    async fn remove_orphan(
+        &self,
+        request: Request<RemoveOrphanRequest>,
+    ) -> Result<Response<RemoveOrphanResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        let epoch = self.node.remove_orphan(&name).await?;
+        Ok(Response::new(RemoveOrphanResponse { epoch: epoch.get() }))
     }
 
     /// Streams the leases this node holds, from its replication's own view (FR-042): a snapshot

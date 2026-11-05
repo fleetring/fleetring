@@ -263,6 +263,12 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Node,
         Binding::Candidate,
     ),
+    // The control node that dropped a database tells its replicas; each asks control state first.
+    rpc(
+        "/fleetring.v1.Replication/DropCopy",
+        Requirement::Node,
+        Binding::Dropped,
+    ),
     // Database.
     rpc(
         "/fleetring.v1.Database/Execute",
@@ -312,6 +318,13 @@ pub const RPCS: &[Rpc] = &[
     rpc(
         "/fleetring.v1.Database/VerifyArchive",
         Requirement::Database(Action::Admin),
+        Binding::None,
+    ),
+    // Deletes a copy the node kept as an orphan (ADR-0042): an operator's call across tenants,
+    // since the copy belongs to no database the control plane knows.
+    rpc(
+        "/fleetring.v1.Database/RemoveOrphan",
+        Requirement::Fleet,
         Binding::None,
     ),
 ];

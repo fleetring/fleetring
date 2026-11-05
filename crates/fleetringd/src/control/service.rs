@@ -36,12 +36,14 @@ use crate::auth::{
 use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
+use crate::control::notices::DropNotices;
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, change_from_proto, description_from_proto, labels_from_proto,
     metadata_to_proto, revocation_from_proto, revocations_to_proto, spec_expiry_from_proto,
 };
 use crate::data::{Descriptions, Expiry, ExpiryRequest, LabelRequirement, is_invisible};
 use crate::dev::DevMode;
+use crate::environment::Network;
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
 
@@ -99,6 +101,7 @@ pub struct ControlService {
     defaults: DurabilityDefaults,
     clock: Arc<dyn Clock>,
     dev: DevMode,
+    notices: Option<DropNotices>,
 }
 
 impl ControlService {
@@ -112,7 +115,16 @@ impl ControlService {
             defaults: DurabilityDefaults::new(),
             clock: Arc::new(SystemClock),
             dev: DevMode::Off,
+            notices: None,
         }
+    }
+
+    /// Tells the replicas of each database it drops over `network`, so that they delete their
+    /// copies (ADR-0042). Without it, their copies are kept as orphans.
+    #[must_use]
+    pub fn with_network(mut self, network: Network) -> Self {
+        self.notices = Some(DropNotices::new(network));
+        self
     }
 
     /// Tells every membership watcher whether this control node runs in dev mode (ADR-0039).
@@ -959,8 +971,17 @@ impl Control for ControlService {
     ) -> Result<Response<DropDatabaseResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
+        // The replicas as they were before the drop: the drop takes the database's reports.
+        let before = self.node.state();
         match self.submit(Action::DropDatabase { name }).await? {
-            (Applied::DatabaseDropped { epoch, .. }, _) => {
+            (Applied::DatabaseDropped { database, epoch }, _) => {
+                if let Some(notices) = &self.notices {
+                    notices.send(
+                        DropNotices::recipients(&before, &database),
+                        &database,
+                        epoch,
+                    );
+                }
                 Ok(Response::new(DropDatabaseResponse { epoch: epoch.get() }))
             }
             (other, _) => Err(unexpected(&other)),

@@ -491,6 +491,7 @@ pub(crate) struct SampledMetrics {
     databases: Family<RoleLabels, Gauge>,
     databases_open: Gauge,
     under_replicated: Gauge,
+    orphaned: Gauge,
     leases_held: Gauge,
     followers: Family<StateLabels, Gauge>,
     mailbox_depth: Gauge,
@@ -512,6 +513,8 @@ pub(crate) struct DataSample {
     pub(crate) followers: usize,
     pub(crate) open: usize,
     pub(crate) under_replicated: usize,
+    /// Copies kept as orphans (ADR-0042).
+    pub(crate) orphaned: usize,
     pub(crate) leases_held: usize,
     /// Followers by state, in [`FOLLOWER_STATES`](names::FOLLOWER_STATES) order.
     pub(crate) follower_states: [usize; 4],
@@ -550,6 +553,7 @@ impl SampledMetrics {
         self.databases_open.set(gauge_value(sample.open));
         self.under_replicated
             .set(gauge_value(sample.under_replicated));
+        self.orphaned.set(gauge_value(sample.orphaned));
         self.leases_held.set(gauge_value(sample.leases_held));
         for (state, count) in names::FOLLOWER_STATES.iter().zip(sample.follower_states) {
             self.followers
@@ -706,6 +710,7 @@ impl Metrics {
             "fleetring_databases_under_replicated",
             sampled.under_replicated.clone(),
         );
+        r.add("fleetring_databases_orphaned", sampled.orphaned.clone());
         r.add("fleetring_leases_held", sampled.leases_held.clone());
         r.add("fleetring_writes", data.writes.0.clone());
         r.add(

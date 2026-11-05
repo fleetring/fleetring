@@ -87,9 +87,10 @@ impl HeldLease {
 /// arrives. It then leads the database through [`Replication::lead`], at the lease's epoch. It
 /// stops as soon as it learns of a newer epoch: from a renewal the control plane refuses, or
 /// from a fence or a stream at that epoch, which [`DataNode::route`] sees in the replication's
-/// highest epoch. A renewal refused as an unknown database means the database was dropped, and
-/// the node deletes its copy (see [`LeaseKeeper`](crate::data::LeaseKeeper)). Any other request
-/// is redirected to the primary the control plane names. Cloning is cheap and shares the node.
+/// highest epoch. It deletes its copy of a database only when a control node tells it of the
+/// database's drop, and keeps one the control plane merely doesn't know as an orphan (see
+/// [`LeaseKeeper`](crate::data::LeaseKeeper), ADR-0042). Any other request is redirected to the
+/// primary the control plane names. Cloning is cheap and shares the node.
 #[derive(Debug, Clone)]
 pub(crate) struct DataNode {
     pub(super) inner: Arc<Inner>,
@@ -122,9 +123,10 @@ pub(super) struct Inner {
     staging: tokio::sync::Semaphore,
     /// Held per database while it is created or restored here, so that two never race.
     creating: NameLocks,
-    /// The dropped databases whose copies this node is flushing and deleting ([`Retiring`]).
-    /// A new database of the same name isn't created or restored here meanwhile.
-    retiring: Mutex<BTreeSet<DatabaseName>>,
+    /// The databases this node stopped serving because the control plane no longer knows them,
+    /// whose change streams it is flushing ([`Retiring`]), each with what becomes of its copy
+    /// afterwards. A new database of the same name isn't created or restored here meanwhile.
+    retiring: Mutex<BTreeMap<DatabaseName, Fate>>,
     /// Where writes, queries, renewals, transfers, and promotions are counted.
     metrics: DataMetrics,
 }
@@ -181,9 +183,24 @@ impl Drop for Counted<'_> {
 /// flushing or deleting; a client retries it ([`DataNode::check_not_dropping`]).
 pub(crate) const BEING_DROPPED: &str = "is being dropped on this node; retry in a moment";
 
-/// Marks a dropped database whose copy this node is flushing and deleting, until dropped. While
-/// it lives, the node refuses to create or restore a database of the same name, so the
-/// deletion can't take the new database's files (ADR-0041, point 4).
+/// What becomes of a copy once its change streams are flushed (ADR-0042).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fate {
+    /// No drop has been seen: the control plane only stopped knowing the database, which an
+    /// empty, older, or foreign control state does too. The copy is kept as an orphan.
+    Kept,
+    /// A control node said it dropped the database at `epoch`, and control state agreed: the
+    /// copy is deleted, unless it has seen an epoch past the drop's.
+    Deleted {
+        /// The epoch the database was dropped at.
+        epoch: LeaseEpoch,
+    },
+}
+
+/// Marks a database whose change streams this node is flushing because it stopped serving it,
+/// until dropped. While it lives, the node refuses to create or restore a database of the same
+/// name, so the old copy can't be opened as the new database's or its deletion take the new
+/// database's files (ADR-0041, point 4).
 #[derive(Debug)]
 pub(crate) struct Retiring {
     node: DataNode,
@@ -242,7 +259,7 @@ impl DataNode {
                 draining: tokio::sync::Mutex::new(()),
                 staging: tokio::sync::Semaphore::new(1),
                 creating: NameLocks::default(),
-                retiring: Mutex::new(BTreeSet::new()),
+                retiring: Mutex::new(BTreeMap::new()),
                 metrics,
             }),
         }
@@ -261,21 +278,78 @@ impl DataNode {
         &self.inner.replication
     }
 
-    fn lock_retiring(&self) -> MutexGuard<'_, BTreeSet<DatabaseName>> {
+    fn lock_retiring(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, Fate>> {
         self.inner
             .retiring
             .lock()
             .expect("retiring databases lock poisoned")
     }
 
-    /// Marks `name`'s copy as being retired, because its database was dropped, until the
-    /// returned guard is dropped. Take it before serving stops.
-    pub(super) fn begin_retiring(&self, name: &DatabaseName) -> Retiring {
-        self.lock_retiring().insert(name.clone());
+    /// Marks `name`'s copy as being retired, with `fate` for it afterwards, until the returned
+    /// guard is dropped. Take it before serving stops.
+    pub(super) fn begin_retiring(&self, name: &DatabaseName, fate: Fate) -> Retiring {
+        self.lock_retiring().insert(name.clone(), fate);
         Retiring {
             node: self.clone(),
             name: name.clone(),
         }
+    }
+
+    /// Marks the copy of `name` being retired for deletion, because its drop at `epoch` was seen
+    /// meanwhile. Returns whether one was being retired.
+    pub(super) fn confirm_drop(&self, name: &DatabaseName, epoch: LeaseEpoch) -> bool {
+        self.lock_retiring()
+            .get_mut(name)
+            .map(|fate| *fate = Fate::Deleted { epoch })
+            .is_some()
+    }
+
+    /// What becomes of the copy of `name` being retired: [`Fate::Kept`] unless its drop was seen.
+    pub(super) fn fate(&self, name: &DatabaseName) -> Fate {
+        self.lock_retiring()
+            .get(name)
+            .copied()
+            .unwrap_or(Fate::Kept)
+    }
+
+    /// Deletes this node's orphan copy of `name` at an operator's request (ADR-0042), and
+    /// returns the highest epoch it had recorded.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if the node holds no copy of `name`; `FAILED_PRECONDITION` if it serves or
+    /// follows the name, or is flushing a copy of it; and `INTERNAL` if the files can't be
+    /// deleted.
+    pub(crate) async fn remove_orphan(&self, name: &DatabaseName) -> Result<LeaseEpoch, Status> {
+        // A create or restore of the name waits, so the removal never races one.
+        let _creating = self.inner.creating.lock(name).await;
+        let id = &self.inner.id;
+        let replication = self.replication();
+        if self.lock_retiring().contains_key(name) {
+            return Err(Status::failed_precondition(format!(
+                "{name} is being retired on node {id}, not an orphan; try again once it is"
+            )));
+        }
+        if self.leases().contains_key(name) || replication.serving(name).is_some() {
+            return Err(Status::failed_precondition(format!(
+                "node {id} serves {name}; only an orphan copy can be removed"
+            )));
+        }
+        let Some(epoch) = replication.highest_epoch(name) else {
+            return Err(Status::not_found(format!(
+                "node {id} holds no copy of {name}"
+            )));
+        };
+        if !replication.is_orphan(name) {
+            return Err(Status::failed_precondition(format!(
+                "node {id} follows {name}; only an orphan copy can be removed"
+            )));
+        }
+        replication.discard(name).await.map_err(|error| {
+            Status::internal(format!("can't delete the orphan copy of {name}: {error}"))
+        })?;
+        tracing::warn!(database = %name, epoch = epoch.get(), node = %id, "removed the orphan copy at an operator's request");
+        Ok(epoch)
     }
 
     /// Refuses a new database named `name` while this node still holds a dropped database of
@@ -286,7 +360,8 @@ impl DataNode {
     ///
     /// `UNAVAILABLE` saying the name [`BEING_DROPPED`]; a client retries it.
     fn check_not_dropping(&self, name: &DatabaseName) -> Result<(), Status> {
-        if self.lock_retiring().contains(name) || self.inner.replication.serving(name).is_some() {
+        if self.lock_retiring().contains_key(name) || self.inner.replication.serving(name).is_some()
+        {
             return Err(Status::unavailable(format!("{name} {BEING_DROPPED}")));
         }
         Ok(())
@@ -294,13 +369,14 @@ impl DataNode {
 
     /// Refuses a database named `name` that has never been leased while this node holds a copy
     /// of an earlier database of the name that it didn't see dropped: an orphan. A node deletes
-    /// a copy only after it saw the drop itself ([`Retiring`]); a control plane whose `name` is
-    /// new says nothing about what became of the old one, since an empty, older, or recreated
-    /// control state says the same (ADR-0041, amendment 7).
+    /// a copy only after it saw the drop itself; a control plane whose `name` is new says
+    /// nothing about what became of the old one, since an empty, older, or recreated control
+    /// state says the same (ADR-0041, amendment 7; ADR-0042).
     ///
     /// # Errors
     ///
-    /// `FAILED_PRECONDITION` naming the orphan, its node, and its epoch, and how to remove it.
+    /// `FAILED_PRECONDITION` naming the orphan, its node, and its epoch, and the command that
+    /// removes it.
     fn refuse_orphan(&self, name: &DatabaseName) -> Result<(), Status> {
         let Some(epoch) = self.inner.replication.highest_epoch(name) else {
             return Ok(());
@@ -309,9 +385,9 @@ impl DataNode {
         tracing::warn!(database = %name, epoch = epoch.get(), "refused a new database over a copy of an earlier one this node didn't see dropped");
         Err(Status::failed_precondition(format!(
             "{name} has a copy on node {id} from epoch {} that the control plane doesn't know; \
-             if that database is gone for good, restart fleetringd on {id}, whose recovery pass \
-             deletes the copy, and try again (copy its files first to keep them), or use another \
-             name",
+             if that database is gone for good, delete the copy with `fleetringd orphan remove \
+             {name} --node {id}` and try again (copy its files first to keep them), or use \
+             another name",
             epoch.get()
         )))
     }
