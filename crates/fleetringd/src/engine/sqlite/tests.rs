@@ -461,7 +461,10 @@ fn fts5_tables_take_writes_and_searches_in_later_statements() -> TestResult {
     let mut db = database(dir.path())?;
     // FTS5 runs `PRAGMA data_version` while a statement steps, under the confinement, once the
     // table was created by an earlier transaction.
-    exec(&mut db, "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")?;
+    exec(
+        &mut db,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    )?;
     exec(
         &mut db,
         "CREATE VIRTUAL TABLE notes_fts USING fts5(body, content = 'notes', content_rowid = 'id')",
@@ -471,7 +474,10 @@ fn fts5_tables_take_writes_and_searches_in_later_statements() -> TestResult {
         "CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN \
          INSERT INTO notes_fts (rowid, body) VALUES (new.id, new.body); END",
     )?;
-    exec(&mut db, "INSERT INTO notes VALUES (1, 'alpha beta'), (2, 'gamma')")?;
+    exec(
+        &mut db,
+        "INSERT INTO notes VALUES (1, 'alpha beta'), (2, 'gamma')",
+    )?;
     exec(&mut db, "CREATE VIRTUAL TABLE docs USING fts5(body)")?;
     exec(&mut db, "INSERT INTO docs VALUES ('alpha')")?;
 
@@ -482,6 +488,52 @@ fn fts5_tables_take_writes_and_searches_in_later_statements() -> TestResult {
     assert_eq!(found.rows, [[Value::Integer(1)]]);
     let docs = query(&mut db, "SELECT rowid FROM docs WHERE docs MATCH 'alpha'")?;
     assert_eq!(docs.rows, [[Value::Integer(1)]]);
+    Ok(())
+}
+
+#[test]
+fn a_recorded_database_takes_triggers_views_and_fts5_tables() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // The recorder's own table, `_fleetring_cdc`, mentions the reserved prefix in its definition;
+    // only triggers and views are checked for it.
+    db.start_recording(CaptureMode::Full)?;
+    exec(
+        &mut db,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    )?;
+    exec(&mut db, "CREATE VIEW recent AS SELECT id FROM notes")?;
+    // A virtual table and its shadow tables get none of the recorder's triggers.
+    exec(
+        &mut db,
+        "CREATE VIRTUAL TABLE notes_fts USING fts5(body, content = 'notes', content_rowid = 'id')",
+    )?;
+    exec(
+        &mut db,
+        "CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN \
+         INSERT INTO notes_fts (rowid, body) VALUES (new.id, new.body); END",
+    )?;
+    let start = db.position()?;
+    exec(&mut db, "INSERT INTO notes VALUES (1, 'alpha')")?;
+    let end = db.position()?.ok_or("a position after a write")?;
+    let changes = db.changes_between(start.as_ref(), &end)?;
+    assert_eq!(
+        changes.len(),
+        1,
+        "only the content table's row: {changes:?}"
+    );
+
+    let found = query(
+        &mut db,
+        "SELECT rowid FROM notes_fts WHERE notes_fts MATCH 'alpha'",
+    )?;
+    assert_eq!(found.rows, [[Value::Integer(1)]]);
+    // A trigger that does name a reserved table is still refused.
+    let message = refusal(exec(
+        &mut db,
+        "CREATE TRIGGER sneaky AFTER INSERT ON t BEGIN DELETE FROM _fleetring_cdc; END",
+    ))?;
+    assert!(message.contains("reserved"), "{message}");
     Ok(())
 }
 

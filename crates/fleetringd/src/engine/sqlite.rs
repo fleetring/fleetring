@@ -884,9 +884,10 @@ fn refuse_programs_on_reserved_names(conn: &Connection) -> Result<(), EngineErro
     let offending: Option<String> = conn
         .query_row(
             "SELECT name FROM (
-                SELECT name, sql FROM main.sqlite_master UNION ALL
-                SELECT name, sql FROM temp.sqlite_master)
-             WHERE sql LIKE ?1 ESCAPE '\\' AND name NOT LIKE ?2 ESCAPE '\\' LIMIT 1",
+                SELECT type, name, sql FROM main.sqlite_master UNION ALL
+                SELECT type, name, sql FROM temp.sqlite_master)
+             WHERE type IN ('trigger', 'view')
+               AND sql LIKE ?1 ESCAPE '\\' AND name NOT LIKE ?2 ESCAPE '\\' LIMIT 1",
             params![pattern, format!("{}%", TRIGGER_PREFIX.replace('_', "\\_"))],
             |row| row.get(0),
         )
