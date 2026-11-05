@@ -40,7 +40,7 @@ use crate::data::convert::{
     acks_from_proto, acks_to_proto, change_from_proto, description_from_proto, labels_from_proto,
     metadata_to_proto, revocation_from_proto, revocations_to_proto,
 };
-use crate::data::{Descriptions, LabelRequirement};
+use crate::data::{Descriptions, LabelRequirement, is_invisible};
 use crate::dev::DevMode;
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
@@ -199,12 +199,14 @@ impl ControlService {
     ///
     /// # Errors
     ///
-    /// `INVALID_ARGUMENT` for an invalid name, factor, engine, or durability.
+    /// `INVALID_ARGUMENT` for an invalid name, one with an invisible character included, factor,
+    /// engine, or durability.
     fn creation(
         &self,
         request: &CreateDatabaseRequest,
     ) -> Result<(DatabaseName, ReplicationFactor, Engine, Durability), Status> {
         let name: DatabaseName = parse("database name", &request.database)?;
+        check_new_name(&name)?;
         let replication_factor = self.replication_factor(request.replication_factor)?;
         let engine = engine_from(request.engine)?;
         let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
@@ -545,10 +547,47 @@ fn leases_held_by(state: &State, id: &fleetring::NodeId) -> Vec<String> {
 /// The principal that made `request`, as control state records it: a database's creator or a
 /// description's author. It comes from the request boundary's caller, never from the request's
 /// fields (ADR-0041, point 1); `None` for a node and for an anonymous caller.
-fn creator<T>(request: &Request<T>) -> Option<PrincipalName> {
-    match authorized(request).ok()?.caller() {
-        Caller::Principal { name, .. } => Some(PrincipalName::from(name)),
-        Caller::Node(_) | Caller::Anonymous => None,
+///
+/// # Errors
+///
+/// `INTERNAL` if the principal's name doesn't fit the grammar control state records, which a
+/// test holds equal to a certificate's: it would take a change to one of them.
+fn creator<T>(request: &Request<T>) -> Result<Option<PrincipalName>, Status> {
+    let Ok(authorized) = authorized(request) else {
+        return Ok(None);
+    };
+    match authorized.caller() {
+        Caller::Principal { name, .. } => {
+            PrincipalName::try_from(name).map(Some).map_err(|error| {
+                tracing::error!(principal = %name, %error, "a principal's name can't be recorded");
+                Status::internal("the caller's principal name can't be recorded")
+            })
+        }
+        Caller::Node(_) | Caller::Anonymous => Ok(None),
+    }
+}
+
+/// Checks a new database's name at the request boundary: it may hold no character a person
+/// reading it can't see, the format characters (Unicode `Cf`, by the fixed table descriptions
+/// use, which takes in the bidirectional controls and the zero-width characters) and the line
+/// and paragraph separators (ADR-0041, amendment 5). `DatabaseName` itself accepts them, and so
+/// does `apply`, so a log that holds such a name still replays.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` naming the character and its byte offset.
+fn check_new_name(name: &DatabaseName) -> Result<(), Status> {
+    match name
+        .as_str()
+        .char_indices()
+        .find(|(_, character)| is_invisible(*character))
+    {
+        Some((at, character)) => Err(Status::invalid_argument(format!(
+            "invalid database name: it contains the character U+{:04X} at byte {at}, which a new \
+             name may not hold",
+            u32::from(character)
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -783,14 +822,14 @@ impl Control for ControlService {
         // the first ordinary creation after an upgrade doesn't enable it and close the rollback
         // window (ADR-0041, point 3). The feature is enabled for good, so once it is, no member
         // can lack it.
-        let metadata = self
-            .node
-            .state()
-            .is_enabled(Feature::Metadata)
-            .then(|| MetadataSpec {
-                created_by: creator(&request),
+        let metadata = if self.node.state().is_enabled(Feature::Metadata) {
+            Some(MetadataSpec {
+                created_by: creator(&request)?,
                 ..MetadataSpec::default()
-            });
+            })
+        } else {
+            None
+        };
         let action = Action::CreateDatabase {
             name: name.clone(),
             replication_factor,
@@ -820,7 +859,7 @@ impl Control for ControlService {
         let spec = MetadataSpec {
             description: description_from_proto(&metadata.description)?,
             labels: labels_from_proto(&metadata.labels)?,
-            created_by: creator(&request),
+            created_by: creator(&request)?,
             ..MetadataSpec::default()
         };
         if !spec.is_explicit() {
@@ -851,7 +890,7 @@ impl Control for ControlService {
         let action = Action::UpdateDatabase {
             name: name.clone(),
             change,
-            by: creator(&request),
+            by: creator(&request)?,
             if_version: request.get_ref().if_version,
         };
         match self.submit(action).await? {

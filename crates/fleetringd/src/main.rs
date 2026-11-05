@@ -35,7 +35,7 @@ use fleetringd::durability::{
 use fleetringd::engine::{Execution, Position, Rows, SqliteEngine, Statement, Value};
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
-use fleetringd::report::{DatabaseReport, render_text};
+use fleetringd::report::{DatabaseReport, printable, render_text};
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
     FleetName, Identity, Peer, Principal, Security, Validity,
@@ -1367,7 +1367,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             }
             .map_err(metadata_failed)?;
             warn_if_under_replicated(&location);
-            let mut output = format!("created {name}\n{}", format_location(&location));
+            let mut output = format!("created {}\n{}", shown(&name), format_location(&location));
             if let Some(metadata) = &location.metadata {
                 output.push_str(&format_metadata_summary(metadata));
             }
@@ -1418,7 +1418,8 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             };
             format!(
                 "description of {name} {what}; metadata version {}\n",
-                metadata.version
+                metadata.version,
+                name = shown(&name)
             )
         }
         Command::Db(DbCommand::SetLabels {
@@ -1441,7 +1442,8 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             format!(
                 "labels of {name}: {}; metadata version {}\n",
                 format_labels(&metadata),
-                metadata.version
+                metadata.version,
+                name = shown(&name)
             )
         }
         Command::Db(DbCommand::SetDurability {
@@ -1458,7 +1460,11 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             format!(
                 "durability of {name} changes to acks={} min_replicas={} at its next epoch; \
                  now acks={} min_replicas={}\n",
-                change.acks, change.min_replicas, change.current_acks, change.current_min_replicas
+                change.acks,
+                change.min_replicas,
+                change.current_acks,
+                change.current_min_replicas,
+                name = shown(&name)
             )
         }
         Command::Db(DbCommand::Exec(args)) => {
@@ -1550,7 +1556,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                     restored.segments,
                     restored.archived_at_ms
                 ),
-                format_location(&restored.location)
+                format_location(&restored.location),
+                name = shown(&name),
+                from = shown(&from)
             )
         }
         Command::Db(DbCommand::Archive(DbArchiveCommand::Show {
@@ -1590,7 +1598,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .drop_database(&name)
                 .await
                 .map_err(failed)?;
-            format!("dropped {name} at epoch {}\n", epoch.get())
+            format!("dropped {} at epoch {}\n", shown(&name), epoch.get())
         }
         Command::Node(NodeCommand::Drain { id, target }) => {
             let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
@@ -1748,7 +1756,7 @@ fn format_archive(archive: &str, description: &ArchiveDescription) -> String {
     let mut output = format!(
         "database: {}\narchive: {archive}\nlatest: {}\nlast segment archived: {}\n\
          segments: {} ({} bytes)\nsnapshots:\n",
-        description.database,
+        shown(&description.database),
         description
             .latest
             .as_ref()
@@ -1800,7 +1808,8 @@ async fn verify_archive(
         .await
         .map_err(failed)?;
     let mut output = format!(
-        "database: {name}\narchive: {archive}\n{}",
+        "database: {}\narchive: {archive}\n{}",
+        shown(name),
         format_restored(
             verified.position.as_ref(),
             &verified.chain_hash,
@@ -1898,7 +1907,8 @@ async fn restore_offline(
             restored.segments,
             restored.archived_at_ms
         ),
-        to.join("data.db").display()
+        to.join("data.db").display(),
+        from = shown(from)
     ))
 }
 
@@ -1928,9 +1938,9 @@ fn format_lease_update(update: &LeaseUpdate) -> String {
     match update {
         LeaseUpdate::Held { leases, .. } => leases
             .iter()
-            .map(|(database, epoch)| format!("held {database} epoch {}\n", epoch.get()))
+            .map(|(database, epoch)| format!("held {} epoch {}\n", shown(database), epoch.get()))
             .collect(),
-        LeaseUpdate::Event(event) => format!("{event}\n"),
+        LeaseUpdate::Event(event) => format!("{}\n", shown(event)),
         _ => String::new(),
     }
 }
@@ -2115,7 +2125,7 @@ async fn verify(
         .filter_map(|replica| Some((replica.node.clone(), replica.address.clone()?)))
         .collect();
     if replicas.is_empty() {
-        return Err(format!("no replica of {name} has an address").into());
+        return Err(format!("no replica of {} has an address", shown(name)).into());
     }
     let ask = |at: Option<Position>| {
         let replicas = &replicas;
@@ -2165,11 +2175,7 @@ async fn verify(
     let position_text = position
         .as_ref()
         .map_or_else(|| "empty log".to_owned(), ToString::to_string);
-    let mut output = format!(
-        "database: {name}
-position: {position_text}
-"
-    );
+    let mut output = format!("database: {}\nposition: {position_text}\n", shown(name));
     let mut agreed: Option<&ChainHash> = None;
     let mut differs: Option<(&NodeId, String)> = None;
     for (node, answer) in &answers {
@@ -2193,11 +2199,12 @@ position: {position_text}
         }
     }
     let Some(hash) = agreed else {
-        return Err(format!("{output}no replica of {name} could answer").into());
+        return Err(format!("{output}no replica of {} could answer", shown(name)).into());
     };
     if let Some((node, reason)) = differs {
         return Err(format!(
-            "{output}replicas of {name} disagree at {position_text}: {node} {reason}"
+            "{output}replicas of {name} disagree at {position_text}: {node} {reason}",
+            name = shown(name)
         )
         .into());
     }
@@ -2225,12 +2232,13 @@ all {} replica{} agree",
 fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
-        return Err(format!("pass --yes to drop {name} without a prompt").into());
+        return Err(format!("pass --yes to drop {} without a prompt", shown(name)).into());
     }
     let mut stderr = std::io::stderr();
     write!(
         stderr,
-        "drop {name}? Every replica deletes its copy, for good. [y/N] "
+        "drop {}? Every replica deletes its copy, for good. [y/N] ",
+        shown(name)
     )?;
     stderr.flush()?;
     let mut answer = String::new();
@@ -2239,7 +2247,7 @@ fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
     if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
         Ok(())
     } else {
-        Err(format!("not dropping {name}").into())
+        Err(format!("not dropping {}", shown(name)).into())
     }
 }
 
@@ -2316,7 +2324,7 @@ fn format_location(location: &Location) -> String {
     let mut output = format!(
         "database: {}\nengine: {}\nepoch: {}\nreplication factor: {}\nacks: {}\n\
          min replicas: {}\nprimary: {primary}\nfollowers: {}\npositions:\n",
-        location.database,
+        shown(&location.database),
         location.engine,
         location.epoch.get(),
         location.replication_factor.get(),
@@ -2354,7 +2362,7 @@ fn format_databases(databases: &[Location]) -> String {
                 .map(|replica| replica.node.to_string())
                 .collect();
             [
-                location.database.to_string(),
+                shown(&location.database),
                 location.engine.to_string(),
                 location.epoch.get().to_string(),
                 location.replicas.len().to_string(),
@@ -2439,7 +2447,7 @@ fn format_drain(id: &NodeId, primaries: &[DatabaseName]) -> String {
     }
     output.push_str(":\n");
     for database in primaries {
-        let _ = writeln!(output, "  {database}");
+        let _ = writeln!(output, "  {}", shown(database));
     }
     output
 }
@@ -2469,7 +2477,7 @@ fn format_node_status(status: &NodeStatus) -> String {
         let _ = writeln!(
             output,
             "  {} {role} epoch={} position={position}",
-            database.database,
+            shown(&database.database),
             database.epoch.get(),
         );
     }
@@ -2492,7 +2500,11 @@ fn format_node_status(status: &NodeStatus) -> String {
         let _ = write!(
             output,
             "  {} {} position={position} ({kept}) acknowledged={acknowledged} backlog={} failures={} resets={}",
-            sink.sink, sink.database, sink.backlog, sink.failures, sink.resets
+            sink.sink,
+            shown(&sink.database),
+            sink.backlog,
+            sink.failures,
+            sink.resets
         );
         if let Some(error) = &sink.last_error {
             let _ = write!(output, " last_error={error:?}");
@@ -2573,7 +2585,7 @@ fn under_replicated(location: &Location) -> Option<String> {
     if replicas >= usize::from(factor) {
         return None;
     }
-    let name = &location.database;
+    let name = shown(&location.database);
     let floor = usize::from(location.durability.min_replicas());
     let nodes = if replicas == 1 { "node" } else { "nodes" };
     let consequence = if replicas < floor {
@@ -2593,25 +2605,48 @@ fn under_replicated(location: &Location) -> Option<String> {
     ))
 }
 
-/// A failed call as one readable line: what kind of failure, and the server's message.
-fn failed(status: tonic::Status) -> Box<dyn Error> {
-    format!("{}: {}", status.code().description(), status.message()).into()
+/// A name a principal chose, such as a database's, as text output prints it: control and
+/// invisible characters escaped, so a name can't reorder, hide, or forge what is printed around
+/// it (ADR-0041, amendment 5).
+fn shown(name: &impl std::fmt::Display) -> String {
+    printable(&name.to_string())
 }
 
-/// A failed creation as [`failed`] says it, with the next step when a member of the fleet
-/// lacks the `metadata` feature (ADR-0041, point 3).
-fn metadata_failed(status: tonic::Status) -> Box<dyn Error> {
-    let lacks_metadata = status.code() == tonic::Code::FailedPrecondition
-        && status.message().contains("can't use 'metadata' yet");
-    if lacks_metadata {
-        format!(
-            "{}\n  hint: create it without --description and --label, or upgrade every member \
-             first",
-            failed(status)
-        )
-        .into()
+/// A failed call as one readable line: what kind of failure, and the server's message.
+fn failed(status: tonic::Status) -> Box<dyn Error> {
+    // The message may name a database, whose name a principal chose.
+    format!(
+        "{}: {}",
+        status.code().description(),
+        printable(status.message())
+    )
+    .into()
+}
+
+/// The next step after a refusal of a creation or update with metadata for want of the
+/// `metadata` fleet feature (ADR-0041, point 3), or `None` for any other status. A fleet with a
+/// member that lacks the feature needs that member upgraded; a fleet that no member has joined
+/// yet needs a data node first (ADR-0041, amendment 3).
+fn metadata_hint(status: &tonic::Status) -> Option<&'static str> {
+    if status.code() != tonic::Code::FailedPrecondition {
+        return None;
+    }
+    let message = status.message();
+    if message.contains("can't use 'metadata' yet: no member has joined") {
+        Some("start a data node first, or create it without --description and --label")
+    } else if message.contains("can't use 'metadata' yet") {
+        Some("create it without --description and --label, or upgrade every member first")
     } else {
-        failed(status)
+        None
+    }
+}
+
+/// A failed creation or metadata update as [`failed`] says it, with the next step when the
+/// fleet can't use the `metadata` feature yet.
+fn metadata_failed(status: tonic::Status) -> Box<dyn Error> {
+    match metadata_hint(&status) {
+        Some(hint) => format!("{}\n  hint: {hint}", failed(status)).into(),
+        None => failed(status),
     }
 }
 
@@ -2930,6 +2965,51 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_refusal_for_want_of_metadata_says_what_to_do_next() {
+        let unsupported = tonic::Status::failed_precondition(
+            "the fleet can't use 'metadata' yet: node 'old' runs fleetringd 0.4.0, which doesn't \
+             support it; upgrade every member first",
+        );
+        let hinted = metadata_failed(unsupported).to_string();
+        assert!(
+            hinted.ends_with(
+                "upgrade every member first\n  hint: create it without --description and \
+                 --label, or upgrade every member first"
+            ),
+            "{hinted}"
+        );
+        let empty = tonic::Status::failed_precondition(
+            "the fleet can't use 'metadata' yet: no member has joined",
+        );
+        let hinted = metadata_failed(empty).to_string();
+        assert!(
+            hinted.ends_with(
+                "no member has joined\n  hint: start a data node first, or create it without \
+                 --description and --label"
+            ),
+            "{hinted}"
+        );
+        let other = tonic::Status::failed_precondition("database notes has no primary yet");
+        assert!(!metadata_failed(other).to_string().contains("hint:"));
+        let denied = tonic::Status::permission_denied("can't use 'metadata' yet");
+        assert_eq!(metadata_hint(&denied), None);
+    }
+
+    #[test]
+    fn names_are_printed_with_invisible_characters_escaped() {
+        let name: DatabaseName = "evil\u{202E}gnp\u{200B}.db\u{2028}x"
+            .parse()
+            .expect("a name the parser accepts");
+        assert_eq!(shown(&name), "evil\\u{202E}gnp\\u{200B}.db\\u{2028}x");
+        let status = tonic::Status::not_found("database 'a\u{202E}b' doesn't exist");
+        let printed = failed(status).to_string();
+        assert!(
+            printed.ends_with("database 'a\\u{202E}b' doesn't exist"),
+            "{printed}"
+        );
     }
 
     #[test]

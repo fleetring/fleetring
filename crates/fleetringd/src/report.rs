@@ -11,10 +11,10 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use fleetring_control::{FORBIDDEN_FORMAT_CHARACTERS, Liveness, ReplicaRole, Timestamp};
+use fleetring_control::{Liveness, ReplicaRole, Timestamp};
 use serde::Serialize;
 
-use crate::data::{Location, MetadataView};
+use crate::data::{Location, MetadataView, is_invisible};
 
 /// One database: where it lives and its metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,16 +178,22 @@ fn rfc3339(at: Timestamp) -> String {
 /// characters a description refuses, and the line and paragraph separators. A description
 /// never holds one, but the text comes from the control node, which may be another release.
 fn escaped(character: char) -> bool {
-    (character.is_control() && character != '\t')
-        || matches!(character, '\u{2028}' | '\u{2029}')
-        || FORBIDDEN_FORMAT_CHARACTERS
-            .iter()
-            .any(|(first, last)| (*first..=*last).contains(&character))
+    (character.is_control() && character != '\t') || is_invisible(character)
 }
 
-/// `text` with every character [`escaped`] names written as `\u{XXXX}`, so nothing a principal
-/// wrote can move the cursor, rewrite the screen, or hide itself.
-fn printable(text: &str) -> String {
+/// `text` with every control character but tab, every format character, and the line and
+/// paragraph separators written as `\u{XXXX}`, so nothing a principal wrote can move the cursor,
+/// rewrite the screen, or hide itself. Text output passes every name and text a principal chose
+/// through it: database names, descriptions, labels.
+///
+/// ```
+/// use fleetringd::report::printable;
+///
+/// assert_eq!(printable("notes"), "notes");
+/// assert_eq!(printable("evil\u{202E}gnp.exe"), "evil\\u{202E}gnp.exe");
+/// ```
+#[must_use]
+pub fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         if escaped(character) {
@@ -239,7 +245,7 @@ pub fn render_text(
             .and_then(|replica| replica.address.as_deref())
             .map_or_else(|| node.to_owned(), |address| format!("{node} ({address})"))
     };
-    writeln!(out, "database: {}", report.database)?;
+    writeln!(out, "database: {}", printable(&report.database))?;
     writeln!(out, "engine: {}", placement.engine)?;
     writeln!(out, "epoch: {}", placement.lease_epoch)?;
     writeln!(out, "replication factor: {}", placement.replication_factor)?;
@@ -435,6 +441,17 @@ mod tests {
         );
         let none = text(&report(None, None), Some("agent-42"));
         assert!(none.contains("description: none\n"), "{none}");
+    }
+
+    #[test]
+    fn a_database_name_is_escaped_too() {
+        let mut named = report(None, None);
+        named.database = "evil\u{202E}gnp".to_owned();
+        let printed = text(&named, None);
+        assert!(
+            printed.starts_with("database: evil\\u{202E}gnp\n"),
+            "{printed}"
+        );
     }
 
     #[test]

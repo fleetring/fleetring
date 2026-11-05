@@ -2878,6 +2878,77 @@ mod metadata {
         Ok(())
     }
 
+    /// A new database's name may hold no character a reader can't see: the format characters
+    /// descriptions refuse, bidirectional controls and zero-width characters among them, and the
+    /// line and paragraph separators. The control service refuses them, through every creation
+    /// call; `apply` doesn't, so a log that already holds such a name replays (ADR-0041,
+    /// amendment 5).
+    #[tokio::test]
+    async fn a_new_name_with_invisible_characters_is_refused() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (daemon, control, _tls) = fleet(dir.path()).await?;
+        for name in [
+            "evil\u{202E}gnp",
+            "zero\u{200B}width",
+            "tag\u{E0041}",
+            "line\u{2028}separator",
+            "isolate\u{2066}x",
+        ] {
+            let plain = control
+                .create_database(create_request(name, 1))
+                .await
+                .expect_err("an invisible character");
+            let labelled = control
+                .create_database_with_metadata(with_metadata(name, "", vec![label("a", "b")]))
+                .await
+                .expect_err("an invisible character");
+            for refused in [plain, labelled] {
+                assert_eq!(
+                    refused.code(),
+                    Code::InvalidArgument,
+                    "{name:?}: {refused:?}"
+                );
+                assert!(
+                    refused
+                        .message()
+                        .starts_with("invalid database name: it contains"),
+                    "{refused:?}"
+                );
+            }
+            let missing = control
+                .locate(LocateRequest {
+                    database: name.to_owned(),
+                })
+                .await
+                .expect_err("never created");
+            assert_eq!(missing.code(), Code::NotFound);
+        }
+        control
+            .create_database(create_request("café-notes", 1))
+            .await?;
+
+        // The writer, below the service, still takes such a name, as a log written before the
+        // check replays it.
+        let handle = daemon.control().ok_or("no control")?;
+        handle
+            .submit(Action::CreateDatabase {
+                name: "old\u{202E}name".parse()?,
+                replication_factor: fleetring::ReplicationFactor::ONE,
+                engine: fleetring_control::Engine::Sqlite,
+                durability: None,
+                metadata: None,
+            })
+            .await?;
+        assert!(
+            handle
+                .state()
+                .database(&"old\u{202E}name".parse()?)
+                .is_some()
+        );
+        daemon.run_until(async {}).await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn metadata_survives_a_control_node_restart() -> TestResult {
         let dir = tempfile::tempdir()?;

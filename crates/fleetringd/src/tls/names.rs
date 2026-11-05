@@ -119,13 +119,13 @@ impl fmt::Display for Principal {
 }
 
 /// The name control state records for a principal, as a database's creator or a description's
-/// author (ADR-0041): both follow the same grammar.
-impl From<&Principal> for fleetring_control::PrincipalName {
-    fn from(principal: &Principal) -> Self {
-        principal
-            .as_str()
-            .parse()
-            .expect("a principal's name follows the grammar of a recorded principal name")
+/// author (ADR-0041). Both follow the same grammar today, which a test pins; the conversion is
+/// fallible so that a later widening of one can't panic a control handler.
+impl TryFrom<&Principal> for fleetring_control::PrincipalName {
+    type Error = fleetring_control::ParsePrincipalNameError;
+
+    fn try_from(principal: &Principal) -> Result<Self, Self::Error> {
+        principal.as_str().parse()
     }
 }
 
@@ -270,7 +270,8 @@ mod tests {
         let longest = "a".repeat(MAX_NAME_LEN);
         for text in ["agent-42", "a", "x_y.z-0", longest.as_str()] {
             let principal: Principal = text.parse().expect("a principal");
-            let recorded = fleetring_control::PrincipalName::from(&principal);
+            let recorded = fleetring_control::PrincipalName::try_from(&principal)
+                .expect("the two grammars are equal");
             assert_eq!(recorded.as_str(), text);
         }
     }

@@ -264,7 +264,7 @@
       "component": "fleetringd",
       "area": "streams",
       "title": "Webhook sinks over HTTPS",
-      "description": "A webhook change-stream sink is HTTPS by default, trusting the platform’s roots and an optional private authority, with optional mutual TLS and a bearer token read from a file or the environment; plain http needs allow_http = true.",
+      "description": "A webhook change-stream sink is HTTPS by default, trusting the platform’s roots and an optional private authority, with optional mutual TLS and a bearer token from a file or the environment; http needs allow_http.",
       "status": "built",
       "since": "0.5.0",
       "ticket": "FR-073",
