@@ -287,6 +287,7 @@ mod tests {
                 chunk_checksums: Vec::new(),
             },
             chunks: Vec::new(),
+            metadata: None,
         }
     }
 

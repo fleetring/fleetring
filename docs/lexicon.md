@@ -663,8 +663,10 @@ The identifier of one request, kept from `x-request-id` or made as `<node-id>-<c
 
 Building a database from an [archive](#archive) at a *restore point*: its latest point, a [position](#position), or a time (ADR-0029, point 10). A restore starts from a base [snapshot](#snapshot) and applies [segments](#segment), verifying each against the [hash chain](#hash-chain). Online, it creates a new database and never overwrites one; offline, it writes a directory with a plain SQLite database.
 
+A restore also returns the [metadata](#metadata) the archive holds for the snapshot it started from, as the archive's claim: `db restore` sets the description without an author and the labels, and never the expiry (ADR-0041, point 10).
+
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `durability::restore_into`, `RestoreTarget`, `Restored`, `RestorePlan`; protocol `Database.Restore`, `RestorePoint`. **CLI:** `db restore`, `archive restore`, `--at-position`, `--at-time`.
+- **Code:** `durability::restore_into`, `RestoreTarget`, `Restored`, `RestorePlan`, `ArchivedMetadata`; protocol `Database.Restore`, `RestorePoint`, `RestoreResponse.archived_metadata`. **CLI:** `db restore`, `archive restore`, `--at-position`, `--at-time`.
 - **Not:** recover (that is what a failover does), import, rollback, rewind.
 
 ### Ring

@@ -1,5 +1,5 @@
-//! A database's manifest in an archive: one `list` of its prefix, with each snapshot's
-//! descriptor read.
+//! A database's manifest in an archive: one `list` of its prefix, and one of its metadata
+//! objects' prefix, with each snapshot's descriptor read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,6 +26,10 @@ pub struct Listing {
     pub damaged: Vec<DamagedObject>,
     /// Every segment, in key order.
     pub segments: Vec<SegmentEntry>,
+    /// Metadata objects that belong to no complete snapshot: the snapshot is being uploaded, was
+    /// deleted, or has a damaged descriptor; or another object of the same snapshot already
+    /// attached.
+    pub orphaned_metadata: Vec<OrphanedMetadata>,
 }
 
 /// A complete snapshot.
@@ -45,6 +49,30 @@ pub struct SnapshotEntry {
     pub descriptor: SnapshotDescriptor,
     /// The keys of the chunks the listing found, in order.
     pub chunks: Vec<String>,
+    /// Its metadata object, if the archive holds one.
+    pub metadata: Option<MetadataEntry>,
+}
+
+/// A snapshot's metadata object (ADR-0041, point 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataEntry {
+    /// Its key.
+    pub key: String,
+    /// The XXH3-128 checksum its name records, as 32 lowercase hex digits.
+    pub checksum: String,
+    /// Its length in bytes.
+    pub size: u64,
+}
+
+/// A metadata object of no complete snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedMetadata {
+    /// Its key.
+    pub key: String,
+    /// The ID of the snapshot it was written for.
+    pub id: String,
+    /// The position that snapshot holds the log up to, or `None` for the log's beginning.
+    pub position: Option<Position>,
 }
 
 /// A snapshot whose descriptor isn't written.
@@ -79,9 +107,10 @@ pub struct SegmentEntry {
 }
 
 impl Listing {
-    /// Lists `database`'s objects under `keys`, and reads each snapshot's descriptor, retrying
-    /// each call that fails for a reason that may pass. A descriptor of another database, or of
-    /// a snapshot another engine than `engine` took, is damaged.
+    /// Lists `database`'s objects under `keys`, and its metadata objects beside them, and reads
+    /// each snapshot's descriptor, retrying each call that fails for a reason that may pass. A
+    /// descriptor of another database, or of a snapshot another engine than `engine` took, is
+    /// damaged. A metadata object is attached by its name alone; it is read at restore.
     ///
     /// # Errors
     ///
@@ -116,6 +145,22 @@ impl Listing {
                 });
             }
         }
+        let mut metadata: BTreeMap<String, Vec<MetadataEntry>> = BTreeMap::new();
+        let beside = keys.metadata_objects();
+        for object in retrying(|| store.list(&beside)).await? {
+            if let Some((id, checksum)) = keys.parse_metadata_key(&object.key) {
+                metadata.entry(id).or_default().push(MetadataEntry {
+                    key: object.key,
+                    checksum,
+                    size: object.size,
+                });
+            } else {
+                listing.damaged.push(DamagedObject {
+                    key: object.key,
+                    reason: "its name is no snapshot's metadata object".to_owned(),
+                });
+            }
+        }
         for (id, (described, mut chunks)) in snapshots {
             chunks.sort();
             let Some((position, epoch)) = ArchiveKeys::parse_snapshot_id(&id) else {
@@ -140,17 +185,44 @@ impl Listing {
                 continue;
             };
             match checked(&bytes, database, engine, position.as_ref(), epoch) {
-                Ok((descriptor, chain)) => listing.snapshots.push(SnapshotEntry {
-                    id,
-                    key,
-                    position,
-                    epoch,
-                    chain,
-                    descriptor,
-                    chunks,
-                }),
+                Ok((descriptor, chain)) => {
+                    // Two objects for one snapshot, as when a retried snapshot saw an edit in
+                    // between: the last by key attaches, and the rest are left to retention.
+                    let mut objects = metadata.remove(&id).unwrap_or_default();
+                    let attached = objects.pop();
+                    listing
+                        .orphaned_metadata
+                        .extend(objects.into_iter().map(|object| OrphanedMetadata {
+                            key: object.key,
+                            id: id.clone(),
+                            position: position.clone(),
+                        }));
+                    listing.snapshots.push(SnapshotEntry {
+                        id,
+                        key,
+                        position,
+                        epoch,
+                        chain,
+                        descriptor,
+                        chunks,
+                        metadata: attached,
+                    });
+                }
                 Err(reason) => listing.damaged.push(DamagedObject { key, reason }),
             }
+        }
+        for (id, objects) in metadata {
+            // `parse_metadata_key` only returns IDs that parse.
+            let Some((position, _)) = ArchiveKeys::parse_snapshot_id(&id) else {
+                continue;
+            };
+            listing
+                .orphaned_metadata
+                .extend(objects.into_iter().map(|object| OrphanedMetadata {
+                    key: object.key,
+                    id: id.clone(),
+                    position: position.clone(),
+                }));
         }
         Ok(listing)
     }
@@ -251,4 +323,150 @@ fn checked(
         return Err("it has a checksum for each of a different number of chunks".to_owned());
     }
     Ok((descriptor, chain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durability::format::{FORMAT, checksum_hex, encode_descriptor};
+    use crate::durability::store::MemoryStore;
+    use crate::replication::ChainHash;
+
+    fn name() -> DatabaseName {
+        "ledger".parse().expect("a database name")
+    }
+
+    /// A complete snapshot at position `[0, byte]` and epoch 1: a chunk and a descriptor.
+    async fn put_snapshot(store: &MemoryStore, keys: &ArchiveKeys, byte: u8) -> String {
+        let at = Position::new([0, byte]);
+        let id = ArchiveKeys::snapshot_id(Some(&at), LeaseEpoch::new(1));
+        let chunk = vec![byte];
+        store
+            .put(&keys.chunk(&id, 0), chunk.clone())
+            .await
+            .expect("put");
+        let descriptor = SnapshotDescriptor {
+            format: FORMAT,
+            database: "ledger".to_owned(),
+            engine: "sqlite".to_owned(),
+            epoch: 1,
+            position: Some(crate::changes::hex(at.as_bytes())),
+            chain: ChainHash::GENESIS.to_string(),
+            taken_at_ms: u64::from(byte),
+            chunks: 1,
+            bytes: 1,
+            checksum: String::new(),
+            chunk_checksums: vec![checksum_hex(&chunk)],
+        };
+        store
+            .put(&keys.descriptor(&id), encode_descriptor(&descriptor))
+            .await
+            .expect("put");
+        id
+    }
+
+    #[tokio::test]
+    async fn metadata_objects_attach_to_their_snapshots_and_orphans_are_listed() {
+        let store = MemoryStore::new();
+        let keys = ArchiveKeys::new("fleetring", &name());
+        let with = put_snapshot(&store, &keys, 1).await;
+        let without = put_snapshot(&store, &keys, 2).await;
+        let sum = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+
+        // One snapshot's object; an object of a snapshot that isn't there, and one of a
+        // snapshot still being uploaded (chunks, no descriptor); a second object for `with`;
+        // and a key under the prefix that is none of them.
+        store
+            .put(&keys.metadata(&with, sum), b"one".to_vec())
+            .await
+            .expect("put");
+        store
+            .put(&keys.metadata(&with, other), b"two".to_vec())
+            .await
+            .expect("put");
+        let gone = ArchiveKeys::snapshot_id(Some(&Position::new([0, 9])), LeaseEpoch::new(1));
+        store
+            .put(&keys.metadata(&gone, sum), b"x".to_vec())
+            .await
+            .expect("put");
+        let uploading = ArchiveKeys::snapshot_id(Some(&Position::new([0, 7])), LeaseEpoch::new(1));
+        store
+            .put(&keys.chunk(&uploading, 0), b"c".to_vec())
+            .await
+            .expect("put");
+        store
+            .put(&keys.metadata(&uploading, sum), b"y".to_vec())
+            .await
+            .expect("put");
+        let junk = format!("{}notes.txt", keys.metadata_objects());
+        store.put(&junk, b"?".to_vec()).await.expect("put");
+        // Another database's objects are not this one's.
+        let tenant = ArchiveKeys::new("fleetring", &"tenant".parse().expect("a name"));
+        store
+            .put(&tenant.metadata(&with, sum), b"z".to_vec())
+            .await
+            .expect("put");
+
+        let listing = Listing::read(&store, &keys, &name(), EngineKind::Sqlite)
+            .await
+            .expect("lists");
+
+        let attached: Vec<(&str, Option<&str>)> = listing
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                (
+                    snapshot.id.as_str(),
+                    snapshot.metadata.as_ref().map(|entry| entry.key.as_str()),
+                )
+            })
+            .collect();
+        // The last of a snapshot's objects by key attaches.
+        let attached_key = keys.metadata(&with, sum).max(keys.metadata(&with, other));
+        let mut expected = vec![
+            (with.as_str(), Some(attached_key.as_str())),
+            (without.as_str(), None),
+        ];
+        expected.sort();
+        let mut attached = attached;
+        attached.sort();
+        assert_eq!(attached, expected);
+        let entry = listing
+            .snapshots
+            .iter()
+            .find_map(|snapshot| snapshot.metadata.as_ref())
+            .expect("an entry");
+        assert_eq!(entry.size, 3);
+        assert_eq!(
+            keys.parse_metadata_key(&entry.key).expect("a key").1,
+            entry.checksum
+        );
+
+        let mut orphans: Vec<&str> = listing
+            .orphaned_metadata
+            .iter()
+            .map(|orphan| orphan.key.as_str())
+            .collect();
+        orphans.sort();
+        let mut want = [
+            keys.metadata(&with, sum).min(keys.metadata(&with, other)),
+            keys.metadata(&gone, sum),
+            keys.metadata(&uploading, sum),
+        ];
+        want.sort();
+        assert_eq!(orphans, want.iter().map(String::as_str).collect::<Vec<_>>());
+        let nine = listing
+            .orphaned_metadata
+            .iter()
+            .find(|orphan| orphan.id == gone)
+            .expect("the gone snapshot's");
+        assert_eq!(nine.position, Some(Position::new([0, 9])));
+
+        // The unparsable key is damaged, as under the database's own prefix; nothing else is.
+        assert_eq!(listing.damaged.len(), 1, "{:#?}", listing.damaged);
+        assert_eq!(listing.damaged[0].key, junk);
+        assert_eq!(listing.incomplete.len(), 1);
+        assert_eq!(listing.segments.len(), 0);
+    }
 }

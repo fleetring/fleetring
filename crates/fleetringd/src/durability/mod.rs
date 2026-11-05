@@ -23,6 +23,13 @@
 //! `list` of a database's prefix is its manifest and no object ever needs a lock or a
 //! conditional write. A snapshot's descriptor is written last and marks it complete.
 //!
+//! # Metadata
+//!
+//! A snapshot of a database that has metadata (a description, labels, a creator) is written
+//! with one more object, outside the database's own prefix so that a release that doesn't know
+//! it never lists it (ADR-0041, point 10). A restore returns it; it never trusts what it says
+//! about who wrote the description.
+//!
 //! # The chain
 //!
 //! Each segment records the hash chain over the log (FR-044) at its start and its end, and each
@@ -41,6 +48,7 @@ mod config;
 mod format;
 mod keys;
 mod listing;
+mod metadata;
 mod plan;
 mod restore;
 mod retention;
@@ -53,11 +61,16 @@ pub(crate) use self::archive::blocking;
 pub use self::archive::{Archive, ArchiveError, ArchiveParts, build_store};
 pub use self::config::{ArchiveConfig, ArchiveSettings, CHUNK_BYTES, CredentialKind, StoreKind};
 pub use self::format::{
-    FORMAT, FormatError, SEGMENT_MAGIC, SegmentHeader, SnapshotDescriptor, checksum_hex,
-    decode_descriptor, decode_segment, encode_descriptor, encode_segment,
+    ArchivedMetadata, FORMAT, FormatError, MAX_METADATA_BYTES, METADATA_FORMAT, SEGMENT_MAGIC,
+    SegmentHeader, SnapshotDescriptor, checksum_hex, decode_descriptor, decode_metadata,
+    decode_segment, encode_descriptor, encode_metadata, encode_segment,
 };
 pub use self::keys::{ArchiveKeys, SegmentName, SnapshotObject};
-pub use self::listing::{DamagedObject, IncompleteSnapshot, Listing, SegmentEntry, SnapshotEntry};
+pub use self::listing::{
+    DamagedObject, IncompleteSnapshot, Listing, MetadataEntry, OrphanedMetadata, SegmentEntry,
+    SnapshotEntry,
+};
+pub use self::metadata::{ControlMetadata, MetadataFuture, MetadataSource, NoMetadata};
 pub use self::plan::{PlanError, RestorePlan, RestoreTarget, plan};
 pub use self::restore::{RestoreError, Restored, finish_offline, restore_into};
 pub use self::retention::{apply_retention, retention};
@@ -72,6 +85,11 @@ const _: () = {
     assert_debug_send_sync::<ArchiveConfig>();
     assert_debug_send_sync::<ArchiveError>();
     assert_debug_send_sync::<ArchiveKeys>();
+    assert_debug_send_sync::<ArchivedMetadata>();
+    assert_debug_send_sync::<ControlMetadata>();
+    assert_debug_send_sync::<MetadataEntry>();
+    assert_debug_send_sync::<NoMetadata>();
+    assert_debug_send_sync::<OrphanedMetadata>();
     assert_debug_send_sync::<ArchiveParts>();
     assert_debug_send_sync::<ArchiveSettings>();
     assert_debug_send_sync::<CredentialKind>();

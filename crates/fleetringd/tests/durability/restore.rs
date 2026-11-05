@@ -9,14 +9,16 @@ use std::time::Duration;
 use fleetring_control::DatabaseName;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::durability::{
-    ArchiveKeys, Listing, MemoryStore, ObjectEntry, ObjectStore, PlanError, RestoreError,
-    RestoreTarget, Restored, StoreError, StoreFuture, decode_segment, encode_descriptor,
-    encode_segment, finish_offline, restore_into,
+    ArchiveKeys, Listing, MAX_METADATA_BYTES, MemoryStore, ObjectEntry, ObjectStore, PlanError,
+    RestoreError, RestoreTarget, Restored, StoreError, StoreFuture, checksum_hex, decode_segment,
+    encode_descriptor, encode_segment, finish_offline, restore_into,
 };
 use fleetringd::engine::{EngineKind, Execution, Position};
 use tokio::sync::watch;
 
-use crate::common::{Node, TestResult, insert, name, settings, sqlite};
+use crate::common::{
+    Node, TestMetadata, TestResult, archived_metadata, insert, name, settings, sqlite,
+};
 
 /// The values of `t` in the copy at `dir`, read from a scratch copy of its files so that SQLite's
 /// own checkpoint on close leaves `dir` as it was, with `PRAGMA integrity_check`'s answer.
@@ -530,5 +532,170 @@ async fn offline_restore_writes_a_plain_sqlite_database() -> TestResult {
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<i64>, _>>()?;
     assert_eq!(values, (1..=6).collect::<Vec<_>>());
+    Ok(())
+}
+
+/// A node archiving `ledger` with metadata to `store`, which holds the values `1..=3` once
+/// archived.
+async fn archived_with_metadata(
+    dir: &Path,
+    store: &MemoryStore,
+) -> Result<(Node, DatabaseName), Box<dyn std::error::Error>> {
+    let ledger = name("ledger");
+    let metadata = TestMetadata::new();
+    metadata.set(&ledger, archived_metadata("ledger"));
+    let node = Node::start_with_metadata(
+        &dir.join("node"),
+        Arc::new(store.clone()),
+        settings(),
+        metadata,
+    );
+    node.create(&ledger, "CREATE TABLE t (value INTEGER NOT NULL)")
+        .await?;
+    for value in 1..=3 {
+        node.execute(&ledger, insert(value)).await?;
+    }
+    node.await_archived().await?;
+    Ok((node, ledger))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_returns_the_archived_metadata_as_the_archives_claim() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let (node, ledger) = archived_with_metadata(dir.path(), &store).await?;
+
+    let staging = dir.path().join("restored");
+    let restored = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await?;
+    // Everything the object said comes back, the author, the creator, and the expiry included:
+    // they are the archive's claims, and the caller decides what to do with each. The daemon's
+    // client sets the description without an author and never copies the expiry.
+    assert_eq!(restored.metadata, Some(archived_metadata("ledger")));
+    assert_eq!(restored.metadata_skipped, None);
+    assert_eq!(rows(&staging)?.0, [1, 2, 3]);
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_without_metadata_restores_exactly_as_before() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    // An archive a release without metadata wrote: no `.metadata/` objects at all.
+    let node = Node::start(
+        &dir.path().join("node"),
+        Arc::new(store.clone()),
+        settings(),
+    );
+    let ledger = create_ledger(&node).await?;
+    for value in 1..=3 {
+        node.execute(&ledger, insert(value)).await?;
+    }
+    node.await_archived().await?;
+    let keys = store.list("").await?;
+    assert!(
+        keys.iter().all(|object| !object.key.contains(".metadata")),
+        "{keys:#?}"
+    );
+
+    let staging = dir.path().join("restored");
+    let restored = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await?;
+    assert_eq!(restored.metadata, None);
+    assert_eq!(restored.metadata_skipped, None);
+    assert_eq!(rows(&staging)?.0, [1, 2, 3]);
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_metadata_object_that_fails_its_checksum_is_ignored() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let (node, ledger) = archived_with_metadata(dir.path(), &store).await?;
+    let listing = node.listing(&ledger).await?;
+    let entry = listing.snapshots[0].metadata.clone().ok_or("an object")?;
+
+    // Flip a byte, keeping the name: the data restores, the metadata is skipped and reported.
+    let mut bytes = store.get(&entry.key).await?.ok_or("the object")?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    store.put(&entry.key, bytes).await?;
+    let staging = dir.path().join("restored");
+    let restored = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await?;
+    assert_eq!(restored.metadata, None);
+    let reason = restored.metadata_skipped.ok_or("a reason")?;
+    assert!(reason.contains("checksum"), "{reason}");
+    assert_eq!(rows(&staging)?.0, [1, 2, 3], "the data restored");
+
+    // A truncated object fails the same way.
+    store.put(&entry.key, vec![b'{']).await?;
+    let staging = dir.path().join("restored-again");
+    let restored = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await?;
+    assert_eq!(restored.metadata, None);
+    assert!(restored.metadata_skipped.is_some());
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_that_checks_out_but_cant_be_used_never_fails_a_data_restore() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let (node, ledger) = archived_with_metadata(dir.path(), &store).await?;
+    let keys = node.archive.keys(&ledger);
+    let listing = node.listing(&ledger).await?;
+    let snapshot = &listing.snapshots[0];
+    let old = snapshot.metadata.clone().ok_or("an object")?;
+
+    let genuine = serde_json::to_value(archived_metadata("ledger"))?;
+    let with = |field: &str, value: serde_json::Value| {
+        let mut object = genuine.clone();
+        object[field] = value;
+        object.to_string().into_bytes()
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("not JSON", b"{ not json".to_vec()),
+        ("an unknown field", with("surprise", serde_json::json!(1))),
+        ("a newer format", with("format", serde_json::json!(2))),
+        (
+            "another database's",
+            with("database", serde_json::json!("other")),
+        ),
+        (
+            "an oversized description",
+            with("description", serde_json::json!("x".repeat(2048))),
+        ),
+        (
+            "too many labels",
+            with(
+                "labels",
+                serde_json::Value::Object(
+                    (0..40)
+                        .map(|n| (format!("k{n}"), serde_json::json!("v")))
+                        .collect(),
+                ),
+            ),
+        ),
+        ("an oversized object", vec![b' '; MAX_METADATA_BYTES + 1]),
+    ];
+    store.delete(&old.key).await?;
+    for (index, (what, bytes)) in cases.into_iter().enumerate() {
+        // The name carries the bytes' own checksum, so only the content is at fault.
+        let key = keys.metadata(&snapshot.id, &checksum_hex(&bytes));
+        store.put(&key, bytes).await?;
+        let staging = dir.path().join(format!("restored-{index}"));
+        let restored = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await?;
+        assert_eq!(restored.metadata, None, "{what}");
+        assert!(restored.metadata_skipped.is_some(), "{what}");
+        assert_eq!(rows(&staging)?.0, [1, 2, 3], "{what}: the data restored");
+        store.delete(&key).await?;
+    }
+
+    // A snapshot whose object is gone restores without metadata, and nothing was skipped.
+    let staging = dir.path().join("restored-gone");
+    let restored = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await?;
+    assert_eq!((restored.metadata, restored.metadata_skipped), (None, None));
+    assert_eq!(rows(&staging)?.0, [1, 2, 3]);
+    node.stop().await;
     Ok(())
 }

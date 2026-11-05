@@ -26,11 +26,12 @@ use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
     ArchiveDescription, Client, DatabaseSpec, LabelRequirement, LeaseUpdate, ListFilter, Location,
-    MetadataView, NewMetadata, NodeStatus, ReplicaInfo, Verification,
+    MetadataView, NewMetadata, NodeStatus, ReplicaInfo, Restoration, Verification,
+    restored_metadata,
 };
 use fleetringd::dev::{self, DevError, DevMode, Prepared};
 use fleetringd::durability::{
-    ArchiveKeys, RestoreTarget, build_store, finish_offline, restore_into,
+    ArchiveKeys, RestoreTarget, build_store, encode_metadata, finish_offline, restore_into,
 };
 use fleetringd::engine::{
     Execution, Internal, MAX_COUNT_LIMIT, Position, Rows, SchemaRequest, SqliteEngine, Statement,
@@ -38,7 +39,7 @@ use fleetringd::engine::{
 };
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
-use fleetringd::report::{DatabaseReport, printable, render_text};
+use fleetringd::report::{DatabaseReport, printable, render_archived_metadata, render_text};
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
     FleetName, Identity, Peer, Principal, Security, Validity,
@@ -1572,8 +1573,8 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 spec = spec.with_acks(acks);
             }
             let metadata = metadata.read(std::io::stdin().lock())?;
-            let restored = target
-                .client()?
+            let client = target.client()?;
+            let restored = client
                 .restore_database_with_metadata(
                     &name,
                     spec,
@@ -1585,8 +1586,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .await
                 .map_err(metadata_failed)?;
             warn_if_under_replicated(&restored.location);
+            let archived = restore_archived_metadata(&client, &name, &restored, &metadata).await;
             format!(
-                "restored {name} from {from} in archive {archive}\n{}{}",
+                "restored {name} from {from} in archive {archive}\n{}{}{archived}",
                 format_restored(
                     restored.position.as_ref(),
                     &restored.chain_hash,
@@ -1811,7 +1813,7 @@ fn format_archive(archive: &str, description: &ArchiveDescription) -> String {
     for snapshot in &description.snapshots {
         let _ = writeln!(
             output,
-            "  {}: position {} epoch {} taken {} ({} bytes)",
+            "  {}: position {} epoch {} taken {} ({} bytes) metadata: {}",
             snapshot.id,
             snapshot
                 .position
@@ -1819,7 +1821,8 @@ fn format_archive(archive: &str, description: &ArchiveDescription) -> String {
                 .map_or_else(|| "begin".to_owned(), ToString::to_string),
             snapshot.epoch.get(),
             format_time(snapshot.taken_at_ms),
-            snapshot.bytes
+            snapshot.bytes,
+            if snapshot.has_metadata { "yes" } else { "no" }
         );
     }
     if description.incomplete > 0 {
@@ -1906,6 +1909,52 @@ async fn verify_archive(
     Ok(output)
 }
 
+/// The file `archive restore` writes the archived metadata to, beside the restored database.
+const ARCHIVED_METADATA_FILE: &str = "metadata.json";
+
+/// Sets the archived description and labels on the restored database `name`, and reports what
+/// the archive held (ADR-0041, point 10). The data has restored by now, so nothing here fails
+/// the command: what can't be set is a warning on stderr, and the report still shows it.
+///
+/// The description is set without an author, so no reader trusts it, and the archived author
+/// and creator are printed as the archive's claims and recorded nowhere. The expiry is never
+/// restored.
+async fn restore_archived_metadata(
+    client: &Client,
+    name: &DatabaseName,
+    restored: &Restoration,
+    flags: &NewMetadata,
+) -> String {
+    if let Some(reason) = &restored.archived_metadata_skipped {
+        eprintln!(
+            "warning: the archived metadata was skipped: {}",
+            printable(reason)
+        );
+    }
+    let Some(archived) = &restored.archived_metadata else {
+        return restored
+            .archived_metadata_skipped
+            .as_ref()
+            .map_or_else(String::new, |_| "archived metadata: skipped\n".to_owned());
+    };
+    let restore = restored_metadata(archived, flags);
+    for skipped in &restore.skipped {
+        eprintln!("warning: skipped {}", printable(skipped));
+    }
+    if !restore.change.is_empty()
+        && let Err(status) = client.update_database(name, &restore.change, None).await
+    {
+        eprintln!(
+            "warning: the archived description and labels weren't restored: {}",
+            failed(status)
+        );
+    }
+    let mut report = Vec::new();
+    // Writing to a vector can't fail.
+    let _ = render_archived_metadata(archived, &mut report);
+    String::from_utf8_lossy(&report).into_owned()
+}
+
 /// Runs `archive restore`: builds the store `config`'s `[[archive]]` entry names, restores `from`
 /// into `to`, and checkpoints it so that `data.db` holds every row.
 async fn restore_offline(
@@ -1934,9 +1983,27 @@ async fn restore_offline(
     )
     .await?;
     finish_offline(&engine, to)?;
+    let metadata = match (&restored.metadata, &restored.metadata_skipped) {
+        (Some(metadata), _) => {
+            let file = to.join(ARCHIVED_METADATA_FILE);
+            std::fs::write(&file, encode_metadata(metadata))?;
+            format!(
+                "the archived metadata, the archive's claims and not verified: {}\n",
+                file.display()
+            )
+        }
+        (None, Some(reason)) => {
+            eprintln!(
+                "warning: the archived metadata was skipped: {}",
+                printable(reason)
+            );
+            "the archived metadata was skipped\n".to_owned()
+        }
+        (None, None) => String::new(),
+    };
     Ok(format!(
         "restored {from} from archive {archive} into {}\n{}the directory holds a plain SQLite \
-         database: {}\n",
+         database: {}\n{metadata}",
         to.display(),
         format_restored(
             restored.position.as_ref(),

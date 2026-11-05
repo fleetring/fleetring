@@ -4,7 +4,15 @@
 //! <prefix>/<db>/snapshots/<id>/snapshot.json              descriptor, written last
 //! <prefix>/<db>/snapshots/<id>/<nnnnnnnn>.chunk            the packed snapshot stream
 //! <prefix>/<db>/segments/<start>_<end>_<epoch>_<at>.seg    one delivered batch
+//! <prefix>/.metadata/<db>/<id>_<checksum>.json             the database's metadata at a snapshot
 //! ```
+//!
+//! The metadata object lives *outside* `<prefix>/<db>/` on purpose (ADR-0041, point 10). A
+//! release without it lists only that prefix, and would report an object it can't parse as
+//! damaged, and leave it behind when it deletes a snapshot; outside the prefix it never sees it.
+//! No database is named `.metadata`, since a database's directory name never holds a `.`.
+//! `<checksum>` is the object's XXH3-128 as 32 lowercase hex digits: it detects damage and
+//! authenticates nothing.
 //!
 //! `<db>` is the database's directory name, escaped so that every key is safe on every store;
 //! positions are lowercase hex, or `begin` for the log's beginning; epochs and `<at>`, the
@@ -31,10 +39,21 @@ const CHUNK_SUFFIX: &str = ".chunk";
 /// The suffix of a segment's name.
 const SEGMENT_SUFFIX: &str = ".seg";
 
+/// The directory, beside the databases' own, that holds their metadata objects: the one key
+/// component beginning with `.` that a store accepts.
+pub(crate) const METADATA_DIR: &str = ".metadata";
+
+/// The suffix of a metadata object's name.
+const METADATA_SUFFIX: &str = ".json";
+
+/// The length of the checksum in a metadata object's name, in hex digits.
+const CHECKSUM_DIGITS: usize = 32;
+
 /// The keys of one database's objects in one archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveKeys {
     root: String,
+    metadata_root: String,
 }
 
 impl ArchiveKeys {
@@ -50,12 +69,18 @@ impl ArchiveKeys {
             })
             .collect();
         let db = db.join("/");
-        let root = if prefix.is_empty() {
-            db
+        let (root, metadata_root) = if prefix.is_empty() {
+            (db.clone(), format!("{METADATA_DIR}/{db}"))
         } else {
-            format!("{prefix}/{db}")
+            (
+                format!("{prefix}/{db}"),
+                format!("{prefix}/{METADATA_DIR}/{db}"),
+            )
         };
-        Self { root }
+        Self {
+            root,
+            metadata_root,
+        }
     }
 
     /// The prefix every one of the database's objects is under, ending in `/`.
@@ -74,6 +99,13 @@ impl ArchiveKeys {
     #[must_use]
     pub fn segments(&self) -> String {
         format!("{}/segments/", self.root)
+    }
+
+    /// The prefix every one of the database's metadata objects is under, ending in `/`. It is
+    /// not under [`database`](Self::database).
+    #[must_use]
+    pub fn metadata_objects(&self) -> String {
+        format!("{}/", self.metadata_root)
     }
 
     /// A snapshot's ID: its position and the epoch of the primary that took it.
@@ -101,6 +133,16 @@ impl ArchiveKeys {
         format!("{}{id}/{index:08}{CHUNK_SUFFIX}", self.snapshots())
     }
 
+    /// The key of the metadata object of snapshot `id` whose bytes have the XXH3-128 checksum
+    /// `checksum`, 32 lowercase hex digits.
+    #[must_use]
+    pub fn metadata(&self, id: &str, checksum: &str) -> String {
+        format!(
+            "{}{id}_{checksum}{METADATA_SUFFIX}",
+            self.metadata_objects()
+        )
+    }
+
     /// The key of the segment `name` names.
     #[must_use]
     pub fn segment(&self, name: &SegmentName) -> String {
@@ -123,6 +165,21 @@ impl ArchiveKeys {
             SnapshotObject::Chunk(index.parse().ok()?)
         };
         Some((id.to_owned(), object))
+    }
+
+    /// The snapshot ID and the checksum `key` names, if it is one of this database's metadata
+    /// objects.
+    #[must_use]
+    pub fn parse_metadata_key(&self, key: &str) -> Option<(String, String)> {
+        let file = key
+            .strip_prefix(&self.metadata_objects())?
+            .strip_suffix(METADATA_SUFFIX)?;
+        let (id, checksum) = file.rsplit_once('_')?;
+        Self::parse_snapshot_id(id)?;
+        let lower = checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        (checksum.len() == CHECKSUM_DIGITS && lower).then(|| (id.to_owned(), checksum.to_owned()))
     }
 
     /// The segment `key` names, if it is one of this database's.
@@ -313,5 +370,70 @@ mod tests {
     fn an_empty_prefix_puts_databases_at_the_top() {
         let keys = ArchiveKeys::new("", &name("ledger"));
         assert_eq!(keys.segments(), "ledger/segments/");
+        assert_eq!(keys.metadata_objects(), ".metadata/ledger/");
+    }
+
+    #[test]
+    fn metadata_keys_round_trip_with_their_checksum() {
+        let keys = ArchiveKeys::new("fleetring", &name("tenant/A"));
+        let id = ArchiveKeys::snapshot_id(Some(&Position::new([0, 2])), LeaseEpoch::new(3));
+        let checksum = "0123456789abcdef0123456789abcdef";
+        let key = keys.metadata(&id, checksum);
+        assert_eq!(
+            key,
+            "fleetring/.metadata/tenant%2f%41/0002_0000000000000003_0123456789abcdef0123456789abcdef.json"
+        );
+        assert!(!key.starts_with(&keys.database()), "{key}");
+        assert_eq!(
+            keys.parse_metadata_key(&key),
+            Some((id.clone(), checksum.to_owned()))
+        );
+        // The beginning of the log has an ID too.
+        let begin = ArchiveKeys::snapshot_id(None, LeaseEpoch::new(1));
+        assert_eq!(
+            keys.parse_metadata_key(&keys.metadata(&begin, checksum)),
+            Some((begin, checksum.to_owned()))
+        );
+        // It is no snapshot object and no segment.
+        assert_eq!(keys.parse_snapshot_key(&key), None);
+        assert_eq!(keys.parse_segment_key(&key), None);
+        let prefix = keys.metadata_objects();
+        for bad in [
+            format!("{prefix}{id}.json"),
+            format!("{prefix}{id}_{}.json", &checksum[1..]),
+            format!("{prefix}{id}_{}.json", checksum.to_uppercase()),
+            format!("{prefix}{id}_{checksum}.txt"),
+            format!("{prefix}nonsense_{checksum}.json"),
+            format!("{prefix}x/{id}_{checksum}.json"),
+            format!("fleetring/other/{id}_{checksum}.json"),
+            format!("{}{id}_{checksum}.json", keys.snapshots()),
+        ] {
+            assert_eq!(keys.parse_metadata_key(&bad), None, "{bad}");
+        }
+        // Another database's metadata isn't this one's.
+        let other = ArchiveKeys::new("fleetring", &name("tenant"));
+        assert_eq!(other.parse_metadata_key(&key), None);
+    }
+
+    #[test]
+    fn no_database_directory_is_named_like_the_metadata_directory() {
+        // `layout::database_dir` escapes `.`, so `.metadata` can't be a database's directory.
+        for text in [".metadata", "a.b", ".", "..", "x/.metadata", ".hidden"] {
+            let Ok(database) = text.parse::<DatabaseName>() else {
+                continue;
+            };
+            let dir = layout::database_dir(&database);
+            for component in dir.components() {
+                let Component::Normal(part) = component else {
+                    continue;
+                };
+                let part = part.to_str().expect("UTF-8");
+                assert!(!part.contains('.'), "{text} -> {part}");
+                assert_ne!(part, METADATA_DIR);
+            }
+        }
+        // And a database's own keys never begin with the metadata directory.
+        let keys = ArchiveKeys::new("", &name("metadata"));
+        assert!(!keys.database().starts_with(METADATA_DIR));
     }
 }

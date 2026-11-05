@@ -242,6 +242,13 @@ pub struct Restoration {
     pub segments: u32,
     /// When the last segment applied was archived, or `None` if none was.
     pub archived_at_ms: Option<u64>,
+    /// The metadata the archive holds for the source, if the restore's snapshot has an object
+    /// that checked out. Everything in it is the archive's claim: the archive isn't signed. It
+    /// is not applied to the new database; [`restored_metadata`](crate::data::restored_metadata)
+    /// says what of it to set.
+    pub archived_metadata: Option<MetadataView>,
+    /// Why the snapshot's metadata object was skipped, if it was. The data restored either way.
+    pub archived_metadata_skipped: Option<String>,
 }
 
 /// One complete snapshot in an archive.
@@ -258,6 +265,8 @@ pub struct ArchivedSnapshot {
     pub taken_at_ms: u64,
     /// The packed stream's length.
     pub bytes: u64,
+    /// Whether the archive holds a metadata object for it.
+    pub has_metadata: bool,
 }
 
 /// What an archive holds for a database, as [`Client::describe_archive`] reports it.
@@ -618,6 +627,8 @@ impl Client {
             snapshot: restored.snapshot,
             segments: restored.segments,
             archived_at_ms: restored.archived_at_ms,
+            archived_metadata: restored.archived_metadata.map(metadata_view),
+            archived_metadata_skipped: restored.archived_metadata_skipped,
         })
     }
 
@@ -652,6 +663,7 @@ impl Client {
                     position: optional_position(snapshot.position),
                     taken_at_ms: snapshot.taken_at_ms,
                     bytes: snapshot.bytes,
+                    has_metadata: snapshot.metadata,
                 })
                 .collect(),
             latest: optional_position(response.latest),

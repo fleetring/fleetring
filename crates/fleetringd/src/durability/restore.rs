@@ -6,6 +6,12 @@
 //! the chain recomputed over its batch must give its `chain_end`, before the engine applies it.
 //! Anything that doesn't hold fails the restore as data loss, naming the object, and the staging
 //! directory is removed: nothing partial is left behind, and nothing is skipped.
+//!
+//! The base snapshot's metadata object is the one exception (ADR-0041, point 10). It is read
+//! after the data is restored, checked against the checksum in its name, and returned; one that
+//! is missing, damaged, or too large is skipped with a warning and a reason in
+//! [`Restored::metadata_skipped`], since the data restored and the metadata is only a
+//! convenience.
 
 use std::io;
 use std::path::Path;
@@ -14,9 +20,12 @@ use std::sync::Arc;
 use fleetring_control::DatabaseName;
 
 use super::archive::blocking;
-use super::format::{SegmentHeader, checksum_hex, decode_segment};
+use super::format::{
+    ArchivedMetadata, MAX_METADATA_BYTES, SegmentHeader, checksum_hex, decode_metadata,
+    decode_segment,
+};
 use super::keys::ArchiveKeys;
-use super::listing::{Listing, SegmentEntry};
+use super::listing::{Listing, MetadataEntry, SegmentEntry};
 use super::plan::{PlanError, RestorePlan, RestoreTarget, plan};
 use super::store::{ObjectStore, StoreError, retrying};
 use crate::changes::{hex, unhex};
@@ -40,6 +49,11 @@ pub struct Restored {
     pub segments: u32,
     /// When the last segment applied was archived, or `None` if none was.
     pub archived_at_ms: Option<u64>,
+    /// The base snapshot's metadata, if it has an object and the object checked out. What it
+    /// says about who wrote the description is the archive's claim and nothing more.
+    pub metadata: Option<ArchivedMetadata>,
+    /// Why the snapshot's metadata object was skipped, if it has one that was.
+    pub metadata_skipped: Option<String>,
 }
 
 /// The error returned when a restore fails. Nothing is left in the staging directory.
@@ -128,7 +142,50 @@ pub async fn restore_into(
             tracing::warn!(%error, "can't remove a failed restore's staging directory");
         }
     }
-    built
+    let mut restored = built?;
+    if let Some(entry) = &plan.snapshot.metadata {
+        match read_metadata(store, database, entry).await {
+            Ok(metadata) => restored.metadata = Some(metadata),
+            Err(reason) => {
+                tracing::warn!(%database, key = %entry.key, %reason, "the archived metadata is damaged; restoring without it");
+                restored.metadata_skipped = Some(reason);
+            }
+        }
+    }
+    Ok(restored)
+}
+
+/// Reads and checks a metadata object: not larger than metadata can be, whole by the checksum
+/// in its name, of the format this version reads, and the database's own.
+async fn read_metadata(
+    store: &dyn ObjectStore,
+    database: &DatabaseName,
+    entry: &MetadataEntry,
+) -> Result<ArchivedMetadata, String> {
+    if usize::try_from(entry.size).is_ok_and(|size| size > MAX_METADATA_BYTES) {
+        return Err(format!(
+            "{} is {} bytes, more than the {MAX_METADATA_BYTES} metadata can take",
+            entry.key, entry.size
+        ));
+    }
+    let bytes = retrying(|| store.get(&entry.key))
+        .await
+        .map_err(|error| format!("can't read {}: {error}", entry.key))?
+        .ok_or_else(|| format!("{} is missing", entry.key))?;
+    if checksum_hex(&bytes) != entry.checksum {
+        return Err(format!(
+            "{} doesn't match the checksum in its name",
+            entry.key
+        ));
+    }
+    let metadata = decode_metadata(&bytes).map_err(|error| format!("{}: {error}", entry.key))?;
+    if metadata.database != database.as_str() {
+        return Err(format!(
+            "{} describes database `{}`, not `{database}`",
+            entry.key, metadata.database
+        ));
+    }
+    Ok(metadata)
 }
 
 /// Builds the copy `plan` describes in `staging`.
@@ -198,6 +255,8 @@ async fn build(
         snapshot: snapshot.id.clone(),
         segments: u32::try_from(plan.segments.len()).unwrap_or(u32::MAX),
         archived_at_ms,
+        metadata: None,
+        metadata_skipped: None,
     })
 }
 

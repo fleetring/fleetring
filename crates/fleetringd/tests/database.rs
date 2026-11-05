@@ -2485,10 +2485,14 @@ async fn statements_are_confined_to_the_database_they_name() -> TestResult {
 mod archives {
     use std::path::Path;
 
-    use fleetring_control::DatabaseName;
+    use std::path::PathBuf;
+
+    use fleetring_control::{DatabaseName, Labels, parse_label};
     use fleetring_proto::v1::RestoreRequest;
-    use fleetringd::data::{Client, DatabaseSpec};
-    use fleetringd::durability::RestoreTarget;
+    use fleetringd::data::{Client, DatabaseSpec, NewMetadata, restored_metadata};
+    use fleetringd::durability::{
+        ArchivedMetadata, RestoreTarget, checksum_hex, decode_metadata, encode_metadata,
+    };
     use fleetringd::engine::{Position, Statement, Value};
     use fleetringd::transport::database_client;
     use tonic::Code;
@@ -2518,6 +2522,16 @@ mod archives {
         count: i64,
     ) -> TestResult {
         client.create_database(database, three()?).await?;
+        write_archived(fleet, client, database, count).await
+    }
+
+    /// Writes `1..=count` to `database`, and waits until its primary has archived them all.
+    async fn write_archived(
+        fleet: &Fleet,
+        client: &Client,
+        database: &DatabaseName,
+        count: i64,
+    ) -> TestResult {
         client
             .execute(
                 database,
@@ -2745,6 +2759,291 @@ mod archives {
         assert_eq!(metadata.label("purpose"), Some("restore"));
         assert_eq!(metadata.created_by.as_deref(), Some("tester"));
         assert_eq!(values(&client, &described).await?, [1, 2, 3]);
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// The metadata a ledger is created with in the tests below.
+    fn ledger_metadata() -> Result<NewMetadata, Box<dyn std::error::Error>> {
+        Ok(NewMetadata {
+            description: Some("Ledger notes.\nSecond line.".parse()?),
+            labels: Labels::try_from_pairs([
+                parse_label("purpose=ledger")?,
+                parse_label("team=billing")?,
+            ])?,
+        })
+    }
+
+    /// Creates `database` with three replicas and `metadata`, writes `1..=count` to it, and
+    /// waits until its primary has archived them all, its metadata included.
+    async fn create_archived_with_metadata(
+        fleet: &Fleet,
+        client: &Client,
+        database: &DatabaseName,
+        count: i64,
+    ) -> TestResult {
+        client
+            .create_database_with_metadata(
+                database,
+                DatabaseSpec::new(three()?),
+                &ledger_metadata()?,
+            )
+            .await?;
+        write_archived(fleet, client, database, count).await
+    }
+
+    /// The metadata objects the directory archive under `root` holds.
+    fn metadata_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                    && path
+                        .components()
+                        .any(|component| component.as_os_str() == ".metadata")
+                {
+                    found.push(path);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_applies_archived_description_and_labels_but_not_the_expiry() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived_with_metadata(&fleet, &client, &ledger, 3).await?;
+
+        // An archive isn't signed, so its object may say anything. This one claims that `ops`
+        // wrote the description and created the database, and that it expires. The checksum
+        // in its name is the forged bytes' own, which is all a checksum can vouch for.
+        let files = metadata_files(&dir.path().join("archive"))?;
+        assert_eq!(files.len(), 1, "{files:?}");
+        let genuine = decode_metadata(&std::fs::read(&files[0])?)?;
+        assert_eq!(genuine.description_by.as_deref(), Some("tester"));
+        let forged = ArchivedMetadata {
+            description_by: Some("ops".to_owned()),
+            created_by: Some("ops".to_owned()),
+            expires_at_ms: Some(1),
+            ..genuine
+        };
+        let bytes = encode_metadata(&forged);
+        let stem = files[0]
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or("a file name")?;
+        let id = stem.rsplit_once('_').ok_or("an id and a checksum")?.0;
+        std::fs::write(
+            files[0].with_file_name(format!("{id}_{}.json", checksum_hex(&bytes))),
+            &bytes,
+        )?;
+        std::fs::remove_file(&files[0])?;
+
+        let restored = name("restored")?;
+        let restoration = client
+            .restore_database(
+                &restored,
+                DatabaseSpec::new(three()?),
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await?;
+        assert_eq!(restoration.archived_metadata_skipped, None);
+        let archived = restoration.archived_metadata.as_ref().ok_or("metadata")?;
+        // What the archive claims is reported as its claim.
+        assert_eq!(archived.description_by.as_deref(), Some("ops"));
+        assert_eq!(archived.created_by.as_deref(), Some("ops"));
+        assert!(archived.expires_at.is_some());
+
+        let restore = restored_metadata(archived, &NewMetadata::default());
+        assert!(restore.skipped.is_empty(), "{:?}", restore.skipped);
+        client
+            .update_database(&restored, &restore.change, None)
+            .await?;
+        let metadata = client
+            .locate(&restored)
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(
+            metadata.description.as_deref(),
+            Some("Ledger notes.\nSecond line.")
+        );
+        assert_eq!(
+            metadata.description_by, None,
+            "a restored description records no author, so every reader treats it as untrusted"
+        );
+        assert_eq!(metadata.label("purpose"), Some("ledger"));
+        assert_eq!(metadata.label("team"), Some("billing"));
+        assert_eq!(
+            metadata.created_by.as_deref(),
+            Some("tester"),
+            "the creator is the principal that restored"
+        );
+        assert_eq!(metadata.expires_at, None, "an expiry is never restored");
+        assert_eq!(values(&client, &restored).await?, [1, 2, 3]);
+        fleet.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_flags_win_over_the_archive() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived_with_metadata(&fleet, &client, &ledger, 3).await?;
+
+        let flags = NewMetadata {
+            description: Some("Mine.".parse()?),
+            labels: Labels::try_from_pairs([parse_label("purpose=scratch")?])?,
+        };
+        let restored = name("restored")?;
+        let restoration = client
+            .restore_database_with_metadata(
+                &restored,
+                DatabaseSpec::new(three()?),
+                &flags,
+                ARCHIVE,
+                &ledger,
+                &RestoreTarget::Latest,
+            )
+            .await?;
+        let archived = restoration.archived_metadata.as_ref().ok_or("metadata")?;
+        let restore = restored_metadata(archived, &flags);
+        client
+            .update_database(&restored, &restore.change, None)
+            .await?;
+        let metadata = client
+            .locate(&restored)
+            .await?
+            .metadata
+            .ok_or("no metadata")?;
+        assert_eq!(metadata.description.as_deref(), Some("Mine."));
+        assert_eq!(
+            metadata.description_by.as_deref(),
+            Some("tester"),
+            "a description given to the restore is the caller's own"
+        );
+        assert_eq!(metadata.label("purpose"), Some("scratch"), "the flag wins");
+        assert_eq!(
+            metadata.label("team"),
+            Some("billing"),
+            "the rest is archived's"
+        );
+        fleet.stop().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_command_line_restores_archived_metadata_as_untrusted() -> TestResult {
+        use super::binary::{args, fleetringd, stdout};
+
+        let dir = tempfile::tempdir()?;
+        let fleet = archived_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        let ledger = name("ledger")?;
+        create_archived_with_metadata(&fleet, &client, &ledger, 3).await?;
+        let control = fleet.control_address()?;
+        let run = async |words: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+            stdout(&fleetringd(fleet.tls.dir(), args(words, &control)).await?)
+        };
+
+        let restored = run(&[
+            "db",
+            "restore",
+            "restored",
+            "--archive",
+            ARCHIVE,
+            "--from",
+            "ledger",
+        ])
+        .await?;
+        assert!(
+            restored.contains("archived description:\n  | Ledger notes.\n  | Second line.\n"),
+            "{restored}"
+        );
+        assert!(
+            restored
+                .contains("archived description by: tester (the archive's claim; not recorded)\n"),
+            "{restored}"
+        );
+        assert!(
+            restored.contains("archived creator: tester (the archive's claim; not recorded)\n"),
+            "{restored}"
+        );
+        assert!(
+            restored.contains("archived labels: purpose=ledger, team=billing\n"),
+            "{restored}"
+        );
+        let shown: serde_json::Value =
+            serde_json::from_str(&run(&["db", "show", "restored", "--json"]).await?)?;
+        let metadata = &shown["metadata"];
+        assert_eq!(metadata["description"], "Ledger notes.\nSecond line.");
+        assert_eq!(metadata["description_by"], serde_json::Value::Null);
+        assert_eq!(metadata["labels"]["purpose"], "ledger");
+        assert_eq!(metadata["labels"]["team"], "billing");
+        assert_eq!(metadata["created_by"], "tester");
+        assert_eq!(metadata["expires_at"], serde_json::Value::Null);
+
+        let described = run(&["db", "archive", "show", "ledger", "--archive", ARCHIVE]).await?;
+        assert!(described.contains("metadata: yes"), "{described}");
+
+        // Offline, the object lands beside the database file, byte for byte.
+        let config = dir.path().join("offline.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\ninsecure_plaintext = true\n\n\
+                 [node]\nid = \"offline\"\n\n[[archive]]\nname = \"{ARCHIVE}\"\n\
+                 databases = [\"*\"]\nstore = \"directory\"\npath = {:?}\n",
+                dir.path().join("offline"),
+                dir.path().join("archive")
+            ),
+        )?;
+        let to = dir.path().join("recovered");
+        let words: Vec<String> = [
+            "archive",
+            "restore",
+            "--config",
+            config.to_str().ok_or("a UTF-8 path")?,
+            "--archive",
+            ARCHIVE,
+            "--from",
+            "ledger",
+            "--to",
+            to.to_str().ok_or("a UTF-8 path")?,
+        ]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
+        let offline = stdout(&fleetringd(fleet.tls.dir(), words).await?)?;
+        assert!(offline.contains("metadata.json"), "{offline}");
+        // The restored database is archived with its own metadata, so pick the ledger's.
+        let files: Vec<PathBuf> = metadata_files(&dir.path().join("archive"))?
+            .into_iter()
+            .filter(|file| {
+                file.parent()
+                    .is_some_and(|parent| parent.ends_with("ledger"))
+            })
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(
+            std::fs::read(to.join("metadata.json"))?,
+            std::fs::read(&files[0])?
+        );
+        assert!(to.join("data.db").is_file());
         fleet.stop().await;
         Ok(())
     }

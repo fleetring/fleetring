@@ -762,6 +762,15 @@ message RestoreResponse {
   uint32 segments = 5;
   // When the last segment applied was archived; unset if the restore applied no segment.
   optional uint64 archived_at_ms = 6;
+  // The metadata the archive holds for the source, as of the snapshot the restore started from
+  // (ADR-0041, point 10). Unset when the snapshot has none, when the archive predates metadata,
+  // or when its object was skipped (`archived_metadata_skipped`). The archive isn't signed, so
+  // `description_by` and `created_by` are its claims and nothing more; `expires_at_ms` is never
+  // to be restored.
+  DatabaseMetadata archived_metadata = 7;
+  // Why the snapshot's metadata object was skipped: missing, damaged, or too large. The data
+  // restored either way. Unset when nothing was skipped.
+  optional string archived_metadata_skipped = 8;
 }
 
 message DescribeArchiveRequest {
@@ -775,6 +784,8 @@ message ArchivedSnapshot {
   bytes position = 3;
   uint64 taken_at_ms = 4;
   uint64 bytes = 5;
+  // The snapshot has a metadata object under `.metadata/`.
+  bool metadata = 6;
 }
 
 message DescribeArchiveResponse {

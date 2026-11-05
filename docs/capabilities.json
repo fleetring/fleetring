@@ -562,6 +562,18 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md"
     },
     {
+      "id": "archived-metadata",
+      "component": "fleetringd",
+      "area": "recovery",
+      "title": "Metadata in archives",
+      "description": "An archive keeps each database’s description and labels with its snapshots, and a restore sets them again, with the description marked untrusted and never the expiry.",
+      "status": "built",
+      "since": "0.6.0",
+      "ticket": "FR-070",
+      "issue": 76,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md"
+    },
+    {
       "id": "agent-kit",
       "component": "fleetringd",
       "area": "access",

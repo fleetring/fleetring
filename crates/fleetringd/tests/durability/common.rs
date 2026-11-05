@@ -7,14 +7,17 @@ use std::error::Error;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetringd::changes::{ChangeParts, ChangeSettings, ChangeStreams, DatabaseMatchers};
 use fleetringd::clock::SystemClock;
-use fleetringd::durability::{Archive, ArchiveParts, ArchiveSettings, Listing, ObjectStore};
+use fleetringd::durability::{
+    Archive, ArchiveParts, ArchiveSettings, ArchivedMetadata, Listing, METADATA_FORMAT,
+    MetadataFuture, MetadataSource, NoMetadata, ObjectEntry, ObjectStore, StoreFuture,
+};
 use fleetringd::engine::{
     DatabaseEngine, EngineConfig, EngineKind, Execution, SqliteEngine, Statement, Transaction,
 };
@@ -102,6 +105,28 @@ impl Node {
         store: Arc<dyn ObjectStore>,
         settings: ArchiveSettings,
     ) -> Self {
+        Self::with_metadata(root, store, settings, Arc::new(NoMetadata))
+    }
+
+    /// As [`start`](Self::start), with `metadata` as where each snapshot gets its database's
+    /// metadata.
+    pub(crate) fn start_with_metadata(
+        root: &Path,
+        store: Arc<dyn ObjectStore>,
+        settings: ArchiveSettings,
+        metadata: Arc<dyn MetadataSource>,
+    ) -> Self {
+        let mut node = Self::with_metadata(root, store, settings, metadata);
+        node.start_streams();
+        node
+    }
+
+    fn with_metadata(
+        root: &Path,
+        store: Arc<dyn ObjectStore>,
+        settings: ArchiveSettings,
+        metadata: Arc<dyn MetadataSource>,
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -119,6 +144,7 @@ impl Node {
                 engine: Arc::new(sqlite()),
                 clock: Arc::new(SystemClock),
                 execution: Execution::Threads,
+                metadata,
             },
         )
         .expect("sqlite is a frame source");
@@ -217,6 +243,116 @@ impl Node {
         }
         self.replication.stop();
         self.registry().close_all().await;
+    }
+}
+
+/// What a [`TestMetadata`] does when asked for a database's metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    Serve,
+    Fail,
+}
+
+/// A metadata source a test fills: the answer for each database it names, `None` for the rest,
+/// or a failure once [`fail_lookups`](Self::fail_lookups) is called.
+#[derive(Debug)]
+pub(crate) struct TestMetadata {
+    answers: Mutex<BTreeMap<DatabaseName, ArchivedMetadata>>,
+    lookup: Mutex<Lookup>,
+}
+
+impl TestMetadata {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::default(),
+            lookup: Mutex::new(Lookup::Serve),
+        })
+    }
+
+    /// Answers `metadata` for `database` from now on.
+    pub(crate) fn set(&self, database: &DatabaseName, metadata: ArchivedMetadata) {
+        self.answers
+            .lock()
+            .expect("lock")
+            .insert(database.clone(), metadata);
+    }
+
+    /// Fails every lookup from now on.
+    pub(crate) fn fail_lookups(&self) {
+        *self.lookup.lock().expect("lock") = Lookup::Fail;
+    }
+
+    /// Answers lookups again.
+    pub(crate) fn serve_lookups(&self) {
+        *self.lookup.lock().expect("lock") = Lookup::Serve;
+    }
+}
+
+impl MetadataSource for TestMetadata {
+    fn metadata<'a>(&'a self, database: &'a DatabaseName) -> MetadataFuture<'a> {
+        let answer = match *self.lookup.lock().expect("lock") {
+            Lookup::Serve => Ok(self.answers.lock().expect("lock").get(database).cloned()),
+            Lookup::Fail => Err("the control plane can't be reached".to_owned()),
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// Metadata for `database` as the control plane might hold it.
+pub(crate) fn archived_metadata(database: &str) -> ArchivedMetadata {
+    ArchivedMetadata {
+        format: METADATA_FORMAT,
+        database: database.to_owned(),
+        description: Some("Ledger notes.\nSecond line.".to_owned()),
+        description_by: Some("ops".to_owned()),
+        labels: BTreeMap::from([
+            ("purpose".to_owned(), "ledger".to_owned()),
+            ("team".to_owned(), "billing".to_owned()),
+        ]),
+        created_by: Some("ops".to_owned()),
+        created_at_ms: Some(1_700_000_000_000),
+        expires_at_ms: Some(1_800_000_000_000),
+        version: 3,
+    }
+}
+
+/// A store that remembers the key of every put, in order, and passes every call on.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordingStore {
+    inner: Arc<dyn ObjectStore>,
+    puts: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingStore {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            puts: Arc::default(),
+        }
+    }
+
+    /// The keys put so far, in order.
+    pub(crate) fn puts(&self) -> Vec<String> {
+        self.puts.lock().expect("lock").clone()
+    }
+}
+
+impl ObjectStore for RecordingStore {
+    fn put(&self, key: &str, bytes: Vec<u8>) -> StoreFuture<'_, ()> {
+        self.puts.lock().expect("lock").push(key.to_owned());
+        self.inner.put(key, bytes)
+    }
+
+    fn get(&self, key: &str) -> StoreFuture<'_, Option<Vec<u8>>> {
+        self.inner.get(key)
+    }
+
+    fn list(&self, prefix: &str) -> StoreFuture<'_, Vec<ObjectEntry>> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> StoreFuture<'_, ()> {
+        self.inner.delete(key)
     }
 }
 

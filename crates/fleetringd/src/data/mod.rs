@@ -70,6 +70,7 @@ pub(crate) use lease::{LeaseKeeper, LeaseSettings};
 pub(crate) use metadata::is_invisible;
 pub use metadata::{
     Descriptions, LabelRequirement, ListFilter, Listing, MetadataView, NewMetadata,
+    RestoredMetadata, restored_metadata,
 };
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};

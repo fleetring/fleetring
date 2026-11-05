@@ -10,10 +10,16 @@
 //! checksum     XXH3-128 over everything before it, 16 bytes
 //! ```
 //!
-//! Both formats carry a `format` number. A reader refuses a number newer than its own before it
-//! looks at any other field, and refuses a field it doesn't know, so a newer writer's object is
-//! never half-understood.
+//! A database's metadata object (ADR-0041, point 10) is JSON as well, and its name carries its
+//! XXH3-128 checksum.
+//!
+//! Every format carries a `format` number. A reader refuses a number newer than its own before
+//! it looks at any other field, and refuses a field it doesn't know, so a newer writer's object
+//! is never half-understood.
 
+use std::collections::BTreeMap;
+
+use fleetring_control::{MAX_DESCRIPTION_BYTES, MAX_LABELS};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_128;
 
@@ -22,6 +28,16 @@ pub const SEGMENT_MAGIC: &[u8; 6] = b"FRSEG\x01";
 
 /// The format number this version writes and the newest it reads.
 pub const FORMAT: u32 = 1;
+
+/// The format number of a metadata object: its own, apart from [`FORMAT`], since it can change
+/// without the segments and descriptors changing.
+pub const METADATA_FORMAT: u32 = 1;
+
+/// The largest metadata object a restore reads and an archive writes, in bytes. A description
+/// holds at most [`MAX_DESCRIPTION_BYTES`] and a database at most [`MAX_LABELS`] labels of at
+/// most 380 bytes each, so a genuine object is far smaller: the bound only keeps a damaged or
+/// hostile object from being read whole.
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
 
 /// The length of a segment's checksum.
 const CHECKSUM_LEN: usize = 16;
@@ -83,6 +99,33 @@ pub struct SnapshotDescriptor {
     pub chunk_checksums: Vec<String>,
 }
 
+/// A database's metadata as an archive keeps it beside each base snapshot (ADR-0041, point 10).
+///
+/// Nothing in it is authenticated: an archive isn't signed, so a restore treats the description
+/// and its author as the archive's claims and never as a principal's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedMetadata {
+    /// The format number, [`METADATA_FORMAT`].
+    pub format: u32,
+    /// The database.
+    pub database: String,
+    /// The description, if it had one.
+    pub description: Option<String>,
+    /// The principal that last set the description, if the control plane could name one.
+    pub description_by: Option<String>,
+    /// The labels.
+    pub labels: BTreeMap<String, String>,
+    /// The principal that created the database, if the creation recorded one.
+    pub created_by: Option<String>,
+    /// When the database was created, in milliseconds since the Unix epoch.
+    pub created_at_ms: Option<u64>,
+    /// When the database was to expire. A restore never uses it.
+    pub expires_at_ms: Option<u64>,
+    /// The metadata's version.
+    pub version: u64,
+}
+
 /// The error returned when an object's bytes aren't a valid object of its kind.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -102,6 +145,9 @@ pub enum FormatError {
     /// The object was written by a newer format than this version reads.
     #[error("format {0} is newer than this version reads")]
     Version(u32),
+    /// A metadata object holds more than a database's metadata can.
+    #[error("the metadata is too large: {0}")]
+    TooLarge(String),
 }
 
 /// Just the format number, read before anything else.
@@ -110,11 +156,14 @@ struct Versioned {
     format: u32,
 }
 
-/// Parses `text` as `T`, after checking its format number.
-fn parse_versioned<'a, T: Deserialize<'a>>(text: &'a [u8]) -> Result<T, FormatError> {
+/// Parses `text` as `T`, after checking that its format number is `supported`.
+fn parse_versioned<'a, T: Deserialize<'a>>(
+    text: &'a [u8],
+    supported: u32,
+) -> Result<T, FormatError> {
     let versioned: Versioned =
         serde_json::from_slice(text).map_err(|error| FormatError::Header(error.to_string()))?;
-    if versioned.format != FORMAT {
+    if versioned.format != supported {
         return Err(FormatError::Version(versioned.format));
     }
     serde_json::from_slice(text).map_err(|error| FormatError::Header(error.to_string()))
@@ -167,7 +216,7 @@ pub fn decode_segment(bytes: &[u8]) -> Result<(SegmentHeader, &[u8]), FormatErro
     let (json, payload) = rest
         .split_at_checked(usize::try_from(len).map_err(|_| FormatError::Truncated)?)
         .ok_or(FormatError::Truncated)?;
-    let header: SegmentHeader = parse_versioned(json)?;
+    let header: SegmentHeader = parse_versioned(json, FORMAT)?;
     if u64::try_from(payload.len()).ok() != Some(header.payload_len) {
         return Err(FormatError::Truncated);
     }
@@ -196,7 +245,49 @@ pub fn checksum_hex(bytes: &[u8]) -> String {
 ///
 /// [`FormatError`] if the bytes aren't a descriptor of a format this version reads.
 pub fn decode_descriptor(bytes: &[u8]) -> Result<SnapshotDescriptor, FormatError> {
-    parse_versioned(bytes)
+    parse_versioned(bytes, FORMAT)
+}
+
+/// Encodes a metadata object as pretty JSON, so an operator can read it with `cat`.
+///
+/// # Panics
+///
+/// Never: metadata always serializes.
+#[must_use]
+pub fn encode_metadata(metadata: &ArchivedMetadata) -> Vec<u8> {
+    serde_json::to_vec_pretty(metadata).expect("archived metadata always serializes")
+}
+
+/// Decodes a metadata object, checking its format number first, as [`decode_descriptor`] does.
+///
+/// # Errors
+///
+/// [`FormatError`] if the bytes aren't metadata of a format this version reads, or hold more
+/// than a database's metadata can: over [`MAX_METADATA_BYTES`], a description over
+/// [`MAX_DESCRIPTION_BYTES`], or more than [`MAX_LABELS`] labels.
+pub fn decode_metadata(bytes: &[u8]) -> Result<ArchivedMetadata, FormatError> {
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(FormatError::TooLarge(format!(
+            "{} bytes, at most {MAX_METADATA_BYTES}",
+            bytes.len()
+        )));
+    }
+    let metadata: ArchivedMetadata = parse_versioned(bytes, METADATA_FORMAT)?;
+    if let Some(description) = &metadata.description
+        && description.len() > MAX_DESCRIPTION_BYTES
+    {
+        return Err(FormatError::TooLarge(format!(
+            "a description of {} bytes, at most {MAX_DESCRIPTION_BYTES}",
+            description.len()
+        )));
+    }
+    if metadata.labels.len() > MAX_LABELS {
+        return Err(FormatError::TooLarge(format!(
+            "{} labels, at most {MAX_LABELS}",
+            metadata.labels.len()
+        )));
+    }
+    Ok(metadata)
 }
 
 #[cfg(test)]
@@ -299,5 +390,92 @@ mod tests {
             decode_descriptor(br#"{"format": 7, "anything": 1}"#),
             Err(FormatError::Version(7))
         );
+    }
+
+    fn metadata() -> ArchivedMetadata {
+        ArchivedMetadata {
+            format: METADATA_FORMAT,
+            database: "tenant/a".to_owned(),
+            description: Some("Notes\nfor agent 7.".to_owned()),
+            description_by: Some("agent-7".to_owned()),
+            labels: BTreeMap::from([
+                ("purpose".to_owned(), "memory".to_owned()),
+                ("agent".to_owned(), "7".to_owned()),
+            ]),
+            created_by: Some("ops".to_owned()),
+            created_at_ms: Some(1_700_000_000_000),
+            expires_at_ms: Some(1_800_000_000_000),
+            version: 4,
+        }
+    }
+
+    #[test]
+    fn metadata_round_trips_and_refuses_unknown_fields_and_newer_formats() {
+        let bytes = encode_metadata(&metadata());
+        assert_eq!(decode_metadata(&bytes), Ok(metadata()));
+        let text = String::from_utf8(bytes).expect("UTF-8");
+        assert!(text.contains("\n  "), "pretty JSON: {text}");
+        // Labels are written in key order, so the same metadata always has the same bytes.
+        assert!(text.find("agent").expect("agent") < text.find("purpose").expect("purpose"));
+
+        let bare = ArchivedMetadata {
+            description: None,
+            description_by: None,
+            labels: BTreeMap::new(),
+            created_by: None,
+            created_at_ms: None,
+            expires_at_ms: None,
+            ..metadata()
+        };
+        assert_eq!(decode_metadata(&encode_metadata(&bare)), Ok(bare));
+
+        let mut value = serde_json::to_value(metadata()).expect("json");
+        value["surprise"] = serde_json::json!(true);
+        assert!(matches!(
+            decode_metadata(value.to_string().as_bytes()),
+            Err(FormatError::Header(_))
+        ));
+        let mut value = serde_json::to_value(metadata()).expect("json");
+        value["format"] = serde_json::json!(2);
+        value["field_of_format_2"] = serde_json::json!("x");
+        assert_eq!(
+            decode_metadata(value.to_string().as_bytes()),
+            Err(FormatError::Version(2))
+        );
+        assert!(matches!(
+            decode_metadata(b"not json"),
+            Err(FormatError::Header(_))
+        ));
+    }
+
+    #[test]
+    fn metadata_over_its_limits_is_refused() {
+        let long = ArchivedMetadata {
+            description: Some("x".repeat(MAX_DESCRIPTION_BYTES + 1)),
+            ..metadata()
+        };
+        assert!(matches!(
+            decode_metadata(&encode_metadata(&long)),
+            Err(FormatError::TooLarge(_))
+        ));
+        let many = ArchivedMetadata {
+            labels: (0..=MAX_LABELS)
+                .map(|n| (format!("k{n}"), "v".to_owned()))
+                .collect(),
+            ..metadata()
+        };
+        assert!(matches!(
+            decode_metadata(&encode_metadata(&many)),
+            Err(FormatError::TooLarge(_))
+        ));
+        assert!(matches!(
+            decode_metadata(&vec![b' '; MAX_METADATA_BYTES + 1]),
+            Err(FormatError::TooLarge(_))
+        ));
+        let at_limit = ArchivedMetadata {
+            description: Some("x".repeat(MAX_DESCRIPTION_BYTES)),
+            ..metadata()
+        };
+        assert_eq!(decode_metadata(&encode_metadata(&at_limit)), Ok(at_limit));
     }
 }
