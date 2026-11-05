@@ -33,7 +33,8 @@ use fleetringd::durability::{
     ArchiveKeys, RestoreTarget, build_store, finish_offline, restore_into,
 };
 use fleetringd::engine::{
-    Execution, Internal, Position, Rows, SchemaRequest, SqliteEngine, Statement, Value,
+    Execution, Internal, MAX_COUNT_LIMIT, Position, Rows, SchemaRequest, SqliteEngine, Statement,
+    Value,
 };
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
@@ -474,8 +475,13 @@ enum DbCommand {
         #[arg(long)]
         no_schema: bool,
         /// Counts each table's rows up to this many, and reports "more than" beyond it; 0
-        /// counts nothing. A node counts at most 1,000,000.
-        #[arg(long, default_value_t = SCHEMA_COUNT_LIMIT)]
+        /// counts nothing. At most 1,000,000, which is also the most rows one request counts
+        /// across all tables; counting delays writes queued on the database while it runs.
+        #[arg(
+            long,
+            default_value_t = SCHEMA_COUNT_LIMIT,
+            value_parser = clap::value_parser!(u64).range(0..=MAX_COUNT_LIMIT)
+        )]
         count_limit: u64,
         /// Includes the engine's own tables, and the shadow tables of virtual tables.
         #[arg(long)]
@@ -3143,6 +3149,21 @@ mod tests {
             (true, 0, true)
         );
         assert_eq!(parsed(&["--count-limit", "250"]), (false, 250, false));
+        assert_eq!(
+            parsed(&["--count-limit", "1000000"]),
+            (false, 1_000_000, false)
+        );
+        let over = Cli::try_parse_from([
+            "fleetringd",
+            "db",
+            "show",
+            "notes",
+            "--control",
+            "127.0.0.1:7400",
+            "--count-limit",
+            "1000001",
+        ]);
+        assert!(over.is_err(), "more than a request can count is refused");
     }
 
     #[test]
