@@ -949,6 +949,10 @@ message QueryRequest {
   string database = 1;
   string sql = 2;
   repeated Value params = 3;
+  // Stop after this many rows, and set QueryResponse.truncated if there are more; 0 for no
+  // limit (ADR-0041, point 9). A node that predates the field returns every row, so a client
+  // that sets it truncates the reply too.
+  uint32 max_rows = 4;
 }
 
 message Row {
@@ -958,6 +962,8 @@ message Row {
 message QueryResponse {
   repeated string columns = 1;
   repeated Row rows = 2;
+  // Set when the query had more rows than QueryRequest.max_rows.
+  bool truncated = 3;
 }
 
 message CreateRequest {

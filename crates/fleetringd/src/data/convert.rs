@@ -95,6 +95,7 @@ pub(crate) fn params_to_proto(statement: &Statement) -> Vec<proto::Value> {
 
 pub(crate) fn rows_to_proto(rows: Rows) -> proto::QueryResponse {
     proto::QueryResponse {
+        truncated: rows.truncated,
         columns: rows.columns,
         rows: rows
             .rows
@@ -123,6 +124,7 @@ pub(crate) fn rows_from_proto(response: proto::QueryResponse) -> Result<Rows, St
     Ok(Rows {
         columns: response.columns,
         rows,
+        truncated: response.truncated,
     })
 }
 

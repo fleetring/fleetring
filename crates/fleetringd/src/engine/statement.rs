@@ -1,5 +1,7 @@
 //! Statements, transactions, and their results, in a form every engine accepts.
 
+use std::num::NonZeroU32;
+
 use serde::{Deserialize, Serialize};
 
 /// A value bound to a statement parameter or read from a result row.
@@ -51,6 +53,7 @@ impl From<Vec<u8>> for Value {
 pub struct Statement {
     sql: String,
     params: Vec<Value>,
+    max_rows: Option<NonZeroU32>,
 }
 
 impl Statement {
@@ -60,6 +63,7 @@ impl Statement {
         Self {
             sql: sql.into(),
             params: Vec::new(),
+            max_rows: None,
         }
     }
 
@@ -69,7 +73,22 @@ impl Statement {
         Self {
             sql: sql.into(),
             params: params.into_iter().collect(),
+            max_rows: None,
         }
+    }
+
+    /// This statement, as a query that stops after `max` rows: the engine reads no further than
+    /// one row past it, to tell whether there were more ([`Rows::truncated`]). Writes ignore it.
+    #[must_use]
+    pub fn with_max_rows(mut self, max: NonZeroU32) -> Self {
+        self.max_rows = Some(max);
+        self
+    }
+
+    /// The most rows a query returns, if it is limited.
+    #[must_use]
+    pub fn max_rows(&self) -> Option<NonZeroU32> {
+        self.max_rows
     }
 
     /// The statement's text.
@@ -131,4 +150,7 @@ pub struct Rows {
     pub columns: Vec<String>,
     /// The result's rows, each with one value per column.
     pub rows: Vec<Vec<Value>>,
+    /// Whether the query had more rows than its statement's
+    /// [`max_rows`](Statement::max_rows), which `rows` then holds the first of.
+    pub truncated: bool,
 }

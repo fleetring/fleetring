@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1136,11 +1137,36 @@ impl Client {
                     database: name.to_string(),
                     sql: statement.sql().to_owned(),
                     params: params.clone(),
+                    max_rows: statement.max_rows().map_or(0, NonZeroU32::get),
                 };
                 async move { client.query(request).await }
             })
             .await?;
         rows_from_proto(response)
+    }
+
+    /// Runs a read-only query on the database's primary, which stops after `max_rows` rows and
+    /// says whether there were more ([`Rows::truncated`]).
+    ///
+    /// A primary that predates the limit returns every row; the client then keeps the first
+    /// `max_rows` and sets `truncated` itself, so the result is the same either way.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::execute`].
+    pub async fn query_limited(
+        &self,
+        name: &DatabaseName,
+        statement: Statement,
+        max_rows: NonZeroU32,
+    ) -> Result<Rows, Status> {
+        let mut rows = self.query(name, statement.with_max_rows(max_rows)).await?;
+        let max = usize::try_from(max_rows.get()).unwrap_or(usize::MAX);
+        if rows.rows.len() > max {
+            rows.rows.truncate(max);
+            rows.truncated = true;
+        }
+        Ok(rows)
     }
 
     /// The database's schema from its primary: its tables, views, indexes, triggers, and virtual

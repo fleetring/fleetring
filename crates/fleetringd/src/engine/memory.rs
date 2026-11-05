@@ -207,6 +207,7 @@ fn read(rows: &BTreeMap<String, Value>, statement: &Statement) -> Result<Rows, E
                 .map(|value| vec![value.clone()])
                 .into_iter()
                 .collect(),
+            truncated: false,
         }),
         ("scan", []) => Ok(Rows {
             columns: vec!["key".to_owned(), "value".to_owned()],
@@ -214,6 +215,7 @@ fn read(rows: &BTreeMap<String, Value>, statement: &Statement) -> Result<Rows, E
                 .iter()
                 .map(|(key, value)| vec![Value::Text(key.clone()), value.clone()])
                 .collect(),
+            truncated: false,
         }),
         ("sleep", [Value::Integer(millis)]) => {
             thread::sleep(Duration::from_millis(u64::try_from(*millis).unwrap_or(0)));

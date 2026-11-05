@@ -70,6 +70,11 @@ const CHECKPOINT_FILE: &str = "data.db-checkpoint";
 /// The smallest and largest page sizes SQLite supports.
 const PAGE_SIZES: std::ops::RangeInclusive<u32> = 512..=65536;
 
+/// Why SQL with a second statement after the first is refused: `Execute` and `Query` run one
+/// statement each, and a batch of several waits for the router's sessions (FR-066). Nothing
+/// runs, the first statement included.
+const ONE_STATEMENT: &str = "a call runs one statement; send each in a call of its own";
+
 /// The SQLite engine, with the page size it gives new databases.
 ///
 /// Each database lives in its own directory as `data.db` and `data.db-wal`. The adapter keeps
@@ -460,15 +465,28 @@ impl Database for SqliteDatabase {
                 statement.params().iter().map(Param),
             ))
             .map_err(classify)?;
+        let max = statement.max_rows().map_or(usize::MAX, |max| {
+            usize::try_from(max.get()).unwrap_or(usize::MAX)
+        });
         let mut out = Vec::new();
+        let mut truncated = false;
         while let Some(row) = rows.next().map_err(classify)? {
+            // A row past the limit is only looked at, never read: it says there are more.
+            if out.len() == max {
+                truncated = true;
+                break;
+            }
             let values = (0..width)
                 .map(|index| row.get_ref(index).map(value_from_sql))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(classify)?;
             out.push(values);
         }
-        Ok(Rows { columns, rows: out })
+        Ok(Rows {
+            columns,
+            rows: out,
+            truncated,
+        })
     }
 
     fn schema(&mut self, request: &SchemaRequest) -> Result<Schema, EngineError> {
@@ -1040,6 +1058,11 @@ fn value_from_sql(value: ValueRef<'_>) -> Value {
 
 /// Sorts an error from running SQL into a statement error or a storage failure.
 fn classify(error: rusqlite::Error) -> EngineError {
+    if matches!(error, rusqlite::Error::MultipleStatement) {
+        return EngineError::Statement {
+            message: ONE_STATEMENT.to_owned(),
+        };
+    }
     let storage_failure = matches!(
         error.sqlite_error_code(),
         Some(

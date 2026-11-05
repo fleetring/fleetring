@@ -1,5 +1,7 @@
 //! The gRPC `Database` service over a data node (ADR-0019).
 
+use std::num::NonZeroU32;
+
 use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
 use fleetring_proto::v1::restore_point::Point;
@@ -82,7 +84,10 @@ impl DatabaseService {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let request = request.into_inner();
-        let statement = statement(request.sql, request.params)?;
+        let mut statement = statement(request.sql, request.params)?;
+        if let Some(max) = NonZeroU32::new(request.max_rows) {
+            statement = statement.with_max_rows(max);
+        }
         let _admitted = self.node.route(&name).await?;
         let rows = self
             .node
