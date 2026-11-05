@@ -15,8 +15,8 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{
-    Acks, DatabaseName, Description, DescriptionChange, LabelKey, LabelValue, Labels, Liveness,
-    MetadataChange, ReplicaRole, parse_label,
+    Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, ReplicaRole,
+    parse_label,
 };
 use fleetring_control::{KeyId, Millis, ParseReleaseError, Release, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
@@ -25,8 +25,8 @@ use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIF
 use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
-    ArchiveDescription, Client, DatabaseSpec, Expiry, ExpiryRequest, LabelRequirement, LeaseUpdate,
-    ListFilter, Location, MetadataView, NewMetadata, NodeStatus, Orphan, ReplicaInfo, Restoration,
+    ArchiveDescription, Client, DatabaseSpec, Expiry, LabelRequirement, LeaseUpdate, ListFilter,
+    Location, MetadataView, NewMetadata, NodeStatus, Orphan, ReplicaInfo, Restoration,
     RestoredExpiry, Verification, restored_metadata,
 };
 use fleetringd::dev::{self, DevError, DevMode, Prepared};
@@ -59,6 +59,8 @@ use fleetringd::{
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt as _;
+
+mod edit;
 
 /// The environment variable that names a directory with `ca.crt`, `client.crt`, and
 /// `client.key`, and the `client.<principal>.crt` and `.key` files `--as` picks from. It supplies
@@ -576,88 +578,16 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Sets or clears a database's description. The control node records you as its author.
-    SetDescription {
-        /// The database's name.
-        name: DatabaseName,
-        /// The description: what the database holds and how it was set up, at most 1 KiB of
-        /// text; tab and line feed are allowed, other control and invisible characters aren't.
-        /// `-` reads it from stdin, without its trailing line feeds.
-        #[arg(long, required_unless_present = "clear", allow_hyphen_values = true)]
-        description: Option<String>,
-        /// Removes the description.
-        #[arg(long, conflicts_with = "description")]
-        clear: bool,
-        /// Changes it only if the metadata is still at this version, as `db show` prints it;
-        /// refused otherwise, so a description read first isn't overwritten by mistake.
-        #[arg(long)]
-        if_version: Option<u64>,
-        #[command(flatten)]
-        target: Target,
-    },
-    /// Sets and removes a database's labels. Labels it doesn't name stay as they are.
-    SetLabels {
-        /// The database's name.
-        name: DatabaseName,
-        /// A label to set, `key=value`, replacing the key's value if the database has it.
-        /// Repeat it for several. At least one `--label` or `--remove` is needed.
-        #[arg(
-            long = "label",
-            value_name = "KEY=VALUE",
-            value_parser = parse_label_arg,
-            required_unless_present = "remove"
-        )]
-        labels: Vec<(LabelKey, LabelValue)>,
-        /// A label key to remove. Repeat it for several.
-        #[arg(long = "remove", value_name = "KEY")]
-        remove: Vec<LabelKey>,
-        /// Changes them only if the metadata is still at this version, as `db show` prints it.
-        #[arg(long)]
-        if_version: Option<u64>,
-        #[command(flatten)]
-        target: Target,
-    },
-    /// Sets, moves, or removes a database's expiry: the time after which the control plane
-    /// drops it, deleting every copy. An archive keeps the database as of what reached it.
-    #[command(group(
-        clap::ArgGroup::new("expiry")
-            .required(true)
-            .args(["expires_in", "expires_at", "never"])
-    ))]
-    SetExpiry {
-        /// The database's name.
-        name: DatabaseName,
-        /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`, at least
-        /// 1m. The control node counts it from its own clock.
-        #[arg(long, value_name = "DURATION", value_parser = parse_ttl)]
-        expires_in: Option<Duration>,
-        /// Drops the database at this time, in RFC 3339, such as 2026-11-05T10:00:00Z: at least
-        /// a minute from now by the control node's clock.
-        #[arg(long, value_name = "TIME", value_parser = parse_rfc3339)]
-        expires_at: Option<Timestamp>,
-        /// Removes the expiry: the database stays until it is dropped.
-        #[arg(long)]
-        never: bool,
-        /// Changes it only if the metadata is still at this version, as `db show` prints it.
-        #[arg(long)]
-        if_version: Option<u64>,
-        #[command(flatten)]
-        target: Target,
-    },
-    /// Changes a database's durability settings, which take effect at its next epoch: the
-    /// current primary keeps the settings it holds the lease under.
-    SetDurability {
-        /// The database's name.
-        name: DatabaseName,
-        /// The acknowledgement mode: `quorum`, `all`, or `local`.
-        #[arg(long)]
-        acks: Acks,
-        /// The floor on reachable replicas; the mode's write quorum if unset.
-        #[arg(long)]
-        min_replicas: Option<u8>,
-        #[command(flatten)]
-        target: Target,
-    },
+    /// Changes a database's settings: its description, labels, expiry, and durability. Only the
+    /// settings you name change.
+    ///
+    /// The metadata settings (description, labels, expiry) go in one update. Durability is a
+    /// separate change that takes effect at the database's next epoch: the current primary keeps
+    /// the settings it holds the lease under. With both, durability is changed first and the
+    /// metadata second, and each outcome is reported on its own line; if the metadata update is
+    /// refused after the durability change went through, the command says so and exits non-zero.
+    /// `--if-version` guards the metadata update only.
+    Edit(edit::EditArgs),
     /// Runs one write statement on the database's primary.
     Exec(SqlArgs),
     /// Runs one read-only query on the database's primary.
@@ -822,7 +752,7 @@ struct ExpiryArgs {
     /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`, at least 1m.
     /// The control node counts it from its own clock. Every copy is deleted; an archive keeps
     /// the database as of what reached it, and without one it is gone. Extend it with
-    /// `db set-expiry`.
+    /// `db edit`.
     #[arg(long, value_name = "DURATION", value_parser = parse_ttl, conflicts_with = "expires_at")]
     expires_in: Option<Duration>,
     /// Drops the database at this time, in RFC 3339, such as 2026-11-05T10:00:00Z: at least a
@@ -1307,7 +1237,19 @@ enum Run {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let hint = edit::removed_verb_hint(&error);
+            let code = error.exit_code();
+            // Help and version requests are not errors; clap prints them to stdout.
+            let _ = error.print();
+            if let Some(hint) = hint {
+                eprintln!("{hint}");
+            }
+            return ExitCode::from(u8::try_from(code).unwrap_or(USAGE_ERROR));
+        }
+    };
     if let Err(error) = cli.check() {
         error.exit();
     }
@@ -1632,111 +1574,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Command::Db(DbCommand::SetDescription {
-            name,
-            description,
-            clear,
-            if_version,
-            target,
-        }) => {
-            let description = match description {
-                Some(text) if !clear => {
-                    DescriptionChange::Set(description_arg(&text, std::io::stdin().lock())?)
-                }
-                _ => DescriptionChange::Clear,
-            };
-            let change = MetadataChange {
-                description,
-                ..MetadataChange::default()
-            };
-            let metadata = target
-                .client()?
-                .update_database(&name, &change, if_version)
-                .await
-                .map_err(|status| updated_failed(status, if_version))?;
-            let what = if metadata.description.is_some() {
-                "set"
-            } else {
-                "cleared"
-            };
-            format!(
-                "description of {name} {what}; metadata version {}\n",
-                metadata.version,
-                name = shown(&name)
-            )
-        }
-        Command::Db(DbCommand::SetLabels {
-            name,
-            labels,
-            remove,
-            if_version,
-            target,
-        }) => {
-            let change = MetadataChange {
-                set_labels: Labels::try_from_pairs(labels)?,
-                remove_labels: remove.into_iter().collect(),
-                ..MetadataChange::default()
-            };
-            let metadata = target
-                .client()?
-                .update_database(&name, &change, if_version)
-                .await
-                .map_err(|status| updated_failed(status, if_version))?;
-            format!(
-                "labels of {name}: {}; metadata version {}\n",
-                format_labels(&metadata),
-                metadata.version,
-                name = shown(&name)
-            )
-        }
-        Command::Db(DbCommand::SetExpiry {
-            name,
-            expires_in,
-            expires_at,
-            never: _,
-            if_version,
-            target,
-        }) => {
-            // The group requires exactly one of the three.
-            let expiry = match (expires_in, expires_at) {
-                (Some(duration), _) => ExpiryRequest::In(duration),
-                (None, Some(at)) => ExpiryRequest::At(at),
-                (None, None) => ExpiryRequest::Clear,
-            };
-            let metadata = target
-                .client()?
-                .update_database_with(&name, &MetadataChange::default(), expiry, if_version)
-                .await
-                .map_err(|status| updated_failed(status, if_version))?;
-            let report = MetadataReport::from_view(&metadata, SystemClock.now());
-            format!(
-                "expiry of {name}: {}; metadata version {}\n",
-                expiry_text(&report),
-                metadata.version,
-                name = shown(&name)
-            )
-        }
-        Command::Db(DbCommand::SetDurability {
-            name,
-            acks,
-            min_replicas,
-            target,
-        }) => {
-            let change = target
-                .client()?
-                .change_durability(&name, acks, min_replicas)
-                .await
-                .map_err(failed)?;
-            format!(
-                "durability of {name} changes to acks={} min_replicas={} at its next epoch; \
-                 now acks={} min_replicas={}\n",
-                change.acks,
-                change.min_replicas,
-                change.current_acks,
-                change.current_min_replicas,
-                name = shown(&name)
-            )
-        }
+        Command::Db(DbCommand::Edit(args)) => edit::run(args).await?,
         Command::Db(DbCommand::Exec(args)) => {
             let (client, name, statement) = args.into_parts().await?;
             let written = client.execute(&name, statement).await.map_err(failed)?;
@@ -1845,10 +1683,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                         "warning: the database was restored without its expiry: {}",
                         printable(message)
                     );
-                    eprintln!(
-                        "hint: fleetringd db set-expiry {} --expires-in <d>",
-                        shown(&name)
-                    );
+                    eprintln!("hint: fleetringd db edit {} --expires-in <d>", shown(&name));
                     return Err(AlreadyReported.into());
                 }
                 _ => {}
@@ -3648,26 +3483,6 @@ mod tests {
             OutputFormat::Json
         );
         assert!(Cli::try_parse_from([&show[..], &["-o", "yaml"]].concat()).is_err());
-        assert!(
-            Cli::try_parse_from(
-                [
-                    &["fleetringd", "db", "set-description", "notes"][..],
-                    &show[4..]
-                ]
-                .concat()
-            )
-            .is_err(),
-            "set-description needs --description or --clear"
-        );
-        let set_labels = ["fleetringd", "db", "set-labels", "notes"];
-        assert!(
-            Cli::try_parse_from([&set_labels[..], &show[4..]].concat()).is_err(),
-            "set-labels needs a label or a removal"
-        );
-        assert!(
-            Cli::try_parse_from([&set_labels[..], &["--remove", "agent"], &show[4..]].concat())
-                .is_ok()
-        );
     }
 
     #[test]
@@ -3741,53 +3556,6 @@ mod tests {
             Status::internal("storage failed"),
         ] {
             assert_eq!(schema_unavailable(&status), None, "{:?}", status.code());
-        }
-    }
-
-    #[test]
-    fn db_set_expiry_takes_exactly_one_form() {
-        let control = ["--control", "127.0.0.1:7400"];
-        let set_expiry = |flags: &[&str]| {
-            Cli::try_parse_from(
-                [
-                    &["fleetringd", "db", "set-expiry", "notes"][..],
-                    flags,
-                    &control,
-                ]
-                .concat(),
-            )
-        };
-        let parsed = |flags: &[&str]| {
-            let cli = set_expiry(flags).expect("db set-expiry parses");
-            let Some(Command::Db(DbCommand::SetExpiry {
-                expires_in,
-                expires_at,
-                never,
-                ..
-            })) = cli.command
-            else {
-                panic!("not db set-expiry: {:?}", cli.command);
-            };
-            (expires_in, expires_at, never)
-        };
-        assert_eq!(
-            parsed(&["--expires-in", "24h"]),
-            (Some(Duration::from_secs(86_400)), None, false)
-        );
-        assert_eq!(
-            parsed(&["--expires-at", "2026-11-05T10:00:00Z"]),
-            (None, Some(Timestamp::from_millis(1_793_872_800_000)), false)
-        );
-        assert_eq!(parsed(&["--never"]), (None, None, true));
-        for wrong in [
-            &[][..],
-            &["--expires-in", "1h", "--never"][..],
-            &["--expires-in", "1h", "--expires-at", "2026-11-05T10:00:00Z"][..],
-            &["--expires-at", "2026-11-05T10:00:00Z", "--never"][..],
-            &["--expires-in", "soon"][..],
-            &["--expires-at", "tomorrow"][..],
-        ] {
-            assert!(set_expiry(wrong).is_err(), "{wrong:?}");
         }
     }
 

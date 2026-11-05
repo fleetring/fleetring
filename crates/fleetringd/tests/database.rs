@@ -1964,16 +1964,13 @@ all 3 replicas agree
         let changed = stdout(
             &fleetringd(
                 fleet.tls.dir(),
-                args(
-                    &["db", "set-durability", "everyone", "--acks", "local"],
-                    &control,
-                ),
+                args(&["db", "edit", "everyone", "--acks", "local"], &control),
             )
             .await?,
         )?;
         assert_eq!(
             changed,
-            "durability of everyone changes to acks=local min_replicas=1 at its next epoch; \
+            "durability: acks=local min_replicas=1 at its next epoch; \
              now acks=all min_replicas=3\n"
         );
         let located = stdout(

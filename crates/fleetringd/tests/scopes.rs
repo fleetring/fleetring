@@ -1415,7 +1415,7 @@ async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult 
 }
 
 /// The same agent through the command line: `db create --description --label`, `db show`,
-/// `db set-labels`, `db set-description`, `db list --label`, and `db drop`, with a token whose
+/// `db edit`, `db list --label`, and `db drop`, with a token whose
 /// only scope is `admin:agent-42-*`; and `token issue` warns about a prefix without a separator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
@@ -1664,25 +1664,30 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
     let relabelled = succeeded(
         &agent(vec![
             "db",
-            "set-labels",
+            "edit",
             "agent-42-notes",
             "--label",
             "task=7",
-            "--remove",
+            "--remove-label",
             "agent",
             "--if-version",
             "1",
         ])
         .await?,
-        "db set-labels",
+        "db edit --label",
     )?;
-    assert_eq!(
-        relabelled,
-        "labels of agent-42-notes: purpose=memory, task=7; metadata version 2\n"
+    assert!(
+        relabelled.starts_with("metadata: updated\n"),
+        "{relabelled}"
     );
+    assert!(
+        relabelled.contains("\nlabels: purpose=memory, task=7\n"),
+        "{relabelled}"
+    );
+    assert!(relabelled.ends_with("version: 2\n"), "{relabelled}");
     let stale = agent(vec![
         "db",
-        "set-description",
+        "edit",
         "agent-42-notes",
         "--description",
         "lost",
@@ -1698,7 +1703,7 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
     succeeded(
         &agent(vec![
             "db",
-            "set-description",
+            "edit",
             "agent-42-notes",
             "--description",
             "Memory, version 2.",
@@ -1706,8 +1711,192 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
             "2",
         ])
         .await?,
-        "db set-description",
+        "db edit --description",
     )?;
+
+    // Every setting alone, then several together.
+    let described = succeeded(
+        &agent(vec!["db", "edit", "agent-42-notes", "--clear-description"]).await?,
+        "db edit --clear-description",
+    )?;
+    assert!(described.contains("description: none\n"), "{described}");
+    assert!(described.ends_with("version: 4\n"), "{described}");
+    let expiring = succeeded(
+        &agent(vec!["db", "edit", "agent-42-notes", "--expires-in", "48h"]).await?,
+        "db edit --expires-in",
+    )?;
+    assert!(expiring.contains("\nexpires: 20"), "{expiring}");
+    assert!(expiring.contains(" (in "), "{expiring}");
+    let dated = succeeded(
+        &agent(vec![
+            "db",
+            "edit",
+            "agent-42-notes",
+            "--expires-at",
+            "2099-01-01T00:00:00Z",
+        ])
+        .await?,
+        "db edit --expires-at",
+    )?;
+    assert!(
+        dated.contains("\nexpires: 2099-01-01T00:00:00Z (in "),
+        "{dated}"
+    );
+    let never = succeeded(
+        &agent(vec!["db", "edit", "agent-42-notes", "--clear-expiry"]).await?,
+        "db edit --clear-expiry",
+    )?;
+    assert!(never.contains("\nexpires: never\n"), "{never}");
+    let durable = succeeded(
+        &agent(vec!["db", "edit", "agent-42-notes", "--acks", "all"]).await?,
+        "db edit --acks",
+    )?;
+    assert_eq!(
+        durable,
+        "durability: acks=all min_replicas=1 at its next epoch; now acks=quorum min_replicas=1\n"
+    );
+    let combined = succeeded(
+        &agent(vec![
+            "db",
+            "edit",
+            "agent-42-notes",
+            "--description",
+            "Combined.",
+            "--label",
+            "stage=test",
+            "--expires-in",
+            "24h",
+            "--acks",
+            "quorum",
+            "--min-replicas",
+            "1",
+            "--json",
+        ])
+        .await?,
+        "db edit with every kind of setting",
+    )?;
+    let combined: serde_json::Value = serde_json::from_str(&combined)?;
+    assert_eq!(combined["database"], "agent-42-notes");
+    assert_eq!(combined["durability"]["acks"], "quorum");
+    assert_eq!(combined["metadata"]["description"], "Combined.");
+    assert_eq!(combined["metadata"]["labels"]["stage"], "test");
+    assert!(combined["metadata"]["expires_at"].is_string());
+    assert!(combined["metadata_error"].is_null());
+
+    // An empty edit changes nothing, and says so.
+    for words in [
+        vec!["db", "edit", "agent-42-notes"],
+        vec!["db", "edit", "agent-42-notes", "--if-version", "1"],
+    ] {
+        failed_with(
+            &agent(words).await?,
+            "an empty edit",
+            "nothing to edit: pass at least one of --description",
+        );
+    }
+
+    // Durability goes first; a metadata update refused after it says so, and the exit is not 0.
+    let partial = agent(vec![
+        "db",
+        "edit",
+        "agent-42-notes",
+        "--acks",
+        "local",
+        "--description",
+        "Lost.",
+        "--if-version",
+        "1",
+    ])
+    .await?;
+    assert!(!partial.status.success());
+    let out = String::from_utf8_lossy(&partial.stdout);
+    assert!(
+        out.contains("durability: acks=local min_replicas=1 at its next epoch; now acks=")
+            && out.ends_with("metadata: not changed\n"),
+        "{out}"
+    );
+    let err = String::from_utf8_lossy(&partial.stderr);
+    assert!(
+        err.contains(
+            "the durability change of agent-42-notes was applied, but the metadata update \
+             failed: the database's metadata changed since version 1"
+        ),
+        "{err}"
+    );
+    let shown = succeeded(
+        &agent(vec![
+            "db",
+            "show",
+            "agent-42-notes",
+            "--json",
+            "--no-schema",
+        ])
+        .await?,
+        "db show after a partial edit",
+    )?;
+    let shown: serde_json::Value = serde_json::from_str(&shown)?;
+    assert_eq!(shown["metadata"]["description"], "Combined.");
+
+    // The removed verbs fail at parse, each with a hint naming `db edit`.
+    for (verb, flags) in [
+        ("set-description", "--description"),
+        ("set-labels", "--label"),
+        ("set-expiry", "--expires-in"),
+        ("set-durability", "--acks"),
+    ] {
+        let removed = agent(vec!["db", verb, "agent-42-notes"]).await?;
+        assert_eq!(removed.status.code(), Some(2), "{verb}");
+        let err = String::from_utf8_lossy(&removed.stderr);
+        assert!(
+            err.contains(&format!("unrecognized subcommand '{verb}'"))
+                && err.contains("hint: use 'fleetringd db edit <db> ")
+                && err.contains(flags),
+            "{verb}: {err}"
+        );
+    }
+
+    // `db show` carries the placement `db locate` prints, in text and in JSON.
+    let located = succeeded(
+        &agent(vec!["db", "locate", "agent-42-notes"]).await?,
+        "db locate",
+    )?;
+    let shown_text = succeeded(
+        &agent(vec!["db", "show", "agent-42-notes", "--no-schema"]).await?,
+        "db show",
+    )?;
+    for line in located.lines() {
+        assert!(
+            shown_text.contains(&format!("{line}\n")),
+            "{line}\n{shown_text}"
+        );
+    }
+    assert!(
+        shown_text.contains("primary: node-1 (") && shown_text.contains("\nfollowers: none\n"),
+        "{shown_text}"
+    );
+    let shown = succeeded(
+        &agent(vec![
+            "db",
+            "show",
+            "agent-42-notes",
+            "--no-schema",
+            "--json",
+        ])
+        .await?,
+        "db show --json",
+    )?;
+    let shown: serde_json::Value = serde_json::from_str(&shown)?;
+    let placement = &shown["placement"];
+    assert_eq!(placement["primary"], "node-1");
+    assert_eq!(placement["followers"], serde_json::json!([]));
+    assert!(
+        placement["lease_epoch"]
+            .as_u64()
+            .is_some_and(|epoch| epoch >= 1)
+    );
+    assert_eq!(placement["acks"], "quorum");
+    assert_eq!(placement["replicas"][0]["node"], "node-1");
+    assert!(placement["replicas"][0]["position"].is_string());
 
     let listed = succeeded(
         &agent(vec!["db", "list", "--label", "purpose=memory"]).await?,
