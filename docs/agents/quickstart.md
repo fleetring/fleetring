@@ -59,7 +59,7 @@ fleetringd db drop agent-42-scratch --yes
 {"mcpServers": {"fleetring": {"command": "fleetringd", "args": ["mcp"], "env": {"FLEETRING_CONTROL": "127.0.0.1:7400", "FLEETRING_TLS_DIR": "/home/me/.fleetring-agents/agent-42", "FLEETRING_AS": "agent-42", "FLEETRING_TOKEN": "<token>"}}}}
 ```
 
-`FLEETRING_TOKEN` holds a secret, so keep the configuration file private to you (`chmod 600`), and don't commit it. Once FR-056 adds `--token-file`, the configuration names the token's file instead. The [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the server's flags (`--read-only`, `--max-result-bytes`), its tools, and how it marks untrusted text.
+The agent needs both its own client certificate, which `FLEETRING_TLS_DIR` and `FLEETRING_AS` pick, and the token. `FLEETRING_TOKEN` holds a secret, so keep the configuration file private to you (`chmod 600`), and don't commit it. Add `"--read-only"` to `args` for an agent that only reads: the server then offers only `db_list`, `db_show`, and `query`. `--max-result-bytes <n>` caps each result's JSON (256 KiB by default, from 64 KiB to 4 MiB). The [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the tools, their results and errors, and how the server marks untrusted text.
 
 ## 5. First tool calls
 
