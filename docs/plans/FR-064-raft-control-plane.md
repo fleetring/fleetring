@@ -86,12 +86,13 @@ Where the two ADRs differ, ADR-0040 wins. This plan follows both and lands in se
 
 | Phase | Pull request | Depends on | Runs in parallel with |
 |---|---|---|---|
-| A1 | Foundations: fixtures, openraft, the runtime, the codec, Raft IDs, the upgrade check. No behaviour change. | — | E |
-| A2 | Storage and a one-voter group behind the existing API, with the migration | A1 | E; the down-conversion (open question 2) once A2 lands |
-| B | The Raft network service, `Probe`, and the `control peer` binding | A2 | E; D's harness-only parts |
+| A1 | Foundations: fixtures, openraft, the runtime, the codec, Raft IDs, the upgrade check. No behaviour change except a refusal in `upgrade` that can't fire yet. | — | E |
+| A2a | The format-2 store and the migration, as library code: no openraft wiring, and the single writer still runs on format 1 | A1 | E; the down-conversion (open question 2) once A2a lands |
+| A2b | The openraft wiring: a one-voter group behind the existing API, with the state machine, proposer, failover timer, readiness, metrics, and simulation checker | A2a | E; the down-conversion |
+| B | The Raft network service, `Probe`, and the `control peer` binding | A2b | E; D's harness-only parts |
 | C | `control add/remove/list/set-voters`, the group gate, `node remove`'s refusal | B, E | D's harness-only parts |
 | D | Simulation groups of three and five, with the new invariants and scenarios | C | — |
-| E | Data-node `addresses`, learning the group, and address rotation | — | A1, A2, B |
+| E | Data-node `addresses`, learning the group, and address rotation | — | A1, A2a, A2b, B |
 | F | Documentation and acceptance | D | — |
 
 E touches only the data-node side and the client. C's real-daemon growth test and D's scenarios need data nodes that move to another control node, so both wait for E.
@@ -102,7 +103,7 @@ D's harness-only parts can be drafted in a worktree while B and C are under revi
 
 ## Phase A1: foundations (`build(fleetringd): add openraft, the control runtime, and the control group's formats`)
 
-No behaviour changes. Everything here is tested in isolation, so A2 is about wiring.
+Nothing the daemon does changes, with one exception: `upgrade` gains the `ControlFormat` refusal, which can't fire until A2b makes a `control.db` format 2. Everything else here is tested in isolation, so A2a and A2b are about storage and wiring.
 
 ### Files
 
@@ -124,6 +125,8 @@ No behaviour changes. Everything here is tested in isolation, so A2 is about wir
     - `Tick`s.
 
     It saves a snapshot at 45. Each writer also writes `commands.json`, every command in the file in order (`serde_json::to_string_pretty`).
+- **`tests/fixtures/control-writers/fields_0_4_0.rs`** (new; run at the 0.4.0 tag like the writers): writes `crates/fleetring-control/tests/it/fixtures/fields-0.4.0.txt`, the sorted JSON field paths of a `State` with every collection non-empty and of every `Action` variant with every optional field set (ADR-0040 point 5's field rule).
+- **`crates/fleetring-control/tests/it/fields.rs`** (new; a test only, so the crate's code doesn't change): `every_field_the_previous_line_lacks_is_gated_or_derived`. It computes the same paths for this build and requires every path missing from `fields-0.4.0.txt` to be in a `NEW_FIELDS` register in the test, each naming its `Feature` or `Derived { from: &[..] }`. The register starts empty.
 - **`scripts/write-control-fixtures.sh`** (new): for each tag (`fleetringd-v0.3.0`, then `fleetringd-v0.4.0`) it runs `git worktree add` into a temporary directory, copies the writer in as `crates/fleetringd/tests/control_fixture_writer.rs`, runs `cargo test -p fleetringd --test control_fixture_writer -- --ignored --exact write` with `FIXTURE_OUT` set (the 0.4.0 run starts from the 0.3.0 output), copies the results into `tests/fixtures/control-0.3.0/` and `tests/fixtures/control-0.4.0/`, and removes the worktrees. It is run once, and its output is committed.
 - **`tests/fixtures/control-0.3.0/` and `control-0.4.0/`:** `control.db`, `commands.json`, and a two-sentence `README.md`: which tag's code wrote the files, with which script, and that they are never regenerated.
 - **`Cargo.toml` (crate):**
@@ -219,35 +222,74 @@ No behaviour changes. Everything here is tested in isolation, so A2 is about wir
 - Both fixtures are committed with their writers and the script, and recover to their replay.
 - Every golden vector round-trips byte for byte.
 - The runtime tests show per-scope determinism.
-- `upgrade` refuses a format downgrade before swapping anything.
+- `upgrade` refuses a format downgrade before swapping anything (tested with a hand-written format-2 `meta`; nothing in the daemon writes format 2 yet).
+- The field-list test passes with an empty register.
 - No existing test changes.
 
 ---
 
-## Phase A2: a one-voter group behind the existing API, with the migration (`feat(fleetringd): run the control node as a one-voter Raft group`)
+## Phase A2a: the format-2 store and the migration (`feat(fleetringd): add control.db format 2 and its migration from format 1`)
 
-After A2 every control node is a Raft group of one. The `Control` service, `ControlHandle::submit`, `state`, and `watch`, and every existing test keep working, but the storage, proposer, state machine, failover timer, metrics, and readiness are the group's.
+A2a adds `control.db` format 2 and the migration as library code, tested on its own. The daemon doesn't use it yet: the single writer, `CommandLog`, and format 1 stay as they are, and `software::running()` still reports `control_format = 1`. A2b switches the daemon over.
 
 ### Files
 
-- **`src/control/log.rs`, the format-2 store.**
-  - Keep the type name `CommandLog`, plus `LogIndex` and `LogError`. `FORMAT_VERSION` becomes `2`.
-  - The schema is ADR-0040 point 3's (`meta`; `log` with `kind` and `payload`, `leader_node` as hex text; `snapshots`), in WAL mode with `synchronous = FULL`.
-  - Methods as the old plan's step 3 listed (`open`, `genesis`, `vote`/`save_vote`, `committed`/`save_committed`, `purged`, `last_log_id`, `append_entries`, `truncate_from`, `purge_through`, `entries`, `save_control_snapshot`, `control_snapshots`, `latest_control_snapshot`, `committed_commands_after`), with arguments in openraft's types converted through `codec.rs`.
-  - `open` takes `own: Option<(RaftId, ControlPeer)>`.
-  - `LogError` gains `Migration { reason }` and `CorruptEntry { index, source }`.
-  - Format-1 code (`append`, `append_all`, `save_snapshot`, `commands`, `recover`) moves to a private `format1` module used by the migration and by `#[doc(hidden)] pub fn format1_recover(path)`, which the fixture test switches to.
-- **Migration in `open`** (ADR-0040 point 8), when `meta.format` is `"1"`:
-  1. Recover with `format1`.
+- **`src/control/store.rs`** (new), the format-2 store, `ControlStore`.
+  - Its schema is ADR-0040 point 3's (`meta`; `log` with `kind` and `payload`, `leader_node` as hex text; `snapshots`), in WAL mode with `synchronous = FULL`.
+  - Methods: `open`, `genesis`, `vote`/`save_vote`, `committed`/`save_committed`, `purged`, `last_log_id`, `append_entries`, `truncate_from`, `purge_through`, `entries`, `save_control_snapshot`, `control_snapshots`, `latest_control_snapshot`, and `committed_commands_after`. They take openraft's value types (`LogId`, `Vote`, `Entry`, `StoredMembership`) and convert them through `codec.rs`. openraft's traits are not implemented here.
+  - `open(path, config, own: Option<(RaftId, ControlPeer)>)`.
+  - `STORE_FORMAT = 2`, beside `log.rs`'s `FORMAT_VERSION = 1`, which A2b retires.
+  - `LogError` gains `Migration { reason }`, `CorruptEntry { index, source }`, and `StrayTable { rows }` ("format-2 control log {path} has a format-1 `commands` table with {rows} rows").
+- **The stray `commands` table** (ADR-0040 point 5). When `open` finds format 2:
+  - an empty `commands` table is dropped in its own transaction, logged at info as `dropped the empty commands table an older release created`;
+  - a non-empty one is `StrayTable`.
+- **Migration in `ControlStore::open`** (ADR-0040 point 8), when `meta.format` is `"1"`:
+  1. Recover with `log.rs`'s format-1 code.
   2. If `commands` starts at index 1 with no gaps, replay it all from genesis and require equality with the recovered state. A mismatch is `LogError::Migration { reason: "the snapshot at {s} doesn't match replaying the log from genesis; the first difference is at {i}" }`. A file without a full history, such as a down-converted one (open question 2), skips this step and says so at info level.
   3. `own` must be `Some`, else `Migration { reason: "the node's raft id is needed" }`.
   4. In one `BEGIN IMMEDIATE` transaction, do the renames and inserts of ADR-0040 point 8.
   5. Log at info: `migrated the control log from format 1 at index {N}`.
 
   An empty format-1 file becomes an empty format-2 store.
-- **`src/control/raft/store.rs`:** `ControlLogStore` (`Clone`; `Arc<Mutex<CommandLog>>` plus `StorageIo`), implementing `RaftLogStorage` and `RaftLogReader`. The callback `append(entries, callback)` fires after the transaction commits. Under `StorageIo::DedicatedThread` every call runs in `tokio::task::spawn_blocking`; under `StorageIo::Inline` it runs on the calling task (simulation).
+- **`tests/fixtures/control-writers/open_format2_0_4_0.rs`** (new; run at the 0.4.0 tag by `scripts/write-control-fixtures.sh stray`). It runs 0.4.0's `CommandLog::open` on a copy of `tests/fixtures/control-0.4.0-migrated/control.db`, which an ignored A2a test writes by migrating the 0.4.0 fixture. It requires `UnsupportedFormat`, and saves the result as `tests/fixtures/control-format2-opened-by-0.4.0/control.db`, which holds the empty `commands` table 0.4.0 leaves behind.
+
+### Tests
+
+`tests/control.rs`, module `store`:
+
+- `appended_entries_survive_reopening`;
+- `truncation_removes_the_tail_and_purging_the_head`;
+- `vote_and_committed_survive_reopening`;
+- `only_the_newest_snapshots_are_kept`;
+- `committed_commands_skip_raft_entries_and_stop_at_committed`;
+- `the_0_3_0_fixture_migrates_to_a_snapshot_of_its_replay`;
+- `the_0_4_0_fixture_migrates_with_its_features_and_software`;
+- `a_snapshot_that_disagrees_with_the_replay_refuses_migration` (a copy with its snapshot's state edited);
+- `an_empty_format_one_log_migrates_to_an_empty_store`;
+- `a_format_one_log_without_an_id_is_refused`;
+- `a_newer_format_is_refused` (`format = 3`);
+- `the_empty_table_0_4_0_leaves_is_dropped` (the `control-format2-opened-by-0.4.0` fixture opens, its `commands` table is gone, and its state is the migrated one);
+- `a_non_empty_stray_table_is_refused`.
+
+### Acceptance criteria
+
+- Every gate is green.
+- Both format-1 fixtures migrate to their replay.
+- The stray-table fixture, written by the real 0.4.0 code, opens.
+- The daemon's behaviour is unchanged: every existing test passes untouched.
+
+---
+
+## Phase A2b: a one-voter group behind the existing API (`feat(fleetringd): run the control node as a one-voter Raft group`)
+
+After A2b every control node is a Raft group of one. The `Control` service, `ControlHandle::submit`, `state`, and `watch`, and every existing test keep working, but the storage, proposer, state machine, failover timer, metrics, and readiness are the group's.
+
+### Files
+
+- **`src/control/log.rs`** becomes a private `format1` module, used only by `ControlStore`'s migration and by `#[doc(hidden)] pub fn format1_recover(path)`, which the fixture test switches to. `ControlStore` takes over `pub use` as the control log, `FORMAT_VERSION` becomes `2`, and `software::running()` reports `control_format = 2`.
+- **`src/control/raft/log_storage.rs`:** `RaftLog` (`Clone`; `Arc<Mutex<ControlStore>>` plus `StorageIo`), implementing `RaftLogStorage` and `RaftLogReader`. The callback `append(entries, callback)` fires after the transaction commits. Under `StorageIo::DedicatedThread` every call runs in `tokio::task::spawn_blocking`; under `StorageIo::Inline` it runs on the calling task (simulation).
 - **`src/control/raft/state_machine.rs`:** `ControlStateMachine`, as the old plan's step 4 specified, with ADR-0040's changes:
-  - **`apply(entries)`.** A command entry whose `screened` leader ID differs from its own log ID's leader ID returns `ControlResponse::Superseded` without decoding the command and without changing state. A command entry that matches decodes the raw command (a decoding failure is a fatal storage error: the node stops applying and `/healthz` fails), runs `fleetring_control::apply`, publishes `AppliedState { index, state }` after every entry, and returns `Applied`. Membership and blank entries return `Raft`.
+  - **`apply(entries)`.** The skip rule applies to `kind = 'command'` entries only; blank and membership entries have no `screened` field. A command entry whose `screened` leader ID differs from its own log ID's leader ID returns `ControlResponse::Superseded` without decoding the command and without changing state. A command entry that matches decodes the raw command. If decoding fails, the node is fail-stop (ADR-0040 point 4): it stops applying at that entry, never applies past it, and its `control_log` readiness check fails with "entry <i> needs fleet feature '<f>', which fleetringd <version> lacks; upgrade this node", or names the decoding error when no feature explains it. Otherwise it runs `fleetring_control::apply`, publishes `AppliedState { index, state }` after every entry, and returns `Applied`. Membership and blank entries return `Raft`.
   - **Snapshots.** `build_snapshot` and `install_snapshot` use point 3's encoding. `install_snapshot` runs `check_state` against the store's genesis, or records the snapshot's `config()` as genesis on a fresh joiner.
   - **`ControlMetrics::command`** is counted here, on every node.
 - **`src/control/raft/proposer.rs`** (new): the proposer of ADR-0040 point 2.
@@ -269,7 +311,7 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
     3. `apply` to `S`;
     4. `client_write_ff(ControlRequest { screened, command })`;
     5. spawn a waiter on the responder that maps `Applied` to `Committed`, `Superseded` to `SubmitError::Superseded`, `ForwardToLeader` to `NotLeader`, and a dropped responder to `Stopped`.
-  - `GroupGate` is a stub in A2 that admits everything; with one voter, the gate is the fleet's. B fills it.
+  - `GroupGate` is a stub in A2b that admits everything; with one voter, the gate is the fleet's. B fills it.
 - **`src/control/node.rs`:**
   - `ControlNode::open(path, options, clock, own: ControlPeer, network: Network, seed: RaftSeed)`, run inside `with_generator(seed, ..)`.
     1. Open the store and the state machine.
@@ -288,7 +330,6 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
 - **`src/daemon.rs`:**
   - Bind the listener before opening the control node, and pass `own = ControlPeer { node_id, address: advertised(&config, bound) }` and the seed.
   - `ControlRole` keeps its shape.
-- **`src/software.rs`:** nothing to change: `FORMAT_VERSION` is 2, so `running()` reports `control_format = 2`.
 - **`src/observe/`** (ADR-0040 point 10):
   - the new gauges and counters in `names.rs`, with `OUTCOMES_PROPOSAL = ["committed", "refused", "superseded", "not_leader"]`;
   - `ControlMetrics` methods for each;
@@ -296,26 +337,17 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
   - `health.rs`: `leader` passes when a leader is known, and `control_group` is new.
 - **`src/sim/check.rs`:** `control_log_replays` is rewritten for format 2, as the old plan's step 12 specified: it starts at the oldest retained snapshot, or at genesis while nothing is purged; at each newer snapshot it must reproduce that snapshot; and it must reach the published state at its index. Superseded command entries are skipped. `ControlLog` gains `replayed_from`. One control host for now.
 - **`src/sim/fleet.rs`:** `Timings` gains `election_timeout` (250 ms in the default fleet), `raft_heartbeat` (50 ms), and `log_keep` (`NonZeroU64::MAX`, so the default fleet never purges). `host_config` sets them.
-- **`tests/upgrade/rolling.rs`** (the nightly test): after the control node moves to this build, it asserts that `fleetringd control list`, once C lands (until then `status`), shows the control node as the only voter, that every database the fleet created is still listed at its epoch, and that `fleetringd upgrade --rollback --config` back to the baseline is refused with the `ControlFormat` error.
+- **`tests/upgrade/rolling.rs`** (the nightly test): after the control node moves to this build, it asserts that `fleetringd control list`, once C lands (until then `status`), shows the control node as the only voter, that every database the fleet created is still listed at its epoch, and that `fleetringd upgrade --rollback --config` back to the baseline is refused with the `ControlFormat` error. It then runs the baseline binary on the data directory directly, as a rollback that bypassed the check would, expects `UnsupportedFormat`, and restarts this build on the same directory, which must drop the stray `commands` table and serve.
 
 ### Tests
 
-- **`tests/control.rs`.** Every existing test keeps passing. Constructors change, and `ControlNode::open` takes `own`, `network`, and `seed`, so `tests/support` gains `fn control_peer()` and `fn test_seed()`. Module `log`:
-  - `appended_entries_survive_reopening`;
-  - `truncation_removes_the_tail_and_purging_the_head`;
-  - `vote_and_committed_survive_reopening`;
-  - `only_the_newest_snapshots_are_kept`;
-  - `committed_commands_skip_raft_entries_and_stop_at_committed`;
-  - `the_0_3_0_fixture_migrates_to_a_snapshot_of_its_replay`;
-  - `the_0_4_0_fixture_migrates_with_its_features_and_software`;
-  - `a_snapshot_that_disagrees_with_the_replay_refuses_migration` (a copy with its snapshot's state edited);
-  - `an_empty_format_one_log_migrates_to_an_empty_store`;
-  - `a_format_one_log_without_an_id_is_refused`;
-  - `a_newer_format_is_refused` (`format = 3`).
+- **`tests/control.rs`.** Every existing test keeps passing. Constructors change, and `ControlNode::open` takes `own`, `network`, and `seed`, so `tests/support` gains `fn control_peer()` and `fn test_seed()`. A2a's `store` tests keep passing.
 - **`src/control/raft/state_machine.rs`:**
   - `applying_entries_matches_applying_commands`, with the 0.4.0 fixture's 60 commands interleaved with a membership and a blank entry;
   - `a_rejection_still_moves_the_applied_index`;
   - `an_entry_appended_in_another_term_is_superseded_without_decoding` (its raw command is invalid JSON for `Command`, and nothing fails);
+  - `blank_and_membership_entries_are_never_skipped`;
+  - `an_undecodable_command_stops_applying_and_says_why` (a matching entry whose action is unknown: the applied index stays before it, and readiness names the entry).
   - `a_built_snapshot_installs_to_the_same_state`;
   - `a_snapshot_with_another_configuration_is_refused`.
 - **`src/control/raft/proposer.rs`** (`#[tokio::test(start_paused = true)]`, one voter):
@@ -339,7 +371,7 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
 
 - Every gate is green, and every existing control and simulation test passes with constructor changes only.
 - `fleetringd dev` starts and is ready in the same time as before (±200 ms on the CI runner).
-- Both fixtures migrate to their replay, and the nightly rolling-upgrade test passes from 0.4.0 to this build with the new assertions (run it once by hand on the PR, as `RELEASING.md` describes).
+- Both fixtures migrate to their replay under a running daemon, and the nightly rolling-upgrade test passes from 0.4.0 to this build with the new assertions (run it once by hand on the PR, as `RELEASING.md` describes).
 
 ---
 
@@ -392,8 +424,9 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
   - A dial failure, a timeout, or `UNAVAILABLE` is `Unreachable`, and the channel is forgotten. Any other status, or a payload that doesn't decode, is a network error.
   - `ControlNetwork::probe(address) -> Result<ProbeReply, ProbeError>`.
 - **`src/control/raft/group.rs`** (new):
-  - `GroupSoftware`, a `Mutex<BTreeMap<RaftId, Heard { software: Software, offset_ms: i64 }>>`, shared by the network, the service, and the proposer's `GroupGate`. A new term on this node clears it.
-  - `GroupGate::check(&self, action, members: &BTreeSet<RaftId>, state: &State) -> Result<(), Rejection>`, implementing ADR-0040 point 4's first-use and window rules; the "control node '<id>' hasn't reported its software yet" case is a `Rejection::FeatureUnsupported` whose release is `0.0.0`. Wired into the proposer, replacing A2's stub.
+  - `GroupSoftware`, a `Mutex<BTreeMap<RaftId, Heard { software: Software, offset_ms: i64, at: tokio::time::Instant, settles_at: Option<LogIndex> }>>`, shared by the network, the service, and the proposer's `GroupGate`. A new term on this node clears it.
+  - **Staleness** (ADR-0040 point 4). A report counts as known only while `at` is within one shortest election timeout. A report whose release or features differ from the previous one records `settles_at`, the proposer's last proposed index then, and counts as unknown until the applied index reaches it.
+  - `GroupGate::check(&self, action, members: &BTreeSet<RaftId>, state: &State) -> Result<(), Rejection>`, implementing ADR-0040 point 4's first-use and window rules; the "control node '<id>' hasn't reported its software yet" case is a `Rejection::FeatureUnsupported` whose release is `0.0.0`. Wired into the proposer, replacing A2b's stub.
   - The largest absolute offset is exported as `fleetring_control_clock_offset_max_seconds`, with a warning, at most once a minute, above the failover margin.
 - **`src/control/raft/service.rs`:** `RaftService`, as the old plan's step 6 specified, with these changes:
   - It checks the binding against the membership in `raft.metrics()`; an empty membership accepts any node certificate of the fleet.
@@ -417,6 +450,8 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
 - `a_node_without_a_raft_service_is_not_added`: a stub server answers `UNIMPLEMENTED`.
 - `a_node_outside_the_window_is_not_added`: a stub `Probe` reports 0.7.0.
 - `the_leader_learns_every_members_software_within_a_heartbeat`.
+- `a_report_older_than_an_election_timeout_counts_as_unknown` (paused time: stop `c3`; after one election timeout a first use of `undrain` is refused as "hasn't reported its software yet").
+- `a_changed_report_settles_before_it_counts`: `c3`'s report drops `undrain` while a first use of `undrain` is in flight; the gate treats `c3` as unknown until that proposal is applied, then refuses the next first use naming `c3`.
 - `the_first_use_of_a_feature_waits_for_every_control_node`: `c3` reports software without `undrain` (set through `Environment::with_software`, added here for tests and D); `Undrain` is `Refused` naming `c3`; after `c3` reports it, `Undrain` is accepted.
 - `a_join_outside_a_control_nodes_window_is_refused`.
 - `a_leader_crash_loses_no_acknowledged_command`: crash `c1` mid-stream; every acknowledged `Join` is in the new leader's state; every unacknowledged submitter got an answer.
@@ -447,6 +482,10 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
   - `leave` refuses a node that is a voter or learner of the group (ADR-0040 point 9) before it submits.
 - **`src/control/absent.rs`:** `NoControl` refuses the four RPCs.
 - **`src/control/client.rs`:** `add_control_node`, `remove_control_node`, and `set_control_voters`, each sent once through `following`, and `describe_control_group`, retried.
+- **The announcement of the next software** (ADR-0040 point 4):
+  - `src/upgrade/mod.rs`: on a node whose data directory holds a `control.db`, `install` and `rollback` with `--config` write `<data_dir>/fleetringd.next-software` (the target's `--software` JSON), send `SIGUSR1` through the process file as the restart does, and poll `DescribeControlGroup` until this node's software there is the reduced one and marked settled (bounded by `--timeout`; on timeout they undo the announcement and refuse). Only then do they check enabled features and swap. If a feature the target lacks was enabled meanwhile, they delete the file, signal again, and refuse with `MissingFeature`.
+  - `src/daemon.rs`: `SIGUSR1` re-reads the file, and the daemon reports the lower release and the shared features in every `RaftPayload`. At startup it deletes the file once its running software matches it.
+  - `ControlNode` in `DescribeControlGroup` gains `bool software_settled = 7`.
 - **`src/main.rs`:** the `control` noun and its four subcommands, as the old plan's step 11 specified.
   - `remove` confirms on a terminal, and exits 2 without one unless `--yes`.
   - `set-voters` with one voter prints the warning `a control group of one voter has no redundancy` on stderr.
@@ -469,6 +508,10 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
   - `a_fleet_grows_from_one_control_node_to_three_while_writing`, as the old plan's step 14 specified, with `d1` and `d2` on `control.address = c1`: after `c1` stops they reach the new leader through the addresses they learned (E);
   - `a_migrated_control_node_keeps_its_fleet` (the 0.4.0 fixture under a real daemon: `ListDatabases` returns its two databases at their epochs; `control list` shows one voter).
 - `tests/daemon.rs`: `control_list_shows_a_single_control_node_as_its_voter_and_leader`.
+- `tests/control_group.rs`:
+  - `an_announced_rollback_blocks_a_first_use_until_it_completes`: three real control nodes; announce the previous line's software on `c3` (write the file, send `SIGUSR1`); once settled, `node undrain` is refused naming `c3`;
+  - `a_first_use_racing_an_announcement_makes_upgrade_refuse`: the first use commits before the announcement settles, and the rollback is refused with `MissingFeature` and nothing swapped.
+- `tests/upgrade/main.rs`: `an_announcement_that_never_settles_is_undone` (a stub control plane that never reports settled: the file is removed and nothing swapped).
 
 ### Acceptance criteria
 
@@ -488,13 +531,17 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
   - `FleetBuilder::control_group(names)` (the first host gets `bootstrap = "new"`, the rest `"join"`; data hosts get `control.addresses` with every control host);
   - `FleetBuilder::clock_skew(host, millis)` (bases `sim_elapsed + SKEW_FLOOR_MS + skew`; `|skew|` at most `SKEW_FLOOR_MS = 600_000`);
   - `FleetBuilder::software(host, Software)` (through `Environment::with_software`);
+  - `FleetBuilder::previous_line(host)`: the host decodes installed snapshots and log entries through a filter that drops every JSON field missing from `fields-0.4.0.txt` (A1), as an older line would. A test-only seam, `Environment::with_decode_filter`, makes this possible;
+  - `Fleet::announce_software(host, Software)`: the same hook `SIGUSR1` drives;
   - `Fleet::build` forms the group through `AddControlNode` and `SetControlVoters` as an `operator` client;
   - `control_hosts`, `control_leader`, `control_handle` (the leader's), `control_log_of`, and `await_control_converged`;
   - `EventKind::Leader { term, leader }` from each control host's `leadership()`.
 
-  These are all as the old plan's step 12 specified. Per-host Raft seeds already come from A2.
+  These are all as the old plan's step 12 specified. Per-host Raft seeds already come from A2b.
 - **`src/sim/check.rs`:**
   - `Invariant::ControlLogsAgree` and `Invariant::OneLeaderPerTerm`, with `control_logs_agree(&[(host, path)])` and `one_leader_per_term(&trace)`;
+  - `Invariant::EveryControlNodeApplies` ("every control node applies its log"): no control host ever stops applying at an entry it can't decode;
+  - `Invariant::PreviousLineDecidesAlike`: on every host with `previous_line`, the state reached through the filter makes the same decisions as the leader's at the same index (`liveness` of every member, `promotions_due`, each lease's holder, epoch, and expiry, the enabled features, the membership epoch);
   - `control_log_replays` runs for every control host against the last state each published;
   - `lease_events_match_control` runs only when replay started at genesis.
 - **`src/sim/trace.rs`:** the `Leader` variant; `Replay::Order` includes it.
@@ -513,6 +560,8 @@ After A2 every control node is a Raft group of one. The `Control` service, `Cont
 | `skewed_clocks_never_make_two_primaries` | 3 control (−5 s, 0, +5 s), 3 data | Crash the leader twice; crash one primary meanwhile. | `OnePrimaryPerEpoch`; the history checker passes; applied stamps, after clamping, never decrease. |
 | `a_fleet_grows_from_one_control_node_to_three` | 1 control, then 2 joining; 3 data | Start `c2` and `c3` at 1 s; add them and set voters at 1.5 s under `CreateAndWrite`; crash `c1` at 4 s. | Three voters; data nodes find the new leader; no write fails longer than one election plus a lease renewal. |
 | `a_late_learner_catches_up_from_a_control_snapshot` | 3 control, 2 data; `snapshot_every = 20`, `log_keep = 10` | 600 heartbeats, then add a fourth control node. | The learner installed a snapshot (its first log index is above 1) and its state equals the leader's; the leader's log never held more than 30 entries; at most 2 snapshots on every node. |
+| `a_rollback_racing_a_first_use_never_strands_a_voter` | 3 control, 2 data | A driver issues the first `Undrain` at random times while `c3`'s next software (the previous line, without `undrain`) is announced; `c3` restarts as `previous_line` once the announcement settles. | Either `Undrain` committed first and `c3`'s rollback is abandoned (the announcement undone), or `Undrain` is refused naming `c3`; `EveryControlNodeApplies`. |
+| `a_previous_line_voter_decides_alike_from_snapshots` | 3 control, `c3` as `previous_line`; `snapshot_every = 20`, `log_keep = 10` | Isolate `c3` for 300 heartbeats so it catches up by `InstallSnapshot`; crash the leader once. | `PreviousLineDecidesAlike`; `ControlLogsAgree`. |
 | `one_hosts_crash_does_not_move_anothers_elections` | 3 control | Run seed 7 twice, once crashing `c3` at 1 s. | `c1`'s and `c2`'s election timeouts (logged as trace events) agree up to the crash's first effect on them. |
 
 **Seed budget.** The scenarios run over `seeds::FIXED_HEAVY`, except `five_control_nodes_survive_two_crashes`, `a_late_learner_catches_up_from_a_control_snapshot`, and `a_refused_join_never_reaches_a_log_across_leader_changes`, which run on seed `1` alone. Together they add at most three minutes to the fixed-seed job (owner decision, 2026-11-03). Measure on the PR; if they exceed it, move more to seed `1` and say so in Progress. The nightly sweep runs them all on its random seeds.
@@ -607,7 +656,7 @@ Decided as recommended when ADR-0035 was accepted, with the release numbers corr
    - **Recommended: keep ADR-0040.** ADR-0035 is accepted, and `docs/adr/README.md` and `CLAUDE.md` say to amend accepted decisions. Folding it in is a mechanical change if you prefer one file.
 2. **A down-conversion so a one-voter control node can roll back from 0.5 to 0.4?**
    - Without one, the first start on 0.5 is a one-way door for control nodes. `upgrade` refuses the rollback, and restoring a pre-upgrade backup can reissue lease epochs.
-   - **Recommended: yes, as a small PR after A2, in parallel with B.** It is offline (daemon stopped), allowed only for a one-voter group, and `fleetringd control downgrade --to-format 1 --config <file>` writes a format-1 file holding the current state as a snapshot at the last applied index N, plus a `Tick` at N, which format 1 requires and recovery never replays. It keeps the format-2 file as `control.db.format2`, and refuses when the state uses a feature 0.4 lacks. That keeps ADR-0038's promise that rollback is safe until a new command is used.
+   - **Recommended: yes, as a small PR after A2a, in parallel with A2b and B.** It is offline (daemon stopped), allowed only for a one-voter group, and `fleetringd control downgrade --to-format 1 --config <file>` writes a format-1 file holding the current state as a snapshot at the last applied index N, plus a `Tick` at N, which format 1 requires and recovery never replays. It keeps the format-2 file as `control.db.format2`, reuses an empty `commands` table that a bypassed 0.4 start left behind and refuses a non-empty one, and refuses when the state uses a feature 0.4 lacks. That keeps ADR-0038's promise that rollback is safe until a new command is used.
 3. **Should `node remove` refuse a control group member?**
    - Options: refuse; remove from both the fleet and the group; or only warn.
    - **Recommended: refuse, naming `control set-voters` and `control remove`.** Removing from both can't be atomic (Raft configuration and control state are separate), and a warning leaves a dead voter counting toward quorums.
@@ -630,8 +679,10 @@ Decided as recommended when ADR-0035 was accepted, with the release numbers corr
 - **Clock skew** delays failovers after a leader change by up to the skew, and denylist entries can be forgotten that much early (ADR-0040 point 6). Safety is unaffected, and the clock-offset gauge shows it.
 - **The fresh-joiner window** (ADR-0035 point 13) stays until control-node certificates exist. `Probe` narrows the operator's part: a joiner with state is refused.
 - **Migration is one-way** unless open question 2 is accepted.
+- **A rollback without `--config`** skips the software announcement, and can leave a voter stopped at an entry it can't decode until it is rolled forward (ADR-0040 point 4). It is fail-stop, and the readiness check names the fix.
 - **Simulation budget.** Five-node groups and compaction runs are heavy; the seed split above may need trimming.
 
 ## Progress
 
 - 2026-11-04: ADR-0040 proposed, amending ADR-0035 for versions, rollback, dev mode, and the leader's screen. This plan was rewritten into phases A1–F around it. openraft 0.9.25's runtime hook was verified in a scratch crate: the same seed gave the same election timeouts across a spawned task. No Raft code is written yet.
+- 2026-11-04: after an independent review, ADR-0040 gained the staleness, announcement, and fail-stop rules, the stray-table rule, the rule on fields an older line drops, and the time assumptions. A2 was split into A2a (store and migration as library code) and A2b (openraft wiring).
