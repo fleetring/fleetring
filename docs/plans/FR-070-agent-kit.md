@@ -115,6 +115,9 @@ message UpdateDatabaseRequest {
   oneof description {
     string set_description = 2;
     bool clear_description = 3;
+    // Sets the description with no author, whoever the caller is: a restored description
+    // (ADR-0041 point 10). Readers treat it as untrusted.
+    string set_description_without_author = 10;
   }
   repeated Label set_labels = 4;
   repeated string remove_labels = 5;
@@ -198,7 +201,7 @@ message SchemaResponse {
 
 // ---- Phase 5 ----
 //   RestoreResponse:  DatabaseMetadata archived_metadata = 7;
-//   ArchivedSnapshot: bool metadata = 6;   // the snapshot carries a metadata.json
+//   ArchivedSnapshot: bool metadata = 6;   // the snapshot has a metadata object under .metadata/
 
 // ---- Phase 6 ----
 //   QueryRequest:  uint32 max_rows = 4;    // 0: no limit
@@ -222,9 +225,24 @@ pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 pub const MAX_LABELS: usize = 32;
 /// Label key prefixes reserved for FleetRing: `fleetring.dev` and its subdomains.
 pub const RESERVED_LABEL_DOMAIN: &str = "fleetring.dev";
+/// Unicode's format characters (`Cf`) as of Unicode 16, as inclusive ranges. Frozen: decoding a
+/// log uses exactly this table forever, so a later Unicode version's additions are refused by
+/// the control service, never here (ADR-0041 point 1).
+pub const FORBIDDEN_FORMAT_CHARACTERS: &[(char, char)] = &[
+    ('\u{00AD}', '\u{00AD}'), ('\u{0600}', '\u{0605}'), ('\u{061C}', '\u{061C}'),
+    ('\u{06DD}', '\u{06DD}'), ('\u{070F}', '\u{070F}'), ('\u{0890}', '\u{0891}'),
+    ('\u{08E2}', '\u{08E2}'), ('\u{180E}', '\u{180E}'), ('\u{200B}', '\u{200F}'),
+    ('\u{202A}', '\u{202E}'), ('\u{2060}', '\u{2064}'), ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'), ('\u{FFF9}', '\u{FFFB}'), ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'), ('\u{13430}', '\u{1343F}'), ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'), ('\u{E0001}', '\u{E0001}'), ('\u{E0020}', '\u{E007F}'),
+];
+// Before committing the table, check it against the Unicode 16 `DerivedGeneralCategory.txt`
+// (category Cf); fix any range that differs, and note the check in the PR.
 
-/// 1..=1024 bytes of UTF-8; tab and line feed allowed; other C0 controls, DEL, C1 controls
-/// (U+0080–U+009F), and U+202A–U+202E and U+2066–U+2069 refused. Not normalized.
+/// 1..=1024 bytes of UTF-8; tab and line feed allowed; refused: other C0 controls, DEL, C1
+/// controls (U+0080–U+009F), every character of FORBIDDEN_FORMAT_CHARACTERS (Unicode `Cf` as of
+/// Unicode 16), and U+2028 and U+2029. Not normalized.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Description(Box<str>);
@@ -311,7 +329,14 @@ impl MetadataSpec {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DescriptionChange { #[default] Keep, Set(Description), Clear }
+pub enum DescriptionChange {
+    #[default] Keep,
+    /// Sets the text; `apply` records the update's `by` as its author.
+    Set(Description),
+    /// Sets the text and clears its author, whoever makes the update: a restored description.
+    SetWithoutAuthor(Description),
+    Clear,
+}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpiryChange { #[default] Keep, Set(Timestamp), Clear }
@@ -334,6 +359,12 @@ impl MetadataChange {
 
 - Add `Feature::Metadata` (`"metadata"`) and `Feature::Expiry` (`"expiry"`), with doc comments naming the actions each covers.
 - `pub const ALL: [Self; 3] = [Self::Undrain, Self::Metadata, Self::Expiry];`
+- **This build must not report `expiry` yet** (ADR-0041 point 3): nothing sweeps until phase 3. In `crates/fleetringd/src/software.rs`:
+  - add `const NOT_YET_REPORTED: [Feature; 1] = [Feature::Expiry];` with a comment naming phase 3;
+  - make `running()` fold over `Feature::ALL` minus `NOT_YET_REPORTED`;
+  - rename the test `this_build_reports_a_release_with_every_feature` to `this_build_reports_every_feature_it_carries_out`, and make it assert that `metadata` is reported and `expiry` isn't.
+
+  Phase 3 deletes the constant.
 
 ### 1.3 `command.rs`
 
@@ -403,7 +434,7 @@ impl MetadataChange {
   3. `if_version` differing from `current` → `MetadataConflict { database, expected, current }`.
   4. Start from the existing metadata, or an empty one with no creator and no creation time.
   5. Remove `remove_labels`, then insert `set_labels`. If the count exceeds `MAX_LABELS` → `TooManyLabels { database, count, max }`.
-  6. Apply the description change; `Set` records `description_by = by`, and `Clear` clears both.
+  6. Apply the description change: `Set` records `description_by = by`; `SetWithoutAuthor` sets the text and clears `description_by`; `Clear` clears both.
   7. Apply the expiry change; `Set(t)` with `t <= now` → `ExpiryPassed`.
   8. `version = current + 1` (saturating).
   9. Outcome: `Applied::DatabaseUpdated { database, version }`.
@@ -433,7 +464,7 @@ impl MetadataChange {
 **Unit tests in `metadata.rs`:**
 
 - `descriptions_allow_tab_and_newline_and_refuse_other_controls`: `\t`, `\n` pass; `\r`, `\0`, `\x1b`, `\x7f`, `\u{85}` fail with `ForbiddenCharacter` and the right byte offset.
-- `bidi_controls_are_refused`: each of U+202A–U+202E and U+2066–U+2069.
+- `format_characters_and_separators_are_refused`: the first and last character of every range in `FORBIDDEN_FORMAT_CHARACTERS`, plus U+2028 and U+2029, each fail with `ForbiddenCharacter`. These include U+200B, U+FEFF, U+202E, and U+E0041, a tag character. Characters next to the ranges pass: U+200A, U+2010, U+E0080.
 - `descriptions_are_at_most_1_kib`: 1,024 ASCII bytes pass, and 1,025 fail; 341 × "€" (1,023 bytes) passes, and 342 (1,026) fails.
 - `label_keys_follow_kubernetes_rules`, a table:
   - valid: `a`, `purpose`, `app.kubernetes.io/name`, `example.com/A_b-c.d`, a 63-character name;
@@ -455,6 +486,7 @@ impl MetadataChange {
 - `if_version_makes_an_update_conditional`
 - `an_update_past_32_labels_is_refused`
 - `the_description_records_who_last_set_it`
+- `a_description_set_without_an_author_records_none`: even when `by` is `Some`.
 - `an_expiry_at_or_before_the_command_time_is_refused`
 - `expire_database_drops_only_once_the_expiry_has_passed`: `NotExpired` at `t - 1`, `DatabaseExpired` at `t`; the reports are gone, and a later `RenewLease` is `UnknownDatabase`.
 - `an_extended_expiry_wins_over_a_stale_sweep`
@@ -481,7 +513,10 @@ impl MetadataChange {
 
 ### Phase 1 acceptance
 
-All gates green. The replay tests pass with metadata and expiry. No behaviour in `fleetringd` changes.
+- All gates green.
+- The replay tests pass with metadata and expiry.
+- No behaviour in `fleetringd` changes.
+- `fleetringd upgrade --software` lists `metadata` and not `expiry`.
 
 ---
 
@@ -503,7 +538,9 @@ pub(crate) fn description_from_proto(text: &str) -> Result<Option<Description>, 
 pub(crate) fn change_from_proto(request: &proto::UpdateDatabaseRequest) -> Result<MetadataChange, Status>;
 ```
 
-`Descriptions` is a new two-variant enum in `data`, `Include` or `Omit`. `change_from_proto` refuses a key in both `set_labels` and `remove_labels`, and an empty change, with `INVALID_ARGUMENT`.
+- `Descriptions` is a new two-variant enum in `data`, `Include` or `Omit`.
+- `change_from_proto` refuses a key in both `set_labels` and `remove_labels`, and an empty change, with `INVALID_ARGUMENT`.
+- `set_description_without_author` maps to `DescriptionChange::SetWithoutAuthor`.
 
 ### 2.3 Control service: `src/control/service.rs`
 
@@ -583,6 +620,11 @@ These are serde structs shared by the CLI's JSON and, in phase 6, the MCP server
 
   `expires_in_ms` is computed from the client's clock when the report is built, and is negative once past.
 - Builders: `DatabaseReport::from_location(&Location, now: Timestamp)`, and `render_text(&DatabaseReport, out: &mut dyn io::Write) -> io::Result<()>`.
+- **`render_text` prints a description as a block** (ADR-0041 point 1).
+  - A line `description:` comes first, then every line of the text, the first included, as two spaces, `| `, and the line.
+  - After it comes `description by: <name>`, or `description by: unknown`.
+  - No line of a description ever starts at column 0, so `"x\nCREATOR: admin"` can't pass for a field.
+  - The restore report (phase 5) uses the same function for the archived description.
 
 ### 2.7 CLI: `src/main.rs`
 
@@ -611,6 +653,10 @@ These are serde structs shared by the CLI's JSON and, in phase 6, the MCP server
   - section 1 gains `mcp` among the top-level commands, with its reason;
   - the "Where `fleetringd` stands" table notes `db show`'s `-o json`.
 - **The daemon README:** the scope table, and a "Database metadata" subsection with the new commands.
+- **`SECURITY.md`'s threat model:**
+  - `Locate` and listings, which need only `read` on a database, now show principal names (`created_by`, `description_by`); before, only audit lines named principals;
+  - descriptions are text written by principals, and restored descriptions are never attributed;
+  - descriptions refuse invisible and control characters.
 
 ### 2.9 Tests
 
@@ -639,6 +685,8 @@ These are serde structs shared by the CLI's JSON and, in phase 6, the MCP server
 **Unit tests:**
 
 - `data/convert.rs`: `labels_round_trip_sorted`.
+- `report.rs`: `render_text_indents_and_prefixes_every_description_line`, with `"x\nCREATOR: admin"`; no output line starts with `CREATOR:`.
+- `oversized_descriptions_and_invalid_labels_are_refused` also sends U+200B, U+E0041, and U+2028.
 - `main.rs`: `db_create_parses_labels_and_reads_a_description_from_stdin_when_dash`.
 
 ### Phase 2 acceptance
@@ -659,24 +707,77 @@ Phase 3's part of [Protocol](#protocol-all-phases). `DatabaseMetadata.expires_at
 
 - `pub const MIN_EXPIRY: Millis = Millis::new(60_000);` in `control/service.rs`.
 - `fn resolve_expiry(&self, expires_at_ms: Option<u64>, expires_in_ms: Option<u64>) -> Result<Option<Timestamp>, Status>`:
-  - a duration is resolved to `self.clock.now() + d`;
+  - let `now = self.clock.now().max(self.node.state().now())`: the later of this node's clock and the control plane's last applied stamp;
+  - a duration is resolved to `now + d`;
   - anything earlier than `now + MIN_EXPIRY` is `INVALID_ARGUMENT`, "expiry must be at least 1m from now".
 
   It is used by `create_database_with_metadata` (into `MetadataSpec.expires_at`) and `update_database` (into `ExpiryChange::Set`). `clear_expiry` maps to `ExpiryChange::Clear`.
 - The spec becomes non-empty with an expiry alone.
+- `rejection_status` maps `Rejection::ExpiryPassed` to `Status::unavailable("the control plane's time moved past the requested expiry; retry")`, the retryable exit code 4. This replaces phase 2's `INVALID_ARGUMENT` for it.
 
-### 3.3 The sweep: `src/control/failover.rs`
+### 3.3 The sweep: a task of its own in `src/control/failover.rs`
 
 - Add the module doc's point 4, "Expired databases".
 - Constants: `const EXPIRY_SWEEP: Duration = Duration::from_secs(1);` and `const MAX_EXPIRIES_PER_SWEEP: usize = 64;`.
-- In the loop, at most once per `EXPIRY_SWEEP` (tracked with a `tokio::time::Instant`):
+- **New `pub(crate) fn spawn_expiry_sweep(handle: ControlHandle, clock: Arc<dyn Clock>) -> JoinHandle<()>`.**
+  - It is started wherever the failover timer is spawned, and stopped with it. Under FR-064 it follows the timer's "ready leader only" rule.
+  - It is a separate task, so expiries never delay ticks, `StartPromotion`, or candidate notices.
+- **Its loop runs on a `tokio::time::interval(EXPIRY_SWEEP)` with `MissedTickBehavior::Delay`:**
+  1. `let due = handle.state().expired_databases(clock.now());`
+  2. For the first `MAX_EXPIRIES_PER_SWEEP` entries, spawn `handle.submit(Action::ExpireDatabase { name })` into a `tokio::task::JoinSet`, all at once, so the writer group-commits them.
+  3. Await the set.
+- **Outcomes:**
+  - `Ok` with `Applied::DatabaseExpired { database, epoch, expires_at }` → `tracing::info!(database = %database, epoch = epoch.get(), %expires_at, "database expired")`;
+  - `Ok` with a rejection (`NotExpired` after an extension, or `UnknownDatabase` after a drop) → debug, skip;
+  - `Err(SubmitError::Refused(_))` → debug, skip;
+  - `Err(SubmitError::Storage(_))` → warn, and retry at the next sweep;
+  - `Err(SubmitError::Stopped)` → end the task.
+- No settle window applies: expiry doesn't depend on leases.
+
+### 3.3a The primary flushes before it deletes a dropped database (ADR-0041 point 4)
+
+- **`src/changes/mod.rs`:** add a method to `ChangeStreams`.
 
   ```rust
-  for database in state.expired_databases(now).into_iter().take(MAX_EXPIRIES_PER_SWEEP)
+  /// Waits until every change stream of `database` has delivered everything acknowledged, up to
+  /// the copy's current end, or until `limit` passes. An archive puts its open segment at once,
+  /// whatever its `segment_interval_ms`.
+  pub async fn flush_database(&self, database: &DatabaseName, limit: Duration) -> Flushed;
+
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub enum Flushed { Delivered, TimedOut }
   ```
 
-  submit `Action::ExpireDatabase { name }`. On `Applied::DatabaseExpired { database, epoch, expires_at }`, log `tracing::info!(database = %database, epoch = epoch.get(), %expires_at, "database expired")`. A rejection (`NotExpired` after an extension) is ignored; a submit error returns, as today's do.
-- No settle window applies: expiry doesn't depend on leases.
+  Implement it like `await_caught_up`, restricted to the database's pumps, with a "cut now" signal to the archive sink's pacing. Look at how `stop(flush)` drains pumps at shutdown and reuse that path. A database with no change streams returns `Delivered` at once.
+- **`src/data/lease.rs`:** add `const DROP_FLUSH_LIMIT: Duration = Duration::from_secs(30);`. In the renewal loop's `missing_database` branch:
+
+  ```rust
+  if node.forget(&database, epoch) {
+      // Serving has stopped; flush what the copy acknowledged, then delete it.
+      match node.change_streams().flush_database(&database, DROP_FLUSH_LIMIT).await {
+          Flushed::Delivered => tracing::info!(database = %database, "flushed the dropped database's change streams"),
+          Flushed::TimedOut => tracing::warn!(database = %database, "the dropped database's change streams didn't catch up in time; its archive holds it as of its last archived segment"),
+      }
+      discard(node, &database).await;
+  }
+  ```
+
+  `discard_if_dropped`, the follower path, is unchanged: followers run no change streams.
+- Update `data::lease`'s module doc ("Dropped databases"), and the daemon README's `db drop` and archive sections, to say what the flush keeps and what's lost without it.
+
+### 3.3b A restore's expiry comes after the restore (ADR-0041 point 10)
+
+`db restore --expires-in` or `--expires-at` does three things in order:
+
+1. it creates the database without an expiry;
+2. after `Restore` returns, it calls `update_database` with the expiry;
+3. on failure, it prints `warning: the database was restored without its expiry: <reason>`, then `hint: fleetringd db set-expiry <database> --expires-in <d>`, and exits 1.
+
+Don't send the expiry with `CreateDatabaseWithMetadata` for a restore.
+
+### 3.3c This build reports `expiry`
+
+Delete `NOT_YET_REPORTED` from `src/software.rs`, so `running()` reports every feature in `Feature::ALL` again. Restore the test's name and its assertion that every feature is reported.
 
 ### 3.4 Client and CLI
 
@@ -699,10 +800,23 @@ Phase 3's part of [Protocol](#protocol-all-phases). `DatabaseMetadata.expires_at
 - `extending_an_expiry_keeps_the_database`
 - `clearing_an_expiry_keeps_the_database`
 - `the_sweep_expires_at_most_64_databases_per_second`
+- `a_refused_expiry_does_not_stop_the_sweep`: make one database's `ExpireDatabase` fail screening, for example by joining a member without the feature after the first expiry. The sweep goes on, and expires the next database once the member is removed.
+- `expiries_do_not_delay_promotion_notices`: 64 databases due at once, while a promotion is in progress; the candidate's notice arrives within one notify interval.
+- `a_duration_resolves_against_the_control_planes_time_when_it_is_ahead`: `State::now()` 5 min ahead of the service clock; `expires_in` 2 min is accepted, and lands 2 min after `State::now()`.
+- `expiry_passed_is_retryable`: unit test of `rejection_status`.
 
 **`tests/database.rs`:**
 
 - `an_expired_databases_replicas_delete_their_copies`: like the existing drop test; the data directories disappear within the renewal interval.
+
+**`tests/durability/archive.rs`:**
+
+- `a_dropped_databases_last_writes_reach_its_archive`: `segment_interval_ms` 1 h; write, drop at once, then restore from the archive; the last write is there.
+- `a_flush_that_times_out_still_deletes_the_copy`: a store that hangs on `put`; the copy is deleted after `DROP_FLUSH_LIMIT`, made overridable in tests, and the warning is logged.
+
+**`tests/durability/restore.rs`:**
+
+- `a_short_expiry_on_restore_is_set_only_after_the_restore`: `--expires-in 1m` on a restore that takes longer, using a paused clock; the restore completes, and the expiry is set from the moment it returned.
 
 **Simulation:**
 
@@ -715,7 +829,12 @@ Phase 3's part of [Protocol](#protocol-all-phases). `DatabaseMetadata.expires_at
 
 ### Phase 3 acceptance
 
-Criterion 3 proven end to end. The lexicon and the daemon README describe expiry, including its dev-mode note and clock-skew caveat.
+- Criterion 3 is proven end to end.
+- `fleetringd upgrade --software` lists `expiry`; it doesn't before this phase.
+- The lexicon and the daemon README describe expiry, including:
+  - the dev-mode note;
+  - the clock-skew caveat: early by the largest lead any control node ever had;
+  - what the final flush keeps, and that without an archive an expiry loses everything.
 
 ---
 
@@ -864,11 +983,15 @@ Depends on phase 2. Parallel with 3 and 4.
   pub fn decode_metadata(bytes: &[u8]) -> Result<ArchivedMetadata, FormatError>;  // checks `format` first, like parse_versioned, against METADATA_FORMAT
   ```
 
-- **`src/durability/keys.rs`:**
-  - `const METADATA: &str = "metadata.json"`;
-  - `ArchiveKeys::metadata(&self, id: &str) -> String`;
-  - `SnapshotObject::Metadata`, recognized by `parse_snapshot_key`;
-  - the module doc's key table gains the line.
+- **`src/durability/keys.rs`.** The object lives *outside* the database's prefix, so 0.5.0, which lists only `<prefix>/<db>/`, never sees it (ADR-0041 point 10):
+  - `const METADATA_DIR: &str = ".metadata";`
+  - `ArchiveKeys` keeps the store prefix it was built with, and gains:
+    - `pub fn metadata_objects(&self) -> String`, which returns `<prefix>/.metadata/<db>/`, or `.metadata/<db>/` for an empty prefix;
+    - `pub fn metadata(&self, id: &str, checksum: &str) -> String`, which returns `<metadata_objects><id>_<checksum>.json`, where `checksum` is 32 lowercase hex digits;
+    - `pub fn parse_metadata_key(&self, key: &str) -> Option<(String, String)>`, which returns the snapshot ID and the checksum, or `None` for anything else.
+  - `parse_snapshot_key` doesn't change.
+  - The module doc's key table gains the line, and says why the object sits outside the prefix.
+  - Add a unit test: `no_database_directory_is_named_like_the_metadata_directory`. `layout::database_dir` never emits `.`, so `.metadata` can't be a database.
 
 ### 5.2 Writing it
 
@@ -886,23 +1009,30 @@ Depends on phase 2. Parallel with 3 and 4.
   - `ControlMetadata` in `src/replication/archive.rs`, or wherever the archive sink is built, calls `Locate` with the node's control client and converts `Placement.metadata`;
   - `NoMetadata`, for tests and for configurations without a control plane.
 - **`src/durability/archive.rs`**, where the `SnapshotDescriptor` is built (around line 542): after the chunks and before the descriptor, fetch the metadata.
-  - `Ok(Some(m))` → put `metadata.json`;
+  - `Ok(Some(m))` → `let bytes = encode_metadata(&m);`, then put `keys.metadata(&id, &checksum_hex(&bytes))`;
   - `Ok(None)` → nothing;
   - `Err(e)` → `tracing::warn!(database, error = %e, "the snapshot is archived without its database's metadata; the next snapshot carries it")`, and nothing.
-- **`src/durability/retention.rs`:** a snapshot's metadata object is deleted with its chunks, after its descriptor.
-- **`src/durability/listing.rs`:** count `Metadata` objects per snapshot. They are neither chunks nor damaged. `SnapshotEntry` gains `pub metadata: bool`.
+- **`src/durability/listing.rs`:**
+  - `Listing::read` also lists `keys.metadata_objects()` and parses each key with `parse_metadata_key`;
+  - `SnapshotEntry` gains `pub metadata: Option<MetadataEntry { key: String, checksum: String }>`;
+  - a metadata object whose snapshot ID isn't in the listing goes into a new `Listing::orphaned_metadata: Vec<String>`;
+  - unparsable keys under the metadata prefix go into `damaged`, as under the database's prefix.
+- **`src/durability/retention.rs`:**
+  - deleting a snapshot deletes its metadata object last: descriptor, then chunks, then metadata;
+  - retention also deletes each `orphaned_metadata` key whose snapshot ID's position is older than the oldest kept complete snapshot's. The same rule as incomplete snapshots, so an upload still in progress during a failover is never touched.
 
 ### 5.3 Restoring it
 
-- `src/durability/restore.rs`: after choosing the base snapshot, if it has metadata, read and decode it; a damaged one is a warning, not a failure. `Restored` gains `pub metadata: Option<ArchivedMetadata>`.
+- `src/durability/restore.rs`: after choosing the base snapshot, if it has a metadata object, read it, check its XXH3-128 against the checksum in its name, and decode it. A mismatch or a decode error is a warning ("the archived metadata is damaged; restoring without it"), not a failure. `Restored` gains `pub metadata: Option<ArchivedMetadata>`.
 - `Database.Restore` fills `RestoreResponse.archived_metadata`, and `DescribeArchive` fills `ArchivedSnapshot.metadata`.
 - **The offline `archive restore`** writes `metadata.json`, the same bytes, beside the restored database file in its output directory.
 - **`Client::restore_database`** returns the archived metadata. `db restore`:
-  1. builds the description and labels from the archive, with each `--description` or `--label` flag winning field by field;
-  2. if the result differs from what the creation set, calls `update_database` once;
-  3. never copies `expires_at`;
-  4. prints `archived creator: <name>` in its report when the archive names one;
-  5. on `FAILED_PRECONDITION` for the `metadata` feature, or `UNIMPLEMENTED`, prints `warning: the archived description and labels weren't restored: <reason>` and exits 0, since the data restored.
+  1. builds the labels from the archive, with each `--label` flag winning per key;
+  2. **takes the archived description only if no `--description` was given, and sends it as `DescriptionChange::SetWithoutAuthor`** (`set_description_without_author`), so it records no author and every reader treats it as untrusted. A `--description` given to `db restore` was set at creation and is attributed to the caller as usual;
+  3. calls `update_database` once, if anything is left to set;
+  4. never copies `expires_at`; phase 3's rule sets any new expiry after this;
+  5. prints, in its report, `archived description by: <name> (the archive's claim; not recorded)` and `archived creator: <name> (the archive's claim; not recorded)` when the archive names them. The archived description is printed with `report::render_text`'s block rule;
+  6. on `FAILED_PRECONDITION` for the `metadata` feature, or `UNIMPLEMENTED`, prints `warning: the archived description and labels weren't restored: <reason>` and exits 0, since the data restored.
 - **`db archive show`** prints `metadata` per snapshot (`yes` or `no`).
 
 ### 5.4 Tests
@@ -910,25 +1040,30 @@ Depends on phase 2. Parallel with 3 and 4.
 **Unit:**
 
 - `format.rs`: `metadata_round_trips_and_refuses_unknown_fields_and_newer_formats`.
-- `keys.rs`: `metadata_keys_parse_as_snapshot_objects`.
-- `listing.rs`: `a_metadata_object_is_neither_a_chunk_nor_damaged`.
+- `keys.rs`: `metadata_keys_round_trip_with_their_checksum`, and `no_database_directory_is_named_like_the_metadata_directory`.
+- `listing.rs`: `metadata_objects_attach_to_their_snapshots_and_orphans_are_listed`.
+- `retention.rs`: `a_deleted_snapshots_metadata_goes_last`, and `old_orphaned_metadata_is_deleted_and_recent_orphans_are_kept`.
 
 **`tests/durability/archive.rs`:**
 
 - `a_snapshot_of_a_database_with_metadata_archives_it_before_its_descriptor`: record the order of `put` calls on the `MemoryStore`.
+- `the_database_prefix_holds_no_metadata_objects`: a listing of `<prefix>/<db>/` alone, which is what 0.5.0 reads, parses every key as a snapshot object or a segment, with nothing damaged.
 - `a_snapshot_without_metadata_writes_no_metadata_object`
 - `a_failed_metadata_lookup_still_completes_the_snapshot`
 - `retention_deletes_a_snapshots_metadata_with_it`
 
 **`tests/durability/restore.rs`:**
 
-- `restore_applies_archived_description_and_labels_but_not_the_expiry`: the creator is the restoring principal, and there's no expiry.
+- `restore_applies_archived_description_and_labels_but_not_the_expiry`: the creator is the restoring principal, there's no expiry, and the description has no author.
+- `a_restored_description_is_never_attributed`: the archive says `description_by: "ops"` and the restorer is `ops`; afterwards `description_by` is unset. Phase 6's MCP renders it as untrusted; add an MCP assertion there.
+- `a_metadata_object_that_fails_its_checksum_is_ignored`: flip a byte; the restore succeeds without metadata and warns.
 - `restore_flags_win_over_the_archive`
 - `offline_restore_writes_metadata_beside_the_database`
 
 ### Phase 5 acceptance
 
-Criterion 2's archive-restore part is proven. The daemon README's archive section names `metadata.json`.
+- Criterion 2's archive-restore part is proven.
+- The daemon README's archive section describes the `.metadata/` objects, that a checksum guards against damage but not tampering, and that restored descriptions are untrusted.
 
 ---
 
@@ -944,7 +1079,7 @@ Depends on phases 3 and 4. Phase 5 is independent.
   rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io", "macros"] }
   ```
 
-- `crates/fleetringd/Cargo.toml`: `rmcp.workspace = true`, and `base64` if it isn't in the tree.
+- `crates/fleetringd/Cargo.toml`: `rmcp.workspace = true`, and `base64` as a direct dependency. The pin drops rmcp's default features, `base64` among them, so `fleetringd` can't rely on getting it through rmcp.
 - Use `rmcp::schemars` (the re-export), not a separate `schemars` dependency, so the versions can't skew.
 - Run `cargo deny check`. The new crates are Apache-2.0 or MIT; `multiple-versions` may warn, which is allowed.
 - Confirm `cargo +1.89 check -p fleetringd` passes.
@@ -1049,6 +1184,7 @@ Depends on phases 3 and 4. Phase 5 is independent.
   7. `db_drop` with `confirm`.
   8. Each of these returns `is_error` with `permission_denied`: `db_create agent-420-x`, `db_create notes`, `query notes`, `exec notes`, `db_drop notes` (with `confirm`), `db_show notes`.
 - `a_description_written_by_another_principal_is_marked_untrusted`: the admin certificate sets the description on `agent-42-shared`; the agent's `db_show` shows `untrusted: true` and the notice.
+- `a_restored_description_is_untrusted_even_for_the_restorer`: the agent restores `agent-42-old` (through `Client::restore_database` in the test) from an archive whose metadata claims `description_by: agent-42`; its own `db_show` shows `written_by: null, untrusted: true`.
 - `read_only_hides_the_tools_that_write`
 - `db_drop_needs_the_name_confirmed`
 - `exec_runs_one_statement`: `"INSERT …; INSERT …"` is an error, and nothing is written.
@@ -1188,10 +1324,21 @@ Reply "ADR-0041 as recommended" to take all six. Otherwise, give the number and 
 ## Open risks
 
 - **`rmcp` churn.** It has had three majors in about a year. The exact pin and the one-module boundary contain it, and a bump is its own PR with the golden `tools.json` reviewed.
-- **Clock jumps on the control node** expire databases early. This is documented; archives are the recovery.
+- **Clock leads on any control node** expire databases early, by the largest lead any stamping node ever had, since `State::now()` never moves back. This is documented. Archives are the recovery, as of what the final flush or the last segment reached; without an archive there is none.
+- **The final flush holds a dropped copy for up to 30 s.** A creation under the same name on the same node during that window meets the existing past-incarnation handling.
 - **Control-state growth** with many labelled databases: at most about 13 KiB each, typically a few hundred bytes. FR-063's control-snapshot metrics show it.
 - **Models may follow instructions in data despite the marking.** The marking makes the boundary explicit. The real limit is the token's scope, which the quickstart keeps to the agent's own prefix.
 
 ## Progress
 
 - 2026-11-04: ADR-0041 (Proposed) and this plan written on the `agent-kit` branch. No code yet.
+- 2026-11-04: revised after an independent review, alongside ADR-0041's "Revisions before acceptance":
+  - restored descriptions have no author;
+  - the primary flushes before it deletes a dropped database (phase 3);
+  - `expiry` is reported only from phase 3;
+  - format characters are refused, and descriptions render as indented blocks;
+  - the metadata object moved under `.metadata/`, with a checksum in its name;
+  - the sweep is its own task;
+  - durations resolve against the control plane's time;
+  - a restore's expiry is set afterwards;
+  - `SECURITY.md` notes that principal names are visible.
