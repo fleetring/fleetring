@@ -578,7 +578,7 @@
       "component": "fleetringd",
       "area": "access",
       "title": "Database expiry",
-      "description": "A database can carry an expiry, set with db create --expires-in or db set-expiry, after which the control plane drops it, and its primary first flushes the last writes to its archive.",
+      "description": "A database can carry an expiry, set with db create --expires-in or db edit, after which the control plane drops it, and its primary first flushes the last writes to its archive.",
       "status": "built",
       "since": "0.6.0",
       "ticket": "FR-070",
