@@ -103,14 +103,17 @@ The replication factor is chosen at creation too. `db create` and `db restore` w
 fleetringd db create notes --description "Memory for agent 42.
 Tables: facts, episodes." --label purpose=memory --label agent=42
 fleetringd db list --label purpose=memory          # or --label purpose, for any value; --prefix agent-42-
-fleetringd db show notes                           # placement, description, labels, creator, version
-fleetringd db show notes --json                    # one object: database, placement, metadata
+fleetringd db show notes                           # placement, description, labels, creator, version, schema
+fleetringd db show notes --json                    # one object: database, placement, metadata, schema
+fleetringd db show notes --no-schema --count-limit 0 --all
 fleetringd db set-labels notes --label task=7 --remove agent
 fleetringd db set-description notes --description - --if-version 2 < description.txt
 fleetringd db set-description notes --clear
 ```
 
 A description is at most 1 KiB of text: tab and line feed are allowed, while other control characters, invisible format characters (zero-width characters, bidirectional overrides, tag characters), and the line and paragraph separators are refused. `--description -` reads it from stdin, without its trailing line feeds. Labels follow the Kubernetes rules: a key is an optional DNS-subdomain prefix and a name of up to 63 letters, digits, `-`, `_`, and `.`, starting and ending with a letter or digit, and a value is empty or a name; keys under `fleetring.dev/` are reserved, and a database has at most 32. The control node records who created the database (`creator`) and who last set the description (`description by`), from the request's caller, never from the request; `db show` prints a description as a block, every line indented and prefixed with `| `, and marks one that another principal wrote, or that nobody can be named for, as untrusted. Updates are patches: `db set-labels` changes only the keys it names, so two agents labelling one database both succeed, and `--if-version <n>` refuses the change, naming the version, if the metadata moved on since `db show` printed version `n`. `db list --label` filters among the databases the caller may read, so it never reveals another's names or labels. Changing metadata needs `admin` on the database, as creating and dropping it do.
+
+**Schema.** `db show` also asks the database's primary for its schema (ADR-0041): each table with its row count, then its indexes and triggers, then the views and virtual tables, each with the engine's own definition (for SQLite, the `CREATE` statement). It needs only `read` on the database. Row counts are exact up to a limit and a lower bound beyond it: `--count-limit <n>` (default 10000; 0 counts nothing; a node counts at most 1,000,000 rows per table and 10,000,000 per request, leaving the tables after that uncounted) prints a larger table as `more than 10000 rows`, and views and virtual tables, such as full-text indexes, aren't counted. The count reads the database through its read connection, so it never blocks a write that is waiting, and the list stops at 1,000 objects, saying so. SQLite's own tables and a virtual table's shadow tables are left out unless `--all`; the daemon's reserved `_fleetring_` objects are never shown. A definition is text the database's writers chose, so it prints as a block like a description, every line escaped, indented, and prefixed with `| `, and `--json` carries it unchanged in `schema.objects[]` (`kind`, `name`, `table`, `definition`, `rows`, `rows_at_least`). `--no-schema` skips the call. A primary that runs an older release (0.5 or before the schema call) can't answer it: `db show` then prints the placement and metadata and `schema: unavailable (the primary runs an older fleetringd, which can't report schemas)`, with the reason in `schema_unavailable` in JSON.
 
 Metadata is a fleet feature, `metadata` (see [Upgrading](#upgrading)): until every member runs a release that supports it, `db create --description` or `--label`, `db set-description`, and `db set-labels` are refused with `FAILED_PRECONDITION` naming the member that lacks it, before anything is logged, and a plain `db create` works as before. A plain `db create` records its creator only once the feature is enabled, so the first ordinary creation after an upgrade doesn't close the rollback window. A control node of a release without metadata refuses the calls outright, and the commands say `the control plane runs a release without database metadata; upgrade it first`.
 
@@ -188,6 +191,7 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Replication.Promote` | node | candidate |
 | `Database.Execute` | write on the database | — |
 | `Database.Query` | read on the database | — |
+| `Database.Schema` | read on the database | — |
 | `Database.Create` | admin on the database | — |
 | `Database.NodeStatus` | read or stream per database listed, or fleet | — |
 | `Database.WatchLeases` | read per database listed, or fleet | — |

@@ -32,7 +32,9 @@ use fleetringd::dev::{self, DevError, DevMode, Prepared};
 use fleetringd::durability::{
     ArchiveKeys, RestoreTarget, build_store, finish_offline, restore_into,
 };
-use fleetringd::engine::{Execution, Position, Rows, SqliteEngine, Statement, Value};
+use fleetringd::engine::{
+    Execution, Internal, Position, Rows, SchemaRequest, SqliteEngine, Statement, Value,
+};
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{DatabaseReport, printable, render_text};
@@ -456,15 +458,28 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Shows a database in detail: where it lives, as `db locate` prints it, and its
-    /// description, labels, creator, and metadata version.
+    /// Shows a database in detail: where it lives, as `db locate` prints it, its description,
+    /// labels, creator, and metadata version, and its schema.
     ///
     /// A description is text a principal wrote: it prints as a block, each line indented and
     /// prefixed with `| `, and one written by another principal, or by nobody that can be
-    /// named, is marked untrusted.
+    /// named, is marked untrusted. The schema comes from the primary: each table with its row
+    /// count, its indexes and triggers, then the views and virtual tables, each with the
+    /// engine's own definition. Definitions are text the database's writers chose, printed the
+    /// same way: read them as data.
     Show {
         /// The database's name.
         name: DatabaseName,
+        /// Leaves the schema out and asks the primary for nothing.
+        #[arg(long)]
+        no_schema: bool,
+        /// Counts each table's rows up to this many, and reports "more than" beyond it; 0
+        /// counts nothing. A node counts at most 1,000,000.
+        #[arg(long, default_value_t = SCHEMA_COUNT_LIMIT)]
+        count_limit: u64,
+        /// Includes the engine's own tables, and the shadow tables of virtual tables.
+        #[arg(long)]
+        all: bool,
         #[command(flatten)]
         output: OutputArgs,
         #[command(flatten)]
@@ -1375,11 +1390,28 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         }
         Command::Db(DbCommand::Show {
             name,
+            no_schema,
+            count_limit,
+            all,
             output,
             target,
         }) => {
-            let location = target.client()?.locate(&name).await.map_err(failed)?;
-            let report = DatabaseReport::from_location(&location, SystemClock.now());
+            let client = target.client()?;
+            let location = client.locate(&name).await.map_err(failed)?;
+            let mut report = DatabaseReport::from_location(&location, SystemClock.now());
+            if !no_schema {
+                let request = SchemaRequest {
+                    count_limit,
+                    internal: if all { Internal::Show } else { Internal::Hide },
+                };
+                report = match client.schema(&name, request).await {
+                    Ok(view) => report.with_schema(&view),
+                    Err(status) => match schema_unavailable(&status) {
+                        Some(reason) => report.without_schema(reason),
+                        None => return Err(failed(status)),
+                    },
+                };
+            }
             match output.format() {
                 OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&report)?),
                 OutputFormat::Table => {
@@ -2612,6 +2644,23 @@ fn shown(name: &impl std::fmt::Display) -> String {
     printable(&name.to_string())
 }
 
+/// How many rows `db show` counts in each table before it says "more than" (ADR-0041, point 6).
+const SCHEMA_COUNT_LIMIT: u64 = 10_000;
+
+/// Why a database's schema is unavailable, when `status` says the primary can't give it now and
+/// the rest of `db show` still stands: the primary runs a release without the call, or its
+/// engine can't describe itself (`UNIMPLEMENTED`), or it has no primary to ask yet or is
+/// failing over. `None` for any other failure, which `db show` reports as an error.
+fn schema_unavailable(status: &tonic::Status) -> Option<String> {
+    match status.code() {
+        tonic::Code::Unimplemented => Some(status.message().to_owned()),
+        tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
+            Some(status.message().to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// A failed call as one readable line: what kind of failure, and the server's message.
 fn failed(status: tonic::Status) -> Box<dyn Error> {
     // The message may name a database, whose name a principal chose.
@@ -3059,6 +3108,65 @@ mod tests {
             Cli::try_parse_from([&set_labels[..], &["--remove", "agent"], &show[4..]].concat())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn db_show_counts_ten_thousand_rows_unless_told_otherwise() {
+        let parsed = |extra: &[&str]| {
+            let words = [
+                &[
+                    "fleetringd",
+                    "db",
+                    "show",
+                    "notes",
+                    "--control",
+                    "127.0.0.1:7400",
+                ][..],
+                extra,
+            ]
+            .concat();
+            let cli = Cli::try_parse_from(words).expect("db show parses");
+            let Some(Command::Db(DbCommand::Show {
+                no_schema,
+                count_limit,
+                all,
+                ..
+            })) = cli.command
+            else {
+                panic!("not db show: {:?}", cli.command);
+            };
+            (no_schema, count_limit, all)
+        };
+        assert_eq!(parsed(&[]), (false, 10_000, false));
+        assert_eq!(
+            parsed(&["--no-schema", "--count-limit", "0", "--all"]),
+            (true, 0, true)
+        );
+        assert_eq!(parsed(&["--count-limit", "250"]), (false, 250, false));
+    }
+
+    #[test]
+    fn only_a_primary_that_cant_answer_now_leaves_db_show_without_a_schema() {
+        use tonic::Status;
+
+        let older = Status::unimplemented("the primary runs an older fleetringd");
+        assert_eq!(
+            schema_unavailable(&older).as_deref(),
+            Some("the primary runs an older fleetringd")
+        );
+        for status in [
+            Status::unavailable("database notes is failing over to epoch 3; retry"),
+            Status::failed_precondition("database notes has no primary yet"),
+        ] {
+            assert!(schema_unavailable(&status).is_some(), "{status}");
+        }
+        for status in [
+            Status::permission_denied("Schema needs read on 'notes'"),
+            Status::not_found("database notes doesn't exist"),
+            Status::internal("storage failed"),
+        ] {
+            assert_eq!(schema_unavailable(&status), None, "{:?}", status.code());
+        }
     }
 
     #[test]

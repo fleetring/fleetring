@@ -7,13 +7,16 @@ use fleetring_proto::v1::{
     ArchivedSnapshot, ChangeSinkStatus, CreateRequest, CreateResponse, DescribeArchiveRequest,
     DescribeArchiveResponse, ExecuteRequest, ExecuteResponse, NodeStatusRequest,
     NodeStatusResponse, QueryRequest, QueryResponse, RestorePoint, RestoreRequest, RestoreResponse,
-    VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest, VerifyResponse, WatchLeasesRequest,
+    SchemaRequest, SchemaResponse, VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest,
+    VerifyResponse, WatchLeasesRequest,
 };
 use tonic::{Code, Request, Response, Status};
 
 use crate::auth::{Action, authorized, require_database};
 use crate::changes::MarkHome;
-use crate::data::convert::{parse, rows_to_proto, statement};
+use crate::data::convert::{
+    parse, rows_to_proto, schema_request_from_proto, schema_to_proto, statement,
+};
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
 use crate::data::redirect::primary_hint;
@@ -89,6 +92,29 @@ impl DatabaseService {
             .map_err(|error| database_status(&error))?;
         Ok(Response::new(rows_to_proto(rows)))
     }
+
+    async fn run_schema(
+        &self,
+        request: Request<SchemaRequest>,
+    ) -> Result<Response<SchemaResponse>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let schema_request = schema_request_from_proto(request.get_ref());
+        let admitted = self.node.route(&name).await?;
+        let lease = admitted.lease();
+        let schema = self
+            .node
+            .registry()
+            .schema(&name, schema_request)
+            .await
+            .map_err(|error| database_status(&error))?;
+        Ok(Response::new(schema_to_proto(
+            schema,
+            self.node.replication().engine().kind(),
+            self.node.id(),
+            lease.epoch,
+        )))
+    }
 }
 
 /// How an `Execute` that failed with `status` is counted: `redirected` to the primary,
@@ -149,6 +175,7 @@ fn engine_status(error: &EngineError) -> Status {
         }
         EngineError::NotFound => Status::not_found(message),
         EngineError::AlreadyExists => Status::already_exists(message),
+        EngineError::Unsupported { .. } => Status::unimplemented(message),
         _ => Status::internal(message),
     }
 }
@@ -200,6 +227,13 @@ impl Database for DatabaseService {
             Err(_) => metrics.query("failed", None),
         }
         result
+    }
+
+    async fn schema(
+        &self,
+        request: Request<SchemaRequest>,
+    ) -> Result<Response<SchemaResponse>, Status> {
+        self.run_schema(request).await
     }
 
     async fn create(
@@ -432,5 +466,38 @@ impl Database for DatabaseService {
                 .unwrap_or_default(),
             chain_hash: verified.hash.as_bytes().to_vec(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{Internal, SchemaRequest};
+
+    #[test]
+    fn an_engine_that_cant_describe_itself_answers_unimplemented() {
+        let status = database_status(&DatabaseError::Engine(EngineError::Unsupported {
+            what: "schema",
+        }));
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.message(), "the engine doesn't support schema");
+    }
+
+    #[test]
+    fn the_default_engine_schema_is_unsupported() {
+        use crate::engine::{DatabaseEngine as _, MemoryEngine, OpenMode};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut database = MemoryEngine::default()
+            .open(dir.path(), OpenMode::Create)
+            .expect("opens");
+        let request = SchemaRequest {
+            count_limit: 10,
+            internal: Internal::Hide,
+        };
+        assert!(matches!(
+            database.schema(&request),
+            Err(EngineError::Unsupported { what: "schema" })
+        ));
     }
 }

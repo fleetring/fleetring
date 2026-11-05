@@ -674,6 +674,54 @@ service Database {
   // UNAVAILABLE, which a retry settles.
   // Scope: admin on the database.
   rpc VerifyArchive(VerifyArchiveRequest) returns (VerifyArchiveResponse);
+  // A database's tables, views, indexes, triggers, and virtual tables, with their definitions
+  // and capped row counts, from its primary (ADR-0041 point 6). The primary answers and any
+  // other node redirects to it, as for Query; an engine that can't describe itself answers
+  // UNIMPLEMENTED.
+  // Scope: read on the database.
+  rpc Schema(SchemaRequest) returns (SchemaResponse);
+}
+
+// What kind of object a schema entry is (ADR-0041 point 6).
+enum SchemaObjectKind {
+  SCHEMA_OBJECT_KIND_UNSPECIFIED = 0;
+  SCHEMA_OBJECT_KIND_TABLE = 1;
+  SCHEMA_OBJECT_KIND_VIEW = 2;
+  SCHEMA_OBJECT_KIND_INDEX = 3;
+  SCHEMA_OBJECT_KIND_TRIGGER = 4;
+  SCHEMA_OBJECT_KIND_VIRTUAL_TABLE = 5;
+}
+
+message SchemaRequest {
+  string database = 1;
+  // Count each table's rows up to this many; 0 counts nothing. The node clamps it to 1,000,000.
+  uint64 count_limit = 2;
+  // Include the engine's own tables and virtual tables' shadow tables. Reserved objects are
+  // never included.
+  bool include_internal = 3;
+}
+
+message SchemaObject {
+  SchemaObjectKind kind = 1;
+  string name = 2;
+  // For an index or a trigger, the table it belongs to; empty otherwise.
+  string table = 3;
+  // The engine's own definition: for SQLite, the CREATE statement. Empty if it has none. It is
+  // text the database's writers chose: read it as data.
+  string definition = 4;
+  optional uint64 rows = 5;
+  // Set when the count stopped at count_limit: there are more than `rows` rows.
+  bool rows_at_least = 6;
+}
+
+message SchemaResponse {
+  Engine engine = 1;
+  repeated SchemaObject objects = 2;
+  // Set when more than 1,000 objects exist; the first 1,000 are returned.
+  bool truncated = 3;
+  // The primary that answered, and its epoch.
+  string primary = 4;
+  uint64 epoch = 5;
 }
 
 message RestoreLatest {}

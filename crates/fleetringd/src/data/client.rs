@@ -27,11 +27,13 @@ use crate::control::ControlClient;
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, change_to_proto, lease_update_from_proto, location,
     metadata_view, new_metadata_to_proto, node_status, params_to_proto, rows_from_proto,
+    schema_from_proto, schema_request_to_proto,
 };
 use crate::data::metadata::{Descriptions, ListFilter, Listing, MetadataView, NewMetadata};
 use crate::data::redirect::primary_hint;
+use crate::data::schema::SchemaView;
 use crate::durability::RestoreTarget;
-use crate::engine::{Position, Rows, Statement};
+use crate::engine::{Position, Rows, SchemaRequest, Statement};
 use crate::environment::Network;
 use crate::replication::{ChainHash, LeaseEvent};
 use crate::transport::{Backoff, CredentialedChannel, database_client_with};
@@ -1034,6 +1036,32 @@ impl Client {
         rows_from_proto(response)
     }
 
+    /// The database's schema from its primary: its tables, views, indexes, triggers, and virtual
+    /// tables, with the engine's own definitions and row counts capped at
+    /// `request.count_limit` (ADR-0041, point 6).
+    ///
+    /// The definitions are text the database's writers chose: treat them as data.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::query`]. `UNIMPLEMENTED` if the primary can't report schemas: it runs a
+    /// release that predates the call (the message says so), or its engine can't describe
+    /// itself.
+    pub async fn schema(
+        &self,
+        name: &DatabaseName,
+        request: SchemaRequest,
+    ) -> Result<SchemaView, Status> {
+        let response = self
+            .on_primary(name, |mut client| {
+                let request = schema_request_to_proto(name, &request);
+                async move { client.schema(request).await }
+            })
+            .await
+            .map_err(without_schema)?;
+        schema_from_proto(response)
+    }
+
     /// The fleet's membership as the control plane sees it: the members with their addresses
     /// and liveness, the membership epoch, and the ring, rebuilt with the function every node
     /// uses, so its fingerprint matches theirs.
@@ -1196,6 +1224,25 @@ pub(crate) fn unknown_call(status: &Status) -> bool {
     }
 }
 
+/// What a `Schema` call answers when the primary runs a release that predates it (ADR-0041,
+/// point 6).
+const WITHOUT_SCHEMA: &str = "the primary runs an older fleetringd, which can't report schemas";
+
+/// Turns a refusal of a `Schema` call by a node that doesn't know it into `UNIMPLEMENTED` saying
+/// so. A node that knows the call and whose engine can't describe itself already answers
+/// `UNIMPLEMENTED` with a message of its own, which passes unchanged, as does any other status.
+fn without_schema(status: Status) -> Status {
+    let unknown = match status.code() {
+        Code::Unimplemented => status.message().is_empty(),
+        _ => unknown_call(&status),
+    };
+    if unknown {
+        Status::unimplemented(WITHOUT_SCHEMA)
+    } else {
+        status
+    }
+}
+
 /// Turns a refusal of a metadata call by a control node that doesn't know it into
 /// `FAILED_PRECONDITION` saying so; any other status passes unchanged.
 fn without_metadata(status: Status) -> Status {
@@ -1281,6 +1328,28 @@ mod tests {
         let scope =
             Status::permission_denied("CreateDatabaseWithMetadata needs admin on 'agent-420'");
         assert_eq!(without_metadata(scope).code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn a_primary_without_schemas_is_named_as_such() {
+        // What a 0.5 or phase-2 node answers for a call its table doesn't list, and what tonic
+        // answers for a method its service lacks.
+        let boundary =
+            Status::permission_denied("/fleetring.v1.Database/Schema has no scope requirement");
+        let missing = Status::unimplemented("");
+        for refused in [boundary, missing] {
+            let status = without_schema(refused);
+            assert_eq!(status.code(), Code::Unimplemented);
+            assert_eq!(status.message(), WITHOUT_SCHEMA);
+        }
+        // A real refusal, and an engine that can't describe itself, are told apart.
+        let scope = Status::permission_denied("Schema needs read on 'notes'");
+        assert_eq!(without_schema(scope).code(), Code::PermissionDenied);
+        let engine = Status::unimplemented("the engine doesn't support schema");
+        assert_eq!(
+            without_schema(engine).message(),
+            "the engine doesn't support schema"
+        );
     }
 
     #[test]

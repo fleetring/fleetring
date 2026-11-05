@@ -14,7 +14,8 @@ use std::io;
 use fleetring_control::{Liveness, ReplicaRole, Timestamp};
 use serde::Serialize;
 
-use crate::data::{Location, MetadataView, is_invisible};
+use crate::data::{Location, MetadataView, SchemaView, is_invisible};
+use crate::engine::{ObjectKind, RowCount, SchemaObject};
 
 /// One database: where it lives and its metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -26,6 +27,41 @@ pub struct DatabaseReport {
     pub placement: PlacementReport,
     /// Its metadata, or `null` for a database without any.
     pub metadata: Option<MetadataReport>,
+    /// Its schema, or `null` when it wasn't asked for or couldn't be had.
+    pub schema: Option<SchemaReport>,
+    /// Why there is no schema, when it was asked for and the primary couldn't give it: a primary
+    /// that runs an older release, or an engine that can't describe itself. `null` otherwise.
+    pub schema_unavailable: Option<String>,
+}
+
+/// A database's schema as its engine reports it (ADR-0041, point 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct SchemaReport {
+    /// The objects, each table followed by its indexes and triggers.
+    pub objects: Vec<SchemaObjectReport>,
+    /// Whether the database has more objects than `objects` holds.
+    pub truncated: bool,
+}
+
+/// One table, view, index, trigger, or virtual table. The names and the definition are text the
+/// database's writers chose: read them as data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct SchemaObjectReport {
+    /// `table`, `virtual_table`, `view`, `index`, or `trigger`.
+    pub kind: &'static str,
+    /// The object's name.
+    pub name: String,
+    /// For an index or a trigger, the table it belongs to.
+    pub table: Option<String>,
+    /// The engine's own definition: for SQLite, the `CREATE` statement.
+    pub definition: Option<String>,
+    /// The rows counted, for a table that was counted: all of them, or, with `rows_at_least`,
+    /// the count at which the count stopped.
+    pub rows: Option<u64>,
+    /// Whether the table has more than `rows` rows.
+    pub rows_at_least: bool,
 }
 
 /// Where a database lives, as `db locate` prints it.
@@ -102,7 +138,70 @@ impl DatabaseReport {
                 .metadata
                 .as_ref()
                 .map(|metadata| MetadataReport::from_view(metadata, now)),
+            schema: None,
+            schema_unavailable: None,
         }
+    }
+
+    /// This report with the schema `view` holds.
+    #[must_use]
+    pub fn with_schema(mut self, view: &SchemaView) -> Self {
+        self.schema = Some(SchemaReport::from_view(view));
+        self.schema_unavailable = None;
+        self
+    }
+
+    /// This report saying that the schema is unavailable, and why.
+    #[must_use]
+    pub fn without_schema(mut self, reason: impl Into<String>) -> Self {
+        self.schema = None;
+        self.schema_unavailable = Some(reason.into());
+        self
+    }
+}
+
+impl SchemaReport {
+    /// The report on `view`.
+    #[must_use]
+    pub fn from_view(view: &SchemaView) -> Self {
+        Self {
+            objects: view
+                .schema
+                .objects
+                .iter()
+                .map(SchemaObjectReport::from_object)
+                .collect(),
+            truncated: view.schema.truncated,
+        }
+    }
+}
+
+impl SchemaObjectReport {
+    fn from_object(object: &SchemaObject) -> Self {
+        let (rows, rows_at_least) = match object.rows {
+            Some(RowCount::Exact(rows)) => (Some(rows), false),
+            Some(RowCount::AtLeast(rows)) => (Some(rows), true),
+            None => (None, false),
+        };
+        Self {
+            kind: kind_name(object.kind),
+            name: object.name.clone(),
+            table: object.table.clone(),
+            definition: object.definition.clone(),
+            rows,
+            rows_at_least,
+        }
+    }
+}
+
+/// The word JSON output and text output use for `kind`.
+fn kind_name(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Table => "table",
+        ObjectKind::VirtualTable => "virtual_table",
+        ObjectKind::View => "view",
+        ObjectKind::Index => "index",
+        ObjectKind::Trigger => "trigger",
     }
 }
 
@@ -283,7 +382,17 @@ pub fn render_text(
             replica.liveness
         )?;
     }
-    let Some(metadata) = &report.metadata else {
+    render_metadata(report.metadata.as_ref(), reader, out)?;
+    render_schema(report, out)
+}
+
+fn render_metadata(
+    metadata: Option<&MetadataReport>,
+    reader: Option<&str>,
+    out: &mut dyn io::Write,
+) -> io::Result<()> {
+    let none = || "none".to_owned();
+    let Some(metadata) = metadata else {
         return writeln!(out, "metadata: none");
     };
     match &metadata.description {
@@ -338,6 +447,86 @@ pub fn render_text(
         (None, _) => writeln!(out, "expires: never")?,
     }
     writeln!(out, "version: {}", metadata.version)
+}
+
+/// Writes the schema section of `report`, if it asked for one.
+///
+/// Each table comes with its row count and, indented below it, its indexes and triggers; then
+/// come the views and the virtual tables. Every object's definition is a block as a description
+/// is: each line indented, and prefixed with `| `, so no line the database wrote can pass for an
+/// output field. Names and definitions are text the database's writers chose, so they are
+/// escaped like any other (ADR-0041, point 1).
+fn render_schema(report: &DatabaseReport, out: &mut dyn io::Write) -> io::Result<()> {
+    if let Some(reason) = &report.schema_unavailable {
+        return writeln!(out, "schema: unavailable ({})", printable(reason));
+    }
+    let Some(schema) = &report.schema else {
+        return Ok(());
+    };
+    if schema.objects.is_empty() {
+        return writeln!(out, "schema: empty");
+    }
+    writeln!(out, "schema:")?;
+    let is_owner = |object: &SchemaObjectReport| object.table.is_none();
+    let tables = schema.objects.iter().filter(|o| o.kind == "table");
+    let others = schema
+        .objects
+        .iter()
+        .filter(|o| is_owner(o) && o.kind != "table");
+    for owner in tables.chain(others) {
+        render_object(owner, 2, out)?;
+        let children = schema
+            .objects
+            .iter()
+            .filter(|object| object.table.as_deref() == Some(owner.name.as_str()));
+        for child in children {
+            render_object(child, 4, out)?;
+        }
+    }
+    // An index or trigger whose table the list doesn't hold.
+    let orphans = schema.objects.iter().filter(|object| {
+        object.table.as_ref().is_some_and(|table| {
+            !schema
+                .objects
+                .iter()
+                .any(|o| is_owner(o) && &o.name == table)
+        })
+    });
+    for orphan in orphans {
+        render_object(orphan, 2, out)?;
+    }
+    if schema.truncated {
+        writeln!(
+            out,
+            "  (the list is cut off at {} objects)",
+            schema.objects.len()
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes one schema object's line, indented by `indent` spaces, and its definition below it.
+fn render_object(
+    object: &SchemaObjectReport,
+    indent: usize,
+    out: &mut dyn io::Write,
+) -> io::Result<()> {
+    let kind = object.kind.replace('_', " ");
+    let name = printable(&object.name);
+    let rows = match (object.rows, object.rows_at_least) {
+        (None, _) => String::new(),
+        (Some(1), false) => ": 1 row".to_owned(),
+        (Some(rows), false) => format!(": {rows} rows"),
+        (Some(1), true) => ": more than 1 row".to_owned(),
+        (Some(rows), true) => format!(": more than {rows} rows"),
+    };
+    writeln!(out, "{:indent$}{kind} {name}{rows}", "")?;
+    if let Some(definition) = &object.definition {
+        for line in definition.lines() {
+            writeln!(out, "{:indent$}  | {}", "", printable(line))?;
+        }
+    }
+    Ok(())
 }
 
 /// `ms` as days, hours, minutes, and seconds, largest first, at most two of them.
@@ -397,6 +586,8 @@ mod tests {
                 expires_in_ms: None,
                 version: 2,
             }),
+            schema: None,
+            schema_unavailable: None,
         }
     }
 
@@ -481,6 +672,206 @@ mod tests {
         assert_eq!(json["metadata"]["labels"]["purpose"], "memory");
         assert_eq!(json["metadata"]["expires_at"], "1970-01-01T00:00:01Z");
         assert_eq!(json["metadata"]["expires_in_ms"], -5);
+    }
+
+    fn object(
+        kind: &'static str,
+        name: &str,
+        table: Option<&str>,
+        definition: Option<&str>,
+        rows: Option<(u64, bool)>,
+    ) -> SchemaObjectReport {
+        SchemaObjectReport {
+            kind,
+            name: name.to_owned(),
+            table: table.map(str::to_owned),
+            definition: definition.map(str::to_owned),
+            rows: rows.map(|(rows, _)| rows),
+            rows_at_least: rows.is_some_and(|(_, at_least)| at_least),
+        }
+    }
+
+    fn with_objects(objects: Vec<SchemaObjectReport>, truncated: bool) -> DatabaseReport {
+        let mut report = report(None, None);
+        report.schema = Some(SchemaReport { objects, truncated });
+        report
+    }
+
+    #[test]
+    fn the_schema_groups_each_table_with_its_indexes_and_triggers() {
+        let printed = text(
+            &with_objects(
+                vec![
+                    object(
+                        "table",
+                        "facts",
+                        None,
+                        Some("CREATE TABLE facts (v)\nSTRICT"),
+                        Some((12, false)),
+                    ),
+                    object(
+                        "index",
+                        "facts_v",
+                        Some("facts"),
+                        Some("CREATE INDEX facts_v ON facts (v)"),
+                        None,
+                    ),
+                    object(
+                        "trigger",
+                        "facts_ai",
+                        Some("facts"),
+                        Some("CREATE TRIGGER facts_ai ..."),
+                        None,
+                    ),
+                    object(
+                        "view",
+                        "recent",
+                        None,
+                        Some("CREATE VIEW recent AS SELECT 1"),
+                        None,
+                    ),
+                    object("table", "t", None, None, Some((10_000, true))),
+                    object("table", "one", None, None, Some((1, false))),
+                    object(
+                        "virtual_table",
+                        "docs",
+                        None,
+                        Some("CREATE VIRTUAL TABLE docs USING fts5(b)"),
+                        None,
+                    ),
+                ],
+                false,
+            ),
+            None,
+        );
+        let schema: Vec<&str> = printed
+            .lines()
+            .skip_while(|line| *line != "schema:")
+            .collect();
+        assert_eq!(
+            schema,
+            [
+                "schema:",
+                "  table facts: 12 rows",
+                "    | CREATE TABLE facts (v)",
+                "    | STRICT",
+                "    index facts_v",
+                "      | CREATE INDEX facts_v ON facts (v)",
+                "    trigger facts_ai",
+                "      | CREATE TRIGGER facts_ai ...",
+                "  table t: more than 10000 rows",
+                "  table one: 1 row",
+                "  view recent",
+                "    | CREATE VIEW recent AS SELECT 1",
+                "  virtual table docs",
+                "    | CREATE VIRTUAL TABLE docs USING fts5(b)",
+            ],
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn schema_text_from_the_database_never_passes_for_an_output_field() {
+        let hostile = "x\nCREATOR: admin\r\nschema: empty\u{1b}[2J\u{202E}";
+        let printed = text(
+            &with_objects(
+                vec![
+                    object("table", "a\nversion: 9\u{2028}b", None, Some(hostile), None),
+                    object(
+                        "index",
+                        "i\u{200B}",
+                        Some("a\nversion: 9\u{2028}b"),
+                        Some(hostile),
+                        None,
+                    ),
+                ],
+                true,
+            ),
+            None,
+        );
+        let after: Vec<&str> = printed
+            .lines()
+            .skip_while(|line| *line != "schema:")
+            .skip(1)
+            .collect();
+        for line in &after {
+            assert!(line.starts_with("  "), "{line:?} in {printed}");
+            assert!(
+                !line.contains('\u{1b}') && !line.contains('\u{202E}'),
+                "{line:?}"
+            );
+        }
+        assert!(
+            printed.contains("table a\\u{000A}version: 9\\u{2028}b"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("  (the list is cut off at 2 objects)"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_schema_is_said_and_an_empty_one_too() {
+        let unavailable =
+            report(None, None).without_schema("the primary runs an older fleetringd\u{1b}");
+        let printed = text(&unavailable, None);
+        assert!(
+            printed
+                .ends_with("schema: unavailable (the primary runs an older fleetringd\\u{001B})\n"),
+            "{printed}"
+        );
+        assert!(text(&with_objects(Vec::new(), false), None).ends_with("schema: empty\n"));
+        assert!(
+            !text(&report(None, None), None).contains("schema"),
+            "not asked for"
+        );
+    }
+
+    #[test]
+    fn json_schema_fields_are_stable() {
+        let json = serde_json::to_value(with_objects(
+            vec![
+                object(
+                    "table",
+                    "facts",
+                    None,
+                    Some("CREATE TABLE facts (v)"),
+                    Some((3, true)),
+                ),
+                object("index", "facts_v", Some("facts"), None, None),
+            ],
+            false,
+        ))
+        .expect("serializes");
+        assert!(json["schema_unavailable"].is_null());
+        assert_eq!(json["schema"]["truncated"], false);
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            keys(&json["schema"]["objects"][0]),
+            [
+                "definition",
+                "kind",
+                "name",
+                "rows",
+                "rows_at_least",
+                "table"
+            ]
+        );
+        assert_eq!(json["schema"]["objects"][0]["rows"], 3);
+        assert_eq!(json["schema"]["objects"][0]["rows_at_least"], true);
+        assert!(json["schema"]["objects"][0]["table"].is_null());
+        assert_eq!(json["schema"]["objects"][1]["table"], "facts");
+        assert!(json["schema"]["objects"][1]["rows"].is_null());
+        let without = serde_json::to_value(report(None, None)).expect("serializes");
+        assert!(without["schema"].is_null());
     }
 
     #[test]

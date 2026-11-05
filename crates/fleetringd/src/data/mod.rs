@@ -40,6 +40,9 @@
 //!   node without the feature refuses, so a creation never silently loses them;
 //!   [`Client::update_database`] patches them; [`Client::list_databases_where`] finds databases
 //!   by label and prefix, page by page.
+//! - **Schema:** [`Client::schema`] asks a database's primary for its tables, views, indexes,
+//!   triggers, and virtual tables, with the engine's own definitions and row counts capped at a
+//!   limit (ADR-0041, point 6).
 //! - **Lease watching:** `WatchLeases` streams the leases one node holds, from the node's own
 //!   view (FR-042): the leases held, then a `Gained` or `Lost` event per change, each with its epoch.
 //!   A worker beside the node acts on the databases the node is primary for and stops when a
@@ -54,6 +57,7 @@ mod leases;
 mod metadata;
 mod node;
 mod redirect;
+mod schema;
 mod service;
 
 pub use client::{
@@ -69,4 +73,5 @@ pub use metadata::{
 };
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};
+pub use schema::SchemaView;
 pub(crate) use service::DatabaseService;

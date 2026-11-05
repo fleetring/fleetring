@@ -13,7 +13,8 @@ use crate::actor::{
 };
 use crate::changes::CaptureRules;
 use crate::engine::{
-    DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Statement, Transaction,
+    DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Schema, SchemaRequest,
+    Statement, Transaction,
 };
 use crate::layout;
 use crate::publisher::BatchPublisher;
@@ -200,6 +201,24 @@ impl Registry {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
                 return handle.query_reserved(permit, statement).await;
+            }
+        }
+    }
+
+    /// The schema of an existing database, opening it if needed.
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseHandle::schema`], and as [`open`](Self::open).
+    pub async fn schema(
+        &self,
+        name: &DatabaseName,
+        request: SchemaRequest,
+    ) -> Result<Schema, DatabaseError> {
+        loop {
+            let handle = self.acquire(name, OpenMode::Existing).await?;
+            if let Some(permit) = handle.reserve().await {
+                return handle.schema_reserved(permit, request).await;
             }
         }
     }

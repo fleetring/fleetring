@@ -17,7 +17,7 @@ use fleetring_proto::v1::{CreateRequest, Revocation, RevokeTokenRequest, Transfe
 use fleetringd::auth::{BearerToken, Grant, TokenSigner};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate};
-use fleetringd::engine::{Statement, Value};
+use fleetringd::engine::{Internal, RowCount, SchemaRequest, Statement, Value};
 use fleetringd::transport::{Credentials, database_client_with};
 use fleetringd::{Config, Daemon, Network};
 use tonic::Code;
@@ -182,6 +182,108 @@ async fn reads_acme_and_nothing_else(client: &Client, who: &str) -> TestResult {
         client.status().await.expect_err("membership"),
         "watch membership",
     );
+    Ok(())
+}
+
+/// A database's schema needs `read` on it: a principal whose scopes cover another prefix, or
+/// only `stream`, or none, is refused, at the data node itself and not only where the client
+/// asks the control plane for the primary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_schema_needs_read_on_the_database() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let control = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "control",
+        "control",
+        None,
+    )?)?)
+    .await?;
+    let address = control.control_address().ok_or("no control address")?;
+    let data = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "data-1",
+        "data",
+        Some(address),
+    )?)?)
+    .await?;
+    let data_target = data.listen_address().to_string();
+
+    let admin = Client::new(address.to_string(), network(&tls, "tester")?);
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match admin.status().await {
+                Ok(view) if view.members().len() == 1 => return Ok::<_, tonic::Status>(()),
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await??;
+    for database in ["tenant:acme/orders", "tenant:zed/orders"] {
+        let database: DatabaseName = database.parse()?;
+        admin
+            .create_database_with(&database, DatabaseSpec::new(ReplicationFactor::ONE))
+            .await?;
+        admin
+            .execute(&database, Statement::new("CREATE TABLE t (v INTEGER)"))
+            .await?;
+    }
+    let acme: DatabaseName = "tenant:acme/orders".parse()?;
+    let zed: DatabaseName = "tenant:zed/orders".parse()?;
+    let request = SchemaRequest {
+        count_limit: 100,
+        internal: Internal::Hide,
+    };
+
+    // Each principal asks the data node directly, so the refusal is its own.
+    let asking = |principal: &str| -> Result<Client, Box<dyn Error>> {
+        Ok(Client::new(address.to_string(), network(&tls, principal)?)
+            .with_entry(data_target.clone()))
+    };
+    let tables = |view: fleetringd::data::SchemaView| {
+        view.schema
+            .objects
+            .into_iter()
+            .map(|object| object.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        tables(asking("tester")?.schema(&acme, request).await?),
+        ["t"]
+    );
+    let reader = asking("reader")?;
+    assert_eq!(tables(reader.schema(&acme, request).await?), ["t"]);
+    let refused = reader
+        .schema(&zed, request)
+        .await
+        .expect_err("another prefix");
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert_eq!(
+        refused.message(),
+        "Schema needs read on 'tenant:zed/orders'"
+    );
+    // `write` implies `read`, `stream` doesn't, and a principal with no scope has nothing.
+    assert_eq!(
+        tables(asking("writer")?.schema(&acme, request).await?),
+        ["t"]
+    );
+    for principal in ["streamer", "app"] {
+        let refused = asking(principal)?
+            .schema(&acme, request)
+            .await
+            .expect_err("without read");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{principal}");
+        assert_eq!(
+            refused.message(),
+            "Schema needs read on 'tenant:acme/orders'",
+            "{principal}"
+        );
+    }
+
+    data.run_until(async {}).await;
+    control.run_until(async {}).await;
     Ok(())
 }
 
@@ -1163,6 +1265,19 @@ async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult 
         .await?;
     agent.execute(&own, write_one()).await?;
     assert_eq!(agent.query(&own, read_one()).await?.rows.len(), 1);
+    let schema = agent
+        .schema(
+            &own,
+            SchemaRequest {
+                count_limit: 100,
+                internal: Internal::Hide,
+            },
+        )
+        .await?
+        .schema;
+    assert_eq!(schema.objects.len(), 1, "{schema:?}");
+    assert_eq!(schema.objects[0].name, "t");
+    assert_eq!(schema.objects[0].rows, Some(RowCount::Exact(1)));
     let updated = agent
         .update_database(
             &own,
@@ -1250,9 +1365,36 @@ async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult 
         agent.locate(&notes).await.expect_err("not the agent's"),
         "locate",
     );
-    let refusals = before.0 + 6;
+    // The schema of a database outside the scope is refused wherever it is asked: by the
+    // control plane, which the client asks where the primary is, and by the data node itself.
+    let everything = SchemaRequest {
+        count_limit: 100,
+        internal: Internal::Show,
+    };
+    assert_eq!(
+        denied(
+            agent
+                .schema(&notes, everything)
+                .await
+                .expect_err("not the agent's"),
+            "schema",
+        ),
+        "Locate needs read on 'notes'"
+    );
+    let direct = agent.clone().with_entry(data.listen_address().to_string());
+    assert_eq!(
+        denied(
+            direct
+                .schema(&notes, everything)
+                .await
+                .expect_err("not the agent's"),
+            "schema, direct",
+        ),
+        "Schema needs read on 'notes'"
+    );
+    let refusals = (before.0 + 7, before.1 + 1);
     tokio::time::timeout(HANG_GUARD, async {
-        while scope_refusals(&control)? < refusals {
+        while scope_refusals(&control)? < refusals.0 || scope_refusals(&data)? < refusals.1 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok::<_, Box<dyn Error>>(())
@@ -1260,7 +1402,7 @@ async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult 
     .await??;
     assert_eq!(
         (scope_refusals(&control)?, scope_refusals(&data)?),
-        (refusals, before.1)
+        refusals
     );
     let untouched = admin.locate(&notes).await?.metadata.ok_or("no metadata")?;
     assert_eq!(untouched.version, 1);
@@ -1409,6 +1551,16 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
         "{created}"
     );
     assert!(created.contains("creator: app"), "{created}");
+    for sql in [
+        "CREATE TABLE facts (id INTEGER PRIMARY KEY, body TEXT)",
+        "CREATE INDEX facts_body ON facts (body)",
+        "INSERT INTO facts (body) VALUES ('one'), ('two')",
+    ] {
+        succeeded(
+            &agent(vec!["db", "exec", "agent-42-notes", sql]).await?,
+            "agent writes its database",
+        )?;
+    }
 
     let shown = succeeded(
         &agent(vec!["db", "show", "agent-42-notes", "--json"]).await?,
@@ -1428,6 +1580,47 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
     assert_eq!(metadata["labels"]["agent"], "42");
     assert!(metadata["expires_at"].is_null());
     assert_eq!(metadata["version"], 1);
+    assert!(shown["schema_unavailable"].is_null());
+    assert_eq!(shown["schema"]["truncated"], false);
+    let objects = shown["schema"]["objects"]
+        .as_array()
+        .ok_or("no schema objects")?;
+    let keys: Vec<&str> = objects[0]
+        .as_object()
+        .ok_or("an object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "definition",
+            "kind",
+            "name",
+            "rows",
+            "rows_at_least",
+            "table"
+        ]
+    );
+    let described: Vec<(&str, &str, Option<u64>)> = objects
+        .iter()
+        .map(|object| {
+            (
+                object["kind"].as_str().unwrap_or_default(),
+                object["name"].as_str().unwrap_or_default(),
+                object["rows"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        [("table", "facts", Some(2)), ("index", "facts_body", None)]
+    );
+    assert_eq!(
+        objects[0]["definition"],
+        "CREATE TABLE facts (id INTEGER PRIMARY KEY, body TEXT)"
+    );
+    assert_eq!(objects[1]["table"], "facts");
     let text = succeeded(
         &agent(vec!["db", "show", "agent-42-notes"]).await?,
         "db show",
@@ -1438,6 +1631,33 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
         ),
         "{text}"
     );
+    assert!(
+        text.ends_with(
+            "schema:\n  table facts: 2 rows\n    | CREATE TABLE facts (id INTEGER PRIMARY KEY, body TEXT)\n    index facts_body\n      | CREATE INDEX facts_body ON facts (body)\n"
+        ),
+        "{text}"
+    );
+    let capped = succeeded(
+        &agent(vec!["db", "show", "agent-42-notes", "--count-limit", "1"]).await?,
+        "db show --count-limit",
+    )?;
+    assert!(
+        capped.contains("table facts: more than 1 row\n"),
+        "{capped}"
+    );
+    let skipped = succeeded(
+        &agent(vec![
+            "db",
+            "show",
+            "agent-42-notes",
+            "--no-schema",
+            "--json",
+        ])
+        .await?,
+        "db show --no-schema",
+    )?;
+    let skipped: serde_json::Value = serde_json::from_str(&skipped)?;
+    assert!(skipped["schema"].is_null() && skipped["schema_unavailable"].is_null());
 
     let relabelled = succeeded(
         &agent(vec![
