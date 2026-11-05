@@ -741,6 +741,14 @@ Where a [change stream](#change-stream) delivers: a `file`, a `webhook`, or an a
 - **Code:** `ChangeSink`, `[[changes.sink]]`, protocol `ChangeSinkStatus`. **CLI:** sink progress in `status --node`.
 - **Not:** consumer (a consumer reads from a sink's destination), target, destination (fine in prose), subscriber, exporter, publisher.
 
+### Skill
+
+The page an AI agent reads to use FleetRing well, [`docs/agents/SKILL.md`](agents/SKILL.md), in the Agent Skills format: when to create a [database](#database) rather than a table, naming, [labels](#label), [descriptions](#description), [expiry](#expiry), and SQL patterns (ADR-0041, point 11). Its SQL runs through the SQLite adapter in the tests. Say *agent skill* where "skill" alone is unclear.
+
+- **Applies to:** daemon.
+- **Code:** `docs/agents/SKILL.md`, with `name: fleetring` in its front matter; `tests/agents_skill.rs`. **CLI:** none.
+- **Not:** prompt, playbook, instructions (the MCP server's `instructions` are a different, shorter text), guide (that is the [quickstart](agents/quickstart.md)'s job).
+
 ### Snapshot
 
 A consistent copy of state at one point. Always say which: a *database snapshot* seeds or re-seeds a replica (FR-032); a *base snapshot* starts an archive's restore chain (ADR-0029); a *control snapshot* compacts the control log. The leases a node holds when a `WatchLeases` stream opens aren't a snapshot; they are its *held leases*.

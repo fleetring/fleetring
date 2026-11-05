@@ -1,0 +1,17 @@
+# FleetRing
+
+> FleetRing places, replicates, and fails over fleets of small SQLite databases on machines you own, one database per agent, user, or task. Agents create, find, query, and drop their own databases through `fleetringd mcp` (an MCP server) or the `fleetringd` CLI, within the scopes of their token.
+
+## Docs
+
+- [README](README.md): what FleetRing is, how to install it, and a five-minute quickstart.
+- [Agent skill](docs/agents/SKILL.md): when to create a database, naming, labels, descriptions, expiry, and SQL patterns for memory, task state, and full-text search.
+- [Agent quickstart](docs/agents/quickstart.md): a dev node, a scoped token, and an MCP client running `fleetringd mcp`.
+- [fleetringd](crates/fleetringd/README.md): the daemon and its commands, scopes and tokens, dev mode, and the MCP server.
+- [CLI guide](docs/cli.md): how the `fleetringd` commands, flags, and output behave.
+- [Lexicon](docs/lexicon.md): the words FleetRing uses, and the ones it doesn't.
+
+## Optional
+
+- [ADR-0041](docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md): database metadata, expiry, `db show`, and the MCP server, with the reasoning.
+- [Architecture decisions](docs/adr/README.md): the index of every ADR.

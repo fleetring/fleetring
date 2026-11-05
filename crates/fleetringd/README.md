@@ -26,6 +26,8 @@ The node serves gRPC on `127.0.0.1:7400` and its admin listener on `127.0.0.1:74
 
 `~/.fleetring/env` sets `FLEETRING_CONTROL` (the control address, which `--control` and `--config` override), `FLEETRING_TLS_DIR`, and `FLEETRING_AS=admin`; dev mode rewrites it at every start. `status` against a dev node starts with `dev mode: one node on loopback, for development only`, and doesn't warn that its one-node ring has fewer nodes than a fleet's replication factor. A dev node holds one copy of each database, so a larger `--replication-factor` leaves writes short of their quorum; `db create` accepts it and warns.
 
+To give an AI agent its own principal and databases on a dev node, follow the [agent quickstart](https://github.com/fleetring/fleetring/blob/main/docs/agents/quickstart.md).
+
 To run it at login, [`deploy/dev/`](https://github.com/fleetring/fleetring/tree/main/deploy/dev) has a Homebrew `service do` block (`homebrew-service.rb`, with the launchd agent it becomes) and a systemd user unit, `fleetringd-dev.service`. The authority's key and the admin key sit unencrypted in the directory: dev mode is for local development only ([SECURITY.md](https://github.com/fleetring/fleetring/blob/main/SECURITY.md#dev-mode)).
 
 ## Run it
