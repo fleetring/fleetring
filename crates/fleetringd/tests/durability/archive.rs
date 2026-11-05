@@ -9,13 +9,17 @@ use fleetring_control::DatabaseName;
 use fleetringd::Config;
 use fleetringd::clock::SystemClock;
 use fleetringd::durability::{
-    Archive, ArchiveConfig, ArchiveError, ArchiveParts, DirectoryStore, FaultyStore, Listing,
-    MemoryStore, ObjectStore, RestoreTarget, decode_segment, plan,
+    Archive, ArchiveConfig, ArchiveError, ArchiveKeys, ArchiveParts, DirectoryStore, FaultyStore,
+    Listing, MemoryStore, NoMetadata, ObjectStore, RestoreTarget, checksum_hex, decode_metadata,
+    decode_segment, plan,
 };
 use fleetringd::engine::{EngineKind, Execution, MemoryEngine};
 use fleetringd::replication::ChainHash;
 
-use crate::common::{Node, TestResult, insert, name, settings, start_replication};
+use crate::common::{
+    Node, RecordingStore, TestMetadata, TestResult, archived_metadata, insert, name, settings,
+    start_replication,
+};
 
 /// Checks that `listing` holds one path, from a snapshot through every segment, that ends at
 /// `end`: each segment starts where the one before ends.
@@ -329,6 +333,7 @@ async fn an_archive_on_a_self_replicating_engine_is_refused_at_start() -> TestRe
             engine: Arc::new(MemoryEngine::new()),
             clock: Arc::new(SystemClock),
             execution: Execution::Threads,
+            metadata: Arc::new(NoMetadata),
         },
     );
     let Err(error) = refused else {
@@ -418,6 +423,11 @@ fn archive_config_is_validated() {
             format!("{directory}prefix = \"a/\"\n"),
             "prefix",
         ),
+        (
+            "a prefix naming the metadata directory",
+            format!("{directory}prefix = \"a/.metadata\"\n"),
+            "prefix",
+        ),
     ];
     for (what, text, mentions) in refused {
         let error = config(&text).expect_err(what).to_string();
@@ -429,4 +439,272 @@ fn archive_config_is_validated() {
         ))
         .is_ok()
     );
+}
+
+/// What the archive holds under `.metadata/` for `database`.
+async fn metadata_keys(
+    store: &dyn ObjectStore,
+    keys: &ArchiveKeys,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(store
+        .list(&keys.metadata_objects())
+        .await?
+        .into_iter()
+        .map(|object| object.key)
+        .collect())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_of_a_database_with_metadata_archives_it_before_its_descriptor() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = RecordingStore::new(Arc::new(MemoryStore::new()));
+    let ledger = name("ledger");
+    let metadata = TestMetadata::new();
+    metadata.set(&ledger, archived_metadata("ledger"));
+    let node = Node::start_with_metadata(
+        &dir.path().join("node"),
+        Arc::new(store.clone()),
+        settings(),
+        metadata,
+    );
+    create_ledger(&node).await?;
+    node.await_archived().await?;
+
+    let listing = node.listing(&ledger).await?;
+    assert!(listing.damaged.is_empty() && listing.orphaned_metadata.is_empty());
+    let snapshot = listing.snapshots.first().ok_or("a snapshot")?;
+    let entry = snapshot.metadata.as_ref().ok_or("its metadata object")?;
+    let puts = store.puts();
+    let at = |key: &str| {
+        puts.iter()
+            .position(|put| put == key)
+            .ok_or_else(|| format!("{key} wasn't put: {puts:#?}"))
+    };
+    let metadata_at = at(&entry.key)?;
+    let descriptor_at = at(&snapshot.key)?;
+    assert!(
+        metadata_at < descriptor_at,
+        "the descriptor is written last"
+    );
+    for chunk in &snapshot.chunks {
+        assert!(at(chunk)? < metadata_at, "chunks come first");
+    }
+
+    // The name carries the checksum of the bytes, and the bytes are what the source gave.
+    let bytes = store.get(&entry.key).await?.ok_or("the object")?;
+    assert_eq!(checksum_hex(&bytes), entry.checksum);
+    assert_eq!(entry.size, u64::try_from(bytes.len())?);
+    assert_eq!(decode_metadata(&bytes)?, archived_metadata("ledger"));
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_database_prefix_holds_no_metadata_objects() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(DirectoryStore::new(dir.path().join("store")));
+    let ledger = name("ledger");
+    let metadata = TestMetadata::new();
+    metadata.set(&ledger, archived_metadata("ledger"));
+    let node = Node::start_with_metadata(
+        &dir.path().join("node"),
+        store.clone(),
+        settings(),
+        metadata,
+    );
+    create_ledger(&node).await?;
+    for value in 1..=3 {
+        node.execute(&ledger, insert(value)).await?;
+    }
+    node.await_archived().await?;
+
+    let keys = node.archive.keys(&ledger);
+    // A listing of `<prefix>/<db>/` alone is what a release without metadata reads. It parses
+    // every key there as a snapshot object or a segment, and has nothing to call damaged.
+    let objects = store.list(&keys.database()).await?;
+    assert!(!objects.is_empty());
+    for object in &objects {
+        assert!(
+            keys.parse_segment_key(&object.key).is_some()
+                || keys.parse_snapshot_key(&object.key).is_some(),
+            "{}",
+            object.key
+        );
+    }
+    // The metadata is in the store, beside the database's prefix and not in it.
+    let stored = metadata_keys(store.as_ref(), &keys).await?;
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!(
+        stored[0].starts_with("fleetring/.metadata/ledger/"),
+        "{}",
+        stored[0]
+    );
+    assert!(
+        dir.path().join("store").join(&stored[0]).is_file(),
+        "{}",
+        stored[0]
+    );
+    assert!(
+        objects
+            .iter()
+            .all(|object| !object.key.contains("/.metadata/")),
+        "{objects:#?}"
+    );
+    node.stop().await;
+    Ok(())
+}
+
+/// The objects of a `0.5.0` archive of `ledger` and `tenant/A` under `prefix`, with a metadata
+/// object for each snapshot as this release writes them, as the keys a store lists.
+fn golden_keys(prefix: &str) -> Vec<String> {
+    let at = |rest: &str| {
+        if prefix.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{prefix}/{rest}")
+        }
+    };
+    let id = "0002_0000000000000001";
+    let checksum = "0123456789abcdef0123456789abcdef";
+    let mut keys = Vec::new();
+    for directory in ["ledger", "tenant%2f%41"] {
+        keys.push(at(&format!("{directory}/snapshots/{id}/00000000.chunk")));
+        keys.push(at(&format!("{directory}/snapshots/{id}/snapshot.json")));
+        keys.push(at(&format!(
+            "{directory}/segments/0002_0003_0000000000000001_0000000000000010.seg"
+        )));
+        keys.push(at(&format!(".metadata/{directory}/{id}_{checksum}.json")));
+    }
+    keys
+}
+
+#[test]
+fn a_release_without_metadata_lists_a_database_prefix_with_nothing_damaged() {
+    // `0.5.0` lists `<prefix>/<db>/` and marks every key it can't parse as damaged
+    // (`durability::listing`, the only caller of `ObjectStore::list`).
+    for prefix in ["fleetring", "", "a/b"] {
+        let all = golden_keys(prefix);
+        for database in ["ledger", "tenant/A"] {
+            let keys = ArchiveKeys::new(prefix, &name(database));
+            let listed: Vec<&String> = all
+                .iter()
+                .filter(|key| key.starts_with(&keys.database()))
+                .collect();
+            assert_eq!(listed.len(), 3, "{prefix:?} {database}: {listed:#?}");
+            for key in listed {
+                assert!(
+                    keys.parse_segment_key(key).is_some() || keys.parse_snapshot_key(key).is_some(),
+                    "{key} would be damaged"
+                );
+            }
+            // And this release's listing of the metadata prefix finds exactly its own.
+            let own: Vec<&String> = all
+                .iter()
+                .filter(|key| key.starts_with(&keys.metadata_objects()))
+                .collect();
+            assert_eq!(own.len(), 1, "{prefix:?} {database}: {own:#?}");
+            assert!(keys.parse_metadata_key(own[0]).is_some(), "{}", own[0]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_without_metadata_writes_no_metadata_object() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = RecordingStore::new(Arc::new(MemoryStore::new()));
+    // The source knows no database: it answers `None`.
+    let node = Node::start_with_metadata(
+        &dir.path().join("node"),
+        Arc::new(store.clone()),
+        settings(),
+        TestMetadata::new(),
+    );
+    let ledger = create_ledger(&node).await?;
+    node.await_archived().await?;
+    let listing = node.listing(&ledger).await?;
+    assert_eq!(listing.snapshots.len(), 1, "{listing:#?}");
+    assert_eq!(listing.snapshots[0].metadata, None);
+    assert!(listing.orphaned_metadata.is_empty() && listing.damaged.is_empty());
+    assert!(
+        store.puts().iter().all(|key| !key.contains(".metadata")),
+        "{:#?}",
+        store.puts()
+    );
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_metadata_lookup_still_completes_the_snapshot() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut settings = settings();
+    // Every segment brings the next snapshot.
+    settings.snapshot_after_bytes = 1;
+    let ledger = name("ledger");
+    let metadata = TestMetadata::new();
+    metadata.set(&ledger, archived_metadata("ledger"));
+    metadata.fail_lookups();
+    let node = Node::start_with_metadata(
+        &dir.path().join("node"),
+        Arc::new(MemoryStore::new()),
+        settings,
+        metadata.clone(),
+    );
+    create_ledger(&node).await?;
+    node.await_archived().await?;
+    let listing = node.listing(&ledger).await?;
+    assert_eq!(listing.snapshots.len(), 1, "the snapshot completed");
+    assert_eq!(listing.snapshots[0].metadata, None);
+    assert!(listing.incomplete.is_empty() && listing.damaged.is_empty());
+
+    // The next snapshot carries the metadata.
+    metadata.serve_lookups();
+    node.execute(&ledger, insert(1)).await?;
+    node.await_archived().await?;
+    let mut snapshots = node.listing(&ledger).await?.snapshots;
+    snapshots.sort_by(|a, b| a.position.cmp(&b.position));
+    assert!(snapshots.len() >= 2, "{snapshots:#?}");
+    assert_eq!(snapshots.first().map(|s| s.metadata.is_some()), Some(false));
+    assert_eq!(snapshots.last().map(|s| s.metadata.is_some()), Some(true));
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_deletes_a_snapshots_metadata_with_it() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut settings = settings();
+    settings.snapshot_after_bytes = 1;
+    settings.keep_snapshots = NonZeroU32::new(2).ok_or("nonzero")?;
+    let store = MemoryStore::new();
+    let ledger = name("ledger");
+    let metadata = TestMetadata::new();
+    metadata.set(&ledger, archived_metadata("ledger"));
+    let node = Node::start_with_metadata(
+        &dir.path().join("node"),
+        Arc::new(store.clone()),
+        settings,
+        metadata,
+    );
+    create_ledger(&node).await?;
+    for value in 1..=6 {
+        node.execute(&ledger, insert(value)).await?;
+        node.await_archived().await?;
+    }
+    let listing = node.listing(&ledger).await?;
+    assert_eq!(listing.snapshots.len(), 2, "{listing:#?}");
+    assert!(listing.orphaned_metadata.is_empty(), "{listing:#?}");
+    // One metadata object per kept snapshot, and no more: the older snapshots' went with them.
+    let mut kept: Vec<String> = listing
+        .snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.metadata.as_ref().map(|entry| entry.key.clone()))
+        .collect();
+    kept.sort();
+    let mut stored = metadata_keys(&store, &node.archive.keys(&ledger)).await?;
+    stored.sort();
+    assert_eq!(kept.len(), 2, "{listing:#?}");
+    assert_eq!(stored, kept);
+    node.stop().await;
+    Ok(())
 }

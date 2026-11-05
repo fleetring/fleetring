@@ -19,6 +19,7 @@ use crate::changes::{MarkHome, SinkStatus};
 use crate::data::client::{LeaseUpdate, Location, NodeStatus, ReplicaInfo, ServedDatabase};
 use crate::data::metadata::{Descriptions, MetadataView, NewMetadata};
 use crate::data::schema::SchemaView;
+use crate::durability::ArchivedMetadata;
 use crate::engine::{
     EngineKind, Internal, MAX_COUNT_LIMIT, ObjectKind, Position, RowCount, Rows, Schema,
     SchemaObject, SchemaRequest, Statement, Value,
@@ -178,6 +179,27 @@ pub(crate) fn metadata_to_proto(
         created_at_ms: metadata.created_at().map(Timestamp::as_millis),
         expires_at_ms: metadata.expires_at().map(Timestamp::as_millis),
         version: metadata.version(),
+    }
+}
+
+/// The protocol form of the metadata an archive holds, as a restore reports it. The labels are
+/// in key order, since the archive's are a sorted map.
+pub(crate) fn archived_to_proto(metadata: &ArchivedMetadata) -> proto::DatabaseMetadata {
+    proto::DatabaseMetadata {
+        description: metadata.description.clone().unwrap_or_default(),
+        description_by: metadata.description_by.clone(),
+        labels: metadata
+            .labels
+            .iter()
+            .map(|(key, value)| proto::Label {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        created_by: metadata.created_by.clone(),
+        created_at_ms: metadata.created_at_ms,
+        expires_at_ms: metadata.expires_at_ms,
+        version: metadata.version,
     }
 }
 

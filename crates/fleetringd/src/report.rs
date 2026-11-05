@@ -397,10 +397,7 @@ fn render_metadata(
     };
     match &metadata.description {
         Some(description) => {
-            writeln!(out, "description:")?;
-            for line in description.lines() {
-                writeln!(out, "  | {}", printable(line))?;
-            }
+            write_block(out, "description:", description)?;
             writeln!(
                 out,
                 "description by: {}",
@@ -505,6 +502,24 @@ fn render_schema(report: &DatabaseReport, out: &mut dyn io::Write) -> io::Result
     Ok(())
 }
 
+/// Writes `text` as a block below the line `header`: every line of it, the first included,
+/// indented by two spaces and prefixed with `| `, so no line of it starts where an output field
+/// does.
+fn write_block(out: &mut dyn io::Write, header: &str, text: &str) -> io::Result<()> {
+    writeln!(out, "{header}")?;
+    write_lines(out, 0, text)
+}
+
+/// Writes the lines of `text` as a block's: after `indent` spaces, two more, `| `, and the line
+/// with every control and invisible character escaped. Descriptions, definitions, and the
+/// archive's claims all go through it, so the escaping lives in one place.
+fn write_lines(out: &mut dyn io::Write, indent: usize, text: &str) -> io::Result<()> {
+    for line in text.lines() {
+        writeln!(out, "{:indent$}  | {}", "", printable(line))?;
+    }
+    Ok(())
+}
+
 /// Writes one schema object's line, indented by `indent` spaces, and its definition below it.
 fn render_object(
     object: &SchemaObjectReport,
@@ -521,12 +536,58 @@ fn render_object(
         (Some(rows), true) => format!(": more than {rows} rows"),
     };
     writeln!(out, "{:indent$}{kind} {name}{rows}", "")?;
-    if let Some(definition) = &object.definition {
-        for line in definition.lines() {
-            writeln!(out, "{:indent$}  | {}", "", printable(line))?;
-        }
+    match &object.definition {
+        Some(definition) => write_lines(out, indent, definition),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Writes the metadata an archive holds, as a restore reports it (ADR-0041, point 10).
+///
+/// All of it is the archive's claim, and an archive isn't signed: the description is a block as
+/// [`render_text`] prints one, and the author and creator it names are marked as claims that
+/// are not recorded anywhere. A restore sets the description with no author and the creator is
+/// the principal that restored.
+///
+/// # Errors
+///
+/// The error `out` returns.
+pub fn render_archived_metadata(
+    metadata: &MetadataView,
+    out: &mut dyn io::Write,
+) -> io::Result<()> {
+    match &metadata.description {
+        Some(description) => write_block(out, "archived description:", description)?,
+        None => writeln!(out, "archived description: none")?,
+    }
+    if let Some(by) = &metadata.description_by {
+        writeln!(
+            out,
+            "archived description by: {} (the archive's claim; not recorded)",
+            printable(by)
+        )?;
+    }
+    if let Some(creator) = &metadata.created_by {
+        writeln!(
+            out,
+            "archived creator: {} (the archive's claim; not recorded)",
+            printable(creator)
+        )?;
+    }
+    let labels: Vec<String> = metadata
+        .labels
+        .iter()
+        .map(|(key, value)| format!("{}={}", printable(key), printable(value)))
+        .collect();
+    writeln!(
+        out,
+        "archived labels: {}",
+        if labels.is_empty() {
+            "none".to_owned()
+        } else {
+            labels.join(", ")
+        }
+    )
 }
 
 /// `ms` as days, hours, minutes, and seconds, largest first, at most two of them.
@@ -618,6 +679,42 @@ mod tests {
         assert!(
             printed.contains("description by: agent-7 (untrusted:"),
             "{printed}"
+        );
+    }
+
+    #[test]
+    fn an_archived_description_is_a_block_and_its_names_are_claims() {
+        let metadata = MetadataView {
+            description: Some("x\nCREATOR: admin\u{1b}[2J".to_owned()),
+            description_by: Some("ops".to_owned()),
+            labels: vec![("purpose".to_owned(), "memory".to_owned())],
+            created_by: Some("ops\u{202E}".to_owned()),
+            created_at: None,
+            expires_at: None,
+            version: 3,
+        };
+        let mut out = Vec::new();
+        render_archived_metadata(&metadata, &mut out).expect("writes to a vector");
+        let printed = String::from_utf8(out).expect("UTF-8");
+        assert_eq!(
+            printed,
+            "archived description:\n  | x\n  | CREATOR: admin\\u{001B}[2J\n\
+             archived description by: ops (the archive's claim; not recorded)\n\
+             archived creator: ops\\u{202E} (the archive's claim; not recorded)\n\
+             archived labels: purpose=memory\n"
+        );
+        let bare = MetadataView {
+            description: None,
+            description_by: None,
+            labels: Vec::new(),
+            created_by: None,
+            ..metadata
+        };
+        let mut out = Vec::new();
+        render_archived_metadata(&bare, &mut out).expect("writes to a vector");
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            "archived description: none\narchived labels: none\n"
         );
     }
 

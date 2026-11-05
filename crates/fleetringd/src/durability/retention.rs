@@ -15,9 +15,11 @@ use super::store::{ObjectStore, StoreError, retrying};
 /// kept with them. Every segment a walk from a kept snapshot reaches is kept.
 ///
 /// It deletes the snapshots past the kept ones, descriptor first, so that a half-deleted
-/// snapshot reads as incomplete; every segment no kept snapshot reaches; and incomplete
-/// snapshots older than the oldest kept one, which no restore can use. While fewer than
-/// `keep` snapshots are live, it deletes nothing.
+/// snapshot reads as incomplete, then its chunks, then its metadata object, so that a crash
+/// leaves at worst an orphan and never a complete snapshot that lost its metadata; every
+/// segment no kept snapshot reaches; and incomplete snapshots and orphaned metadata objects
+/// older than the oldest kept snapshot, which no restore can use. While fewer than `keep`
+/// snapshots are live, it deletes nothing.
 ///
 /// Nothing a kept snapshot's walk can use is deleted, so an old and a new primary pruning one
 /// archive at once never delete what the other needs.
@@ -59,6 +61,12 @@ pub fn retention(listing: &Listing, keep: NonZeroU32) -> Vec<String> {
     for snapshot in dropped {
         keys.push(snapshot.key.clone());
         keys.extend(snapshot.chunks.iter().cloned());
+        keys.extend(
+            snapshot
+                .metadata
+                .iter()
+                .map(|metadata| metadata.key.clone()),
+        );
     }
     keys.extend(
         listing
@@ -73,6 +81,13 @@ pub fn retention(listing: &Listing, keep: NonZeroU32) -> Vec<String> {
             .iter()
             .filter(|snapshot| snapshot.position < oldest)
             .flat_map(|snapshot| snapshot.chunks.iter().cloned()),
+    );
+    keys.extend(
+        listing
+            .orphaned_metadata
+            .iter()
+            .filter(|orphan| orphan.position < oldest)
+            .map(|orphan| orphan.key.clone()),
     );
     keys
 }
@@ -96,7 +111,9 @@ mod tests {
     use super::*;
     use crate::durability::format::{FORMAT, SnapshotDescriptor};
     use crate::durability::keys::SegmentName;
-    use crate::durability::listing::{IncompleteSnapshot, SegmentEntry, SnapshotEntry};
+    use crate::durability::listing::{
+        IncompleteSnapshot, MetadataEntry, OrphanedMetadata, SegmentEntry, SnapshotEntry,
+    };
     use crate::engine::Position;
     use crate::replication::ChainHash;
 
@@ -125,6 +142,25 @@ mod tests {
                 chunk_checksums: vec![String::new()],
             },
             chunks: vec![format!("s{position}/00000000.chunk")],
+            metadata: None,
+        }
+    }
+
+    /// `snapshot` with a metadata object, as the archive writes one.
+    fn with_metadata(mut snapshot: SnapshotEntry) -> SnapshotEntry {
+        snapshot.metadata = Some(MetadataEntry {
+            key: format!("{}.json", snapshot.id),
+            checksum: "0".repeat(32),
+            size: 1,
+        });
+        snapshot
+    }
+
+    fn orphan(position: u8) -> OrphanedMetadata {
+        OrphanedMetadata {
+            key: format!("o{position}.json"),
+            id: format!("o{position}"),
+            position: Some(at(position)),
         }
     }
 
@@ -170,6 +206,43 @@ mod tests {
         );
         let keep_all = NonZeroU32::new(3).expect("nonzero");
         assert!(retention(&listing, keep_all).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_snapshots_metadata_goes_last() {
+        let listing = Listing {
+            snapshots: vec![
+                with_metadata(snapshot(1)),
+                with_metadata(snapshot(5)),
+                with_metadata(snapshot(9)),
+            ],
+            segments: vec![segment(1, 5), segment(5, 9)],
+            ..Listing::default()
+        };
+        let keep = NonZeroU32::new(2).expect("nonzero");
+        assert_eq!(
+            retention(&listing, keep),
+            ["s1/snapshot.json", "s1/00000000.chunk", "s1.json", "seg1-5"]
+        );
+        // What a kept snapshot has is never deleted.
+        assert!(retention(&listing, NonZeroU32::new(3).expect("nonzero")).is_empty());
+    }
+
+    #[test]
+    fn old_orphaned_metadata_is_deleted_and_recent_orphans_are_kept() {
+        let listing = Listing {
+            snapshots: vec![snapshot(1), snapshot(5), snapshot(9)],
+            segments: vec![segment(1, 5), segment(5, 9)],
+            // 3 is older than the oldest kept snapshot (5); 7 and 9 are an upload in progress
+            // or a failover's, and 5 is the oldest kept one's own.
+            orphaned_metadata: vec![orphan(3), orphan(5), orphan(7), orphan(9)],
+            ..Listing::default()
+        };
+        let keep = NonZeroU32::new(2).expect("nonzero");
+        assert_eq!(
+            retention(&listing, keep),
+            ["s1/snapshot.json", "s1/00000000.chunk", "seg1-5", "o3.json"]
+        );
     }
 
     /// A segment of epoch 2, a new primary's.

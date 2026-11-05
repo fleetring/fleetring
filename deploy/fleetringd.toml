@@ -181,7 +181,9 @@ id = "node-1"
 # `databases`             exact names or prefixes ending in `*`
 # `store`                 "s3"         an S3-compatible bucket: AWS S3, MinIO, Cloudflare R2, Garage
 #                         "directory"  a local directory, such as a mounted volume
-# `prefix`                the key prefix every object is under: "fleetring" by default
+# `prefix`                the key prefix every object is under: "fleetring" by default; the
+#                         databases' metadata objects are under `<prefix>/.metadata/`, so no
+#                         part of a prefix may be `.metadata`
 # `segment_interval_ms`   the least time between two segments of a database: 10000
 # `snapshot_interval_ms`  how old the newest base snapshot may get: 86400000 (a day)
 # `snapshot_after_bytes`  how many bytes of segments bring a new base snapshot: 1073741824

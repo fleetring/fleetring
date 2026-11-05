@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::keys::METADATA_DIR;
 use crate::engine::Execution;
 
 /// The future an [`ObjectStore`] call returns.
@@ -19,7 +20,8 @@ pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>>
 
 /// Whole immutable objects by key: the only operations an archive needs (ADR-0029, point 2).
 ///
-/// A key is one or more components joined by `/`; no component is empty or begins with `.`.
+/// A key is one or more components joined by `/`; no component is empty or begins with `.`,
+/// except the archive's `.metadata` directory (ADR-0041, point 10).
 /// Every store refuses other keys with [`StoreError::InvalidKey`], so an archive's keys are
 /// valid on every store. An archive never overwrites an object, and never needs a lock or a
 /// conditional write: names say what objects hold, and `list` over a prefix is the manifest.
@@ -137,7 +139,9 @@ pub(crate) fn check_prefix(prefix: &str) -> Result<(), StoreError> {
 }
 
 fn valid_component(component: &str) -> bool {
-    !component.is_empty() && !component.starts_with('.') && !component.contains(['\\', '\0'])
+    (component == METADATA_DIR || !component.starts_with('.'))
+        && !component.is_empty()
+        && !component.contains(['\\', '\0'])
 }
 
 fn ready<T: Send + 'static>(result: Result<T, StoreError>) -> StoreFuture<'static, T> {
@@ -444,10 +448,27 @@ mod tests {
 
     #[test]
     fn keys_are_components_none_empty_or_hidden() {
-        for key in ["a", "a/b", "fleetring/tenant%2fa/segments/x_y.seg"] {
+        for key in [
+            "a",
+            "a/b",
+            "fleetring/tenant%2fa/segments/x_y.seg",
+            ".metadata/ledger/x.json",
+            "p/.metadata/ledger/x.json",
+        ] {
             assert_eq!(check_key(key), Ok(()), "{key}");
         }
-        for key in ["", "/a", "a/", "a//b", "a/./b", "a/../b", ".hidden", "a\\b"] {
+        for key in [
+            "",
+            "/a",
+            "a/",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            ".hidden",
+            ".metadata2",
+            "a/.metadata.json/b",
+            "a\\b",
+        ] {
             assert!(check_key(key).is_err(), "{key}");
         }
         for prefix in ["", "a/", "a/b", "a/b/"] {

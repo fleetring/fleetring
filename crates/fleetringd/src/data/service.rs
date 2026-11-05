@@ -15,7 +15,7 @@ use tonic::{Code, Request, Response, Status};
 use crate::auth::{Action, authorized, require_database};
 use crate::changes::MarkHome;
 use crate::data::convert::{
-    parse, rows_to_proto, schema_request_from_proto, schema_to_proto, statement,
+    archived_to_proto, parse, rows_to_proto, schema_request_from_proto, schema_to_proto, statement,
 };
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
@@ -343,6 +343,8 @@ impl Database for DatabaseService {
             snapshot: restored.snapshot,
             segments: restored.segments,
             archived_at_ms: restored.archived_at_ms,
+            archived_metadata: restored.metadata.as_ref().map(archived_to_proto),
+            archived_metadata_skipped: restored.metadata_skipped,
         }))
     }
 
@@ -379,6 +381,7 @@ impl Database for DatabaseService {
                     .unwrap_or_default(),
                 taken_at_ms: snapshot.descriptor.taken_at_ms,
                 bytes: snapshot.descriptor.bytes,
+                metadata: snapshot.metadata.is_some(),
             })
             .collect();
         snapshots.sort_by(|a, b| (&a.position, a.epoch).cmp(&(&b.position, b.epoch)));

@@ -5,8 +5,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use fleetring_control::{
-    DatabaseName, Description, FORBIDDEN_FORMAT_CHARACTERS, LabelKey, LabelValue, Labels,
-    ParseLabelError, Timestamp, parse_label,
+    DatabaseName, Description, DescriptionChange, FORBIDDEN_FORMAT_CHARACTERS, LabelKey,
+    LabelValue, Labels, MAX_LABELS, MetadataChange, ParseLabelError, Timestamp, parse_label,
 };
 
 use crate::data::client::Location;
@@ -152,6 +152,71 @@ impl MetadataView {
     }
 }
 
+/// What `db restore` sets on a restored database from the metadata the archive holds
+/// (ADR-0041, point 10).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RestoredMetadata {
+    /// The patch to apply with [`Client::update_database`](crate::data::Client::update_database),
+    /// empty when there is nothing to set.
+    pub change: MetadataChange,
+    /// What of the archive's description and labels was left out because it isn't valid, with
+    /// why: the archive is data from outside the control plane, and is checked as a request is.
+    pub skipped: Vec<String>,
+}
+
+/// The patch that restores the description and labels of `archived` onto a database that was
+/// created with `flags`.
+///
+/// - **The description** is set *without an author*, so no principal is recorded for it and
+///   every reader treats it as untrusted, whoever restored it. It is left out if the restore
+///   was given a description (`flags`), which the creation recorded as the caller's own.
+/// - **Labels** are all set, except those `flags` already gave: a flag wins per key.
+/// - **The expiry** is never restored, and neither are the archive's creator, author, or
+///   version: they are the archive's claims.
+///
+/// A description or label that wouldn't be accepted if a client sent it is skipped and named
+/// in [`RestoredMetadata::skipped`], not set.
+#[must_use]
+pub fn restored_metadata(archived: &MetadataView, flags: &NewMetadata) -> RestoredMetadata {
+    let mut restored = RestoredMetadata::default();
+    if flags.description.is_none()
+        && let Some(text) = &archived.description
+    {
+        match text.parse::<Description>() {
+            Ok(description) => {
+                restored.change.description = DescriptionChange::SetWithoutAuthor(description);
+            }
+            Err(error) => restored
+                .skipped
+                .push(format!("the archived description: {error}")),
+        }
+    }
+    let mut labels = Vec::new();
+    for (key, value) in &archived.labels {
+        match (key.parse::<LabelKey>(), value.parse::<LabelValue>()) {
+            (Ok(key), Ok(value)) => {
+                if flags.labels.get(&key).is_none() {
+                    labels.push((key, value));
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => restored
+                .skipped
+                .push(format!("the archived label {key}={value}: {error}")),
+        }
+    }
+    if flags.labels.len() + labels.len() > MAX_LABELS {
+        restored.skipped.push(format!(
+            "the {} archived labels: with the {} given, a database has at most {MAX_LABELS}",
+            labels.len(),
+            flags.labels.len()
+        ));
+    } else if let Ok(labels) = Labels::try_from_pairs(labels) {
+        restored.change.set_labels = labels;
+    }
+    restored
+}
+
 /// Which databases a listing returns, and how much of each.
 ///
 /// # Examples
@@ -238,4 +303,110 @@ pub struct Listing {
     pub databases: Vec<Location>,
     /// The last name listed, when more databases follow: the next page's `after`.
     pub next_after: Option<DatabaseName>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archived(description: Option<&str>, labels: &[(&str, &str)]) -> MetadataView {
+        MetadataView {
+            description: description.map(str::to_owned),
+            description_by: Some("ops".to_owned()),
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            created_by: Some("ops".to_owned()),
+            created_at: Some(Timestamp::from_millis(10)),
+            expires_at: Some(Timestamp::from_millis(20)),
+            version: 9,
+        }
+    }
+
+    fn flags(description: Option<&str>, labels: &[&str]) -> NewMetadata {
+        NewMetadata {
+            description: description.map(|text| text.parse().expect("a description")),
+            labels: Labels::try_from_pairs(
+                labels
+                    .iter()
+                    .map(|label| parse_label(label).expect("a label")),
+            )
+            .expect("few labels"),
+        }
+    }
+
+    #[test]
+    fn an_archived_description_is_set_without_an_author_and_labels_are_set() {
+        let restored = restored_metadata(
+            &archived(Some("Notes."), &[("agent", "7"), ("purpose", "memory")]),
+            &NewMetadata::default(),
+        );
+        assert_eq!(
+            restored.change.description,
+            DescriptionChange::SetWithoutAuthor("Notes.".parse().expect("description"))
+        );
+        let keys: Vec<&str> = restored
+            .change
+            .set_labels
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(keys, ["agent", "purpose"]);
+        // Nothing of the archive's claims about the expiry, creator, or author is a change.
+        assert!(!restored.change.touches_expiry());
+        assert!(restored.change.remove_labels.is_empty());
+        assert!(restored.skipped.is_empty());
+    }
+
+    #[test]
+    fn restore_flags_win_over_the_archive() {
+        let restored = restored_metadata(
+            &archived(Some("Archived."), &[("agent", "7"), ("purpose", "memory")]),
+            &flags(Some("Mine."), &["purpose=scratch"]),
+        );
+        assert_eq!(restored.change.description, DescriptionChange::Keep);
+        let labels: Vec<(&str, &str)> = restored
+            .change
+            .set_labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(labels, [("agent", "7")], "the flag's value stays");
+        assert!(restored.skipped.is_empty());
+
+        let only_labels = restored_metadata(&archived(None, &[]), &flags(Some("Mine."), &[]));
+        assert!(only_labels.change.is_empty());
+    }
+
+    #[test]
+    fn invalid_archived_text_is_skipped_and_named() {
+        let restored = restored_metadata(
+            &archived(
+                Some("clear\u{1b}[2J"),
+                &[("good", "yes"), ("-bad", "x"), ("fleetring.dev/x", "y")],
+            ),
+            &NewMetadata::default(),
+        );
+        assert_eq!(restored.change.description, DescriptionChange::Keep);
+        assert_eq!(restored.change.set_labels.len(), 1, "only `good` is valid");
+        assert_eq!(restored.skipped.len(), 3, "{:?}", restored.skipped);
+    }
+
+    #[test]
+    fn archived_labels_over_the_limit_with_the_flags_are_skipped_together() {
+        let many: Vec<(String, String)> = (0..MAX_LABELS)
+            .map(|n| (format!("k{n}"), "v".to_owned()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = many
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let restored = restored_metadata(&archived(None, &borrowed), &flags(None, &["extra=1"]));
+        assert!(restored.change.set_labels.is_empty());
+        assert_eq!(restored.skipped.len(), 1, "{:?}", restored.skipped);
+        // Without the flag they fit.
+        let fits = restored_metadata(&archived(None, &borrowed), &NewMetadata::default());
+        assert_eq!(fits.change.set_labels.len(), MAX_LABELS);
+    }
 }

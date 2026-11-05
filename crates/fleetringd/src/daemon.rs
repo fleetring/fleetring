@@ -15,12 +15,12 @@ use crate::auth::{AuthLayer, Authorizer};
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::{HEARTBEATS_PER_TIMEOUT, reachable};
 use crate::control::{
-    ControlHandle, ControlNode, ControlOptions, ControlService, Failover, FailoverSettings,
-    NoControl, OpenError,
+    ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService, Failover,
+    FailoverSettings, NoControl, OpenError,
 };
 use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSettings};
 use crate::dev::DevMode;
-use crate::durability::{Archive, ArchiveError, ArchiveParts, build_store};
+use crate::durability::{Archive, ArchiveError, ArchiveParts, ControlMetadata, build_store};
 use crate::engine::{DatabaseEngine, Execution, InvalidPageSizeError, SqliteEngine};
 use crate::environment::{Environment, Network};
 use crate::observe::admin::{self, AdminParts, AdminTlsParts, RunningAdmin};
@@ -673,7 +673,7 @@ fn start_data(
         .iter()
         .map(|sink| build_sink(sink, config.engine.execution))
         .collect::<Result<Vec<_>, _>>()?;
-    let archives = start_archives(config, environment, &replication, &archive_engine)?;
+    let archives = start_archives(config, environment, &replication, &archive_engine, &control)?;
     sinks.extend(archives.iter().map(Archive::sink));
     let changes = ChangeStreams::start(ChangeParts {
         sinks,
@@ -720,6 +720,7 @@ fn start_archives(
     environment: &Environment,
     replication: &Replication,
     engine: &Arc<dyn DatabaseEngine>,
+    control: &ControlClient,
 ) -> Result<Vec<Archive>, StartError> {
     config
         .archive
@@ -734,6 +735,7 @@ fn start_archives(
                 engine: Arc::clone(engine),
                 clock: environment.clock(),
                 execution: config.engine.execution,
+                metadata: Arc::new(ControlMetadata::new(control.clone())),
             };
             let archive = Archive::new(entry, store, parts)?;
             tracing::info!(archive = %entry.name, store = ?entry.store, prefix = %entry.prefix, "archiving databases");

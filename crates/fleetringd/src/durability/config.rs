@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::keys::METADATA_DIR;
 use super::s3::{CredentialSource, HttpPolicy, PathStyle, S3Settings};
 use super::store::check_key;
 use crate::changes::{DatabaseMatcher, DatabaseMatchers};
@@ -241,7 +242,10 @@ impl ArchiveConfig {
                 "archive `{name}` names no databases; add `databases = [\"*\"]` to archive every one"
             )));
         }
-        if !self.prefix.is_empty() && check_key(&self.prefix).is_err() {
+        if !self.prefix.is_empty()
+            && (check_key(&self.prefix).is_err()
+                || self.prefix.split('/').any(|part| part == METADATA_DIR))
+        {
             return Err(invalid(format!(
                 "archive `{name}` has prefix `{}`: it must be `/`-separated parts, none empty or \
                  starting with `.`, with no leading or trailing `/`",

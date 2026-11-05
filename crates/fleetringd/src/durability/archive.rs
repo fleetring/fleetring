@@ -9,11 +9,12 @@ use fleetring_control::{DatabaseName, LeaseEpoch};
 
 use super::config::{ArchiveConfig, ArchiveSettings, StoreKind};
 use super::format::{
-    FORMAT, SegmentHeader, SnapshotDescriptor, checksum_hex, decode_segment, encode_descriptor,
-    encode_segment,
+    FORMAT, MAX_METADATA_BYTES, SegmentHeader, SnapshotDescriptor, checksum_hex, decode_segment,
+    encode_descriptor, encode_metadata, encode_segment,
 };
 use super::keys::{ArchiveKeys, SegmentName};
 use super::listing::Listing;
+use super::metadata::MetadataSource;
 use super::retention::{apply_retention, retention};
 use super::s3::{S3ConfigError, S3Store};
 use super::store::{DirectoryStore, ObjectStore, retrying};
@@ -40,6 +41,8 @@ pub struct ArchiveParts {
     pub clock: Arc<dyn Clock>,
     /// Where blocking reads of a snapshot's files run: inline under simulation.
     pub execution: Execution,
+    /// Where a snapshot gets its database's metadata (ADR-0041, point 10).
+    pub metadata: Arc<dyn MetadataSource>,
 }
 
 /// The error returned when an archive can't be built.
@@ -112,6 +115,7 @@ struct Inner {
     engine: Arc<dyn DatabaseEngine>,
     clock: Arc<dyn Clock>,
     execution: Execution,
+    metadata: Arc<dyn MetadataSource>,
     /// Each database's state, behind a lock its sink and its snapshots share.
     databases_state: Mutex<BTreeMap<DatabaseName, Arc<tokio::sync::Mutex<DbArchive>>>>,
 }
@@ -153,6 +157,9 @@ enum Continuity {
         chain: ChainHash,
     },
 }
+
+/// How long a snapshot waits for its database's metadata before it is archived without it.
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Archive {
     /// The archive an `[[archive]]` entry describes, writing to `store`.
@@ -206,6 +213,7 @@ impl Archive {
                 engine: parts.engine,
                 clock: parts.clock,
                 execution: parts.execution,
+                metadata: parts.metadata,
                 databases_state: Mutex::default(),
             }),
         })
@@ -539,6 +547,7 @@ impl Inner {
             .finish()
             .map_err(|error| format!("the snapshot changed while it was read: {error}"))?;
         drop(packer);
+        self.put_metadata(keys, database, &id).await?;
         let descriptor = SnapshotDescriptor {
             format: FORMAT,
             database: database.to_string(),
@@ -566,6 +575,40 @@ impl Inner {
         state.last_snapshot_ms = Some(taken_at_ms);
         self.prune(keys, database).await;
         Ok(())
+    }
+
+    /// Writes the metadata object of snapshot `id`, if `database` has metadata, before the
+    /// snapshot's descriptor. A source that fails, or metadata that is too large, doesn't fail
+    /// the snapshot: it is written without, and the next snapshot carries the metadata. Only a
+    /// failed upload does, since the store is then failing the snapshot's other objects too.
+    async fn put_metadata(
+        &self,
+        keys: &ArchiveKeys,
+        database: &DatabaseName,
+        id: &str,
+    ) -> Result<(), String> {
+        let found =
+            match tokio::time::timeout(METADATA_TIMEOUT, self.metadata.metadata(database)).await {
+                Ok(found) => found,
+                Err(_) => Err(format!("no answer in {}s", METADATA_TIMEOUT.as_secs())),
+            };
+        let metadata = match found {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(archive = %self.name, %database, %error, "the snapshot is archived without its database's metadata; the next snapshot carries it");
+                return Ok(());
+            }
+        };
+        let bytes = encode_metadata(&metadata);
+        if bytes.len() > MAX_METADATA_BYTES {
+            tracing::warn!(archive = %self.name, %database, bytes = bytes.len(), "the database's metadata is too large to archive; the snapshot is archived without it");
+            return Ok(());
+        }
+        let key = keys.metadata(id, &checksum_hex(&bytes));
+        retrying(|| self.store.put(&key, bytes.clone()))
+            .await
+            .map_err(|error| format!("can't upload {key}: {error}"))
     }
 
     /// Deletes what retention says no kept snapshot's path can use. A failure leaves the rest
