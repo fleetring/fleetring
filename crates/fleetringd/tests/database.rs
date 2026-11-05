@@ -4257,7 +4257,8 @@ mod orphans {
 
     /// Sends `DropCopy` for `database` at each of `epochs` to every data daemon, as the node
     /// `data-1`'s certificate, as a stolen node key or a control node retrying late would, and
-    /// checks that each node refuses it for its binding.
+    /// checks that each node refuses it: for its binding where control state holds the database
+    /// at that epoch or later, and as naming another incarnation than its copy's otherwise.
     async fn drop_copy_refused_everywhere(
         fleet: &Fleet,
         database: &str,
@@ -4274,15 +4275,18 @@ mod orphans {
                     })
                     .await
                     .expect_err("not a drop of this copy");
-                assert_eq!(refused.code(), Code::PermissionDenied, "{id}: {refused}");
-                assert_eq!(
-                    refused
-                        .metadata()
-                        .get("fleetring-binding")
-                        .and_then(|value| value.to_str().ok()),
-                    Some("dropped"),
-                    "{id}: {refused}"
-                );
+                let binding = refused
+                    .metadata()
+                    .get("fleetring-binding")
+                    .and_then(|value| value.to_str().ok());
+                match refused.code() {
+                    Code::PermissionDenied => assert_eq!(binding, Some("dropped"), "{id}"),
+                    Code::FailedPrecondition => assert!(
+                        refused.message().contains("not the dropped epoch"),
+                        "{id}: {refused}"
+                    ),
+                    _ => return Err(format!("{id}: {refused}").into()),
+                }
             }
         }
         Ok(())

@@ -350,13 +350,20 @@ pub(super) async fn check_promote(
     Err(refuse(inner, Some(database), denied))
 }
 
-/// Checks a `DropCopy` naming `database` at `epoch`, whoever made it (ADR-0042): the drop stands
-/// only if `epoch` is exactly the highest epoch this node's copy recorded, so the notice names
-/// this copy's incarnation, and control state no longer holds the database, or holds a newer one
-/// of the name at a lower epoch. A live database's control epoch equals its copies' highest, and
-/// a database created again under the name restarts its epochs, so neither a forged notice nor a
-/// late one for an earlier incarnation passes. A node certificate is refused with the binding;
-/// a plaintext caller with `FAILED_PRECONDITION`.
+/// Checks a `DropCopy` naming `database` at `epoch`, whoever made it (ADR-0042). The drop
+/// stands only if control state no longer holds the database, or holds a newer one of the name at
+/// a lower epoch, and `epoch` is exactly the highest epoch this node's copy recorded, so the
+/// notice names this copy's incarnation. A live database's control epoch equals its copies'
+/// highest, and a database created again under the name restarts its epochs, so neither a
+/// forged notice nor a late one for an earlier incarnation deletes anything.
+///
+/// # Errors
+///
+/// - A notice for a database control state still holds at `epoch` or later fails the binding:
+///   `PERMISSION_DENIED` for a node certificate, `FAILED_PRECONDITION` for a plaintext caller.
+/// - One whose epoch isn't this node's copy's gets `FAILED_PRECONDITION`, and changes nothing: a
+///   replica that missed a promotion is told of the drop honestly, and keeps its copy as an
+///   orphan. A node with no copy of the name accepts it, and has nothing to delete.
 pub(super) async fn check_drop(
     inner: &Inner,
     database: &DatabaseName,
@@ -364,24 +371,31 @@ pub(super) async fn check_drop(
     caller: Option<&NodeId>,
 ) -> Result<(), Status> {
     let lease_epoch = LeaseEpoch::new(epoch);
-    if inner.epochs.highest(database) == Some(epoch) {
-        match inner.authority.holders(database).await {
-            Ok(holders) if holders.epoch < lease_epoch => return Ok(()),
-            Ok(_) => {}
-            Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
-            Err(status) => return Err(status),
-        }
-    }
-    let reason = Unbound::NotDropped {
-        database: database.clone(),
-        epoch: lease_epoch,
+    let dropped = match inner.authority.holders(database).await {
+        Ok(holders) => holders.epoch < lease_epoch,
+        Err(status) if status.code() == tonic::Code::NotFound => true,
+        Err(status) => return Err(status),
     };
-    match caller {
-        Some(caller) => {
-            let denied = BindingDenied::new("DropCopy", caller.clone(), reason);
-            Err(refuse(inner, Some(database), denied))
-        }
-        None => Err(Status::failed_precondition(reason.to_string())),
+    if !dropped {
+        let reason = Unbound::NotDropped {
+            database: database.clone(),
+            epoch: lease_epoch,
+        };
+        return match caller {
+            Some(caller) => {
+                let denied = BindingDenied::new("DropCopy", caller.clone(), reason);
+                Err(refuse(inner, Some(database), denied))
+            }
+            None => Err(Status::failed_precondition(reason.to_string())),
+        };
+    }
+    match inner.epochs.highest(database) {
+        None => Ok(()),
+        Some(highest) if highest == epoch => Ok(()),
+        Some(highest) => Err(Status::failed_precondition(format!(
+            "this node's copy of {database} is at epoch {highest}, not the dropped epoch {epoch}; \
+             it keeps the copy"
+        ))),
     }
 }
 
