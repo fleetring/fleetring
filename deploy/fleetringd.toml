@@ -152,7 +152,8 @@ id = "node-1"
 # token_env = "HOOKS_TOKEN"
 #
 # `http://` urls are refused, since every change would leave the node in plaintext, unless the
-# sink says so. Use it for a receiver on the same machine, and never with a token.
+# sink says so. Use it for a receiver on the same machine, and never with a token. An https://
+# url always uses TLS, whatever this says.
 # allow_http = true
 
 # [[archive]]
