@@ -122,6 +122,9 @@ pub(super) struct Inner {
     staging: tokio::sync::Semaphore,
     /// Held per database while it is created or restored here, so that two never race.
     creating: NameLocks,
+    /// The dropped databases whose copies this node is flushing and deleting ([`Retiring`]).
+    /// A new database of the same name isn't created or restored here meanwhile.
+    retiring: Mutex<BTreeSet<DatabaseName>>,
     /// Where writes, queries, renewals, transfers, and promotions are counted.
     metrics: DataMetrics,
 }
@@ -174,6 +177,25 @@ impl Drop for Counted<'_> {
     }
 }
 
+/// What a node answers a creation or restore of a name whose dropped database it is still
+/// flushing or deleting; a client retries it ([`DataNode::check_not_dropping`]).
+pub(crate) const BEING_DROPPED: &str = "is being dropped on this node; retry in a moment";
+
+/// Marks a dropped database whose copy this node is flushing and deleting, until dropped. While
+/// it lives, the node refuses to create or restore a database of the same name, so the
+/// deletion can't take the new database's files (ADR-0041, point 4).
+#[derive(Debug)]
+pub(crate) struct Retiring {
+    node: DataNode,
+    name: DatabaseName,
+}
+
+impl Drop for Retiring {
+    fn drop(&mut self) {
+        self.node.lock_retiring().remove(&self.name);
+    }
+}
+
 /// A request [`DataNode::route`] admitted on a database this node is primary for. A drain that
 /// starts while it lives waits for it to be dropped before it steps down, so that its write
 /// isn't cut off between its commit and replication: drop it once the write is in
@@ -220,6 +242,7 @@ impl DataNode {
                 draining: tokio::sync::Mutex::new(()),
                 staging: tokio::sync::Semaphore::new(1),
                 creating: NameLocks::default(),
+                retiring: Mutex::new(BTreeSet::new()),
                 metrics,
             }),
         }
@@ -236,6 +259,52 @@ impl DataNode {
 
     pub(crate) fn replication(&self) -> &Replication {
         &self.inner.replication
+    }
+
+    fn lock_retiring(&self) -> MutexGuard<'_, BTreeSet<DatabaseName>> {
+        self.inner
+            .retiring
+            .lock()
+            .expect("retiring databases lock poisoned")
+    }
+
+    /// Marks `name`'s copy as being retired, because its database was dropped, until the
+    /// returned guard is dropped. Take it before serving stops.
+    pub(super) fn begin_retiring(&self, name: &DatabaseName) -> Retiring {
+        self.lock_retiring().insert(name.clone());
+        Retiring {
+            node: self.clone(),
+            name: name.clone(),
+        }
+    }
+
+    /// Refuses a new database named `name` while this node still holds a dropped database of
+    /// that name: it serves it, or is flushing and deleting its copy. Creating the new one now
+    /// would open the old files as its own, and the old copy's deletion would then take them.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` saying the name [`BEING_DROPPED`]; a client retries it.
+    fn check_not_dropping(&self, name: &DatabaseName) -> Result<(), Status> {
+        if self.lock_retiring().contains(name) || self.inner.replication.serving(name).is_some() {
+            return Err(Status::unavailable(format!("{name} {BEING_DROPPED}")));
+        }
+        Ok(())
+    }
+
+    /// Deletes what this node holds of an earlier database named `name`: the control plane's
+    /// `name` has never been leased, so no epoch this node recorded for it belongs to it.
+    async fn discard_past_incarnation(&self, name: &DatabaseName) -> Result<(), Status> {
+        if self.inner.replication.highest_epoch(name).is_none() {
+            return Ok(());
+        }
+        tracing::info!(database = %name, "deleting a dropped database's copy before creating its successor");
+        self.forget_any(name);
+        self.inner
+            .replication
+            .discard(name)
+            .await
+            .map_err(|error| Status::internal(format!("can't remove the old copy: {error}")))
     }
 
     pub(crate) fn change_streams(&self) -> &ChangeStreams {
@@ -316,7 +385,10 @@ impl DataNode {
             )));
         }
         // Never leased, so nothing in a copy here was ever acknowledged: it is what a failed
-        // restore or create left.
+        // restore or create left, or an earlier database's, which waits for its deletion if it
+        // is under way.
+        self.check_not_dropping(name)?;
+        self.discard_past_incarnation(name).await?;
         self.registry().close(name).await;
         self.registry()
             .remove(name)
@@ -447,6 +519,10 @@ impl DataNode {
                         "{id} isn't in the replica set of {name}"
                     )));
                 }
+                // Never leased, so a copy here is an earlier database's: wait for its deletion
+                // if it is under way, or delete it now.
+                self.check_not_dropping(name)?;
+                self.discard_past_incarnation(name).await?;
                 let lease = self
                     .inner
                     .control

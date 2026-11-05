@@ -168,9 +168,6 @@ pub struct Membership {
     current: Arc<ArcSwap<MembershipView>>,
     updates: watch::Receiver<Arc<MembershipView>>,
     denylist: Denylist,
-    /// The databases this node reported that the control plane said it doesn't know, as of the
-    /// last heartbeat reply.
-    unknown: Arc<watch::Sender<std::collections::BTreeSet<String>>>,
 }
 
 impl Membership {
@@ -239,7 +236,6 @@ impl Membership {
                 limit: reply_limit(interval),
                 databases: Box::new(databases),
                 unknown: std::collections::BTreeSet::new(),
-                published_unknown: Arc::clone(&membership.unknown),
                 denylist: membership.denylist.clone(),
                 metrics,
             },
@@ -286,13 +282,11 @@ impl Membership {
             updates: sender,
         };
         let denylist = Denylist::new();
-        let (unknown, _) = watch::channel(std::collections::BTreeSet::new());
         (
             Self {
                 current,
                 updates,
                 denylist,
-                unknown: Arc::new(unknown),
             },
             publisher,
         )
@@ -303,12 +297,6 @@ impl Membership {
     #[must_use]
     pub fn denylist(&self) -> &Denylist {
         &self.denylist
-    }
-
-    /// The databases this node reported in its last answered heartbeat that the control plane
-    /// doesn't know: dropped ones, among them, whose copies this node still holds.
-    pub(crate) fn unknown_databases(&self) -> std::collections::BTreeSet<String> {
-        self.unknown.borrow().clone()
     }
 
     /// Returns the current ring, or `None` before the node has heard of any member.
@@ -705,8 +693,6 @@ struct Heartbeats {
     databases: Box<dyn DatabaseStatuses>,
     /// The reported databases the control plane said it doesn't know, as of the last reply.
     unknown: std::collections::BTreeSet<String>,
-    /// Where the membership publishes them.
-    published_unknown: Arc<watch::Sender<std::collections::BTreeSet<String>>>,
     /// Where each reply's denylist goes.
     denylist: Denylist,
     /// Where heartbeats are counted and timed.
@@ -734,7 +720,6 @@ impl Heartbeats {
             for database in unknown.difference(&self.unknown) {
                 tracing::warn!(node = %id, database, "the control plane doesn't know this database; its reports are ignored");
             }
-            self.published_unknown.send_replace(unknown.clone());
             self.unknown = unknown;
             self.denylist
                 .replace(revocations_from_proto(response.revocations.clone()));

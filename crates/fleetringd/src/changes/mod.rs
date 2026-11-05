@@ -452,12 +452,6 @@ impl ChangeStreams {
         }
     }
 
-    /// Whether a [`HeldStreams`] keeps `database`'s streams: its primary is flushing them
-    /// before it deletes its copy.
-    pub(crate) fn is_held(&self, database: &DatabaseName) -> bool {
-        self.inner.lock_held().contains_key(database)
-    }
-
     /// Waits until every change stream of `database` has delivered everything acknowledged, up
     /// to the copy's current end, or until `limit` passes. An archive puts its open segment at
     /// once, whatever its `segment_interval_ms`. A database with no change streams is delivered
