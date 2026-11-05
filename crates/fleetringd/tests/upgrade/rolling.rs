@@ -49,6 +49,15 @@ fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
     Ok(Some(bin))
 }
 
+/// The release `bin` says it is.
+fn release_of(bin: &Path) -> TestResult<fleetring_control::Release> {
+    let printed = Command::new(bin).arg("--version").output()?;
+    Ok(String::from_utf8_lossy(&printed.stdout)
+        .trim()
+        .trim_start_matches("fleetringd ")
+        .parse()?)
+}
+
 /// Whether the binary at `bin` has the `upgrade` command.
 fn has_upgrade(bin: &Path) -> TestResult<bool> {
     Ok(Command::new(bin)
@@ -76,6 +85,9 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         );
         return Ok(());
     };
+    // `node undrain` is the first fleet feature (0.4.0): a baseline before it makes the fleet
+    // refuse the command until every member is upgraded.
+    let baseline_lacks_undrain = release_of(&baseline)? < fleetring_control::Release::new(0, 4, 0);
     let mut fleet = ProcessFleet::start_release(&scratch.path().join("fleet"), &baseline, 3)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let client = fleet.client()?;
@@ -163,7 +175,7 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         runtime.block_on(wait_for_members(&client, &[id.as_str()], expected.as_ref()))?;
         progress(&format!("{id} runs {}", current()));
 
-        if index == 2 {
+        if index == 2 && baseline_lacks_undrain {
             // A mixed fleet refuses a command a member doesn't support, whichever release its
             // control node runs: the old one doesn't know it, the new one gates it.
             let refused = fleet
