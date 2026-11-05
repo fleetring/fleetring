@@ -3498,7 +3498,7 @@ mod expiry {
     /// A name created again right after its database was dropped gets a new, empty database:
     /// the node still flushing the old copy makes the creation wait, and the old copy's deletion
     /// never takes the new database's files, on its primary or on its followers (ADR-0041,
-    /// amendment 6).
+    /// amendment 7).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_name_created_again_right_after_a_drop_starts_empty() -> TestResult {
         const LIMIT: Duration = Duration::from_secs(3);
