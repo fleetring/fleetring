@@ -41,6 +41,10 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Revocations::is_empty")]
     pub(crate) revocations: Revocations,
     /// The fleet features enabled for good. Absent from states written before features.
+    ///
+    /// Unlike a member's [`Software`](crate::Software), this decodes strictly: a release that
+    /// doesn't know an enabled feature mustn't run the fleet, so its control node fails to load
+    /// the state rather than drop the name (ADR-0041, amendment 1).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) features: BTreeSet<Feature>,
 }
