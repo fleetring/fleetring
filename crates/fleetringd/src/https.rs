@@ -1,9 +1,10 @@
-//! The HTTP client the S3 store sends its requests with: the daemon's own `hyper` over TCP, with
-//! TLS from `tokio-rustls` and `ring`, trusting the platform's roots and any extra authority.
+//! The HTTP client the daemon's outbound HTTP uses, the S3 store and the webhook sink: its own
+//! `hyper` over TCP, with TLS from `tokio-rustls` and `ring`, trusting the platform's roots and
+//! any extra authority, and presenting a client certificate when given one.
 
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -17,19 +18,60 @@ use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject as _;
-use rustls_pki_types::{CertificateDer, ServerName};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use zeroize::Zeroizing;
 
-use super::{HttpPolicy, S3ConfigError};
+/// Whether a plain `http://` endpoint may be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpPolicy {
+    /// Only `https://`.
+    #[default]
+    HttpsOnly,
+    /// `http://` too, for a local service and nothing else.
+    AllowHttp,
+}
 
-/// The client type the store holds.
+/// The error returned when the client's TLS can't be set up.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HttpsError {
+    /// The extra authority can't be read.
+    #[error("authority {}: {reason}", path.display())]
+    Ca {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
+    /// The client certificate or its key can't be read.
+    #[error("client certificate {}: {reason}", path.display())]
+    ClientCertificate {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
+    /// TLS can't be set up.
+    #[error("can't set up TLS: {reason}")]
+    Tls {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// The client type callers hold.
 pub(crate) type HttpClient = Client<Connector, Full<Bytes>>;
 
 /// Builds the client: TLS for `https://` with the platform's roots plus the PEM certificates in
-/// `ca`, and plain TCP for `http://` only under [`HttpPolicy::AllowHttp`].
-pub(crate) fn client(ca: Option<&Path>, http: HttpPolicy) -> Result<HttpClient, S3ConfigError> {
+/// `ca`, presenting the certificate chain and key in `identity` (`(certificate, key)` PEM files)
+/// if given, and plain TCP for `http://` only under [`HttpPolicy::AllowHttp`].
+pub(crate) fn client(
+    ca: Option<&Path>,
+    identity: Option<(&Path, &Path)>,
+    http: HttpPolicy,
+) -> Result<HttpClient, HttpsError> {
     let mut roots = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for error in &native.errors {
@@ -37,7 +79,7 @@ pub(crate) fn client(ca: Option<&Path>, http: HttpPolicy) -> Result<HttpClient, 
     }
     let (_added, _ignored) = roots.add_parsable_certificates(native.certs);
     if let Some(ca) = ca {
-        let invalid = |reason: String| S3ConfigError::Ca {
+        let invalid = |reason: String| HttpsError::Ca {
             path: ca.to_owned(),
             reason,
         };
@@ -55,19 +97,53 @@ pub(crate) fn client(ca: Option<&Path>, http: HttpPolicy) -> Result<HttpClient, 
         }
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|error| S3ConfigError::Tls {
+        .map_err(|error| HttpsError::Tls {
             reason: error.to_string(),
         })?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+    let mut config = match identity {
+        None => builder.with_no_client_auth(),
+        Some((certificate, key)) => {
+            let (chain, key) = read_identity(certificate, key)?;
+            builder.with_client_auth_cert(chain, key).map_err(|error| {
+                HttpsError::ClientCertificate {
+                    path: certificate.to_owned(),
+                    reason: error.to_string(),
+                }
+            })?
+        }
+    };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let connector = Connector {
         tls: TlsConnector::from(Arc::new(config)),
         http,
     };
     Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+/// Reads a PEM certificate chain and its PEM private key. The key's text is zeroed once parsed.
+fn read_identity(
+    certificate: &Path,
+    key: &Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), HttpsError> {
+    let invalid = |path: &Path, reason: String| HttpsError::ClientCertificate {
+        path: path.to_owned(),
+        reason,
+    };
+    let pem =
+        std::fs::read(certificate).map_err(|error| invalid(certificate, error.to_string()))?;
+    let chain = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| invalid(certificate, format!("not a PEM certificate chain: {error}")))?;
+    if chain.is_empty() {
+        return Err(invalid(certificate, "holds no certificate".to_owned()));
+    }
+    let pem = Zeroizing::new(std::fs::read(key).map_err(|error| invalid(key, error.to_string()))?);
+    let key = PrivateKeyDer::from_pem_slice(&pem)
+        .map_err(|error| invalid(key, format!("not a PEM private key: {error}")))?;
+    Ok((chain, key))
 }
 
 /// Dials a request's host: TLS for `https://`, plain TCP for `http://` when allowed.
@@ -126,7 +202,7 @@ impl tower::Service<Uri> for Connector {
     }
 }
 
-/// A connection to the store: plain TCP or TLS over it.
+/// A connection to the server: plain TCP or TLS over it.
 #[derive(Debug)]
 pub(crate) enum Stream {
     Plain(TokioIo<TcpStream>),

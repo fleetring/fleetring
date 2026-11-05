@@ -2,7 +2,6 @@
 //! replies without doing I/O, over the daemon's own `hyper` and `rustls` (ADR-0029, point 15).
 
 mod credentials;
-pub(crate) mod http;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -17,9 +16,11 @@ use rusty_s3::{Bucket, S3Action, UrlStyle};
 use tokio::time;
 
 use self::credentials::CredentialStore;
-use self::http::HttpClient;
 use super::store::{ObjectEntry, ObjectStore, StoreError, StoreFuture, check_key, check_prefix};
 use crate::clock::Clock;
+use crate::https::{self, HttpClient, HttpsError};
+
+pub use crate::https::HttpPolicy;
 
 /// How long a signed request stays valid.
 const SIGNED_FOR: Duration = Duration::from_secs(60);
@@ -41,16 +42,6 @@ pub enum PathStyle {
     VirtualHost,
     /// `https://<endpoint host>/<bucket>/<key>`, as MinIO and most self-hosted services need.
     Path,
-}
-
-/// Whether a plain `http://` endpoint may be used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HttpPolicy {
-    /// Only `https://`.
-    #[default]
-    HttpsOnly,
-    /// `http://` too, for a local MinIO and nothing else.
-    AllowHttp,
 }
 
 /// Where a store's static credentials come from (ADR-0029, point 14).
@@ -131,6 +122,18 @@ pub enum S3ConfigError {
     },
 }
 
+impl From<HttpsError> for S3ConfigError {
+    fn from(error: HttpsError) -> Self {
+        match error {
+            HttpsError::Ca { path, reason } => Self::Ca { path, reason },
+            HttpsError::Tls { reason } => Self::Tls { reason },
+            other @ HttpsError::ClientCertificate { .. } => Self::Tls {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
 /// A store in an S3-compatible bucket: AWS S3, MinIO, Cloudflare R2, Garage, and the like.
 ///
 /// Each call is one request, or a few for a `list` that pages: signed with the time from the
@@ -200,7 +203,7 @@ impl S3Store {
             other => return Err(invalid(format!("unsupported scheme {other}"))),
         }
         let credentials = CredentialStore::new(&settings.credentials, Arc::clone(&clock))?;
-        let client = http::client(settings.ca.as_deref(), settings.http)?;
+        let client = https::client(settings.ca.as_deref(), None, settings.http)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 bucket,

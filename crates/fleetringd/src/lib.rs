@@ -19,6 +19,7 @@ mod data_dir;
 pub mod durability;
 pub mod engine;
 mod environment;
+mod https;
 mod layout;
 mod membership;
 pub mod observe;
