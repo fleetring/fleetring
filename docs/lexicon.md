@@ -693,10 +693,10 @@ Returning a node to the binary its last [upgrade](#upgrade) replaced, kept besid
 
 ### Schema
 
-*Planned* (FR-070 phase 4). A database's tables, views, indexes, triggers, and virtual tables with their definitions, as its engine adapter reports them, and capped row counts (ADR-0041, point 6).
+A database's tables, views, indexes, triggers, and virtual tables with their definitions, as its engine adapter reports them, and capped row counts (ADR-0041, point 6). The primary answers; the engine's own tables and reserved objects are left out unless asked for.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** *planned* `engine::Schema`, `Database.Schema`. **CLI:** *planned*, the schema section of `db show`.
+- **Code:** `engine::Schema`, `Database.Schema`, `data::SchemaView`, `report::SchemaReport`. **CLI:** the schema section of `db show`, with `--no-schema`, `--count-limit`, and `--all`.
 - **Not:** catalog, DDL (fine in prose), spec (that's placement's).
 
 ### Scope
