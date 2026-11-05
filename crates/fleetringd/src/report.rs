@@ -401,7 +401,14 @@ pub fn render_text(
     render_schema(report, out)
 }
 
-fn render_metadata(
+/// Writes `metadata` as key and value lines, as [`render_text`] prints its metadata section:
+/// the description as a block, then the labels, creator, creation time, expiry, and version.
+/// `reader` is the principal reading it, if known, for marking a description it didn't write.
+///
+/// # Errors
+///
+/// The error `out` returns.
+pub fn render_metadata(
     metadata: Option<&MetadataReport>,
     reader: Option<&str>,
     out: &mut dyn io::Write,
