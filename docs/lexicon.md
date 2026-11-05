@@ -501,10 +501,10 @@ A [sink](#sink)'s delivered [position](#position), kept inside the database so t
 
 ### MCP server
 
-*Planned* (FR-070 phase 6). `fleetringd mcp`: the Model Context Protocol over stdio, acting as one [principal](#principal) with that principal's [scopes](#scope), so an agent can create, use, and drop its own databases (ADR-0041, point 9).
+`fleetringd mcp`: the Model Context Protocol over stdio, acting as one [principal](#principal) with that principal's [scopes](#scope), so an agent can create, use, and drop its own databases (ADR-0041, point 9). Its tools are `db_create`, `db_list`, `db_show`, `query`, `exec`, `db_update`, and `db_drop`; text principals wrote reaches a result only in JSON string fields, and a [description](#description) carries its author and whether it is untrusted.
 
 - **Applies to:** daemon, CLI.
-- **Code:** *planned* `fleetringd::mcp`. **CLI:** *planned* `fleetringd mcp`.
+- **Code:** `fleetringd::mcp`. **CLI:** `fleetringd mcp`.
 - **Not:** agent server, plugin, connector, bridge.
 
 ### Member

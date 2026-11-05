@@ -29,6 +29,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Security: mutual TLS with a built-in certificate authority, principals with prefix scopes and signed, revocable tokens, statements confined to their database, node calls bound to placement, and signed, attested releases
 - Operations: `db create/exec/query/locate/list/drop/verify` and `status`, with a hash-chained log that shows whether every replica holds the same history; Prometheus metrics, health and readiness probes, request IDs, and JSON logs; `fleetringd upgrade`, verified with cosign, with rollback and a tested rolling upgrade
 - `fleetringd dev`: one command for a local node on a laptop, over the same TLS and scopes as a fleet
+- `fleetringd mcp`: an MCP server over stdio, so an agent creates, finds, queries, and drops its own databases as one scoped principal, with text others wrote marked untrusted
 
 **Planned**, each tracked as a [GitHub issue](https://github.com/fleetring/fleetring/issues):
 
@@ -39,7 +40,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Keyed leases, Merkle anti-entropy, and cells in the daemon
 - CLI contexts and JSON output, a terminal UI, and a desktop app
 - Archive follow-ups: acknowledging a write once it is archived, workload-identity credentials, and Vercel Blob
-- An agent kit with an MCP server, vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
+- The rest of the agent kit (database expiry and a skill), vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
 - apt, yum, AUR, and Homebrew packages
 
 ## Install

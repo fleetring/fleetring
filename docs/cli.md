@@ -29,7 +29,7 @@ fleetringd context use home
   | `undrain` | clear a drain mark, so the node takes work again | no |
   | `drop`, `remove`, `revoke` | delete for good | asks |
 
-- **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, `dev`, *planned* `mcp`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request. `dev` is the daemon too, run from a directory it prepares (ADR-0039), so it sits beside `--config` rather than under a noun. `mcp` (FR-070) is a long-running process that speaks the Model Context Protocol on stdio as one principal, as the router speaks its protocol (ADR-0037, ADR-0041 point 8), so it acts on many nouns and belongs under none.
+- **Top-level commands** are few: `status`, `ui`, `completions`, `upgrade`, `dev`, `mcp`, and the daemon itself (`fleetringd --config <file>`). A new one needs a reason in its pull request. `dev` is the daemon too, run from a directory it prepares (ADR-0039), so it sits beside `--config` rather than under a noun. `mcp` (FR-070) is a long-running process that speaks the Model Context Protocol on stdio as one principal, as the router speaks its protocol (ADR-0037, ADR-0041 point 8), so it acts on many nouns and belongs under none.
 - **Arguments** are for the thing the command acts on (`db drop <database>`); everything else is a flag. At most one positional kind per command, plus SQL and its parameters for `db exec` and `db query`.
 - **No aliases.** A command or flag has one spelling; a rename replaces it outright ([renames](#14-renames)).
 
@@ -193,7 +193,7 @@ As of the 0.3.0 renames (FR-059, FR-062). "Ticket" is where the gap closes.
 | Confirmation and `--yes` | `db drop` asks on a terminal and refuses elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask; the draining node logs `no other replica; the database is unavailable until this node returns` for a database that has none (FR-055). | FR-056 |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | FR-056 |
 | Completions and man pages | None. | FR-056 |
-| Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin (`db create`, `db restore`, `db set-description`); nothing else reads `-`. | FR-056 |
+| Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin (`db create`, `db restore`, `db set-description`); nothing else reads `-`. `mcp` speaks the Model Context Protocol on stdin and stdout, so stdout carries JSON-RPC messages and nothing else, and its logs go to stderr like every command's. | FR-056 |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | FR-056 |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0. | Done |
 | `upgrade` | `upgrade` installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place; `--check` changes nothing and exits 1 when the fleet doesn't allow the release, by its window or its enabled features; `node remove` takes out a member that is gone for good; `--timeout` bounds each step, 5m by default (ADR-0038). | Done (FR-054) |
