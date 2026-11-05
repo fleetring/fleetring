@@ -292,19 +292,28 @@ impl DataNode {
         Ok(())
     }
 
-    /// Deletes what this node holds of an earlier database named `name`: the control plane's
-    /// `name` has never been leased, so no epoch this node recorded for it belongs to it.
-    async fn discard_past_incarnation(&self, name: &DatabaseName) -> Result<(), Status> {
-        if self.inner.replication.highest_epoch(name).is_none() {
+    /// Refuses a database named `name` that has never been leased while this node holds a copy
+    /// of an earlier database of the name that it didn't see dropped: an orphan. A node deletes
+    /// a copy only after it saw the drop itself ([`Retiring`]); a control plane whose `name` is
+    /// new says nothing about what became of the old one, since an empty, older, or recreated
+    /// control state says the same (ADR-0041, amendment 6).
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` naming the orphan, its node, and its epoch, and how to remove it.
+    fn refuse_orphan(&self, name: &DatabaseName) -> Result<(), Status> {
+        let Some(epoch) = self.inner.replication.highest_epoch(name) else {
             return Ok(());
-        }
-        tracing::info!(database = %name, "deleting a dropped database's copy before creating its successor");
-        self.forget_any(name);
-        self.inner
-            .replication
-            .discard(name)
-            .await
-            .map_err(|error| Status::internal(format!("can't remove the old copy: {error}")))
+        };
+        let id = &self.inner.id;
+        tracing::warn!(database = %name, epoch = epoch.get(), "refused a new database over a copy of an earlier one this node didn't see dropped");
+        Err(Status::failed_precondition(format!(
+            "{name} has a copy on node {id} from epoch {} that the control plane doesn't know; \
+             if that database is gone for good, restart fleetringd on {id}, whose recovery pass \
+             deletes the copy, and try again (copy its files first to keep them), or use another \
+             name",
+            epoch.get()
+        )))
     }
 
     pub(crate) fn change_streams(&self) -> &ChangeStreams {
@@ -385,10 +394,10 @@ impl DataNode {
             )));
         }
         // Never leased, so nothing in a copy here was ever acknowledged: it is what a failed
-        // restore or create left, or an earlier database's, which waits for its deletion if it
-        // is under way.
+        // restore or create left. A dropped database's copy still being deleted makes it wait,
+        // and one this node didn't see dropped refuses it.
         self.check_not_dropping(name)?;
-        self.discard_past_incarnation(name).await?;
+        self.refuse_orphan(name)?;
         self.registry().close(name).await;
         self.registry()
             .remove(name)
@@ -520,9 +529,9 @@ impl DataNode {
                     )));
                 }
                 // Never leased, so a copy here is an earlier database's: wait for its deletion
-                // if it is under way, or delete it now.
+                // if it is under way, and refuse it if this node didn't see it dropped.
                 self.check_not_dropping(name)?;
-                self.discard_past_incarnation(name).await?;
+                self.refuse_orphan(name)?;
                 let lease = self
                     .inner
                     .control

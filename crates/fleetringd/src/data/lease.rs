@@ -9,10 +9,12 @@
 //!   followers fenced at a newer epoch refuse the old primary's batches, so it can't acknowledge
 //!   a write however long it takes to notice.
 //! - **Dropped databases.** A renewal refused as an unknown database means the database was
-//!   dropped, by `db drop` or because its expiry passed; so does one refused because the name
-//!   now belongs to a newer database that has never been leased, created right after the drop.
-//!   The primary stops serving it within one renewal interval of the drop, so it admits no write
-//!   after that. Before it deletes its copy, it flushes the database's change streams, its
+//!   dropped, by `db drop` or because its expiry passed. One refused because the name now
+//!   belongs to a database that has never been leased isn't: control state that was lost or
+//!   replaced looks the same, so the node demotes and keeps its copy, an orphan that a creation
+//!   or restore of the name on this node refuses, naming it. After a drop, the primary stops
+//!   serving within one renewal interval, so it admits no write after that. Before it deletes
+//!   its copy, it flushes the database's change streams, its
 //!   archive included, for up to [`DROP_FLUSH_LIMIT`] (ADR-0041, point 4): every stream
 //!   delivers what the copy acknowledged, and an archive puts its open segment at once, so the
 //!   archive holds every acknowledged write. A flush that runs out of time, or a primary that is
@@ -323,12 +325,14 @@ async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSe
             }
             Ok(Err(status)) if is_lost(&status) => {
                 if created_again(node, &database).await {
-                    tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped and its name created again");
-                    stop_dropped(node, &database, epoch, dropped).await;
+                    // Not proof of a drop: an empty or recreated control state looks the same.
+                    // The copy stays, an orphan a creation here refuses until an operator
+                    // removes it (ADR-0041, amendment 6).
+                    tracing::warn!(database = %database, epoch = epoch.get(), "the control plane's database of this name has never been leased; this node's copy from the earlier one is kept as an orphan");
                 } else {
                     tracing::warn!(database = %database, epoch = epoch.get(), %status, "lost the lease");
-                    demote(node, &database, epoch).await;
                 }
+                demote(node, &database, epoch).await;
             }
             Ok(Err(status)) => {
                 tracing::debug!(database = %database, %status, "can't renew the lease; still serving");
@@ -369,9 +373,9 @@ async fn stop_dropped(
     }
 }
 
-/// Whether the control plane's `database` is a newer database than the one this node leads: one
-/// created under the name after a drop, and never leased yet. Its control plane refuses the old
-/// lease as stale rather than unknown.
+/// Whether the control plane's `database` has never been leased, while this node leads one of
+/// the name: a database created under the name after a drop, or after the control state was
+/// lost or replaced. Its control plane refuses the old lease as stale rather than unknown.
 async fn created_again(node: &DataNode, database: &DatabaseName) -> bool {
     matches!(
         node.locate(database).await,
