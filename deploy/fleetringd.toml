@@ -67,8 +67,14 @@ id = "node-1"
 # address = "192.0.2.1:7400"
 
 # [replication]
-# The durability a database gets when `db create` names none (ADR-0023). Each database keeps the
-# settings it was created with; `db set-durability` changes them from its next epoch on.
+# The replication factor and durability a database gets when `db create` names none (ADR-0023,
+# ADR-0039). Each database keeps the settings it was created with; `db set-durability` changes
+# its durability from its next epoch on. The control node reads these; a data node ignores them.
+#
+# `replication_factor` is how many replicas a database has, the primary included: 3 by default,
+# at least 1. `fleetringd dev` sets it to 1. A database created with a larger factor than the
+# fleet has data nodes is accepted, with a warning, and gains replicas as nodes join.
+# replication_factor = 3
 #
 # `acks` says how many replicas must hold a write before it is acknowledged:
 #   "quorum"  a majority (the default): no acknowledged write is lost while a majority survives

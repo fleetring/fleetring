@@ -431,9 +431,11 @@ enum DbCommand {
     Create {
         /// The database's name.
         name: DatabaseName,
-        /// How many replicas it has, the primary included.
-        #[arg(long, default_value_t = 3)]
-        replication_factor: u8,
+        /// How many replicas it has, the primary included. The fleet's default if unset: the
+        /// control node's `[replication] replication_factor`, which is 3 unless its configuration
+        /// says otherwise, and 1 on a dev node.
+        #[arg(long)]
+        replication_factor: Option<u8>,
         /// How many replicas must store a write before it is acknowledged: `quorum` (a
         /// majority), `all` (every replica), or `local` (the primary alone; a failover may lose
         /// acknowledged writes). The fleet's default if unset.
@@ -514,9 +516,10 @@ enum DbCommand {
         from: DatabaseName,
         #[command(flatten)]
         point: PointArgs,
-        /// How many replicas the new database has, the primary included.
-        #[arg(long, default_value_t = 3)]
-        replication_factor: u8,
+        /// How many replicas the new database has, the primary included; the fleet's default if
+        /// unset, as for `db create`.
+        #[arg(long)]
+        replication_factor: Option<u8>,
         /// The acknowledgement mode, as for `db create`; the fleet's default if unset.
         #[arg(long)]
         acks: Option<Acks>,
@@ -1172,9 +1175,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             min_replicas,
             target,
         }) => {
-            let replication_factor = ReplicationFactor::new(replication_factor)
-                .ok_or("the replication factor must be at least 1")?;
-            let mut spec = DatabaseSpec::new(replication_factor);
+            let mut spec = database_spec(replication_factor)?;
             if let Some(acks) = acks {
                 spec = spec.with_acks(acks);
             }
@@ -1186,6 +1187,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .create_database_with(&name, spec)
                 .await
                 .map_err(failed)?;
+            warn_if_under_replicated(&location);
             format!("created {name}\n{}", format_location(&location))
         }
         Command::Db(DbCommand::SetDurability {
@@ -1251,9 +1253,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             acks,
             target,
         }) => {
-            let replication_factor = ReplicationFactor::new(replication_factor)
-                .ok_or("the replication factor must be at least 1")?;
-            let mut spec = DatabaseSpec::new(replication_factor);
+            let mut spec = database_spec(replication_factor)?;
             if let Some(acks) = acks {
                 spec = spec.with_acks(acks);
             }
@@ -1262,6 +1262,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .restore_database(&name, spec, &archive, &from, &point.target())
                 .await
                 .map_err(failed)?;
+            warn_if_under_replicated(&restored.location);
             format!(
                 "restored {name} from {from} in archive {archive}\n{}{}",
                 format_restored(
@@ -2264,6 +2265,53 @@ fn format_status(view: &MembershipView) -> String {
     output
 }
 
+/// What `db create` and `db restore` ask for: `replication_factor` replicas, or the fleet's
+/// default when the flag is absent.
+fn database_spec(replication_factor: Option<u8>) -> Result<DatabaseSpec, Box<dyn Error>> {
+    match replication_factor {
+        None => Ok(DatabaseSpec::default()),
+        Some(factor) => ReplicationFactor::new(factor)
+            .map(DatabaseSpec::new)
+            .ok_or_else(|| "the replication factor must be at least 1".into()),
+    }
+}
+
+/// Warns on stderr when a new database's replica set is smaller than its replication factor,
+/// because the fleet has fewer data nodes. The creation stands: placement fills the replica set
+/// as nodes join (ADR-0039).
+fn warn_if_under_replicated(location: &Location) {
+    if let Some(warning) = under_replicated(location) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// The warning [`warn_if_under_replicated`] prints, if any.
+fn under_replicated(location: &Location) -> Option<String> {
+    let factor = location.replication_factor.get();
+    let replicas = location.replicas.len();
+    if replicas >= usize::from(factor) {
+        return None;
+    }
+    let name = &location.database;
+    let floor = usize::from(location.durability.min_replicas());
+    let nodes = if replicas == 1 { "node" } else { "nodes" };
+    let consequence = if replicas < floor {
+        let missing = floor - replicas;
+        let verb = if missing == 1 { "joins" } else { "join" };
+        format!(
+            "its writes fail until {missing} more {verb}, or create it with a smaller \
+             --replication-factor"
+        )
+    } else {
+        let copies = if replicas == 1 { "replica" } else { "replicas" };
+        format!("it has {replicas} {copies} until more join")
+    };
+    Some(format!(
+        "{name} has a replication factor of {factor}, but the fleet has {replicas} data {nodes}: \
+         {consequence}"
+    ))
+}
+
 /// A failed call as one readable line: what kind of failure, and the server's message.
 fn failed(status: tonic::Status) -> Box<dyn Error> {
     format!("{}: {}", status.code().description(), status.message()).into()
@@ -2461,6 +2509,47 @@ mod tests {
         let refused = cli.check().expect_err("a daemon option beside dev");
         assert_eq!(refused.kind(), ErrorKind::ArgumentConflict);
         assert!(Cli::try_parse_from(["fleetringd", "dev", "--listen", "0.0.0.0:7400"]).is_err());
+    }
+
+    #[test]
+    fn db_create_leaves_the_replication_factor_to_the_fleet_unless_given() {
+        let factor = |words: &[&str]| {
+            let cli = Cli::try_parse_from(words).expect("db create parses");
+            let Some(Command::Db(DbCommand::Create {
+                replication_factor, ..
+            })) = cli.command
+            else {
+                panic!("not db create: {:?}", cli.command);
+            };
+            replication_factor
+        };
+        let control = ["--control", "127.0.0.1:7400"];
+        let unset = factor(&[&["fleetringd", "db", "create", "notes"][..], &control].concat());
+        assert_eq!(unset, None);
+        let two = factor(
+            &[
+                &[
+                    "fleetringd",
+                    "db",
+                    "create",
+                    "notes",
+                    "--replication-factor",
+                    "2",
+                ][..],
+                &control,
+            ]
+            .concat(),
+        );
+        assert_eq!(two, Some(2));
+
+        assert_eq!(database_spec(None).ok(), Some(DatabaseSpec::default()));
+        let two = ReplicationFactor::new(2).expect("nonzero");
+        assert_eq!(database_spec(Some(2)).ok(), Some(DatabaseSpec::new(two)));
+        let zero = database_spec(Some(0)).expect_err("a factor of 0");
+        assert_eq!(
+            zero.to_string(),
+            "the replication factor must be at least 1"
+        );
     }
 
     #[test]

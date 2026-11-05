@@ -784,6 +784,10 @@ fn config_text(dir: &Path, port: u16) -> Result<String, DevError> {
          # A stop keeps the node's databases placed on it, for the next start.\n\
          on_shutdown = \"stay\"\n\
          \n\
+         [replication]\n\
+         # One node, so a database created without --replication-factor gets one replica.\n\
+         replication_factor = 1\n\
+         \n\
          [tls]\n\
          ca = {ca}\n\
          cert = {cert}\n\
@@ -1079,6 +1083,15 @@ mod tests {
 
     fn generated() -> String {
         config_text(Path::new("/tmp/fleetring-dev"), DEFAULT_PORT).expect("a config")
+    }
+
+    #[test]
+    fn databases_on_a_dev_node_get_one_replica_unless_their_creation_says_otherwise() {
+        let config = Config::from_toml(&generated()).expect("the generated config");
+        assert_eq!(
+            config.replication.replication_factor,
+            fleetring::ReplicationFactor::ONE
+        );
     }
 
     #[test]

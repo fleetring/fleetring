@@ -251,6 +251,7 @@ impl Daemon {
             address,
             control.as_ref().map(|role| {
                 ControlService::new(role.node.handle())
+                    .with_default_replication_factor(config.replication.replication_factor)
                     .with_durability_defaults(config.replication.durability_defaults())
                     .with_clock(environment.clock())
                     .with_dev_mode(config.dev)

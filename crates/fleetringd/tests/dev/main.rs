@@ -24,7 +24,7 @@ use std::time::Duration;
 use fleetring::ReplicationFactor;
 use fleetring_control::DatabaseName;
 use fleetringd::Network;
-use fleetringd::data::Client;
+use fleetringd::data::{Client, DatabaseSpec};
 use fleetringd::engine::{Statement, Value};
 use fleetringd::tls::{Identity, Security};
 
@@ -207,11 +207,15 @@ impl Drop for DevNode {
 /// How long to wait between attempts while a new database finds its primary.
 const POLL: Duration = Duration::from_millis(100);
 
-/// The client code both a dev node and a fleet run: creates `name` with `factor` replicas,
-/// creates a table once it has a primary, writes a row, and reads it back.
-async fn create_write_read(client: &Client, name: &str, factor: ReplicationFactor) -> TestResult {
+/// The client code both a dev node and a fleet run: creates `name` with the fleet's default
+/// replication factor, which must be `expected`, creates a table once it has a primary, writes a
+/// row that every replica acknowledges, and reads it back.
+async fn create_write_read(client: &Client, name: &str, expected: ReplicationFactor) -> TestResult {
     let name: DatabaseName = name.parse()?;
-    client.create_database(&name, factor).await?;
+    let location = client
+        .create_database_with(&name, DatabaseSpec::default())
+        .await?;
+    assert_eq!(location.replication_factor, expected, "{location:?}");
     let deadline = tokio::time::Instant::now() + PATIENCE;
     while let Err(status) = client
         .execute(
@@ -235,6 +239,7 @@ async fn create_write_read(client: &Client, name: &str, factor: ReplicationFacto
         )
         .await?;
     assert_eq!(written.rows_affected, 1);
+    assert_eq!(written.replicas, u32::from(expected.get()), "{written:?}");
     assert!(!written.under_replicated, "{written:?}");
     read_back(client, &name).await
 }
@@ -448,8 +453,9 @@ fn the_quickstart_runs_as_documented() -> TestResult {
         status.starts_with("dev mode: one node on loopback, for development only\n"),
         "{status}"
     );
-    let created = run("fleetringd db create notes --replication-factor 1")?;
+    let created = run("fleetringd db create notes")?;
     assert!(created.starts_with("created notes\n"), "{created}");
+    assert!(created.contains("\nreplication factor: 1\n"), "{created}");
     wait_for("notes takes a write", || {
         run("fleetringd db exec notes \"CREATE TABLE note (body TEXT)\"").ok()
     })?;
@@ -469,5 +475,31 @@ fn the_quickstart_runs_as_documented() -> TestResult {
             .filter(|text| text.contains("hello"))
     })?;
     assert!(streamed.contains("\"note\""), "{streamed}");
+
+    // `status` doesn't warn that the one-node ring replicates fewer ways than a fleet's ring.
+    let status = shell(
+        root.path(),
+        &format!(". '{}' && fleetringd status", env.display()),
+    )?;
+    let warnings = String::from_utf8_lossy(&status.stderr);
+    assert!(!warnings.contains("replicates"), "{warnings}");
+
+    // A factor larger than the fleet is accepted, with a warning that names both numbers.
+    let wide = shell(
+        root.path(),
+        &format!(
+            ". '{}' && fleetringd db create wide --replication-factor 3",
+            env.display()
+        ),
+    )?;
+    assert!(wide.status.success(), "{}", printed(&wide));
+    let warning = String::from_utf8_lossy(&wide.stderr);
+    assert!(
+        warning.contains(
+            "warning: wide has a replication factor of 3, but the fleet has 1 data node: its \
+             writes fail until 1 more joins"
+        ),
+        "{warning}"
+    );
     Ok(())
 }

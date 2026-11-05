@@ -507,11 +507,10 @@ impl Publisher {
                 ..MembershipView::clone(&previous)
             }
         } else {
-            match rebuild(epoch, members, draining) {
+            match rebuild(epoch, members, draining, dev) {
                 Some(view) => MembershipView {
                     previous_ring: previous.ring.clone(),
                     features,
-                    dev,
                     ..view
                 },
                 None => return,
@@ -541,12 +540,8 @@ impl MembershipView {
         let dev = DevMode::from(update.dev_mode);
         let (members, draining) = members_from(update)
             .map_err(|status| tonic::Status::internal(format!("invalid membership: {status}")))?;
-        rebuild(epoch, members, draining)
-            .map(|view| MembershipView {
-                features,
-                dev,
-                ..view
-            })
+        rebuild(epoch, members, draining, dev)
+            .map(|view| MembershipView { features, ..view })
             .ok_or_else(|| tonic::Status::internal("the membership can't form a ring"))
     }
 }
@@ -609,21 +604,29 @@ fn members_from(
 }
 
 /// Builds the view for a new membership epoch, or `None` if its members can't form a ring.
+///
+/// The ring's diagnostics are logged, except in dev mode: its one node is by design, and each
+/// database there has the replication factor it was created with, 1 by default, rather than the
+/// ring's 3 that the diagnostics judge (ADR-0039).
 fn rebuild(
     epoch: Epoch,
     members: Vec<(Member, Liveness)>,
     draining: Vec<NodeId>,
+    dev: DevMode,
 ) -> Option<MembershipView> {
     if members.is_empty() {
         return Some(MembershipView {
             epoch,
+            dev,
             ..MembershipView::default()
         });
     }
     match membership_ring(members.iter().map(|(member, _)| member), epoch) {
         Ok(ring) => {
-            for diagnostic in ring.diagnostics() {
-                log_diagnostic(epoch, &diagnostic);
+            if dev == DevMode::Off {
+                for diagnostic in ring.diagnostics() {
+                    log_diagnostic(epoch, &diagnostic);
+                }
             }
             Some(MembershipView {
                 epoch,
@@ -633,7 +636,7 @@ fn rebuild(
                 members,
                 draining,
                 features: Vec::new(),
-                dev: DevMode::Off,
+                dev,
             })
         }
         Err(error) => {

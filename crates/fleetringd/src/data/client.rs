@@ -65,9 +65,9 @@ pub struct Location {
     pub durability: Durability,
 }
 
-/// What to create a database with: its replication factor and, optionally, its durability
-/// settings. Settings left unset take the fleet's defaults (`[replication] acks` and
-/// `min_replicas` on the control node).
+/// What to create a database with: optionally, its replication factor and its durability
+/// settings. Settings left unset take the fleet's defaults (`[replication] replication_factor`,
+/// `acks`, and `min_replicas` on the control node).
 ///
 /// # Examples
 ///
@@ -80,13 +80,16 @@ pub struct Location {
 ///     .with_acks(Acks::All)
 ///     .with_min_replicas(3);
 /// assert_eq!(spec.acks, Some(Acks::All));
+///
+/// // Every setting the fleet's default.
+/// assert_eq!(DatabaseSpec::default().replication_factor, None);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct DatabaseSpec {
-    /// How many replicas the database should have.
-    pub replication_factor: ReplicationFactor,
+    /// How many replicas the database should have, or `None` for the fleet's default.
+    pub replication_factor: Option<ReplicationFactor>,
     /// The acknowledgement mode, or `None` for the fleet's default.
     pub acks: Option<Acks>,
     /// The floor on reachable replicas, or `None` for the fleet's default: the mode's W.
@@ -94,13 +97,31 @@ pub struct DatabaseSpec {
 }
 
 impl DatabaseSpec {
-    /// A database with `replication_factor` replicas and the fleet's default durability.
+    /// A database with `replication_factor` replicas and the fleet's default durability. For the
+    /// fleet's default replication factor too, use [`DatabaseSpec::default`].
     #[must_use]
     pub const fn new(replication_factor: ReplicationFactor) -> Self {
         Self {
-            replication_factor,
+            replication_factor: Some(replication_factor),
             acks: None,
             min_replicas: None,
+        }
+    }
+
+    /// The creation request for `name` as this spec says: 0 for an unset replication factor or
+    /// floor, and an unspecified acknowledgement mode, so the control node fills in its defaults.
+    fn to_request(self, name: &DatabaseName) -> CreateDatabaseRequest {
+        CreateDatabaseRequest {
+            database: name.to_string(),
+            replication_factor: self
+                .replication_factor
+                .map_or(0, |factor| u32::from(factor.get())),
+            engine: proto::Engine::Sqlite.into(),
+            acks: self
+                .acks
+                .map_or(proto::Acks::Unspecified, acks_to_proto)
+                .into(),
+            min_replicas: u32::from(self.min_replicas.unwrap_or(0)),
         }
     }
 
@@ -450,7 +471,8 @@ impl Client {
     }
 
     /// Creates a SQLite database as `spec` says, and opens it on its primary; see
-    /// [`Client::create_database`].
+    /// [`Client::create_database`]. What `spec` leaves unset, the replication factor included,
+    /// takes the fleet's default.
     ///
     /// # Errors
     ///
@@ -461,27 +483,7 @@ impl Client {
         name: &DatabaseName,
         spec: DatabaseSpec,
     ) -> Result<Location, Status> {
-        let request = CreateDatabaseRequest {
-            database: name.to_string(),
-            replication_factor: u32::from(spec.replication_factor.get()),
-            engine: proto::Engine::Sqlite.into(),
-            acks: spec
-                .acks
-                .map_or(proto::Acks::Unspecified, acks_to_proto)
-                .into(),
-            min_replicas: u32::from(spec.min_replicas.unwrap_or(0)),
-        };
-        let placement = match self.control.create_database(request).await {
-            Ok(response) => placement_of(response.placement)?,
-            Err(status) if status.code() == Code::AlreadyExists => {
-                let placement = self.placement(name).await?;
-                if placement.primary.is_some() {
-                    return Err(status);
-                }
-                placement
-            }
-            Err(status) => return Err(status),
-        };
+        let placement = self.place(name, spec).await?;
         let start = match &self.entry {
             Some(entry) => entry.clone(),
             None => first_candidate(&placement).ok_or_else(|| {
@@ -521,27 +523,7 @@ impl Client {
         source: &DatabaseName,
         target: &RestoreTarget,
     ) -> Result<Restoration, Status> {
-        let request = CreateDatabaseRequest {
-            database: name.to_string(),
-            replication_factor: u32::from(spec.replication_factor.get()),
-            engine: proto::Engine::Sqlite.into(),
-            acks: spec
-                .acks
-                .map_or(proto::Acks::Unspecified, acks_to_proto)
-                .into(),
-            min_replicas: u32::from(spec.min_replicas.unwrap_or(0)),
-        };
-        let placement = match self.control.create_database(request).await {
-            Ok(response) => placement_of(response.placement)?,
-            Err(status) if status.code() == Code::AlreadyExists => {
-                let placement = self.placement(name).await?;
-                if placement.primary.is_some() {
-                    return Err(status);
-                }
-                placement
-            }
-            Err(status) => return Err(status),
-        };
+        let placement = self.place(name, spec).await?;
         let start = match &self.entry {
             Some(entry) => entry.clone(),
             None => first_candidate(&placement).ok_or_else(|| {
@@ -933,6 +915,37 @@ impl Client {
         }
     }
 
+    /// Asks the control plane to create `name` as `spec` says, and returns its placement. A
+    /// database that exists without a primary, because an earlier creation stopped halfway, is
+    /// returned as it is, so the caller can finish it.
+    ///
+    /// A control node before 0.5.0 refuses a request that leaves the replication factor to the
+    /// fleet, as it refuses any factor of 0; the request is then sent again with 3, the factor
+    /// commands asked for before the fleet had a default of its own.
+    async fn place(
+        &self,
+        name: &DatabaseName,
+        spec: DatabaseSpec,
+    ) -> Result<proto::Placement, Status> {
+        let mut request = spec.to_request(name);
+        let mut created = self.control.create_database(request.clone()).await;
+        if request.replication_factor == 0 && created.as_ref().is_err_and(refuses_fleet_default) {
+            request.replication_factor = u32::from(ReplicationFactor::default().get());
+            created = self.control.create_database(request).await;
+        }
+        match created {
+            Ok(response) => placement_of(response.placement),
+            Err(status) if status.code() == Code::AlreadyExists => {
+                let placement = self.placement(name).await?;
+                if placement.primary.is_some() {
+                    return Err(status);
+                }
+                Ok(placement)
+            }
+            Err(status) => Err(status),
+        }
+    }
+
     async fn placement(&self, name: &DatabaseName) -> Result<proto::Placement, Status> {
         let response = self
             .control
@@ -999,6 +1012,15 @@ impl Client {
     }
 }
 
+/// Whether `status` is a control node before 0.5.0 refusing a creation that leaves the
+/// replication factor to the fleet: those read 0 as a factor, and refuse it with this message.
+fn refuses_fleet_default(status: &Status) -> bool {
+    status.code() == Code::InvalidArgument
+        && status
+            .message()
+            .starts_with("invalid replication factor 0: expected 1 to 255")
+}
+
 fn placement_of(placement: Option<proto::Placement>) -> Result<proto::Placement, Status> {
     placement.ok_or_else(|| Status::internal("the reply has no placement"))
 }
@@ -1040,4 +1062,36 @@ fn first_candidate(placement: &proto::Placement) -> Option<String> {
         .find(|replica| replica.live)
         .or_else(|| with_address().next())
         .and_then(|replica| replica.address.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_old_control_nodes_refusal_of_a_zero_factor_is_retried_with_three() {
+        // What 0.3.0 and 0.4.0 answer to a factor of 0.
+        let old = Status::invalid_argument("invalid replication factor 0: expected 1 to 255");
+        assert!(refuses_fleet_default(&old));
+        let current = Status::invalid_argument(
+            "invalid replication factor 256: expected 1 to 255, or 0 for the fleet's default",
+        );
+        assert!(!refuses_fleet_default(&current));
+        let other = Status::failed_precondition("invalid replication factor 0: expected 1 to 255");
+        assert!(!refuses_fleet_default(&other));
+    }
+
+    #[test]
+    fn a_spec_leaves_unset_settings_to_the_fleet() {
+        let name: DatabaseName = "notes".parse().expect("a name");
+        let request = DatabaseSpec::default().to_request(&name);
+        assert_eq!(request.replication_factor, 0);
+        assert_eq!(request.acks, i32::from(proto::Acks::Unspecified));
+        assert_eq!(request.min_replicas, 0);
+        let two = ReplicationFactor::new(2).expect("nonzero");
+        assert_eq!(
+            DatabaseSpec::new(two).to_request(&name).replication_factor,
+            2
+        );
+    }
 }
