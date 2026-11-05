@@ -4,6 +4,30 @@ The FleetRing daemon. It places, replicates, and fails over SQLite databases acr
 
 > **Status:** early development. Not production-ready.
 
+## Dev mode
+
+`fleetringd dev` runs one node on a laptop with no setup ([ADR-0039](https://github.com/fleetring/fleetring/blob/main/docs/adr/0039-dev-mode.md)):
+
+```sh
+fleetringd dev                           # in one terminal; Ctrl-C stops it
+
+. ~/.fleetring/env                       # in another: points the commands at it
+fleetringd status
+fleetringd db create notes --replication-factor 1
+fleetringd db exec notes "CREATE TABLE note (body TEXT)"
+fleetringd db exec notes "INSERT INTO note VALUES (?)" "hello"
+fleetringd db query notes "SELECT body FROM note"
+tail -f ~/.fleetring/changes/notes.ndjson   # every database's changes, one JSON line per transaction
+```
+
+The first run creates, in `~/.fleetring` (or `--data-dir <dir>`): an authority for the fleet `dev` (`tls/ca.crt`, `tls/ca.key`), a certificate for the node `dev` at `127.0.0.1`, `::1`, and `localhost`, a certificate for the principal `admin`, which the configuration gives every scope, and `fleetringd.toml`. Certificates last a year. Later runs reuse every file and never overwrite one: a missing certificate is issued again from the existing authority, and anything that can't be completed safely, such as `ca.crt` without `ca.key` or an expired certificate, fails naming the file and what to do. No token is stored; the admin certificate needs none, and `fleetringd token issue --dir ~/.fleetring/tls` issues one for an application. On Unix the directories are `0700` and the keys `0600`.
+
+The node serves gRPC on `127.0.0.1:7400` and its admin listener on `127.0.0.1:7401`; `--port <n>` picks another port on the first run, and the admin listener takes the next one. It is the normal daemon running `~/.fleetring/fleetringd.toml`, so `fleetringd --config ~/.fleetring/fleetringd.toml` runs the same node, and the file may be edited: `dev = true` in it makes the daemon refuse any `listen`, `node.advertise`, `control.address`, or `[admin] listen` that isn't loopback, any role but `both`, and plaintext, however it is started. The configuration keeps the node's databases placed on it across a stop (`[membership] on_shutdown = "stay"`) and sends every database's row changes to a file sink, `dev`, in `~/.fleetring/changes/`.
+
+`~/.fleetring/env` sets `FLEETRING_CONTROL` (the control address, which `--control` and `--config` override), `FLEETRING_TLS_DIR`, and `FLEETRING_AS=admin`; dev mode rewrites it at every start. `status` against a dev node starts with `dev mode: one node on loopback, for development only`. A dev node holds one copy of each database, so a larger `--replication-factor` leaves writes short of their quorum.
+
+To run it at login, [`deploy/dev/`](https://github.com/fleetring/fleetring/tree/main/deploy/dev) has a Homebrew `service do` block (`homebrew-service.rb`, with the launchd agent it becomes) and a systemd user unit, `fleetringd-dev.service`. The authority's key and the admin key sit unencrypted in the directory: dev mode is for local development only ([SECURITY.md](https://github.com/fleetring/fleetring/blob/main/SECURITY.md#dev-mode)).
+
 ## Run it
 
 Every connection is mutual TLS (ADR-0025): nodes and clients present certificates issued by the fleet's own certificate authority. Create the authority once, then a certificate for the node and one for yourself:
@@ -87,7 +111,7 @@ A data node runs one restore or verification at a time, and answers another with
 
 S3 credentials are static keys: `credentials = "env"` (the default) reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` when the daemon starts; `credentials = "file"` reads a TOML file with `access_key_id`, `secret_access_key`, and optionally `session_token`, which only its owner may read, and is re-read when it changes. Secrets are never logged. `endpoint` defaults to AWS's for the `region`; `path_style = true` suits MinIO; `ca` adds a private endpoint's authority to the platform's; and `allow_http = true` permits a plain `http://` endpoint, for a local MinIO only. The store must give read-after-write and list-after-write consistency, as these services do. An archive holds every row of the databases it names, unencrypted: grant its bucket the same care as the nodes' disks. `deploy/fleetringd.toml` documents every setting.
 
-The subcommands take `--control <host:port>`, the address of the node that runs the control role, or `--config <file>` to read it from a daemon's configuration. A control call sent to a data-only node answers with the control node's address.
+The subcommands take `--control <host:port>`, the address of the node that runs the control role, or `--config <file>` to read it from a daemon's configuration, or else `FLEETRING_CONTROL`. A control call sent to a data-only node answers with the control node's address.
 
 **Plaintext.** A daemon without a `[tls]` table refuses to start. `--insecure-plaintext` (or `insecure_plaintext = true` in the file) lets it run without one, warning at every start, and the subcommands take the same flag to connect to it; nothing on the wire is then authenticated or encrypted, so it is for local experiments only. A node whose certificate names another ID is refused on `Join` and `Heartbeat` with `PERMISSION_DENIED`, and only nodes may make node-to-node calls such as replication. In plaintext no certificate names the caller, so a request without a token may do anything, and a token is refused, since there is no authority to verify it against.
 

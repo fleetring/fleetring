@@ -50,6 +50,10 @@ The admin listener (`/metrics`, `/healthz`, `/readyz`, ADR-0034) is loopback and
 
 Logs are more revealing than metrics. Every request runs in an `rpc` span that carries the caller's principal or node ID and the database the request names, and every line the request causes, in text or JSON, repeats them (ADR-0034, point 8); audit lines name the principal, the credential (`certificate` or `token:<id>`), and the database. Tokens, keys, and certificates are never logged. Database names are tenant data, so treat logs, and wherever they are shipped, with the care the scopes give the databases.
 
+### Dev mode
+
+`fleetringd dev` (ADR-0039) keeps its authority's key (`tls/ca.key`) and the `admin` principal's key, which carries every scope, unencrypted in its directory, `~/.fleetring` by default, beside the databases. Whoever can read that directory owns the dev fleet. That is acceptable only because dev mode is for local development on a single-user machine: with `dev = true` the daemon refuses any address that isn't loopback, any role but `both`, and plaintext, however it is started, and its directories are `0700` and its keys `0600` on Unix. Never put data you care about in a dev node, never copy its directory to a server, and never trust its authority anywhere else.
+
 ### The authority key
 
 These properties rest on the authority key staying secret: that a node's certificate names its real node ID, that a client certificate names its real principal, and that a token's scopes are the ones an operator issued. Whoever holds the key can issue a certificate for any node ID, which can then join the fleet and make node-to-node calls; a certificate for any principal, which then gets that principal's `[[principal]]` scopes; and a token with any scopes, `fleet` included. Keep it off every node, as `fleetringd cert init` and the daemon README say.
