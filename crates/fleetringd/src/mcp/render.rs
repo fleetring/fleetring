@@ -219,6 +219,39 @@ pub(crate) fn fit<T: Serialize, E: Serialize>(
     Ok(true)
 }
 
+/// Fits `db_list`'s result within `max` bytes as [`fit`] does and, when databases had to go,
+/// points `next_after` at the last one kept, or at `after` if none was, so the next page
+/// continues there. `next_after` is counted in the bound: a database more goes if it doesn't
+/// fit beside it. Returns whether anything was dropped.
+///
+/// # Errors
+///
+/// If `out` can't be serialized.
+pub(crate) fn fit_listing(
+    out: &mut ListOut,
+    after: Option<&str>,
+    max: usize,
+) -> Result<bool, serde_json::Error> {
+    if !fit(
+        out,
+        |out| &mut out.databases,
+        |out| out.truncated = true,
+        max,
+    )? {
+        return Ok(false);
+    }
+    loop {
+        out.next_after = out
+            .databases
+            .last()
+            .map(|listed| listed.name.clone())
+            .or_else(|| after.map(str::to_owned));
+        if text_len(out)? <= max || out.databases.pop().is_none() {
+            return Ok(true);
+        }
+    }
+}
+
 /// The length of `value`'s text, as [`text`] writes it.
 fn text_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
     let json = serde_json::to_string(value)?;
@@ -266,6 +299,8 @@ fn escaped_len(character: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use crate::mcp::tools::QueryOut;
 
     fn view(description: Option<&str>, by: Option<&str>) -> MetadataView {
@@ -372,6 +407,46 @@ mod tests {
         assert!(!fit(&mut small, |out| &mut out.rows, mark, max)?);
         assert!(!small.truncated);
         assert_eq!(small.rows.len(), 3);
+        Ok(())
+    }
+
+    fn listing(count: usize) -> ListOut {
+        ListOut {
+            databases: (0..count)
+                .map(|index| ListedOut {
+                    name: format!("agent-42-{index:04}-{}", "n".repeat(index % 40)),
+                    description: None,
+                    labels: BTreeMap::new(),
+                    created_by: Some("agent-42".to_owned()),
+                    expires_at: None,
+                    primary: Some("dev".to_owned()),
+                })
+                .collect(),
+            next_after: None,
+            truncated: false,
+            notice: NOTICE.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_cut_listing_counts_its_next_after_within_the_cap() -> Result<(), serde_json::Error> {
+        let full = text(&listing(60))?.len();
+        // Every bound from a few databases' worth up to the whole: whatever is cut, the result
+        // with its next_after stays within the bound and continues after the last one kept.
+        for max in (full / 4..full).step_by(31) {
+            let mut out = listing(60);
+            assert!(fit_listing(&mut out, Some("agent-42-"), max)?, "{max}");
+            let size = text(&out)?.len();
+            assert!(size <= max, "{size} bytes for a bound of {max}");
+            assert!(out.truncated);
+            let last = out.databases.last().map(|listed| listed.name.clone());
+            assert!(last.is_some(), "{max}");
+            assert_eq!(out.next_after, last, "{max}");
+        }
+        let mut whole = listing(60);
+        assert!(!fit_listing(&mut whole, None, full)?);
+        assert_eq!(whole.next_after, None);
+        assert_eq!(whole.databases.len(), 60);
         Ok(())
     }
 
