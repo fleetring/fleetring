@@ -133,6 +133,7 @@ fn a_database_records_its_settings_and_the_state_answers_quorums_from_them() {
         replication_factor: factor(3),
         engine: fleetring_control::Engine::Sqlite,
         durability: Some(Durability::new(Acks::All, factor(5))),
+        metadata: None,
     };
     let before = state.clone();
     let rejection = run(&mut state, 0, bad).expect_err("floor above R");

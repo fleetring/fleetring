@@ -84,8 +84,8 @@ impl State {
         self.features.contains(&feature)
     }
 
-    /// Checks `action` against the feature gate alone: it passes if it needs no feature, if its
-    /// feature is enabled, or if every member, live or down, supports the feature.
+    /// Checks `action` against the feature gate alone: it passes if each feature it needs is
+    /// enabled, or supported by every member, live or down.
     ///
     /// [`apply`](crate::apply) makes the same check. The control node also makes it before it
     /// logs a command, so that a refused command never reaches the log, where a control node of
@@ -93,7 +93,8 @@ impl State {
     ///
     /// # Errors
     ///
-    /// [`Rejection::FeatureUnsupported`] naming the feature and the first member, in ID order,
+    /// [`Rejection::FeatureUnsupported`] naming the first feature, in [`Action::features`]'s
+    /// order, that isn't enabled and that a member lacks, and the first member, in ID order,
     /// that lacks it.
     ///
     /// # Examples
@@ -123,10 +124,10 @@ impl State {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn check_features(&self, action: &Action) -> Result<(), Rejection> {
-        match action.feature() {
-            Some(feature) => self.check_feature(feature),
-            None => Ok(()),
-        }
+        action
+            .features()
+            .iter()
+            .try_for_each(|feature| self.check_feature(*feature))
     }
 
     /// Checks every rule [`apply`](crate::apply) refuses `action` for because of software: the
@@ -344,6 +345,7 @@ impl State {
     ///     replication_factor: ReplicationFactor::new(2).ok_or("zero")?,
     ///     engine: Engine::Sqlite,
     ///     durability: None,
+    ///     metadata: None,
     /// })?;
     /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
     /// // "b" keeps reporting its copy; "a" goes quiet.
@@ -367,6 +369,65 @@ impl State {
             .filter(|name| plan_promotion(self, at, name).is_ok())
             .cloned()
             .collect()
+    }
+
+    /// Returns every database an `ExpireDatabase` stamped `at` would drop, ordered by expiry and
+    /// then by name.
+    ///
+    /// That is every database whose expiry is at or before `at`, or before [`State::now`] if
+    /// `at` is earlier, as [`apply`](crate::apply) judges it. The control node asks this on a
+    /// timer and submits a command for each; `apply` decides again by the command's own time, so
+    /// an expiry extended in between wins.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring::ReplicationFactor;
+    /// use fleetring_control::{
+    ///     apply, Action, Command, ControlConfig, Engine, Feature, Member, MetadataSpec, Release,
+    ///     Software, State, Timestamp,
+    /// };
+    ///
+    /// let mut state = State::new(ControlConfig::new());
+    /// let run = |state: &mut State, millis, action| {
+    ///     apply(state, Command::new(Timestamp::from_millis(millis), action))
+    /// };
+    /// let software = Feature::ALL
+    ///     .into_iter()
+    ///     .fold(Software::new(Release::new(0, 6, 0), 1), Software::with_feature);
+    /// let member = Member::new("a".parse()?).with_software(software);
+    /// run(&mut state, 0, Action::Join { member })?;
+    /// for (name, expires_at) in [("scratch-b", 60_000), ("scratch-a", 60_000), ("memory", 0)] {
+    ///     let spec = MetadataSpec {
+    ///         expires_at: (expires_at > 0).then(|| Timestamp::from_millis(expires_at)),
+    ///         ..MetadataSpec::default()
+    ///     };
+    ///     run(&mut state, 0, Action::CreateDatabase {
+    ///         name: name.parse()?,
+    ///         replication_factor: ReplicationFactor::ONE,
+    ///         engine: Engine::Sqlite,
+    ///         durability: None,
+    ///         metadata: Some(spec),
+    ///     })?;
+    /// }
+    /// assert!(state.expired_databases(Timestamp::from_millis(59_999)).is_empty());
+    /// let due = state.expired_databases(Timestamp::from_millis(60_000));
+    /// assert_eq!(due, ["scratch-a".parse()?, "scratch-b".parse()?]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn expired_databases(&self, at: Timestamp) -> Vec<DatabaseName> {
+        let at = at.max(self.now);
+        let mut due: Vec<(Timestamp, &DatabaseName)> = self
+            .databases
+            .values()
+            .filter_map(|database| {
+                let expires_at = database.metadata()?.expires_at()?;
+                (expires_at <= at).then_some((expires_at, database.name()))
+            })
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, name)| name.clone()).collect()
     }
 
     pub(crate) fn database_or_reject(&self, name: &DatabaseName) -> Result<&Database, Rejection> {

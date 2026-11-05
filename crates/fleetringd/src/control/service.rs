@@ -706,6 +706,7 @@ impl Control for ControlService {
             replication_factor,
             engine,
             durability: Some(durability),
+            metadata: None,
         };
         match self.submit(action).await? {
             (Applied::DatabaseCreated { .. }, state) => {

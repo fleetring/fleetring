@@ -7,7 +7,7 @@ use std::str::FromStr;
 use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
-use crate::Timestamp;
+use crate::{Metadata, Timestamp};
 
 /// The longest database name, in bytes.
 const MAX_NAME_LEN: usize = 255;
@@ -554,6 +554,9 @@ impl Promotion {
 /// The durability settings are fixed at creation and change only through a `ChangeDurability`
 /// command, which takes effect when the next lease is granted (ADR-0023). Records written before
 /// the settings existed load as [`Acks::Quorum`] with the floor at W.
+///
+/// A database may carry [`Metadata`] (ADR-0041). One without any is stored exactly as before
+/// metadata existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "DatabaseRecord", into = "DatabaseRecord")]
 pub struct Database {
@@ -565,10 +568,12 @@ pub struct Database {
     epoch: LeaseEpoch,
     lease: Option<Lease>,
     promotion: Option<Promotion>,
+    metadata: Option<Metadata>,
 }
 
 /// A database as it is stored: the durability fields are optional, so records written before
-/// they existed load with the defaults.
+/// they existed load with the defaults, and the metadata comes last and only when there is
+/// some, so a record without it is written byte for byte as before metadata existed.
 #[derive(Serialize, Deserialize)]
 struct DatabaseRecord {
     name: DatabaseName,
@@ -583,6 +588,8 @@ struct DatabaseRecord {
     epoch: LeaseEpoch,
     lease: Option<Lease>,
     promotion: Option<Promotion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<Metadata>,
 }
 
 impl From<DatabaseRecord> for Database {
@@ -602,6 +609,7 @@ impl From<DatabaseRecord> for Database {
             epoch: record.epoch,
             lease: record.lease,
             promotion: record.promotion,
+            metadata: record.metadata,
         }
     }
 }
@@ -618,6 +626,7 @@ impl From<Database> for DatabaseRecord {
             epoch: database.epoch,
             lease: database.lease,
             promotion: database.promotion,
+            metadata: database.metadata,
         }
     }
 }
@@ -628,6 +637,7 @@ impl Database {
         replication_factor: ReplicationFactor,
         engine: Engine,
         durability: Durability,
+        metadata: Option<Metadata>,
     ) -> Self {
         Self {
             name,
@@ -638,6 +648,7 @@ impl Database {
             epoch: LeaseEpoch::ZERO,
             lease: None,
             promotion: None,
+            metadata,
         }
     }
 
@@ -722,6 +733,17 @@ impl Database {
 
     pub(crate) fn set_promotion(&mut self, promotion: Option<Promotion>) {
         self.promotion = promotion;
+    }
+
+    /// Returns the database's metadata, or `None` if it was created without any and never
+    /// updated.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
+    }
+
+    pub(crate) fn set_metadata(&mut self, metadata: Metadata) {
+        self.metadata = Some(metadata);
     }
 }
 

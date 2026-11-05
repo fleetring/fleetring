@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::command::UnknownReports;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
-    Action, Command, Database, DatabaseName, Durability, DurabilityError, Engine, Feature,
-    HostedReplica, Lease, LeaseEpoch, Member, Position, Promotion, Quorums, Release, Revoked,
+    Action, Command, Database, DatabaseName, DescriptionChange, Durability, DurabilityError,
+    Engine, ExpiryChange, Feature, HostedReplica, Lease, LeaseEpoch, MAX_LABELS, Member, Metadata,
+    MetadataChange, MetadataSpec, Position, PrincipalName, Promotion, Quorums, Release, Revoked,
     Software, State, Timestamp,
 };
 
@@ -29,10 +30,13 @@ pub type Outcome = Result<Applied, Rejection>;
 ///
 /// **Rejections** leave the state exactly as it was, including [`State::now`].
 ///
-/// **Features.** An action that needs a fleet feature ([`Action::feature`]) is checked against
-/// the gate first ([`State::check_features`]); the first one accepted enables the feature for
-/// good (ADR-0038, point 4). A join is checked against the release window and the enabled
-/// features; [`State::check_admission`] makes both checks without applying anything.
+/// **Features.** An action that needs fleet features ([`Action::features`]) is checked against
+/// the gate first ([`State::check_features`]); the first one accepted enables every feature it
+/// needs for good (ADR-0038, point 4). A join is checked against the release window and the
+/// enabled features; [`State::check_admission`] makes both checks without applying anything.
+///
+/// **Expiry** is judged at the command's time alone: no clock is read, so an expiry passes at
+/// the same command in every replay.
 ///
 /// # Errors
 ///
@@ -57,6 +61,7 @@ pub type Outcome = Result<Applied, Rejection>;
 ///     replication_factor: ReplicationFactor::ONE,
 ///     engine: Engine::Sqlite,
 ///     durability: None,
+///     metadata: None,
 /// }))?;
 /// let granted = apply(&mut state, Command::new(at, Action::AcquireLease {
 ///     database: "tenant:acme".parse()?,
@@ -68,9 +73,9 @@ pub type Outcome = Result<Applied, Rejection>;
 /// ```
 pub fn apply(state: &mut State, command: Command) -> Outcome {
     let now = command.at.max(state.now);
-    let feature = command.action.feature();
-    if let Some(feature) = feature {
-        state.check_feature(feature)?;
+    let features = command.action.features();
+    for feature in features {
+        state.check_feature(*feature)?;
     }
     let applied = match command.action {
         Action::Join { member } => join(state, now, member),
@@ -86,7 +91,23 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             replication_factor,
             engine,
             durability,
-        } => create_database(state, name, replication_factor, engine, durability),
+            metadata,
+        } => create_database(
+            state,
+            now,
+            name,
+            replication_factor,
+            engine,
+            durability,
+            metadata,
+        ),
+        Action::UpdateDatabase {
+            name,
+            change,
+            by,
+            if_version,
+        } => update_database(state, now, name, change, by, if_version),
+        Action::ExpireDatabase { name } => expire_database(state, now, name),
         Action::ChangeDurability {
             database,
             durability,
@@ -117,9 +138,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         Action::TransferLease { database, target } => transfer_lease(state, now, database, target),
         Action::RevokeToken { revoked, until } => revoke_token(state, now, revoked, until),
     }?;
-    if let Some(feature) = feature {
-        state.features.insert(feature);
-    }
+    state.features.extend(features.iter().copied());
     state.now = now;
     Ok(applied)
 }
@@ -259,6 +278,25 @@ pub enum Applied {
         revoked: Revoked,
         /// When the entry may be forgotten: the later of this and any earlier revocation's.
         until: Timestamp,
+    },
+
+    /// A database's metadata was patched.
+    DatabaseUpdated {
+        /// The database.
+        database: DatabaseName,
+        /// The metadata's version after the update.
+        version: u64,
+    },
+
+    /// A database whose expiry had passed was dropped, as `DropDatabase` drops one.
+    DatabaseExpired {
+        /// The database.
+        database: DatabaseName,
+        /// The epoch the database was at when it was dropped. A node still serving it at that
+        /// epoch stops once its next renewal is refused.
+        epoch: LeaseEpoch,
+        /// The expiry that had passed.
+        expires_at: Timestamp,
     },
 }
 
@@ -523,6 +561,47 @@ pub enum Rejection {
         /// When the entry would have been forgotten.
         until: Timestamp,
     },
+
+    /// A conditional update named a version the database's metadata isn't at.
+    #[error("metadata of database '{database}' is at version {current}, not {expected}")]
+    MetadataConflict {
+        /// The database.
+        database: DatabaseName,
+        /// The version the update required.
+        expected: u64,
+        /// The metadata's version: 0 for a database without metadata.
+        current: u64,
+    },
+
+    /// An update would leave a database with more labels than it may carry.
+    #[error("database '{database}' would have {count} labels; the maximum is {max}")]
+    TooManyLabels {
+        /// The database.
+        database: DatabaseName,
+        /// How many labels the update would leave.
+        count: usize,
+        /// The most a database may carry.
+        max: usize,
+    },
+
+    /// An expiry is at or before the command's time, so the database would expire at once.
+    #[error("expiry {expires_at} of database '{database}' has already passed")]
+    ExpiryPassed {
+        /// The database.
+        database: DatabaseName,
+        /// The expiry asked for.
+        expires_at: Timestamp,
+    },
+
+    /// An `ExpireDatabase` named a database whose expiry hasn't passed at the command's time, or
+    /// that has none: it was extended or cleared after the command was made.
+    #[error("database '{database}' has not expired")]
+    NotExpired {
+        /// The database.
+        database: DatabaseName,
+        /// The database's expiry, if it has one.
+        expires_at: Option<Timestamp>,
+    },
 }
 
 fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
@@ -685,10 +764,12 @@ fn heartbeat(
 
 fn create_database(
     state: &mut State,
+    now: Timestamp,
     name: DatabaseName,
     replication_factor: ReplicationFactor,
     engine: Engine,
     durability: Option<Durability>,
+    metadata: Option<MetadataSpec>,
 ) -> Outcome {
     if state.databases.contains_key(&name) {
         return Err(Rejection::DatabaseExists { database: name });
@@ -700,11 +781,115 @@ fn create_database(
             database: name.clone(),
             source,
         })?;
+    if let Some(expires_at) = metadata.as_ref().and_then(|spec| spec.expires_at) {
+        check_expiry(&name, now, expires_at)?;
+    }
+    let metadata = metadata.map(|spec| Metadata::created(spec, now));
     state.databases.insert(
         name.clone(),
-        Database::new(name.clone(), replication_factor, engine, durability),
+        Database::new(
+            name.clone(),
+            replication_factor,
+            engine,
+            durability,
+            metadata,
+        ),
     );
     Ok(Applied::DatabaseCreated { database: name })
+}
+
+/// Rejects an expiry at or before `now`, which would expire the database at once.
+fn check_expiry(
+    database: &DatabaseName,
+    now: Timestamp,
+    expires_at: Timestamp,
+) -> Result<(), Rejection> {
+    if expires_at <= now {
+        return Err(Rejection::ExpiryPassed {
+            database: database.clone(),
+            expires_at,
+        });
+    }
+    Ok(())
+}
+
+/// Patches a database's metadata, starting from none if it has none: label removals, then label
+/// sets, then the description and the expiry. The version grows by one.
+fn update_database(
+    state: &mut State,
+    now: Timestamp,
+    name: DatabaseName,
+    change: MetadataChange,
+    by: Option<PrincipalName>,
+    if_version: Option<u64>,
+) -> Outcome {
+    let db = state.database_or_reject(&name)?;
+    let current = db.metadata().map_or(0, Metadata::version);
+    if let Some(expected) = if_version.filter(|expected| *expected != current) {
+        return Err(Rejection::MetadataConflict {
+            database: name,
+            expected,
+            current,
+        });
+    }
+    let mut metadata = db.metadata().cloned().unwrap_or_else(Metadata::empty);
+    let MetadataChange {
+        description,
+        set_labels,
+        remove_labels,
+        expiry,
+    } = change;
+    let labels = metadata
+        .labels()
+        .patched(&remove_labels, &set_labels)
+        .map_err(|count| Rejection::TooManyLabels {
+            database: name.clone(),
+            count,
+            max: MAX_LABELS,
+        })?;
+    metadata.set_labels(labels);
+    match description {
+        DescriptionChange::Keep => {}
+        DescriptionChange::Set(text) => metadata.set_description(Some(text), by),
+        DescriptionChange::SetWithoutAuthor(text) => metadata.set_description(Some(text), None),
+        DescriptionChange::Clear => metadata.set_description(None, None),
+    }
+    match expiry {
+        ExpiryChange::Keep => {}
+        ExpiryChange::Set(expires_at) => {
+            check_expiry(&name, now, expires_at)?;
+            metadata.set_expires_at(Some(expires_at));
+        }
+        ExpiryChange::Clear => metadata.set_expires_at(None),
+    }
+    let version = current.saturating_add(1);
+    metadata.set_version(version);
+
+    database_mut(state, &name)?.set_metadata(metadata);
+    Ok(Applied::DatabaseUpdated {
+        database: name,
+        version,
+    })
+}
+
+/// Drops a database whose expiry is at or before `now`, as `DropDatabase` drops one.
+fn expire_database(state: &mut State, now: Timestamp, name: DatabaseName) -> Outcome {
+    let db = state.database_or_reject(&name)?;
+    let expires_at = db.metadata().and_then(Metadata::expires_at);
+    let Some(expires_at) = expires_at.filter(|expires_at| *expires_at <= now) else {
+        return Err(Rejection::NotExpired {
+            database: name,
+            expires_at,
+        });
+    };
+    let Some(database) = remove_database(state, &name) else {
+        return Err(Rejection::UnknownDatabase { database: name });
+    };
+    Ok(Applied::DatabaseExpired {
+        database: name,
+        epoch: database.epoch(),
+        expires_at,
+    })
 }
 
 fn change_durability(state: &mut State, database: DatabaseName, durability: Durability) -> Outcome {
@@ -725,20 +910,26 @@ fn change_durability(state: &mut State, database: DatabaseName, durability: Dura
     })
 }
 
-/// Removes the database with every member's report of it, so that no stale report outlives it.
-/// Reports are replaced wholesale by each heartbeat anyway; dropping them here keeps a snapshot
-/// taken right after the drop identical to one taken after the next heartbeats.
 fn drop_database(state: &mut State, name: DatabaseName) -> Outcome {
-    let Some(database) = state.databases.remove(&name) else {
+    let Some(database) = remove_database(state, &name) else {
         return Err(Rejection::UnknownDatabase { database: name });
     };
-    for entry in state.members.values_mut() {
-        entry.reports.remove(&name);
-    }
     Ok(Applied::DatabaseDropped {
         database: name,
         epoch: database.epoch(),
     })
+}
+
+/// Removes the database, with its lease and any promotion, and every member's report of it, so
+/// that no stale report outlives it; returns it, or `None` if there is no such database. Reports
+/// are replaced wholesale by each heartbeat anyway; dropping them here keeps a snapshot taken
+/// right after the drop identical to one taken after the next heartbeats.
+fn remove_database(state: &mut State, name: &DatabaseName) -> Option<Database> {
+    let database = state.databases.remove(name)?;
+    for entry in state.members.values_mut() {
+        entry.reports.remove(name);
+    }
+    Some(database)
 }
 
 fn acquire_lease(

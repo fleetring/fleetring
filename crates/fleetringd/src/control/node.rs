@@ -575,7 +575,7 @@ impl Writer {
 }
 
 /// Whether `action` may be refused for software, so the writer screens it before it logs it: a
-/// join, or a command that needs a fleet feature.
+/// join, or a command that needs any fleet feature.
 fn needs_screening(action: &Action) -> bool {
-    action.feature().is_some() || matches!(action, Action::Join { .. })
+    !action.features().is_empty() || matches!(action, Action::Join { .. })
 }

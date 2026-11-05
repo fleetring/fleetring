@@ -6,11 +6,12 @@
 //! move from one node to Raft without changing its logic.
 //!
 //! - [`State`] holds the members with their placement attributes and liveness, the membership
-//!   epoch, and every database with its engine, epoch, lease, and any promotion in progress.
+//!   epoch, and every database with its engine, epoch, lease, any promotion in progress, and any
+//!   metadata.
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create or drop a database,
-//!   change its durability, acquire or renew a lease, start a promotion, record a fenced member,
-//!   complete a promotion, tick, drain or undrain a member, transfer a lease, or revoke a bearer
-//!   token.
+//!   change its durability or its metadata, expire it, acquire or renew a lease, start a
+//!   promotion, record a fenced member, complete a promotion, tick, drain or undrain a member,
+//!   transfer a lease, or revoke a bearer token.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -53,6 +54,17 @@
 //!   enables the feature for good.
 //! - **Revocations** list token and key IDs, never credentials, each until a time after which it
 //!   is forgotten; ticks and revocations forget the entries the time has passed (ADR-0025).
+//! - **Metadata** (ADR-0041): a database may carry a [`Description`], [`Labels`], its creator
+//!   and creation time, and an expiry, in a [`Metadata`] record. A creation records it from a
+//!   [`MetadataSpec`]; afterwards, each update is a [`MetadataChange`] patch that changes only
+//!   what it names, so concurrent updates to different fields both land and, for one field, the
+//!   later in the log wins. Every accepted update grows the metadata's version, and an update
+//!   may require a version first. The creator and each description's author are recorded as the
+//!   command gives them; nothing is decided by them.
+//! - **Expiry** is judged only at a command's time. An expiry must be later than the time of the
+//!   command that sets it, and an `ExpireDatabase` drops a database, as `DropDatabase` does,
+//!   only if its expiry is at or before the command's time; an expiry extended since wins.
+//!   [`State::expired_databases`] lists the databases due.
 //!
 //! # Examples
 //!
@@ -73,6 +85,7 @@
 //!     replication_factor: ReplicationFactor::new(3).ok_or("zero")?,
 //!     engine: Engine::Sqlite,
 //!     durability: None,
+//!     metadata: None,
 //! }))?;
 //! let quorums = state.quorums(&"tenant:acme".parse()?)?;
 //! assert_eq!((quorums.write(), quorums.promotion()), (2, 2));
@@ -91,6 +104,7 @@ mod command;
 mod config;
 mod database;
 mod member;
+mod metadata;
 mod revocation;
 mod software;
 mod state;
@@ -104,6 +118,12 @@ pub use database::{
     ParseAcksError, ParseDatabaseNameError, Position, Promotion, Quorums,
 };
 pub use member::{HostedReplica, Liveness, Member, ReplicaRole, Report};
+pub use metadata::{
+    Description, DescriptionChange, ExpiryChange, FORBIDDEN_FORMAT_CHARACTERS, LabelKey,
+    LabelValue, Labels, MAX_DESCRIPTION_BYTES, MAX_LABELS, Metadata, MetadataChange, MetadataSpec,
+    ParseDescriptionError, ParseLabelError, ParsePrincipalNameError, PrincipalName,
+    RESERVED_LABEL_DOMAIN, parse_label,
+};
 pub use revocation::{KeyId, ParseCredentialIdError, Revocations, Revoked, TokenId};
 pub use software::{Feature, ParseFeatureError, ParseReleaseError, Release, Software};
 pub use state::{State, membership_ring};
@@ -119,25 +139,38 @@ const _: () = {
     assert_debug_send_sync::<ControlConfig>();
     assert_debug_send_sync::<Database>();
     assert_debug_send_sync::<DatabaseName>();
+    assert_debug_send_sync::<Description>();
+    assert_debug_send_sync::<DescriptionChange>();
     assert_debug_send_sync::<Durability>();
     assert_debug_send_sync::<DurabilityError>();
     assert_debug_send_sync::<Engine>();
+    assert_debug_send_sync::<ExpiryChange>();
     assert_debug_send_sync::<Feature>();
     assert_debug_send_sync::<HostedReplica>();
     assert_debug_send_sync::<JoinKind>();
     assert_debug_send_sync::<KeyId>();
+    assert_debug_send_sync::<LabelKey>();
+    assert_debug_send_sync::<LabelValue>();
+    assert_debug_send_sync::<Labels>();
     assert_debug_send_sync::<Lease>();
     assert_debug_send_sync::<LeaseEpoch>();
     assert_debug_send_sync::<Liveness>();
     assert_debug_send_sync::<Member>();
+    assert_debug_send_sync::<Metadata>();
+    assert_debug_send_sync::<MetadataChange>();
+    assert_debug_send_sync::<MetadataSpec>();
     assert_debug_send_sync::<Millis>();
     assert_debug_send_sync::<Outcome>();
     assert_debug_send_sync::<ParseAcksError>();
     assert_debug_send_sync::<ParseCredentialIdError>();
     assert_debug_send_sync::<ParseDatabaseNameError>();
+    assert_debug_send_sync::<ParseDescriptionError>();
     assert_debug_send_sync::<ParseFeatureError>();
+    assert_debug_send_sync::<ParseLabelError>();
+    assert_debug_send_sync::<ParsePrincipalNameError>();
     assert_debug_send_sync::<ParseReleaseError>();
     assert_debug_send_sync::<Position>();
+    assert_debug_send_sync::<PrincipalName>();
     assert_debug_send_sync::<Promotion>();
     assert_debug_send_sync::<Quorums>();
     assert_debug_send_sync::<Rejection>();

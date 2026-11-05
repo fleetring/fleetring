@@ -220,17 +220,28 @@ pub struct ParseReleaseError {
 pub enum Feature {
     /// [`Action::Undrain`](crate::Action::Undrain): clearing a member's draining mark.
     Undrain,
+    /// Database metadata (ADR-0041): an [`Action::CreateDatabase`](crate::Action::CreateDatabase)
+    /// that carries a [`MetadataSpec`](crate::MetadataSpec), and every
+    /// [`Action::UpdateDatabase`](crate::Action::UpdateDatabase) and
+    /// [`Action::ExpireDatabase`](crate::Action::ExpireDatabase).
+    Metadata,
+    /// Database expiry (ADR-0041): a creation or an update that sets or changes an expiry, and
+    /// [`Action::ExpireDatabase`](crate::Action::ExpireDatabase). Each of them needs
+    /// [`Feature::Metadata`] too.
+    Expiry,
 }
 
 impl Feature {
     /// Every feature this release knows, in order.
-    pub const ALL: [Self; 1] = [Self::Undrain];
+    pub const ALL: [Self; 3] = [Self::Undrain, Self::Metadata, Self::Expiry];
 
     /// Returns the feature's name, as members report it and errors print it.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Undrain => "undrain",
+            Self::Metadata => "metadata",
+            Self::Expiry => "expiry",
         }
     }
 }

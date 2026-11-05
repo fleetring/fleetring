@@ -3,9 +3,10 @@
 
 use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
-    Acks, Action, Command, ControlConfig, DatabaseName, Durability, Engine, Feature, HostedReplica,
-    LeaseEpoch, Member, Millis, Outcome, Position, Release, ReplicaRole, Revoked, Software, State,
-    Timestamp, apply,
+    Acks, Action, Command, ControlConfig, DatabaseName, DescriptionChange, Durability, Engine,
+    ExpiryChange, Feature, HostedReplica, LeaseEpoch, Member, MetadataChange, MetadataSpec, Millis,
+    Outcome, Position, Release, ReplicaRole, Revoked, Software, State, Timestamp, apply,
+    parse_label,
 };
 use proptest::prelude::*;
 
@@ -57,6 +58,7 @@ pub(crate) fn create(name: &str, replication_factor: u8) -> Action {
         replication_factor: factor(replication_factor),
         engine: Engine::Sqlite,
         durability: None,
+        metadata: None,
     }
 }
 
@@ -67,6 +69,7 @@ pub(crate) fn create_with(name: &str, replication_factor: u8, acks: Acks) -> Act
         replication_factor: factor(replication_factor),
         engine: Engine::Sqlite,
         durability: Some(Durability::new(acks, factor(replication_factor))),
+        metadata: None,
     }
 }
 
@@ -107,6 +110,18 @@ pub(crate) fn arb_op() -> impl Strategy<Value = Op> {
     })
 }
 
+/// What software generated members report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SoftwareMix {
+    /// Releases from two adjacent lines and one too far from them, some without any feature, so
+    /// that version refusals and feature gates replay.
+    #[default]
+    Mixed,
+    /// Every member runs a current release with every feature, so that commands the features
+    /// gate, such as database metadata and expiry, are accepted and replay.
+    Current,
+}
+
 /// Turns [`Op`]s into commands, keeping the control node's clock.
 ///
 /// The generator reads the state only to aim commands at things that exist (the current lease
@@ -114,9 +129,15 @@ pub(crate) fn arb_op() -> impl Strategy<Value = Op> {
 #[derive(Debug, Default)]
 pub(crate) struct Generator {
     clock: u64,
+    mix: SoftwareMix,
 }
 
 impl Generator {
+    /// A generator whose members report `mix`.
+    pub(crate) fn with_mix(mix: SoftwareMix) -> Self {
+        Self { clock: 0, mix }
+    }
+
     pub(crate) fn command(&mut self, state: &State, op: Op) -> Command {
         self.clock += u64::from(op.dt);
         // Now and then the stamp goes backwards, as a control node's clock might.
@@ -125,8 +146,16 @@ impl Generator {
         } else {
             self.clock
         };
-        Command::new(at(stamp), action(state, op))
+        Command::new(at(stamp), action(state, op, self.mix))
     }
+}
+
+/// The software a current member reports: a 0.6 release with every feature.
+pub(crate) fn current_software() -> Software {
+    Feature::ALL.into_iter().fold(
+        Software::new(Release::new(0, 6, 0), 1),
+        Software::with_feature,
+    )
 }
 
 /// Software a generated member reports: releases from two adjacent lines and one too far from
@@ -140,11 +169,15 @@ pub(crate) fn software_for(b: usize) -> Software {
     }
 }
 
-fn action(state: &State, op: Op) -> Action {
+fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
     let a = usize::from(op.a);
     let b = usize::from(op.b);
     let node = NODES[a % NODES.len()];
     let database = db(DATABASES[a % DATABASES.len()]);
+    let reported = |b: usize| match mix {
+        SoftwareMix::Mixed => software_for(b),
+        SoftwareMix::Current => current_software(),
+    };
     match op.kind % 16 {
         0 => {
             let mut joining = member(a % NODES.len());
@@ -156,9 +189,9 @@ fn action(state: &State, op: Op) -> Action {
                 joining = joining.with_address(format!("{node}.local:{}", 7400 + b % 3));
             }
             // Members report software, sometimes too far apart to run together, so replays cover
-            // version refusals and feature gates too.
-            if b % 5 == 1 {
-                joining = joining.with_software(software_for(b));
+            // version refusals and feature gates too. Current members always report theirs.
+            if b % 5 == 1 || mix == SoftwareMix::Current {
+                joining = joining.with_software(reported(b));
             }
             Action::Join { member: joining }
         }
@@ -178,6 +211,18 @@ fn action(state: &State, op: Op) -> Action {
             },
             until: at(state.now().as_millis() + u64::from(op.a) * 20).max(at(u64::from(op.b) * 10)),
         },
+        // Metadata only among current members: in a mixed fleet the gate refuses it, except in
+        // a fleet with no members at all, where it would enable the feature and refuse every
+        // later join, and the rest of the log would test nothing.
+        8 if b % 10 == 1 && mix == SoftwareMix::Current => update(state, op, database),
+        // Half of the expiries aim where the control node's sweep would, the rest anywhere.
+        8 if b % 10 == 6 && mix == SoftwareMix::Current => Action::ExpireDatabase {
+            name: state
+                .expired_databases(state.now())
+                .into_iter()
+                .find(|_| a.is_multiple_of(2))
+                .unwrap_or(database),
+        },
         8 if b % 10 == 7 => Action::TransferLease {
             database,
             target: (b % 4 == 3).then(|| id(NODES[(a + 1) % NODES.len()])),
@@ -188,11 +233,18 @@ fn action(state: &State, op: Op) -> Action {
         },
         1 | 8 => {
             let factor = 1 + op.b % 3;
-            if b.is_multiple_of(4) {
+            let mut creation = if b.is_multiple_of(4) {
                 create(DATABASES[a % DATABASES.len()], factor)
             } else {
                 create_with(DATABASES[a % DATABASES.len()], factor, acks_for(b))
+            };
+            if b % 4 == 2
+                && mix == SoftwareMix::Current
+                && let Action::CreateDatabase { metadata, .. } = &mut creation
+            {
+                *metadata = Some(metadata_spec(state, op));
             }
+            creation
         }
         2..=7 => {
             let mut replicas: Vec<HostedReplica> = DATABASES
@@ -224,7 +276,7 @@ fn action(state: &State, op: Op) -> Action {
                 id: id(node),
                 replicas,
                 unknown_reports,
-                software: (b % 7 == 2).then(|| software_for(b)),
+                software: (b % 7 == 2).then(|| reported(b)),
             }
         }
         9 => Action::AcquireLease {
@@ -255,6 +307,69 @@ fn action(state: &State, op: Op) -> Action {
             epoch: promotion_epoch(state, &database, b),
             database,
         },
+    }
+}
+
+/// What a generated creation records: a `purpose` label, sometimes a description, and sometimes
+/// an expiry. The expiry is up to 12 s past the state's time, and sometimes at it, so that some
+/// have already passed when the command runs.
+fn metadata_spec(state: &State, op: Op) -> MetadataSpec {
+    let purpose = if op.a.is_multiple_of(2) {
+        "purpose=memory"
+    } else {
+        "purpose=task"
+    };
+    MetadataSpec {
+        description: op
+            .a
+            .is_multiple_of(3)
+            .then(|| format!("Generated database {}.\nIt holds nothing.", op.a))
+            .map(|text| text.parse().expect("a valid description")),
+        labels: fleetring_control::Labels::try_from_pairs([
+            parse_label(purpose).expect("a valid label")
+        ])
+        .expect("one label"),
+        expires_at: (op.a % 2 == 1)
+            .then(|| at(state.now().as_millis() + u64::from(op.a / 4 % 4) * 4_000)),
+        created_by: Some("agent-1".parse().expect("a valid principal name")),
+    }
+}
+
+/// A metadata update: sets or removes a label, sometimes sets the expiry (sometimes to the
+/// state's time, which is refused) or the description, and sometimes requires a version, the
+/// current one or one off.
+fn update(state: &State, op: Op, database: DatabaseName) -> Action {
+    let a = usize::from(op.a);
+    let mut change = MetadataChange::default();
+    let key = format!("k{}", a % 3);
+    if a.is_multiple_of(2) {
+        change.set_labels = fleetring_control::Labels::try_from_pairs([parse_label(&format!(
+            "{key}=v{}",
+            op.b % 4
+        ))
+        .expect("a valid label")])
+        .expect("one label");
+    } else {
+        change
+            .remove_labels
+            .insert(key.parse().expect("a valid key"));
+    }
+    if a.is_multiple_of(5) {
+        let ahead = u64::from(op.b / 10 % 4) * 3_000;
+        change.expiry = ExpiryChange::Set(at(state.now().as_millis() + ahead));
+    }
+    if a % 7 == 3 {
+        change.description = DescriptionChange::Set("Updated.".parse().expect("valid"));
+    }
+    let version = state
+        .database(&database)
+        .and_then(|d| d.metadata())
+        .map_or(0, fleetring_control::Metadata::version);
+    Action::UpdateDatabase {
+        name: database,
+        change,
+        by: Some("agent-2".parse().expect("a valid principal name")),
+        if_version: a.is_multiple_of(3).then(|| version + u64::from(op.b % 2)),
     }
 }
 
@@ -314,8 +429,13 @@ pub(crate) fn fixed_ops(seed: u64, len: usize) -> Vec<Op> {
 /// Generates a command log from `ops` by running it against a fresh state, and returns the log
 /// with the outcomes and the final state.
 pub(crate) fn record(ops: &[Op]) -> (Vec<Command>, Vec<Outcome>, State) {
+    record_with(ops, SoftwareMix::Mixed)
+}
+
+/// Generates a command log from `ops` as [`record`] does, with members reporting `mix`.
+pub(crate) fn record_with(ops: &[Op], mix: SoftwareMix) -> (Vec<Command>, Vec<Outcome>, State) {
     let mut state = State::new(config());
-    let mut generator = Generator::default();
+    let mut generator = Generator::with_mix(mix);
     let mut log = Vec::with_capacity(ops.len());
     let mut outcomes = Vec::with_capacity(ops.len());
     for &op in ops {
