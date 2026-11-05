@@ -598,6 +598,18 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#mcp-server"
     },
     {
+      "id": "orphan-copies",
+      "component": "fleetringd",
+      "area": "operations",
+      "title": "No deletion by absence",
+      "description": "A data node deletes a copy only when told of its database’s drop, and keeps any copy the control plane doesn’t know as an orphan, listed and counted, until orphan remove deletes it.",
+      "status": "built",
+      "since": "0.6.0",
+      "ticket": "FR-077",
+      "issue": 105,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0042-no-deletion-by-absence.md"
+    },
+    {
       "id": "agent-kit",
       "component": "fleetringd",
       "area": "access",

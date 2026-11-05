@@ -145,7 +145,7 @@ Where a database's actor hands each committed batch to be replicated, right afte
 
 ### Binding
 
-What a node making a node-to-node call must be for the database or node the request names: `self`, `replica`, `holder`, `candidate`, `holder or candidate`, or `follower` (ADR-0031). A call that fails its binding is refused before it touches state.
+What a node making a node-to-node call must be for the database or node the request names: `self`, `replica`, `holder`, `candidate`, `holder or candidate`, `follower`, or `dropped` (ADR-0031, ADR-0042). A call that fails its binding is refused before it touches state.
 
 - **Applies to:** daemon.
 - **Code:** `replication::binding`, metadata `fleetring-binding`, the `Binding:` lines in the protocol. **CLI:** none.
@@ -325,7 +325,7 @@ A number that only grows, used to order and fence. Always say which one:
 
 ### Expiry
 
-The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). A duration is turned into a time by the control node before it logs the command, at least a minute ahead. The control node's sweep stamps the command that drops it with its own clock, so a control node whose clock runs ahead expires databases early by as much. Before the primary deletes its copy, it flushes the database's change streams, its [archive](#archive) included, for up to 30 seconds.
+The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). A duration is turned into a time by the control node before it logs the command, at least a minute ahead. The control node's sweep stamps the command that drops it with its own clock, so a control node whose clock runs ahead expires databases early by as much. Before the primary deletes its copy, it flushes the database's change streams, its [archive](#archive) included, for up to 30 seconds. A replica that misses the drop keeps its copy as an [orphan](#orphan).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Metadata::expires_at`, `Action::ExpireDatabase`, `Feature::Expiry`, `control::MIN_EXPIRY`, `data::Expiry`, `ChangeStreams::flush_database`. **CLI:** `--expires-in`, `--expires-at` on `db create` and `db restore`, `db set-expiry`; `expires` in `db show`.
@@ -538,6 +538,14 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 - **Applies to:** daemon, CLI.
 - **Code:** `fleetringd::NodeRole`, `role` in config. **CLI:** `--role data|control|both`.
 - **Not:** role alone (say whose), mode, type, kind, function.
+
+### Orphan
+
+A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `Replication::orphan`, `data::Orphan`, protocol `OrphanStatus` and `Database.RemoveOrphan`. **CLI:** `fleetringd orphan list`, `fleetringd orphan remove <database> --node <id>`.
+- **Not:** stale copy, leftover, stray, zombie, dangling replica.
 
 ### Placement
 
