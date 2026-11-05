@@ -48,7 +48,6 @@
         "replication_factor": {
           "default": null,
           "description": "How many replicas it has, the primary included; the fleet's default if left out.",
-          "format": "uint8",
           "maximum": 255,
           "minimum": 1,
           "type": [
@@ -141,7 +140,6 @@
             },
             "version": {
               "description": "The metadata's version, for `db_update`'s `expected_version`.",
-              "format": "uint64",
               "minimum": 0,
               "type": "integer"
             }
@@ -165,13 +163,11 @@
             },
             "lease_epoch": {
               "description": "Its lease epoch, 0 before its first lease.",
-              "format": "uint64",
               "minimum": 0,
               "type": "integer"
             },
             "min_replicas": {
               "description": "The least number of reachable replicas a write needs.",
-              "format": "uint8",
               "maximum": 255,
               "minimum": 0,
               "type": "integer"
@@ -192,7 +188,6 @@
             },
             "replication_factor": {
               "description": "How many replicas it should have.",
-              "format": "uint8",
               "maximum": 255,
               "minimum": 0,
               "type": "integer"
@@ -260,7 +255,6 @@
             },
             "rows": {
               "description": "The rows counted, for a table that was counted.",
-              "format": "uint64",
               "minimum": 0,
               "type": [
                 "integer",
@@ -396,7 +390,6 @@
         "limit": {
           "default": null,
           "description": "The most databases to list: 100 if left out, at most 1,000.",
-          "format": "uint32",
           "maximum": 1000,
           "minimum": 1,
           "type": [
@@ -543,7 +536,6 @@
         "count_limit": {
           "default": null,
           "description": "Counts each table's rows up to this many; 10,000 if left out, 0 counts nothing, and at most 1,000,000 rows are counted across all tables.",
-          "format": "uint64",
           "maximum": 1000000,
           "minimum": 0,
           "type": [
@@ -648,7 +640,6 @@
             },
             "version": {
               "description": "The metadata's version, for `db_update`'s `expected_version`.",
-              "format": "uint64",
               "minimum": 0,
               "type": "integer"
             }
@@ -672,13 +663,11 @@
             },
             "lease_epoch": {
               "description": "Its lease epoch, 0 before its first lease.",
-              "format": "uint64",
               "minimum": 0,
               "type": "integer"
             },
             "min_replicas": {
               "description": "The least number of reachable replicas a write needs.",
-              "format": "uint8",
               "maximum": 255,
               "minimum": 0,
               "type": "integer"
@@ -699,7 +688,6 @@
             },
             "replication_factor": {
               "description": "How many replicas it should have.",
-              "format": "uint8",
               "maximum": 255,
               "minimum": 0,
               "type": "integer"
@@ -767,7 +755,6 @@
             },
             "rows": {
               "description": "The rows counted, for a table that was counted.",
-              "format": "uint64",
               "minimum": 0,
               "type": [
                 "integer",
@@ -930,7 +917,6 @@
         "max_rows": {
           "default": null,
           "description": "The most rows to return: 200 if left out, at most 5,000.",
-          "format": "uint32",
           "maximum": 5000,
           "minimum": 1,
           "type": [
@@ -1086,19 +1072,16 @@
       "properties": {
         "acknowledged_by": {
           "description": "How many replicas, the primary included, held the write when it was acknowledged.",
-          "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "replicas": {
           "description": "How many replicas the database should have.",
-          "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "rows_affected": {
           "description": "The rows the statement inserted, updated, or deleted.",
-          "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
@@ -1138,7 +1121,6 @@
         "expected_version": {
           "default": null,
           "description": "Applies the update only if the metadata is still at this version, as `db_show` returned it; refused with `aborted` otherwise, so a description read first isn't overwritten.",
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -1264,7 +1246,6 @@
             },
             "version": {
               "description": "The metadata's version, for `db_update`'s `expected_version`.",
-              "format": "uint64",
               "minimum": 0,
               "type": "integer"
             }
@@ -1337,7 +1318,6 @@
         },
         "epoch": {
           "description": "The lease epoch it was dropped at.",
-          "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
