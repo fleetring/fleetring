@@ -12,7 +12,7 @@ use hyper::{Request, Uri};
 use serde::Deserialize;
 
 use crate::durability::HttpPolicy;
-use crate::durability::s3::http::{HttpClient, client};
+use crate::https::{HttpClient, client};
 use crate::upgrade::UpgradeError;
 
 /// The repository releases come from.
@@ -66,10 +66,11 @@ impl Source {
         mirror: Option<String>,
         timeout: Duration,
     ) -> Result<Self, UpgradeError> {
-        let http = client(None, HttpPolicy::AllowHttp).map_err(|error| UpgradeError::Network {
-            url: String::new(),
-            reason: error.to_string(),
-        })?;
+        let http =
+            client(None, None, HttpPolicy::AllowHttp).map_err(|error| UpgradeError::Network {
+                url: String::new(),
+                reason: error.to_string(),
+            })?;
         Ok(Self {
             releases: releases.unwrap_or_else(|| RELEASES_URL.to_owned()),
             mirror: mirror.map(|mirror| mirror.trim_end_matches('/').to_owned()),
