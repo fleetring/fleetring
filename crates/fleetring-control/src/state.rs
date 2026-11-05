@@ -89,7 +89,7 @@ impl State {
     }
 
     /// Checks `action` against the feature gate alone: it passes if each feature it needs is
-    /// enabled, or supported by every member, live or down.
+    /// enabled, or supported by every member, live or down, of a fleet that has at least one.
     ///
     /// [`apply`](crate::apply) makes the same check. The control node also makes it before it
     /// logs a command, so that a refused command never reaches the log, where a control node of
@@ -99,7 +99,8 @@ impl State {
     ///
     /// [`Rejection::FeatureUnsupported`] naming the first feature, in [`Action::features`]'s
     /// order, that isn't enabled and that a member lacks, and the first member, in ID order,
-    /// that lacks it.
+    /// that lacks it; [`Rejection::FeatureWithoutMembers`] for a feature that isn't enabled
+    /// while the fleet has no members.
     ///
     /// # Examples
     ///
@@ -183,6 +184,13 @@ impl State {
     pub(crate) fn check_feature(&self, feature: Feature) -> Result<(), Rejection> {
         if self.is_enabled(feature) {
             return Ok(());
+        }
+        // With no members, "every member supports it" would hold of any feature, even one no
+        // release reports yet, and enabling it would refuse every later join (ADR-0041,
+        // amendment 3). This changes no replay: until this rule, the only gated action was
+        // `Undrain`, which names a member and so was already rejected in an empty fleet.
+        if self.members.is_empty() {
+            return Err(Rejection::FeatureWithoutMembers { feature });
         }
         for (id, entry) in &self.members {
             let software = entry.member.running();

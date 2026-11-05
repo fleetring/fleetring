@@ -326,18 +326,10 @@ struct SoftwareRecord {
 
 impl From<SoftwareRecord> for Software {
     fn from(record: SoftwareRecord) -> Self {
-        let mut software = Self::new(record.release, record.control_format);
-        for name in record.features.into_iter().chain(record.newer_features) {
-            match name.parse() {
-                Ok(feature) => {
-                    software.features.insert(feature);
-                }
-                Err(ParseFeatureError { name }) => {
-                    software.unknown_features.insert(name.into_boxed_str());
-                }
-            }
-        }
-        software
+        record.features.iter().chain(&record.newer_features).fold(
+            Self::new(record.release, record.control_format),
+            |software, name| software.with_feature_name(name),
+        )
     }
 }
 
@@ -388,6 +380,34 @@ impl Software {
     #[must_use]
     pub fn with_feature(mut self, feature: Feature) -> Self {
         self.features.insert(feature);
+        self
+    }
+
+    /// Adds the feature named `name` to what the member reports: a feature this release knows,
+    /// or else a name kept as given, as a newer member reports one, which never counts as
+    /// supported here.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fleetring_control::{Feature, Release, Software};
+    ///
+    /// let software = Software::new(Release::new(0, 7, 0), 1)
+    ///     .with_feature_name("metadata")
+    ///     .with_feature_name("future-x");
+    /// assert!(software.supports(Feature::Metadata));
+    /// assert_eq!(software.unknown_features().collect::<Vec<_>>(), ["future-x"]);
+    /// ```
+    #[must_use]
+    pub fn with_feature_name(mut self, name: &str) -> Self {
+        match name.parse() {
+            Ok(feature) => {
+                self.features.insert(feature);
+            }
+            Err(ParseFeatureError { name }) => {
+                self.unknown_features.insert(name.into_boxed_str());
+            }
+        }
         self
     }
 

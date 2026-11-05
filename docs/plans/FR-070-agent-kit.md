@@ -500,7 +500,7 @@ impl MetadataChange {
   - `Mixed` is today's behaviour.
   - `Current` makes every `Join` report `Software::new(Release::new(0, 6, 0), 1)` with every feature in `Feature::ALL`.
 - Add `pub(crate) fn record_with(ops: &[Op], mix: SoftwareMix)`; `record` calls it with `Mixed`.
-- In `action()`, and only in the `Current` mix: in `Mixed`, a fleet with no members passes every feature gate, so one metadata command would enable the feature and refuse every later join, and the rest of the log would test nothing.
+- In `action()`, and only in the `Current` mix: in `Mixed` the gate refuses all of it, in an empty fleet too (ADR-0041, amendment 3, tested in `a_fleet_without_members_enables_no_feature`), and leaving it out keeps the mixed log as it was.
   - `1 | 8` creations with `b % 4 == 2` carry a `MetadataSpec`: labels `purpose=memory` or `purpose=task` by `a % 2`; a description when `a % 3 == 0`; an expiry of `state.now() + (u64::from(op.a / 4 % 4) * 4_000)` ms when `a % 2 == 1` (0 ms ahead a quarter of the time, so `ExpiryPassed` occurs); `created_by` `agent-1`.
   - `8 if b % 10 == 1` → `UpdateDatabase`: set or remove one label by `a % 2`; set the expiry to `state.now() + (u64::from(op.b / 10 % 4) * 3_000)` ms when `a % 5 == 0`; `if_version: Some(…)` when `a % 3 == 0`, from the database's current version or one off.
   - `8 if b % 10 == 6` → `ExpireDatabase`: for even `a`, the first of `state.expired_databases(state.now())`, as the sweep would pick; otherwise `database`.

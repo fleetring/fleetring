@@ -211,9 +211,9 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
             },
             until: at(state.now().as_millis() + u64::from(op.a) * 20).max(at(u64::from(op.b) * 10)),
         },
-        // Metadata only among current members: in a mixed fleet the gate refuses it, except in
-        // a fleet with no members at all, where it would enable the feature and refuse every
-        // later join, and the rest of the log would test nothing.
+        // Metadata only among current members: in a mixed fleet the gate refuses all of it, and
+        // in a fleet with no members too (`FeatureWithoutMembers`), which the gate's own tests
+        // cover; leaving it out keeps the mixed log as it was.
         8 if b % 10 == 1 && mix == SoftwareMix::Current => update(state, op, database),
         // Half of the expiries aim where the control node's sweep would, the rest anywhere.
         8 if b % 10 == 6 && mix == SoftwareMix::Current => Action::ExpireDatabase {
