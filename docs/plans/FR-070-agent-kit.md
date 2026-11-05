@@ -1358,8 +1358,9 @@ Reply "ADR-0041 as recommended" to take all six. Otherwise, give the number and 
   - `SECURITY.md` notes that principal names are visible.
 - 2026-11-05: phase 6 built, with expiry on top of phase 3: `db_create` and `db_update` take `expires_in` (`"never"` clears on `db_update`) or `expires_at`, and results carry `expires_at` and `expires_in_ms`. Where it departs from 6.3:
   - a failed tool call's `{"error": …}` is the result's text block, with no `structuredContent`, which ADR-0041 point 9 requires to match the tool's output schema;
-  - `ServerHandler` is written by hand over a fixed tool table rather than with `#[tool_router]`, so malformed arguments stay a JSON-RPC `invalid_params` error, which rmcp's router would turn into a tool error;
+  - `ServerHandler` is written by hand over a fixed tool table rather than with `#[tool_router]`, so malformed arguments stay a JSON-RPC `invalid_params` error, which rmcp's router would turn into a tool error; `rmcp`'s `macros` feature is dropped;
   - each result's text block escapes control and invisible characters as JSON `\u` escapes, so it parses to exactly the structured content;
   - a statement's own error message goes in `detail`, marked untrusted, and internal errors' messages aren't sent;
   - `fit` drops entries in one pass, and a cut listing's `next_after` is the last database kept;
   - `--max-result-bytes` is at least 64 KiB, and every call has a 60 s timeout.
+  - ADR-0041 amendment 8 records these departures.
