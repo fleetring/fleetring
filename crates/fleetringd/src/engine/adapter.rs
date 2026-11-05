@@ -8,7 +8,8 @@ use std::path::Path;
 
 use crate::engine::{
     CaptureMode, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, LogicalSupport,
-    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Statement, Transaction,
+    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Statement,
+    Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -60,6 +61,20 @@ pub trait Database: fmt::Debug + Send {
     ///
     /// [`EngineError::Statement`] if the query fails or tries to write.
     fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError>;
+
+    /// The database's schema (ADR-0041, point 6): its tables, views, indexes, triggers, and
+    /// virtual tables, with the engine's own definitions and row counts capped by the request.
+    /// It reads the latest committed state, as [`query`](Self::query) does, and must not hold
+    /// up writes. Engines that can't describe themselves keep the default.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Unsupported`] if the engine can't describe its databases, and
+    /// [`EngineError::Storage`] if the catalog can't be read.
+    fn schema(&mut self, request: &SchemaRequest) -> Result<Schema, EngineError> {
+        let _ = request;
+        Err(EngineError::Unsupported { what: "schema" })
+    }
 
     /// Writes a consistent copy of the database into `destination`, a directory that a follower
     /// can later open as its location.
@@ -479,4 +494,10 @@ pub enum EngineError {
     /// Storage failed.
     #[error("storage failed")]
     Storage(#[source] Box<dyn Error + Send + Sync>),
+    /// The engine doesn't offer the operation.
+    #[error("the engine doesn't support {what}")]
+    Unsupported {
+        /// What was asked for.
+        what: &'static str,
+    },
 }
