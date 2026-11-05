@@ -43,11 +43,12 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0032](0032-fleet-replaces-cluster.md) | "Fleet" replaces "cluster" for the nodes one control plane and one authority govern, as a clean break in 0.3.0 with no aliases | Accepted |
 | [0033](0033-cli-tui-desktop-surfaces.md) | The CLI, a TUI, and a desktop app are separate surfaces over one client crate, with the same RPCs and the same lexicon | Accepted |
 | [0034](0034-metrics-health-and-logs.md) | Metrics, health, and readiness on a separate admin listener, with bounded labels and a span per request | Accepted |
-| [0035](0035-raft-control-group.md) | The control log is replicated by a Raft control group on openraft, with one code path from one voter to five | Accepted |
+| [0035](0035-raft-control-group.md) | The control log is replicated by a Raft control group on openraft, with one code path from one voter to five | Accepted (amendments proposed in 0040) |
 | [0036](0036-fault-injection-on-real-daemons.md) | Fault injection on real daemons: an in-repo harness runs five daemons in containers with partitions, kills, pauses, and clock skew, judged by the history checker | Accepted |
 | [0037](0037-router-hrana-front-door.md) | The router is a Hrana-over-HTTP front door that authenticates each request and runs it in a session on its database's primary (amends 0026, point 4, for sessions) | Accepted |
 | [0038](0038-version-compatibility-and-upgrades.md) | A fleet runs two adjacent release lines at once, gates new control commands as fleet features, and upgrades a node with a verified, atomic binary swap | Accepted |
 | [0039](0039-dev-mode.md) | Dev mode is the normal daemon on loopback, with a local authority and an admin principal it creates once and reuses | Accepted |
+| [0040](0040-raft-control-group-versions-and-dev-mode.md) | The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends 0035) | Proposed |
 
 ## Template
 
