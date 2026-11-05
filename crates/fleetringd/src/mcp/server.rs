@@ -39,7 +39,7 @@ use crate::mcp::limits::{
     MAX_PARAMS, MAX_ROWS, MAX_SQL_BYTES,
 };
 use crate::mcp::render::{
-    NOTICE, PAGE_HINT, database_out, fit, list_out, metadata_out, query_out, text,
+    NOTICE, PAGE_HINT, database_out, fit, fit_listing, list_out, metadata_out, query_out, text,
 };
 use crate::mcp::tools::{
     DatabaseOut, DbCreateInput, DbDropInput, DbListInput, DbShowInput, DbUpdateInput, DropOut,
@@ -380,20 +380,11 @@ impl FleetringMcp {
             .await
             .map_err(Failed::status)?;
         let mut out = list_out(&listing, self.me());
-        let cut = fit(
+        fit_listing(
             &mut out,
-            |out| &mut out.databases,
-            |out| out.truncated = true,
+            input.after.as_deref(),
             self.settings.max_result_bytes,
         )?;
-        if cut {
-            // The next page starts after the last database this one kept.
-            out.next_after = out
-                .databases
-                .last()
-                .map(|listed| listed.name.clone())
-                .or(input.after);
-        }
         Ok(out)
     }
 
