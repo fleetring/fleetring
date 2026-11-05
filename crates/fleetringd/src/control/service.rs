@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::{
-    Acks, Action, Applied, DatabaseName, Durability, Engine, Feature, HostedReplica, Lease,
-    LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName, Rejection,
-    ReplicaRole, Revoked, Software, State,
+    Acks, Action, Applied, DatabaseName, Durability, Engine, ExpiryChange, Feature, HostedReplica,
+    Lease, LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName, Rejection,
+    ReplicaRole, Revoked, Software, State, Timestamp,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
@@ -38,9 +38,9 @@ use crate::clock::{Clock, SystemClock};
 use crate::control::node::{ControlHandle, SubmitError};
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, change_from_proto, description_from_proto, labels_from_proto,
-    metadata_to_proto, revocation_from_proto, revocations_to_proto,
+    metadata_to_proto, revocation_from_proto, revocations_to_proto, spec_expiry_from_proto,
 };
-use crate::data::{Descriptions, LabelRequirement, is_invisible};
+use crate::data::{Descriptions, Expiry, ExpiryRequest, LabelRequirement, is_invisible};
 use crate::dev::DevMode;
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
@@ -85,6 +85,10 @@ impl DurabilityDefaults {
             .unwrap_or_else(|_| Durability::new(self.acks, replication_factor))
     }
 }
+
+/// The least time ahead of the control plane's time that a new expiry may be (ADR-0041,
+/// point 4): an expiry that passes before the creating client's next call is a mistake.
+pub const MIN_EXPIRY: Millis = Millis::new(60_000);
 
 /// The `Control` service: every mutation goes through the control node's single writer, and
 /// reads come from its published state.
@@ -211,6 +215,44 @@ impl ControlService {
         let engine = engine_from(request.engine)?;
         let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
         Ok((name, replication_factor, engine, durability))
+    }
+
+    /// The time `expiry` names, resolved before the command is stamped and logged, so the log
+    /// holds only absolute times (ADR-0041, point 4). A duration counts from the later of this
+    /// node's clock and the control plane's last applied stamp, which may be ahead of this
+    /// node's clock after a failover from a node whose clock ran ahead; resolving against the
+    /// later of the two keeps a fresh duration from landing behind the time `apply` judges by.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for a time less than [`MIN_EXPIRY`] after that time.
+    fn resolve_expiry(&self, expiry: Expiry) -> Result<Timestamp, Status> {
+        let now = self.clock.now().max(self.node.state().now());
+        let at = match expiry {
+            Expiry::At(at) => at,
+            Expiry::In(duration) => now.saturating_add(Millis::new(
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            )),
+        };
+        if at < now.saturating_add(MIN_EXPIRY) {
+            return Err(Status::invalid_argument(
+                "expiry must be at least 1m from now",
+            ));
+        }
+        Ok(at)
+    }
+
+    /// The expiry change an update asks for, with a new time resolved as
+    /// [`resolve_expiry`](Self::resolve_expiry) does.
+    fn expiry_change(&self, expiry: ExpiryRequest) -> Result<ExpiryChange, Status> {
+        Ok(match expiry {
+            ExpiryRequest::Keep => ExpiryChange::Keep,
+            ExpiryRequest::At(at) => ExpiryChange::Set(self.resolve_expiry(Expiry::At(at))?),
+            ExpiryRequest::In(duration) => {
+                ExpiryChange::Set(self.resolve_expiry(Expiry::In(duration))?)
+            }
+            ExpiryRequest::Clear => ExpiryChange::Clear,
+        })
     }
 
     /// Submits a creation and answers with the new database's placement.
@@ -840,9 +882,9 @@ impl Control for ControlService {
         self.create(name, replication_factor, action).await
     }
 
-    /// Creates a database with a description or labels, recording the caller as its creator.
-    /// A fleet with a member that lacks `metadata` refuses it before it is logged (ADR-0041,
-    /// point 3).
+    /// Creates a database with a description, labels, or an expiry, recording the caller as its
+    /// creator. A fleet with a member that lacks `metadata`, or `expiry` for an expiry, refuses
+    /// it before it is logged (ADR-0041, point 3).
     async fn create_database_with_metadata(
         &self,
         request: Request<CreateDatabaseWithMetadataRequest>,
@@ -859,13 +901,15 @@ impl Control for ControlService {
         let spec = MetadataSpec {
             description: description_from_proto(&metadata.description)?,
             labels: labels_from_proto(&metadata.labels)?,
+            expires_at: spec_expiry_from_proto(&metadata)
+                .map(|expiry| self.resolve_expiry(expiry))
+                .transpose()?,
             created_by: creator(&request)?,
-            ..MetadataSpec::default()
         };
         if !spec.is_explicit() {
             return Err(Status::invalid_argument(
-                "the creation carries no description or labels; use CreateDatabase for a \
-                 database without metadata",
+                "the creation carries no description, labels, or expiry; use CreateDatabase for \
+                 a database without metadata",
             ));
         }
         let action = Action::CreateDatabase {
@@ -878,15 +922,17 @@ impl Control for ControlService {
         self.create(name, replication_factor, action).await
     }
 
-    /// Patches a database's description or labels, recording the caller as the description's
-    /// author when the description changes, and answers with the metadata after it.
+    /// Patches a database's description, labels, or expiry, recording the caller as the
+    /// description's author when the description changes, and answers with the metadata after
+    /// it. A new expiry is resolved to a time before the update is logged.
     async fn update_database(
         &self,
         request: Request<UpdateDatabaseRequest>,
     ) -> Result<Response<UpdateDatabaseResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
-        let change = change_from_proto(request.get_ref())?;
+        let (mut change, expiry) = change_from_proto(request.get_ref())?;
+        change.expiry = self.expiry_change(expiry)?;
         let action = Action::UpdateDatabase {
             name: name.clone(),
             change,

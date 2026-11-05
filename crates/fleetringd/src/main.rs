@@ -25,9 +25,9 @@ use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIF
 use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
-    ArchiveDescription, Client, DatabaseSpec, LabelRequirement, LeaseUpdate, ListFilter, Location,
-    MetadataView, NewMetadata, NodeStatus, ReplicaInfo, Restoration, Verification,
-    restored_metadata,
+    ArchiveDescription, Client, DatabaseSpec, Expiry, ExpiryRequest, LabelRequirement, LeaseUpdate,
+    ListFilter, Location, MetadataView, NewMetadata, NodeStatus, ReplicaInfo, Restoration,
+    RestoredExpiry, Verification, restored_metadata,
 };
 use fleetringd::dev::{self, DevError, DevMode, Prepared};
 use fleetringd::durability::{
@@ -39,7 +39,9 @@ use fleetringd::engine::{
 };
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
-use fleetringd::report::{DatabaseReport, printable, render_archived_metadata, render_text};
+use fleetringd::report::{
+    DatabaseReport, MetadataReport, expiry_text, printable, render_archived_metadata, render_text,
+};
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
     FleetName, Identity, Peer, Principal, Security, Validity,
@@ -461,7 +463,7 @@ enum DbCommand {
         target: Target,
     },
     /// Shows a database in detail: where it lives, as `db locate` prints it, its description,
-    /// labels, creator, and metadata version, and its schema.
+    /// labels, creator, expiry, and metadata version, and its schema.
     ///
     /// A description is text a principal wrote: it prints as a block, each line indented and
     /// prefixed with `| `, and one written by another principal, or by nobody that can be
@@ -528,6 +530,33 @@ enum DbCommand {
         #[arg(long = "remove", value_name = "KEY")]
         remove: Vec<LabelKey>,
         /// Changes them only if the metadata is still at this version, as `db show` prints it.
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Sets, moves, or removes a database's expiry: the time after which the control plane
+    /// drops it, deleting every copy. An archive keeps the database as of what reached it.
+    #[command(group(
+        clap::ArgGroup::new("expiry")
+            .required(true)
+            .args(["expires_in", "expires_at", "never"])
+    ))]
+    SetExpiry {
+        /// The database's name.
+        name: DatabaseName,
+        /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`, at least
+        /// 1m. The control node counts it from its own clock.
+        #[arg(long, value_name = "DURATION", value_parser = parse_ttl)]
+        expires_in: Option<Duration>,
+        /// Drops the database at this time, in RFC 3339, such as 2026-11-05T10:00:00Z: at least
+        /// a minute from now by the control node's clock.
+        #[arg(long, value_name = "TIME", value_parser = parse_rfc3339)]
+        expires_at: Option<Timestamp>,
+        /// Removes the expiry: the database stays until it is dropped.
+        #[arg(long)]
+        never: bool,
+        /// Changes it only if the metadata is still at this version, as `db show` prints it.
         #[arg(long)]
         if_version: Option<u64>,
         #[command(flatten)]
@@ -684,6 +713,8 @@ struct MetadataArgs {
     /// several, at most 32.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label_arg)]
     labels: Vec<(LabelKey, LabelValue)>,
+    #[command(flatten)]
+    expiry: ExpiryArgs,
 }
 
 impl MetadataArgs {
@@ -697,7 +728,34 @@ impl MetadataArgs {
         Ok(NewMetadata {
             description,
             labels,
+            expiry: self.expiry.expiry(),
         })
+    }
+}
+
+/// When a new database is dropped, if it is: `--expires-in` or `--expires-at`.
+#[derive(Debug, Args)]
+struct ExpiryArgs {
+    /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`, at least 1m.
+    /// The control node counts it from its own clock. Every copy is deleted; an archive keeps
+    /// the database as of what reached it, and without one it is gone. Extend it with
+    /// `db set-expiry`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_ttl, conflicts_with = "expires_at")]
+    expires_in: Option<Duration>,
+    /// Drops the database at this time, in RFC 3339, such as 2026-11-05T10:00:00Z: at least a
+    /// minute from now by the control node's clock.
+    #[arg(long, value_name = "TIME", value_parser = parse_rfc3339)]
+    expires_at: Option<Timestamp>,
+}
+
+impl ExpiryArgs {
+    /// The expiry the flags ask for, if any.
+    fn expiry(&self) -> Option<Expiry> {
+        match (self.expires_in, self.expires_at) {
+            (Some(duration), _) => Some(Expiry::In(duration)),
+            (None, Some(at)) => Some(Expiry::At(at)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -1071,6 +1129,11 @@ fn parse_param(text: &str) -> Result<Value, String> {
     }
 }
 
+/// A time in RFC 3339, as a timestamp.
+fn parse_rfc3339(text: &str) -> Result<Timestamp, String> {
+    parse_time(text).map(Timestamp::from_millis)
+}
+
 /// A time in RFC 3339, as milliseconds since the Unix epoch.
 fn parse_time(text: &str) -> Result<u64, String> {
     let time = time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
@@ -1213,7 +1276,9 @@ fn main() -> ExitCode {
         Ok(Stopped::Restart { exe, restarts }) => restart_in_place(&exe, restarts),
         Ok(Stopped::Exit) => ExitCode::SUCCESS,
         Err(error) => {
-            report(error.as_ref());
+            if !error.is::<AlreadyReported>() {
+                report(error.as_ref());
+            }
             ExitCode::FAILURE
         }
     }
@@ -1485,6 +1550,33 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 name = shown(&name)
             )
         }
+        Command::Db(DbCommand::SetExpiry {
+            name,
+            expires_in,
+            expires_at,
+            never: _,
+            if_version,
+            target,
+        }) => {
+            // The group requires exactly one of the three.
+            let expiry = match (expires_in, expires_at) {
+                (Some(duration), _) => ExpiryRequest::In(duration),
+                (None, Some(at)) => ExpiryRequest::At(at),
+                (None, None) => ExpiryRequest::Clear,
+            };
+            let metadata = target
+                .client()?
+                .update_database_with(&name, &MetadataChange::default(), expiry, if_version)
+                .await
+                .map_err(|status| updated_failed(status, if_version))?;
+            let report = MetadataReport::from_view(&metadata, SystemClock.now());
+            format!(
+                "expiry of {name}: {}; metadata version {}\n",
+                expiry_text(&report),
+                metadata.version,
+                name = shown(&name)
+            )
+        }
         Command::Db(DbCommand::SetDurability {
             name,
             acks,
@@ -1586,8 +1678,12 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .await
                 .map_err(metadata_failed)?;
             warn_if_under_replicated(&restored.location);
+            // The follow-ups, in order, once the restore has returned (ADR-0041, point 10): the
+            // archive's description and labels, whose failure is a warning, then the expiry the
+            // flags asked for, whose failure fails the command.
             let archived = restore_archived_metadata(&client, &name, &restored, &metadata).await;
-            format!(
+            let expiry = client.set_restored_expiry(&name, metadata.expiry).await;
+            let mut output = format!(
                 "restored {name} from {from} in archive {archive}\n{}{}{archived}",
                 format_restored(
                     restored.position.as_ref(),
@@ -1599,7 +1695,26 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 format_location(&restored.location),
                 name = shown(&name),
                 from = shown(&from)
-            )
+            );
+            match &expiry {
+                RestoredExpiry::Set(at) => {
+                    let _ = writeln!(output, "expires: {}", format_time(at.as_millis()));
+                }
+                RestoredExpiry::Failed { message, .. } => {
+                    print!("{output}");
+                    eprintln!(
+                        "warning: the database was restored without its expiry: {}",
+                        printable(message)
+                    );
+                    eprintln!(
+                        "hint: fleetringd db set-expiry {} --expires-in <d>",
+                        shown(&name)
+                    );
+                    return Err(AlreadyReported.into());
+                }
+                _ => {}
+            }
+            output
         }
         Command::Db(DbCommand::Archive(DbArchiveCommand::Show {
             name,
@@ -2746,20 +2861,29 @@ fn failed(status: tonic::Status) -> Box<dyn Error> {
 }
 
 /// The next step after a refusal of a creation or update with metadata for want of the
-/// `metadata` fleet feature (ADR-0041, point 3), or `None` for any other status. A fleet with a
-/// member that lacks the feature needs that member upgraded; a fleet that no member has joined
-/// yet needs a data node first (ADR-0041, amendment 3).
+/// `metadata` or `expiry` fleet feature (ADR-0041, point 3), or `None` for any other status. A
+/// fleet with a member that lacks the feature needs that member upgraded; a fleet that no member
+/// has joined yet needs a data node first (ADR-0041, amendment 3).
 fn metadata_hint(status: &tonic::Status) -> Option<&'static str> {
     if status.code() != tonic::Code::FailedPrecondition {
         return None;
     }
     let message = status.message();
-    if message.contains("can't use 'metadata' yet: no member has joined") {
-        Some("start a data node first, or create it without --description and --label")
-    } else if message.contains("can't use 'metadata' yet") {
-        Some("create it without --description and --label, or upgrade every member first")
-    } else {
+    let gated = ["metadata", "expiry"]
+        .iter()
+        .any(|feature| message.contains(&format!("can't use '{feature}' yet")));
+    if !gated {
         None
+    } else if message.contains("yet: no member has joined") {
+        Some(
+            "start a data node first, or create it without --description, --label, and \
+             --expires-in",
+        )
+    } else {
+        Some(
+            "create it without --description, --label, and --expires-in, or upgrade every \
+             member first",
+        )
     }
 }
 
@@ -2798,16 +2922,30 @@ fn format_labels(metadata: &MetadataView) -> String {
         .join(", ")
 }
 
-/// What a creation recorded, after its placement: the labels, the creator, and the version;
-/// `db show` prints the description.
+/// What a creation recorded, after its placement: the labels, the creator, the expiry, and the
+/// version; `db show` prints the description.
 fn format_metadata_summary(metadata: &MetadataView) -> String {
     format!(
-        "labels: {}\ncreator: {}\nversion: {}\n",
+        "labels: {}\ncreator: {}\nexpires: {}\nversion: {}\n",
         format_labels(metadata),
         metadata.created_by.as_deref().unwrap_or("unknown"),
+        expiry_text(&MetadataReport::from_view(metadata, SystemClock.now())),
         metadata.version
     )
 }
+
+/// The error of a command that has printed its own message, as a restore that couldn't set
+/// its expiry does: it only makes the process exit with 1.
+#[derive(Debug)]
+struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the command failed")
+    }
+}
+
+impl Error for AlreadyReported {}
 
 /// Prints an error and its causes, one per line.
 fn report(error: &dyn Error) {
@@ -3098,10 +3236,20 @@ mod tests {
         let hinted = metadata_failed(unsupported).to_string();
         assert!(
             hinted.ends_with(
-                "upgrade every member first\n  hint: create it without --description and \
-                 --label, or upgrade every member first"
+                "upgrade every member first\n  hint: create it without --description, --label, \
+                 and --expires-in, or upgrade every member first"
             ),
             "{hinted}"
+        );
+        // A fleet with metadata but a member without expiry refuses an expiry the same way.
+        let no_expiry = tonic::Status::failed_precondition(
+            "the fleet can't use 'expiry' yet: node 'old' runs fleetringd 0.5.0, which doesn't \
+             support it; upgrade every member first",
+        );
+        assert!(
+            metadata_failed(no_expiry)
+                .to_string()
+                .ends_with("and --expires-in, or upgrade every member first")
         );
         let empty = tonic::Status::failed_precondition(
             "the fleet can't use 'metadata' yet: no member has joined",
@@ -3110,7 +3258,7 @@ mod tests {
         assert!(
             hinted.ends_with(
                 "no member has joined\n  hint: start a data node first, or create it without \
-                 --description and --label"
+                 --description, --label, and --expires-in"
             ),
             "{hinted}"
         );
@@ -3255,6 +3403,114 @@ mod tests {
         ] {
             assert_eq!(schema_unavailable(&status), None, "{:?}", status.code());
         }
+    }
+
+    #[test]
+    fn db_set_expiry_takes_exactly_one_form() {
+        let control = ["--control", "127.0.0.1:7400"];
+        let set_expiry = |flags: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    &["fleetringd", "db", "set-expiry", "notes"][..],
+                    flags,
+                    &control,
+                ]
+                .concat(),
+            )
+        };
+        let parsed = |flags: &[&str]| {
+            let cli = set_expiry(flags).expect("db set-expiry parses");
+            let Some(Command::Db(DbCommand::SetExpiry {
+                expires_in,
+                expires_at,
+                never,
+                ..
+            })) = cli.command
+            else {
+                panic!("not db set-expiry: {:?}", cli.command);
+            };
+            (expires_in, expires_at, never)
+        };
+        assert_eq!(
+            parsed(&["--expires-in", "24h"]),
+            (Some(Duration::from_secs(86_400)), None, false)
+        );
+        assert_eq!(
+            parsed(&["--expires-at", "2026-11-05T10:00:00Z"]),
+            (None, Some(Timestamp::from_millis(1_793_872_800_000)), false)
+        );
+        assert_eq!(parsed(&["--never"]), (None, None, true));
+        for wrong in [
+            &[][..],
+            &["--expires-in", "1h", "--never"][..],
+            &["--expires-in", "1h", "--expires-at", "2026-11-05T10:00:00Z"][..],
+            &["--expires-at", "2026-11-05T10:00:00Z", "--never"][..],
+            &["--expires-in", "soon"][..],
+            &["--expires-at", "tomorrow"][..],
+        ] {
+            assert!(set_expiry(wrong).is_err(), "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn db_create_and_restore_take_an_expiry_in_one_form() {
+        let control = ["--control", "127.0.0.1:7400"];
+        let create = |flags: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    &["fleetringd", "db", "create", "scratch"][..],
+                    flags,
+                    &control,
+                ]
+                .concat(),
+            )
+        };
+        let expiry = |flags: &[&str]| {
+            let cli = create(flags).expect("db create parses");
+            let Some(Command::Db(DbCommand::Create { metadata, .. })) = cli.command else {
+                panic!("not db create: {:?}", cli.command);
+            };
+            metadata.read(&b""[..]).expect("valid").expiry
+        };
+        assert_eq!(
+            expiry(&["--expires-in", "90m"]),
+            Some(Expiry::In(Duration::from_secs(5_400)))
+        );
+        assert_eq!(
+            expiry(&["--expires-at", "1970-01-01T00:01:00Z"]),
+            Some(Expiry::At(Timestamp::from_millis(60_000)))
+        );
+        assert_eq!(expiry(&[]), None);
+        assert!(
+            create(&["--expires-in", "1h", "--expires-at", "2026-11-05T10:00:00Z"]).is_err(),
+            "one form only"
+        );
+        let restore = Cli::try_parse_from(
+            [
+                &[
+                    "fleetringd",
+                    "db",
+                    "restore",
+                    "copy",
+                    "--archive",
+                    "backups",
+                    "--from",
+                    "notes",
+                    "--expires-in",
+                    "1m",
+                ][..],
+                &control,
+            ]
+            .concat(),
+        )
+        .expect("db restore parses");
+        let Some(Command::Db(DbCommand::Restore { metadata, .. })) = restore.command else {
+            panic!("not db restore");
+        };
+        assert_eq!(
+            metadata.read(&b""[..]).expect("valid").expiry,
+            Some(Expiry::In(Duration::from_secs(60)))
+        );
     }
 
     #[test]

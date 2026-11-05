@@ -26,6 +26,14 @@
 //! replication settings' `lag_limit`; after that the log may restart past it, and the pump then
 //! restarts from the log's beginning and counts a reset in its status.
 //!
+//! # Flushing a dropped database
+//!
+//! A pump stops once its node no longer serves the database, unless [`ChangeStreams::hold`]
+//! keeps it. A dropped database's primary holds its streams before it stops serving, then
+//! [`ChangeStreams::flush_database`] has every pump deliver what the copy acknowledged, a paced
+//! sink such as an archive at once, for a bounded time, before the copy is deleted (ADR-0041,
+//! point 4).
+//!
 //! # Where positions live
 //!
 //! When the database's engine can keep sink marks ([`SinkMarks`](crate::engine::SinkMarks),
@@ -284,6 +292,9 @@ struct Inner {
     settings: ChangeSettings,
     metrics: ChangeMetrics,
     pumps: Mutex<BTreeMap<(String, DatabaseName), Pump>>,
+    /// The databases whose pumps run on after the node stops serving them, each with how many
+    /// [`HeldStreams`] keep them.
+    held: Mutex<BTreeMap<DatabaseName, usize>>,
     supervisor: Mutex<Option<AbortOnDrop>>,
 }
 
@@ -292,7 +303,44 @@ struct Pump {
     epoch: LeaseEpoch,
     format: Format,
     state: Arc<Mutex<PumpState>>,
+    /// Set to deliver what is acknowledged at once, whatever the sink's pace.
+    cut: watch::Sender<bool>,
     _task: AbortOnDrop,
+}
+
+/// How [`ChangeStreams::flush_database`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Flushed {
+    /// Every change stream of the database delivered everything acknowledged.
+    Delivered,
+    /// The limit passed first.
+    TimedOut,
+}
+
+/// Keeps a database's change streams running after the node stops serving it, until dropped:
+/// a dropped database's primary flushes them before it deletes its copy (ADR-0041, point 4).
+#[derive(Debug)]
+#[must_use = "the streams stop once the hold is dropped"]
+pub struct HeldStreams {
+    inner: Arc<Inner>,
+    database: DatabaseName,
+}
+
+impl Drop for HeldStreams {
+    fn drop(&mut self) {
+        {
+            let mut held = self.inner.lock_held();
+            if let Some(count) = held.get_mut(&self.database) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    held.remove(&self.database);
+                }
+            }
+        }
+        let served = self.inner.replication.served().borrow().clone();
+        self.inner.reconcile(&served);
+    }
 }
 
 /// Aborts a task when dropped.
@@ -328,6 +376,7 @@ impl ChangeStreams {
             settings,
             metrics,
             pumps: Mutex::default(),
+            held: Mutex::default(),
             supervisor: Mutex::default(),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner), served));
@@ -387,6 +436,58 @@ impl ChangeStreams {
         .is_ok()
     }
 
+    /// Keeps `database`'s change streams running after this node stops serving it, until the
+    /// returned hold is dropped, so that [`flush_database`](Self::flush_database) can deliver
+    /// what its copy acknowledged before the copy is deleted. Take it before serving stops: the
+    /// streams of a database the node no longer serves stop as soon as they notice.
+    ///
+    /// # Panics
+    ///
+    /// If the held databases' lock was poisoned by a panic in another thread.
+    pub fn hold(&self, database: &DatabaseName) -> HeldStreams {
+        *self.inner.lock_held().entry(database.clone()).or_default() += 1;
+        HeldStreams {
+            inner: Arc::clone(&self.inner),
+            database: database.clone(),
+        }
+    }
+
+    /// Whether a [`HeldStreams`] keeps `database`'s streams: its primary is flushing them
+    /// before it deletes its copy.
+    pub(crate) fn is_held(&self, database: &DatabaseName) -> bool {
+        self.inner.lock_held().contains_key(database)
+    }
+
+    /// Waits until every change stream of `database` has delivered everything acknowledged, up
+    /// to the copy's current end, or until `limit` passes. An archive puts its open segment at
+    /// once, whatever its `segment_interval_ms`. A database with no change streams is delivered
+    /// at once.
+    ///
+    /// The streams of a database this node no longer serves run only while
+    /// [`hold`](Self::hold) keeps them.
+    ///
+    /// # Panics
+    ///
+    /// If the pumps' lock was poisoned by a panic in another thread.
+    pub async fn flush_database(&self, database: &DatabaseName, limit: Duration) -> Flushed {
+        for ((_, pumped), pump) in self.inner.lock_pumps().iter() {
+            if pumped == database {
+                pump.cut.send_replace(true);
+            }
+        }
+        let poll = self.inner.settings.retry_initial;
+        let flushed = time::timeout(limit, async {
+            while !self.inner.caught_up(database) {
+                time::sleep(poll).await;
+            }
+        })
+        .await;
+        match flushed {
+            Ok(()) => Flushed::Delivered,
+            Err(_) => Flushed::TimedOut,
+        }
+    }
+
     /// Gives the pumps up to `flush` to deliver what is acknowledged, then stops them. Their
     /// positions are recorded, so they continue from there when the node starts again.
     pub async fn stop(&self, flush: Duration) {
@@ -407,6 +508,27 @@ impl Inner {
         self.supervisor
             .lock()
             .expect("change streams lock poisoned")
+    }
+
+    fn lock_held(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, usize>> {
+        self.held.lock().expect("change streams lock poisoned")
+    }
+
+    /// Whether every pump of `database` has delivered the write quorum's position now, as its
+    /// primary reports it; true once the node has no primary for it, since nothing more can be
+    /// delivered then.
+    fn caught_up(&self, database: &DatabaseName) -> bool {
+        let Some(feed) = self.replication.primary_feed(database) else {
+            return true;
+        };
+        let acknowledged = feed.acknowledged();
+        self.lock_pumps()
+            .iter()
+            .filter(|((_, pumped), _)| pumped == database)
+            .all(|(_, pump)| {
+                let state = pump::lock(&pump.state);
+                state.caught_up && state.position == acknowledged
+            })
     }
 
     /// Whether every pump's delivered position is the write quorum's position now, as the
@@ -436,14 +558,18 @@ impl Inner {
     }
 
     /// Starts a pump for every sink and served database that lacks one, restarts those whose
-    /// database moved to a new epoch, and stops those whose database this node no longer serves.
+    /// database moved to a new epoch, and stops those whose database this node no longer serves,
+    /// unless a [`HeldStreams`] keeps them.
     fn reconcile(self: &Arc<Self>, served: &BTreeMap<DatabaseName, LeaseEpoch>) {
         let mut pumps = self.lock_pumps();
+        let held = self.lock_held();
         pumps.retain(|(_, database), pump| {
-            served
-                .get(database)
-                .is_some_and(|epoch| *epoch == pump.epoch)
+            held.contains_key(database)
+                || served
+                    .get(database)
+                    .is_some_and(|epoch| *epoch == pump.epoch)
         });
+        drop(held);
         for configured in &self.sinks {
             let name = configured.sink.name().to_owned();
             for (database, epoch) in served {
@@ -455,6 +581,7 @@ impl Inner {
                     continue;
                 }
                 let state = Arc::new(Mutex::new(PumpState::default()));
+                let (cut, cut_requested) = watch::channel(false);
                 let context = PumpContext {
                     sink: Arc::clone(&configured.sink),
                     format: configured.format,
@@ -465,6 +592,7 @@ impl Inner {
                     settings: self.settings,
                     metrics: self.metrics.clone(),
                     streams: Arc::downgrade(self),
+                    cut: cut_requested,
                 };
                 let task = tokio::spawn(pump::run(context));
                 pumps.insert(
@@ -473,6 +601,7 @@ impl Inner {
                         epoch: *epoch,
                         format: configured.format,
                         state,
+                        cut,
                         _task: AbortOnDrop(task),
                     },
                 );
@@ -607,7 +736,9 @@ const _: () = {
     assert_debug_send_sync::<DatabaseMatcher>();
     assert_debug_send_sync::<DatabaseMatchers>();
     assert_debug_send_sync::<FileSink>();
+    assert_debug_send_sync::<Flushed>();
     assert_debug_send_sync::<Format>();
+    assert_debug_send_sync::<HeldStreams>();
     assert_debug_send_sync::<MarkHome>();
     assert_debug_send_sync::<MemorySink>();
     assert_debug_send_sync::<SinkConfig>();

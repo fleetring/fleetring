@@ -3,10 +3,12 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use fleetring_control::{
-    DatabaseName, Description, DescriptionChange, FORBIDDEN_FORMAT_CHARACTERS, LabelKey,
-    LabelValue, Labels, MAX_LABELS, MetadataChange, ParseLabelError, Timestamp, parse_label,
+    DatabaseName, Description, DescriptionChange, ExpiryChange, FORBIDDEN_FORMAT_CHARACTERS,
+    LabelKey, LabelValue, Labels, MAX_LABELS, MetadataChange, ParseLabelError, Timestamp,
+    parse_label,
 };
 
 use crate::data::client::Location;
@@ -102,21 +104,75 @@ impl fmt::Display for LabelRequirement {
     }
 }
 
-/// What a creation records besides placement and durability: a description, labels, or both.
-/// The control node records the creator itself, from the caller.
+/// When a database expires, as a client asks for it (ADR-0041, point 4): at a time, or after a
+/// duration that the control node turns into a time, against its own clock, before it logs the
+/// command. Either way it must be at least a minute ahead of the control plane's time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    /// At this time, in milliseconds since the Unix epoch.
+    At(Timestamp),
+    /// This long after the control node receives the request.
+    In(Duration),
+}
+
+/// What an update does to a database's expiry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExpiryRequest {
+    /// Leaves it as it is.
+    #[default]
+    Keep,
+    /// Sets it to this time.
+    At(Timestamp),
+    /// Sets it this long after the control node receives the update.
+    In(Duration),
+    /// Removes it: the database no longer expires.
+    Clear,
+}
+
+impl ExpiryRequest {
+    /// Whether the update leaves the expiry as it is.
+    #[must_use]
+    pub fn is_keep(&self) -> bool {
+        *self == Self::Keep
+    }
+}
+
+impl From<Expiry> for ExpiryRequest {
+    fn from(expiry: Expiry) -> Self {
+        match expiry {
+            Expiry::At(at) => Self::At(at),
+            Expiry::In(duration) => Self::In(duration),
+        }
+    }
+}
+
+impl From<ExpiryChange> for ExpiryRequest {
+    fn from(change: ExpiryChange) -> Self {
+        match change {
+            ExpiryChange::Set(at) => Self::At(at),
+            ExpiryChange::Clear => Self::Clear,
+            _ => Self::Keep,
+        }
+    }
+}
+
+/// What a creation records besides placement and durability: a description, labels, an expiry,
+/// or any of them. The control node records the creator itself, from the caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewMetadata {
     /// The description, if any.
     pub description: Option<Description>,
     /// The labels.
     pub labels: Labels,
+    /// When the database expires, if it does.
+    pub expiry: Option<Expiry>,
 }
 
 impl NewMetadata {
     /// Whether the creation asks for no metadata, so a plain creation does.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.description.is_none() && self.labels.is_empty()
+        self.description.is_none() && self.labels.is_empty() && self.expiry.is_none()
     }
 }
 
@@ -333,6 +389,7 @@ mod tests {
                     .map(|label| parse_label(label).expect("a label")),
             )
             .expect("few labels"),
+            expiry: None,
         }
     }
 

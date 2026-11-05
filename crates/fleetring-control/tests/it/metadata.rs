@@ -232,8 +232,9 @@ fn a_mixed_fleet_refuses_metadata_and_changes_nothing() {
     assert!(!state.is_enabled(Feature::Metadata));
 }
 
-/// This build reports `metadata` but not yet `expiry` (ADR-0041, point 3), so a fleet of it
-/// takes metadata and refuses any expiry, enabling only what it accepted.
+/// A fleet whose members report `metadata` but not `expiry`, as a release built before the
+/// control node's expiry sweep did (ADR-0041, point 3), takes metadata and refuses any expiry,
+/// enabling only what it accepted.
 #[test]
 fn a_fleet_without_expiry_takes_metadata_and_refuses_an_expiry() {
     let without_expiry = Software::new(Release::new(0, 6, 0), 1)

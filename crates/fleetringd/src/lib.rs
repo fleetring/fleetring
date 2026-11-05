@@ -107,8 +107,11 @@ const _: () = {
     assert_debug_send_sync::<data::ArchivedSnapshot>();
     assert_debug_send_sync::<data::Client>();
     assert_debug_send_sync::<data::Restoration>();
+    assert_debug_send_sync::<data::RestoredExpiry>();
     assert_debug_send_sync::<data::DatabaseSpec>();
     assert_debug_send_sync::<data::Descriptions>();
+    assert_debug_send_sync::<data::Expiry>();
+    assert_debug_send_sync::<data::ExpiryRequest>();
     assert_debug_send_sync::<data::LabelRequirement>();
     assert_debug_send_sync::<data::ListFilter>();
     assert_debug_send_sync::<data::Listing>();

@@ -16,6 +16,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::clock::{Clock, SystemClock};
 use crate::control::{ControlClient, StorageIo};
+use crate::data::DROP_FLUSH_LIMIT;
 use crate::durability::ObjectStore;
 use crate::engine::Execution;
 use crate::tls::{Conn, Raw, Security};
@@ -206,6 +207,8 @@ pub struct Environment {
     execution: Execution,
     /// Object stores that replace the ones `[[archive]]` entries name, by archive name.
     object_stores: BTreeMap<String, Arc<dyn ObjectStore>>,
+    /// How long a dropped database's change streams have to flush before its copy is deleted.
+    drop_flush_limit: Duration,
 }
 
 impl Environment {
@@ -217,6 +220,7 @@ impl Environment {
             clock: Arc::new(SystemClock),
             execution: Execution::Threads,
             object_stores: BTreeMap::new(),
+            drop_flush_limit: DROP_FLUSH_LIMIT,
         }
     }
 
@@ -232,6 +236,7 @@ impl Environment {
             clock: Arc::new(clock),
             execution: Execution::Inline,
             object_stores: BTreeMap::new(),
+            drop_flush_limit: DROP_FLUSH_LIMIT,
         }
     }
 
@@ -271,6 +276,21 @@ impl Environment {
     ) -> Self {
         self.object_stores.insert(archive.into(), store);
         self
+    }
+
+    /// Gives a dropped database's change streams `limit`, instead of 30 seconds, to deliver
+    /// what its copy acknowledged before the primary deletes the copy (ADR-0041, point 4): for
+    /// tests that run out the limit.
+    #[must_use]
+    pub fn with_drop_flush_limit(mut self, limit: Duration) -> Self {
+        self.drop_flush_limit = limit;
+        self
+    }
+
+    /// How long a dropped database's change streams have to flush before its copy is deleted.
+    #[must_use]
+    pub fn drop_flush_limit(&self) -> Duration {
+        self.drop_flush_limit
     }
 
     /// The store that replaces the one the archive named `archive` names, if any.

@@ -309,7 +309,8 @@ fn record_holders(state: &State, holders: &mut LeaseHolders) {
 
 /// Checks that `state` holds everything `history` says was acknowledged: every joined member
 /// that wasn't later asked to leave, every created database, and every granted or renewed lease,
-/// unless a later epoch replaced it.
+/// unless a later epoch replaced it. A database created with an expiry
+/// ([`Operation::CreateExpiring`]) may be gone, dropped once its expiry passed.
 ///
 /// # Errors
 ///

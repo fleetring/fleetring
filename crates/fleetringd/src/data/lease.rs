@@ -9,10 +9,21 @@
 //!   followers fenced at a newer epoch refuse the old primary's batches, so it can't acknowledge
 //!   a write however long it takes to notice.
 //! - **Dropped databases.** A renewal refused as an unknown database means the database was
-//!   dropped: the primary stops serving it and deletes its copy, within one renewal interval of
-//!   the drop. Its streams end with it, and a follower whose stream ends asks the control plane
-//!   whether the database still exists; if not, it deletes its copy too. A node that was away
-//!   makes the same check for every database it has a record of when it recovers.
+//!   dropped, by `db drop` or because its expiry passed: the primary stops serving it within one
+//!   renewal interval of the drop, so it admits no write after that. Before it deletes its copy,
+//!   it flushes the database's change streams, its archive included, for up to
+//!   [`DROP_FLUSH_LIMIT`] (ADR-0041, point 4): every stream delivers what the copy acknowledged,
+//!   and an archive puts its open segment at once, so the archive holds every acknowledged write.
+//!   A flush that runs out of time, or a primary that is down when the drop happens, leaves the
+//!   archive as of its last archived segment, and the writes acknowledged after it are lost
+//!   with the copy; without an archive, the copy is all there was. The flush runs beside the
+//!   renewals, so it never holds up another database's lease. The primary's streams to its
+//!   followers end once the copy is deleted, and a follower whose stream ends asks the control
+//!   plane whether the database still exists; if not, it deletes its copy too. A follower whose
+//!   primary went down before it noticed the drop has no stream to end: once the control plane
+//!   has answered its heartbeats for longer than the flush limit and two renewal intervals that
+//!   it doesn't know the database, it makes the same check. A node that was away makes it for
+//!   every database it has a record of when it recovers.
 //! - **After a restart**, the node asks the control plane about every database it has an epoch
 //!   record for, and leads each one whose lease it holds at once, rather than when the first
 //!   request arrives. The same pass reads its copies' positions, so its heartbeats report them.
@@ -38,15 +49,21 @@ use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::{
     CompletePromotionRequest, Placement, RecordFencedRequest, RenewLeaseRequest,
 };
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tonic::{Code, Status};
 
+use crate::changes::{Flushed, HeldStreams};
 use crate::control::missing_database;
 use crate::data::drain::DrainSettings;
 use crate::data::node::{DataNode, HeldLease};
 use crate::engine::Position;
 use crate::replication::{Fenced, PromotionRequest, Replication};
+
+/// The longest a primary waits for a dropped database's change streams to deliver what its copy
+/// acknowledged before it deletes the copy (ADR-0041, point 4).
+pub(crate) const DROP_FLUSH_LIMIT: Duration = Duration::from_secs(30);
 
 /// How a data node paces its leases and promotions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +77,17 @@ pub(crate) struct LeaseSettings {
     pub(crate) transfer_timeout: Duration,
     /// How a drain hands the node's leases over.
     pub(crate) drain: DrainSettings,
+    /// How long a dropped database's change streams have to flush before its copy is deleted:
+    /// [`DROP_FLUSH_LIMIT`], unless a test shortens it.
+    pub(crate) drop_flush_limit: Duration,
+}
+
+/// A database this node stopped serving because it was dropped, with its change streams held
+/// for the flush before its copy is deleted.
+#[derive(Debug)]
+struct Dropped {
+    database: DatabaseName,
+    streams: HeldStreams,
 }
 
 /// Aborts a task when dropped.
@@ -102,6 +130,15 @@ async fn run(node: DataNode, settings: LeaseSettings) {
     // The drain this node runs because the membership says it is draining, until the membership
     // says otherwise, as after it joins again.
     let mut draining: Option<AbortOnDrop> = None;
+    // Dropped databases the renewals found, each flushed and deleted in a task of its own, so
+    // that a slow flush holds up no renewal.
+    let (dropped_found, mut dropped) = mpsc::unbounded_channel::<Dropped>();
+    let mut retiring = JoinSet::new();
+    // The databases the control plane has said it doesn't know, each since when.
+    let mut unknown_since: BTreeMap<DatabaseName, tokio::time::Instant> = BTreeMap::new();
+    let unknown_grace = settings
+        .drop_flush_limit
+        .saturating_add(settings.renew_interval.saturating_mul(2));
     let mut ticks = tokio::time::interval(settings.renew_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -130,11 +167,25 @@ async fn run(node: DataNode, settings: LeaseSettings) {
                 // failover.
                 if renewing.as_ref().is_none_or(|task| task.0.is_finished()) {
                     let node = node.clone();
+                    let dropped_found = dropped_found.clone();
                     renewing = Some(AbortOnDrop(tokio::spawn(async move {
-                        renew_all(&node, settings.renew_interval).await;
+                        renew_all(&node, settings.renew_interval, &dropped_found).await;
                     })));
                 }
+                for database in long_unknown(&node, &membership, &mut unknown_since, unknown_grace) {
+                    let node = node.clone();
+                    checking.spawn(async move {
+                        discard_if_dropped(&node, &database).await;
+                    });
+                }
             }
+            Some(found) = dropped.recv() => {
+                let node = node.clone();
+                retiring.spawn(async move {
+                    retire(&node, found, settings.drop_flush_limit).await;
+                });
+            }
+            Some(_) = retiring.join_next() => {}
             Some(_) = restarting.join_next() => {}
             Some(_) = checking.join_next() => {}
             changed = ended.changed() => {
@@ -242,8 +293,8 @@ async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
 }
 
 /// Renews every lease the node holds, each within `limit`, and stops serving each one the control
-/// plane says is gone.
-async fn renew_all(node: &DataNode, limit: Duration) {
+/// plane says is gone. A dropped one goes to `dropped`, to be flushed and deleted.
+async fn renew_all(node: &DataNode, limit: Duration, dropped: &mpsc::UnboundedSender<Dropped>) {
     let mut renewals = JoinSet::new();
     for (database, lease) in node.held_leases() {
         let control = node.inner.control.clone();
@@ -271,8 +322,19 @@ async fn renew_all(node: &DataNode, limit: Duration) {
             Ok(Ok(_)) => {}
             Ok(Err(status)) if missing_database(&status).is_some() => {
                 tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped");
+                // Held before serving stops, since the streams of a database the node no longer
+                // serves stop as soon as they notice.
+                let streams = node.change_streams().hold(&database);
                 if node.forget(&database, epoch) {
-                    discard(node, &database).await;
+                    let found = Dropped {
+                        database: database.clone(),
+                        streams,
+                    };
+                    if let Err(unsent) = dropped.send(found) {
+                        // The keeper has stopped; the copy goes without a flush.
+                        drop(unsent.0.streams);
+                        discard(node, &database).await;
+                    }
                 }
             }
             Ok(Err(status)) if is_lost(&status) => {
@@ -287,6 +349,27 @@ async fn renew_all(node: &DataNode, limit: Duration) {
             }
         }
     }
+}
+
+/// Deletes the copy of a database this node stopped serving because it was dropped, once its
+/// change streams have delivered what the copy acknowledged, or once `limit` passes.
+async fn retire(node: &DataNode, dropped: Dropped, limit: Duration) {
+    let Dropped { database, streams } = dropped;
+    match node.change_streams().flush_database(&database, limit).await {
+        Flushed::Delivered => {
+            tracing::info!(database = %database, "flushed the dropped database's change streams");
+        }
+        Flushed::TimedOut => {
+            tracing::warn!(
+                database = %database,
+                limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+                "the dropped database's change streams didn't catch up in time; its archive \
+                 holds it as of its last archived segment"
+            );
+        }
+    }
+    drop(streams);
+    discard(node, &database).await;
 }
 
 /// Stops serving `database`, whose lease at `epoch` is gone.
@@ -311,6 +394,39 @@ async fn discard_if_dropped(node: &DataNode, database: &DatabaseName) {
             tracing::debug!(database = %database, %status, "can't ask whether the database still exists");
         }
     }
+}
+
+/// The databases this node reported that the control plane has said, for at least `grace`, it
+/// doesn't know, and that this node neither leads nor is flushing; `since` keeps when each was
+/// first said so. They are copies a drop left behind when their primary went down before it
+/// could end their streams; by the time `grace` has passed, a primary that noticed the drop has
+/// flushed and deleted its own copy, so checking them can't cut a flush short.
+fn long_unknown(
+    node: &DataNode,
+    membership: &crate::Membership,
+    since: &mut BTreeMap<DatabaseName, tokio::time::Instant>,
+    grace: Duration,
+) -> Vec<DatabaseName> {
+    let now = tokio::time::Instant::now();
+    let unknown: Vec<DatabaseName> = membership
+        .unknown_databases()
+        .iter()
+        .filter_map(|name| name.parse().ok())
+        .collect();
+    since.retain(|database, _| unknown.contains(database));
+    let mut due = Vec::new();
+    for database in unknown {
+        let first = *since.entry(database.clone()).or_insert(now);
+        if now.duration_since(first) >= grace
+            && node.held(&database).is_none()
+            && !node.change_streams().is_held(&database)
+        {
+            // Still unknown after the check, it waits a whole grace again.
+            since.remove(&database);
+            due.push(database);
+        }
+    }
+    due
 }
 
 /// Whether this node's copy of `database` comes from a database that was dropped and created

@@ -146,15 +146,15 @@ service Control {
   // so a revocation reaches every live node within one heartbeat interval.
   // Scope: fleet.
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
-  // Creates a database with a description or labels (ADR-0041); needs the `metadata` fleet
-  // feature, and refuses a request without metadata. A control node that predates it answers
-  // UNIMPLEMENTED, so a creation never loses its metadata to an older node. The control node
-  // records the caller as the creator.
+  // Creates a database with a description, labels, or an expiry (ADR-0041); needs the
+  // `metadata` fleet feature, and `expiry` too for an expiry, and refuses a request without
+  // metadata. A control node that predates it answers UNIMPLEMENTED, so a creation never loses
+  // its metadata to an older node. The control node records the caller as the creator.
   // Scope: admin on the database.
   rpc CreateDatabaseWithMetadata(CreateDatabaseWithMetadataRequest) returns (CreateDatabaseResponse);
-  // Changes a database's description or labels with a patch; needs the `metadata` fleet feature.
-  // The control node records the caller as the description's author when the description
-  // changes.
+  // Changes a database's description, labels, or expiry with a patch; needs the `metadata`
+  // fleet feature, and `expiry` too for a change to the expiry. The control node records the
+  // caller as the description's author when the description changes.
   // Scope: admin on the database.
   rpc UpdateDatabase(UpdateDatabaseRequest) returns (UpdateDatabaseResponse);
 }
@@ -372,7 +372,14 @@ message DatabaseMetadata {
 message MetadataSpec {
   string description = 1;
   repeated Label labels = 2;
-  // Field numbers 3 and 4 are reserved for an expiry (FR-070 phase 3).
+  // When the database is dropped (ADR-0041 point 4): an absolute time, or a duration the
+  // control node resolves against its time before it logs the creation. At least one minute
+  // ahead; needs the `expiry` fleet feature.
+  oneof expiry {
+    // Milliseconds since the Unix epoch.
+    uint64 expires_at_ms = 3;
+    uint64 expires_in_ms = 4;
+  }
 }
 
 // A creation with metadata. A new RPC rather than new CreateDatabaseRequest fields, so that a
@@ -394,7 +401,15 @@ message UpdateDatabaseRequest {
   }
   repeated Label set_labels = 4;
   repeated string remove_labels = 5;
-  // Field numbers 6, 7, and 8 are reserved for an expiry (FR-070 phase 3).
+  // Sets or clears the expiry (ADR-0041 point 4); needs the `expiry` fleet feature. A new
+  // expiry is at least one minute ahead, and a duration resolves against the control node's
+  // time before the update is logged.
+  oneof expiry {
+    // Milliseconds since the Unix epoch.
+    uint64 expires_at_ms = 6;
+    uint64 expires_in_ms = 7;
+    bool clear_expiry = 8;
+  }
   // The update applies only if the metadata is at this version; ABORTED otherwise.
   optional uint64 if_version = 9;
 }

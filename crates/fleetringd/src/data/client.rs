@@ -8,6 +8,7 @@ use std::time::Duration;
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::{
     Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, MetadataChange, ReplicaRole,
+    Timestamp,
 };
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::restore_point::Point;
@@ -29,7 +30,9 @@ use crate::data::convert::{
     metadata_view, new_metadata_to_proto, node_status, params_to_proto, rows_from_proto,
     schema_from_proto, schema_request_to_proto,
 };
-use crate::data::metadata::{Descriptions, ListFilter, Listing, MetadataView, NewMetadata};
+use crate::data::metadata::{
+    Descriptions, Expiry, ExpiryRequest, ListFilter, Listing, MetadataView, NewMetadata,
+};
 use crate::data::redirect::primary_hint;
 use crate::data::schema::SchemaView;
 use crate::durability::RestoreTarget;
@@ -249,6 +252,26 @@ pub struct Restoration {
     pub archived_metadata: Option<MetadataView>,
     /// Why the snapshot's metadata object was skipped, if it was. The data restored either way.
     pub archived_metadata_skipped: Option<String>,
+}
+
+/// What became of the expiry a restore asked for (ADR-0041, point 10), which
+/// [`Client::set_restored_expiry`] sets once the restore has returned, so a short one can't
+/// drop the database while it is being restored; an update that fails leaves the database
+/// restored without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RestoredExpiry {
+    /// The restore asked for none.
+    NotAsked,
+    /// It was set to this time.
+    Set(Timestamp),
+    /// Setting it failed, so the database doesn't expire.
+    Failed {
+        /// The status code of the failed update.
+        code: Code,
+        /// The control node's message.
+        message: String,
+    },
 }
 
 /// One complete snapshot in an archive.
@@ -502,9 +525,10 @@ impl Client {
         self.open_on_primary(name, &placement).await
     }
 
-    /// Creates a SQLite database as `spec` says with a description, labels, or both, and opens
-    /// it on its primary; see [`Client::create_database`]. The control node records the caller
-    /// as the creator. With no metadata, this is [`Client::create_database_with`].
+    /// Creates a SQLite database as `spec` says with a description, labels, or an expiry, and
+    /// opens it on its primary; see [`Client::create_database`]. The control node records the
+    /// caller as the creator, and turns an expiry's duration into a time. With no metadata, this
+    /// is [`Client::create_database_with`].
     ///
     /// The creation goes through `CreateDatabaseWithMetadata`, which a control node without
     /// database metadata refuses, so a database is never created without the metadata asked
@@ -513,8 +537,11 @@ impl Client {
     /// # Errors
     ///
     /// As [`Client::create_database_with`]; `FAILED_PRECONDITION` while a member of the fleet
-    /// lacks the `metadata` feature, naming it, or when the control node runs a release without
-    /// database metadata; and `INVALID_ARGUMENT` for a description or labels it refuses.
+    /// lacks the `metadata` feature, or `expiry` for an expiry, naming it, or when the control
+    /// node runs a release without database metadata; `INVALID_ARGUMENT` for a description or
+    /// labels it refuses, or an expiry less than a minute ahead; and `UNAVAILABLE` if the
+    /// control plane's time passed the expiry before the creation was logged, which a retry
+    /// resolves.
     pub async fn create_database_with_metadata(
         &self,
         name: &DatabaseName,
@@ -584,7 +611,11 @@ impl Client {
     }
 
     /// Restores as [`Client::restore_database`] does, and creates the new database with
-    /// `metadata`, as [`Client::create_database_with_metadata`] does, before the restore runs.
+    /// `metadata`'s description and labels, as [`Client::create_database_with_metadata`] does,
+    /// before the restore runs. Its expiry is left out: the caller sets it with
+    /// [`Client::set_restored_expiry`] once the restore has returned, and after the archive's
+    /// description and labels ([`restored_metadata`](crate::data::restored_metadata)), so that a
+    /// short one can't drop the database while it is being restored (ADR-0041, point 10).
     ///
     /// # Errors
     ///
@@ -598,7 +629,11 @@ impl Client {
         source: &DatabaseName,
         target: &RestoreTarget,
     ) -> Result<Restoration, Status> {
-        let metadata = (!metadata.is_empty()).then_some(metadata);
+        let creation = NewMetadata {
+            expiry: None,
+            ..metadata.clone()
+        };
+        let metadata = (!creation.is_empty()).then_some(&creation);
         let placement = self.place(name, spec, metadata).await?;
         let start = match &self.entry {
             Some(entry) => entry.clone(),
@@ -630,6 +665,42 @@ impl Client {
             archived_metadata: restored.archived_metadata.map(metadata_view),
             archived_metadata_skipped: restored.archived_metadata_skipped,
         })
+    }
+
+    /// Sets the expiry a restore of `name` asked for, `expiry` from its own flags, once the
+    /// restore has returned (ADR-0041, point 10): never one from the archive. Call it last, after
+    /// the archive's description and labels are set. A failure leaves the database restored
+    /// without an expiry, and is reported rather than returned.
+    pub async fn set_restored_expiry(
+        &self,
+        name: &DatabaseName,
+        expiry: Option<Expiry>,
+    ) -> RestoredExpiry {
+        let Some(expiry) = expiry else {
+            return RestoredExpiry::NotAsked;
+        };
+        let updated = self
+            .update_database_with(
+                name,
+                &MetadataChange::default(),
+                ExpiryRequest::from(expiry),
+                None,
+            )
+            .await;
+        match updated {
+            Ok(MetadataView {
+                expires_at: Some(at),
+                ..
+            }) => RestoredExpiry::Set(at),
+            Ok(_) => RestoredExpiry::Failed {
+                code: Code::Internal,
+                message: "the update's reply has no expiry".to_owned(),
+            },
+            Err(status) => RestoredExpiry::Failed {
+                code: status.code(),
+                message: status.message().to_owned(),
+            },
+        }
     }
 
     /// Asks the data node at `address` (`host:port`) what `archive` holds for `name`.
@@ -891,26 +962,47 @@ impl Client {
         Ok(listing)
     }
 
-    /// Changes `name`'s description or labels with `change`, a patch: what it doesn't name
-    /// stays as it is. With `if_version`, the change applies only if the metadata is still at
-    /// that version. The control node records the caller as the description's author when the
-    /// description changes. Sent once per leader, not retried. Returns the metadata after the
-    /// change.
+    /// Changes `name`'s description, labels, or expiry with `change`, a patch: what it doesn't
+    /// name stays as it is. With `if_version`, the change applies only if the metadata is still
+    /// at that version. The control node records the caller as the description's author when
+    /// the description changes. Sent once per leader, not retried. Returns the metadata after
+    /// the change.
     ///
     /// # Errors
     ///
     /// `NOT_FOUND` if there is no such database; `ABORTED` if the metadata isn't at
     /// `if_version`; `INVALID_ARGUMENT` for a change that changes nothing, sets and removes one
-    /// key, leaves more than 32 labels, or touches the expiry; `FAILED_PRECONDITION` while a
-    /// member lacks the `metadata` feature, or when the control node runs a release without
-    /// database metadata; or the status of the failed control call.
+    /// key, leaves more than 32 labels, or sets an expiry less than a minute ahead;
+    /// `UNAVAILABLE` if the control plane's time passed the expiry meanwhile, which a retry
+    /// resolves; `FAILED_PRECONDITION` while a member lacks the `metadata` feature, or `expiry`
+    /// for a change to the expiry, or when the control node runs a release without database
+    /// metadata; or the status of the failed control call.
     pub async fn update_database(
         &self,
         name: &DatabaseName,
         change: &MetadataChange,
         if_version: Option<u64>,
     ) -> Result<MetadataView, Status> {
-        let request = change_to_proto(name, change, if_version)?;
+        self.update_database_with(name, change, ExpiryRequest::Keep, if_version)
+            .await
+    }
+
+    /// Changes `name`'s metadata as [`Client::update_database`] does, with the expiry as
+    /// `expiry` says: a duration is turned into a time by the control node, against its own
+    /// clock, before it logs the update (ADR-0041, point 4).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::update_database`], and `INVALID_ARGUMENT` if `change` changes the expiry
+    /// too.
+    pub async fn update_database_with(
+        &self,
+        name: &DatabaseName,
+        change: &MetadataChange,
+        expiry: ExpiryRequest,
+        if_version: Option<u64>,
+    ) -> Result<MetadataView, Status> {
+        let request = change_to_proto(name, change, expiry, if_version)?;
         let response = self
             .control
             .update_database(request)

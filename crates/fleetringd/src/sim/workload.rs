@@ -90,6 +90,19 @@ pub enum Operation {
         /// quorum.
         durability: DurabilityMode,
     },
+    /// Creates a SQLite database through the data plane with an expiry, as `db create
+    /// --expires-in` does: it expires `expires_in` after the control node takes the creation
+    /// (ADR-0041, point 4). An expiring database may be gone by the end of a run, so the check
+    /// that acknowledged creations survive leaves it out. A database that already exists counts
+    /// as created.
+    CreateExpiring {
+        /// The database.
+        database: DatabaseName,
+        /// How many replicas it should have.
+        replication_factor: u32,
+        /// How long after its creation it expires.
+        expires_in: Duration,
+    },
     /// Inserts `value` into the database's [`WRITES_TABLE`] on its primary, through the data
     /// plane, and waits for the write quorum to hold it.
     Write {
@@ -146,6 +159,7 @@ impl Operation {
     pub fn database(&self) -> Option<&DatabaseName> {
         match self {
             Self::Create { database, .. }
+            | Self::CreateExpiring { database, .. }
             | Self::Write { database, .. }
             | Self::Read { database, .. }
             | Self::CreateDatabase { database, .. }
@@ -192,6 +206,15 @@ impl fmt::Display for Operation {
             } => write!(
                 f,
                 "open {database} rf {replication_factor} acks {durability}"
+            ),
+            Self::CreateExpiring {
+                database,
+                replication_factor,
+                expires_in,
+            } => write!(
+                f,
+                "open {database} rf {replication_factor} expiring in {} ms",
+                expires_in.as_millis()
             ),
             Self::Write { database, value } => write!(f, "write {value} to {database}"),
             Self::Read {

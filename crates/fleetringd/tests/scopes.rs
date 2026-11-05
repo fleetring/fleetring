@@ -1227,6 +1227,7 @@ async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult 
             &NewMetadata {
                 description: Some("The operator's notes.".parse()?),
                 labels: memory()?,
+                ..NewMetadata::default()
             },
         )
         .await?;
@@ -1254,6 +1255,7 @@ async fn an_agent_token_manages_its_own_prefix_and_nothing_else() -> TestResult 
             &NewMetadata {
                 description: Some("Memory for agent 42.".parse()?),
                 labels: memory()?,
+                ..NewMetadata::default()
             },
         )
         .await?;

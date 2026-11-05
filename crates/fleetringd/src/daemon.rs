@@ -699,6 +699,7 @@ fn start_data(
             fence_timeout: settings.stall_timeout,
             transfer_timeout: settings.open_timeout,
             drain,
+            drop_flush_limit: environment.drop_flush_limit(),
         },
     );
     let role = DataRole {

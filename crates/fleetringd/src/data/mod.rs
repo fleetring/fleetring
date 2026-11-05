@@ -28,18 +28,21 @@
 //!   so nothing commits. One that committed on the primary without reaching its quorum fails
 //!   with `ABORTED`, since it may still replicate later.
 //! - **Dropping** is a control command: `Control.DropDatabase` removes the database from the
-//!   control plane at its current epoch. The primary learns of it when its next lease renewal is
-//!   refused as an unknown database, within one renewal interval, and stops serving it; its
-//!   streams end, and each follower whose stream ends asks the control plane whether the database
-//!   still exists. Every replica then closes its copy through its registry and deletes the files.
-//!   A write to a dropped database fails with `NOT_FOUND`.
+//!   control plane at its current epoch, and so does an expiry once it passes. The primary
+//!   learns of it when its next lease renewal is refused as an unknown database, within one
+//!   renewal interval, and stops serving it; it flushes the database's change streams, its
+//!   archive included, for a bounded time, then deletes its copy. Its streams end, and each
+//!   follower whose stream ends asks the control plane whether the database still exists.
+//!   Every replica then closes its copy through its registry and deletes the files. A write to a
+//!   dropped database fails with `NOT_FOUND`.
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
-//! - **Metadata:** a database may carry a description and labels in control state (ADR-0041).
-//!   [`Client::create_database_with_metadata`] creates one with them, through a call a control
-//!   node without the feature refuses, so a creation never silently loses them;
+//! - **Metadata:** a database may carry a description, labels, and an expiry in control state
+//!   (ADR-0041). [`Client::create_database_with_metadata`] creates one with them, through a call
+//!   a control node without the feature refuses, so a creation never silently loses them;
 //!   [`Client::update_database`] patches them; [`Client::list_databases_where`] finds databases
-//!   by label and prefix, page by page.
+//!   by label and prefix, page by page. Once a database's expiry passes, the control node drops
+//!   it, as `Control.DropDatabase` would.
 //! - **Schema:** [`Client::schema`] asks a database's primary for its tables, views, indexes,
 //!   triggers, and virtual tables, with the engine's own definitions and row counts capped at a
 //!   limit (ADR-0041, point 6).
@@ -63,14 +66,14 @@ mod service;
 pub use client::{
     ArchiveDescription, ArchiveVerification, ArchivedSnapshot, Client, DatabaseSpec,
     DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus, ReplicaInfo, Restoration,
-    ServedDatabase, Verification, Written,
+    RestoredExpiry, ServedDatabase, Verification, Written,
 };
 pub(crate) use drain::DrainSettings;
-pub(crate) use lease::{LeaseKeeper, LeaseSettings};
+pub(crate) use lease::{DROP_FLUSH_LIMIT, LeaseKeeper, LeaseSettings};
 pub(crate) use metadata::is_invisible;
 pub use metadata::{
-    Descriptions, LabelRequirement, ListFilter, Listing, MetadataView, NewMetadata,
-    RestoredMetadata, restored_metadata,
+    Descriptions, Expiry, ExpiryRequest, LabelRequirement, ListFilter, Listing, MetadataView,
+    NewMetadata, RestoredMetadata, restored_metadata,
 };
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};

@@ -708,3 +708,109 @@ async fn retention_deletes_a_snapshots_metadata_with_it() -> TestResult {
     node.stop().await;
     Ok(())
 }
+
+/// Settings that segment once an hour, so nothing but a flush puts a segment within a test.
+fn hourly() -> fleetringd::durability::ArchiveSettings {
+    let mut settings = settings();
+    settings.segment_interval = std::time::Duration::from_secs(3_600);
+    settings
+}
+
+/// A dropped database's primary flushes before it deletes its copy (ADR-0041, point 4): the
+/// archive puts its open segment at once, whatever its segment interval, so it holds every
+/// acknowledged write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_puts_the_open_segment_at_once() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = MemoryStore::new();
+    let node = Node::start(&dir.path().join("node"), Arc::new(store.clone()), hourly());
+    let ledger = create_ledger(&node).await?;
+    // The first delivery takes the base snapshot; the pump then waits an hour before the next.
+    crate::common::guarded("the base snapshot", async {
+        while node
+            .listing(&ledger)
+            .await
+            .map_or(true, |listing| listing.snapshots.is_empty())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    for value in 1..=5 {
+        node.execute(&ledger, insert(value)).await?;
+    }
+    let end = node.position(&ledger).await?;
+
+    let held = node.streams()?.hold(&ledger);
+    let flushed = node
+        .streams()?
+        .flush_database(&ledger, crate::common::HANG_GUARD)
+        .await;
+    assert_eq!(flushed, fleetringd::changes::Flushed::Delivered);
+    drop(held);
+    let listing = node.listing(&ledger).await?;
+    assert_one_path(&listing, end.as_ref());
+
+    // A database without streams is flushed at once.
+    let unknown = name("unknown");
+    assert_eq!(
+        node.streams()?
+            .flush_database(&unknown, std::time::Duration::ZERO)
+            .await,
+        fleetringd::changes::Flushed::Delivered
+    );
+    node.stop().await;
+    Ok(())
+}
+
+/// A store whose every `put` hangs, as an unreachable bucket can.
+#[derive(Debug, Default)]
+struct HangingStore(MemoryStore);
+
+impl ObjectStore for HangingStore {
+    fn put(&self, _: &str, _: Vec<u8>) -> fleetringd::durability::StoreFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+
+    fn get(&self, key: &str) -> fleetringd::durability::StoreFuture<'_, Option<Vec<u8>>> {
+        self.0.get(key)
+    }
+
+    fn list(
+        &self,
+        prefix: &str,
+    ) -> fleetringd::durability::StoreFuture<'_, Vec<fleetringd::durability::ObjectEntry>> {
+        self.0.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> fleetringd::durability::StoreFuture<'_, ()> {
+        self.0.delete(key)
+    }
+}
+
+/// A flush is bounded: against a store that never answers, it gives up once its limit passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_against_a_hanging_store_times_out() -> TestResult {
+    const LIMIT: std::time::Duration = std::time::Duration::from_millis(300);
+    let dir = tempfile::tempdir()?;
+    let node = Node::start(
+        &dir.path().join("node"),
+        Arc::new(HangingStore::default()),
+        hourly(),
+    );
+    let ledger = create_ledger(&node).await?;
+    node.execute(&ledger, insert(1)).await?;
+    let held = node.streams()?.hold(&ledger);
+    let started = tokio::time::Instant::now();
+    let flushed = node.streams()?.flush_database(&ledger, LIMIT).await;
+    let took = started.elapsed();
+    assert_eq!(flushed, fleetringd::changes::Flushed::TimedOut);
+    assert!(took >= LIMIT, "gave up after {took:?}");
+    assert!(
+        took < crate::common::HANG_GUARD,
+        "the limit bounds it: {took:?}"
+    );
+    drop(held);
+    node.stop().await;
+    Ok(())
+}
