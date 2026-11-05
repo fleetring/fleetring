@@ -56,7 +56,7 @@ The `fleetringd` daemon ships as one binary. Each `fleetringd` release has three
   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh
   # A given version, somewhere else:
   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
-    | sh -s -- --version 0.5.0 --prefix /opt/fleetring
+    | sh -s -- --version 0.6.0 --prefix /opt/fleetring
   ```
 
 - **Docker**, for `linux/amd64` and `linux/arm64`. The image runs a one-node fleet from [`deploy/fleetringd.toml`](deploy/fleetringd.toml) as a non-root user, with its databases in the `/data` volume:
@@ -134,6 +134,7 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 - [x] Backups and point-in-time restore (0.3.0)
 - [x] Metrics, health checks, and a tested rolling upgrade (0.4.0)
 - [x] `fleetringd dev`, a one-command local node, and webhook sinks over HTTPS (0.5.0)
+- [x] Agent kit: database descriptions, labels and expiry, `db show`, an MCP server, and an agent skill (0.6.0)
 - [ ] Router sidecar (libSQL/Hrana protocol)
 - [ ] Live migration
 - [ ] Raft control plane
