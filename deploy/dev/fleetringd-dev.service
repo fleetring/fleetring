@@ -1,0 +1,26 @@
+# A systemd user unit that runs a dev mode node (ADR-0039) for one user, with everything in
+# ~/.fleetring. Not for production: dev mode serves loopback only, with its authority's key in its
+# directory.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp fleetringd-dev.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now fleetringd-dev
+#   journalctl --user -u fleetringd-dev      # the banner and the logs
+#   . ~/.fleetring/env                       # point the commands at it
+#
+# ExecStart assumes install.sh's location for a user install, ~/.local/bin; change it to
+# /usr/local/bin/fleetringd (install.sh as root) or /usr/bin/fleetringd (a package) as needed.
+[Unit]
+Description=fleetringd dev mode: one local node for development
+Documentation=https://github.com/fleetring/fleetring/blob/main/docs/adr/0039-dev-mode.md
+
+[Service]
+ExecStart=%h/.local/bin/fleetringd dev
+# SIGTERM stops the node cleanly; it keeps its databases for the next start.
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
