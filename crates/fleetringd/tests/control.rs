@@ -2227,3 +2227,118 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
     assert!(old.member(&"far".parse()?).is_some());
     Ok(())
 }
+
+/// The writer screens every command that needs any fleet feature, not only `undrain`: a
+/// metadata command a member can't act on is refused before it is logged, so a control node of
+/// the previous line, after a rollback, never meets one it can't decode (ADR-0041, point 3).
+/// This build doesn't report `expiry` yet, so a fleet of it refuses an expiry too.
+#[tokio::test]
+async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
+    use fleetring_control::{
+        Engine, Feature, Labels, MetadataChange, MetadataSpec, Rejection, Software, parse_label,
+    };
+    use fleetringd::control::SubmitError;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("control.db");
+    let node = ControlNode::open(&path, ControlOptions::default(), TickClock::default()).await?;
+    let handle = node.handle();
+    let join = |id: &str, software: Software| -> Result<Action, Box<dyn Error>> {
+        Ok(Action::Join {
+            member: Member::new(id.parse()?).with_software(software),
+        })
+    };
+    let create = |name: &str, metadata: Option<MetadataSpec>| -> Result<Action, Box<dyn Error>> {
+        Ok(Action::CreateDatabase {
+            name: name.parse()?,
+            replication_factor: fleetring::ReplicationFactor::ONE,
+            engine: Engine::Sqlite,
+            durability: None,
+            metadata,
+        })
+    };
+    let labelled = MetadataSpec {
+        labels: Labels::try_from_pairs([parse_label("purpose=task")?])?,
+        ..MetadataSpec::default()
+    };
+    let label = Action::UpdateDatabase {
+        name: "plain".parse()?,
+        change: MetadataChange {
+            set_labels: Labels::try_from_pairs([parse_label("purpose=memory")?])?,
+            ..MetadataChange::default()
+        },
+        by: None,
+        if_version: None,
+    };
+
+    // "old" runs the line before this build's, which knows no metadata.
+    let old = Software::new(previous_line(), 1).with_feature(Feature::Undrain);
+    let current = fleetringd::software::running();
+    handle.submit(join("old", old)?).await?;
+    handle.submit(join("new", current.clone())?).await?;
+    handle.submit(create("plain", None)?).await?;
+    for refused in [create("labelled", Some(labelled.clone()))?, label.clone()] {
+        let refused = handle
+            .submit(refused)
+            .await
+            .expect_err("old lacks metadata");
+        assert!(
+            matches!(
+                &refused,
+                SubmitError::Refused(Rejection::FeatureUnsupported {
+                    feature: Feature::Metadata,
+                    id,
+                    ..
+                }) if id.as_str() == "old"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    // Once every member runs this build, metadata applies, and an expiry is still refused.
+    handle.submit(join("old", current)?).await?;
+    handle.submit(create("labelled", Some(labelled))?).await?;
+    handle.submit(label).await?;
+    let expiring = MetadataSpec {
+        expires_at: Some(Timestamp::MAX),
+        ..MetadataSpec::default()
+    };
+    let refused = handle
+        .submit(create("expiring", Some(expiring))?)
+        .await
+        .expect_err("this build doesn't report expiry");
+    assert!(
+        matches!(
+            &refused,
+            SubmitError::Refused(Rejection::FeatureUnsupported {
+                feature: Feature::Expiry,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let published = handle.state();
+    assert!(published.is_enabled(Feature::Metadata));
+    assert!(!published.is_enabled(Feature::Expiry));
+    node.shutdown().await;
+
+    let log = CommandLog::open(&path, ControlConfig::new())?;
+    let logged: Vec<Action> = log
+        .commands()?
+        .into_iter()
+        .map(|(_, command)| command.action)
+        .collect();
+    let gated: Vec<&Action> = logged
+        .iter()
+        .filter(|action| !action.features().is_empty())
+        .collect();
+    assert_eq!(
+        gated.len(),
+        2,
+        "only the accepted metadata commands: {gated:?}"
+    );
+    let (replayed, outcomes) = replay(&log)?;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert_eq!(replayed, *published);
+    Ok(())
+}

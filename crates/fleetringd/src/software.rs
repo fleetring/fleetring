@@ -25,14 +25,25 @@ pub fn release() -> Release {
         .expect("the crate's version is a valid release")
 }
 
+/// Fleet features the control crate knows but this build doesn't carry out yet, so it doesn't
+/// report them. A release reports a feature only once it acts on every command the feature
+/// covers (ADR-0041, point 3).
+///
+/// `expiry`: `apply` decides `ExpireDatabase`, but nothing submits one until the control node's
+/// expiry sweep exists (FR-070 phase 3, which removes this list).
+const NOT_YET_REPORTED: [Feature; 1] = [Feature::Expiry];
+
 /// Returns the software this build runs: its release, the control-log format it reads, and every
-/// fleet feature it knows.
+/// fleet feature it carries out.
 #[must_use]
 pub fn running() -> Software {
-    Feature::ALL.into_iter().fold(
-        Software::new(release(), FORMAT_VERSION),
-        Software::with_feature,
-    )
+    Feature::ALL
+        .into_iter()
+        .filter(|feature| !NOT_YET_REPORTED.contains(feature))
+        .fold(
+            Software::new(release(), FORMAT_VERSION),
+            Software::with_feature,
+        )
 }
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
@@ -89,17 +100,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn this_build_reports_a_release_with_every_feature() {
+    fn this_build_reports_every_feature_it_carries_out() {
         let software = running();
         assert_eq!(software.release().to_string(), VERSION);
+        assert!(software.supports(Feature::Undrain));
+        assert!(software.supports(Feature::Metadata));
+        // Nothing sweeps expired databases until FR-070 phase 3, so `expiry` isn't reported:
+        // a fleet could otherwise enable it with no node that ever expires a database.
+        assert!(!software.supports(Feature::Expiry));
         assert!(
             Feature::ALL
                 .into_iter()
-                .all(|feature| software.supports(feature))
+                .all(|feature| software.supports(feature) != NOT_YET_REPORTED.contains(&feature))
         );
         assert_eq!(
             software_from_proto(software_to_proto(&software)).expect("valid"),
             software
+        );
+        let printed: serde_json::Value =
+            serde_json::from_str(&running_json()).expect("upgrade --software prints JSON");
+        assert_eq!(
+            printed["features"],
+            serde_json::json!(["undrain", "metadata"])
         );
     }
 

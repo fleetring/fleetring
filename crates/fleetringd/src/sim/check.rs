@@ -1057,6 +1057,7 @@ mod tests {
                 replication_factor: ReplicationFactor::new(1).expect("one"),
                 engine: fleetring_control::Engine::Sqlite,
                 durability: None,
+                metadata: None,
             },
             Action::AcquireLease {
                 database: "db".parse().expect("name"),

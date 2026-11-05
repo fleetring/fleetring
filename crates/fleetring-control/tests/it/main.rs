@@ -3,6 +3,7 @@
 
 mod common;
 mod durability;
+mod metadata;
 mod properties;
 mod replay;
 mod scenarios;

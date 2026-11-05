@@ -4,9 +4,15 @@ use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DatabaseName, Durability, Engine, Feature, HostedReplica, LeaseEpoch, Member, Position,
-    Revoked, Software, Timestamp,
+    DatabaseName, Durability, Engine, Feature, HostedReplica, LeaseEpoch, Member, MetadataChange,
+    MetadataSpec, Position, PrincipalName, Revoked, Software, Timestamp,
 };
+
+/// The features of a command that needs database metadata.
+const METADATA: &[Feature] = &[Feature::Metadata];
+
+/// The features of a command that needs database metadata and sets an expiry or acts on one.
+const METADATA_AND_EXPIRY: &[Feature] = &[Feature::Metadata, Feature::Expiry];
 
 /// One change to control state, stamped with the control node's time.
 ///
@@ -95,6 +101,43 @@ pub enum Action {
         /// floor at W. Creations logged before the field existed carry none.
         #[serde(default)]
         durability: Option<Durability>,
+        /// What the creation records as the database's metadata, or `None` for none. Needs
+        /// [`Feature::Metadata`], and [`Feature::Expiry`] too if it sets an expiry. Creations
+        /// logged before the field existed carry none, and a creation without it logs exactly
+        /// what one did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<MetadataSpec>,
+    },
+
+    /// Changes a database's metadata with a patch (ADR-0041, point 2): only the description,
+    /// labels, and expiry the change names, removing labels before it sets them. A database
+    /// created without metadata gets it at its first update, with no creator and no creation
+    /// time. Every accepted update grows the metadata's version by one.
+    ///
+    /// Needs [`Feature::Metadata`], and [`Feature::Expiry`] too if it touches the expiry.
+    UpdateDatabase {
+        /// The database's name.
+        name: DatabaseName,
+        /// What changes.
+        change: MetadataChange,
+        /// The principal making the change, recorded as the description's author when the
+        /// change sets the description. Recorded only; nothing is decided by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<PrincipalName>,
+        /// Apply the change only if the metadata is at this version: 0 for a database without
+        /// metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_version: Option<u64>,
+    },
+
+    /// Drops a database whose expiry has passed at the command's time, exactly as
+    /// [`Action::DropDatabase`] drops one. An expiry extended or cleared since the command was
+    /// made wins: the command is then rejected.
+    ///
+    /// Needs [`Feature::Metadata`] and [`Feature::Expiry`].
+    ExpireDatabase {
+        /// The database's name.
+        name: DatabaseName,
     },
 
     /// Records new durability settings for a database, which take effect when its next lease is
@@ -226,23 +269,52 @@ pub enum Action {
 }
 
 impl Action {
-    /// Returns the fleet feature the action needs, if it needs one: an action that needs a
-    /// feature is accepted only once every member supports it (ADR-0038, point 4).
+    /// Returns the fleet features the action needs, in order: an action that needs features is
+    /// accepted only once every member supports each of them, and the first one accepted
+    /// enables them all (ADR-0038, point 4).
     ///
     /// # Examples
     ///
     /// ```
-    /// use fleetring_control::{Action, Feature};
+    /// use fleetring_control::{Action, ExpiryChange, Feature, MetadataChange, Timestamp};
     ///
-    /// assert_eq!(Action::Undrain { id: "a".parse()? }.feature(), Some(Feature::Undrain));
-    /// assert_eq!(Action::Tick.feature(), None);
-    /// # Ok::<(), fleetring::ParseLabelError>(())
+    /// assert_eq!(Action::Undrain { id: "a".parse()? }.features(), [Feature::Undrain]);
+    /// assert!(Action::Tick.features().is_empty());
+    /// let extend = Action::UpdateDatabase {
+    ///     name: "agent-42-task".parse()?,
+    ///     change: MetadataChange {
+    ///         expiry: ExpiryChange::Set(Timestamp::from_millis(90_000)),
+    ///         ..MetadataChange::default()
+    ///     },
+    ///     by: None,
+    ///     if_version: None,
+    /// };
+    /// assert_eq!(extend.features(), [Feature::Metadata, Feature::Expiry]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
-    pub fn feature(&self) -> Option<Feature> {
+    pub fn features(&self) -> &'static [Feature] {
         match self {
-            Self::Undrain { .. } => Some(Feature::Undrain),
-            _ => None,
+            Self::Undrain { .. } => &[Feature::Undrain],
+            Self::CreateDatabase {
+                metadata: Some(spec),
+                ..
+            } => {
+                if spec.expires_at.is_some() {
+                    METADATA_AND_EXPIRY
+                } else {
+                    METADATA
+                }
+            }
+            Self::UpdateDatabase { change, .. } => {
+                if change.touches_expiry() {
+                    METADATA_AND_EXPIRY
+                } else {
+                    METADATA
+                }
+            }
+            Self::ExpireDatabase { .. } => METADATA_AND_EXPIRY,
+            _ => &[],
         }
     }
 }
