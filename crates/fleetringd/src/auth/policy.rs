@@ -225,6 +225,18 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Fleet,
         Binding::None,
     ),
+    // Database metadata (ADR-0041): what creating and dropping need, so a scoped principal
+    // describes and labels its own databases and no others.
+    rpc(
+        "/fleetring.v1.Control/CreateDatabaseWithMetadata",
+        Requirement::Database(Action::Admin),
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Control/UpdateDatabase",
+        Requirement::Database(Action::Admin),
+        Binding::None,
+    ),
     // Replication: nodes only.
     rpc(
         "/fleetring.v1.Replication/Replicate",

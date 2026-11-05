@@ -118,6 +118,17 @@ impl fmt::Display for Principal {
     }
 }
 
+/// The name control state records for a principal, as a database's creator or a description's
+/// author (ADR-0041): both follow the same grammar.
+impl From<&Principal> for fleetring_control::PrincipalName {
+    fn from(principal: &Principal) -> Self {
+        principal
+            .as_str()
+            .parse()
+            .expect("a principal's name follows the grammar of a recorded principal name")
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for Principal {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
@@ -253,6 +264,16 @@ impl fmt::Display for SubjectUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_principal_converts_to_the_name_control_state_records() {
+        let longest = "a".repeat(MAX_NAME_LEN);
+        for text in ["agent-42", "a", "x_y.z-0", longest.as_str()] {
+            let principal: Principal = text.parse().expect("a principal");
+            let recorded = fleetring_control::PrincipalName::from(&principal);
+            assert_eq!(recorded.as_str(), text);
+        }
+    }
 
     #[test]
     fn subject_uris_round_trip() {

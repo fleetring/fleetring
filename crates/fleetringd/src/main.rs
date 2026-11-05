@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
+use std::io::{BufRead as _, IsTerminal as _, Read, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,7 +14,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{Acks, DatabaseName, Liveness, ReplicaRole};
+use fleetring_control::{
+    Acks, DatabaseName, Description, DescriptionChange, LabelKey, LabelValue, Labels, Liveness,
+    MetadataChange, ReplicaRole, parse_label,
+};
 use fleetring_control::{KeyId, Millis, ParseReleaseError, Release, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
@@ -22,8 +25,8 @@ use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIF
 use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
-    ArchiveDescription, Client, DatabaseSpec, LeaseUpdate, Location, NodeStatus, ReplicaInfo,
-    Verification,
+    ArchiveDescription, Client, DatabaseSpec, LabelRequirement, LeaseUpdate, ListFilter, Location,
+    MetadataView, NewMetadata, NodeStatus, ReplicaInfo, Verification,
 };
 use fleetringd::dev::{self, DevError, DevMode, Prepared};
 use fleetringd::durability::{
@@ -32,9 +35,10 @@ use fleetringd::durability::{
 use fleetringd::engine::{Execution, Position, Rows, SqliteEngine, Statement, Value};
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
+use fleetringd::report::{DatabaseReport, render_text};
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
-    FleetName, Identity, Principal, Security, Validity,
+    FleetName, Identity, Peer, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
 #[cfg(unix)]
@@ -448,6 +452,63 @@ enum DbCommand {
         #[arg(long)]
         min_replicas: Option<u8>,
         #[command(flatten)]
+        metadata: MetadataArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Shows a database in detail: where it lives, as `db locate` prints it, and its
+    /// description, labels, creator, and metadata version.
+    ///
+    /// A description is text a principal wrote: it prints as a block, each line indented and
+    /// prefixed with `| `, and one written by another principal, or by nobody that can be
+    /// named, is marked untrusted.
+    Show {
+        /// The database's name.
+        name: DatabaseName,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Sets or clears a database's description. The control node records you as its author.
+    SetDescription {
+        /// The database's name.
+        name: DatabaseName,
+        /// The description: what the database holds and how it was set up, at most 1 KiB of
+        /// text; tab and line feed are allowed, other control and invisible characters aren't.
+        /// `-` reads it from stdin, without its trailing line feeds.
+        #[arg(long, required_unless_present = "clear", allow_hyphen_values = true)]
+        description: Option<String>,
+        /// Removes the description.
+        #[arg(long, conflicts_with = "description")]
+        clear: bool,
+        /// Changes it only if the metadata is still at this version, as `db show` prints it;
+        /// refused otherwise, so a description read first isn't overwritten by mistake.
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Sets and removes a database's labels. Labels it doesn't name stay as they are.
+    SetLabels {
+        /// The database's name.
+        name: DatabaseName,
+        /// A label to set, `key=value`, replacing the key's value if the database has it.
+        /// Repeat it for several. At least one `--label` or `--remove` is needed.
+        #[arg(
+            long = "label",
+            value_name = "KEY=VALUE",
+            value_parser = parse_label_arg,
+            required_unless_present = "remove"
+        )]
+        labels: Vec<(LabelKey, LabelValue)>,
+        /// A label key to remove. Repeat it for several.
+        #[arg(long = "remove", value_name = "KEY")]
+        remove: Vec<LabelKey>,
+        /// Changes them only if the metadata is still at this version, as `db show` prints it.
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[command(flatten)]
         target: Target,
     },
     /// Changes a database's durability settings, which take effect at its next epoch: the
@@ -482,6 +543,13 @@ enum DbCommand {
         /// Lists only the databases this node is primary for.
         #[arg(long)]
         node: Option<NodeId>,
+        /// Lists only the databases with this label: `key=value`, or `key` for any value.
+        /// Repeat it to require several.
+        #[arg(long = "label", value_name = "KEY=VALUE|KEY")]
+        labels: Vec<LabelRequirement>,
+        /// Lists only the databases whose names start with this.
+        #[arg(long)]
+        prefix: Option<String>,
         #[command(flatten)]
         target: Target,
     },
@@ -523,6 +591,8 @@ enum DbCommand {
         /// The acknowledgement mode, as for `db create`; the fleet's default if unset.
         #[arg(long)]
         acks: Option<Acks>,
+        #[command(flatten)]
+        metadata: MetadataArgs,
         #[command(flatten)]
         target: Target,
     },
@@ -578,6 +648,66 @@ enum NodeCommand {
         #[command(flatten)]
         target: Target,
     },
+}
+
+/// What `db create` and `db restore` record about the new database besides its placement.
+#[derive(Debug, Args)]
+struct MetadataArgs {
+    /// What the database holds and how it was set up, at most 1 KiB of text; tab and line feed
+    /// are allowed, other control and invisible characters aren't. `-` reads it from stdin,
+    /// without its trailing line feeds. The control node records you as the creator.
+    #[arg(long, allow_hyphen_values = true)]
+    description: Option<String>,
+    /// A label, `key=value`, to find the database by (`db list --label`). Repeat it for
+    /// several, at most 32.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label_arg)]
+    labels: Vec<(LabelKey, LabelValue)>,
+}
+
+impl MetadataArgs {
+    /// The metadata the flags ask for, reading the description from `stdin` if it is `-`.
+    fn read(self, stdin: impl Read) -> Result<NewMetadata, Box<dyn Error>> {
+        let description = self
+            .description
+            .map(|text| description_arg(&text, stdin))
+            .transpose()?;
+        let labels = Labels::try_from_pairs(self.labels)?;
+        Ok(NewMetadata {
+            description,
+            labels,
+        })
+    }
+}
+
+/// How a command prints its result: `-o table|json`, or `--json`.
+#[derive(Debug, Args)]
+struct OutputArgs {
+    /// The output format: `table`, key and value lines for one item, or `json`, one object
+    /// with stable snake_case fields.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+    /// Short for `-o json`.
+    #[arg(long, conflicts_with = "output")]
+    json: bool,
+}
+
+impl OutputArgs {
+    fn format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.output
+        }
+    }
+}
+
+/// An output format (`docs/cli.md`, section 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    /// For people.
+    Table,
+    /// For programs.
+    Json,
 }
 
 #[derive(Debug, Args)]
@@ -715,14 +845,38 @@ impl TlsArgs {
         Ok(IdentityFiles { ca, cert, key })
     }
 
-    fn network(&self) -> Result<Network, Box<dyn Error>> {
-        let network = Network::default().with_security(self.security()?);
-        let token = match &self.token {
+    /// The bearer token the command sends: `--token`, else `FLEETRING_TOKEN`, if set.
+    fn token(&self) -> Option<String> {
+        match &self.token {
             Some(token) => Some(token.clone()),
             None => std::env::var(TOKEN_VAR)
                 .ok()
                 .filter(|token| !token.is_empty()),
-        };
+        }
+    }
+
+    /// The principal the command acts as, so that what others wrote can be told apart from
+    /// what it wrote: the one its token names, if it sends one, else its certificate's. Read
+    /// without verifying; the nodes verify. `None` in plaintext without a token, or when
+    /// neither can be read.
+    fn principal(&self) -> Option<String> {
+        if let Some(token) = self.token() {
+            return BearerToken::new(token.trim())
+                .claimed_principal()
+                .map(|principal| principal.to_string());
+        }
+        match self.security().ok()? {
+            Security::Tls(identity) => match identity.peer() {
+                Peer::Principal(name) => Some(name.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn network(&self) -> Result<Network, Box<dyn Error>> {
+        let network = Network::default().with_security(self.security()?);
+        let token = self.token();
         Ok(match token {
             Some(token) => {
                 network.with_credentials(Credentials::bearer(&BearerToken::new(token.trim()))?)
@@ -805,6 +959,24 @@ impl DaemonArgs {
         }
         config
     }
+}
+
+/// A label as `key=value`.
+fn parse_label_arg(text: &str) -> Result<(LabelKey, LabelValue), String> {
+    parse_label(text).map_err(|error| error.to_string())
+}
+
+/// A description from a flag: the text itself, or, for `-`, everything `stdin` holds, without
+/// its trailing line feeds.
+fn description_arg(text: &str, mut stdin: impl Read) -> Result<Description, Box<dyn Error>> {
+    if text != "-" {
+        return Ok(text.parse()?);
+    }
+    let mut read = String::new();
+    stdin
+        .read_to_string(&mut read)
+        .map_err(|error| format!("can't read the description from stdin: {error}"))?;
+    Ok(read.trim_end_matches('\n').parse()?)
 }
 
 /// A lifetime as `<n>d`, `<n>h`, `<n>m`, or `<n>s`.
@@ -1173,6 +1345,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             replication_factor,
             acks,
             min_replicas,
+            metadata,
             target,
         }) => {
             let mut spec = database_spec(replication_factor)?;
@@ -1182,13 +1355,94 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             if let Some(min_replicas) = min_replicas {
                 spec = spec.with_min_replicas(min_replicas);
             }
-            let location = target
-                .client()?
-                .create_database_with(&name, spec)
-                .await
-                .map_err(failed)?;
+            let metadata = metadata.read(std::io::stdin().lock())?;
+            let client = target.client()?;
+            // A plain creation keeps the call every release knows (ADR-0041, point 2).
+            let location = if metadata.is_empty() {
+                client.create_database_with(&name, spec).await
+            } else {
+                client
+                    .create_database_with_metadata(&name, spec, &metadata)
+                    .await
+            }
+            .map_err(metadata_failed)?;
             warn_if_under_replicated(&location);
-            format!("created {name}\n{}", format_location(&location))
+            let mut output = format!("created {name}\n{}", format_location(&location));
+            if let Some(metadata) = &location.metadata {
+                output.push_str(&format_metadata_summary(metadata));
+            }
+            output
+        }
+        Command::Db(DbCommand::Show {
+            name,
+            output,
+            target,
+        }) => {
+            let location = target.client()?.locate(&name).await.map_err(failed)?;
+            let report = DatabaseReport::from_location(&location, SystemClock.now());
+            match output.format() {
+                OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&report)?),
+                OutputFormat::Table => {
+                    let mut text = Vec::new();
+                    render_text(&report, target.tls.principal().as_deref(), &mut text)?;
+                    String::from_utf8(text)?
+                }
+            }
+        }
+        Command::Db(DbCommand::SetDescription {
+            name,
+            description,
+            clear,
+            if_version,
+            target,
+        }) => {
+            let description = match description {
+                Some(text) if !clear => {
+                    DescriptionChange::Set(description_arg(&text, std::io::stdin().lock())?)
+                }
+                _ => DescriptionChange::Clear,
+            };
+            let change = MetadataChange {
+                description,
+                ..MetadataChange::default()
+            };
+            let metadata = target
+                .client()?
+                .update_database(&name, &change, if_version)
+                .await
+                .map_err(|status| updated_failed(status, if_version))?;
+            let what = if metadata.description.is_some() {
+                "set"
+            } else {
+                "cleared"
+            };
+            format!(
+                "description of {name} {what}; metadata version {}\n",
+                metadata.version
+            )
+        }
+        Command::Db(DbCommand::SetLabels {
+            name,
+            labels,
+            remove,
+            if_version,
+            target,
+        }) => {
+            let change = MetadataChange {
+                set_labels: Labels::try_from_pairs(labels)?,
+                remove_labels: remove.into_iter().collect(),
+                ..MetadataChange::default()
+            };
+            let metadata = target
+                .client()?
+                .update_database(&name, &change, if_version)
+                .await
+                .map_err(|status| updated_failed(status, if_version))?;
+            format!(
+                "labels of {name}: {}; metadata version {}\n",
+                format_labels(&metadata),
+                metadata.version
+            )
         }
         Command::Db(DbCommand::SetDurability {
             name,
@@ -1231,8 +1485,23 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Db(DbCommand::Locate { name, target }) => {
             format_location(&target.client()?.locate(&name).await.map_err(failed)?)
         }
-        Command::Db(DbCommand::List { node, target }) => {
-            let mut databases = target.client()?.list_databases().await.map_err(failed)?;
+        Command::Db(DbCommand::List {
+            node,
+            labels,
+            prefix,
+            target,
+        }) => {
+            let filter = ListFilter {
+                labels,
+                prefix,
+                ..ListFilter::default()
+            };
+            let mut databases = target
+                .client()?
+                .list_databases_where(&filter)
+                .await
+                .map_err(failed)?
+                .databases;
             if let Some(node) = &node {
                 databases.retain(|location| location.primary.as_ref() == Some(node));
             }
@@ -1251,17 +1520,26 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             point,
             replication_factor,
             acks,
+            metadata,
             target,
         }) => {
             let mut spec = database_spec(replication_factor)?;
             if let Some(acks) = acks {
                 spec = spec.with_acks(acks);
             }
+            let metadata = metadata.read(std::io::stdin().lock())?;
             let restored = target
                 .client()?
-                .restore_database(&name, spec, &archive, &from, &point.target())
+                .restore_database_with_metadata(
+                    &name,
+                    spec,
+                    &metadata,
+                    &archive,
+                    &from,
+                    &point.target(),
+                )
                 .await
-                .map_err(failed)?;
+                .map_err(metadata_failed)?;
             warn_if_under_replicated(&restored.location);
             format!(
                 "restored {name} from {from} in archive {archive}\n{}{}",
@@ -1667,6 +1945,9 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             dir,
         } => {
             let ttl = ttl.unwrap_or(DEFAULT_TOKEN_LIFETIME);
+            for warning in scopes.iter().filter_map(Scope::separator_warning) {
+                eprintln!("warning: {warning}");
+            }
             if ttl > MAX_TOKEN_LIFETIME {
                 return Err(format!(
                     "a token lasts at most {} days, so its revocation stays short",
@@ -2317,6 +2598,60 @@ fn failed(status: tonic::Status) -> Box<dyn Error> {
     format!("{}: {}", status.code().description(), status.message()).into()
 }
 
+/// A failed creation as [`failed`] says it, with the next step when a member of the fleet
+/// lacks the `metadata` feature (ADR-0041, point 3).
+fn metadata_failed(status: tonic::Status) -> Box<dyn Error> {
+    let lacks_metadata = status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains("can't use 'metadata' yet");
+    if lacks_metadata {
+        format!(
+            "{}\n  hint: create it without --description and --label, or upgrade every member \
+             first",
+            failed(status)
+        )
+        .into()
+    } else {
+        failed(status)
+    }
+}
+
+/// A failed metadata update as [`failed`] says it; a conditional update whose version no
+/// longer holds says how to read the metadata again.
+fn updated_failed(status: tonic::Status, if_version: Option<u64>) -> Box<dyn Error> {
+    match if_version {
+        Some(version) if status.code() == tonic::Code::Aborted => format!(
+            "the database's metadata changed since version {version}; read it again with \
+             fleetringd db show"
+        )
+        .into(),
+        _ => metadata_failed(status),
+    }
+}
+
+/// A database's labels as `key=value` pairs, or `none`.
+fn format_labels(metadata: &MetadataView) -> String {
+    if metadata.labels.is_empty() {
+        return "none".to_owned();
+    }
+    metadata
+        .labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What a creation recorded, after its placement: the labels, the creator, and the version;
+/// `db show` prints the description.
+fn format_metadata_summary(metadata: &MetadataView) -> String {
+    format!(
+        "labels: {}\ncreator: {}\nversion: {}\n",
+        format_labels(metadata),
+        metadata.created_by.as_deref().unwrap_or("unknown"),
+        metadata.version
+    )
+}
+
 /// Prints an error and its causes, one per line.
 fn report(error: &dyn Error) {
     eprintln!("fleetringd: {error}");
@@ -2509,6 +2844,141 @@ mod tests {
         let refused = cli.check().expect_err("a daemon option beside dev");
         assert_eq!(refused.kind(), ErrorKind::ArgumentConflict);
         assert!(Cli::try_parse_from(["fleetringd", "dev", "--listen", "0.0.0.0:7400"]).is_err());
+    }
+
+    #[test]
+    fn db_create_parses_labels_and_reads_a_description_from_stdin_when_dash() {
+        let metadata = |words: &[&str]| {
+            let cli = Cli::try_parse_from(words).expect("db create parses");
+            let Some(Command::Db(DbCommand::Create { metadata, .. })) = cli.command else {
+                panic!("not db create: {:?}", cli.command);
+            };
+            metadata
+        };
+        let control = ["--control", "127.0.0.1:7400"];
+        let words = [
+            "fleetringd",
+            "db",
+            "create",
+            "notes",
+            "--description",
+            "-",
+            "--label",
+            "purpose=memory",
+            "--label",
+            "agent=42",
+        ];
+        let read = metadata(&[&words[..], &control].concat())
+            .read(&b"Memory for agent 42.\nTables: facts.\n\n"[..])
+            .expect("valid metadata");
+        assert_eq!(
+            read.description.as_ref().map(Description::as_str),
+            Some("Memory for agent 42.\nTables: facts.")
+        );
+        let labels: Vec<String> = read
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        assert_eq!(labels, ["agent=42", "purpose=memory"]);
+
+        let inline = metadata(
+            &[
+                &[
+                    "fleetringd",
+                    "db",
+                    "create",
+                    "notes",
+                    "--description",
+                    "inline",
+                ][..],
+                &control,
+            ]
+            .concat(),
+        )
+        .read(&b"never read"[..])
+        .expect("valid");
+        assert_eq!(
+            inline.description.as_ref().map(Description::as_str),
+            Some("inline")
+        );
+        let plain = metadata(&[&["fleetringd", "db", "create", "notes"][..], &control].concat())
+            .read(&b""[..])
+            .expect("nothing to read");
+        assert!(plain.is_empty());
+
+        let escape = metadata(
+            &[
+                &["fleetringd", "db", "create", "notes", "--description", "-"][..],
+                &control,
+            ]
+            .concat(),
+        )
+        .read(&b"\x1b[2J"[..])
+        .expect_err("an escape sequence");
+        assert!(escape.to_string().contains("U+001B"), "{escape}");
+        for bad in ["-bad=x", "fleetring.dev/x=y", "purpose"] {
+            assert!(
+                Cli::try_parse_from(
+                    [
+                        &["fleetringd", "db", "create", "notes", "--label", bad][..],
+                        &control
+                    ]
+                    .concat()
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_show_takes_json_as_a_flag_or_an_output_format() {
+        let format = |words: &[&str]| {
+            let cli = Cli::try_parse_from(words).expect("db show parses");
+            let Some(Command::Db(DbCommand::Show { output, .. })) = cli.command else {
+                panic!("not db show: {:?}", cli.command);
+            };
+            output.format()
+        };
+        let show = [
+            "fleetringd",
+            "db",
+            "show",
+            "notes",
+            "--control",
+            "127.0.0.1:7400",
+        ];
+        assert_eq!(format(&show), OutputFormat::Table);
+        assert_eq!(
+            format(&[&show[..], &["--json"]].concat()),
+            OutputFormat::Json
+        );
+        assert_eq!(
+            format(&[&show[..], &["-o", "json"]].concat()),
+            OutputFormat::Json
+        );
+        assert!(Cli::try_parse_from([&show[..], &["-o", "yaml"]].concat()).is_err());
+        assert!(
+            Cli::try_parse_from(
+                [
+                    &["fleetringd", "db", "set-description", "notes"][..],
+                    &show[4..]
+                ]
+                .concat()
+            )
+            .is_err(),
+            "set-description needs --description or --clear"
+        );
+        let set_labels = ["fleetringd", "db", "set-labels", "notes"];
+        assert!(
+            Cli::try_parse_from([&set_labels[..], &show[4..]].concat()).is_err(),
+            "set-labels needs a label or a removal"
+        );
+        assert!(
+            Cli::try_parse_from([&set_labels[..], &["--remove", "agent"], &show[4..]].concat())
+                .is_ok()
+        );
     }
 
     #[test]

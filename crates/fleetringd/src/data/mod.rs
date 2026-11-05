@@ -35,6 +35,11 @@
 //!   A write to a dropped database fails with `NOT_FOUND`.
 //! - **Peers' addresses** come from the control plane: each member advertises one when it joins
 //!   (`[node] advertise`), and placements carry it for each replica.
+//! - **Metadata:** a database may carry a description and labels in control state (ADR-0041).
+//!   [`Client::create_database_with_metadata`] creates one with them, through a call a control
+//!   node without the feature refuses, so a creation never silently loses them;
+//!   [`Client::update_database`] patches them; [`Client::list_databases_where`] finds databases
+//!   by label and prefix, page by page.
 //! - **Lease watching:** `WatchLeases` streams the leases one node holds, from the node's own
 //!   view (FR-042): the leases held, then a `Gained` or `Lost` event per change, each with its epoch.
 //!   A worker beside the node acts on the databases the node is primary for and stops when a
@@ -46,6 +51,7 @@ pub(crate) mod convert;
 mod drain;
 mod lease;
 mod leases;
+mod metadata;
 mod node;
 mod redirect;
 mod service;
@@ -57,6 +63,9 @@ pub use client::{
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{LeaseKeeper, LeaseSettings};
+pub use metadata::{
+    Descriptions, LabelRequirement, ListFilter, Listing, MetadataView, NewMetadata,
+};
 pub(crate) use node::DataNode;
 pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};
 pub(crate) use service::DatabaseService;

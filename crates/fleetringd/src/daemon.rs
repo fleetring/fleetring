@@ -191,6 +191,13 @@ impl Daemon {
         environment: Environment,
     ) -> Result<Self, StartError> {
         config.validate()?;
+        // A prefix without a separator covers more than it seems to (ADR-0041, point 5); the
+        // scope still loads, since changing what it covers would break existing principals.
+        for principal in &config.principals {
+            for warning in principal.scopes.separator_warnings() {
+                tracing::warn!(principal = %principal.name, "{warning}");
+            }
+        }
         let ack_timeout = config.replication.settings().ack_timeout;
         let network = environment.network().clone().outlasting(ack_timeout);
         let environment = environment.with_network(network);

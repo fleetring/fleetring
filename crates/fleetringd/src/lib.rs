@@ -27,6 +27,7 @@ pub mod observe;
 mod publisher;
 mod registry;
 pub mod replication;
+pub mod report;
 #[cfg(feature = "simulation")]
 pub mod sim;
 pub mod software;
@@ -107,6 +108,12 @@ const _: () = {
     assert_debug_send_sync::<data::Client>();
     assert_debug_send_sync::<data::Restoration>();
     assert_debug_send_sync::<data::DatabaseSpec>();
+    assert_debug_send_sync::<data::Descriptions>();
+    assert_debug_send_sync::<data::LabelRequirement>();
+    assert_debug_send_sync::<data::ListFilter>();
+    assert_debug_send_sync::<data::Listing>();
+    assert_debug_send_sync::<data::MetadataView>();
+    assert_debug_send_sync::<data::NewMetadata>();
     assert_debug_send_sync::<data::DurabilityChange>();
     assert_debug_send_sync::<data::LeaseUpdate>();
     assert_debug_send_sync::<data::LeaseUpdates>();
@@ -117,6 +124,10 @@ const _: () = {
     assert_debug_send_sync::<data::Verification>();
     assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<dev::Created>();
+    assert_debug_send_sync::<report::DatabaseReport>();
+    assert_debug_send_sync::<report::MetadataReport>();
+    assert_debug_send_sync::<report::PlacementReport>();
+    assert_debug_send_sync::<report::ReplicaReport>();
     assert_debug_send_sync::<dev::DevError>();
     assert_debug_send_sync::<dev::DevMode>();
     assert_debug_send_sync::<dev::Prepared>();
