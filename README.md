@@ -111,6 +111,10 @@ tail -f ~/.fleetring/changes/notes.ndjson   # the change stream: one JSON line p
 
 Run another `db exec` and watch its row arrive in the `tail`. Ctrl-C stops the node, and the next `fleetringd dev` picks up the same databases. A dev node holds one copy of each database: its configuration makes 1 the default replication factor, so `db create` needs no `--replication-factor`, and the same commands and the same client code run against a fleet, given its address and certificates, where the default is 3. Dev mode is for development only: it listens on loopback alone and keeps its authority's key in `~/.fleetring` ([SECURITY.md](SECURITY.md#dev-mode)). [`deploy/dev/`](deploy/dev/) has a Homebrew service block and a systemd user unit that run it at login.
 
+## Agents
+
+An AI agent can have its own databases: it creates them under its own name prefix, describes and labels them so they can be found again, gives scratch databases an expiry, and drops them when it's done, through `fleetringd mcp`, an MCP server, or the CLI. The [agent quickstart](docs/agents/quickstart.md) sets one up on a dev node with a scoped token, and the [agent skill](docs/agents/SKILL.md) is what the agent reads: when to create a database rather than a table, naming, labels, expiry, and SQL patterns for memory, task state, and full-text search. [`llms.txt`](llms.txt) lists the pages an agent should read.
+
 ## The placement crate
 
 The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-purpose: *deterministic, cross-language placement with zone-aware replicas*. FleetRing uses it to place SQLite databases, but it works for anything keyed: key-value shards, chat rooms, actors, queue partitions, and inference sessions.
