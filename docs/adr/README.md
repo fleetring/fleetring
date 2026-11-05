@@ -49,7 +49,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0038](0038-version-compatibility-and-upgrades.md) | A fleet runs two adjacent release lines at once, gates new control commands as fleet features, and upgrades a node with a verified, atomic binary swap | Accepted |
 | [0039](0039-dev-mode.md) | Dev mode is the normal daemon on loopback, with a local authority and an admin principal it creates once and reuses | Accepted |
 | [0040](0040-raft-control-group-versions-and-dev-mode.md) | The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends 0035) | Proposed |
-| [0041](0041-agent-kit-metadata-expiry-and-mcp.md) | Databases carry a description, labels, a creator, and an expiry in control state, gated as fleet features and expired by stamped commands; `db show` adds the schema through the engine adapter; `fleetringd mcp` acts on them as one principal | Proposed |
+| [0041](0041-agent-kit-metadata-expiry-and-mcp.md) | Databases carry a description, labels, a creator, and an expiry in control state, gated as fleet features and expired by stamped commands; `db show` adds the schema through the engine adapter; `fleetringd mcp` acts on them as one principal | Accepted |
 
 ## Template
 

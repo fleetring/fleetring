@@ -1,6 +1,6 @@
 # ADR-0041: Databases carry a description, labels, a creator, and an expiry in control state, and an MCP server acts on them as one principal
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-05)
 - **Date:** 2026-11-04
 - **Related:** ADR-0016 (engine adapters), ADR-0017 (control state machine), ADR-0020 (simulation), ADR-0021 (engines), ADR-0025 and ADR-0026 (principals, scopes, tokens), ADR-0029 (archives), ADR-0033 (surfaces), ADR-0038 (versions and fleet features), ADR-0039 (dev mode), ADR-0040 (Raft amendments); tickets FR-070 (#76), FR-066 (router), FR-064 (Raft), FR-069 (vectors), FR-056 (contexts and `-o json`), #95 (upgrade configuration check)
 
@@ -495,6 +495,8 @@ The **fleet feature** entry lists `metadata` and `expiry`.
 9. **Principal names are now visible with read scope** (Consequences).
 
 ## Open questions for the owner
+
+Decided on 2026-11-05: the owner took every recommendation below.
 
 1. **The verb: `db show` or `db describe`?**
    - **TL;DR:** `show` (recommended) follows `docs/cli.md`'s verb table, which defines it as "one item in detail"; `describe` matches the ticket's words and `kubectl`.
