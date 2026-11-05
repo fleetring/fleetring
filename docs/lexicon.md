@@ -57,6 +57,9 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | role (alone) | [node role](#node-role) or [replica role](#replica-role) | |
 | API key, password | [token](#token) or [certificate](#certificate) | |
 | health (for a member's liveness) | [liveness](#liveness) | `/healthz` is about the process; liveness is the control plane's view. |
+| tag | [label](#label) | ADR-0041. |
+| owner (of a database) | [creator](#creator) | Being the creator grants nothing; scopes decide. "Owner" is refused for a lease holder and a primary too. |
+| TTL (as a field or flag) | [expiry](#expiry) | "TTL" is fine in prose for the duration. |
 
 ## Terms
 
@@ -228,6 +231,14 @@ The control service as a whole: membership, placement records, epochs, leases, p
 - **Code:** `control::`, protocol service `Control`. **CLI:** "the control plane" in messages.
 - **Not:** control node (when you mean the service, not a machine), management plane, brain.
 
+### Creator
+
+The [principal](#principal) that created a database, which the control node records from the request's caller, never from the request (ADR-0041). Being the creator grants nothing: what a principal may do comes from its [scopes](#scope) alone. A database created before `metadata` was enabled, or by an anonymous caller, has none.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `Metadata::created_by`, protocol `DatabaseMetadata.created_by`. **CLI:** `creator:` in `db show`; `created_by` in its JSON.
+- **Not:** owner (being the creator grants nothing), author (that is a description's), holder (that is a lease's).
+
 ### Data node
 
 A node that runs the data role: it hosts replicas and serves database calls. A node with `role = "both"` is a data node and a control node.
@@ -251,6 +262,14 @@ The set of revoked tokens and signing keys the control plane keeps and publishes
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Revocations`, `Revoked`, protocol `Revocation`. **CLI:** `fleetringd token revoke`.
 - **Not:** blocklist, blacklist, revocation list, CRL.
+
+### Description
+
+Free text, at most 1 KiB, saying what a database holds and how it was set up; part of its [metadata](#metadata) (ADR-0041). Tab and line feed are allowed; other control characters, invisible format characters, and the line and paragraph separators are refused. It records who last set it (`description_by`), and text output marks one written by another principal, or by nobody that can be named, as untrusted.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetring_control::Description`, `DescriptionChange`, protocol `DatabaseMetadata.description`. **CLI:** `--description` on `db create` and `db restore`, `db set-description`; `description:` in `db show`.
+- **Not:** comment, note, summary.
 
 ### Dev mode
 
@@ -304,6 +323,14 @@ A number that only grows, used to order and fence. Always say which one:
 - **Code and CLI:** as above; output headers say `epoch` only where the kind is clear from the command.
 - **Not:** term, generation (a generation is SQLite's, below the adapter), version (for a lease), round.
 
+### Expiry
+
+*Planned* (FR-070 phase 3). The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). The control node's own clock stamps the command that drops it.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `Metadata::expires_at`, `Action::ExpireDatabase`, `Feature::Expiry`. **CLI:** *planned* `--expires-in`, `--expires-at`, `db set-expiry`.
+- **Not:** TTL (fine in prose for the duration), retention (an archive's), lifetime (a token's), deadline.
+
 ### Failover
 
 A promotion after a primary's lease expires: the control plane starts it, and a candidate completes it (ADR-0022). A planned move of the lease is a [transfer](#transfer), not a failover.
@@ -338,10 +365,10 @@ The set of nodes that one control plane and one certificate authority govern, un
 
 ### Fleet feature
 
-A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The first is `undrain`.
+A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (*planned*: a command that sets or changes an expiry, and the one that expires a database), ADR-0041.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Feature`, `Action::feature`, `State::features`, `State::check_features`, `State::check_admission`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
+- **Code:** `fleetring_control::Feature`, `Action::features`, `State::features`, `State::check_features`, `State::check_admission`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
 - **Not:** feature flag (alone), capability, cluster version, finalization.
 
 ### Fleet name
@@ -424,6 +451,14 @@ The placement key: in the placement crate, the opaque bytes that name a placeabl
 - **Code:** *planned*. **CLI:** *planned*, `fleetringd lease acquire|renew|release|watch`.
 - **Not:** lock, mutex, distributed lock.
 
+### Label
+
+A `key=value` pair on a database, by the Kubernetes rules, for finding it again: `db list --label purpose=memory`. At most 32 per database; keys under `fleetring.dev/` are reserved. Part of its [metadata](#metadata) (ADR-0041). *Placement label* is the qualified name for a [zone](#zone) or [host](#host), and the placement crate's `label` module names validated identifiers (ADR-0005); say which.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `LabelKey`, `LabelValue`, `Labels`, `data::LabelRequirement`, protocol `Label`. **CLI:** `--label` on `db create`, `db restore`, `db list`, and `db set-labels`; `labels:` in `db show`.
+- **Not:** tag, annotation, attribute.
+
 ### Leader
 
 The control node that accepts control commands. Today the only control node; with Raft, the elected one, and others redirect to it. The word is reserved for the control plane.
@@ -464,6 +499,14 @@ A [sink](#sink)'s delivered [position](#position), kept inside the database so t
 - **Code:** `SinkMarks`, `MarkHome`, the `_fleetring_sinks` table. **CLI:** `replicated` or `local` after a sink's position in `status --node`.
 - **Not:** checkpoint (that is the log's, see [checkpoint](#checkpoint)), high-water mark, cursor, offset.
 
+### MCP server
+
+*Planned* (FR-070 phase 6). `fleetringd mcp`: the Model Context Protocol over stdio, acting as one [principal](#principal) with that principal's [scopes](#scope), so an agent can create, use, and drop its own databases (ADR-0041, point 9).
+
+- **Applies to:** daemon, CLI.
+- **Code:** *planned* `fleetringd::mcp`. **CLI:** *planned* `fleetringd mcp`.
+- **Not:** agent server, plugin, connector, bridge.
+
 ### Member
 
 A node as the fleet's membership records it: its ID, placement attributes, address, liveness, and whether it is draining. "Member" is the record; "node" is the process.
@@ -471,6 +514,14 @@ A node as the fleet's membership records it: its ID, placement attributes, addre
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetring_control::Member`, protocol `Member`, `WatchMembership`. **CLI:** "members" in `status`.
 - **Not:** peer (fine in prose for "another node"), participant, server.
+
+### Metadata
+
+Database metadata: a database's [description](#description), [labels](#label), [creator](#creator), creation time, and [expiry](#expiry), kept in control state with a version that grows with every update (ADR-0041). Updates are patches applied in log order; `--if-version` makes one conditional. A creation or update with metadata is a [fleet feature](#fleet-feature), `metadata`.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `fleetring_control::Metadata`, `MetadataSpec`, `MetadataChange`, `Feature::Metadata`; protocol `DatabaseMetadata`, `CreateDatabaseWithMetadata`, `UpdateDatabase`. **CLI:** `db show`, `db set-description`, `db set-labels`; `metadata` in `db show --json`.
+- **Not:** annotations, properties, attributes.
 
 ### Node
 
@@ -639,6 +690,14 @@ Returning a node to the binary its last [upgrade](#upgrade) replaced, kept besid
 - **Applies to:** daemon, CLI.
 - **Code:** *planned*; `forward_tokens = true` in its `[[principal]]` entry. **CLI:** *planned*.
 - **Not:** proxy (fine in prose), gateway, load balancer, sidecar (fine for how it is deployed).
+
+### Schema
+
+*Planned* (FR-070 phase 4). A database's tables, views, indexes, triggers, and virtual tables with their definitions, as its engine adapter reports them, and capped row counts (ADR-0041, point 6).
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** *planned* `engine::Schema`, `Database.Schema`. **CLI:** *planned*, the schema section of `db show`.
+- **Not:** catalog, DDL (fine in prose), spec (that's placement's).
 
 ### Scope
 

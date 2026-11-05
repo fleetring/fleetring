@@ -538,11 +538,23 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/docs/roadmap.md#e7-access-and-integration"
     },
     {
+      "id": "database-metadata",
+      "component": "fleetringd",
+      "area": "access",
+      "title": "Database descriptions and labels",
+      "description": "Each database can carry a description and labels with its recorded creator, shown by db show and searched with db list --label, and a token scoped to a prefix manages only its own databases.",
+      "status": "built",
+      "since": "0.6.0",
+      "ticket": "FR-070",
+      "issue": 76,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md"
+    },
+    {
       "id": "agent-kit",
       "component": "fleetringd",
       "area": "access",
       "title": "Agent kit with an MCP server",
-      "description": "Database descriptions, labels and expiry, db describe, an MCP server and a skill, so agents can find, use and clean up their own databases.",
+      "description": "Database expiry, schemas in db show, an MCP server and a skill, so agents can find, use and clean up their own databases.",
       "status": "planned",
       "ticket": "FR-070",
       "issue": 76,
