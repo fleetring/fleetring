@@ -347,6 +347,9 @@ async fn the_change_table_is_reserved_and_hidden_from_statements() -> TestResult
         "UPDATE _fleetring_cdc SET change_type = 9",
         "DROP TABLE _fleetring_cdc",
         "ALTER TABLE _fleetring_cdc RENAME TO mine",
+        "ALTER TABLE t RENAME TO _fleetring_new",
+        "ALTER TABLE t RENAME TO _FLEETRING_other",
+        "SELECT * FROM _FLEETRING_CDC",
         "CREATE INDEX _fleetring_mine ON t (value)",
         "CREATE TABLE _fleetring_other (x)",
         "CREATE TRIGGER mine AFTER INSERT ON t BEGIN DELETE FROM _fleetring_cdc; END",
@@ -578,6 +581,10 @@ mod marks {
             "UPDATE _fleetring_sinks SET position = x'00'",
             "DELETE FROM _fleetring_sinks",
             "DROP TABLE _fleetring_sinks",
+            "ALTER TABLE _fleetring_sinks RENAME TO mine",
+            "ALTER TABLE t RENAME TO _fleetring_cdc",
+            "ALTER TABLE t RENAME TO _Fleetring_Other",
+            "SELECT * FROM _FLEETRING_SINKS",
         ];
         for sql in statements {
             let error = db

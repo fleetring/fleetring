@@ -153,6 +153,8 @@ fn pragmas_that_change_the_database_are_refused() -> TestResult {
         "PRAGMA query_only = 0",
         "PRAGMA journal_size_limit = -1",
         "PRAGMA data_version = 1",
+        "PRAGMA foreign_key_check",
+        "PRAGMA foreign_key_check(t)",
         "PRAGMA main.Journal_Mode = OFF",
     ] {
         let message =
@@ -191,8 +193,6 @@ fn introspection_pragmas_still_work() -> TestResult {
         "PRAGMA index_info(t_v)",
         "PRAGMA index_xinfo(t_v)",
         "PRAGMA foreign_key_list(t)",
-        "PRAGMA foreign_key_check",
-        "PRAGMA foreign_key_check(t)",
         "PRAGMA integrity_check",
         "PRAGMA quick_check(10)",
         "PRAGMA user_version",
@@ -650,6 +650,424 @@ fn a_second_statement_is_refused_and_nothing_runs() -> TestResult {
     assert_eq!(
         message,
         "a call runs one statement; send each in a call of its own"
+    );
+    Ok(())
+}
+
+/// The `type` and `name` of every schema object in `main` and `temp` whose name or table is
+/// reserved, read on the write connection with the confinement clear.
+fn reserved_objects(db: &SqliteDatabase) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let mut statement = db.writer.prepare(
+        "SELECT type, name FROM (
+            SELECT type, name, tbl_name FROM main.sqlite_master UNION ALL
+            SELECT type, name, tbl_name FROM temp.sqlite_master)
+         WHERE (name LIKE '\\_fleetring\\_%' ESCAPE '\\' OR tbl_name LIKE '\\_fleetring\\_%' ESCAPE '\\')
+           AND name NOT LIKE '\\_fleetring\\_trg\\_%' ESCAPE '\\'
+         ORDER BY type, name",
+    )?;
+    let objects = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(objects)
+}
+
+fn objects(names: &[(&str, &str)]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .map(|&(kind, name)| (kind.to_owned(), name.to_owned()))
+        .collect()
+}
+
+/// The refusal of a statement that names, or reaches, the reserved namespace.
+fn reserved_refusal() -> String {
+    Refusal::Reserved.to_string()
+}
+
+#[test]
+fn renaming_a_table_into_the_reserved_namespace_is_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    for target in [
+        "_fleetring_sinks",
+        "_fleetring_cdc",
+        "_FLEETRING_cdc",
+        "\"_Fleetring_Sinks\"",
+        "_fleetring_mine",
+    ] {
+        let sql = format!("ALTER TABLE t RENAME TO {target}");
+        let message = refusal(exec(&mut db, &sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, reserved_refusal(), "`{sql}`");
+    }
+    // The refusal rolls back the whole transaction, and the table keeps its name and rows.
+    let message = refusal(db.execute(&Transaction::new([
+        Statement::new("INSERT INTO t VALUES (2)"),
+        Statement::new("ALTER TABLE t RENAME TO _fleetring_sinks"),
+    ])))?;
+    assert_eq!(message, reserved_refusal());
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
+    assert_eq!(reserved_objects(&db)?, objects(&[]));
+
+    // Nor can a temporary table be renamed there, where it would shadow the adapter's tables.
+    exec(
+        &mut db,
+        "CREATE TEMP TABLE scratch (sink TEXT, position BLOB)",
+    )?;
+    let message = refusal(exec(
+        &mut db,
+        "ALTER TABLE temp.scratch RENAME TO _fleetring_sinks",
+    ))?;
+    assert_eq!(message, reserved_refusal());
+    assert_eq!(reserved_objects(&db)?, objects(&[]));
+
+    // With the adapter's own tables in place, too.
+    db.start_recording(CaptureMode::Full)?;
+    db.stage("s", &Position::new([1]));
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    for sql in [
+        "ALTER TABLE t RENAME TO _fleetring_other",
+        "ALTER TABLE _fleetring_sinks RENAME TO mine",
+        "ALTER TABLE _FLEETRING_CDC RENAME TO mine",
+        "ALTER TABLE _fleetring_cdc ADD COLUMN extra",
+        "ALTER TABLE _fleetring_sinks RENAME COLUMN position TO at",
+        "ALTER TABLE _fleetring_cdc DROP COLUMN updates",
+    ] {
+        refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+    }
+    assert_eq!(
+        reserved_objects(&db)?,
+        objects(&[("table", "_fleetring_cdc"), ("table", "_fleetring_sinks")])
+    );
+    assert_eq!(db.marks()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn names_in_any_case_are_reserved() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    for sql in [
+        "CREATE TABLE _FLEETRING_x (v)",
+        "CREATE TEMP TABLE _Fleetring_Sinks (sink, position)",
+        "CREATE TEMP VIEW _FLEETRING_CDC AS SELECT 1",
+        "CREATE INDEX _FleetRing_i ON t (v)",
+        "CREATE TRIGGER _FLEETRING_TRG_t AFTER INSERT ON t BEGIN SELECT 1; END",
+        "INSERT INTO _FLEETRING_CDC (change_txn_id, change_type, start) VALUES (0, 2, x'')",
+    ] {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, reserved_refusal(), "`{sql}`");
+    }
+    refusal(query(&mut db, "SELECT * FROM _FLEETRING_CDC"))?;
+    assert_eq!(
+        reserved_objects(&db)?,
+        objects(&[("table", "_fleetring_cdc")])
+    );
+    Ok(())
+}
+
+#[test]
+fn renaming_and_altering_ordinary_tables_still_works() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.execute(&Transaction::new([
+        Statement::new("ALTER TABLE t ADD COLUMN w"),
+        Statement::new("ALTER TABLE t RENAME COLUMN w TO x"),
+        Statement::new("ALTER TABLE t DROP COLUMN x"),
+        Statement::new("CREATE TEMP TABLE scratch (v)"),
+        Statement::new("ALTER TABLE temp.scratch RENAME TO scratched"),
+    ]))?;
+    db.start_recording(CaptureMode::Full)?;
+    db.stage("s", &Position::new([1]));
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    db.execute(&Transaction::new([
+        Statement::new("ALTER TABLE t RENAME TO u"),
+        Statement::new("ALTER TABLE u ADD COLUMN w"),
+        Statement::new("ALTER TABLE u RENAME COLUMN w TO x"),
+    ]))?;
+    let start = db.position()?;
+    exec(&mut db, "INSERT INTO u (v) VALUES (3)")?;
+    let end = db.position()?.ok_or("a position after a write")?;
+    let changes = db.changes_between(start.as_ref(), &end)?;
+    assert_eq!(
+        changes.len(),
+        1,
+        "the renamed table is recorded: {changes:?}"
+    );
+    assert_eq!(
+        query(&mut db, "SELECT v FROM u ORDER BY v")?.rows,
+        [
+            [Value::Integer(1)],
+            [Value::Integer(2)],
+            [Value::Integer(3)]
+        ]
+    );
+    assert_eq!(db.marks()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_table_with_triggers_has_no_route_into_the_reserved_namespace() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // The review's attack: a table shaped like the marks table, whose triggers copy every row
+    // into a table of the user's, renamed into the namespace before the adapter creates its own.
+    db.execute(&Transaction::new([
+        Statement::new("CREATE TABLE plain (sink TEXT PRIMARY KEY, position BLOB NOT NULL)"),
+        Statement::new("CREATE TABLE stolen (sink, position)"),
+        Statement::new(
+            "CREATE TRIGGER copy_insert AFTER INSERT ON plain BEGIN \
+             INSERT INTO stolen VALUES (new.sink, new.position); END",
+        ),
+        Statement::new(
+            "CREATE TRIGGER copy_update AFTER UPDATE ON plain BEGIN \
+             INSERT INTO stolen VALUES (new.sink, new.position); END",
+        ),
+    ]))?;
+    for sql in [
+        "ALTER TABLE plain RENAME TO _fleetring_sinks",
+        "ALTER TABLE plain RENAME TO _fleetring_cdc",
+        // Renaming the table a trigger writes to rewrites the trigger to name the new name.
+        "ALTER TABLE stolen RENAME TO _fleetring_sinks",
+    ] {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, reserved_refusal(), "`{sql}`");
+    }
+    db.start_recording(CaptureMode::Full)?;
+    db.stage("s", &Position::new([7]));
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    db.stage("s", &Position::new([8]));
+    exec(&mut db, "INSERT INTO t VALUES (3)")?;
+
+    assert_eq!(
+        db.marks()?,
+        BTreeMap::from([("s".to_owned(), Position::new([8]))])
+    );
+    assert_eq!(
+        query(&mut db, "SELECT count(*) FROM stolen")?.rows,
+        [[Value::Integer(0)]],
+        "no mark reached the user's table"
+    );
+    let triggers = query(
+        &mut db,
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+    )?;
+    assert_eq!(
+        triggers.rows,
+        [[Value::from("copy_insert")], [Value::from("copy_update")]]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_planted_change_table_with_a_trigger_is_not_adopted() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // Planted with the confinement clear, as a database written before the namespace was
+    // guarded, or by another program, could hold it.
+    db.writer.execute_batch(
+        "CREATE TABLE \"_fleetring_cdc\" (
+            change_id INTEGER PRIMARY KEY,
+            change_txn_id INTEGER NOT NULL,
+            change_type INTEGER NOT NULL,
+            table_name TEXT,
+            id TEXT,
+            before TEXT,
+            after TEXT,
+            updates TEXT,
+            start BLOB NOT NULL);
+         CREATE TABLE stolen (row);
+         CREATE TRIGGER evil AFTER INSERT ON _fleetring_cdc BEGIN
+            INSERT INTO stolen VALUES (new.after); END;",
+    )?;
+    let message = refusal(db.start_recording(CaptureMode::Full))?;
+    assert!(
+        message.starts_with("trigger `evil` in the namespace reserved for fleetringd"),
+        "{message}"
+    );
+    assert!(db.recorder.is_none(), "nothing is recorded");
+    // Writes that don't touch the adapter's tables go on, and nothing is dropped.
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    assert_eq!(
+        reserved_objects(&db)?,
+        objects(&[("table", "_fleetring_cdc"), ("trigger", "evil")])
+    );
+    assert_eq!(
+        query(&mut db, "SELECT count(*) FROM stolen")?.rows,
+        [[Value::Integer(0)]]
+    );
+    // A sink mark isn't written or read either.
+    db.stage("s", &Position::new([1]));
+    let message = refusal(exec(&mut db, "INSERT INTO t VALUES (3)"))?;
+    assert!(message.contains("`evil`"), "{message}");
+    refusal(db.marks())?;
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)], [Value::Integer(2)]]);
+    Ok(())
+}
+
+#[test]
+fn a_trigger_planted_after_recording_started_stops_it() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    db.writer.execute_batch(
+        "CREATE TABLE stolen (row);
+         CREATE TRIGGER evil AFTER INSERT ON _fleetring_cdc BEGIN
+            INSERT INTO stolen VALUES (new.after); END;",
+    )?;
+    let message = refusal(exec(&mut db, "INSERT INTO t VALUES (3)"))?;
+    assert!(message.contains("`evil`"), "{message}");
+    assert_eq!(
+        query(&mut db, "SELECT count(*) FROM stolen")?.rows,
+        [[Value::Integer(0)]]
+    );
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)], [Value::Integer(2)]]);
+    Ok(())
+}
+
+#[test]
+fn planted_objects_of_another_shape_are_not_adopted() -> TestResult {
+    for (planted, kind, name) in [
+        // Not `STRICT` or `WITHOUT ROWID`.
+        (
+            "CREATE TABLE _fleetring_sinks (sink TEXT PRIMARY KEY, position BLOB NOT NULL)",
+            "table",
+            "_fleetring_sinks",
+        ),
+        // Another column.
+        (
+            "CREATE TABLE _fleetring_sinks (sink TEXT PRIMARY KEY, position BLOB NOT NULL, \
+             extra ANY) STRICT, WITHOUT ROWID",
+            "table",
+            "_fleetring_sinks",
+        ),
+        // A view in the table's place.
+        (
+            "CREATE VIEW _fleetring_sinks AS SELECT 'x' AS sink, x'00' AS position",
+            "view",
+            "_fleetring_sinks",
+        ),
+        // A temporary table, which the adapter's statements would find first.
+        (
+            "CREATE TEMP TABLE _fleetring_sinks (sink TEXT PRIMARY KEY, position BLOB NOT NULL) \
+             STRICT, WITHOUT ROWID",
+            "table",
+            "_fleetring_sinks",
+        ),
+        // The adapter's name in another case.
+        ("CREATE TABLE _FLEETRING_x (v)", "table", "_FLEETRING_x"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let mut db = database(dir.path())?;
+        db.writer.execute_batch(planted)?;
+        db.stage("s", &Position::new([1]));
+        let message = refusal(exec(&mut db, "INSERT INTO t VALUES (2)"))?;
+        assert!(
+            message.starts_with(&format!(
+                "{kind} `{name}` in the namespace reserved for fleetringd"
+            )),
+            "`{planted}`: {message}"
+        );
+        refusal(db.marks())?;
+        assert_eq!(values(&mut db)?, [[Value::Integer(1)]], "`{planted}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_view_reading_the_namespace_is_refused_when_created_and_when_run() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    for sql in [
+        "CREATE VIEW peek AS SELECT * FROM _fleetring_cdc",
+        "CREATE VIEW peek AS SELECT * FROM _FLEETRING_CDC",
+        "CREATE TEMP VIEW peek AS SELECT * FROM main._fleetring_cdc",
+    ] {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert!(message.contains("reserved"), "`{sql}`: {message}");
+    }
+    // A view that got in anyway is refused when it runs, on either connection.
+    db.writer
+        .execute_batch("CREATE VIEW peek AS SELECT * FROM _FLEETRING_CDC")?;
+    let message = refusal(query(&mut db, "SELECT * FROM peek"))?;
+    assert_eq!(message, reserved_refusal());
+    let message = refusal(exec(&mut db, "SELECT * FROM peek"))?;
+    assert_eq!(message, reserved_refusal());
+    Ok(())
+}
+
+#[test]
+fn foreign_key_check_is_refused_as_an_oracle_for_reserved_rows() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    // Declaring the key is allowed. Enforcing it reads the reserved table, which is refused, and
+    // the pragma that would report which reserved rows exist is refused in every form.
+    exec(
+        &mut db,
+        "CREATE TABLE probe (id INTEGER REFERENCES _fleetring_cdc (change_id))",
+    )?;
+    let message = refusal(exec(&mut db, "INSERT INTO probe VALUES (1)"))?;
+    assert_eq!(message, reserved_refusal());
+    for sql in [
+        "PRAGMA foreign_key_check",
+        "PRAGMA foreign_key_check(probe)",
+        "SELECT * FROM pragma_foreign_key_check('probe')",
+    ] {
+        let message = refusal(query(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert!(
+            message.starts_with("pragma `foreign_key_check` isn't allowed"),
+            "`{sql}`: {message}"
+        );
+        refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_user_table_taken_for_a_shadow_table_stays_readable_and_is_kept() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    exec(&mut db, "CREATE TABLE notes_content (v)")?;
+    exec(&mut db, "INSERT INTO notes_content VALUES (1)")?;
+    // A contentless FTS5 table creates no `_content` table, so SQLite takes the user's table of
+    // that name for its shadow table: defensive mode then keeps it read-only, and the recorder,
+    // which skips shadow tables, records nothing for it, since nothing can change it.
+    exec(
+        &mut db,
+        "CREATE VIRTUAL TABLE notes USING fts5(body, content = '')",
+    )?;
+    let message = refusal(exec(&mut db, "INSERT INTO notes_content VALUES (2)"))?;
+    assert!(message.contains("may not be modified"), "{message}");
+    refusal(exec(&mut db, "DROP TABLE notes_content"))?;
+    assert_eq!(
+        query(&mut db, "SELECT v FROM notes_content")?.rows,
+        [[Value::Integer(1)]]
+    );
+    // Dropping the virtual table gives the table back once the database is opened again: the
+    // connection keeps the table marked as a shadow table until it reloads the schema.
+    exec(&mut db, "DROP TABLE notes")?;
+    Box::new(db).close()?;
+    let mut db = SqliteDatabase::open(
+        dir.path().join(DATABASE_FILE),
+        OpenMode::Existing,
+        4096,
+        Arc::default(),
+    )?;
+    db.start_recording(CaptureMode::Full)?;
+    let start = db.position()?;
+    exec(&mut db, "INSERT INTO notes_content VALUES (2)")?;
+    let end = db.position()?.ok_or("a position after a write")?;
+    let changes = db.changes_between(start.as_ref(), &end)?;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        query(&mut db, "SELECT v FROM notes_content ORDER BY v")?.rows,
+        [[Value::Integer(1)], [Value::Integer(2)]]
     );
     Ok(())
 }
