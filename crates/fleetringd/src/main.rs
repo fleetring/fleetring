@@ -66,10 +66,12 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod compat;
 mod context_cmd;
 mod edit;
+mod progress;
 mod resolve;
 
 use compat::{Invocation, ProgramName};
 use context_cmd::ContextCommand;
+use progress::{MachineOutput, Progress, Quiet, Stepped, Surroundings, SuspendingStderr};
 use resolve::{
     ContextsFile, ContextsUnusable, EnvSnapshot, Resolved, SecurityFiles, TargetFlags, TokenSource,
     Wire,
@@ -1471,7 +1473,7 @@ fn main() -> ExitCode {
         Run::Daemon { .. } => "info",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
-    if let Err(error) = log_subscriber(format, filter, std::io::stderr).try_init() {
+    if let Err(error) = log_subscriber(format, filter, SuspendingStderr).try_init() {
         report(&error);
         return ExitCode::FAILURE;
     }
@@ -1588,7 +1590,18 @@ async fn run_daemon(config: Config, dev: Option<Prepared>) -> Result<Stopped, Bo
     // Listened for before the daemon logs its start, so that no signal sent once it has started
     // finds the default action, which ends the process.
     let signals = StopSignals::listen();
+    // Until the banner; log lines while it starts go around the spinner.
+    let starting = dev.as_ref().map(|_| {
+        Progress::start(
+            "starting the dev node\u{2026}",
+            &spinner_surroundings(MachineOutput::No),
+        )
+    });
     let daemon = Daemon::start(config).await?;
+    if let Some(starting) = starting {
+        // The banner is the result, so there is no line to leave behind.
+        starting.finish_err();
+    }
     if let Some(prepared) = &dev {
         // Written once the node serves, so a start that fails leaves the contexts alone.
         let context = context_cmd::write_dev_context(prepared);
@@ -1681,6 +1694,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             }
             let metadata = metadata.read(std::io::stdin().lock())?;
             let client = target.client()?;
+            let progress = Progress::start(
+                format!("creating {}\u{2026}", shown(&name)),
+                &spinner_surroundings(MachineOutput::No),
+            );
             // A plain creation keeps the call every release knows (ADR-0041, point 2).
             let location = if metadata.is_empty() {
                 client.create_database_with(&name, spec).await
@@ -1690,6 +1707,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                     .await
             }
             .map_err(metadata_failed)?;
+            progress.finish_ok(format!("created {}", shown(&name)));
             warn_if_under_replicated(&location);
             let mut output = format!("created {}\n{}", shown(&name), format_location(&location));
             if let Some(metadata) = &location.metadata {
@@ -1782,7 +1800,15 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             at,
             expect,
             target,
-        }) => verify(&target.client()?, &name, at, expect).await?,
+        }) => {
+            let progress = Progress::start(
+                format!("verifying {}\u{2026}", shown(&name)),
+                &spinner_surroundings(MachineOutput::No),
+            );
+            let report = verify(&target.client()?, &name, at, expect).await?;
+            progress.finish_ok(format!("verified {}", shown(&name)));
+            report
+        }
         Command::Db(DbCommand::Restore {
             name,
             archive,
@@ -1799,6 +1825,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             }
             let metadata = metadata.read(std::io::stdin().lock())?;
             let client = target.client()?;
+            let progress = Progress::start(
+                format!("restoring {}\u{2026}", shown(&name)),
+                &spinner_surroundings(MachineOutput::No),
+            );
             let restored = client
                 .restore_database_with_metadata(
                     &name,
@@ -1810,6 +1840,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 )
                 .await
                 .map_err(metadata_failed)?;
+            progress.finish_ok(format!("restored {}", shown(&name)));
             warn_if_under_replicated(&restored.location);
             // The follow-ups, in order, once the restore has returned (ADR-0041, point 10): the
             // archive's description and labels, whose failure is a warning, then the expiry the
@@ -1866,14 +1897,32 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             address,
             point,
             target,
-        })) => verify_archive(&target.client()?, &name, &archive, address, &point.target()).await?,
+        })) => {
+            let progress = Progress::start(
+                format!("verifying the archive of {}\u{2026}", shown(&name)),
+                &spinner_surroundings(MachineOutput::No),
+            );
+            let report =
+                verify_archive(&target.client()?, &name, &archive, address, &point.target())
+                    .await?;
+            progress.finish_ok(format!("verified the archive of {}", shown(&name)));
+            report
+        }
         Command::Archive(ArchiveCommand::Restore {
             config,
             archive,
             from,
             to,
             point,
-        }) => restore_offline(&config, &archive, &from, &to, &point.target()).await?,
+        }) => {
+            let progress = Progress::start(
+                format!("restoring {} from the archive\u{2026}", shown(&from)),
+                &spinner_surroundings(MachineOutput::No),
+            );
+            let report = restore_offline(&config, &archive, &from, &to, &point.target()).await?;
+            progress.finish_ok(format!("restored {} into {}", shown(&from), to.display()));
+            report
+        }
         Command::Db(DbCommand::Drop { name, yes, target }) => {
             if !yes {
                 confirm_drop(&name, &target.place()?)?;
@@ -1886,7 +1935,15 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             format!("dropped {} at epoch {}\n", shown(&name), epoch.get())
         }
         Command::Node(NodeCommand::Drain { id, target }) => {
-            let primaries = target.client()?.drain_node(&id).await.map_err(failed)?;
+            let client = target.client()?;
+            let progress = Progress::start(
+                format!("draining {id}\u{2026}"),
+                &spinner_surroundings(MachineOutput::No),
+            );
+            // The control plane hands every primary over before it answers, so the message
+            // doesn't change per database.
+            let primaries = client.drain_node(&id).await.map_err(failed)?;
+            progress.finish_ok(format!("drained {id}"));
             format_drain(&id, &primaries)
         }
         Command::Upgrade(args) => run_upgrade(args).await?,
@@ -1951,10 +2008,15 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 confirm_remove_orphan(&name, &label, &target.place()?)?;
             }
             let client = Client::new(address.clone(), target.network()?);
+            let progress = Progress::start(
+                format!("removing the orphan copy of {}\u{2026}", shown(&name)),
+                &spinner_surroundings(MachineOutput::No),
+            );
             let epoch = client
                 .remove_orphan(&address, &name)
                 .await
                 .map_err(failed)?;
+            progress.finish_ok(format!("removed the orphan copy of {}", shown(&name)));
             format!(
                 "removed the orphan copy of {} from epoch {} on {label}\n",
                 shown(&name),
@@ -2012,6 +2074,9 @@ async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
     } else {
         None
     };
+    // Starts at the first step, after any question the upgrade asks, and clears itself if the
+    // upgrade fails.
+    let stepped = Stepped::new(spinner_surroundings(MachineOutput::No));
     let outcome = upgrade::run(Options {
         mode,
         restart: if args.no_restart {
@@ -2025,6 +2090,7 @@ async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
         node,
         fleet,
         timeout: args.timeout.unwrap_or(UPGRADE_TIMEOUT),
+        steps: stepped.steps(),
         start_command: if args.yes {
             StartCommand::Confirmed
         } else if std::io::stdin().is_terminal() {
@@ -2034,11 +2100,21 @@ async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
         },
     })
     .await?;
+    stepped.finish_ok(match mode {
+        Mode::Check => "checked the release",
+        Mode::Install => "upgraded",
+        Mode::Rollback => "rolled back",
+    });
     if outcome.blocked {
         print!("{}", outcome.report);
         return Err("the fleet doesn't allow the newest release yet".into());
     }
     Ok(outcome.report)
+}
+
+/// What a spinner may show on in this process. No command has `-q` yet (phase G adds it).
+fn spinner_surroundings(machine_output: MachineOutput) -> Surroundings {
+    Surroundings::capture(machine_output, Quiet::No)
 }
 
 /// The address of the data node a command asks directly: `address` as given, or the address the
