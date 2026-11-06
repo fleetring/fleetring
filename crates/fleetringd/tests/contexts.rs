@@ -12,21 +12,9 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+mod support;
 
-/// The variables a developer's shell may hold that would point a command elsewhere.
-const CLIENT_VARS: [&str; 10] = [
-    "FLEETRING_CONTEXT",
-    "FLEETRING_CONTROL",
-    "FLEETRING_TLS_DIR",
-    "FLEETRING_AS",
-    "FLEETRING_CA",
-    "FLEETRING_CERT",
-    "FLEETRING_KEY",
-    "FLEETRING_TOKEN",
-    "FLEETRING_TOKEN_FILE",
-    "FLEETRING_LOG_FORMAT",
-];
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// What the dev node's banner starts with once it serves.
 const BANNER: &str = "fleetringd is running in dev mode";
@@ -79,15 +67,12 @@ impl Machine {
 
     /// `fleetring` with `args`, in a clean environment whose contexts are this machine's.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fleetring"));
+        let mut command = support::fleetring();
         command
             .args(args)
             .env("HOME", self.root.path())
             .env("XDG_CONFIG_HOME", self.config_dir())
             .stdin(Stdio::null());
-        for variable in CLIENT_VARS {
-            command.env_remove(variable);
-        }
         command
     }
 
@@ -149,7 +134,7 @@ impl Node {
     fn start_on(root: &Path, port: u16) -> TestResult<Self> {
         let dir = root.join("node");
         let log = root.join("node.log");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fleetring"));
+        let mut command = support::fleetring();
         command
             .args(["dev", "--port", &port.to_string(), "--data-dir"])
             .arg(&dir)
@@ -158,9 +143,6 @@ impl Node {
             .env("XDG_CONFIG_HOME", root.join("node-xdg"))
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log)?);
-        for variable in CLIENT_VARS {
-            command.env_remove(variable);
-        }
         let mut child = command.spawn()?;
         for _ in 0..ATTEMPTS {
             if fs::read_to_string(&log)
@@ -670,6 +652,276 @@ fn adding_a_name_that_exists_is_refused_with_a_hint() -> TestResult {
         stderr(&output).contains("hint: pass --fleet <name>"),
         "{}",
         printed(&output)
+    );
+    Ok(())
+}
+
+/// A context named `prod` with explicit files that don't exist, a control address that nothing
+/// listens on, and a token file holding a secret no node would accept.
+fn add_prod(machine: &Machine) -> TestResult<PathBuf> {
+    let token = machine.root.path().join("prod-token");
+    fs::write(&token, "prod-secret-token\n")?;
+    let (ca, cert, key) = (
+        machine.root.path().join("prod/ca.crt"),
+        machine.root.path().join("prod/client.ops.crt"),
+        machine.root.path().join("prod/client.ops.key"),
+    );
+    machine.ok(&[
+        "context",
+        "add",
+        "prod",
+        "--control",
+        DEAD,
+        "--fleet",
+        "prod",
+        "--ca",
+        ca.to_str().ok_or("a UTF-8 path")?,
+        "--cert",
+        cert.to_str().ok_or("a UTF-8 path")?,
+        "--key",
+        key.to_str().ok_or("a UTF-8 path")?,
+        "--token-file",
+        token.to_str().ok_or("a UTF-8 path")?,
+    ])?;
+    machine.ok(&["switch", "prod"])?;
+    Ok(token)
+}
+
+#[test]
+fn a_dev_env_over_a_prod_context_sends_nothing_of_prod() -> TestResult {
+    let (machine, node) = fleet()?;
+    add_prod(&machine)?;
+    // Without the variables the current context is prod, which is dead.
+    assert!(!machine.run(&["status"])?.status.success());
+    // A sourced dev `env` file: the control address, the directory and the principal.
+    let output = machine
+        .command(&["status"])
+        .env("FLEETRING_CONTROL", &node.control)
+        .env("FLEETRING_TLS_DIR", &node.tls)
+        .env("FLEETRING_AS", "admin")
+        .output()?;
+    // Prod's token would be refused by the node, so this shows it was not sent.
+    assert!(output.status.success(), "{}", printed(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains(
+            "warning: the identity from the environment (FLEETRING_TLS_DIR, FLEETRING_AS) \
+             replaces the identity from context 'prod' (ca, cert, key, token_file)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("warning: FLEETRING_CONTROL overrides context 'prod'"),
+        "{text}"
+    );
+    assert!(!text.contains("prod-secret-token"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn a_tls_dir_flag_over_a_context_with_explicit_files_wins_whole() -> TestResult {
+    let (machine, node) = fleet()?;
+    add_prod(&machine)?;
+    let tls = node.tls.to_str().ok_or("a UTF-8 path")?;
+    let output = machine.run(&[
+        "status",
+        "--control",
+        &node.control,
+        "--tls-dir",
+        tls,
+        "--as",
+        "admin",
+    ])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    assert!(
+        stderr(&output).contains(
+            "warning: the identity from the command line (--tls-dir, --as) replaces the \
+             identity from context 'prod' ("
+        ),
+        "{}",
+        printed(&output)
+    );
+    // `-q` leaves the warning out.
+    let quiet = machine.run(&[
+        "-q",
+        "status",
+        "--control",
+        &node.control,
+        "--tls-dir",
+        tls,
+        "--as",
+        "admin",
+    ])?;
+    assert!(quiet.status.success(), "{}", printed(&quiet));
+    assert_eq!(stderr(&quiet), "");
+    Ok(())
+}
+
+#[test]
+fn a_certificate_from_another_fleet_than_its_authority_is_refused() -> TestResult {
+    let (machine, node) = fleet()?;
+    let other = machine.root.path().join("other");
+    let other_text = other.to_str().ok_or("a UTF-8 path")?;
+    machine.ok(&["cert", "init", "--fleet", "other", "--dir", other_text])?;
+    machine.ok(&["cert", "client", "admin", "--dir", other_text])?;
+    let ca = node.tls.join("ca.crt");
+    let (cert, key) = (
+        other.join("client.admin.crt"),
+        other.join("client.admin.key"),
+    );
+    let output = machine.run(&[
+        "status",
+        "--control",
+        &node.control,
+        "--ca",
+        ca.to_str().ok_or("a UTF-8 path")?,
+        "--cert",
+        cert.to_str().ok_or("a UTF-8 path")?,
+        "--key",
+        key.to_str().ok_or("a UTF-8 path")?,
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{}", printed(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("is for fleet 'other', but the authority")
+            && text.contains(&ca.display().to_string())
+            && text.contains("is for fleet 'dev'"),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_contexts_file_that_cannot_be_used_says_how_to_go_on() -> TestResult {
+    let (machine, node) = fleet()?;
+    let file = machine.contexts_file();
+    let tls = node.tls.to_str().ok_or("a UTF-8 path")?;
+    let flags = [
+        "status",
+        "--control",
+        &node.control,
+        "--tls-dir",
+        tls,
+        "--as",
+        "admin",
+    ];
+    for broken in ["version = 2\n", "this is = not [ toml"] {
+        fs::write(&file, broken)?;
+        let output = machine.run(&flags)?;
+        assert_eq!(output.status.code(), Some(1), "{}", printed(&output));
+        let text = stderr(&output);
+        assert!(
+            text.contains(&format!(
+                "{} can't be used, and every client command reads it",
+                file.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "hint: set FLEETRING_CONTEXT= (empty) to run without contexts, or move the file aside"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("caused by:"), "{text}");
+        // The way past it: no contexts at all, and the flags carry the rest.
+        let past = machine
+            .command(&flags)
+            .env("FLEETRING_CONTEXT", "")
+            .output()?;
+        assert!(past.status.success(), "{broken:?}: {}", printed(&past));
+        assert_eq!(stderr(&past), "");
+        // The file itself is left alone.
+        assert_eq!(fs::read_to_string(&file)?, broken);
+    }
+    // `--context` needs the file, so it doesn't skip it.
+    let named = machine
+        .command(&["status", "--context", "good"])
+        .env("FLEETRING_CONTEXT", "")
+        .output()?;
+    assert_eq!(named.status.code(), Some(1), "{}", printed(&named));
+    Ok(())
+}
+
+/// The environment of a developer's shell and home, as a test finds it.
+#[test]
+fn a_spawned_client_never_reads_the_real_home() -> TestResult {
+    let real = tempfile::tempdir()?;
+    // A context that is current in the "real" home: a command that read it would see `trap`.
+    let config = real.path().join("xdg").join("fleetring");
+    fs::create_dir_all(&config)?;
+    fs::write(
+        config.join("contexts.toml"),
+        "version = 1\ncurrent = \"trap\"\n\n[contexts.trap]\ncontrol = [\"127.0.0.1:1\"]\n\
+         token_file = \"/trap/token\"\n",
+    )?;
+    let program = support::fleetring().get_program().to_owned();
+    let mut poisoned = std::process::Command::new(program);
+    poisoned
+        .env("HOME", real.path())
+        .env("XDG_CONFIG_HOME", real.path().join("xdg"))
+        .env("APPDATA", real.path().join("xdg"))
+        .env("FLEETRING_CONTEXT", "trap")
+        .env("FLEETRING_CONTROL", "127.0.0.1:1")
+        .env("FLEETRING_TOKEN", "a-secret");
+    // Unprotected, the poisoned command sees the planted context.
+    let seen = clone_command(&poisoned)
+        .args(["context", "current"])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&seen.stdout), "trap\n");
+    // Isolated, it sees none.
+    support::isolate(&mut poisoned);
+    let output = poisoned.args(["context", "current"]).output()?;
+    assert_eq!(output.status.code(), Some(1), "{}", printed(&output));
+    assert!(output.stdout.is_empty(), "{}", printed(&output));
+    Ok(())
+}
+
+/// A copy of `command`'s program and environment changes, since `Command` isn't `Clone`.
+fn clone_command(command: &std::process::Command) -> std::process::Command {
+    let mut copy = std::process::Command::new(command.get_program());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => copy.env(key, value),
+            None => copy.env_remove(key),
+        };
+    }
+    copy
+}
+
+/// Every integration test runs the binary through `support::fleetring` or `support::isolate`,
+/// so that none reads or writes the developer's own contexts. This reads the sources.
+#[test]
+fn every_test_runs_the_binary_through_the_isolating_helper() -> TestResult {
+    fn sources(dir: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                sources(&path, found)?;
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+        Ok(())
+    }
+    // Spelled in two pieces so that this file does not contain it.
+    let direct = concat!("Command::new(env!(\"CARGO_BIN_", "EXE_fleetring\"))");
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = Vec::new();
+    sources(&tests, &mut files)?;
+    let mut offenders = Vec::new();
+    for file in files {
+        let helper = file.ends_with("support/mod.rs");
+        let text = fs::read_to_string(&file)?;
+        // The helper itself spawns the binary directly.
+        if !helper && text.contains(direct) {
+            offenders.push(file.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these tests spawn the binary without `support::fleetring()`, so they would read the \
+         developer's contexts: {offenders:?}"
     );
     Ok(())
 }

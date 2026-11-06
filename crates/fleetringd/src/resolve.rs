@@ -50,6 +50,30 @@ pub(crate) struct EnvSnapshot {
     pub(crate) token: Option<String>,
     pub(crate) token_file: Option<PathBuf>,
     pub(crate) context: Option<String>,
+    /// Whether `FLEETRING_CONTEXT` is set to nothing, which means no contexts file is read.
+    pub(crate) contexts: ContextsFile,
+}
+
+/// Whether a command reads the contexts file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ContextsFile {
+    #[default]
+    Read,
+    /// `FLEETRING_CONTEXT=` (set, and empty): the way past a file that can't be read.
+    Skip,
+}
+
+/// The contexts file can't be used, and every client command reads it.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{} can't be used, and every client command reads it\n  hint: set {CONTEXT_VAR}= (empty) \
+     to run without contexts, or move the file aside",
+    path.display()
+)]
+pub(crate) struct ContextsUnusable {
+    pub(crate) path: PathBuf,
+    #[source]
+    pub(crate) source: fleetring_client::context::ContextError,
 }
 
 impl EnvSnapshot {
@@ -79,6 +103,11 @@ impl EnvSnapshot {
             token: text(TOKEN_VAR),
             token_file: path(TOKEN_FILE_VAR),
             context: text(CONTEXT_VAR),
+            contexts: if lookup(CONTEXT_VAR).is_some_and(|value| value.is_empty()) {
+                ContextsFile::Skip
+            } else {
+                ContextsFile::Read
+            },
         }
     }
 }
@@ -236,6 +265,15 @@ struct Layer {
     token: Option<TokenSource>,
     /// The context this step is, if it is one.
     context: Option<ContextName>,
+    kind: Kind,
+}
+
+/// What a step of the precedence is, for the warnings that name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Flags,
+    Variables,
+    Context,
 }
 
 impl Layer {
@@ -255,6 +293,7 @@ impl Layer {
             principal: flags.principal.clone(),
             token: flags.token.clone(),
             context: None,
+            kind: Kind::Flags,
         }
     }
 
@@ -275,6 +314,7 @@ impl Layer {
             principal: env.principal.clone(),
             token,
             context: None,
+            kind: Kind::Variables,
         }
     }
 
@@ -289,7 +329,115 @@ impl Layer {
             principal: context.principal.clone(),
             token: context.token_file.clone().map(TokenSource::File),
             context: Some(name.clone()),
+            kind: Kind::Context,
         }
+    }
+
+    /// Whether this step names TLS material: a directory, an authority, a certificate or a key.
+    /// A step with only a principal or a token supplies no identity of its own.
+    fn has_material(&self) -> bool {
+        self.tls_dir.is_some() || self.ca.is_some() || self.cert.is_some() || self.key.is_some()
+    }
+
+    /// Whether this step names an authority or a directory.
+    fn names_trust(&self) -> bool {
+        self.tls_dir.is_some() || self.ca.is_some()
+    }
+
+    /// Whether this step names nothing of an identity but where to find an authority.
+    fn is_trust_only(&self) -> bool {
+        self.names_trust()
+            && self.cert.is_none()
+            && self.key.is_none()
+            && self.principal.is_none()
+            && self.token.is_none()
+    }
+
+    /// Whether this step is the environment next to flags that name an identity, and adds only
+    /// what they pair with: an authority and a token.
+    fn is_supporting(&self, unit: &Self) -> bool {
+        self.kind == Kind::Variables
+            && unit.kind == Kind::Flags
+            && self.cert.is_none()
+            && self.key.is_none()
+            && self.principal.is_none()
+    }
+
+    /// Whether this step names any part of an identity.
+    fn has_identity(&self) -> bool {
+        self.has_material() || self.principal.is_some() || self.token.is_some()
+    }
+
+    /// The parts of the identity this step sets, as the user wrote them.
+    fn parts(&self) -> Vec<&'static str> {
+        let names = match self.kind {
+            Kind::Flags => [
+                "--tls-dir",
+                "--ca",
+                "--cert",
+                "--key",
+                "--as",
+                "--token",
+                "--token-file",
+            ],
+            Kind::Variables => [
+                TLS_DIR_VAR,
+                CA_VAR,
+                CERT_VAR,
+                KEY_VAR,
+                AS_VAR,
+                TOKEN_VAR,
+                TOKEN_FILE_VAR,
+            ],
+            Kind::Context => [
+                "tls_dir",
+                "ca",
+                "cert",
+                "key",
+                "as",
+                "token_file",
+                "token_file",
+            ],
+        };
+        let token = match &self.token {
+            None => None,
+            Some(TokenSource::Value(_)) => Some(names[5]),
+            Some(TokenSource::File(_) | TokenSource::Stdin) => Some(names[6]),
+        };
+        [
+            self.tls_dir.as_ref().map(|_| names[0]),
+            self.ca.as_ref().map(|_| names[1]),
+            self.cert.as_ref().map(|_| names[2]),
+            self.key.as_ref().map(|_| names[3]),
+            self.principal.as_ref().map(|_| names[4]),
+            token,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// This step in words: where it is and what it sets.
+    fn describe(&self) -> String {
+        let parts = self.parts().join(", ");
+        match (&self.context, self.kind) {
+            (Some(name), _) => format!("context '{name}' ({parts})"),
+            (None, Kind::Flags) => format!("the command line ({parts})"),
+            (None, _) => format!("the environment ({parts})"),
+        }
+    }
+
+    /// Whether every identity part this step sets is set the same way by `other`, so that
+    /// `other` replaces nothing of it.
+    fn is_covered_by(&self, other: &Self) -> bool {
+        let same =
+            |mine: &Option<PathBuf>, theirs: &Option<PathBuf>| mine.is_none() || mine == theirs;
+        same(&self.tls_dir, &other.tls_dir)
+            && same(&self.ca, &other.ca)
+            && same(&self.cert, &other.cert)
+            && same(&self.key, &other.key)
+            && (self.principal.is_none() || self.principal == other.principal)
+            && (self.token.is_none() || self.token == other.token)
     }
 }
 
@@ -327,33 +475,52 @@ impl Part {
     }
 }
 
-/// A picked file, and the context that supplied it, if one did.
-type Picked<'a> = (PathBuf, Option<&'a ContextName>);
-
-/// The identity file `part`: at the first step that names it, its explicit path, or, for the
-/// certificate and key, the principal's file under the TLS directory; else the directory's
-/// default.
-fn pick<'a>(
-    layers: &'a [Layer],
+/// The identity file `part`, from the layer `unit` alone (ADR-0043, point 4.4): a principal named
+/// by a layer above it (`principal_above`) picks the principal's file under the unit's TLS
+/// directory; otherwise the unit's explicit path; otherwise its own principal's file; otherwise
+/// the directory's default; and for the authority only, with neither of those, the nearest step
+/// `below` that names one.
+fn pick(
+    unit: &Layer,
+    below: &[Layer],
+    principal_above: Option<&str>,
     part: Part,
-    dir: Option<&'a (PathBuf, Option<&'a ContextName>)>,
-) -> Result<Picked<'a>, ResolveError> {
-    for layer in layers {
-        if let Some(path) = part.explicit(layer) {
-            return Ok((path.clone(), layer.context.as_ref()));
-        }
-        if part != Part::Ca
-            && let Some(principal) = &layer.principal
-        {
-            let (cert, key) = principal_files(principal, dir.map(|(dir, _)| dir.as_path()))?;
-            let path = if part == Part::Cert { cert } else { key };
-            return Ok((path, layer.context.as_ref()));
+) -> Result<PathBuf, ResolveError> {
+    let dir = unit.tls_dir.as_deref();
+    let from_principal = |principal: &str| -> Result<PathBuf, ResolveError> {
+        let (cert, key) = principal_files(principal, dir)?;
+        Ok(if part == Part::Cert { cert } else { key })
+    };
+    if part != Part::Ca
+        && let Some(principal) = principal_above
+    {
+        return from_principal(principal);
+    }
+    if let Some(path) = part.explicit(unit) {
+        return Ok(path.clone());
+    }
+    if part != Part::Ca
+        && let Some(principal) = &unit.principal
+    {
+        return from_principal(principal);
+    }
+    if let Some(dir) = dir {
+        return Ok(dir.join(part.default_name()));
+    }
+    // An identity of explicit certificate and key names no authority: the trust anchor comes
+    // from the nearest step below that names one. It cannot pair the certificate with another
+    // fleet's authority, because a certificate must name the fleet its authority names.
+    if part == Part::Ca {
+        for lower in below {
+            if let Some(ca) = &lower.ca {
+                return Ok(ca.clone());
+            }
+            if let Some(dir) = &lower.tls_dir {
+                return Ok(dir.join(part.default_name()));
+            }
         }
     }
-    match dir {
-        Some((dir, origin)) => Ok((dir.join(part.default_name()), *origin)),
-        None => Err(ResolveError::NoDirectory { flag: part.flag() }),
-    }
+    Err(ResolveError::NoDirectory { flag: part.flag() })
 }
 
 /// The certificate and key `cert client <principal>` writes under `dir`.
@@ -391,6 +558,12 @@ fn principal_files(
 /// [`SelectedBy::Flag`] sits above the variables, the others below. `flags` holds only what the
 /// command line gave.
 ///
+/// The control address and the other plain settings resolve one by one. The identity resolves as
+/// a unit (ADR-0043, point 4.4, as amended): the highest layer that names any TLS material (a
+/// directory, an authority, a certificate or a key) supplies all of it, and the lower layers
+/// supply none, neither files nor a token. A layer above that one that names only a principal
+/// (`--as`) picks among the unit's files, and a token at or above the unit's layer is sent.
+///
 /// Nothing here fails: a control address that is missing leaves `control` empty, since a command
 /// that names a data node by address needs none, and an identity that can't be found becomes
 /// [`SecurityFiles::Unresolved`], with the error that says why.
@@ -405,7 +578,7 @@ pub(crate) fn resolve(
         match by {
             SelectedBy::Flag => layers.push(Layer::context(name, selected)),
             SelectedBy::Variable | SelectedBy::Current => {
-                below = Some(Layer::context(name, selected))
+                below = Some(Layer::context(name, selected));
             }
         }
     }
@@ -421,12 +594,38 @@ pub(crate) fn resolve(
                 .map(|control| (control.clone(), layer.control_from.clone()))
         })
         .unwrap_or_else(|| (Vec::new(), Source::Default));
-    let token = layers.iter().find_map(|layer| layer.token.clone());
 
-    let (security, fleet) = match identity(flags.wire, &layers, context) {
-        Ok(found) => found,
-        Err(error) => (SecurityFiles::Unresolved(error.to_string()), None),
+    // The layer that supplies the identity, and the ones above it.
+    let unit = layers.iter().position(Layer::has_material);
+    let kept = unit.map_or(layers.len(), |unit| unit + 1);
+    let mut token = layers[..kept].iter().find_map(|layer| layer.token.clone());
+    // Flags that name an identity are often used with a token from the environment, which is
+    // theirs to pair; a context's own token is not, and stays with its context.
+    if token.is_none()
+        && let Some(unit) = unit
+        && layers[unit].kind == Kind::Flags
+    {
+        token = layers[kept..]
+            .iter()
+            .find(|layer| layer.kind == Kind::Variables)
+            .and_then(|layer| layer.token.clone());
+    }
+
+    let (security, fleet) = match flags.wire {
+        Wire::Plaintext => (SecurityFiles::Plaintext, None),
+        Wire::Tls => match identity(&layers, unit) {
+            Ok(files) => {
+                let fleet = unit
+                    .and_then(|unit| layers[unit].context.as_ref())
+                    .and(context)
+                    .and_then(|(_, selected, _)| selected.fleet.clone());
+                (SecurityFiles::Tls(files), fleet)
+            }
+            Err(error) => (SecurityFiles::Unresolved(error.to_string()), None),
+        },
     };
+    let mut warnings = displaced(&layers, unit);
+    warnings.extend(overrides(flags, env, context, &layers, unit));
     Resolved {
         control,
         control_from,
@@ -434,36 +633,57 @@ pub(crate) fn resolve(
         token,
         context: context.map(|(name, _, _)| name.clone()),
         fleet,
-        warnings: warnings(flags, env, context),
+        warnings,
     }
 }
 
-/// The identity files, and the fleet the selected context names if it supplied the certificate.
-fn identity(
-    wire: Wire,
-    layers: &[Layer],
-    context: Option<(&ContextName, &Context, SelectedBy)>,
-) -> Result<(SecurityFiles, Option<String>), ResolveError> {
-    Ok(match wire {
-        Wire::Plaintext => (SecurityFiles::Plaintext, None),
-        Wire::Tls => {
-            let dir = layers.iter().find_map(|layer| {
-                layer
-                    .tls_dir
-                    .as_ref()
-                    .map(|dir| (dir.clone(), layer.context.as_ref()))
-            });
-            // The principal's files first: a missing one is the likeliest mistake, and the
-            // error names the files it looked for.
-            let (cert, cert_from) = pick(layers, Part::Cert, dir.as_ref())?;
-            let (key, _) = pick(layers, Part::Key, dir.as_ref())?;
-            let (ca, _) = pick(layers, Part::Ca, dir.as_ref())?;
-            let fleet = cert_from
-                .and(context)
-                .and_then(|(_, selected, _)| selected.fleet.clone());
-            (SecurityFiles::Tls(IdentityFiles { ca, cert, key }), fleet)
-        }
-    })
+/// The identity files the layer `unit` supplies.
+fn identity(layers: &[Layer], unit: Option<usize>) -> Result<IdentityFiles, ResolveError> {
+    let Some(unit) = unit else {
+        // Nothing names a directory or a file.
+        return Err(
+            match layers.iter().find_map(|layer| layer.principal.clone()) {
+                Some(principal) => ResolveError::PrincipalNeedsDirectory { principal },
+                None => ResolveError::NoDirectory { flag: "cert" },
+            },
+        );
+    };
+    let (above, below) = (&layers[..unit], &layers[unit + 1..]);
+    let unit = &layers[unit];
+    let principal_above = above.iter().find_map(|layer| layer.principal.as_deref());
+    // The certificate first: a missing principal file is the likeliest mistake, and the error
+    // names the files it looked for.
+    let cert = pick(unit, below, principal_above, Part::Cert)?;
+    let key = pick(unit, below, principal_above, Part::Key)?;
+    let ca = pick(unit, below, principal_above, Part::Ca)?;
+    Ok(IdentityFiles { ca, cert, key })
+}
+
+/// One warning for each lower layer whose identity the unit's layer replaces (ADR-0043, point
+/// 4.4): it names both. A lower layer that names the same things the unit does is not
+/// mentioned, so a sourced dev `env` file next to the `dev` context says nothing.
+fn displaced(layers: &[Layer], unit: Option<usize>) -> Vec<String> {
+    let Some(unit) = unit else {
+        return Vec::new();
+    };
+    layers[unit + 1..]
+        .iter()
+        .filter(|lower| {
+            lower.has_identity()
+                && !lower.is_covered_by(&layers[unit])
+                // A step that only names a trust anchor, for an identity that names none, is
+                // used rather than replaced.
+                && !(lower.is_trust_only() && !layers[unit].names_trust())
+                && !lower.is_supporting(&layers[unit])
+        })
+        .map(|lower| {
+            format!(
+                "warning: the identity from {} replaces the identity from {}",
+                layers[unit].describe(),
+                lower.describe()
+            )
+        })
+        .collect()
 }
 
 /// One variable that may override a field of the selected context.
@@ -479,6 +699,8 @@ struct Field {
     differs: Differs,
     /// Whether the command line names this field itself, which outranks both.
     flagged: Flagged,
+    /// Whether the field is part of the identity, which resolves as a unit.
+    part: Setting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,6 +713,13 @@ enum Differs {
 enum Flagged {
     Yes,
     No,
+}
+
+/// Whether a [`Field`] is the control address or part of the identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Setting {
+    Control,
+    Identity,
 }
 
 impl Differs {
@@ -510,19 +739,31 @@ impl From<bool> for Flagged {
 }
 
 /// The warnings for variables that override the selected context, or that its `--context` flag
-/// outranks (ADR-0043, point 4.5). A variable that holds what the context holds overrides
-/// nothing, and is not mentioned.
-fn warnings(
+/// outranks (ADR-0043, point 4.5): the control address, the principal and the token. The rest of
+/// the identity is covered by [`displaced`]. A variable that holds what the context holds
+/// overrides nothing, and is not mentioned.
+fn overrides(
     flags: &TargetFlags,
     env: &EnvSnapshot,
     context: Option<(&ContextName, &Context, SelectedBy)>,
+    layers: &[Layer],
+    unit: Option<usize>,
 ) -> Vec<String> {
     let Some((name, selected, by)) = context else {
         return Vec::new();
     };
+    // When a layer above the context or the variables supplied the identity, theirs is
+    // replaced, which `displaced` has said.
+    let below_unit = |wanted: &dyn Fn(&Layer) -> bool| {
+        matches!(
+            (unit, layers.iter().position(wanted)),
+            (Some(unit), Some(at)) if at > unit
+        )
+    };
+    let context_displaced = below_unit(&|layer| layer.context.as_ref() == Some(name))
+        || below_unit(&|layer| layer.kind == Kind::Variables);
     let shown = |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string());
     let control = (!selected.control.is_empty()).then(|| selected.control.clone());
-    let control_flagged = Flagged::from(flags.control.is_some() || flags.config.is_some());
     let token_flagged = Flagged::from(flags.token.is_some());
     let fields = [
         Field {
@@ -531,39 +772,8 @@ fn warnings(
             set: env.control.is_some(),
             held: control.as_ref().map(|control| control.join(",")),
             differs: Differs::between(&env.control.clone().map(|control| vec![control]), &control),
-            flagged: control_flagged,
-        },
-        Field {
-            variable: TLS_DIR_VAR,
-            name: "tls_dir",
-            set: env.tls_dir.is_some(),
-            held: shown(&selected.tls_dir),
-            differs: Differs::between(&env.tls_dir, &selected.tls_dir),
-            flagged: Flagged::from(flags.tls_dir.is_some()),
-        },
-        Field {
-            variable: CA_VAR,
-            name: "ca",
-            set: env.ca.is_some(),
-            held: shown(&selected.ca),
-            differs: Differs::between(&env.ca, &selected.ca),
-            flagged: Flagged::from(flags.ca.is_some()),
-        },
-        Field {
-            variable: CERT_VAR,
-            name: "cert",
-            set: env.cert.is_some(),
-            held: shown(&selected.cert),
-            differs: Differs::between(&env.cert, &selected.cert),
-            flagged: Flagged::from(flags.cert.is_some()),
-        },
-        Field {
-            variable: KEY_VAR,
-            name: "key",
-            set: env.key.is_some(),
-            held: shown(&selected.key),
-            differs: Differs::between(&env.key, &selected.key),
-            flagged: Flagged::from(flags.key.is_some()),
+            flagged: Flagged::from(flags.control.is_some() || flags.config.is_some()),
+            part: Setting::Control,
         },
         Field {
             variable: AS_VAR,
@@ -572,6 +782,7 @@ fn warnings(
             held: selected.principal.clone(),
             differs: Differs::between(&env.principal, &selected.principal),
             flagged: Flagged::from(flags.principal.is_some()),
+            part: Setting::Identity,
         },
         // A token is not a file, so it is never what the context's `token_file` holds.
         Field {
@@ -581,6 +792,7 @@ fn warnings(
             held: shown(&selected.token_file),
             differs: Differs::Yes,
             flagged: token_flagged,
+            part: Setting::Identity,
         },
         Field {
             variable: TOKEN_FILE_VAR,
@@ -589,13 +801,18 @@ fn warnings(
             held: shown(&selected.token_file),
             differs: Differs::between(&env.token_file, &selected.token_file),
             flagged: token_flagged,
+            part: Setting::Identity,
         },
     ];
     fields
         .into_iter()
         .filter_map(|field| {
             let held = field.held?;
-            if !field.set || field.flagged == Flagged::Yes || field.differs == Differs::No {
+            if !field.set
+                || field.flagged == Flagged::Yes
+                || field.differs == Differs::No
+                || (field.part == Setting::Identity && context_displaced)
+            {
                 return None;
             }
             Some(match by {
@@ -909,10 +1126,9 @@ mod tests {
             Some((&home, &context, SelectedBy::Current)),
         );
         assert_eq!(tls(&resolved).ca, variable_dir.path().join("ca.crt"));
-        assert_eq!(
-            tls(&resolved).cert,
-            variable_dir.path().join("client.ops.crt")
-        );
+        // The context's `as` belongs to the identity the variable replaced: the directory's
+        // own client.crt is used, not the context's principal's.
+        assert_eq!(tls(&resolved).cert, variable_dir.path().join("client.crt"));
         // `--context` outranks the variable.
         let resolved = run(
             &TargetFlags::default(),
@@ -1122,13 +1338,14 @@ mod tests {
         assert_eq!(
             overridden_by(&env, SelectedBy::Current),
             [
+                "warning: the identity from the environment (FLEETRING_TLS_DIR, FLEETRING_CA, \
+                 FLEETRING_AS) replaces the identity from context 'home' (tls_dir, as, \
+                 token_file)",
                 "warning: FLEETRING_CONTROL overrides context 'home' (control 10.0.0.2:7400)",
-                "warning: FLEETRING_TLS_DIR overrides context 'home' (tls_dir /ctx/tls)",
-                "warning: FLEETRING_AS overrides context 'home' (as ops)",
             ]
         );
         // `FLEETRING_CONTEXT`'s context is overridden the same way.
-        assert_eq!(overridden_by(&env, SelectedBy::Variable).len(), 3);
+        assert_eq!(overridden_by(&env, SelectedBy::Variable).len(), 2);
         // A token overrides the context's token file.
         let env = EnvSnapshot {
             token: Some("t".to_owned()),
@@ -1160,14 +1377,21 @@ mod tests {
         };
         assert_eq!(
             overridden_by(&env, SelectedBy::Flag),
-            ["warning: FLEETRING_CONTROL is ignored: --context home sets control"]
+            [
+                "warning: the identity from context 'home' (tls_dir, as, token_file) replaces \
+                 the identity from the environment (FLEETRING_CA)",
+                "warning: FLEETRING_CONTROL is ignored: --context home sets control",
+            ]
         );
     }
 
     #[test]
     fn a_variable_outranked_by_its_own_flag_is_not_an_override_of_the_context() {
         let home = name("home");
-        let context = with_control(&["10.0.0.2:7400"]);
+        let context = Context {
+            control: vec!["10.0.0.2:7400".to_owned()],
+            ..Context::default()
+        };
         let env = EnvSnapshot {
             control: Some("127.0.0.1:7400".to_owned()),
             ..EnvSnapshot::default()
@@ -1184,6 +1408,233 @@ mod tests {
                 resolved.warnings
             );
         }
+    }
+
+    /// A prod context with explicit files and a token, as a sourced dev `env` file meets it.
+    fn prod() -> Context {
+        Context {
+            fleet: Some("prod".to_owned()),
+            control: vec!["10.0.0.2:7400".to_owned()],
+            ca: path("/prod/ca.crt"),
+            cert: path("/prod/client.ops.crt"),
+            key: path("/prod/client.ops.key"),
+            token_file: path("/prod/token"),
+            ..Context::default()
+        }
+    }
+
+    #[test]
+    fn a_dev_env_over_a_prod_context_sends_nothing_of_prod() {
+        let dev = tls_dir(&["admin"]);
+        let prod_name = name("prod");
+        let env = EnvSnapshot {
+            control: Some("127.0.0.1:7400".to_owned()),
+            tls_dir: Some(dev.path().to_owned()),
+            principal: Some("admin".to_owned()),
+            ..EnvSnapshot::default()
+        };
+        let context = prod();
+        let resolved = run(
+            &TargetFlags::default(),
+            &env,
+            Some((&prod_name, &context, SelectedBy::Current)),
+        );
+        // The whole identity is the variables': none of prod's files, and not its token.
+        let files = tls(&resolved);
+        assert_eq!(files.ca, dev.path().join("ca.crt"));
+        assert_eq!(files.cert, dev.path().join("client.admin.crt"));
+        assert_eq!(files.key, dev.path().join("client.admin.key"));
+        assert_eq!(resolved.token, None);
+        // And it isn't prod's fleet to check.
+        assert_eq!(resolved.fleet, None);
+        assert_eq!(resolved.control, ["127.0.0.1:7400"]);
+        // The warning names both.
+        assert_eq!(
+            resolved.warnings,
+            [
+                "warning: the identity from the environment (FLEETRING_TLS_DIR, FLEETRING_AS) \
+                 replaces the identity from context 'prod' (ca, cert, key, token_file)",
+                "warning: FLEETRING_CONTROL overrides context 'prod' (control 10.0.0.2:7400)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tls_dir_flag_over_a_context_with_explicit_files_wins_whole() {
+        let dir = tls_dir(&[]);
+        let prod_name = name("prod");
+        let context = prod();
+        let flags = TargetFlags {
+            tls_dir: Some(dir.path().to_owned()),
+            ..TargetFlags::default()
+        };
+        for by in [SelectedBy::Flag, SelectedBy::Current] {
+            let resolved = run(
+                &flags,
+                &EnvSnapshot::default(),
+                Some((&prod_name, &context, by)),
+            );
+            assert_eq!(
+                tls(&resolved),
+                &IdentityFiles {
+                    ca: dir.path().join("ca.crt"),
+                    cert: dir.path().join("client.crt"),
+                    key: dir.path().join("client.key"),
+                },
+                "{by:?}"
+            );
+            assert_eq!(resolved.token, None, "{by:?}");
+            assert_eq!(
+                resolved.warnings.len(),
+                1,
+                "{by:?}: {:?}",
+                resolved.warnings
+            );
+            assert!(
+                resolved.warnings[0].starts_with(
+                    "warning: the identity from the command line (--tls-dir) replaces the \
+                     identity from context 'prod' ("
+                ),
+                "{by:?}: {:?}",
+                resolved.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_is_sent_only_from_the_layer_of_the_identity_or_above() {
+        let prod_name = name("prod");
+        let context = prod();
+        let current = Some((&prod_name, &context, SelectedBy::Current));
+        // The context's identity and its token, with nothing above.
+        let resolved = run(&TargetFlags::default(), &EnvSnapshot::default(), current);
+        assert_eq!(
+            resolved.token,
+            Some(TokenSource::File(PathBuf::from("/prod/token")))
+        );
+        // A token above the identity is kept, and replaces the context's.
+        let env = EnvSnapshot {
+            token: Some("var-token".to_owned()),
+            ..EnvSnapshot::default()
+        };
+        assert_eq!(
+            run(&TargetFlags::default(), &env, current).token,
+            Some(TokenSource::Value("var-token".to_owned()))
+        );
+        // The context's token is dropped with the identity that replaced the context's. A token
+        // from the environment is kept for flags that name an identity: it is theirs to pair.
+        let flags = TargetFlags {
+            ca: path("/f/ca.crt"),
+            cert: path("/f/c.crt"),
+            key: path("/f/c.key"),
+            ..TargetFlags::default()
+        };
+        assert_eq!(
+            run(&flags, &env, current).token,
+            Some(TokenSource::Value("var-token".to_owned()))
+        );
+        assert_eq!(run(&flags, &EnvSnapshot::default(), current).token, None);
+        // But a context chosen by `--context` has an identity of its own, and an environment
+        // token below it is not sent.
+        let own = Context {
+            token_file: None,
+            ..prod()
+        };
+        assert_eq!(
+            run(
+                &TargetFlags::default(),
+                &env,
+                Some((&prod_name, &own, SelectedBy::Flag))
+            )
+            .token,
+            None
+        );
+    }
+
+    #[test]
+    fn a_principal_above_the_identity_picks_among_its_files() {
+        let dir = tls_dir(&["reader", "ops"]);
+        let home = name("home");
+        let context = Context {
+            tls_dir: Some(dir.path().to_owned()),
+            principal: Some("ops".to_owned()),
+            ..Context::default()
+        };
+        let flags = TargetFlags {
+            principal: Some("reader".to_owned()),
+            ..TargetFlags::default()
+        };
+        let resolved = run(
+            &flags,
+            &EnvSnapshot::default(),
+            Some((&home, &context, SelectedBy::Current)),
+        );
+        assert_eq!(tls(&resolved).cert, dir.path().join("client.reader.crt"));
+        assert_eq!(tls(&resolved).ca, dir.path().join("ca.crt"));
+        // `--as` takes nothing from the context but its directory: no warning.
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+    }
+
+    #[test]
+    fn a_lower_layer_that_names_the_same_things_is_not_mentioned() {
+        // A sourced dev `env` file next to the `dev` context it matches.
+        let dir = tls_dir(&["admin"]);
+        let dev = name("dev");
+        let context = Context {
+            control: vec!["127.0.0.1:7400".to_owned()],
+            tls_dir: Some(dir.path().to_owned()),
+            principal: Some("admin".to_owned()),
+            ..Context::default()
+        };
+        let env = EnvSnapshot {
+            control: Some("127.0.0.1:7400".to_owned()),
+            tls_dir: Some(dir.path().to_owned()),
+            principal: Some("admin".to_owned()),
+            ..EnvSnapshot::default()
+        };
+        let resolved = run(
+            &TargetFlags::default(),
+            &env,
+            Some((&dev, &context, SelectedBy::Current)),
+        );
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+    }
+
+    #[test]
+    fn an_explicit_certificate_and_key_take_their_authority_from_the_step_below() {
+        let dir = tls_dir(&[]);
+        let flags = TargetFlags {
+            cert: path("/f/c.crt"),
+            key: path("/f/c.key"),
+            ..TargetFlags::default()
+        };
+        // The directory only says where the authority is: it is used, not replaced.
+        let env = EnvSnapshot {
+            tls_dir: Some(dir.path().to_owned()),
+            ..EnvSnapshot::default()
+        };
+        let resolved = run(&flags, &env, None);
+        assert_eq!(
+            tls(&resolved),
+            &IdentityFiles {
+                ca: dir.path().join("ca.crt"),
+                cert: PathBuf::from("/f/c.crt"),
+                key: PathBuf::from("/f/c.key"),
+            }
+        );
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+        // A lower step's own certificate is replaced, not borrowed.
+        let prod_name = name("prod");
+        let context = prod();
+        let resolved = run(
+            &flags,
+            &EnvSnapshot::default(),
+            Some((&prod_name, &context, SelectedBy::Current)),
+        );
+        assert_eq!(tls(&resolved).ca, Path::new("/prod/ca.crt"));
+        assert_eq!(tls(&resolved).cert, Path::new("/f/c.crt"));
+        assert_eq!(resolved.token, None);
+        assert_eq!(resolved.warnings.len(), 1, "{:?}", resolved.warnings);
     }
 
     #[test]

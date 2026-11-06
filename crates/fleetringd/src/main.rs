@@ -70,7 +70,10 @@ mod resolve;
 
 use compat::{Invocation, ProgramName};
 use context_cmd::ContextCommand;
-use resolve::{EnvSnapshot, Resolved, SecurityFiles, TargetFlags, TokenSource, Wire};
+use resolve::{
+    ContextsFile, ContextsUnusable, EnvSnapshot, Resolved, SecurityFiles, TargetFlags, TokenSource,
+    Wire,
+};
 
 /// The environment variable that chooses the log format when `--log-format` isn't given.
 const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
@@ -895,9 +898,11 @@ struct Target {
 
 /// The identity a command connects with: a client certificate from `cert client`.
 ///
-/// Each of the three files is the first of these that names it, at each step of the order
-/// (flag, `--context`, variable, current context): its path, then the principal's file under the
-/// TLS directory, and finally the directory's default.
+/// The identity resolves as a unit: the highest step of the order (flag, `--context`, variable,
+/// current context) that names a TLS directory, an authority, a certificate or a key supplies
+/// all of it, and the steps below supply none. Within it, a file's own path wins over the
+/// principal's file under the TLS directory, which wins over the directory's default; a step
+/// above it that names only `--as` picks among its files.
 #[derive(Debug, Args)]
 struct TlsArgs {
     /// A directory with `ca.crt`, `client.crt` and `client.key`, and the
@@ -1019,7 +1024,14 @@ impl Target {
         let flags = self.flags()?;
         let named = self.context.is_some() || env.context.is_some();
         let contexts = match context_cmd::store() {
-            Ok(store) => store.load()?,
+            // `FLEETRING_CONTEXT=` skips the file, unless `--context` needs it.
+            Ok(_) if env.contexts == ContextsFile::Skip && self.context.is_none() => {
+                Contexts::empty()
+            }
+            Ok(store) => store.load().map_err(|source| ContextsUnusable {
+                path: store.path().to_owned(),
+                source,
+            })?,
             // No home directory means no contexts, which only matters if one was asked for.
             Err(_) if !named => Contexts::empty(),
             Err(error) => return Err(error.into()),
@@ -1038,16 +1050,39 @@ impl Target {
         Ok(self.resolved.get_or_init(|| Box::new(resolved)))
     }
 
+    /// The identity the command connects with, loaded and checked: its certificate must name
+    /// the fleet its authority names, and the fleet the context names if the context supplied
+    /// it.
     fn security(&self) -> Result<Security, Box<dyn Error>> {
-        match &self.resolved()?.security {
-            SecurityFiles::Plaintext => Ok(Security::Plaintext),
-            SecurityFiles::Unresolved(why) => Err(why.clone().into()),
-            SecurityFiles::Tls(files) => Ok(Security::Tls(Identity::load(
-                &files.ca,
-                &files.cert,
-                &files.key,
-            )?)),
+        let resolved = self.resolved()?;
+        let files = match &resolved.security {
+            SecurityFiles::Plaintext => return Ok(Security::Plaintext),
+            SecurityFiles::Unresolved(why) => return Err(why.clone().into()),
+            SecurityFiles::Tls(files) => files,
+        };
+        let identity = Identity::load(&files.ca, &files.cert, &files.key)?;
+        let found = identity.fleet();
+        let authorities = identity.authority_fleets();
+        if !authorities.is_empty() && !authorities.contains(&found) {
+            let names: Vec<String> = authorities.iter().map(ToString::to_string).collect();
+            return Err(format!(
+                "the certificate {} is for fleet '{found}', but the authority {} is for fleet '{}'",
+                files.cert.display(),
+                files.ca.display(),
+                names.join("', '")
+            )
+            .into());
         }
+        if let (Some(fleet), Some(context)) = (&resolved.fleet, &resolved.context)
+            && found.as_str() != fleet
+        {
+            return Err(format!(
+                "context '{context}' is for fleet '{fleet}', but its certificate is for fleet \
+                 '{found}'"
+            )
+            .into());
+        }
+        Ok(Security::Tls(identity))
     }
 
     /// The bearer token the command sends, if any.
@@ -1121,18 +1156,6 @@ impl Target {
             return Err(NO_CONTROL.into());
         }
         let security = self.security()?;
-        if let (Some(fleet), Some(context), Security::Tls(identity)) =
-            (&resolved.fleet, &resolved.context, &security)
-        {
-            let found = identity.fleet();
-            if found.as_str() != fleet {
-                return Err(format!(
-                    "context '{context}' is for fleet '{fleet}', but its certificate is for \
-                     fleet '{found}'"
-                )
-                .into());
-            }
-        }
         Ok(Client::new(
             first_reachable(&resolved.control),
             self.network_with(security)?,
