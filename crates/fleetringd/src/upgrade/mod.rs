@@ -1,4 +1,4 @@
-//! `fleetringd upgrade`: a verified self-upgrade, a rollback, and a restart in place
+//! `fleetring upgrade`: a verified self-upgrade, a rollback, and a restart in place
 //! (ADR-0038).
 //!
 //! 1. **Find the release:** the newest final release, or the one `--version` names.
@@ -8,7 +8,8 @@
 //!    with cosign against the release workflow's identity, then the archive's checksum, then the
 //!    extracted binary's `--version`. Any failure is a refusal; nothing unverified is installed.
 //! 4. **Swap:** the new binary replaces the installed one atomically, which is kept as
-//!    `fleetringd.previous` for `--rollback`.
+//!    `<name>.previous` for `--rollback`. A release before 0.7 can't run `serve`, so installing
+//!    one first checks how the node was started (ADR-0043, point 3.5).
 //! 5. **Restart:** with `--config` naming a running node, drain it, send it `SIGHUP` so it
 //!    restarts in place, and wait until it has rejoined on the new release and caught up.
 
@@ -18,6 +19,7 @@ mod release;
 mod verify;
 
 use std::fmt::Write as _;
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -37,7 +39,7 @@ use crate::upgrade::verify::{Cosign, check_sum};
 /// How often the restart's waits look again.
 const POLL: Duration = Duration::from_millis(200);
 
-/// Why `fleetringd upgrade` refused or failed.
+/// Why `fleetring upgrade` refused or failed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum UpgradeError {
@@ -50,14 +52,14 @@ pub enum UpgradeError {
         reason: String,
     },
     /// The releases list names no final release.
-    #[error("{url} lists no fleetringd release; pass --version")]
+    #[error("{url} lists no fleetring release; pass --version")]
     NoRelease {
         /// The releases list.
         url: String,
     },
     /// cosign isn't on `PATH`, so the release's signature can't be verified.
     #[error(
-        "cosign isn't installed, so the release's signature can't be verified, and fleetringd \
+        "cosign isn't installed, so the release's signature can't be verified, and fleetring \
          never installs an unverified release\n  hint: install cosign 2.4.2 or newer ({install}) \
          and run the command again"
     )]
@@ -115,7 +117,7 @@ pub enum UpgradeError {
     },
     /// The fleet's window of release lines doesn't allow the release.
     #[error(
-        "the fleet doesn't allow fleetringd {release}: node '{member}' runs {member_release}, \
+        "the fleet doesn't allow fleetring {release}: node '{member}' runs {member_release}, \
          and a fleet runs at most two adjacent release lines at once\n  hint: upgrade every \
          member to the line between them first"
     )]
@@ -130,7 +132,7 @@ pub enum UpgradeError {
     /// The release lacks a fleet feature the fleet has enabled, so the fleet would refuse the
     /// node, or a control node on it couldn't read the control log.
     #[error(
-        "the fleet doesn't allow fleetringd {release}: it lacks the fleet feature '{feature}' \
+        "the fleet doesn't allow fleetring {release}: it lacks the fleet feature '{feature}' \
          this fleet uses, so the fleet would refuse the node\n  hint: install a release that \
          supports it; a fleet never gives up a feature it has used"
     )]
@@ -150,6 +152,28 @@ pub enum UpgradeError {
         path: PathBuf,
         /// Why.
         source: std::io::Error,
+    },
+    /// The release can't run the node's command line: the node was started with `serve`, which a
+    /// release before 0.7 doesn't know (ADR-0043, point 3.5).
+    #[error(
+        "fleetring {release} doesn't know `serve`, which this node was started with\n  hint: \
+         start the node with `fleetringd --config <file>` instead, restart it, then roll back \
+         again"
+    )]
+    StartedWithServe {
+        /// The release that would be installed.
+        release: Release,
+    },
+    /// The release doesn't know `serve`, and no running node shows how it was started: there is
+    /// no terminal to ask on, and `--yes` wasn't given.
+    #[error(
+        "fleetring {release} doesn't know `serve`, and no running node shows whether it was \
+         started with it\n  hint: pass --config naming the node, or --yes if no node on this \
+         machine starts with `fleetring serve`"
+    )]
+    StartCommandUnknown {
+        /// The release that would be installed.
+        release: Release,
     },
     /// There is no previous binary to roll back to.
     #[error("there is no previous binary at {path} to roll back to")]
@@ -173,7 +197,7 @@ pub enum UpgradeError {
     Control(String),
     /// The restart didn't finish.
     #[error(
-        "{reason}\n  hint: to go back, run `fleetringd upgrade --rollback` with the same --config"
+        "{reason}\n  hint: to go back, run `fleetring upgrade --rollback` with the same --config"
     )]
     Restart {
         /// What didn't happen.
@@ -225,6 +249,18 @@ pub enum Restart {
     No,
 }
 
+/// How `upgrade` learns whether a node it can't see runs `serve`, before it installs a release
+/// that doesn't know it (ADR-0043, point 3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartCommand {
+    /// `--yes`: no node on this machine starts with `serve`.
+    Confirmed,
+    /// Ask on the terminal.
+    Ask,
+    /// There is no terminal to ask on: refuse.
+    Unknown,
+}
+
 /// The node on this machine, from its configuration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalNode {
@@ -234,7 +270,7 @@ pub struct LocalNode {
     pub data_dir: PathBuf,
 }
 
-/// What `fleetringd upgrade` was asked to do.
+/// What `fleetring upgrade` was asked to do.
 #[derive(Debug)]
 pub struct Options {
     /// Install, check, or roll back.
@@ -253,16 +289,18 @@ pub struct Options {
     pub fleet: Option<Client>,
     /// How long each download, the drain, the rejoin, and the catch-up may take.
     pub timeout: Duration,
+    /// Whether a node that isn't running may have been started with `serve`.
+    pub start_command: StartCommand,
 }
 
-/// Runs `fleetringd upgrade` and returns its report.
+/// Runs `fleetring upgrade` and returns its report.
 ///
 /// # Errors
 ///
 /// [`UpgradeError`] when it refuses or fails; nothing is changed by a refusal.
 pub async fn run(options: Options) -> Result<Outcome, UpgradeError> {
     let exe = std::env::current_exe().map_err(|source| UpgradeError::Io {
-        path: PathBuf::from("fleetringd"),
+        path: PathBuf::from("fleetring"),
         source,
     })?;
     let installed = Installed::at(&exe)?;
@@ -270,7 +308,7 @@ pub async fn run(options: Options) -> Result<Outcome, UpgradeError> {
         Mode::Check => check(&options).await,
         Mode::Install => install(&options, &installed).await,
         // A new binary that doesn't run can't roll itself back, so the previous one can do it:
-        // `fleetringd.previous upgrade --rollback` swaps the pair it belongs to.
+        // `<name>.previous upgrade --rollback` swaps the pair it belongs to.
         Mode::Rollback => roll_back(&options, &installed.kept_for().unwrap_or(installed)).await,
     }
 }
@@ -385,7 +423,7 @@ async fn check(options: &Options) -> Result<Outcome, UpgradeError> {
     let available = target_release(options, &source).await?;
     let mut report = format!("installed: {installed}\navailable: {available}\n");
     if available <= installed && options.version.is_none() {
-        report.push_str("fleetringd is up to date\n");
+        report.push_str("fleetring is up to date\n");
         return Ok(Outcome::done(report));
     }
     let Some(view) = fleet_view(options).await? else {
@@ -457,7 +495,7 @@ async fn fetch(
     let archive = source.download(release, &archive_file, scratch).await?;
     verifier.verify(&sums, &bundle)?;
     check_sum(&sums, &archive_file, &archive)?;
-    let binary = scratch.join("fleetringd");
+    let binary = scratch.join("fleetring");
     extract(&archive, release, target, &binary)?;
     check_binary(&binary, release)?;
     Ok(binary)
@@ -466,7 +504,7 @@ async fn fetch(
 async fn install(options: &Options, installed: &Installed) -> Result<Outcome, UpgradeError> {
     if cfg!(windows) {
         return Err(UpgradeError::Unsupported {
-            reason: "fleetringd upgrade can't replace a binary on Windows; download the .zip \
+            reason: "fleetring upgrade can't replace a binary on Windows; download the .zip \
                      from https://github.com/fleetring/fleetring/releases",
         });
     }
@@ -475,10 +513,11 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
     let release = target_release(options, &source).await?;
     if options.version.is_none() && release <= current {
         return Ok(Outcome::done(format!(
-            "fleetringd {current} is up to date\n"
+            "fleetring {current} is up to date\n"
         )));
     }
     let running = running_daemon(options, installed)?;
+    check_start_command(options, running.as_ref(), &release)?;
     let view = fleet_view(options).await?;
     if let Some(view) = &view {
         check_window(view, options.node.as_ref().map(|node| &node.id), &release)?;
@@ -492,11 +531,12 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
     installed.replace_with(&binary)?;
 
     let mut report = format!(
-        "installed fleetringd {release} at {} (verified the signature and the checksum); the \
+        "installed fleetring {release} at {} (verified the signature and the checksum); the \
          previous binary, {current}, is kept at {}\n",
         installed.path().display(),
         installed.previous().display()
     );
+    report.push_str(&complete_names(installed));
     report.push_str(&restart(options, installed, running, &release).await?);
     Ok(Outcome::done(report))
 }
@@ -504,7 +544,7 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
 async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, UpgradeError> {
     if cfg!(windows) {
         return Err(UpgradeError::Unsupported {
-            reason: "fleetringd upgrade can't replace a binary on Windows",
+            reason: "fleetring upgrade can't replace a binary on Windows",
         });
     }
     let previous = installed.previous();
@@ -514,6 +554,7 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
     let software = software_of(&previous)?;
     let release = software.release.clone();
     let running = running_daemon(options, installed)?;
+    check_start_command(options, running.as_ref(), &release)?;
     if let Some(view) = fleet_view(options).await? {
         check_window(&view, options.node.as_ref().map(|node| &node.id), &release)?;
         check_features(&view, &software)?;
@@ -521,12 +562,106 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
     let current = this_release();
     installed.roll_back()?;
     let mut report = format!(
-        "rolled back to fleetringd {release} at {}; {current} is kept at {}\n",
+        "rolled back to fleetring {release} at {}; {current} is kept at {}\n",
         installed.path().display(),
         previous.display()
     );
+    report.push_str(&complete_names(installed));
     report.push_str(&restart(options, installed, running, &release).await?);
     Ok(Outcome::done(report))
+}
+
+/// The first release line that knows `serve` (ADR-0043, point 1.1).
+const SERVE_LINE: (u64, u64) = (0, 7);
+
+/// Whether `release` knows `serve`: it is 0.7 or later, or on this build's own line, since this
+/// build knows it even before its release sets its version.
+fn knows_serve(release: &Release) -> bool {
+    release.line() >= SERVE_LINE || release.line() >= this_release().line()
+}
+
+/// Refuses to install `release` if it can't run the node's command line: a release before 0.7
+/// doesn't know `serve` (ADR-0043, point 3.5). `running` is [`running_daemon`]'s answer. A
+/// running node's process file says how it was started; without one, `options.start_command`
+/// says whether to ask, to trust `--yes`, or to refuse. It never only warns.
+///
+/// # Errors
+///
+/// [`UpgradeError::StartedWithServe`] if the node was started with `serve`, or the answer on the
+/// terminal says one was, and [`UpgradeError::StartCommandUnknown`] if it can't tell and can't
+/// ask.
+fn check_start_command(
+    options: &Options,
+    running: Option<&Option<ProcessFile>>,
+    release: &Release,
+) -> Result<(), UpgradeError> {
+    if knows_serve(release) {
+        return Ok(());
+    }
+    let refused = || UpgradeError::StartedWithServe {
+        release: release.clone(),
+    };
+    match running {
+        Some(Some(daemon)) if daemon.started_with_serve() => Err(refused()),
+        // Started without `serve`, or by a release before 0.4 that writes no process file and
+        // doesn't know `serve` either.
+        Some(_) => Ok(()),
+        None => match options.start_command {
+            StartCommand::Confirmed => Ok(()),
+            StartCommand::Unknown => Err(UpgradeError::StartCommandUnknown {
+                release: release.clone(),
+            }),
+            StartCommand::Ask => {
+                if ask_whether_serve(release)? {
+                    Err(refused())
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    }
+}
+
+/// Asks on the terminal whether any node on this machine starts with `fleetring serve`, and
+/// returns the answer: yes unless it is `n` or `no`, or empty, the default.
+fn ask_whether_serve(release: &Release) -> Result<bool, UpgradeError> {
+    let unknown = |_| UpgradeError::StartCommandUnknown {
+        release: release.clone(),
+    };
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err(UpgradeError::StartCommandUnknown {
+            release: release.clone(),
+        });
+    }
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "does any node on this machine start with 'fleetring serve'? fleetring {release} can't \
+         run it [y/N] "
+    )
+    .and_then(|()| stderr.flush())
+    .map_err(unknown)?;
+    let mut answer = String::new();
+    stdin.lock().read_line(&mut answer).map_err(unknown)?;
+    let answer = answer.trim();
+    Ok(!(answer.is_empty()
+        || answer.eq_ignore_ascii_case("n")
+        || answer.eq_ignore_ascii_case("no")))
+}
+
+/// Puts the `fleetring` name beside a binary installed as `fleetringd` (ADR-0043, point 3.4), and
+/// says so. The swap has happened by now, so a link that can't be made only adds a line.
+fn complete_names(installed: &Installed) -> String {
+    match installed.complete_names() {
+        Ok(Some(link)) => format!("added fleetring beside fleetringd at {}\n", link.display()),
+        Ok(None) => String::new(),
+        Err(error) => format!(
+            "can't add fleetring beside {}: {error}; add it with `ln -s fleetringd fleetring` in \
+             that directory\n",
+            installed.path().display()
+        ),
+    }
 }
 
 /// The daemon running on this machine for `options.node`, if any, as its process file
@@ -811,4 +946,166 @@ async fn catch_up(fleet: &Client, node: &NodeId, limit: Duration) -> Result<Stri
         "{count} database{} at its primary's position",
         if count == 1 { "" } else { "s" }
     ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A scratch install: the installed binary, a previous binary that says it is a given
+    /// release, and a data directory.
+    struct Scratch {
+        dir: tempfile::TempDir,
+        installed: Installed,
+    }
+
+    impl Scratch {
+        fn new(previous: &str) -> TestResult<Self> {
+            let dir = tempfile::tempdir()?;
+            let bin = dir.path().join("bin");
+            fs::create_dir_all(&bin)?;
+            let path = bin.join("fleetring");
+            fs::write(&path, b"this build")?;
+            let kept = bin.join("fleetring.previous");
+            fs::write(&kept, format!("#!/bin/sh\necho 'fleetringd {previous}'\n"))?;
+            fs::set_permissions(&kept, fs::Permissions::from_mode(0o755))?;
+            fs::create_dir_all(dir.path().join("data"))?;
+            let installed = Installed::at(&path)?;
+            Ok(Self { dir, installed })
+        }
+
+        fn data_dir(&self) -> PathBuf {
+            self.dir.path().join("data")
+        }
+
+        /// A daemon of the installed binary running on the data directory, started with
+        /// `args`; it runs while the returned lock is held.
+        fn run_daemon(&self, args: &[&str]) -> TestResult<crate::DataDir> {
+            let lock = crate::DataDir::lock(self.data_dir())?;
+            ProcessFile {
+                pid: std::process::id(),
+                exe: self.installed.path().to_owned(),
+                version: "0.7.0".to_owned(),
+                restarts: 0,
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            }
+            .write(&self.data_dir())?;
+            Ok(lock)
+        }
+
+        fn options(&self, mode: Mode, restart: Restart, version: Option<&str>) -> Options {
+            Options {
+                mode,
+                restart,
+                version: version.and_then(|version| version.parse().ok()),
+                base_url: Some("http://127.0.0.1:1".to_owned()),
+                releases_url: None,
+                node: Some(LocalNode {
+                    id: "node-1".parse().expect("a node ID"),
+                    data_dir: self.data_dir(),
+                }),
+                fleet: None,
+                timeout: Duration::from_secs(1),
+                start_command: StartCommand::Unknown,
+            }
+        }
+
+        /// Whether neither binary has moved.
+        fn unchanged(&self) -> bool {
+            fs::read(self.installed.path()).ok().as_deref() == Some(&b"this build"[..])
+                && fs::read_to_string(self.installed.previous())
+                    .is_ok_and(|kept| kept.contains("fleetringd"))
+        }
+    }
+
+    // The releases before the rename here are 0.5: a build before its own release still says it
+    // is the previous one, 0.6, and its own line counts as knowing `serve`.
+
+    #[tokio::test]
+    async fn a_rollback_past_the_rename_is_refused_for_a_node_started_with_serve() -> TestResult {
+        for restart in [Restart::InPlace, Restart::No] {
+            for args in [
+                &["serve", "--config", "x"][..],
+                &["--log-format", "json", "serve", "--config", "x"],
+            ] {
+                let scratch = Scratch::new("0.5.0")?;
+                let _running = scratch.run_daemon(args)?;
+                let mut options = scratch.options(Mode::Rollback, restart, None);
+                // Even `--yes` doesn't override what the process file shows.
+                options.start_command = StartCommand::Confirmed;
+                let refused = roll_back(&options, &scratch.installed).await;
+                assert!(
+                    matches!(&refused, Err(UpgradeError::StartedWithServe { release })
+                        if release.to_string() == "0.5.0"),
+                    "{restart:?} {args:?}: {refused:?}"
+                );
+                assert!(scratch.unchanged(), "{restart:?} {args:?}: swapped");
+            }
+        }
+        // A node started the 0.6 way rolls back.
+        let scratch = Scratch::new("0.5.0")?;
+        let _running = scratch.run_daemon(&["--config", "x"])?;
+        let options = scratch.options(Mode::Rollback, Restart::No, None);
+        let outcome = roll_back(&options, &scratch.installed).await?;
+        assert!(
+            outcome.report.starts_with("rolled back to fleetring 0.5.0"),
+            "{}",
+            outcome.report
+        );
+        assert!(!scratch.unchanged());
+        // A previous release that knows `serve` rolls back whatever the node runs.
+        let scratch = Scratch::new("0.7.1")?;
+        let _running = scratch.run_daemon(&["serve", "--config", "x"])?;
+        let options = scratch.options(Mode::Rollback, Restart::No, None);
+        roll_back(&options, &scratch.installed).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_downgrade_past_the_rename_without_a_node_needs_yes() -> TestResult {
+        for with_config in [false, true] {
+            let scratch = Scratch::new("0.7.0")?;
+            let mut options = scratch.options(Mode::Install, Restart::No, Some("0.5.0"));
+            if !with_config {
+                options.node = None;
+            }
+            // No --config, or a node that isn't running: nothing shows how it starts.
+            let refused = install(&options, &scratch.installed).await;
+            assert!(
+                matches!(&refused, Err(UpgradeError::StartCommandUnknown { release })
+                    if release.to_string() == "0.5.0"),
+                "{refused:?}"
+            );
+            assert!(scratch.unchanged());
+            // With --yes it goes on to the download, which this mirror refuses: the swap itself
+            // is the upgrade suite's to test.
+            options.start_command = StartCommand::Confirmed;
+            let fetched = install(&options, &scratch.installed).await;
+            assert!(
+                matches!(
+                    &fetched,
+                    Err(UpgradeError::Network { .. }
+                        | UpgradeError::CosignMissing { .. }
+                        | UpgradeError::CosignTooOld { .. })
+                ),
+                "{fetched:?}"
+            );
+            assert!(scratch.unchanged());
+        }
+        // A release that knows `serve` needs no confirmation.
+        let scratch = Scratch::new("0.7.0")?;
+        let mut options = scratch.options(Mode::Install, Restart::No, Some("0.7.0"));
+        options.node = None;
+        let fetched = install(&options, &scratch.installed).await;
+        assert!(
+            !matches!(&fetched, Err(UpgradeError::StartCommandUnknown { .. })),
+            "{fetched:?}"
+        );
+        Ok(())
+    }
 }

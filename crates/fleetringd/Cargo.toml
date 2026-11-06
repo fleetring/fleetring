@@ -69,6 +69,12 @@ simulation = ["dep:turmoil"]
 [lints]
 workspace = true
 
+# One binary, `fleetring`; `fleetringd` is the same file under a second name until 1.0, and the
+# package keeps its name (ADR-0043, point 1).
+[[bin]]
+name = "fleetring"
+path = "src/main.rs"
+
 [[test]]
 name = "sim"
 required-features = ["simulation"]

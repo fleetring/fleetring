@@ -1386,7 +1386,7 @@ mod binary {
     ) -> Result<Output, Box<dyn std::error::Error>> {
         let tls_dir = tls_dir.to_owned();
         Ok(tokio::task::spawn_blocking(move || {
-            Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            Command::new(env!("CARGO_BIN_EXE_fleetring"))
                 .env("FLEETRING_TLS_DIR", &tls_dir)
                 .args(&args)
                 .output()
@@ -1405,7 +1405,7 @@ mod binary {
 
         let tls_dir = tls_dir.to_owned();
         let line = tokio::task::spawn_blocking(move || {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            let mut child = Command::new(env!("CARGO_BIN_EXE_fleetring"))
                 .env("FLEETRING_TLS_DIR", &tls_dir)
                 .args(&args)
                 .stdout(Stdio::piped())

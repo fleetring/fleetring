@@ -1217,9 +1217,9 @@ fn the_daemon_writes_json_lines_with_log_format_json() -> TestResult {
     std::fs::File::create(&path)?
         .write_all(config(dir.path(), &tls, "solo", "both", None, "")?.as_bytes())?;
     for (flag, variable) in [(Some("json"), None), (None, Some("json"))] {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"));
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"));
         command
-            .arg("--config")
+            .args(["serve", "--config"])
             .arg(&path)
             .env("RUST_LOG", "info")
             .env_remove("FLEETRING_LOG_FORMAT")
@@ -1250,8 +1250,8 @@ fn the_daemon_writes_json_lines_with_log_format_json() -> TestResult {
         assert!(admin.parse::<SocketAddr>().is_ok(), "{started}");
         drop(daemon);
     }
-    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
-        .arg("--config")
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        .args(["serve", "--config"])
         .arg(&path)
         .env("FLEETRING_LOG_FORMAT", "xml")
         .output()?;

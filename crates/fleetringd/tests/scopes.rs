@@ -727,7 +727,7 @@ async fn fleetringd(
         .collect();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     Ok(tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
             .env("FLEETRING_TLS_DIR", &tls_dir)
             .env_remove("FLEETRING_TOKEN")
             .env_remove("FLEETRING_AS")
@@ -1133,10 +1133,10 @@ async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> 
         assert!(!output.status.success(), "{what} nobody should fail");
         let stderr = String::from_utf8_lossy(&output.stderr);
         for needle in [
-            "fleetringd: no client identity for principal 'nobody'",
+            "fleetring: no client identity for principal 'nobody'",
             nobody_cert.to_str().ok_or("a non-UTF-8 path")?,
             nobody_key.to_str().ok_or("a non-UTF-8 path")?,
-            "hint: create it with `fleetringd cert client nobody --dir",
+            "hint: create it with `fleetring cert client nobody --dir",
         ] {
             assert!(stderr.contains(needle), "{what}: {needle} not in {stderr}");
         }
@@ -1144,7 +1144,7 @@ async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> 
 
     // `--as` without a directory says what it needs.
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
             .env_remove("FLEETRING_TLS_DIR")
             .env_remove("FLEETRING_AS")
             .args(["status", "--control", "127.0.0.1:1", "--as", "reader"])
@@ -1698,7 +1698,7 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
     failed_with(
         &stale,
         "a stale --if-version",
-        "the database's metadata changed since version 1; read it again with fleetringd db show",
+        "the database's metadata changed since version 1; read it again with fleetring db show",
     );
     succeeded(
         &agent(vec![
@@ -1849,7 +1849,7 @@ async fn the_command_line_manages_an_agent_prefix_with_a_token() -> TestResult {
         let err = String::from_utf8_lossy(&removed.stderr);
         assert!(
             err.contains(&format!("unrecognized subcommand '{verb}'"))
-                && err.contains("hint: use 'fleetringd db edit <db> ")
+                && err.contains("hint: use 'fleetring db edit <db> ")
                 && err.contains(flags),
             "{verb}: {err}"
         );

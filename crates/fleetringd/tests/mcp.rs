@@ -154,7 +154,7 @@ impl Session {
         env: &[(&str, &str)],
         args: &[&str],
     ) -> Result<Self, Box<dyn Error>> {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fleetring"));
         command
             .arg("mcp")
             .args(args)
@@ -1090,7 +1090,7 @@ async fn stdout_carries_only_protocol() -> TestResult {
     );
 
     // Without credentials, the server never starts a session, and says why on stderr only.
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
         .arg("mcp")
         .env_remove("FLEETRING_CONTROL")
         .env_remove("FLEETRING_TLS_DIR")

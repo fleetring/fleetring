@@ -21,47 +21,79 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> UpgradeError + '_ {
     }
 }
 
-/// Extracts `fleetringd-<release>-<target>/fleetringd` from the `.tar.gz` at `archive` into
-/// `into`, and nothing else.
+/// The binary's name in a release archive from 0.7 on, which holds it under its compatibility
+/// name too (ADR-0043, point 3).
+const BINARY: &str = "fleetring";
+
+/// The binary's name in a release archive before 0.7, and its compatibility name since.
+const COMPAT_BINARY: &str = "fleetringd";
+
+/// Extracts the binary from the `.tar.gz` at `archive` into `into`, and nothing else: the regular
+/// file `fleetringd-<release>-<target>/fleetring` if the archive has it, else
+/// `fleetringd-<release>-<target>/fleetringd`, as a release before 0.7 holds it (ADR-0043,
+/// point 3.3). The archive is read in one pass.
 ///
 /// # Errors
 ///
-/// [`UpgradeError::Archive`] if the archive can't be read or holds no such regular file.
+/// [`UpgradeError::Archive`] if the archive can't be read, holds neither file, or holds the one it
+/// would use as anything but a regular file.
 pub(crate) fn extract(
     archive: &Path,
     release: &Release,
     target: &str,
     into: &Path,
 ) -> Result<(), UpgradeError> {
-    let wanted = format!("fleetringd-{release}-{target}/fleetringd");
+    let dir = format!("fleetringd-{release}-{target}");
+    let wanted = format!("{dir}/{BINARY}");
+    let compat = format!("{dir}/{COMPAT_BINARY}");
     let bad = |reason: String| UpgradeError::Archive { reason };
     let file = File::open(archive).map_err(io_error(archive))?;
     let mut entries = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    // The compatibility entry, if it came first: used only if the archive has no `fleetring`.
+    let mut fallback: Option<Result<(), UpgradeError>> = None;
     for entry in entries.entries().map_err(|error| bad(error.to_string()))? {
         let entry = entry.map_err(|error| bad(error.to_string()))?;
         let path = entry.path().map_err(|error| bad(error.to_string()))?;
-        if path.to_str() != Some(wanted.as_str()) {
+        let Some(path) = path.to_str().map(str::to_owned) else {
             continue;
+        };
+        if path == wanted {
+            return copy_binary(entry, &wanted, into);
         }
-        if !entry.header().entry_type().is_file() {
-            return Err(bad(format!("{wanted} isn't a regular file")));
+        if path == compat && fallback.is_none() {
+            // Copied now, since a tar stream can't be read twice; `fleetring`, if it follows,
+            // overwrites it.
+            fallback = Some(copy_binary(entry, &compat, into));
         }
-        let mut out = File::create(into).map_err(io_error(into))?;
-        let copied = io::copy(&mut entry.take(MAX_BINARY_BYTES + 1), &mut out)
-            .map_err(|error| bad(error.to_string()))?;
-        if copied > MAX_BINARY_BYTES {
-            return Err(bad(format!(
-                "{wanted} is larger than {MAX_BINARY_BYTES} bytes"
-            )));
-        }
-        out.sync_all().map_err(io_error(into))?;
-        make_executable(into)?;
-        return Ok(());
     }
-    Err(bad(format!("it holds no {wanted}")))
+    fallback.unwrap_or_else(|| Err(bad(format!("it holds neither {wanted} nor {compat}"))))
 }
 
-/// Checks that the binary at `path` runs and prints `fleetringd <release>`.
+/// Copies the archive's `entry`, named `name`, into `into`, if it is a regular file no larger than
+/// [`MAX_BINARY_BYTES`].
+fn copy_binary<R: io::Read>(
+    entry: tar::Entry<'_, R>,
+    name: &str,
+    into: &Path,
+) -> Result<(), UpgradeError> {
+    let bad = |reason: String| UpgradeError::Archive { reason };
+    if !entry.header().entry_type().is_file() {
+        return Err(bad(format!("{name} isn't a regular file")));
+    }
+    let mut out = File::create(into).map_err(io_error(into))?;
+    let copied = io::copy(&mut entry.take(MAX_BINARY_BYTES + 1), &mut out)
+        .map_err(|error| bad(error.to_string()))?;
+    if copied > MAX_BINARY_BYTES {
+        return Err(bad(format!(
+            "{name} is larger than {MAX_BINARY_BYTES} bytes"
+        )));
+    }
+    out.sync_all().map_err(io_error(into))?;
+    make_executable(into)
+}
+
+/// Checks that the binary at `path` runs and prints `fleetring <release>`, or `fleetringd
+/// <release>`.
 ///
 /// # Errors
 ///
@@ -72,12 +104,13 @@ pub(crate) fn check_binary(path: &Path, release: &Release) -> Result<(), Upgrade
         Ok(())
     } else {
         Err(UpgradeError::Binary {
-            reason: format!("it says it is fleetringd {printed}, not {release}"),
+            reason: format!("it says it is fleetring {printed}, not {release}"),
         })
     }
 }
 
-/// The release the binary at `path` says it is, from `--version`.
+/// The release the binary at `path` says it is, from `--version`: `fleetring <version>`, or
+/// `fleetringd <version>` from a release before 0.7 or a binary run under that name.
 ///
 /// # Errors
 ///
@@ -90,15 +123,16 @@ pub(crate) fn version_of(path: &Path) -> Result<Release, UpgradeError> {
             reason: format!("{} doesn't run: {error}", path.display()),
         })?;
     let text = String::from_utf8_lossy(&output.stdout);
-    text.trim()
-        .strip_prefix("fleetringd ")
+    let printed = text.trim();
+    printed
+        .strip_prefix("fleetring ")
+        .or_else(|| printed.strip_prefix("fleetringd "))
         .and_then(|version| version.parse().ok())
         .filter(|_| output.status.success())
         .ok_or_else(|| UpgradeError::Binary {
             reason: format!(
-                "{} --version printed '{}', not 'fleetringd <version>'",
+                "{} --version printed '{printed}', not 'fleetring <version>'",
                 path.display(),
-                text.trim()
             ),
         })
 }
@@ -198,8 +232,37 @@ impl Installed {
         let name = self
             .path
             .file_name()
-            .map_or_else(|| "fleetringd".into(), |name| name.to_string_lossy());
+            .map_or_else(|| BINARY.into(), |name| name.to_string_lossy());
         self.path.with_file_name(format!("{prefix}{name}{suffix}"))
+    }
+
+    /// Puts the `fleetring` name beside a binary installed as `fleetringd`, as a 0.6 upgrader
+    /// leaves it (ADR-0043, point 3.4): if the installed file is named `fleetringd` and nothing
+    /// is named `fleetring` beside it, creates the relative symbolic link `fleetring ->
+    /// fleetringd`. Returns the link's path if it made one. On Windows, which installs two
+    /// copies, it does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`UpgradeError::Io`] if the directory can't be read or the link can't be made.
+    pub(crate) fn complete_names(&self) -> Result<Option<PathBuf>, UpgradeError> {
+        #[cfg(unix)]
+        {
+            if self.path.file_name() != Some(std::ffi::OsStr::new(COMPAT_BINARY)) {
+                return Ok(None);
+            }
+            let link = self.path.with_file_name(BINARY);
+            match fs::symlink_metadata(&link) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&link)(error)),
+                Ok(_) => return Ok(None),
+            }
+            std::os::unix::fs::symlink(COMPAT_BINARY, &link).map_err(io_error(&link))?;
+            self.sync_directory()?;
+            Ok(Some(link))
+        }
+        #[cfg(not(unix))]
+        Ok(None)
     }
 
     /// Checks that a new binary can be put beside the installed one, before anything is
@@ -304,6 +367,163 @@ impl Installed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One entry of a test archive.
+    enum Entry<'a> {
+        File(&'a str, &'a [u8]),
+        Symlink(&'a str, &'a str),
+    }
+
+    /// Writes a `.tar.gz` holding `entries` to `path`.
+    fn write_archive(path: &Path, entries: &[Entry<'_>]) -> io::Result<()> {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o755);
+            match entry {
+                Entry::File(name, bytes) => {
+                    header.set_size(u64::try_from(bytes.len()).map_err(io::Error::other)?);
+                    header.set_cksum();
+                    archive.append_data(&mut header, name, *bytes)?;
+                }
+                Entry::Symlink(name, target) => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_size(0);
+                    archive.append_link(&mut header, name, target)?;
+                }
+            }
+        }
+        fs::write(path, archive.into_inner()?.finish()?)
+    }
+
+    #[test]
+    fn extract_prefers_fleetring_and_falls_back_to_fleetringd() -> Result<(), UpgradeError> {
+        let dir = tempfile::tempdir().map_err(io_error(Path::new(".")))?;
+        let release: Release = "0.7.0".parse().map_err(|_| UpgradeError::Unsupported {
+            reason: "a release",
+        })?;
+        let target = "x86_64-unknown-linux-gnu";
+        let prefix = format!("fleetringd-{release}-{target}");
+        let at = |name: &str| format!("{prefix}/{name}");
+        let into = dir.path().join("out");
+        let extracted = |entries: &[Entry<'_>]| {
+            let archive = dir.path().join("release.tar.gz");
+            write_archive(&archive, entries).map_err(io_error(&archive))?;
+            let _gone = fs::remove_file(&into);
+            extract(&archive, &release, target, &into)?;
+            fs::read(&into).map_err(io_error(&into))
+        };
+        let (fleetring, fleetringd) = (at("fleetring"), at("fleetringd"));
+        let readme = at("README.md");
+
+        // Both names, in either order: the `fleetring` entry.
+        for entries in [
+            &[
+                Entry::File(&readme, b"read me"),
+                Entry::File(&fleetring, b"new"),
+                Entry::File(&fleetringd, b"compat"),
+            ][..],
+            &[
+                Entry::File(&fleetringd, b"compat"),
+                Entry::File(&fleetring, b"new"),
+            ],
+        ] {
+            assert_eq!(extracted(entries)?, b"new");
+        }
+        // A release before 0.7: only `fleetringd`.
+        assert_eq!(extracted(&[Entry::File(&fleetringd, b"old")])?, b"old");
+        // Only a link named `fleetringd`: refused, as 0.6's extractor refuses it.
+        let link = extracted(&[Entry::Symlink(&fleetringd, "fleetring")]);
+        assert!(
+            matches!(&link, Err(UpgradeError::Archive { reason }) if reason.contains("isn't a regular file")),
+            "{link:?}"
+        );
+        // Neither name: the error names both.
+        let neither = extracted(&[Entry::File(&readme, b"read me")]);
+        assert!(
+            matches!(&neither, Err(UpgradeError::Archive { reason })
+                if reason.contains(&fleetring) && reason.contains(&fleetringd)),
+            "{neither:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn script(path: &Path, printed: &str) -> Result<(), UpgradeError> {
+        fs::write(path, format!("#!/bin/sh\necho '{printed}'\n")).map_err(io_error(path))?;
+        make_executable(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_of_accepts_both_names() -> Result<(), UpgradeError> {
+        let dir = tempfile::tempdir().map_err(io_error(Path::new(".")))?;
+        for (name, printed) in [("new", "fleetring 0.7.0"), ("old", "fleetringd 0.6.0")] {
+            let path = dir.path().join(name);
+            script(&path, printed)?;
+            assert_eq!(
+                version_of(&path)?.to_string(),
+                printed.split(' ').nth(1).unwrap_or("")
+            );
+        }
+        let other = dir.path().join("other");
+        script(&other, "fleet 0.7.0")?;
+        let refused = version_of(&other);
+        assert!(
+            matches!(&refused, Err(UpgradeError::Binary { reason }) if reason.contains("not 'fleetring <version>'")),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_names_links_fleetring_beside_a_fleetringd_file() -> Result<(), UpgradeError> {
+        let dir = tempfile::tempdir().map_err(io_error(Path::new(".")))?;
+        let path = dir.path().join("fleetringd");
+        fs::write(&path, b"binary").map_err(io_error(&path))?;
+        let installed = Installed::at(&path)?;
+        let Some(link) = installed.complete_names()? else {
+            panic!("no link beside {}", installed.path().display());
+        };
+        assert_eq!(link, installed.path().with_file_name("fleetring"));
+        assert_eq!(
+            fs::read_link(&link).map_err(io_error(&link))?,
+            PathBuf::from("fleetringd")
+        );
+        assert_eq!(fs::read(&link).ok(), Some(b"binary".to_vec()));
+        // Done once: a second call leaves it.
+        assert_eq!(installed.complete_names()?, None);
+        // Through the link, the installed file is still `fleetringd`.
+        assert_eq!(Installed::at(&link)?, installed);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_names_leaves_an_existing_fleetring_alone() -> Result<(), UpgradeError> {
+        let dir = tempfile::tempdir().map_err(io_error(Path::new(".")))?;
+        let fleetringd = dir.path().join("fleetringd");
+        let fleetring = dir.path().join("fleetring");
+        fs::write(&fleetringd, b"binary").map_err(io_error(&fleetringd))?;
+        fs::write(&fleetring, b"another").map_err(io_error(&fleetring))?;
+        assert_eq!(Installed::at(&fleetringd)?.complete_names()?, None);
+        assert_eq!(fs::read(&fleetring).ok(), Some(b"another".to_vec()));
+        // A dangling link counts as there, too.
+        fs::remove_file(&fleetring).map_err(io_error(&fleetring))?;
+        std::os::unix::fs::symlink("nowhere", &fleetring).map_err(io_error(&fleetring))?;
+        assert_eq!(Installed::at(&fleetringd)?.complete_names()?, None);
+        // A fresh 0.7 install: `fleetring` is the file, and needs nothing.
+        let fresh = tempfile::tempdir().map_err(io_error(Path::new(".")))?;
+        let real = fresh.path().join("fleetring");
+        fs::write(&real, b"binary").map_err(io_error(&real))?;
+        assert_eq!(Installed::at(&real)?.complete_names()?, None);
+        assert!(!fresh.path().join("fleetringd").exists());
+        Ok(())
+    }
 
     #[test]
     fn replacing_keeps_the_previous_binary_and_rollback_swaps_them() -> Result<(), UpgradeError> {
