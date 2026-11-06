@@ -8,6 +8,7 @@
 #   systemctl --user enable --now fleetring-dev
 #   journalctl --user -u fleetring-dev       # the banner and the logs
 #   fleetring status                         # the `dev` context points the commands at it
+#   systemctl --user stop fleetring-dev      # stops it; `fleetring dev stop` refuses a node systemd runs
 #
 # Every start writes the `dev` context and makes it current unless another context is; if one is,
 # `fleetring switch dev` selects it. ~/.fleetring/env is still written, for scripts.

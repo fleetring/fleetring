@@ -313,7 +313,7 @@ Free text, at most 1 KiB, saying what a database holds and how it was set up; pa
 One node on loopback, with a local [authority](#authority) and an `admin` [principal](#principal) with every [scope](#scope), that `fleetring dev` creates once in `~/.fleetring` and reuses, for development only (ADR-0039). It is the normal daemon with `dev = true` in its configuration, which keeps every address on loopback; `status` prints `dev mode` for it.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `dev::DevMode`, `dev::prepare`, protocol `MembershipUpdate.dev_mode`. **CLI:** `fleetring dev [--data-dir <dir>] [--port <n>]`, which writes the `dev` [context](#context); `dev = true` in config; `~/.fleetring/env`, for scripts.
+- **Code:** `dev::DevMode`, `dev::prepare`, protocol `MembershipUpdate.dev_mode`. **CLI:** `fleetring dev [--data-dir <dir>] [--port <n>] [-d]`, which writes the `dev` [context](#context); `fleetring dev stop|status|logs`; `dev = true` in config; `~/.fleetring/env`, for scripts.
 - **Not:** local mode, sandbox, playground, standalone, single-node mode (a fleet of one node needn't be dev mode).
 
 ### Directory
