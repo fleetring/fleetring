@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use fleetring_client::redirect::{LEADER_METADATA_KEY, leader_hint, not_leader};
 use fleetring_control::{Action, Command, ControlConfig, Member, Millis, State, Timestamp, apply};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::control_server::Control;
@@ -25,8 +26,7 @@ use fleetringd::auth::{AuthLayer, Authorizer, refused_binding};
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
     CommandLog, Committed, ControlClient, ControlHandle, ControlNode, ControlOptions,
-    ControlService, LEADER_METADATA_KEY, LogError, LogIndex, OpenError, StorageIo, leader_hint,
-    not_leader,
+    ControlService, LogError, LogIndex, OpenError, StorageIo,
 };
 use fleetringd::transport::{TransportConfig, control_server};
 use fleetringd::{Config, ConfigError, Daemon, NodeRole};

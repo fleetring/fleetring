@@ -15,6 +15,7 @@ use std::time::Duration;
 use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_client::context::{ContextName, Contexts, select};
+use fleetring_client::output::printable;
 use fleetring_control::{
     Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, ReplicaRole,
     parse_label,
@@ -42,8 +43,8 @@ use fleetringd::mcp::{self, Access, McpSettings};
 use fleetringd::observe::{LogColour, log_subscriber};
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{
-    DatabaseReport, MetadataReport, NodeList, expiry_text, printable, render_archived_metadata,
-    render_text, schema_unavailable, table,
+    database_report, expiry_text, metadata_report, node_list, node_list_text,
+    render_archived_metadata, render_text, schema_report, schema_unavailable, table,
 };
 use fleetringd::tls::{
     AUTHORITY_CERT_FILE, Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
@@ -1919,14 +1920,14 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         }) => {
             let client = target.client()?;
             let location = client.locate(&name).await.map_err(failed)?;
-            let mut report = DatabaseReport::from_location(&location, SystemClock.now());
+            let mut report = database_report(&location, SystemClock.now());
             if !no_schema {
                 let request = SchemaRequest {
                     count_limit,
                     internal: if all { Internal::Show } else { Internal::Hide },
                 };
                 report = match client.schema(&name, request).await {
-                    Ok(view) => report.with_schema(&view),
+                    Ok(view) => report.with_schema(schema_report(&view)),
                     Err(status) => match schema_unavailable(&status) {
                         Some(reason) => report.without_schema(reason),
                         None => return Err(failed(status)),
@@ -2129,10 +2130,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             format!("dropped {} at epoch {}\n", shown(&name), epoch.get())
         }
         Command::Node(NodeCommand::List { output, target }) => {
-            let nodes = NodeList::from_view(&target.client()?.status().await.map_err(failed)?);
+            let nodes = node_list(&target.client()?.status().await.map_err(failed)?);
             match output.format() {
                 OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&nodes)?),
-                OutputFormat::Table => nodes.text(),
+                OutputFormat::Table => node_list_text(&nodes),
             }
         }
         Command::Node(NodeCommand::Drain { id, target }) => {
@@ -3509,7 +3510,7 @@ fn format_metadata_summary(metadata: &MetadataView) -> String {
         "labels: {}\ncreator: {}\nexpires: {}\nversion: {}\n",
         format_labels(metadata),
         metadata.created_by.as_deref().unwrap_or("unknown"),
-        expiry_text(&MetadataReport::from_view(metadata, SystemClock.now())),
+        expiry_text(&metadata_report(metadata, SystemClock.now())),
         metadata.version
     )
 }

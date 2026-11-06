@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
+use fleetring_client::redirect::not_primary;
 use fleetring_control::{DatabaseName, Durability, LeaseEpoch};
 use fleetring_proto::v1::{AcquireLeaseRequest, LocateRequest, Placement};
 use tokio::sync::watch;
@@ -14,7 +15,6 @@ use tonic::Status;
 use crate::changes::ChangeStreams;
 use crate::control::ControlClient;
 use crate::data::convert::durability_of;
-use crate::data::redirect::not_primary;
 use crate::data::service::database_status;
 use crate::durability::{Archive, RestoreError, RestoreTarget, Restored, StoreError, restore_into};
 use crate::engine::EngineError;
@@ -524,8 +524,8 @@ impl DataNode {
     ///
     /// # Errors
     ///
-    /// A redirect ([`not_primary`]) if another node holds the lease; `FAILED_PRECONDITION` if no
-    /// node does yet; `UNAVAILABLE` if the control plane can't be reached, the primary has no
+    /// A redirect ([`not_primary`](fleetring_client::redirect::not_primary)) if another node
+    /// holds the lease; `FAILED_PRECONDITION` if no node does yet; `UNAVAILABLE` if the control plane can't be reached, the primary has no
     /// known address, or this node is handing the lease over; and the control plane's status
     /// otherwise, such as `NOT_FOUND`.
     pub(crate) async fn route(&self, name: &DatabaseName) -> Result<Admitted<'_>, Status> {

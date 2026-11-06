@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
+use fleetring_client::redirect::primary_hint;
 use fleetring_control::{
     Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, MetadataChange, ReplicaRole,
     Timestamp,
@@ -36,7 +37,6 @@ use crate::data::metadata::{
     Descriptions, Expiry, ExpiryRequest, ListFilter, Listing, MetadataView, NewMetadata,
 };
 use crate::data::node::BEING_DROPPED;
-use crate::data::redirect::primary_hint;
 use crate::data::schema::SchemaView;
 use crate::durability::RestoreTarget;
 use crate::engine::{Position, Rows, SchemaRequest, Statement};
@@ -446,7 +446,8 @@ pub struct Written {
 ///   retries what is safe to retry.
 /// - **Database calls** (`execute`, `query`) go to the database's primary, which the client
 ///   locates through the control plane. A node that isn't the primary answers with a redirect
-///   ([`not_primary`](crate::data::not_primary)), and the client follows up to four of them.
+///   ([`not_primary`](fleetring_client::redirect::not_primary)), and the client follows up to
+///   four of them.
 ///   Database calls are sent once and never retried, because a lost reply leaves a write's
 ///   outcome unknown.
 /// - **Creation** registers the database with the control plane, which places it with the ring,

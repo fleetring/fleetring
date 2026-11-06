@@ -12,8 +12,9 @@
 //! - **Draining:** a node that is about to leave hands its leases over first (the `drain` module):
 //!   each database answers `UNAVAILABLE` for a moment, then redirects to its new primary.
 //! - **Redirects, not forwarding:** any other node answers `UNAVAILABLE` and names the primary as
-//!   `host:port` in the [`PRIMARY_METADATA_KEY`] metadata entry, as a control node that isn't the
-//!   leader does. A write then crosses one hop, and a lost reply is never doubled by a proxy.
+//!   `host:port` in the
+//!   [`PRIMARY_METADATA_KEY`](fleetring_client::redirect::PRIMARY_METADATA_KEY) metadata entry,
+//!   as a control node that isn't the leader does. A write then crosses one hop, and a lost reply is never doubled by a proxy.
 //!   [`Client`] follows redirects on its own.
 //! - **Creation is driven by the primary itself.** The client registers the database with the
 //!   control plane, which places it with the ring, then calls `Create` on the first live member
@@ -60,7 +61,6 @@ mod lease;
 mod leases;
 mod metadata;
 mod node;
-mod redirect;
 mod schema;
 mod service;
 
@@ -78,6 +78,5 @@ pub use metadata::{
     NewMetadata, RestoredMetadata, restored_metadata,
 };
 pub(crate) use node::DataNode;
-pub use redirect::{PRIMARY_METADATA_KEY, not_primary, primary_hint};
 pub use schema::SchemaView;
 pub(crate) use service::DatabaseService;

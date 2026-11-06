@@ -224,7 +224,7 @@ The engine folding its log into the main database file (SQLite's WAL checkpoint)
 Anything that calls the fleet's RPCs as a [principal](#principal): the CLI, the TUI, the desktop app, an application, the router. Clients share one crate (ADR-0033).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetringd::data::Client` today; the `fleetring-client` crate holds contexts, and the clients move into it with FR-056. **CLI:** the `fleetring` commands; `fleetring cert client` issues a client's certificate.
+- **Code:** `fleetringd::data::Client` today; the `fleetring-client` crate holds contexts, the redirect replies and the typed results a client prints (`fleetring_client::output`), and the clients move into it once the types they share with the daemon do (ADR-0033, amendment). **CLI:** the `fleetring` commands; `fleetring cert client` issues a client's certificate.
 - **Not:** user, consumer (a change stream has consumers), caller (fine in prose about one RPC).
 
 ### Context

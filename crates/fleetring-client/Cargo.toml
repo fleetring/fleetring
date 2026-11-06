@@ -1,6 +1,6 @@
 [package]
 name = "fleetring-client"
-description = "What a FleetRing client command needs before it dials a node: contexts, and the directories they live in."
+description = "What every FleetRing client shares: contexts, the redirects it follows, and the typed results it prints."
 version = "0.0.0"
 publish = false
 edition.workspace = true
@@ -12,11 +12,17 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+# For the characters text output escapes, which a description refuses.
+fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 toml = "1.1.8"
+# The redirect replies are gRPC statuses with metadata; no transport.
+tonic = { version = "0.14", default-features = false }
+tracing = "0.1.44"
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3.27.0"
 
 [lints]

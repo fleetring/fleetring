@@ -706,10 +706,14 @@ dependencies = [
 name = "fleetring-client"
 version = "0.0.0"
 dependencies = [
+ "fleetring-control",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

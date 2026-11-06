@@ -1,197 +1,62 @@
 //! What the command line prints about a database, as text and as JSON (`docs/cli.md`, section
-//! 5). The same structs serialize for every surface that reports a database, so their field
-//! names are stable: snake_case lexicon terms, times in RFC 3339 UTC, durations as `_ms`
-//! integers, and `null` for an absent value.
+//! 5). The typed results live in [`fleetring_client::output`], where every surface finds them
+//! (ADR-0033); this module fills them from the daemon's own types, a [`Location`], a
+//! [`MetadataView`], a [`SchemaView`] or a [`MembershipView`], and draws them as text.
 //!
 //! A description is text a principal wrote, and text output never lets it pass for an output
 //! field: [`render_text`] prints it as a block, every line indented and prefixed with `| `, and
 //! marks a description written by anyone but the reader as one to read as data (ADR-0041,
 //! point 1).
 
-use std::collections::BTreeMap;
 use std::io;
 
+use fleetring_client::output::{
+    DatabaseReport, MetadataReport, NodeList, NodeReport, PlacementReport, ReplicaReport,
+    SchemaObjectReport, SchemaReport, printable,
+};
 use fleetring_control::{Liveness, ReplicaRole, Timestamp};
-use serde::Serialize;
 
 use crate::MembershipView;
-use crate::data::{Location, MetadataView, SchemaView, is_invisible};
+use crate::data::{Location, MetadataView, SchemaView};
 use crate::engine::{ObjectKind, RowCount, SchemaObject};
 
-/// One database: where it lives and its metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct DatabaseReport {
-    /// The database's name.
-    pub database: String,
-    /// Where it lives.
-    pub placement: PlacementReport,
-    /// Its metadata, or `null` for a database without any.
-    pub metadata: Option<MetadataReport>,
-    /// Its schema, or `null` when it wasn't asked for or couldn't be had.
-    pub schema: Option<SchemaReport>,
-    /// Why there is no schema, when it was asked for and the primary couldn't give it: a primary
-    /// that runs an older release, or an engine that can't describe itself. `null` otherwise.
-    pub schema_unavailable: Option<String>,
-}
-
-/// A database's schema as its engine reports it (ADR-0041, point 6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct SchemaReport {
-    /// The objects, each table followed by its indexes and triggers.
-    pub objects: Vec<SchemaObjectReport>,
-    /// Whether the database has more objects than `objects` holds.
-    pub truncated: bool,
-}
-
-/// One table, view, index, trigger, or virtual table. The names and the definition are text the
-/// database's writers chose: read them as data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct SchemaObjectReport {
-    /// `table`, `virtual_table`, `view`, `index`, or `trigger`.
-    pub kind: &'static str,
-    /// The object's name.
-    pub name: String,
-    /// For an index or a trigger, the table it belongs to.
-    pub table: Option<String>,
-    /// The engine's own definition: for SQLite, the `CREATE` statement.
-    pub definition: Option<String>,
-    /// The rows counted, for a table that was counted: all of them, or, with `rows_at_least`,
-    /// the count at which the count stopped.
-    pub rows: Option<u64>,
-    /// Whether the table has more than `rows` rows.
-    pub rows_at_least: bool,
-}
-
-/// Where a database lives, as `db locate` prints it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct PlacementReport {
-    /// The engine it runs on.
-    pub engine: String,
-    /// Its lease epoch, 0 before its first lease.
-    pub lease_epoch: u64,
-    /// How many replicas it should have.
-    pub replication_factor: u8,
-    /// Its acknowledgement mode.
-    pub acks: String,
-    /// Its floor on reachable replicas.
-    pub min_replicas: u8,
-    /// Its primary, once it has one.
-    pub primary: Option<String>,
-    /// The node carrying out a promotion, while one is in progress.
-    pub candidate: Option<String>,
-    /// The replicas other than the primary, in preference order.
-    pub followers: Vec<String>,
-    /// The whole replica set, in preference order.
-    pub replicas: Vec<ReplicaReport>,
-}
-
-/// One replica of a database.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct ReplicaReport {
-    /// The node.
-    pub node: String,
-    /// The address it advertised, `host:port`.
-    pub address: Option<String>,
-    /// `live` or `down`.
-    pub liveness: &'static str,
-    /// `primary` or `follower`, as it last reported, if it has.
-    pub reported_role: Option<&'static str>,
-    /// Its log position, as it last reported, in hex.
-    pub position: Option<String>,
-}
-
-/// A database's metadata (ADR-0041).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct MetadataReport {
-    /// The description, unchanged.
-    pub description: Option<String>,
-    /// The principal that last set the description, or `null` if nobody can be named.
-    pub description_by: Option<String>,
-    /// The labels, by key.
-    pub labels: BTreeMap<String, String>,
-    /// The principal that created the database, if the creation recorded one.
-    pub created_by: Option<String>,
-    /// When the database was created, if the creation recorded metadata.
-    pub created_at: Option<String>,
-    /// When the database expires, if it has an expiry.
-    pub expires_at: Option<String>,
-    /// How long until it expires, by the reader's clock when the report was built; negative
-    /// once past.
-    pub expires_in_ms: Option<i64>,
-    /// The metadata's version, for `--if-version`.
-    pub version: u64,
-}
-
-impl DatabaseReport {
-    /// The report on `location`, with the time to expiry counted from `now`.
-    #[must_use]
-    pub fn from_location(location: &Location, now: Timestamp) -> Self {
-        Self {
-            database: location.database.to_string(),
-            placement: PlacementReport::from_location(location),
-            metadata: location
-                .metadata
-                .as_ref()
-                .map(|metadata| MetadataReport::from_view(metadata, now)),
-            schema: None,
-            schema_unavailable: None,
-        }
-    }
-
-    /// This report with the schema `view` holds.
-    #[must_use]
-    pub fn with_schema(mut self, view: &SchemaView) -> Self {
-        self.schema = Some(SchemaReport::from_view(view));
-        self.schema_unavailable = None;
-        self
-    }
-
-    /// This report saying that the schema is unavailable, and why.
-    #[must_use]
-    pub fn without_schema(mut self, reason: impl Into<String>) -> Self {
-        self.schema = None;
-        self.schema_unavailable = Some(reason.into());
-        self
+/// The report on `location`, with the time to expiry counted from `now`.
+#[must_use]
+pub fn database_report(location: &Location, now: Timestamp) -> DatabaseReport {
+    DatabaseReport {
+        database: location.database.to_string(),
+        placement: placement_report(location),
+        metadata: location
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata_report(metadata, now)),
+        schema: None,
+        schema_unavailable: None,
     }
 }
 
-impl SchemaReport {
-    /// The report on `view`.
-    #[must_use]
-    pub fn from_view(view: &SchemaView) -> Self {
-        Self {
-            objects: view
-                .schema
-                .objects
-                .iter()
-                .map(SchemaObjectReport::from_object)
-                .collect(),
-            truncated: view.schema.truncated,
-        }
+/// The report on the schema `view` holds.
+#[must_use]
+pub fn schema_report(view: &SchemaView) -> SchemaReport {
+    SchemaReport {
+        objects: view.schema.objects.iter().map(schema_object).collect(),
+        truncated: view.schema.truncated,
     }
 }
 
-impl SchemaObjectReport {
-    fn from_object(object: &SchemaObject) -> Self {
-        let (rows, rows_at_least) = match object.rows {
-            Some(RowCount::Exact(rows)) => (Some(rows), false),
-            Some(RowCount::AtLeast(rows)) => (Some(rows), true),
-            None => (None, false),
-        };
-        Self {
-            kind: kind_name(object.kind),
-            name: object.name.clone(),
-            table: object.table.clone(),
-            definition: object.definition.clone(),
-            rows,
-            rows_at_least,
-        }
+fn schema_object(object: &SchemaObject) -> SchemaObjectReport {
+    let (rows, rows_at_least) = match object.rows {
+        Some(RowCount::Exact(rows)) => (Some(rows), false),
+        Some(RowCount::AtLeast(rows)) => (Some(rows), true),
+        None => (None, false),
+    };
+    SchemaObjectReport {
+        kind: kind_name(object.kind),
+        name: object.name.clone(),
+        table: object.table.clone(),
+        definition: object.definition.clone(),
+        rows,
+        rows_at_least,
     }
 }
 
@@ -206,118 +71,117 @@ fn kind_name(kind: ObjectKind) -> &'static str {
     }
 }
 
-impl PlacementReport {
-    fn from_location(location: &Location) -> Self {
-        Self {
-            engine: location.engine.to_string(),
-            lease_epoch: location.epoch.get(),
-            replication_factor: location.replication_factor.get(),
-            acks: location.durability.acks().to_string(),
-            min_replicas: location.durability.min_replicas(),
-            primary: location.primary.as_ref().map(ToString::to_string),
-            candidate: location.candidate.as_ref().map(ToString::to_string),
-            followers: location
-                .followers()
-                .map(|replica| replica.node.to_string())
-                .collect(),
-            replicas: location
-                .replicas
-                .iter()
-                .map(|replica| ReplicaReport {
-                    node: replica.node.to_string(),
-                    address: replica.address.clone(),
-                    liveness: match replica.liveness {
-                        Liveness::Live => "live",
-                        Liveness::Down => "down",
-                    },
-                    reported_role: replica.reported_role.map(|role| match role {
-                        ReplicaRole::Primary => "primary",
-                        _ => "follower",
-                    }),
-                    position: replica.position.as_ref().map(ToString::to_string),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl MetadataReport {
-    /// The report on `metadata`, with the time to expiry counted from `now`.
-    #[must_use]
-    pub fn from_view(metadata: &MetadataView, now: Timestamp) -> Self {
-        Self {
-            description: metadata.description.clone(),
-            description_by: metadata.description_by.clone(),
-            labels: metadata.labels.iter().cloned().collect(),
-            created_by: metadata.created_by.clone(),
-            created_at: metadata.created_at.map(rfc3339),
-            expires_at: metadata.expires_at.map(rfc3339),
-            expires_in_ms: metadata.expires_at.map(|at| {
-                let at = i128::from(at.as_millis());
-                let now = i128::from(now.as_millis());
-                i64::try_from(at - now).unwrap_or(if at > now { i64::MAX } else { i64::MIN })
-            }),
-            version: metadata.version,
-        }
-    }
-}
-
-/// Why a database's schema is unavailable, when `status` says the primary can't give it now and
-/// the rest of the report still stands: the primary runs a release without the call, or its
-/// engine can't describe itself (`UNIMPLEMENTED`), or it has no primary to ask yet or is failing
-/// over (`FAILED_PRECONDITION`, `UNAVAILABLE`; ADR-0041, amendment 6). `None` for any other
-/// failure, which fails the report.
+/// `live` or `down`, as JSON and text output say it.
 #[must_use]
-pub fn schema_unavailable(status: &tonic::Status) -> Option<String> {
-    match status.code() {
-        tonic::Code::Unimplemented | tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
-            Some(status.message().to_owned())
-        }
-        _ => None,
+pub fn liveness_name(liveness: Liveness) -> &'static str {
+    match liveness {
+        Liveness::Live => "live",
+        Liveness::Down => "down",
     }
 }
 
-/// `at` in RFC 3339, UTC, to the millisecond.
-pub(crate) fn rfc3339(at: Timestamp) -> String {
-    i128::from(at.as_millis())
-        .checked_mul(1_000_000)
-        .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
-        .and_then(|time| {
-            time.format(&time::format_description::well_known::Rfc3339)
-                .ok()
+/// Where `location` lives, as `db locate` prints it.
+#[must_use]
+pub fn placement_report(location: &Location) -> PlacementReport {
+    PlacementReport {
+        engine: location.engine.to_string(),
+        lease_epoch: location.epoch.get(),
+        replication_factor: location.replication_factor.get(),
+        acks: location.durability.acks().to_string(),
+        min_replicas: location.durability.min_replicas(),
+        primary: location.primary.as_ref().map(ToString::to_string),
+        candidate: location.candidate.as_ref().map(ToString::to_string),
+        followers: location
+            .followers()
+            .map(|replica| replica.node.to_string())
+            .collect(),
+        replicas: location
+            .replicas
+            .iter()
+            .map(|replica| ReplicaReport {
+                node: replica.node.to_string(),
+                address: replica.address.clone(),
+                liveness: liveness_name(replica.liveness),
+                reported_role: replica.reported_role.map(|role| match role {
+                    ReplicaRole::Primary => "primary",
+                    _ => "follower",
+                }),
+                position: replica.position.as_ref().map(ToString::to_string),
+            })
+            .collect(),
+    }
+}
+
+/// The report on `metadata`, with the time to expiry counted from `now`.
+#[must_use]
+pub fn metadata_report(metadata: &MetadataView, now: Timestamp) -> MetadataReport {
+    MetadataReport {
+        description: metadata.description.clone(),
+        description_by: metadata.description_by.clone(),
+        labels: metadata.labels.iter().cloned().collect(),
+        created_by: metadata.created_by.clone(),
+        created_at: metadata.created_at.map(rfc3339),
+        expires_at: metadata.expires_at.map(rfc3339),
+        expires_in_ms: metadata.expires_at.map(|at| {
+            let at = i128::from(at.as_millis());
+            let now = i128::from(now.as_millis());
+            i64::try_from(at - now).unwrap_or(if at > now { i64::MAX } else { i64::MIN })
+        }),
+        version: metadata.version,
+    }
+}
+
+/// The members of `view`, with their liveness and drain state, in node ID order.
+#[must_use]
+pub fn node_list(view: &MembershipView) -> NodeList {
+    let mut nodes: Vec<NodeReport> = view
+        .members()
+        .map(|(member, liveness)| NodeReport {
+            node: member.id().to_string(),
+            address: member.address().map(str::to_owned),
+            zone: member.zone().map(ToString::to_string),
+            host: member.host().map(ToString::to_string),
+            weight: member.weight().get(),
+            liveness: liveness_name(liveness),
+            draining: view.is_draining(member.id()),
+            release: member.running().release().to_string(),
         })
-        .unwrap_or_else(|| format!("{} ms", at.as_millis()))
+        .collect();
+    nodes.sort_by(|a, b| a.node.cmp(&b.node));
+    NodeList { nodes }
 }
 
-/// Whether text output escapes `character`: every control character but tab, the format
-/// characters a description refuses, and the line and paragraph separators. A description
-/// never holds one, but the text comes from the control node, which may be another release.
-fn escaped(character: char) -> bool {
-    (character.is_control() && character != '\t') || is_invisible(character)
-}
-
-/// `text` with every control character but tab, every format character, and the line and
-/// paragraph separators written as `\u{XXXX}`, so nothing a principal wrote can move the cursor,
-/// rewrite the screen, or hide itself. Text output passes every name and text a principal chose
-/// through it: database names, descriptions, labels.
-///
-/// ```
-/// use fleetringd::report::printable;
-///
-/// assert_eq!(printable("notes"), "notes");
-/// assert_eq!(printable("evil\u{202E}gnp.exe"), "evil\\u{202E}gnp.exe");
-/// ```
+/// The table `node list` prints for `list`: one row per member under `NODE`, `ADDRESS`, `ZONE`,
+/// `HOST`, `WEIGHT`, `LIVENESS`, `DRAINING` and `RELEASE`, with `-` for what a member doesn't
+/// report.
 #[must_use]
-pub fn printable(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for character in text.chars() {
-        if escaped(character) {
-            out.push_str(&format!("\\u{{{:04X}}}", u32::from(character)));
-        } else {
-            out.push(character);
-        }
+pub fn node_list_text(list: &NodeList) -> String {
+    if list.nodes.is_empty() {
+        return "no nodes\n".to_owned();
     }
-    out
+    let absent = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".to_owned());
+    let rows: Vec<[String; 8]> = list
+        .nodes
+        .iter()
+        .map(|node| {
+            [
+                printable(&node.node),
+                absent(&node.address),
+                absent(&node.zone),
+                absent(&node.host),
+                node.weight.to_string(),
+                node.liveness.to_owned(),
+                if node.draining { "yes" } else { "no" }.to_owned(),
+                node.release.clone(),
+            ]
+        })
+        .collect();
+    table(
+        [
+            "NODE", "ADDRESS", "ZONE", "HOST", "WEIGHT", "LIVENESS", "DRAINING", "RELEASE",
+        ],
+        &rows,
+    )
 }
 
 /// Who wrote a description, as text output names them: the reader, another principal, or
@@ -517,9 +381,13 @@ fn render_schema(report: &DatabaseReport, out: &mut dyn io::Write) -> io::Result
 }
 
 /// Writes `text` as a block below the line `header`: every line of it, the first included,
-/// indented by two spaces and prefixed with `| `, so no line of it starts where an output field
-/// does.
-fn write_block(out: &mut dyn io::Write, header: &str, text: &str) -> io::Result<()> {
+/// indented by two spaces and prefixed with `| `, with control and invisible characters escaped,
+/// so no line of it starts where an output field does.
+///
+/// # Errors
+///
+/// The error `out` returns.
+pub fn write_block(out: &mut dyn io::Write, header: &str, text: &str) -> io::Result<()> {
     writeln!(out, "{header}")?;
     write_lines(out, 0, text)
 }
@@ -554,54 +422,6 @@ fn render_object(
         Some(definition) => write_lines(out, indent, definition),
         None => Ok(()),
     }
-}
-
-/// Writes the metadata an archive holds, as a restore reports it (ADR-0041, point 10).
-///
-/// All of it is the archive's claim, and an archive isn't signed: the description is a block as
-/// [`render_text`] prints one, and the author and creator it names are marked as claims that
-/// are not recorded anywhere. A restore sets the description with no author and the creator is
-/// the principal that restored.
-///
-/// # Errors
-///
-/// The error `out` returns.
-pub fn render_archived_metadata(
-    metadata: &MetadataView,
-    out: &mut dyn io::Write,
-) -> io::Result<()> {
-    match &metadata.description {
-        Some(description) => write_block(out, "archived description:", description)?,
-        None => writeln!(out, "archived description: none")?,
-    }
-    if let Some(by) = &metadata.description_by {
-        writeln!(
-            out,
-            "archived description by: {} (the archive's claim; not recorded)",
-            printable(by)
-        )?;
-    }
-    if let Some(creator) = &metadata.created_by {
-        writeln!(
-            out,
-            "archived creator: {} (the archive's claim; not recorded)",
-            printable(creator)
-        )?;
-    }
-    let labels: Vec<String> = metadata
-        .labels
-        .iter()
-        .map(|(key, value)| format!("{}={}", printable(key), printable(value)))
-        .collect();
-    writeln!(
-        out,
-        "archived labels: {}",
-        if labels.is_empty() {
-            "none".to_owned()
-        } else {
-            labels.join(", ")
-        }
-    )
 }
 
 /// A database's expiry as text output prints it: the time and how long until it, such as
@@ -645,93 +465,6 @@ fn duration(ms: u64) -> String {
     }
 }
 
-/// One member of the fleet, as `node list` reports it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct NodeReport {
-    /// The node's ID.
-    pub node: String,
-    /// The address data clients dial, `host:port`, if the node has one.
-    pub address: Option<String>,
-    /// The zone the node reports, if any.
-    pub zone: Option<String>,
-    /// The host the node reports, if any.
-    pub host: Option<String>,
-    /// The node's weight in placement.
-    pub weight: u32,
-    /// `live` or `down`, as the control plane sees the node's heartbeats.
-    pub liveness: &'static str,
-    /// Whether the node is handing its leases over before it leaves, and gets no new ones.
-    pub draining: bool,
-    /// The release the node runs; a member that reports no software runs 0.3.0 (ADR-0038).
-    pub release: String,
-}
-
-/// `node list`'s result: every member, in node ID order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[non_exhaustive]
-pub struct NodeList {
-    /// The members.
-    pub nodes: Vec<NodeReport>,
-}
-
-impl NodeList {
-    /// The members of `view`, with their liveness and drain state.
-    #[must_use]
-    pub fn from_view(view: &MembershipView) -> Self {
-        let mut nodes: Vec<NodeReport> = view
-            .members()
-            .map(|(member, liveness)| NodeReport {
-                node: member.id().to_string(),
-                address: member.address().map(str::to_owned),
-                zone: member.zone().map(ToString::to_string),
-                host: member.host().map(ToString::to_string),
-                weight: member.weight().get(),
-                liveness: match liveness {
-                    Liveness::Live => "live",
-                    Liveness::Down => "down",
-                },
-                draining: view.is_draining(member.id()),
-                release: member.running().release().to_string(),
-            })
-            .collect();
-        nodes.sort_by(|a, b| a.node.cmp(&b.node));
-        Self { nodes }
-    }
-
-    /// The table `node list` prints: one row per member under `NODE`, `ADDRESS`, `ZONE`, `HOST`,
-    /// `WEIGHT`, `LIVENESS`, `DRAINING` and `RELEASE`, with `-` for what a member doesn't report.
-    #[must_use]
-    pub fn text(&self) -> String {
-        if self.nodes.is_empty() {
-            return "no nodes\n".to_owned();
-        }
-        let absent = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".to_owned());
-        let rows: Vec<[String; 8]> = self
-            .nodes
-            .iter()
-            .map(|node| {
-                [
-                    printable(&node.node),
-                    absent(&node.address),
-                    absent(&node.zone),
-                    absent(&node.host),
-                    node.weight.to_string(),
-                    node.liveness.to_owned(),
-                    if node.draining { "yes" } else { "no" }.to_owned(),
-                    node.release.clone(),
-                ]
-            })
-            .collect();
-        table(
-            [
-                "NODE", "ADDRESS", "ZONE", "HOST", "WEIGHT", "LIVENESS", "DRAINING", "RELEASE",
-            ],
-            &rows,
-        )
-    }
-}
-
 /// A table: `header`, then one line per row, each column padded to its widest cell and separated
 /// by two spaces, with no trailing padding.
 #[must_use]
@@ -762,9 +495,122 @@ pub fn table<const COLUMNS: usize>(header: [&str; COLUMNS], rows: &[[String; COL
     output
 }
 
+/// Why a database's schema is unavailable, when `status` says the primary can't give it now and
+/// the rest of the report still stands: the primary runs a release without the call, or its
+/// engine can't describe itself (`UNIMPLEMENTED`), or it has no primary to ask yet or is failing
+/// over (`FAILED_PRECONDITION`, `UNAVAILABLE`; ADR-0041, amendment 6). `None` for any other
+/// failure, which fails the report.
+#[must_use]
+pub fn schema_unavailable(status: &tonic::Status) -> Option<String> {
+    match status.code() {
+        tonic::Code::Unimplemented | tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
+            Some(status.message().to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// `at` in RFC 3339, UTC, to the millisecond.
+pub(crate) fn rfc3339(at: Timestamp) -> String {
+    i128::from(at.as_millis())
+        .checked_mul(1_000_000)
+        .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .and_then(|time| {
+            time.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| format!("{} ms", at.as_millis()))
+}
+
+/// Writes the metadata an archive holds, as a restore reports it (ADR-0041, point 10).
+///
+/// All of it is the archive's claim, and an archive isn't signed: the description is a block as
+/// [`render_text`] prints one, and the author and creator it names are marked as claims that are
+/// not recorded anywhere. A restore sets the description with no author and the creator is the
+/// principal that restored.
+///
+/// # Errors
+///
+/// The error `out` returns.
+pub fn render_archived_metadata(
+    metadata: &MetadataView,
+    out: &mut dyn io::Write,
+) -> io::Result<()> {
+    match &metadata.description {
+        Some(description) => write_block(out, "archived description:", description)?,
+        None => writeln!(out, "archived description: none")?,
+    }
+    if let Some(by) = &metadata.description_by {
+        writeln!(
+            out,
+            "archived description by: {} (the archive's claim; not recorded)",
+            printable(by)
+        )?;
+    }
+    if let Some(creator) = &metadata.created_by {
+        writeln!(
+            out,
+            "archived creator: {} (the archive's claim; not recorded)",
+            printable(creator)
+        )?;
+    }
+    let labels: Vec<String> = metadata
+        .labels
+        .iter()
+        .map(|(key, value)| format!("{}={}", printable(key), printable(value)))
+        .collect();
+    writeln!(
+        out,
+        "archived labels: {}",
+        if labels.is_empty() {
+            "none".to_owned()
+        } else {
+            labels.join(", ")
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    #[test]
+    fn an_archived_description_is_a_block_and_its_names_are_claims() {
+        let metadata = MetadataView {
+            description: Some("x\nCREATOR: admin\u{1b}[2J".to_owned()),
+            description_by: Some("ops".to_owned()),
+            labels: vec![("purpose".to_owned(), "memory".to_owned())],
+            created_by: Some("ops\u{202E}".to_owned()),
+            created_at: None,
+            expires_at: None,
+            version: 3,
+        };
+        let mut out = Vec::new();
+        render_archived_metadata(&metadata, &mut out).expect("writes to a vector");
+        let printed = String::from_utf8(out).expect("UTF-8");
+        assert_eq!(
+            printed,
+            "archived description:\n  | x\n  | CREATOR: admin\\u{001B}[2J\n\
+             archived description by: ops (the archive's claim; not recorded)\n\
+             archived creator: ops\\u{202E} (the archive's claim; not recorded)\n\
+             archived labels: purpose=memory\n"
+        );
+        let bare = MetadataView {
+            description: None,
+            description_by: None,
+            labels: Vec::new(),
+            created_by: None,
+            ..metadata
+        };
+        let mut out = Vec::new();
+        render_archived_metadata(&bare, &mut out).expect("writes to a vector");
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            "archived description: none\narchived labels: none\n"
+        );
+    }
 
     fn report(description: Option<&str>, by: Option<&str>) -> DatabaseReport {
         DatabaseReport {
@@ -815,7 +661,10 @@ mod tests {
 
     #[test]
     fn no_members_print_no_nodes() {
-        assert_eq!(NodeList { nodes: Vec::new() }.text(), "no nodes\n");
+        assert_eq!(
+            node_list_text(&NodeList { nodes: Vec::new() }),
+            "no nodes\n"
+        );
     }
 
     fn text(report: &DatabaseReport, reader: Option<&str>) -> String {
@@ -845,42 +694,6 @@ mod tests {
         assert!(
             printed.contains("description by: agent-7 (untrusted:"),
             "{printed}"
-        );
-    }
-
-    #[test]
-    fn an_archived_description_is_a_block_and_its_names_are_claims() {
-        let metadata = MetadataView {
-            description: Some("x\nCREATOR: admin\u{1b}[2J".to_owned()),
-            description_by: Some("ops".to_owned()),
-            labels: vec![("purpose".to_owned(), "memory".to_owned())],
-            created_by: Some("ops\u{202E}".to_owned()),
-            created_at: None,
-            expires_at: None,
-            version: 3,
-        };
-        let mut out = Vec::new();
-        render_archived_metadata(&metadata, &mut out).expect("writes to a vector");
-        let printed = String::from_utf8(out).expect("UTF-8");
-        assert_eq!(
-            printed,
-            "archived description:\n  | x\n  | CREATOR: admin\\u{001B}[2J\n\
-             archived description by: ops (the archive's claim; not recorded)\n\
-             archived creator: ops\\u{202E} (the archive's claim; not recorded)\n\
-             archived labels: purpose=memory\n"
-        );
-        let bare = MetadataView {
-            description: None,
-            description_by: None,
-            labels: Vec::new(),
-            created_by: None,
-            ..metadata
-        };
-        let mut out = Vec::new();
-        render_archived_metadata(&bare, &mut out).expect("writes to a vector");
-        assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            "archived description: none\narchived labels: none\n"
         );
     }
 
@@ -924,7 +737,7 @@ mod tests {
     fn json_fields_are_stable_and_absent_values_null() {
         let mut report = report(None, None);
         if let Some(metadata) = report.metadata.as_mut() {
-            metadata.expires_at = Some(rfc3339(Timestamp::from_millis(1_000)));
+            metadata.expires_at = Some("1970-01-01T00:00:01Z".to_owned());
             metadata.expires_in_ms = Some(-5);
         }
         let json = serde_json::to_value(&report).expect("serializes");

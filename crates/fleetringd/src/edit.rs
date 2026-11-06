@@ -10,12 +10,13 @@ use std::io::{Read, Write as _};
 
 use clap::Args;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
+use fleetring_client::output::MetadataReport;
 use fleetring_control::{
     Acks, DatabaseName, DescriptionChange, LabelKey, LabelValue, Labels, MetadataChange,
 };
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{DurabilityChange, ExpiryRequest};
-use fleetringd::report::{MetadataReport, render_metadata};
+use fleetringd::report::{metadata_report, render_metadata};
 use serde::Serialize;
 
 use super::{
@@ -249,7 +250,7 @@ pub(crate) async fn run(args: EditArgs) -> Result<String, Box<dyn Error>> {
             .await;
         match updated {
             Ok(view) => {
-                report.metadata = Some(MetadataReport::from_view(&view, SystemClock.now()));
+                report.metadata = Some(metadata_report(&view, SystemClock.now()));
             }
             Err(status) => {
                 let error = updated_failed(status, if_version);

@@ -8,7 +8,7 @@
 //!   publishes the new state. [`ControlHandle`] submits commands and reads the published state.
 //! - [`ControlService`] serves the `Control` gRPC service over a handle.
 //! - [`ControlClient`] calls the service, retrying and following leader redirects
-//!   ([`not_leader`]).
+//!   ([`not_leader`](fleetring_client::redirect::not_leader)).
 //! - [`Failover`] ticks the state machine on a timer, starts promotions for expired leases, and
 //!   tells each promotion's candidate (ADR-0018). Beside it, a sweep of its own drops databases
 //!   whose expiry has passed (ADR-0041, point 4).
@@ -23,7 +23,6 @@ mod failover;
 mod log;
 mod node;
 mod notices;
-mod redirect;
 mod service;
 
 pub use absent::NoControl;
@@ -35,7 +34,6 @@ pub use node::{
     Committed, ControlHandle, ControlNode, ControlOptions, OpenError, RecoverySummary, StorageIo,
     SubmitError,
 };
-pub use redirect::{LEADER_METADATA_KEY, leader_hint, not_leader};
 pub use service::{
     ControlService, DurabilityDefaults, MIN_EXPIRY, MISSING_DATABASE_KEY, MembershipStream,
     missing_database, rejection_status,

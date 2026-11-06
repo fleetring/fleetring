@@ -133,14 +133,6 @@ const _: () = {
     assert_debug_send_sync::<data::Verification>();
     assert_debug_send_sync::<data::Written>();
     assert_debug_send_sync::<dev::Created>();
-    assert_debug_send_sync::<report::DatabaseReport>();
-    assert_debug_send_sync::<report::MetadataReport>();
-    assert_debug_send_sync::<report::NodeList>();
-    assert_debug_send_sync::<report::NodeReport>();
-    assert_debug_send_sync::<report::PlacementReport>();
-    assert_debug_send_sync::<report::ReplicaReport>();
-    assert_debug_send_sync::<report::SchemaObjectReport>();
-    assert_debug_send_sync::<report::SchemaReport>();
     assert_debug_send_sync::<dev::Detached>();
     assert_debug_send_sync::<dev::DevChecked>();
     assert_debug_send_sync::<dev::DevContextLine>();
