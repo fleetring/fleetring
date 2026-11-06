@@ -1,67 +1,69 @@
 # Agent quickstart
 
-Give an AI agent its own FleetRing databases on a laptop: a dev node, a principal scoped to the agent's names, a first database with a description, labels, and an expiry, and an MCP client that runs `fleetring mcp`. It takes about five minutes. The [skill](SKILL.md) is what the agent reads afterwards.
+Give an AI agent its own FleetRing databases on a laptop with one command: the agent's MCP client runs `fleetring mcp --agent 42`, which starts a dev node if none runs, gives the agent its own principal scoped to its own databases, and serves. The [skill](SKILL.md) is what the agent reads afterwards.
 
-## 1. Start a dev node
+> **Trusted local development.** Agents on this machine can read each other's credentials. FleetRing tokens restrict FleetRing requests, not an agent's process: agents running as the same OS user can read each other's identity files under `~/.fleetring/agents/` and open SQLite files directly, so separate identities and private directories don't isolate them from each other. Secure separation between agents needs an isolated agent launcher and credential broker, which [ADR-0044](../adr/0044-identity-delegation-and-forking-for-agents.md) ("Runtime isolation and the agent launcher") designs, and which isn't part of 0.7.
 
-```sh
-fleetring dev                           # in one terminal; Ctrl-C stops it
-fleetring status                        # in another, through the `dev` context, as admin: "dev mode: one node on loopback, ..."
-```
+## 1. Register the MCP server
 
-`fleetring dev` writes a context named `dev` that points the commands at the node as `admin`, and makes it current unless another context is; its banner says which, and `fleetring switch dev` selects it. `~/.fleetring` holds the node's authority, its configuration, and an `admin` certificate with every scope ([dev mode](../../crates/fleetringd/README.md#dev-mode)). Don't give the agent that certificate.
-
-## 2. Give the agent a principal
-
-The agent acts as its own principal, `agent-42`, with one scope: `admin:agent-42-*`, which lets it create, use, describe, label, list, and drop databases whose names start with `agent-42-`, and nothing else. It needs a certificate naming it and a token carrying the scope; a node refuses a token whose principal differs from the certificate's.
+For Claude Code:
 
 ```sh
-mkdir -m 700 -p ~/.fleetring-agents/agent-42
-fleetring cert client agent-42 --dir ~/.fleetring/tls --ttl 30d
-mv ~/.fleetring/tls/client.agent-42.* ~/.fleetring-agents/agent-42/
-cp ~/.fleetring/tls/ca.crt ~/.fleetring-agents/agent-42/
-fleetring token issue --dir ~/.fleetring/tls --principal agent-42 --scope 'admin:agent-42-*' --ttl 30d \
-  > ~/.fleetring-agents/agent-42/token
-chmod 600 ~/.fleetring-agents/agent-42/token
+claude mcp add fleetring -- fleetring mcp --agent 42 --context dev
 ```
 
-The agent's files move out of `~/.fleetring/tls`, because `fleetring dev` refuses to start from a directory holding files it didn't write. Keep the trailing `-` in the scope: `admin:agent-42*` would also cover `agent-420-memory`, another agent's database, and `token issue` warns about it. Quote the scope so the shell doesn't expand the `*`.
+For another MCP client, print its configuration and paste it in:
+
+```sh
+fleetring agent add 42 --print-config json     # or cursor; `--print-config claude` prints the line above
+```
+
+```json
+{"mcpServers": {"fleetring": {"command": "/usr/local/bin/fleetring", "args": ["mcp", "--agent", "42", "--context", "dev"]}}}
+```
+
+The configuration holds no secret, only the command: `mcp --agent` finds its own credentials. The path is absolute, because GUI MCP clients often lack your shell's `PATH`, and the context is pinned, so that a later `fleetring switch` doesn't move the agent to another fleet. `fleetring agent add 42 --install claude` runs the `claude mcp add` line for you.
+
+`agent add` mints the identity at once, and starts the dev node if none runs; with only the `claude mcp add` line, the first start does both. Add `--read-only` to `agent add` for an agent that only reads: its scope is then `read:agent-42-*`, and the server offers only `db_list`, `db_show`, and `query`.
+
+## 2. What the first start does
+
+When the MCP client starts `fleetring mcp --agent 42` and the `dev` context is selected, or none is and nothing names a connection:
+
+1. **It acquires a node.** If no dev node runs from `~/.fleetring`, it starts one in the background, as `fleetring dev -d` does, writes the `dev` context, and makes it current unless another context is. The node outlives the MCP server; `fleetring dev stop` stops it, and `fleetring dev logs` shows its log.
+2. **It acquires an identity.** If `~/.fleetring/agents/42/` holds none, it checks that `~/.fleetring` is a dev directory (its configuration says `dev = true` and keeps every address on loopback, and its authority is for the fleet `dev`), then mints one from the dev authority:
+   - the principal `agent-42`, with a client certificate valid for a year;
+   - a token scoped `admin:agent-42-*`, valid for 30 days, which lets the agent create, use, describe, label, list, and drop databases whose names start with `agent-42-`, and nothing else;
+   - in `~/.fleetring/agents/42/`, a directory only you can read (`0700`): `ca.crt`, `client.agent-42.crt` and `client.agent-42.key`, `token`, and `identity.toml`, which holds no secret. Every file is `0600`.
+3. **It serves** MCP on stdin and stdout as `agent-42`, and says on stderr whom it serves as, on which context, and when the certificate and token expire.
+
+Later starts reuse the node and the identity and regenerate nothing. In dev mode only, a start renews the token once fewer than 7 days remain, and the certificate once fewer than 30 do, and revokes the old token. A session that outlives its token gets a tool error that says to restart the MCP server.
+
+Keep the trailing `-` in the scope: `admin:agent-42*` would also cover `agent-420-memory`, another agent's database, which is why agent IDs are lowercase letters, digits, and `_`, never `-` or `.`. `fleetring agent show 42` prints the identity, its files, and when the token must be renewed by; `fleetring agent list` lists every agent of the context.
 
 ## 3. Try it from the shell, as the agent
 
+`--agent 42` acts as the agent's identity on any command, so you see what the agent sees. It only uses an identity that exists; only `mcp --agent`, `agent add`, and `agent renew` mint.
+
 ```sh
-fleetring context add agent-42 --control 127.0.0.1:7400 --tls-dir ~/.fleetring-agents/agent-42 \
-  --as agent-42 --token-file ~/.fleetring-agents/agent-42/token
-fleetring switch agent-42               # the commands below act as agent-42
-
-fleetring db create agent-42-memory --label purpose=memory --label agent=42 --description "Long-term memory for agent 42.
+fleetring db create agent-42-memory --agent 42 --label purpose=memory --label agent=42 --description "Long-term memory for agent 42.
 Schema v1: facts (subject, predicate) upserts."
-fleetring db create agent-42-scratch --label purpose=scratch --label agent=42 --expires-in 2h
+fleetring db create agent-42-scratch --agent 42 --label purpose=scratch --label agent=42 --expires-in 2h
 
-fleetring db exec agent-42-memory "CREATE TABLE IF NOT EXISTS facts (subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (subject, predicate))"
-fleetring db exec agent-42-memory "INSERT INTO facts VALUES (?, ?, ?, ?) ON CONFLICT (subject, predicate) DO UPDATE SET object = excluded.object, updated_at = excluded.updated_at" user:ana prefers "short answers" 1767225600000
-fleetring db query agent-42-memory "SELECT predicate, object FROM facts WHERE subject = ?" user:ana
+fleetring db exec agent-42-memory --agent 42 "CREATE TABLE IF NOT EXISTS facts (subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (subject, predicate))"
+fleetring db exec agent-42-memory --agent 42 "INSERT INTO facts VALUES (?, ?, ?, ?) ON CONFLICT (subject, predicate) DO UPDATE SET object = excluded.object, updated_at = excluded.updated_at" user:ana prefers "short answers" 1767225600000
+fleetring db query agent-42-memory --agent 42 "SELECT predicate, object FROM facts WHERE subject = ?" user:ana
 
-fleetring db list --prefix agent-42- --label purpose=memory
-fleetring db show agent-42-memory       # placement, description, labels, creator, expiry, schema
-fleetring db edit agent-42-scratch --expires-in 4h
-fleetring db create agent-43-memory     # refused: outside the agent's scope
-fleetring db drop agent-42-scratch --yes
+fleetring db list --agent 42 --prefix agent-42- --label purpose=memory
+fleetring db show agent-42-memory --agent 42      # placement, description, labels, creator, expiry, schema
+fleetring db edit agent-42-scratch --agent 42 --expires-in 4h
+fleetring db create agent-43-memory --agent 42    # refused: outside the agent's scope
+fleetring db drop agent-42-scratch --agent 42 --yes
 ```
 
-`fleetring switch dev` (or `switch -`) goes back to acting as admin. The context stores the token file's path, never the token. `db show` prints the description as an indented block, marked as written by `agent-42 (you)`, and the schema with each table's row count. `db create agent-43-memory` fails with `PERMISSION_DENIED`, naming the action and the database.
+Without `--agent`, the commands act as the `dev` context's `admin`. `FLEETRING_AGENT=42` does the same as `--agent 42` for a shell. `db show` prints the description as an indented block, marked as written by `agent-42 (you)`, and the schema with each table's row count. `db create agent-43-memory` fails with `PERMISSION_DENIED`, naming the action and the database.
 
-## 4. Register `fleetring mcp` with an MCP client
-
-`fleetring mcp` is an MCP server on stdio that acts as one principal, found as every command finds it. Most MCP clients take a JSON configuration like this one; put in your own paths and the token from `~/.fleetring-agents/agent-42/token`:
-
-```json
-{"mcpServers": {"fleetring": {"command": "fleetring", "args": ["mcp"], "env": {"FLEETRING_CONTROL": "127.0.0.1:7400", "FLEETRING_TLS_DIR": "/home/me/.fleetring-agents/agent-42", "FLEETRING_AS": "agent-42", "FLEETRING_TOKEN": "<token>"}}}}
-```
-
-The agent needs both its own client certificate, which `FLEETRING_TLS_DIR` and `FLEETRING_AS` pick, and the token. `FLEETRING_TOKEN` holds a secret, so keep the configuration file private to you (`chmod 600`), and don't commit it. Add `"--read-only"` to `args` for an agent that only reads: the server then offers only `db_list`, `db_show`, and `query`. `--max-result-bytes <n>` caps each result's JSON (256 KiB by default, from 64 KiB to 4 MiB). The [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the tools, their results and errors, and how the server marks untrusted text.
-
-## 5. First tool calls
+## 4. First tool calls
 
 Ask the agent to do the same through the tools. The calls look like this:
 
@@ -73,10 +75,20 @@ Ask the agent to do the same through the tools. The calls look like this:
 {"tool": "db_drop", "arguments": {"name": "agent-42-task-7f3a", "confirm": "agent-42-task-7f3a"}}
 ```
 
-Then give the agent the [skill](SKILL.md): load it as a skill if the client supports skills, or put it in the agent's instructions. It covers when to create a database rather than a table, naming, labels, descriptions, expiry, and SQL patterns for memory, task state, and full-text search.
+Then give the agent the [skill](SKILL.md): load it as a skill if the client supports skills, or put it in the agent's instructions. It covers when to create a database rather than a table, naming, labels, descriptions, expiry, and SQL patterns for memory, task state, and full-text search. `--max-result-bytes <n>` after `mcp` caps each result's JSON (256 KiB by default, from 64 KiB to 4 MiB); the [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the tools, their results and errors, and how the server marks untrusted text.
+
+## Another fleet
+
+Minting is dev-mode-only: it needs the dev authority on this machine, on loopback. Against any other context, `--agent 42` uses an identity that exists, and fails, minting nothing, with the commands that create one. Mint it where the fleet's authority is, with a context for the fleet:
+
+```sh
+fleetring agent add 42 --context prod --authority /secure/prod-ca      # the directory with ca.crt and ca.key
+```
+
+It writes the identity to `~/.local/share/fleetring/agents/prod/42/` (`$XDG_DATA_HOME/fleetring/agents/<context>/`), with the certificate valid for 30 days (`--ttl` sets it) and the token as long, at most 30 days. Copy that directory to the same path on the agent's machine, keeping it private, and register `fleetring mcp --agent 42 --context prod`. Nothing renews it by itself there: run `fleetring agent renew 42 --context prod --authority <dir>` before the token expires, and copy the directory again. `fleetring agent remove 42 --context prod` revokes the token and deletes the directory.
 
 ## Dev mode notes
 
 - **One copy of each database.** A dev node holds one replica, its default replication factor; a fleet's default is 3, and the same commands and tools work against it.
 - **Expiry still drops.** An expired database is dropped when the node next runs, even if the node was stopped when the time passed. A dev node has no archive unless you configure one, so an expired or dropped database is gone.
-- **The agent gets a token, not the admin certificate.** The admin certificate in `~/.fleetring` has every scope. Give each agent its own principal and a prefix scope, and revoke a token you no longer trust with `fleetring token revoke --token-id <id>`, the ID `token issue` printed.
+- **The agent gets its own identity, never the admin certificate.** The `admin` certificate in `~/.fleetring/tls` has every scope. `fleetring agent remove 42` revokes the agent's token and deletes its directory; `fleetring agent renew 42` reissues both credentials now and revokes the old token.

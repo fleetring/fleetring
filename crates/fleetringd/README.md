@@ -53,7 +53,7 @@ fleetring cert client admin --dir /etc/fleetring/tls
 export FLEETRING_TLS_DIR=/etc/fleetring/tls   # or pass --ca, --cert, and --key to each command
 ```
 
-`cert init` writes `ca.crt` and `ca.key`; the key issues every certificate and belongs on no node. `cert node` writes `node.node-1.crt` and `node.node-1.key`, naming the node's ID and the addresses (IP addresses or DNS names) it is reached at; `cert client` writes `client.admin.crt` and `client.admin.key`, naming the principal the commands act as. The commands read `$FLEETRING_TLS_DIR/ca.crt`, `client.crt`, and `client.key`. To act as another principal, name it once with `--as <principal>` (or `FLEETRING_AS`), which reads `client.<principal>.crt` and `client.<principal>.key` from that directory instead, and fails naming both files if either is missing. `--ca`, `--cert`, and `--key` (or `FLEETRING_CA`, `FLEETRING_CERT`, and `FLEETRING_KEY`) name a file outright. For each file the first of these wins: its flag, its environment variable, `--as` or `FLEETRING_AS`, and the default in `FLEETRING_TLS_DIR`; `--help` repeats the order. Node certificates last 30 days and client certificates 7 by default (`--ttl 90d`); a node reloads its files when they change, so renewing one needs no restart, and `ca.crt` may hold two authority certificates while a rotation overlaps. Certificates from Vault, cert-manager, or SPIRE work the same way: the daemon only needs a certificate, its key, and the authority certificates to trust.
+`cert init` writes `ca.crt` and `ca.key`; the key issues every certificate and belongs on no node. `cert node` writes `node.node-1.crt` and `node.node-1.key`, naming the node's ID and the addresses (IP addresses or DNS names) it is reached at; `cert client` writes `client.admin.crt` and `client.admin.key`, naming the principal the commands act as; with `--out <dir>`, it writes them and a copy of `ca.crt` into that directory instead, created private to you, a complete TLS directory to hand to a client. If `ca.crt` is missing beside `ca.key`, `cert` and `token issue` say how to restore it. The commands read `$FLEETRING_TLS_DIR/ca.crt`, `client.crt`, and `client.key`. To act as another principal, name it once with `--as <principal>` (or `FLEETRING_AS`), which reads `client.<principal>.crt` and `client.<principal>.key` from that directory instead, and fails naming both files if either is missing. `--ca`, `--cert`, and `--key` (or `FLEETRING_CA`, `FLEETRING_CERT`, and `FLEETRING_KEY`) name a file outright. For each file the first of these wins: its flag, its environment variable, `--as` or `FLEETRING_AS`, and the default in `FLEETRING_TLS_DIR`; `--help` repeats the order. Node certificates last 30 days and client certificates 7 by default (`--ttl 90d`); a node reloads its files when they change, so renewing one needs no restart, and `ca.crt` may hold two authority certificates while a rotation overlaps. Certificates from Vault, cert-manager, or SPIRE work the same way: the daemon only needs a certificate, its key, and the authority certificates to trust.
 
 Write a configuration file. This one runs a one-node fleet, with its databases in `/var/lib/fleetring`:
 
@@ -195,35 +195,26 @@ The subcommands take `--control <host:port>`, the address of the node that runs 
 
 `fleetring mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io) on stdin and stdout, so that an agent's MCP client can create, find, use, describe, and drop databases ([ADR-0041](https://github.com/fleetring/fleetring/blob/main/docs/adr/0041-agent-kit-metadata-expiry-and-mcp.md), point 9). The client starts it as a command and talks newline-delimited JSON-RPC to it; stdout carries the protocol and nothing else, and logs go to stderr. It runs until the client closes stdin. There is no network listener: a remote agent uses the gRPC client, or the router once FR-066 ships it.
 
-**One principal.** The server acts as the principal its credentials name, found exactly as every other command finds them: `--token` or `FLEETRING_TOKEN`; `--as` or `FLEETRING_AS`; `--cert`, `--key`, and `--ca`, or their variables; `FLEETRING_TLS_DIR`; and `--control`, `--config`, or `FLEETRING_CONTROL`. It never takes a credential or a principal from the client: tool inputs refuse unknown fields, and none of them names one. Every tool call is an ordinary call to the fleet, which the nodes authorize against that principal's scopes, so a token scoped to `admin:agent-42-*` reaches `agent-42-*` databases and is refused everything else with `permission_denied`. The token rule is the same as for any client: the certificate the server connects with must name the token's principal.
+**One principal.** The server acts as the principal its credentials name, found exactly as every other command finds them: `--agent` or `FLEETRING_AGENT`; `--token` or `FLEETRING_TOKEN`; `--as` or `FLEETRING_AS`; `--cert`, `--key`, and `--ca`, or their variables; `FLEETRING_TLS_DIR`; a context; and `--control`, `--config`, or `FLEETRING_CONTROL`. It never takes a credential or a principal from the client: tool inputs refuse unknown fields, and none of them names one. Every tool call is an ordinary call to the fleet, which the nodes authorize against that principal's scopes, so a token scoped to `admin:agent-42-*` reaches `agent-42-*` databases and is refused everything else with `permission_denied`. The token rule is the same as for any client: the certificate the server connects with must name the token's principal.
 
-To give an agent on a dev node its own databases, issue it a certificate and a token scoped to its prefix, and register the server with its MCP client. Never hand an agent the dev node's `admin` certificate, which has every scope.
+**Agents set themselves up** (ADR-0043, point 8). `fleetring mcp --agent 42` is the whole setup on a laptop. With the `dev` context selected, or none and nothing naming a connection, it starts a dev node in the background if none runs (as `fleetring dev -d` does), mints the agent's identity on first use, and serves as `agent-42`:
 
-```sh
-fleetring cert client agent-42 --dir ~/.fleetring/tls
-fleetring token issue --dir ~/.fleetring/tls --principal agent-42 --scope 'admin:agent-42-*' --ttl 30d
-```
+- the identity is the principal `agent-42`, a certificate valid for a year, and a token scoped `admin:agent-42-*`, valid for 30 days, signed by the dev authority after a read-only check that `~/.fleetring` is a dev directory (`dev = true`, every address on loopback, the authority for the fleet `dev`);
+- it lives in `~/.fleetring/agents/42/` (`0700`): `ca.crt`, `client.agent-42.crt` and `.key`, `token`, and `identity.toml`, which holds no secret; every file is `0600`;
+- later starts reuse it, and renew the token once fewer than 7 days remain and the certificate once fewer than 30 do, revoking the old token;
+- start-up says on stderr whom it serves as, on which context, and when the certificate and token expire.
 
-The JSON that Claude Code reads from a project's `.mcp.json`, and Cursor from `.cursor/mcp.json` or `~/.cursor/mcp.json`; other clients that start stdio servers take the same command, arguments, and environment:
+Register it with Claude Code as `claude mcp add fleetring -- fleetring mcp --agent 42 --context dev`, or print another client's configuration with `fleetring agent add 42 --print-config json` (or `cursor`, or `claude`); `--install claude` runs `claude mcp add` for you. The configuration holds no secret, only the command, with this binary's absolute path and the context pinned; Claude Code reads it from a project's `.mcp.json`, and Cursor from `.cursor/mcp.json` or `~/.cursor/mcp.json`:
 
 ```json
-{
-  "mcpServers": {
-    "fleetring": {
-      "command": "fleetring",
-      "args": ["mcp"],
-      "env": {
-        "FLEETRING_CONTROL": "127.0.0.1:7400",
-        "FLEETRING_TLS_DIR": "/home/me/.fleetring/tls",
-        "FLEETRING_AS": "agent-42",
-        "FLEETRING_TOKEN": "<the token>"
-      }
-    }
-  }
-}
+{"mcpServers": {"fleetring": {"command": "/usr/local/bin/fleetring", "args": ["mcp", "--agent", "42", "--context", "dev"]}}}
 ```
 
-The values are what `~/.fleetring/env` sets, with the agent's principal in place of `admin`, and the token. Claude Code also registers it from the command line: `claude mcp add fleetring --env FLEETRING_CONTROL=127.0.0.1:7400 --env FLEETRING_TLS_DIR=$HOME/.fleetring/tls --env FLEETRING_AS=agent-42 --env FLEETRING_TOKEN=<the token> -- fleetring mcp`. The token is a secret: keep the file that holds it private, and out of version control. `--token-file <path>` (or `FLEETRING_TOKEN_FILE`, or a context's `token_file`) reads the token from a file instead.
+Minting is dev-mode-only. Against any other context, `--agent 42` uses an identity that exists, from `$XDG_DATA_HOME/fleetring/agents/<context>/42/`, and otherwise fails, minting nothing, with the commands that create one: `fleetring agent add 42 --context prod --authority <dir with ca.key>`, run where the fleet's authority is, and a copy of the directory it writes. `fleetring agent list`, `show`, `renew`, and `remove` manage identities; `remove` revokes the token and deletes the directory. `--agent <id>` works on every client command, so `fleetring db list --agent 42` shows what the agent sees. Agent IDs are 1 to 32 lowercase letters, digits, and `_`.
+
+**Trusted local development.** Agents on this machine can read each other's credentials: they run as the same OS user, so separate identities and private directories don't isolate them, and an agent can open another's SQLite files directly. The server says so at start, and `agent add` does too. Secure separation between agents needs an isolated agent launcher, which ADR-0044 designs and 0.7 doesn't ship. Never hand an agent the dev node's `admin` certificate, which has every scope.
+
+Without `--agent`, the server takes the usual flags, variables, and context; `--token-file <path>` (or `FLEETRING_TOKEN_FILE`, or a context's `token_file`) reads a token from a file, which keeps it out of an MCP client's configuration.
 
 **Tools.** Inputs are JSON objects that refuse unknown fields; database names and labels are checked by the same rules as the command line's.
 
@@ -265,6 +256,8 @@ A principal gets its scopes in one of two ways:
 - **Bearer token.** `fleetring token issue --principal <name> --scope <scope>… --ttl <duration> --dir <authority dir>` signs a token (an Ed25519 JWT whose header names the signing key in `kid`, with the claims `iss`, `sub`, `jti`, `iat`, `nbf`, `exp`, and `fleetring.scopes`) with the authority's key, valid one hour by default and 30 days at most; nodes refuse a token that lasts longer from `nbf` to `exp`, whatever minted it. A client sends it as `authorization: Bearer <token>` (`--token` or `FLEETRING_TOKEN` on the command line), and the request then acts with the token's scopes alone. Nodes verify it with the trusted `ca.crt`, with no call to the control plane, and refuse an expired, tampered, or revoked token with `UNAUTHENTICATED`. The certificate on the same connection must name the same principal, unless its `[[principal]]` entry sets `forward_tokens = true`, as a router that relays its callers' tokens does.
 
 `fleetring token revoke --token-id <id>` (the ID `token issue` prints) or `--key-id <kid>` adds a token, or every token a signing key issued, to a denylist the control plane keeps; data nodes receive it with every heartbeat reply, so each refuses the token within one heartbeat interval. A revoked token's entry is forgotten once the token would have expired anyway.
+
+**Reserved names.** A principal name that starts with `agent-` and contains `.` (`agent-42.c7`) is reserved for delegated agents (ADR-0044, point 1.8): `cert client` and `token issue` refuse to issue one, a `[[principal]]` entry or an `[admin] scrapers` name that is one fails validation at start, and a node refuses a client certificate or a token that names one with `UNAUTHENTICATED`. Reissue such an identity under another name; dotted names that don't start with `agent-`, such as `workload.prod`, keep working. The scope words `fork` and `grant`, alone or as an action (`fork:<pattern>`), are reserved for delegation, and every parser refuses them, a node's included, so a token carrying one is refused. A new database's name may not start with `_fleetring`, which FleetRing keeps for its own databases.
 
 Each request a principal makes is logged at debug on the `fleetringd::audit` target, and each refusal as a warning, with the principal, the credential (`certificate`, or `token:<id>`), the action, the database, and the RPC; never the token itself. A refused token's line names its ID whenever the token's signature verified (a revoked, expired, or mismatched token), so the ID `token revoke` takes is in the log; a token that never verified is logged as `token`, since nothing in it can be believed.
 
