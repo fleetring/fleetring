@@ -278,7 +278,7 @@ One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, re
 
 ### Delegation
 
-*Planned* (ADR-0044). A holder handing a narrower copy of its token to another holder, offline and without the authority: it appends a block to its biscuit token that names the new holder's principal, its parent, and its holder key, with scopes and an expiry that can only narrow. It needs the `grant` action. A *delegated token* is one with such a block; *attenuation* is appending a block that narrows without naming a new holder.
+*Planned* (ADR-0044). An agent handing a narrower copy of its token to a child, offline and without the authority: it appends a block to its biscuit token that names the child's principal (its own, `.`, one segment), itself as parent, and the child's holder key, with scopes and an expiry that can only narrow, and signs the block with its own holder key as a biscuit third-party block, so copied token bytes can't delegate. It needs the `grant` action, and FleetRing's own verifier, not biscuit's Datalog, enforces it. A *delegated token* is one with such a block; *attenuation* is appending a block that narrows without naming a new holder.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** none yet; the token vocabulary is specified in `docs/spec/tokens-v1.md` when built. **CLI:** none yet.
@@ -466,7 +466,7 @@ Who holds a lease: for a database lease, the primary; for a keyed lease, the nam
 
 ### Holder key
 
-*Planned* (ADR-0044). The Ed25519 key a delegated token is bound to: the holder generates it on its own machine, the delegation block names its public key, and the holder presents it as a self-signed client certificate. A node accepts the token only on a connection with that key, or through a relay with `forward_tokens` for a bearer delegation.
+*Planned* (ADR-0044). The Ed25519 key a token is bound to: a root agent's is its certificate's key; a child generates its own on its machine, its parent's delegation block names the public key, and the child presents it as a self-signed client certificate, which a node accepts only with `[tls] accept_holder_keys` on and never reads a name from. A node accepts the token only on a connection that proves that key, or, for a bearer delegation, through a relay with `forward_tokens`. Delegating from a token needs a signature by its holder key.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet.
@@ -610,7 +610,7 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 
 ### Organization
 
-*Planned* (ADR-0044). A namespace of principals and databases in a fleet that serves several: its databases are under `<org>/`, its principals are named `<org>.<name>`, and its administrators edit its groups and access roles. A fleet that serves one organization needs none. `org-` in a database name is the organization-wide tier.
+*Planned* (ADR-0044). A namespace of principals and databases in a fleet that serves several: its databases are under `<org>/`, its principals are named `<org>_<name>` (never with `.`, which is reserved for lineage), and its administrators edit its groups and access roles. A fleet that serves one organization needs none. `org-` in a database name is the organization-wide tier.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** none yet. **CLI:** none yet.
@@ -642,7 +642,7 @@ A copy of a database that a data node keeps on disk, closed, because the control
 
 ### Package
 
-*Planned* (ADR-0044). A database a publisher releases in versions for others to read or fork. A *package version* is described by a *package manifest*: the publisher, the package, the version, the engine, the digests of its files, its position and chain hash, and the previous version's manifest digest, signed by the publisher's key and verifiable offline with that key alone. "Verified" means the publisher's identity, never the content's truth or safety, and a package's content is untrusted data.
+*Planned* (ADR-0044). A database a publisher releases in versions for others to read or fork. A *package version* is described by a *package manifest*: the publisher, the package, the version, the engine, the digests of its files, its position and chain hash, and the previous version's manifest digest, signed by the publisher's key and verifiable offline with that key alone. Each manifest has a sequence that only grows and an expiry, and a publisher may sign a *latest statement*, valid for a day at most, naming its newest manifests, so readers detect rollback and freeze. "Verified" means the publisher's identity, never the content's truth or safety, and a package's content is untrusted data.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** none yet. **CLI:** none yet.
