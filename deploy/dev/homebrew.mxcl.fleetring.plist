@@ -8,6 +8,9 @@
   and the log paths, then run:
 
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/homebrew.mxcl.fleetring.plist
+
+  Stop it with `brew services stop fleetring` (or `launchctl bootout` for a copy without
+  Homebrew); `fleetring dev stop` refuses a node launchd runs.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

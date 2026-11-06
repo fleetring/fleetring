@@ -25,6 +25,19 @@ The node serves gRPC on `127.0.0.1:7400` and its admin listener on `127.0.0.1:74
 
 Every start writes a context named `dev` (the node's address, `~/.fleetring/tls`, `as = "admin"`) and makes it current unless another context is; the banner says which (`context    dev (current)`), and `fleetring switch dev` selects it otherwise. A `dev` context you made yourself is left alone. `~/.fleetring/env`, for scripts and CI, sets `FLEETRING_CONTROL` (the control address, which `--control` and `--config` override), `FLEETRING_TLS_DIR`, and `FLEETRING_AS=admin`; dev mode rewrites it at every start. `status` against a dev node starts with `dev mode: one node on loopback, for development only`, and doesn't warn that its one-node ring has fewer nodes than a fleet's replication factor. A dev node holds one copy of each database, so a larger `--replication-factor` leaves writes short of their quorum; `db create` accepts it and warns.
 
+### Running in the background
+
+`fleetring dev -d` starts the same node in the background and returns once it is ready, so one terminal is enough:
+
+```sh
+fleetring dev -d              # returns when the node answers; `dev node already running (pid N)` if it does
+fleetring dev status          # running or not, with its PID, address, release, log and context; -o json for scripts
+fleetring dev logs -f         # follows ~/.fleetring/fleetring.log until Ctrl-C
+fleetring dev stop            # drains the node and waits until it has exited
+```
+
+The node's output goes to `<dir>/fleetring.log` (`0600`), which rotates when a start finds it over 16 MiB. If the node exits before it is ready, `dev -d` fails with the log's path and its last lines. `dev stop` and `fleetring stop --data-dir <dir>` (or `--config <file>`, for a node started with `serve`) send the node SIGTERM through its process file and wait for it to drain, 2m by default (`--timeout`); they never kill it. They refuse a node that systemd or launchd runs, naming that supervisor's own stop command (`systemctl stop <unit>`, `brew services stop fleetring`), unless `dev -d` started it. On Windows, `dev -d`, `dev stop` and `stop` aren't supported yet: run `fleetring dev` in a terminal and stop it with Ctrl-C.
+
 To give an AI agent its own principal and databases on a dev node, follow the [agent quickstart](https://github.com/fleetring/fleetring/blob/main/docs/agents/quickstart.md).
 
 To run it at login, [`deploy/dev/`](https://github.com/fleetring/fleetring/tree/main/deploy/dev) has a Homebrew `service do` block (`homebrew-service.rb`, with the launchd agent it becomes) and a systemd user unit, `fleetring-dev.service`. The authority's key and the admin key sit unencrypted in the directory: dev mode is for local development only ([SECURITY.md](https://github.com/fleetring/fleetring/blob/main/SECURITY.md#dev-mode)).
