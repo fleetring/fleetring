@@ -194,3 +194,11 @@ gh attestation verify fleetringd-X.Y.Z-<target>.tar.gz --repo fleetring/fleetrin
 gh attestation verify oci://ghcr.io/fleetring/fleetringd:X.Y.Z --repo fleetring/fleetring
 ```
 ````
+
+### 0.7.0: upgrading across the rename
+
+A draft for 0.7.0's notes, under "Breaking changes" (ADR-0043, points 1 and 3). The binary is `fleetring`; `fleetringd` stays a name for it until 1.0, and `fleetringd --config <file>`, without `serve`, still runs a node, with a warning.
+
+- **Upgrade from 0.6 as usual,** with `fleetringd upgrade` or `install.sh`. The archives keep their names and hold the binary under both names, so 0.6's `upgrade` installs 0.7 over `fleetringd` and restarts the node in place on its 0.6 arguments.
+- **Add the new name.** A host upgraded by 0.6's `upgrade` has no `fleetring`. Add it with `ln -s fleetringd "$(dirname "$(command -v fleetringd)")/fleetring"`, or rerun `install.sh`. A 0.7 `upgrade` or `upgrade --rollback` adds the link itself, and says so. On such a host the real file stays `fleetringd`, and the previous binary is kept as `fleetringd.previous`.
+- **Keep service units on `fleetringd --config <file>`** until no node needs to roll back to 0.6. 0.6 doesn't know `serve`. A 0.7 `upgrade --rollback`, or `upgrade --version` with a release before 0.7, refuses to install it over a node started with `serve`, and without a running node to check, it asks, or needs `--yes`. But the 0.6 binary kept as `fleetringd.previous` can't check: `fleetringd.previous upgrade --rollback` installs 0.6 anyway, and a unit that runs `fleetring serve` then fails to start, and its supervisor restarts it in a loop. After switching a unit to `fleetring serve`, rolling back to 0.6 requires reverting the unit to `fleetringd --config` first.
