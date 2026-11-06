@@ -576,6 +576,11 @@ const SERVE_LINE: (u64, u64) = (0, 7);
 
 /// Whether `release` knows `serve`: it is 0.7 or later, or on this build's own line, since this
 /// build knows it even before its release sets its version.
+///
+/// The own-line clause exists only while `crates/fleetringd/Cargo.toml` still says 0.6.0, so that
+/// a build before the 0.7.0 bump can reinstall itself over a node it runs with `serve`. From the
+/// bump on it adds nothing; 0.7.0's release removes it (`docs/plans/0.7.0-cli.md`, A.7), and the
+/// tests' 0.5 releases may then be 0.6.
 fn knows_serve(release: &Release) -> bool {
     release.line() >= SERVE_LINE || release.line() >= this_release().line()
 }
