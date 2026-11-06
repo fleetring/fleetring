@@ -1,4 +1,5 @@
-# An example fleetringd configuration, and the one the container image starts with (FR-034).
+# An example node configuration, and the one the container image starts with (FR-034). Run it
+# with `fleetring serve --config <this file>`. The file keeps its 0.6 name (ADR-0043, point 1.7).
 #
 # It runs a one-node fleet: the control role and the data role in one process. To change it,
 # mount your own file over /etc/fleetring/fleetringd.toml, or override single fields with flags:
@@ -22,7 +23,7 @@ role = "both"
 # authenticated or encrypted, so this is for local experiments only.
 # insecure_plaintext = true
 
-# Dev mode (ADR-0039), which `fleetringd dev` writes into its own configuration: the daemon then
+# Dev mode (ADR-0039), which `fleetring dev` writes into its own configuration: the daemon then
 # refuses any listen, advertise, control, or admin address that isn't loopback, any role but
 # `both`, and plaintext. Never set it on a node of a real fleet.
 # dev = true
@@ -32,9 +33,9 @@ role = "both"
 # and trusts the authority certificates in `ca`; clients and other nodes must present certificates
 # from the same authority. Create them with the built-in authority, on a machine that keeps ca.key:
 #
-#   fleetringd cert init --fleet home --dir ./tls
-#   fleetringd cert node node-1 --addresses 192.0.2.10,node-1.example --dir ./tls
-#   fleetringd cert client admin --dir ./tls
+#   fleetring cert init --fleet home --dir ./tls
+#   fleetring cert node node-1 --addresses 192.0.2.10,node-1.example --dir ./tls
+#   fleetring cert client admin --dir ./tls
 #
 # then copy ca.crt, node.node-1.crt, and node.node-1.key to the node (for the container image,
 # mount them under /etc/fleetring/tls). Keep ca.key off every node. The files are re-read when they
@@ -72,7 +73,7 @@ id = "node-1"
 # its durability from its next epoch on. The control node reads these; a data node ignores them.
 #
 # `replication_factor` is how many replicas a database has, the primary included: 3 by default,
-# at least 1. `fleetringd dev` sets it to 1. A database created with a larger factor than the
+# at least 1. `fleetring dev` sets it to 1. A database created with a larger factor than the
 # fleet has data nodes is accepted, with a warning, and gains replicas as nodes join.
 # replication_factor = 3
 #
@@ -90,7 +91,7 @@ id = "node-1"
 # min_replicas = 2
 
 # [membership]
-# What a graceful stop (SIGINT, SIGTERM, `fleetringd stop`) does with the node's membership.
+# What a graceful stop (SIGINT, SIGTERM, `fleetring stop`) does with the node's membership.
 #   "leave"   the default: the node drains first, handing each database it is primary for to
 #             the most advanced follower so clients see a short redirect instead of a failover,
 #             then leaves the fleet and the ring is rebuilt without it
@@ -201,8 +202,9 @@ id = "node-1"
 # `allow_http`            false; true permits an http:// endpoint, for a local MinIO only
 #
 # An archive holds every row of the databases it names, unencrypted: give the bucket the care
-# the nodes' disks get. Restore with `fleetringd db restore <new> --archive <name> --from <db>`,
-# or offline, with no fleet, with `fleetringd archive restore --config <this file> ...`.
+# the nodes' disks get. Restore with `fleetring db restore <new> --archive <name> --from <db>`,
+# or offline, with no fleet, with
+# `fleetring archive restore <db> --to <dir> --config <this file> --archive <name>`.
 #
 # name = "backups"
 # databases = ["*"]
@@ -235,7 +237,7 @@ id = "node-1"
 # itself. To scrape or probe from outside, set `listen` to a reachable address and either
 #   tls = true              serve HTTPS with this node's [tls] certificate; `/metrics` then needs
 #                           a client certificate whose principal `scrapers` lists (issue one with
-#                           `fleetringd cert client prometheus`), and the probes answer anyone
+#                           `fleetring cert client prometheus`), and the probes answer anyone
 #   allow_plaintext = true  serve plaintext to anyone who can connect, for a network you control
 #                           (a pod network behind a network policy); the daemon warns at every start
 # A non-loopback `listen` with neither fails validation.
@@ -266,10 +268,10 @@ id = "node-1"
 #
 # An application usually connects with its own certificate and a short-lived token instead:
 #
-#   fleetringd token issue --principal notes-app --scope write:notes --ttl 1h --dir ./tls
+#   fleetring token issue --principal notes-app --scope write:notes --ttl 1h --dir ./tls
 #
 # The token carries its scopes, so `notes-app` needs no entry here. A request with a token acts
-# with the token's scopes alone; `fleetringd token revoke --token-id <id>` refuses it on every node
+# with the token's scopes alone; `fleetring token revoke --token-id <id>` refuses it on every node
 # within one heartbeat interval.
 [[principal]]
 name = "admin"
