@@ -30,7 +30,7 @@ pub use authority::{
 pub use conn::{Accepted, Conn, HandshakeError, Raw};
 pub(crate) use conn::{HANDSHAKE_TIMEOUT, peer_of};
 pub use identity::{Identity, IdentityError};
-pub use names::{FleetName, NameError, Principal, SubjectUri};
+pub use names::{AGENT_PREFIX, FleetName, NameError, Principal, SubjectUri};
 
 /// Who a connection authenticated as.
 #[derive(Debug, Clone, PartialEq, Eq)]

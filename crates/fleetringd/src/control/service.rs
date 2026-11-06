@@ -621,16 +621,30 @@ fn creator<T>(request: &Request<T>) -> Result<Option<PrincipalName>, Status> {
     }
 }
 
-/// Checks a new database's name at the request boundary: it may hold no character a person
-/// reading it can't see, the format characters (Unicode `Cf`, by the fixed table descriptions
-/// use, which takes in the bidirectional controls and the zero-width characters) and the line
-/// and paragraph separators (ADR-0041, amendment 5). `DatabaseName` itself accepts them, and so
-/// does `apply`, so a log that holds such a name still replays.
+/// The prefix of the database names FleetRing keeps for its own databases (ADR-0044, the
+/// `_fleetring/identity` database). It is a namespace of databases, apart from the SQLite
+/// adapter's `_fleetring_*` tables inside each one.
+pub(crate) const RESERVED_DATABASE_PREFIX: &str = "_fleetring";
+
+/// Checks a new database's name at the request boundary: it may not start with
+/// [`RESERVED_DATABASE_PREFIX`], and may hold no character a person reading it can't see, the
+/// format characters (Unicode `Cf`, by the fixed table descriptions use, which takes in the
+/// bidirectional controls and the zero-width characters) and the line and paragraph separators
+/// (ADR-0041, amendment 5). `DatabaseName` itself accepts them, and so does `apply`, so a log
+/// that holds such a name still replays.
 ///
 /// # Errors
 ///
-/// `INVALID_ARGUMENT` naming the character and its byte offset.
+/// `INVALID_ARGUMENT` naming the reserved prefix, or the character and its byte offset.
 fn check_new_name(name: &DatabaseName) -> Result<(), Status> {
+    // Checked here, at the request, and never when the log replays, so that a database created
+    // under such a name before the rule existed stays as it is (#114).
+    if name.as_str().starts_with(RESERVED_DATABASE_PREFIX) {
+        return Err(Status::invalid_argument(format!(
+            "invalid database name: names starting with {RESERVED_DATABASE_PREFIX} are reserved \
+             for FleetRing's own databases"
+        )));
+    }
     match name
         .as_str()
         .char_indices()
@@ -1356,6 +1370,31 @@ impl Control for ControlService {
                 }))
             }
             (other, _) => Err(unexpected(&other)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_name_under_the_reserved_prefix_is_refused() {
+        for name in [
+            "_fleetring",
+            "_fleetring/identity",
+            "_fleetring-x",
+            "_fleetringdb",
+        ] {
+            let refused = check_new_name(&name.parse().expect("a name")).expect_err(name);
+            assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{name}");
+            assert!(refused.message().contains("reserved"), "{refused:?}");
+        }
+        for name in ["fleetring", "_fleet", "agent-42-_fleetring", "_fleetrin"] {
+            assert!(
+                check_new_name(&name.parse().expect("a name")).is_ok(),
+                "{name}"
+            );
         }
     }
 }

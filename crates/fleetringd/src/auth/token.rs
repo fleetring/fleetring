@@ -327,6 +327,13 @@ pub enum TokenError {
     /// A scope in the token doesn't parse.
     #[error("the token carries an invalid scope")]
     Scope(#[source] ParseScopeError),
+    /// The token's subject is a reserved dotted agent name, which only a delegation may create
+    /// (ADR-0044, point 1.8).
+    #[error(
+        "the token names a principal reserved for delegated agents (agent-<id> with '.'); \
+         reissue it under another name"
+    )]
+    ReservedPrincipal,
 }
 
 /// A refused token's error, with the token's ID when the signature verified, so that the ID is
@@ -478,6 +485,9 @@ impl TokenVerifier {
             .sub
             .parse()
             .map_err(|_| refuse(TokenError::Malformed))?;
+        if principal.is_reserved_agent_name() {
+            return Err(refuse(TokenError::ReservedPrincipal));
+        }
         if revoked.refuses(&id, &key_id) {
             return Err(refuse(TokenError::Revoked));
         }
@@ -797,6 +807,32 @@ mod tests {
         assert_eq!(
             verifier.verify(&issued, at_secs(2_000), &Revocations::new()),
             Err(TokenError::Issuer)
+        );
+    }
+
+    #[test]
+    fn a_token_naming_a_reserved_dotted_agent_is_refused() {
+        let signer = key(7, "prod");
+        let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
+        let dotted = Grant {
+            principal: "agent-42.c7".parse().expect("a principal"),
+            ..grant(&["read:agent-42.c7-*"])
+        };
+        let issued = signer.issue(&dotted).expect("issues");
+        assert_eq!(
+            verifier.verify(&issued, at_secs(2_000), &Revocations::new()),
+            Err(TokenError::ReservedPrincipal)
+        );
+        // A dotted name that isn't an agent's keeps working, as a service.
+        let service = Grant {
+            principal: "workload.prod".parse().expect("a principal"),
+            ..grant(&["read:x"])
+        };
+        let issued = signer.issue(&service).expect("issues");
+        assert!(
+            verifier
+                .verify(&issued, at_secs(2_000), &Revocations::new())
+                .is_ok()
         );
     }
 

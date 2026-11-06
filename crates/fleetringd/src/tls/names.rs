@@ -45,6 +45,15 @@ pub enum NameError {
         /// How many fleetring URIs the certificate carries.
         count: usize,
     },
+    /// The name starts with `agent-` and contains `.`, which is reserved for delegated agents.
+    #[error(
+        "'{name}' is reserved: '.' in a name that starts with agent- marks a delegated agent \
+         (agent-<id>.<child>), which only a delegation creates; choose a name without '.'"
+    )]
+    ReservedAgent {
+        /// The offending name.
+        name: String,
+    },
 }
 
 fn check_name(what: &'static str, name: &str) -> Result<(), NameError> {
@@ -95,11 +104,50 @@ impl fmt::Display for FleetName {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Principal(String);
 
+/// The prefix of an agent's principal name (ADR-0043, point 8.5).
+pub const AGENT_PREFIX: &str = "agent-";
+
 impl Principal {
     /// Returns the name as text.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this is a *reserved dotted agent name*: it starts with `agent-` and contains `.`,
+    /// which marks a delegated agent's lineage (`agent-42.c7`, ADR-0044 point 1.8). Only a
+    /// delegation may create such a name, so from 0.7 no command issues one and no node accepts
+    /// one, by certificate, token, or `[[principal]]` entry.
+    ///
+    /// ```
+    /// use fleetringd::tls::Principal;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// assert!("agent-42.c7".parse::<Principal>()?.is_reserved_agent_name());
+    /// assert!(!"agent-42".parse::<Principal>()?.is_reserved_agent_name());
+    /// assert!(!"workload.prod".parse::<Principal>()?.is_reserved_agent_name());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn is_reserved_agent_name(&self) -> bool {
+        self.0.starts_with(AGENT_PREFIX) && self.0.contains('.')
+    }
+
+    /// Refuses a reserved dotted agent name (see
+    /// [`is_reserved_agent_name`](Self::is_reserved_agent_name)), for a command about to issue a
+    /// credential for it.
+    ///
+    /// # Errors
+    ///
+    /// [`NameError::ReservedAgent`] for a reserved dotted agent name.
+    pub fn refuse_reserved(&self) -> Result<(), NameError> {
+        if self.is_reserved_agent_name() {
+            return Err(NameError::ReservedAgent {
+                name: self.0.clone(),
+            });
+        }
+        Ok(())
     }
 }
 

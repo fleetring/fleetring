@@ -847,6 +847,12 @@ impl Config {
                     reason: format!("'{}' is listed more than once", principal.name),
                 });
             }
+            if principal.name.is_reserved_agent_name() {
+                return Err(ConfigError::Invalid {
+                    field: "principal",
+                    reason: reserved_reason(&principal.name),
+                });
+            }
         }
         if self.replication.retry_interval_ms == 0 {
             return Err(ConfigError::Invalid {
@@ -902,9 +908,23 @@ impl Config {
                     reason: format!("'{scraper}' is listed more than once"),
                 });
             }
+            if scraper.is_reserved_agent_name() {
+                return Err(ConfigError::Invalid {
+                    field: "admin.scrapers",
+                    reason: reserved_reason(scraper),
+                });
+            }
         }
         Ok(())
     }
+}
+
+/// Why a configuration may not name `name`: a reserved dotted agent name (ADR-0044, point 1.8).
+fn reserved_reason(name: &Principal) -> String {
+    format!(
+        "'{name}' is reserved for delegated agents ('.' after agent- marks a lineage), so no \
+         certificate or token for it is accepted; rename the entry and reissue its certificate"
+    )
 }
 
 /// The address a client on this machine dials to reach a server bound to `address`: the loopback
@@ -979,6 +999,27 @@ mod tests {
         assert!(reason.contains("'prometheus'"), "{reason}");
         let unknown = with("\n[admin]\nport = 7401\n");
         assert!(unknown.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn reserved_dotted_agent_names_are_refused_at_load() {
+        let refused = with("\n[[principal]]\nname = \"agent-42.c7\"\nscopes = [\"read:*\"]\n")
+            .expect_err("a reserved name");
+        let ConfigError::Invalid { field, reason } = &refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(*field, "principal");
+        assert!(reason.contains("'agent-42.c7'"), "{reason}");
+        assert!(reason.contains("rename"), "{reason}");
+        let scraper = with("\n[admin]\nscrapers = [\"agent-1.x\"]\n").expect_err("a scraper");
+        assert!(
+            matches!(&scraper, ConfigError::Invalid { field, .. } if *field == "admin.scrapers"),
+            "{scraper}"
+        );
+        for kept in ["workload.prod", "agent-42", "agent_x.y"] {
+            let config = with(&format!("\n[[principal]]\nname = \"{kept}\"\n"));
+            assert!(config.is_ok(), "{kept}: {config:?}");
+        }
     }
 
     #[test]

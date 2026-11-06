@@ -208,6 +208,17 @@ impl Authorizer {
         peer: &Peer,
         token: Option<&BearerToken>,
     ) -> Result<Caller, Refused> {
+        // A delegated agent's name can't come from a certificate, which only the authority's key
+        // issues (ADR-0044, point 1.8).
+        if let Peer::Principal(name) = peer
+            && name.is_reserved_agent_name()
+        {
+            return Err(Status::unauthenticated(format!(
+                "the client certificate names '{name}', which is reserved for delegated agents \
+                 (agent-<id> with '.'); reissue the certificate under another name"
+            ))
+            .into());
+        }
         let Some(token) = token else {
             return Ok(match peer {
                 Peer::Node(id) => Caller::Node(id.clone()),
@@ -814,6 +825,25 @@ mod tests {
             .resolve(&Peer::Node("n2".parse().expect("id")), None)
             .expect("resolves");
         assert_eq!(node, Caller::Node("n2".parse().expect("id")));
+    }
+
+    #[tokio::test]
+    async fn a_reserved_dotted_agent_is_unauthenticated_by_certificate_or_token() {
+        let fixture = fixture();
+        let auth = authorizer(&fixture, &[("router", &[], TokenForwarding::Allowed)]);
+        let dotted = auth
+            .resolve(&principal("agent-42.c7"), None)
+            .expect_err("a dotted agent certificate is refused");
+        assert_eq!(dotted.code(), tonic::Code::Unauthenticated);
+        assert!(dotted.message().contains("reserved"), "{dotted:?}");
+        let bearer = token(&fixture.signer, "agent-42.c7", &["read:x"], "t1");
+        let forwarded = auth
+            .resolve(&principal("router"), Some(&bearer))
+            .expect_err("a dotted agent token is refused");
+        assert_eq!(forwarded.code(), tonic::Code::Unauthenticated);
+        // Today's dotted service names keep working.
+        assert!(auth.resolve(&principal("workload.prod"), None).is_ok());
+        assert!(auth.resolve(&principal("agent-42"), None).is_ok());
     }
 
     #[tokio::test]
