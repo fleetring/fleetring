@@ -1,8 +1,8 @@
 # ADR-0043: One binary named `fleetring`, with `fleetringd` as its compatibility name until 1.0, contexts, a detached dev node, agents that set themselves up, and help that fits a screen
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-06)
 - **Date:** 2026-11-05
-- **Related:** ADR-0025 and ADR-0026 (principals, scopes, tokens), ADR-0032 (renames are clean breaks; amended here by points 2 and 6), ADR-0033 (surfaces and the client crate; point 2 amended by point 1), ADR-0034 (admin listener, `/readyz`), ADR-0038 (upgrades; points 6 and 7 amended by point 3), ADR-0039 (dev mode; points 1, 3 and 6 amended by points 5 and 7), ADR-0041 (`mcp`); tickets FR-075 (#103), FR-056 (#59), FR-079 (#114), FR-054 (#57), FR-060 (#62); [CLI style guide](../cli.md)
+- **Related:** ADR-0025 and ADR-0026 (principals, scopes, tokens; the scope grammar's reserved words, point 8.11), ADR-0032 (renames are clean breaks; amended here by points 2 and 6), ADR-0033 (surfaces and the client crate; point 2 amended by point 1), ADR-0034 (admin listener, `/readyz`), ADR-0038 (upgrades; points 6 and 7 amended by point 3), ADR-0039 (dev mode; points 1, 3 and 6 amended by points 5 and 7), ADR-0041 (`mcp`); tickets FR-075 (#103), FR-056 (#59), FR-079 (#114), FR-054 (#57), FR-060 (#62); [CLI style guide](../cli.md)
 
 ## Context
 
@@ -28,7 +28,7 @@ The CLI grew one feature at a time inside the daemon's binary, `fleetringd`. 0.7
 4. **`fleetringd` with 0.6's daemon flags still runs a node.** If the first argument after the global `--log-format <v>` is one of 0.6's top-level daemon flags (`--config`, `--node-id`, `--data-dir`, `--listen`, `--advertise`, `--control`, `--role` or `--insecure-plaintext`, alone or as `--flag=value`), the arguments are read as `serve` followed by them. This holds under either name, for the reason in point 2. It is what existing service units run, what the container image's old `CMD` runs, and what a 0.6 daemon's restart in place executes after a 0.6 upgrader has swapped in 0.7. The daemon then logs one warning at start: ``starting without `serve` is kept until 1.0; run `fleetring serve --config <file>` ``. The rewrite happens before clap parses, so the top-level help lists no daemon flags, and `fleetring` with no arguments prints help and exits 2.
 5. **These are compatibility names, not hidden aliases.** The `fleetringd` name and the bare daemon flags are documented in `fleetring --help` (one line under the command list), in `fleetring serve --help`, in the style guide's renames section, and in the 0.7.0 release notes, and each is removed in 1.0. ADR-0032's "no hidden alias" holds: nothing is accepted that the help doesn't mention. Point 6 amends ADR-0032 to allow exactly these two.
 6. **The package stays `fleetringd`.** Renaming the package would rename the library crate every test imports (`use fleetringd::…`), every `-p fleetringd` in CI and the docs, the `fleetringd-v` release tags that `RELEASING.md` ties to the package's version, and the tags a 0.6 upgrader looks for (point 3), all for a package that isn't published. `cargo install --git https://github.com/fleetring/fleetring fleetringd` installs the `fleetring` binary; the README says so, and says to add the link (`ln -s fleetring ~/.cargo/bin/fleetringd`) only if something still calls `fleetringd`. If the CLI is ever published to crates.io, it is as `fleetring-cli`, a decision for 1.0.
-7. **What keeps its name.** These are on-disk or on-the-wire names that a 0.6 binary or an existing directory depends on, so they stay until a release can break them safely:
+7. **What keeps its name.** These are on-disk or on-the-wire names that a 0.6 binary or an existing directory depends on, so they stay through 0.x and are decided at 1.0 (open question 4):
    - the release tag prefix `fleetringd-v` and the archive names `fleetringd-<version>-<target>.tar.gz` and `.zip`, which 0.6's `upgrade` and `install.sh` look for and its cosign identity names;
    - `<data_dir>/fleetringd.process`, `<data_dir>/fleetringd.lock` and `FLEETRINGD_RESTARTS`, which a 0.6 upgrader waits on and a 0.6 daemon passes to the binary it executes;
    - `fleetringd.toml`, which dev mode's directory check reads (ADR-0039, point 3), and `deploy/fleetringd.toml`;
@@ -105,31 +105,38 @@ These are clean breaks under ADR-0032, apart from the two compatibility names. E
 
    Context names are 1 to 63 characters of lowercase letters, digits, `-`, `_` and `.`, start with a letter or digit, and aren't `-`. A `version` other than 1 is refused, with the file's path. Control addresses are tried in order until one connects; a control node that isn't the leader redirects as today. Unknown keys are refused, so a typo doesn't silently drop a setting.
 4. **Precedence.** Each setting is resolved on its own, and the first match wins:
-   1. the flag on the command line;
-   2. its environment variable (`FLEETRING_CONTROL`, `FLEETRING_TLS_DIR`, `FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`, `FLEETRING_AS`, `FLEETRING_TOKEN`, `FLEETRING_TOKEN_FILE`);
-   3. the context named by `--context`, or else by `FLEETRING_CONTEXT`;
-   4. the current context;
+   1. the setting's own flag on the command line (`--control`, `--tls-dir`, `--as` and so on);
+   2. the context the `--context` flag names;
+   3. the setting's environment variable (`FLEETRING_CONTROL`, `FLEETRING_TLS_DIR`, `FLEETRING_CA`, `FLEETRING_CERT`, `FLEETRING_KEY`, `FLEETRING_AS`, `FLEETRING_TOKEN`, `FLEETRING_TOKEN_FILE`, `FLEETRING_AGENT`);
+   4. the context `FLEETRING_CONTEXT` names, or else the current context;
    5. the built-in default, where a safe one exists.
 
-   Steps 3 and 4 pick one context; they never merge two. Within that order, the identity resolves per file (the certificate, its key and the authority). An explicit path at a step (`--cert`, `FLEETRING_CERT`, the context's `cert`) wins over a principal at the same step (`--as`, `FLEETRING_AS`, the context's `as`, which picks `client.<as>.crt` under the TLS directory). A principal wins over the TLS directory's `client.crt`. The TLS directory itself is resolved by the same order (`--tls-dir`, `FLEETRING_TLS_DIR`, the context's `tls_dir`). `--config <file>` counts as a flag for the control address, as today.
-5. **Overrides are visible.** The commonest surprise is a shell that sourced dev mode's `env` file and then switched contexts. When a context is in use and an environment variable overrides a field that context sets, the command prints one warning on stderr per variable, naming the variable, the context and the field. It does this only when stderr is a terminal and `-q` isn't given. `--verbose` names the context used and where each setting came from.
-6. **Checked on use.** If the context names a fleet and the client certificate names another, the command fails and names both. The certificate's fleet comes from its URI SAN (`fleetring://<fleet>/principal/<name>`).
-7. **Commands.**
+   **This amends #59's stated order** (flags, then variables, then `--context`), after review. A `--context` flag typed on this command line is the most explicit choice there is, while a field variable is ambient state, often left behind by a sourced `env` file. So the flag outranks the variables. Without the flag, the variables still override `FLEETRING_CONTEXT`'s context and the current one, as #59 wanted, so scripts that set `FLEETRING_CONTROL` keep working.
+
+   Steps 2 and 4 pick one context; they never merge two. Within that order, the identity resolves per file (the certificate, its key and the authority). An explicit path at a step (`--cert`, `FLEETRING_CERT`, the context's `cert`) wins over a principal at the same step (`--as`, `FLEETRING_AS`, the context's `as`, which picks `client.<as>.crt` under the TLS directory). A principal wins over the TLS directory's `client.crt`. The TLS directory itself is resolved by the same order (`--tls-dir`, `FLEETRING_TLS_DIR`, the context's `tls_dir`). `--config <file>` counts as a flag for the control address, as today.
+5. **Overrides are visible.** The commonest surprise is a shell that sourced dev mode's `env` file and then switched contexts. Every override prints one warning per variable on stderr unless `-q` is given, terminal or not, so a script's log shows it too:
+   - a field variable that overrides the current context's (or `FLEETRING_CONTEXT`'s) field: `warning: FLEETRING_CONTROL overrides context 'home' (control 10.0.0.2:7400)`;
+   - a field variable that a `--context` flag outranks, and that therefore goes unused: `warning: FLEETRING_CONTROL is ignored: --context home sets control`.
+
+   `--verbose` names the context used and where each setting came from.
+6. **Destructive confirmations name the fleet and the context.** The prompts of `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` say where they act, as `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. Without a context, they name the fleet and the control address. Typing a name into the wrong fleet is the mistake contexts make easy.
+7. **Checked on use.** If the context names a fleet and the client certificate names another, the command fails and names both. The certificate's fleet comes from its URI SAN (`fleetring://<fleet>/principal/<name>`).
+8. **Commands.**
    - `fleetring context list [-o table|json]`: `CURRENT` (`*`), `NAME`, `FLEET`, `CONTROL` and `AS`.
    - `context show [<name>] [-o table|json]`: the current context by default.
    - `context current`: prints only the name, for shell prompts. It reads no network and starts no runtime, prints nothing and exits 1 when no context is current.
    - `context add <name> --control <addr>… [--fleet <f>] [--tls-dir <dir> | --ca <f> --cert <f> --key <f>] [--as <p>] [--token-file <f>]`: `--fleet` defaults to the fleet the certificate names. A name that exists is refused, with a hint to remove it first. The first context added becomes current.
    - `context use <name>`: makes it current and records the one it replaces as `previous`.
    - `context remove <name>`: removes it. It doesn't ask, because it deletes only paths, which `context add` restores. Removing the current context leaves none current, and the command says so.
-8. **`fleetring switch` is the shortcut, the only one.**
+9. **`fleetring switch` is the shortcut, the only one.**
    - `switch <name>` is `context use <name>`.
    - `switch -` goes back to `previous`, like `cd -`.
    - `switch` with no name opens a picker when stdin and stderr are terminals: arrow keys, type to filter, the current context marked and preselected, Esc to cancel (exit 130). Without a terminal it prints `context list`'s table on stderr and exits 2, with the hint `` pass a name: `fleetring switch <name>` ``. A script that runs `switch` without a name has a bug, and exit 0 would hide it.
 
-   `context use` stays the scriptable form. It takes only a name, never the picker or `-`. The style guide lists `switch` as the one documented shortcut, so it is neither an alias nor hidden. The picker is `dialoguer`'s `FuzzySelect` (point 11).
-9. **Contexts belong to the client crate.** Following ADR-0033 (decision 1), the context code (the file, its format, its lock, and selecting a context) lives in a new crate, `fleetring-client` (`publish = false`, MSRV 1.89 for `File::lock`), which FR-056 then grows with the clients and the typed results. The precedence itself is resolved in the CLI, where the flags are. It is a pure function of the flags, an environment snapshot and the selected context, so it is tested without touching the process environment.
-10. **The `env` file stays.** Dev mode still writes `<dir>/env` for scripts and CI (ADR-0039, point 6). It is no longer how people are told to point the CLI at a dev node.
-11. **Dependencies.** `dialoguer` 0.12 (MIT, MSRV 1.66) with only its `fuzzy-select` feature, for the picker. It shares `console` with `indicatif` (point 6.3), so the two add one terminal layer, not two. Raw-mode input on Unix and Windows is the part not worth hand-rolling.
+   `context use` stays the scriptable form. It takes only a name, never the picker or `-`. The style guide lists `switch` as the one documented shortcut, so it is neither an alias nor hidden. The picker is `dialoguer`'s `FuzzySelect` (point 12).
+10. **Contexts belong to the client crate.** Following ADR-0033 (decision 1), the context code (the file, its format, its lock, and selecting a context) lives in a new crate, `fleetring-client` (`publish = false`, MSRV 1.89 for `File::lock`), which FR-056 then grows with the clients and the typed results. The precedence itself is resolved in the CLI, where the flags are. It is a pure function of the flags, an environment snapshot and the selected context, so it is tested without touching the process environment.
+11. **The `env` file stays.** Dev mode still writes `<dir>/env` for scripts and CI (ADR-0039, point 6). It is no longer how people are told to point the CLI at a dev node.
+12. **Dependencies.** `dialoguer` 0.12 (MIT, MSRV 1.66) with only its `fuzzy-select` feature, for the picker. It shares `console` with `indicatif` (point 6.3), so the two add one terminal layer, not two. Raw-mode input on Unix and Windows is the part not worth hand-rolling.
 
 ### 5. A detached dev node, `stop`, and the dev context
 
@@ -182,7 +189,7 @@ These are clean breaks under ADR-0032, apart from the two compatibility names. E
    - `CI` is unset or empty.
 
    The check is one pure function over a snapshot of those facts, tested on its own. Log lines written while a spinner shows go through it (`ProgressBar::suspend`), so they don't tear the line.
-3. **`indicatif` 0.18** (MIT, MSRV 1.85), built with `default-features = false` and only `unicode-width`. It adds `console` and `unit-prefix`; `portable-atomic` and `unicode-width` are already in the tree. A hand-rolled spinner would be short, but the suspend-while-logging and terminal-width handling are where it goes wrong, and the picker needs `console` anyway (point 4.11).
+3. **`indicatif` 0.18** (MIT, MSRV 1.85), built with `default-features = false` and only `unicode-width`. It adds `console` and `unit-prefix`; `portable-atomic` and `unicode-width` are already in the tree. A hand-rolled spinner would be short, but the suspend-while-logging and terminal-width handling are where it goes wrong, and the picker needs `console` anyway (point 4.12).
 
 ### 7. Help that fits one screen
 
@@ -236,14 +243,16 @@ These are clean breaks under ADR-0032, apart from the two compatibility names. E
    - the certificate when fewer than 30 days remain, or when it wasn't signed by the current `ca.crt` (a dev directory that started over);
    - the token when fewer than 7 days remain, so a session has at least a week.
 
-   A renewal revokes the old token if the node is reachable, and otherwise logs that it couldn't. A session that outlives its token gets the node's refusal as a tool error that says to restart the MCP server. Renewing inside a running server is deferred (open question 7).
+   A renewal revokes the old token if the node is reachable, and otherwise logs that it couldn't. A session that outlives its token gets the node's refusal as a tool error that says to restart the MCP server. Renewing inside a running server is not in 0.7 (open question 7).
 3. **An agent identity is a directory,** `<agents_dir>/<id>/`, holding:
    - `ca.crt`, a copy, so the directory is a complete TLS directory;
    - `client.agent-<id>.crt` and `client.agent-<id>.key`, the key `0600`;
    - `token`, `0600`;
-   - `agent.toml`, which holds no secret: the principal, the scopes, `read_only`, the token's ID and expiry, the certificate's expiry, the fleet, and `issued_by` (`dev`, `authority`, and later `enrollment`).
+   - `identity.toml`, which holds no secret: the principal, the scopes, `read_only`, the token's ID and expiry, the certificate's expiry, the fleet, `issued_by` (`dev`, `authority`, and later `enrollment`), and two fields for delegation (point 8.11):
+     - `owner`, the principal that created the identity: the principal the command ran as (`admin` in dev mode), or `authority` when `agent add --authority` ran without one;
+     - `parent`, the agent ID of the agent that created it, or absent for none. It is always absent in 0.7, since only people and their contexts create agents.
 
-   The directory is created `0700`. `--agent <id>` therefore means `--tls-dir <agents_dir>/<id> --as agent-<id> --token-file <agents_dir>/<id>/token`, at the flag's step of the precedence (point 4.4). It conflicts with `--as`, `--cert`, `--key`, `--tls-dir`, `--token` and `--token-file`. Its variable is `FLEETRING_AGENT`.
+   The directory is created `0700`. `--agent <id>` therefore means `--tls-dir <agents_dir>/<id> --as agent-<id> --token-file <agents_dir>/<id>/token`, at the flag's step of the precedence (point 4.4). It conflicts with `--as`, `--cert`, `--key`, `--tls-dir`, `--token` and `--token-file`. Its variable is `FLEETRING_AGENT`. It works on every client command (open question 2), always with an identity that already exists. Only `mcp --agent`, `agent add` and `agent renew` mint.
 4. **Where agent identities live.** `<agents_dir>` is the selected context's `agents_dir` key if it sets one. For a context dev mode wrote, it is `<dev_dir>/agents`, so the agents' credentials sit beside the authority that issued them and go with it. For any other context it is `$XDG_DATA_HOME/fleetring/agents/<context>/` (`~/.local/share/…`; `%LOCALAPPDATA%\fleetring\agents\<context>\` on Windows). That is data, not configuration, and a context file therefore never points at keys it didn't choose. A context doesn't list its agents, and `switch` never shows them.
 5. **Agent IDs are 1 to 32 characters of lowercase letters, digits and `_`.** The `-` that follows the ID in `agent-<id>-*` then always ends it, so `admin:agent-4-*` can't cover agent `4-2`'s databases (`agent-4-2-…`). The same reasoning made the quickstart keep the trailing `-`.
 6. **Auto-minting is dev-mode-only.** It needs the local dev authority, which is on loopback by construction (ADR-0039, point 3). Against any other context, `--agent <id>` uses an existing identity. If there is none, it fails with exit 1 and mints nothing. The error names the directory it looked in, and gives the commands that create an identity where the fleet's authority is:
@@ -266,13 +275,16 @@ These are clean breaks under ADR-0032, apart from the two compatibility names. E
 
    The path is absolute because GUI MCP clients often lack the shell's `PATH`, and the context is pinned so that a later `switch` doesn't move the agent to another fleet.
 9. **Future work: enrollment for remote fleets.** An operator runs `fleetring agent invite <id> --scope … --ttl …` to get a one-time code. The agent's `fleetring mcp --agent <id> --enroll <code>` exchanges the code through a control-plane issuance RPC for a certificate (its key generated on the agent's machine, so no key file is ever copied) and a short-lived token. That needs its own ADR, covering the RPC, approval, single use, rate limits, revocation and audit. 0.7 stays compatible with it:
-   - the identity directory and `agent.toml` are what enrollment writes too (`issued_by = "enrollment"`);
+   - the identity directory and `identity.toml` are what enrollment writes too (`issued_by = "enrollment"`);
    - `--agent` resolves an identity the same way however it was issued;
    - no `--enroll` flag or `invite` command exists until that ADR, so nothing hidden is reserved.
 10. **Small fixes found on the way.**
     - **`cert client --out <dir>`** writes the certificate, its key and a copy of `ca.crt` to `<dir>` (created `0700`) instead of the authority's directory. The output is then a complete TLS directory.
     - **A missing `ca.crt` beside `ca.key` gets a recovery hint** in `cert client`, `cert node`, `token issue` and `agent add`. The hint says to copy `ca.crt` back from a node's `[tls] ca` file or a backup, or, in dev mode, to remove `<dir>/tls` to start a new authority, which makes every certificate and token the old one issued stop working. Dev mode's own start-up message already says this (ADR-0039, point 5).
     - **The agent quickstart is rewritten around `fleetring mcp --agent`.**
+11. **Forward-compatible with delegation.** An ADR on identity and delegation is being written in parallel. Delegated child agents, an agent minting a narrower identity for a sub-agent it starts, are future work for that ADR, not 0.7. Two things keep 0.7 compatible with it:
+    - **Identities record their lineage.** `identity.toml` records `owner` and `parent` (point 8.3), so identities minted now can be read by a delegation-aware release without guessing.
+    - **The scope grammar reserves `fork` and `grant`.** Both words are reserved as a bare scope and as an action (`fork:<pattern>`, `grant:<pattern>`). Until delegation is implemented, every parser refuses them with `'fork' is reserved for delegation, which this release doesn't support`: `token issue --scope`, `[[principal]]` scopes, and `agent add --scope`. A node refuses a token that carries one. They can therefore never come to mean something else. This amends ADR-0025's grammar by refusal only; every scope valid today stays valid.
 
 ### 9. Not in 0.7.0: `db watch`
 
@@ -316,12 +328,27 @@ It is deferred to its own ticket and ADR, so that 0.7.0 changes no protocol and 
 - **The dev directory may hold `fleetring.log`, `fleetring.start.lock` and `agents/`,** and dev mode's directory check allows them.
 - **The agent quickstart becomes one command,** and printed MCP configurations carry no secret.
 - **At 1.0, a follow-up ADR removes the compatibility names** (`fleetringd` and the bare daemon flags), and decides the release tag and archive names and whether to publish `fleetring-cli`.
-- **Follow-ups:** `db watch` (its own ADR), agent enrollment for remote fleets (its own ADR), renewing a token inside a running MCP server, and Windows support for `dev -d` and `stop`.
+- **Follow-ups:** `db watch` (its own ticket and ADR), agent enrollment for remote fleets (its own ADR), delegated child agents with `fork` and `grant` (the identity-and-delegation ADR), renewing a token inside a running MCP server, and Windows support for `dev -d` and `stop` (its own ticket).
 - **On acceptance,** these accepted records are amended by this one, each in its own status line:
+  - ADR-0025 (the scope grammar reserves `fork` and `grant`, point 8.11);
   - ADR-0032 (point 5: the two compatibility names and the `switch` shortcut are allowed);
   - ADR-0033 (point 2: the CLI is `fleetring`, not `fleetringd`'s subcommands);
   - ADR-0038 (points 6 and 7: what `upgrade` extracts and accepts);
   - ADR-0039 (points 1 and 6: the `dev` context replaces the `env` line in the banner; point 3: the new entries).
+
+## Open questions for the owner
+
+Decided on 2026-11-06: the owner took every recommendation, and the reviewer's precedence fix. The body states each answer where it applies.
+
+1. **`db watch` in 0.7.0?** Deferred to its own ticket and ADR, so 0.7.0 changes no protocol (point 9).
+2. **Should `--agent` work on every client command?** Yes, using an identity that exists, so a person can see what the agent sees (`fleetring db list --agent 42`). Only `mcp --agent`, `agent add` and `agent renew` mint (point 8.3).
+3. **Where do agent identities live?** Beside the dev authority (`<dev_dir>/agents/<id>/`) for a context dev mode wrote, and `$XDG_DATA_HOME/fleetring/agents/<context>/` for others. Never as contexts (point 8.4).
+4. **The release tag and archive names** (`fleetringd-v…`, `fleetringd-<v>-<target>`). Kept through 0.x, since a 0.6 upgrader needs them, and decided at 1.0 with `fleetring-cli` (point 1.7).
+5. **Windows `dev -d` and `stop`?** Refused in 0.7 with a clear message, and ticketed (point 5.6).
+6. **`fleetring stop` with no flag?** A usage error with the `dev stop` hint, rather than a default directory (point 5.4).
+7. **Renewing an agent's token inside a running MCP server?** Not in 0.7: renewal happens at start when fewer than 7 days remain, and an expired token's refusal says to restart the server (point 8.2).
+8. **`agent add --authority` for fleets other than dev?** Yes, explicit only, until enrollment's ADR (points 8.6 and 8.7).
+9. **The reviewer's precedence finding.** An explicit `--context` flag wins over the field variables, which still override the current context and `FLEETRING_CONTEXT`'s context. Every override warns (points 4.4 and 4.5).
 
 ## Revisions
 
@@ -331,3 +358,7 @@ It is deferred to its own ticket and ADR, so that 0.7.0 changes no protocol and 
   - Minting runs the full dev-directory check first, whether or not a node is running, so a context file can't authorize it (point 8.1).
   - Both `display_name` and `bin_name` are set; `check-archive.sh` compares the two entries byte for byte; the rename table says which hosts keep `fleetringd.previous`.
   - Log rotation is at start only, `switch` without a name or a terminal exits 2, and the token's expiry is printed by `agent show` and at MCP start-up.
+- **2026-11-06, on acceptance.**
+  - The owner's answers to the open questions are folded into the body.
+  - An explicit `--context` flag outranks the field variables, which still override the current context. Every override warns unless `-q`, and destructive confirmations name the fleet and the context (points 4.4 to 4.6).
+  - Agent identities record `owner` and `parent` in `identity.toml`, and the scope grammar reserves `fork` and `grant` for delegation (points 8.3 and 8.11).

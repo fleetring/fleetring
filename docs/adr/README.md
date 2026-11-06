@@ -51,7 +51,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0040](0040-raft-control-group-versions-and-dev-mode.md) | The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends 0035) | Proposed |
 | [0041](0041-agent-kit-metadata-expiry-and-mcp.md) | Databases carry a description, labels, a creator, and an expiry in control state, gated as fleet features and expired by stamped commands; `db show` adds the schema through the engine adapter; `fleetringd mcp` acts on them as one principal | Accepted |
 | [0042](0042-no-deletion-by-absence.md) | A data node deletes a copy only after it saw the database's drop, told by the control node that applied it, and keeps every other copy the control plane doesn't know as an orphan for an operator to remove | Accepted |
-| [0043](0043-the-fleetring-cli.md) | One binary named `fleetring`, with `fleetringd` as its compatibility name until 1.0; contexts and `switch`; a detached dev node and `stop`; agents that mint their own dev identity; spinners and help that fits a screen (amends 0032, 0033, 0038, 0039) | Proposed |
+| [0043](0043-the-fleetring-cli.md) | One binary named `fleetring`, with `fleetringd` as its compatibility name until 1.0; contexts and `switch`; a detached dev node and `stop`; agents that mint their own dev identity; spinners and help that fits a screen (amends 0025, 0032, 0033, 0038, 0039) | Accepted |
 
 ## Template
 
