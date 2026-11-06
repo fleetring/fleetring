@@ -5,7 +5,7 @@
 //! binary then runs that configuration as it runs any other. With `dev = true`, validation keeps
 //! every address on loopback, however the node is started.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, Write as _};
@@ -46,7 +46,7 @@ pub const ENV_FILE: &str = "env";
 pub const TLS_DIR: &str = "tls";
 
 /// The daemon's data directory, in the dev directory.
-const DATA_DIR: &str = "data";
+pub const DATA_DIR: &str = "data";
 
 /// Where the dev sink writes each database's changes, in the dev directory.
 const CHANGES_DIR: &str = "changes";
@@ -343,6 +343,16 @@ pub enum DevError {
         /// How long `dev -d` waited.
         timeout: Duration,
     },
+    /// The directory has no configuration, so dev mode hasn't prepared it.
+    #[error(
+        "{} has no {CONFIG_FILE}, so it isn't a dev directory dev mode has prepared; start the \
+         dev node with `fleetring dev -d` first",
+        dir.display()
+    )]
+    NoConfig {
+        /// The directory.
+        dir: PathBuf,
+    },
     /// Running the dev node in the background needs Unix.
     #[error(
         "running the dev node in the background isn't available on Windows yet; run `fleetring \
@@ -517,11 +527,92 @@ impl Prepared {
 ///
 /// [`DevError::NoHome`] if the variable is unset or empty.
 pub fn default_dir() -> Result<PathBuf, DevError> {
+    default_dir_in(&|name| std::env::var_os(name))
+}
+
+/// [`default_dir`], with the environment read through `env`, so a test needn't touch the
+/// process's.
+///
+/// # Errors
+///
+/// [`DevError::NoHome`] if the variable is unset or empty.
+pub fn default_dir_in(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, DevError> {
     let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    match std::env::var_os(variable) {
+    match env(variable) {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(DIR_NAME)),
         _ => Err(DevError::NoHome { variable }),
     }
+}
+
+/// A dev directory that passed [`check_dev_dir`], with its configuration and its authority as
+/// they were checked. Only [`check_dev_dir`] makes one, so a mint from a dev authority can't
+/// happen without the check (ADR-0043, point 8.1).
+#[derive(Debug)]
+pub struct DevChecked {
+    dir: PathBuf,
+    config: Config,
+    authority: Authority,
+}
+
+impl DevChecked {
+    /// Returns the dev directory.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Returns the directory's configuration, which says `dev = true` and passed validation.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Returns the directory's authority, for the fleet [`FLEET`].
+    #[must_use]
+    pub fn authority(&self) -> &Authority {
+        &self.authority
+    }
+
+    /// Returns the directory with the authority and the certificates.
+    #[must_use]
+    pub fn tls_dir(&self) -> PathBuf {
+        self.dir.join(TLS_DIR)
+    }
+}
+
+/// Checks, reading only, that `dir` is a dev directory dev mode prepared (ADR-0039, point 3):
+/// its `fleetringd.toml` exists, says `dev = true`, and passes validation, so every address is
+/// loopback; its `tls/` holds only the files dev mode writes; and its authority is for the fleet
+/// [`FLEET`]. It creates nothing. Run it immediately before minting from the directory's
+/// authority, whether or not a node holds the directory, since a context's `dev_dir` only says
+/// where to look (ADR-0043, point 8.1).
+///
+/// # Errors
+///
+/// [`DevError::NoConfig`] if there is no configuration, and otherwise the [`DevError`] naming
+/// the check that failed.
+pub fn check_dev_dir(dir: &Path) -> Result<DevChecked, DevError> {
+    let path = dir.join(CONFIG_FILE);
+    if !exists(&path)? {
+        return Err(DevError::NoConfig {
+            dir: dir.to_owned(),
+        });
+    }
+    let config = load_dev_config(&path, None)?;
+    let tls = dir.join(TLS_DIR);
+    check_entries(&tls, &TLS_FILES, dir)?;
+    let authority = Authority::load(&tls)?;
+    if authority.fleet().as_str() != FLEET {
+        return Err(DevError::ForeignAuthority {
+            path: tls.join("ca.crt"),
+            fleet: authority.fleet().to_string(),
+        });
+    }
+    Ok(DevChecked {
+        dir: dir.to_owned(),
+        config,
+        authority,
+    })
 }
 
 /// Creates whatever `dir` lacks for a dev node, then loads its configuration.
@@ -1054,10 +1145,41 @@ pub async fn detach(
     if cfg!(not(unix)) {
         return Err(DevError::Unsupported);
     }
-    let dir = prepared.dir();
-    let data_dir = &prepared.config().data_dir;
     // Held until the node is ready or has failed, so that a second `dev -d` waits for this one
     // and then finds its node running. Closing the file releases it.
+    let _start_lock = lock_start(prepared.dir())?;
+    detach_locked(prepared, exe, arg0, port, timeout).await
+}
+
+/// Prepares `dir` and starts its dev node in the background, unless one already runs from it,
+/// all under the start lock, so that two at once prepare and start one node (ADR-0043, point
+/// 8.1). It refuses a directory that isn't dev mode's before it creates anything in it, the start
+/// lock included. Certificates it creates are valid from `now`.
+///
+/// # Errors
+///
+/// As [`prepare`] and [`detach`].
+pub async fn start_detached(
+    dir: &Path,
+    exe: &Path,
+    arg0: &OsStr,
+    timeout: Duration,
+    now: Timestamp,
+) -> Result<(Prepared, Detached), DevError> {
+    if cfg!(not(unix)) {
+        return Err(DevError::Unsupported);
+    }
+    check_existing(dir, &dir.join(CONFIG_FILE), None)?;
+    create_private_dir(dir)?;
+    let _start_lock = lock_start(dir)?;
+    let prepared = prepare(dir, None, now)?;
+    let detached = detach_locked(&prepared, exe, arg0, None, timeout).await?;
+    Ok((prepared, detached))
+}
+
+/// Opens and locks [`START_LOCK`] in `dir`, waiting for another holder; dropping the file
+/// releases it.
+fn lock_start(dir: &Path) -> Result<File, DevError> {
     let lock_path = dir.join(START_LOCK);
     let start_lock = open_private(
         &lock_path,
@@ -1068,6 +1190,19 @@ pub async fn detach(
         path: lock_path,
         source,
     })?;
+    Ok(start_lock)
+}
+
+/// [`detach`]'s work, once the start lock is held.
+async fn detach_locked(
+    prepared: &Prepared,
+    exe: &Path,
+    arg0: &OsStr,
+    port: Option<u16>,
+    timeout: Duration,
+) -> Result<Detached, DevError> {
+    let dir = prepared.dir();
+    let data_dir = &prepared.config().data_dir;
     if let Running::Yes(file) = running_in(data_dir)? {
         return Ok(Detached::AlreadyRunning { pid: file.pid });
     }

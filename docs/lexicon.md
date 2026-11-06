@@ -115,6 +115,14 @@ The HTTP listener a daemon serves `/metrics`, `/healthz`, and `/readyz` on, apar
 - **Code:** `[admin]`, `AdminConfig`, `observe::admin`. **CLI:** none.
 - **Not:** status port, management port, HTTP port, debug server.
 
+### Agent
+
+An AI agent's identity in a fleet: the [principal](#principal) `agent-<id>`, with a client [certificate](#certificate) and a [token](#token) scoped to its own databases (`admin:agent-<id>-*` by default), kept in a directory of its own, `<agents dir>/<id>/` (ADR-0043, point 8). The *agent ID* is 1 to 32 lowercase letters, digits, and `_`, so the `-` after it in `agent-<id>-*` always ends it, and `.` is left for [delegation](#delegation). The directory, created `0700`, holds `ca.crt`, the certificate and its key, the token, and `identity.toml`, the *identity record*, which holds no secret: the principal, scopes, expiries, `issued_by`, the [owner](#owner), and the [parent](#parent). The *agents directory* is `<dev_dir>/agents` for the `dev` context, a context's `agents_dir` if it sets one, and `$XDG_DATA_HOME/fleetring/agents/<context>/` for any other. In [dev mode](#dev-mode), `fleetring mcp --agent <id>` mints the identity on first use and renews it at start; elsewhere `agent add --authority` mints it where the [authority](#authority) is. A name that starts with `agent-` and holds `.` is a *reserved dotted agent name*, which no command issues and no node accepts in 0.7 (ADR-0044, point 1.8). Without an [agent launcher](#agent-launcher), agents run in [trusted local development](#trusted-local-development).
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `AgentId`, `AgentDir`, `AgentRecord` in the CLI; `Principal::is_reserved_agent_name`. **CLI:** `fleetring agent add|list|show|renew|remove`, `--agent <id>` and `FLEETRING_AGENT` on every client command, `mcp --agent`.
+- **Not:** bot, assistant, robot, service account, agent user.
+
 ### Agent launcher
 
 *Planned* (ADR-0044). The trusted program that starts agents in enforced sandboxes, gives each only its own credential or a *credential proxy* that keeps holder keys outside the sandbox, spawns children within their parent's ceiling and the user's saved policy, and exposes a restricted spawn and report endpoint instead of a terminal's control socket. A secure multi-agent mode needs one; without it, agents run in [trusted local development](#trusted-local-development).
@@ -645,7 +653,7 @@ A copy of a database that a data node keeps on disk, closed, because the control
 *Planned* (ADR-0044). The principal an agent acts for and answers to: the principal the command that created the root agent ran as, or `authority` when only the authority's key was used (ADR-0043). A child agent inherits its parent's owner. Recorded in the agent's identity record and its token; it grants nothing. Only agents have owners: a database has a [creator](#creator), a lease a [holder](#holder).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet (`owner` in `identity.toml` from 0.7, ADR-0043). **CLI:** `agent show`.
+- **Code:** `AgentRecord::owner`, `owner` in `identity.toml` (ADR-0043); none yet in tokens. **CLI:** `agent show`.
 - **Not:** creator, sponsor, user (as a field).
 
 ### Package
@@ -661,7 +669,7 @@ A copy of a database that a data node keeps on disk, closed, because the control
 *Planned* (ADR-0044). The agent that spawned an agent, recorded by agent ID in the child's `identity.toml` and by principal in the delegation block that created its token. A child's ID extends its parent's with `.` (`42.c7`), so its databases, `agent-42.c7-…`, fall under its parent's subtree scope `agent-42.*`. It grants nothing by itself.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet (`parent` in `identity.toml` from 0.7, ADR-0043, as the parent's agent ID). **CLI:** `agent show`.
+- **Code:** `AgentRecord::parent`, `parent` in `identity.toml` as the parent's agent ID (ADR-0043), always absent in 0.7. **CLI:** `agent show`.
 - **Not:** creator, owner, ancestor (fine in prose for any agent above).
 
 ### Placement
@@ -973,10 +981,10 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 
 ### Trusted local development
 
-*Planned* (ADR-0044). Running agents without an [agent launcher](#agent-launcher): each agent's FleetRing requests are scoped, but agents running as the same OS user can read each other's credential files and database files, so it isn't secure separation between agents. 0.7's `fleetring mcp --agent` runs in this mode.
+Running agents without an [agent launcher](#agent-launcher) (ADR-0044, point 11): each agent's FleetRing requests are scoped, but agents running as the same OS user can read each other's credential files and database files, so it isn't secure separation between agents. 0.7's `fleetring mcp --agent` runs in this mode, and says so.
 
 - **Applies to:** docs, CLI.
-- **Code:** none. **CLI:** named in the help of `mcp` and `agent add`.
+- **Code:** none. **CLI:** the line `trusted local development: agents on this machine can read each other's credentials`, which `mcp --agent` prints at start and `agent add` and `agent show` print; the help of `mcp` and `agent`.
 - **Not:** sandbox, secure mode, isolated mode.
 ### Upgrade
 

@@ -37,6 +37,8 @@ pub(crate) const TOKEN_VAR: &str = "FLEETRING_TOKEN";
 pub(crate) const TOKEN_FILE_VAR: &str = "FLEETRING_TOKEN_FILE";
 /// The variable that names the context to use.
 pub(crate) const CONTEXT_VAR: &str = "FLEETRING_CONTEXT";
+/// The variable that names an agent whose identity to act as (ADR-0043, point 8.3).
+pub(crate) const AGENT_VAR: &str = "FLEETRING_AGENT";
 
 /// The environment variables resolution reads, captured once.
 #[derive(Debug, Clone, Default)]
@@ -52,6 +54,9 @@ pub(crate) struct EnvSnapshot {
     pub(crate) context: Option<String>,
     /// Whether `FLEETRING_CONTEXT` is set to nothing, which means no contexts file is read.
     pub(crate) contexts: ContextsFile,
+    /// `FLEETRING_AGENT`. Read here, not through clap, so that clap's conflicts apply to the
+    /// flags alone; the command fills in the identity it names.
+    pub(crate) agent: Option<String>,
 }
 
 /// Whether a command reads the contexts file.
@@ -108,6 +113,7 @@ impl EnvSnapshot {
             } else {
                 ContextsFile::Read
             },
+            agent: text(AGENT_VAR),
         }
     }
 }
@@ -203,6 +209,9 @@ pub(crate) struct TargetFlags {
     /// `--token`, or `--token-file`.
     pub(crate) token: Option<TokenSource>,
     pub(crate) wire: Wire,
+    /// The agent `--agent` named, whose identity the command filled into `tls_dir`, `principal`
+    /// and `token`; only the warnings read it.
+    pub(crate) agent: Option<String>,
 }
 
 /// A command's settings, resolved.
@@ -265,6 +274,8 @@ struct Layer {
     token: Option<TokenSource>,
     /// The context this step is, if it is one.
     context: Option<ContextName>,
+    /// The agent whose identity this step's directory, principal and token are.
+    agent: Option<String>,
     kind: Kind,
 }
 
@@ -293,6 +304,7 @@ impl Layer {
             principal: flags.principal.clone(),
             token: flags.token.clone(),
             context: None,
+            agent: flags.agent.clone(),
             kind: Kind::Flags,
         }
     }
@@ -314,6 +326,7 @@ impl Layer {
             principal: env.principal.clone(),
             token,
             context: None,
+            agent: env.agent.clone(),
             kind: Kind::Variables,
         }
     }
@@ -329,6 +342,7 @@ impl Layer {
             principal: context.principal.clone(),
             token: context.token_file.clone().map(TokenSource::File),
             context: Some(name.clone()),
+            agent: None,
             kind: Kind::Context,
         }
     }
@@ -404,6 +418,17 @@ impl Layer {
             Some(TokenSource::Value(_)) => Some(names[5]),
             Some(TokenSource::File(_) | TokenSource::Stdin) => Some(names[6]),
         };
+        // An agent's identity is one setting as the user wrote it, not the three it fills in.
+        if self.agent.is_some() {
+            let agent = if self.kind == Kind::Flags {
+                "--agent"
+            } else {
+                AGENT_VAR
+            };
+            return std::iter::once(agent)
+                .chain(self.ca.as_ref().map(|_| names[1]))
+                .collect();
+        }
         [
             self.tls_dir.as_ref().map(|_| names[0]),
             self.ca.as_ref().map(|_| names[1]),
@@ -666,6 +691,11 @@ fn displaced(layers: &[Layer], unit: Option<usize>) -> Vec<String> {
     let Some(unit) = unit else {
         return Vec::new();
     };
+    // `--agent` names a whole identity on purpose, so the one it replaces is no surprise; the
+    // variable may be left over in a shell, so it still warns.
+    if layers[unit].kind == Kind::Flags && layers[unit].agent.is_some() {
+        return Vec::new();
+    }
     layers[unit + 1..]
         .iter()
         .filter(|lower| {
@@ -1635,6 +1665,55 @@ mod tests {
         assert_eq!(tls(&resolved).cert, Path::new("/f/c.crt"));
         assert_eq!(resolved.token, None);
         assert_eq!(resolved.warnings.len(), 1, "{:?}", resolved.warnings);
+    }
+
+    #[test]
+    fn an_agents_identity_is_named_as_the_agent_and_the_flag_draws_no_warning() {
+        let agent = tls_dir(&["agent-42"]);
+        let flags = TargetFlags {
+            tls_dir: Some(agent.path().to_owned()),
+            principal: Some("agent-42".to_owned()),
+            token: Some(TokenSource::File(agent.path().join("token"))),
+            agent: Some("42".to_owned()),
+            ..TargetFlags::default()
+        };
+        let dev = tls_dir(&["admin"]);
+        let env = EnvSnapshot {
+            tls_dir: Some(dev.path().to_owned()),
+            principal: Some("admin".to_owned()),
+            ..EnvSnapshot::default()
+        };
+        let resolved = run(&flags, &env, None);
+        assert_eq!(
+            tls(&resolved).cert,
+            agent.path().join("client.agent-42.crt")
+        );
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+        // The variable may be left over in a shell, so replacing a context's identity warns.
+        let env = EnvSnapshot {
+            tls_dir: Some(agent.path().to_owned()),
+            principal: Some("agent-42".to_owned()),
+            token_file: Some(agent.path().join("token")),
+            agent: Some("42".to_owned()),
+            ..EnvSnapshot::default()
+        };
+        let context = Context {
+            tls_dir: Some(dev.path().to_owned()),
+            principal: Some("admin".to_owned()),
+            ..Context::default()
+        };
+        let resolved = run(
+            &TargetFlags::default(),
+            &env,
+            Some((&name("dev"), &context, SelectedBy::Current)),
+        );
+        assert_eq!(
+            resolved.warnings,
+            [format!(
+                "warning: the identity from the environment ({AGENT_VAR}) replaces the identity \
+                 from context 'dev' (tls_dir, as)"
+            )]
+        );
     }
 
     #[test]

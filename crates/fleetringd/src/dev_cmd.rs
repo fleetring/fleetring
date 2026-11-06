@@ -17,7 +17,7 @@ use crate::stop::{self, StopTarget};
 use crate::{OutputArgs, OutputFormat, context_cmd, parse_ttl, program, spinner_surroundings};
 
 /// How long `dev -d` waits for the node to be ready unless `--timeout` says otherwise.
-const DETACH_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DETACH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often `dev logs -f` looks for new lines.
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
