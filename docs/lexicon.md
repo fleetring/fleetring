@@ -5,11 +5,11 @@ The names FleetRing uses, in code, docs, the CLI, the TUI and desktop app, and t
 Each entry gives a definition, where the word applies, its canonical spelling in code and in the CLI, and the words not to use for it. "Applies to" uses four places:
 
 - **crate**: the `fleetring` placement crate, which says "key", never "database" (ADR-0011).
-- **daemon**: `fleetringd` and the `fleetring-control`, `fleetring-wal` and `fleetring-proto` crates.
-- **CLI**: the `fleetringd` subcommands (see the [CLI style guide](cli.md)).
+- **daemon**: the node process (`fleetring serve`; the `fleetringd` crate) and the `fleetring-control`, `fleetring-wal` and `fleetring-proto` crates.
+- **CLI**: the `fleetring` commands (see the [CLI style guide](cli.md)).
 - **UI**: the TUI and the desktop app (ADR-0033).
 
-A word marked *planned* names something decided but not yet built. Accepted ADRs and finished tickets keep the words they were written with; [renamed in 0.3.0](#renamed-in-030) maps the old words to these.
+A word marked *planned* names something decided but not yet built. Accepted ADRs and finished tickets keep the words they were written with; [renamed in 0.3.0](#renamed-in-030) and [renamed in 0.7.0](#renamed-in-070) map the old words to these.
 
 ## Hierarchy
 
@@ -19,13 +19,13 @@ fleet                 one control plane, one certificate authority, one fleet na
     │                 (cells nest: a region can be a cell of cells)
     └── zone          a failure-domain label; a cell's ring spreads replicas across zones first
         └── host      a machine label; then across hosts
-            └── node  one fleetringd process, a member of the fleet and of its cell's ring
+            └── node  one fleetring serve process, a member of the fleet and of its cell's ring
 ```
 
 - **Cells partition; zones and hosts spread** (ADR-0012, fact 1). A directory or a ring picks a key's cell, and the cell's ring picks its nodes. Zones and hosts are labels on a ring's nodes, not layers: one key's replicas sit in several zones of one cell.
 - **A host belongs to exactly one zone**, and a node without a host label is its own host (ADR-0006, point 2).
-- **A fleet without cells is one cell**: one ring over all its nodes. That is the only shape `fleetringd` runs today; cells exist in the placement crate (FR-020).
-- **A ring places keys onto nodes.** In `fleetringd` the key is the database's name. The ring's preference list for a key starts with its replica set, the first R nodes; the first of those is the preferred primary. A lease makes one replica the primary at an epoch, and the other replicas are its followers.
+- **A fleet without cells is one cell**: one ring over all its nodes. That is the only shape the daemon runs today; cells exist in the placement crate (FR-020).
+- **A ring places keys onto nodes.** In the daemon the key is the database's name. The ring's preference list for a key starts with its replica set, the first R nodes; the first of those is the preferred primary. A lease makes one replica the primary at an epoch, and the other replicas are its followers.
 
 ```text
 database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3, n1, n7]
@@ -58,7 +58,7 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | capability (for a scope or an action) | [scope](#scope), [action](#action) | Fine in prose about capability-based security in general. |
 | branch, copy (for a fork) | [fork](#fork) | "Clone" is fine for the file-system mechanism. |
 | checkpoint (for a co-signed chain head) | [signed head](#signed-head) | A [checkpoint](#checkpoint) is the engine's. |
-| release (for a package's version) | package version ([package](#package)) | A [release](#release) is a version of `fleetringd`. |
+| release (for a package's version) | package version ([package](#package)) | A [release](#release) is a version of the `fleetring` binary. |
 | API key, password | [token](#token) or [certificate](#certificate) | |
 | health (for a member's liveness) | [liveness](#liveness) | `/healthz` is about the process; liveness is the control plane's view. |
 | tag | [label](#label) | ADR-0041. |
@@ -144,7 +144,7 @@ One log line on the `fleetringd::audit` target per request a principal makes: de
 The fleet's certificate authority: an Ed25519 key (`ca.key`) and its certificate (`ca.crt`). It issues every node and client certificate and signs every token. Its key belongs on no node.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `tls::Authority`. **CLI:** `fleetringd cert init`; files `ca.crt` and `ca.key`; flag `--ca`.
+- **Code:** `tls::Authority`. **CLI:** `fleetring cert init`; files `ca.crt` and `ca.key`; flag `--ca`.
 - **Not:** CA (in prose; fine in file names and flags), root, issuer (the token claim `iss` names the fleet, not the authority), PKI.
 
 ### Batch
@@ -192,7 +192,7 @@ A partition of the key space with its own ring. A directory, a ring over the cel
 An X.509 certificate from the fleet's [authority](#authority). A *node certificate* names a node, `fleetring://<fleet>/node/<id>`; a *client certificate* names a [principal](#principal), `fleetring://<fleet>/principal/<name>` (ADR-0025). Every connection is mutual TLS with them.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `tls::Identity` (a certificate, its private key, and the trusted authorities), `SubjectUri`. **CLI:** `fleetringd cert node`, `fleetringd cert client`; files `node.<id>.crt`, `client.<principal>.crt`; flags `--cert`, and `--key` for the certificate's private key.
+- **Code:** `tls::Identity` (a certificate, its private key, and the trusted authorities), `SubjectUri`. **CLI:** `fleetring cert node`, `fleetring cert client`; files `node.<id>.crt`, `client.<principal>.crt`; flags `--cert`, and `--key` for the certificate's private key.
 - **Not:** cert (fine in commands and files, not in prose), key pair (the certificate and its private key together are an *identity*), credential (a credential is a certificate *or* a token).
 
 ### Change stream
@@ -216,7 +216,7 @@ The engine folding its log into the main database file (SQLite's WAL checkpoint)
 Anything that calls the fleet's RPCs as a [principal](#principal): the CLI, the TUI, the desktop app, an application, the router. Clients share one crate (ADR-0033).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetringd::data::Client` today; `fleetring-client` *planned* (FR-056). **CLI:** `fleetringd cert client`.
+- **Code:** `fleetringd::data::Client` today; the `fleetring-client` crate holds contexts, and the clients move into it with FR-056. **CLI:** the `fleetring` commands; `fleetring cert client` issues a client's certificate.
 - **Not:** user, consumer (a change stream has consumers), caller (fine in prose about one RPC).
 
 ### Context
@@ -281,7 +281,7 @@ A node that runs the data role: it hosts replicas and serves database calls. A n
 One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, replicates, and fails over as a unit. Its name is its placement [key](#key), but the daemon, its scopes, and its messages say "database": `admin on the database`, `auth::Target::Database`. The placement crate never says "database".
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Database`, `DatabaseName`. **CLI:** the noun `db` (`fleetringd db create`), the argument `<database>`; "database" in output headers.
+- **Code:** `fleetring_control::Database`, `DatabaseName`. **CLI:** the noun `db` (`fleetring db create`), the argument `<database>`; "database" in output headers.
 - **Not:** shard, partition, tenant, keyspace, namespace, table, instance.
 
 ### Delegation
@@ -297,7 +297,7 @@ One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, re
 The set of revoked tokens and signing keys the control plane keeps and publishes to data nodes with every heartbeat reply. A node refuses a token on it. *Planned* (ADR-0044): it also holds [revocation IDs](#revocation-id) of token blocks, and principals whose earlier tokens are revoked.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Revocations`, `Revoked`, protocol `Revocation`. **CLI:** `fleetringd token revoke`.
+- **Code:** `Revocations`, `Revoked`, protocol `Revocation`. **CLI:** `fleetring token revoke`.
 - **Not:** blocklist, blacklist, revocation list, CRL.
 
 ### Description
@@ -310,10 +310,10 @@ Free text, at most 1 KiB, saying what a database holds and how it was set up; pa
 
 ### Dev mode
 
-One node on loopback, with a local [authority](#authority) and an `admin` [principal](#principal) with every [scope](#scope), that `fleetringd dev` creates once in `~/.fleetring` and reuses, for development only (ADR-0039). It is the normal daemon with `dev = true` in its configuration, which keeps every address on loopback; `status` prints `dev mode` for it.
+One node on loopback, with a local [authority](#authority) and an `admin` [principal](#principal) with every [scope](#scope), that `fleetring dev` creates once in `~/.fleetring` and reuses, for development only (ADR-0039). It is the normal daemon with `dev = true` in its configuration, which keeps every address on loopback; `status` prints `dev mode` for it.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `dev::DevMode`, `dev::prepare`, protocol `MembershipUpdate.dev_mode`. **CLI:** `fleetringd dev [--data-dir <dir>] [--port <n>]`; `dev = true` in config; `~/.fleetring/env`.
+- **Code:** `dev::DevMode`, `dev::prepare`, protocol `MembershipUpdate.dev_mode`. **CLI:** `fleetring dev [--data-dir <dir>] [--port <n>]`, which writes the `dev` [context](#context); `dev = true` in config; `~/.fleetring/env`, for scripts.
 - **Not:** local mode, sandbox, playground, standalone, single-node mode (a fleet of one node needn't be dev mode).
 
 ### Directory
@@ -329,7 +329,7 @@ In cells: the explicit rules, by longest prefix or exact key, that pick a key's 
 Marking a member as draining: it gets no new leases and is never a promotion's candidate, and it hands every lease it holds to a follower through a [transfer](#transfer) (FR-038). A drained node stays a follower until it stops, restarts, or is *undrained*: its mark cleared, a [fleet feature](#fleet-feature).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Control.Drain`, `Control.Undrain`, `Action::Undrain`, protocol `Member.draining`. **CLI:** `fleetringd node drain <node-id>`, `fleetringd node undrain <node-id>`; `[membership] on_shutdown = "leave"`.
+- **Code:** `Control.Drain`, `Control.Undrain`, `Action::Undrain`, protocol `Member.draining`. **CLI:** `fleetring node drain <node-id>`, `fleetring node undrain <node-id>`; `[membership] on_shutdown = "leave"`.
 - **Not:** evacuate, cordon, decommission, step down.
 
 ### Durability
@@ -337,7 +337,7 @@ Marking a member as draining: it gets no new leases and is never a promotion's c
 A database's acknowledgement mode and replica floor together (ADR-0023). The *replica floor* (`min_replicas`) is how many replicas, the primary included, must be reachable for a write to run.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Durability`, `Acks`, `min_replicas`. **CLI:** `fleetringd db edit`, `--acks`, `--min-replicas`.
+- **Code:** `Durability`, `Acks`, `min_replicas`. **CLI:** `fleetring db edit`, `--acks`, `--min-replicas`.
 - **Not:** consistency, safety level, replication mode.
 
 ### Engine
@@ -453,7 +453,7 @@ A replica that isn't the primary: it applies the primary's batches and can be pr
 One BLAKE3 hash per transaction over the replication log, each folding in the one before, so the hash at a position commits every byte before it (FR-044). One value of it is a *chain hash*.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `ChainHash`, `replication::chain`. **CLI:** `fleetringd db verify`, `--expect <hash>`.
+- **Code:** `ChainHash`, `replication::chain`. **CLI:** `fleetring db verify`, `--expect <hash>`.
 - **Not:** Merkle tree (a [page hash tree](adr/0030-page-hash-trees.md) is one; the chain isn't), checksum, signature (the chain isn't signed).
 
 ### Heartbeat
@@ -525,7 +525,7 @@ The placement key: in the placement crate, the opaque bytes that name a placeabl
 *Planned* (FR-043). A fenced, renewable lease on any key, requested by a named holder and kept in control state, for things that have no database (ADR-0027).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** *planned*. **CLI:** *planned*, `fleetringd lease acquire|renew|release|watch`.
+- **Code:** *planned*. **CLI:** *planned*, `fleetring lease acquire|renew|release|watch`.
 - **Not:** lock, mutex, distributed lock.
 
 ### Label
@@ -549,7 +549,7 @@ The control node that accepts control commands. Today the only control node; wit
 The right of one node to write one database at one lease epoch, granted and renewed by the control plane (ADR-0018). A lease expires unless renewed; safety still never depends on clocks, because epochs fence.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Lease`, `AcquireLease`, `RenewLease`, `WatchLeases`, `HeldLeases`, `LeaseUpdate::Held`. **CLI:** `fleetringd lease watch --node <node-id>` or `--address <host:port>`, which prints `held`, `gained`, and `lost` lines.
+- **Code:** `Lease`, `AcquireLease`, `RenewLease`, `WatchLeases`, `HeldLeases`, `LeaseUpdate::Held`. **CLI:** `fleetring lease watch --node <node-id>` or `--address <host:port>`, which prints `held`, `gained`, and `lost` lines.
 - **Not:** lock, ownership, token, claim.
 
 ### Leave
@@ -557,7 +557,7 @@ The right of one node to write one database at one lease epoch, granted and rene
 A member removing itself from the fleet's membership, as a node does when it shuts down with `on_shutdown = "leave"`. An operator with the fleet scope makes the same call to remove another member.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Control.Leave`, `Client::remove_node`. **CLI:** `on_shutdown = "leave"`; "left the fleet" in logs; `fleetringd node remove <node-id>` removes another member, refusing a live one unless `--force`.
+- **Code:** `Control.Leave`, `Client::remove_node`. **CLI:** `on_shutdown = "leave"`; "left the fleet" in logs; `fleetring node remove <node-id>` removes another member, refusing a live one unless `--force`.
 - **Not:** depart, departure (FR-038's title keeps it), decommission, deregister, kick.
 
 ### Liveness
@@ -578,10 +578,10 @@ A [sink](#sink)'s delivered [position](#position), kept inside the database so t
 
 ### MCP server
 
-`fleetringd mcp`: the Model Context Protocol over stdio, acting as one [principal](#principal) with that principal's [scopes](#scope), so an agent can create, use, and drop its own databases (ADR-0041, point 9). Its tools are `db_create`, `db_list`, `db_show`, `query`, `exec`, `db_update`, and `db_drop`; text principals wrote reaches a result only in JSON string fields, and a [description](#description) carries its author and whether it is untrusted.
+`fleetring mcp`: the Model Context Protocol over stdio, acting as one [principal](#principal) with that principal's [scopes](#scope), so an agent can create, use, and drop its own databases (ADR-0041, point 9). Its tools are `db_create`, `db_list`, `db_show`, `query`, `exec`, `db_update`, and `db_drop`; text principals wrote reaches a result only in JSON string fields, and a [description](#description) carries its author and whether it is untrusted.
 
 - **Applies to:** daemon, CLI.
-- **Code:** `fleetringd::mcp`. **CLI:** `fleetringd mcp`.
+- **Code:** `fleetringd::mcp`. **CLI:** `fleetring mcp`.
 - **Not:** agent server, plugin, connector, bridge.
 
 ### Member
@@ -602,10 +602,10 @@ Database metadata: a database's [description](#description), [labels](#label), [
 
 ### Node
 
-One `fleetringd` process: a member of the fleet, a ring member, a data node, a control node, or both. In the placement crate, a ring member with an ID, a weight, a zone, and a host.
+One daemon process (`fleetring serve`, or `fleetring dev`): a member of the fleet, a ring member, a data node, a control node, or both. In the placement crate, a ring member with an ID, a weight, a zone, and a host.
 
 - **Applies to:** crate, daemon, CLI, UI.
-- **Code:** `Node`, `NodeId`, `[node]`. **CLI:** the noun `node` (`fleetringd node drain`), `<node-id>`, and `--node <node-id>` in every command that takes one; a node's [address](#address) is `--address`.
+- **Code:** `Node`, `NodeId`, `[node]`. **CLI:** the noun `node` (`fleetring node drain`, `fleetring node list`), `<node-id>`, and `--node <node-id>` in every command that takes one; a node's [address](#address) is `--address`.
 - **Not:** server, instance, host (unless the machine is meant), worker, replica, peer (as a name), daemon (fine for the binary).
 
 ### Node role
@@ -629,7 +629,7 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Replication::orphan`, `data::Orphan`, protocol `OrphanStatus` and `Database.RemoveOrphan`. **CLI:** `fleetringd orphan list`, `fleetringd orphan remove <database> --node <id>`.
+- **Code:** `Replication::orphan`, `data::Orphan`, protocol `OrphanStatus` and `Database.RemoveOrphan`. **CLI:** `fleetring orphan list`, `fleetring orphan remove <database> --node <id>`.
 - **Not:** stale copy, leftover, stray, zombie, dangling replica.
 
 ### Overlay
@@ -654,7 +654,7 @@ A copy of a database that a data node keeps on disk, closed, because the control
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** none yet. **CLI:** none yet.
-- **Not:** release (a [release](#release) is a version of `fleetringd`), dataset, bundle, image.
+- **Not:** release (a [release](#release) is a version of the `fleetring` binary), dataset, bundle, image.
 
 ### Parent
 
@@ -669,7 +669,7 @@ A copy of a database that a data node keeps on disk, closed, because the control
 The deterministic mapping from a key to its replica set (and, with cells, its cell). Placement is a wire format: changing which nodes a key maps to needs a new spec version (ADR-0008).
 
 - **Applies to:** crate, daemon, CLI, UI.
-- **Code:** `Placement` trait, `CellPlacement`, protocol `Placement`. **CLI:** `fleetringd db locate`.
+- **Code:** `Placement` trait, `CellPlacement`, protocol `Placement`. **CLI:** `fleetring db locate`.
 - **Not:** sharding, allocation, scheduling, routing (routing sends a request where placement says).
 
 ### Position
@@ -746,10 +746,10 @@ Whether a node should be sent work now: `/readyz` passes when every check of its
 
 ### Release
 
-A published version of `fleetringd`, `MAJOR.MINOR.PATCH` with an optional prerelease such as `-rc.1`, built and signed by the release workflow from a `fleetringd-vX.Y.Z` tag. Its *release line* is `MAJOR.MINOR`; a fleet runs at most two adjacent lines at once (ADR-0038).
+A published version of the `fleetring` binary (the `fleetringd` package), `MAJOR.MINOR.PATCH` with an optional prerelease such as `-rc.1`, built and signed by the release workflow from a `fleetringd-vX.Y.Z` tag. Its *release line* is `MAJOR.MINOR`; a fleet runs at most two adjacent lines at once (ADR-0038).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Release`, `Release::line`, `Release::runs_beside`. **CLI:** `--version` (of `upgrade`), `version=` in `fleetringd status`.
+- **Code:** `fleetring_control::Release`, `Release::line`, `Release::runs_beside`. **CLI:** `--version` (of `upgrade`), `version=` in `fleetring status`.
 - **Not:** build, cluster version, version (alone, for a line).
 
 ### Replica
@@ -820,10 +820,10 @@ The placement structure over a set of nodes, with a strategy (weighted rendezvou
 
 ### Rollback
 
-Returning a node to the binary its last [upgrade](#upgrade) replaced, kept beside it as `fleetringd.previous`. A rollback swaps the two, so a second one rolls forward; the fleet refuses one below a release whose [fleet feature](#fleet-feature) is enabled.
+Returning a node to the binary its last [upgrade](#upgrade) replaced, kept beside it as `<name>.previous`: `fleetring.previous` on a fresh install, and `fleetringd.previous` on a host upgraded from 0.6, whose real file is still `fleetringd` (ADR-0043, point 2). A rollback swaps the two, so a second one rolls forward; the fleet refuses one below a release whose [fleet feature](#fleet-feature) is enabled.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `upgrade::Mode::Rollback`. **CLI:** `fleetringd upgrade --rollback`.
+- **Code:** `upgrade::Mode::Rollback`. **CLI:** `fleetring upgrade --rollback`; the kept binary can also roll back on its own, as `<name>.previous upgrade --rollback`.
 - **Not:** downgrade (for this), revert, restore (that builds a database from an archive).
 
 ### Router
@@ -855,7 +855,7 @@ A database's tables, views, indexes, triggers, and virtual tables with their def
 A principal whose client certificate may read `/metrics` on an [admin listener](#admin-listener) with TLS (`[admin] scrapers`). It has no scope on the gRPC port unless a `[[principal]]` entry gives it one (ADR-0034).
 
 - **Applies to:** daemon.
-- **Code:** `AdminConfig::scrapers`. **CLI:** `fleetringd cert client <principal>` issues its certificate.
+- **Code:** `AdminConfig::scrapers`. **CLI:** `fleetring cert client <principal>` issues its certificate.
 - **Not:** collector, exporter, monitor.
 
 ### Segment
@@ -903,7 +903,7 @@ A consistent copy of state at one point. Always say which: a *database snapshot*
 What a member reports it runs: its [release](#release), the newest protocol and control-log format it speaks, and the [fleet features](#fleet-feature) it supports. A member that reports none runs 0.3.0 (ADR-0038).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetring_control::Software`, `Member::software`, `Member::running`; protocol `Software` on `JoinRequest`, `HeartbeatRequest`, and `Member`. **CLI:** `version=` in `fleetringd status`.
+- **Code:** `fleetring_control::Software`, `Member::software`, `Member::running`; protocol `Software` on `JoinRequest`, `HeartbeatRequest`, and `Member`. **CLI:** `version=` in `fleetring status`.
 - **Not:** build info, version info, capabilities.
 
 ### Spec
@@ -919,7 +919,7 @@ The placement spec: the normative description of placement that every implementa
 One of the three ways people use FleetRing: the CLI, the TUI, and the desktop app. All three use the same client crate, RPCs, and words (ADR-0033).
 
 - **Applies to:** CLI, UI.
-- **Code:** `fleetringd` subcommands; *planned* `fleetringd ui`, `apps/desktop`. **CLI:** `fleetringd ui` (*planned*, FR-057).
+- **Code:** the `fleetring` commands, in the `fleetringd` crate; *planned* `fleetring ui`, `apps/desktop`. **CLI:** `fleetring ui` (*planned*, FR-057).
 - **Not:** frontend, client (a client is any caller), interface, dashboard (fine for one view).
 
 ### Tenant
@@ -935,7 +935,7 @@ Not a FleetRing object. A tenant is a naming convention for keys, `tenant:<name>
 A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`. *Planned* (ADR-0044): a token may also be a biscuit in FleetRing's fixed vocabulary, which a holder can narrow and [delegate](#delegation) without the authority.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `auth::BearerToken`, `TokenId`, `KeyId`. **CLI:** `fleetringd token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
+- **Code:** `auth::BearerToken`, `TokenId`, `KeyId`. **CLI:** `fleetring token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
 - **Not:** API key, password, secret, session, JWT (fine where the format matters).
 
 ### Transfer
@@ -967,7 +967,7 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 Moving a node to another [release](#release): verify the release's signature and checksum, swap the binary atomically, and restart the node in place after a [drain](#drain), within the fleet's window of release lines (ADR-0038). A *rolling upgrade* moves a fleet one node at a time.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetringd upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`, `--software`; `SIGHUP` restarts a daemon in place.
+- **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetring upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`, `--software`; `SIGHUP` restarts a daemon in place. A 0.6 binary installs 0.7 under its old name, `fleetringd`, and a 0.7 `upgrade` then adds the `fleetring` link beside it (ADR-0043, point 3).
 - **Not:** update, self-update, patch (a patch is one kind of release).
 
 ### Weight
@@ -1007,3 +1007,21 @@ A placement label for a failure domain (a room, a rack, a cloud availability zon
 | up | [live](#liveness) |
 
 `Node` and `Member` in the protocol were never a conflict: a [member](#member) is the record of a [node](#node).
+
+## Renamed in 0.7.0
+
+0.7.0 named the binary `fleetring` (ADR-0043). These are clean breaks, apart from two compatibility names kept until 1.0: `fleetringd` as a second name for the binary, and a node started with `--config <file>` and no `serve`. Each old spelling fails with a `hint:` naming the new one.
+
+| Old word | Word now |
+|---|---|
+| `fleetringd …` (the binary) | `fleetring …`; `fleetringd` stays a name for it until 1.0 |
+| `fleetringd --config <file> [daemon flags]` | `fleetring serve --config <file> [daemon flags]`; the old form still runs a node until 1.0, with a warning |
+| `db archive show <db> --archive <a>` | `archive show <db> --archive <a>` |
+| `db archive verify <db> --archive <a>` | `archive verify <db> --archive <a>` |
+| `archive restore --from <db> --to <dir>` | `archive restore <db> --to <dir>` |
+| `ghcr.io/fleetring/fleetringd` | `ghcr.io/fleetring/fleetring`; the old name is pushed too until 1.0 |
+| `deploy/dev/fleetringd-dev.service`, `homebrew.mxcl.fleetringd` | `deploy/dev/fleetring-dev.service`, `homebrew.mxcl.fleetring` |
+| `fleetringd.previous` (the kept binary) | `<name>.previous`, beside the real file |
+| sourcing `~/.fleetring/env` to reach a dev node | the `dev` [context](#context); the `env` file is still written, for scripts |
+
+Kept through 0.x: the `fleetringd` package and crate (`-p fleetringd`, `fleetringd::…`, the `fleetringd::audit` log target), the `fleetringd-v` release tags, the `fleetringd-<version>-<target>` archives, `fleetringd.toml`, `<data_dir>/fleetringd.process`, `<data_dir>/fleetringd.lock`, `FLEETRINGD_RESTARTS`, and `FLEETRINGD_BASELINE_VERSION` and `FLEETRINGD_BASELINE_BIN` in the rolling-upgrade test (ADR-0043, point 1.7).

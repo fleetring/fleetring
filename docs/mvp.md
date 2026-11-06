@@ -22,13 +22,13 @@ An open-source Rust layer that places, routes, replicates, and moves **millions 
 - **Leadership per database, not per fleet.** A database's first ring node is its primary; the next N-1 are followers pulling its WAL. Leases in a small control database pick the primary. Raft for the control database comes later.
 - **Borrowed traits:** consistent hashing, replication factor, hinted handoff, and repair (DynamoDB/Cassandra); per-object databases created on first use and routed by name (Durable Objects); S3-compatible archives; libSQL/Hrana wire compatibility (Turso).
 - **General-purpose placement core.** The `fleetring` crate knows nothing about SQLite. It is published as general-purpose placement infrastructure, and the SQLite product is built on top of it (ADR-0011).
-- **One daemon, two modes.** The crate stays a pure library. `fleetringd` is batteries included: `fleetring up` on a LAN uses mDNS to form a fleet, weights nodes by disk and RAM, and treats a sleeping laptop as a temporarily down node.
+- **One daemon, two modes.** The crate stays a pure library. The daemon (`fleetring serve`) is batteries included: `fleetring up` on a LAN uses mDNS to form a fleet, weights nodes by disk and RAM, and treats a sleeping laptop as a temporarily down node.
 - **Agents connect by name:** `fleet.db("agent:sam-researcher")`. Local agents use the bundled MCP server (`memory.write`, `memory.search`, `db.query`, `db.fork`, `db.snapshot`). Cloud agents use the router over HTTPS with API keys scoped to a name prefix.
 - **Client:** the Rust client embeds the ring (no extra hop). Everything else goes through the libSQL-compatible router, so existing Turso/libSQL SDKs work on day one. The client caches the ring map, follows redirects when a database moves, writes to the primary, and can opt into replica reads.
 
 ## MVP (v0.1, about 4–6 weeks), in build order
 1. **Ring crate:** weighted virtual nodes, replication factor, host/zone-aware placement, bounded loads, pluggable rendezvous/vnode-ring strategy. Deterministic and heavily tested.
-2. **`fleetringd`:** per-database primary plus followers, leases, heartbeats.
+2. **The daemon (`fleetring serve`):** per-database primary plus followers, leases, heartbeats.
 3. **Live migration** on join/leave (database snapshot plus WAL tail, cutover) with zero lost writes; deterministic simulation tests from day one.
 4. **Router plus Rust client.**
 5. **Home lab mode** (`fleetring up`, mDNS) and **S3-compatible archives** of base snapshots and the log (MinIO, R2, S3).
@@ -47,7 +47,7 @@ agents (MCP)    apps (libSQL SDKs)    Rust client (embedded ring)
                |
         control db (membership, leases, db→node map)
                |
-  node A    node B    node C     fleetringd: per-db primary + WAL followers
+  node A    node B    node C     fleetring serve: per-db primary + WAL followers
       \        |        /
      S3-compatible archives
 ```

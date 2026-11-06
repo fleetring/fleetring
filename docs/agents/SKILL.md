@@ -11,15 +11,15 @@ FleetRing runs many small SQLite databases on machines its operator owns, each r
 
 You reach it in one of two ways:
 
-| Task | MCP tool (`fleetringd mcp`) | CLI |
+| Task | MCP tool (`fleetring mcp`) | CLI |
 |---|---|---|
-| Create a database | `db_create` (`name`, `description`, `labels`, `expires_in` or `expires_at`, `replication_factor`) | `fleetringd db create <db> --description … --label k=v --expires-in 2h` |
-| Find databases | `db_list` (`prefix`, `labels`, `after`, `limit`) | `fleetringd db list --prefix agent-42- --label purpose=memory` |
-| See one in detail | `db_show` (`name`, `schema`, `count_limit`) | `fleetringd db show <db>` |
-| Read rows | `query` (`database`, `sql`, `params`, `max_rows`) | `fleetringd db query <db> "<sql>" [params…]` |
-| Write rows or change the schema | `exec` (`database`, `sql`, `params`) | `fleetringd db exec <db> "<sql>" [params…]` |
-| Change the description, labels, or expiry | `db_update` (`name`, `description`, `labels`, `expires_in` or `expires_at`, `expected_version`) | `fleetringd db edit <db> --description … --label k=v --remove-label k --expires-in 2h --if-version <n>` |
-| Drop a database | `db_drop` (`name`, `confirm`, which repeats `name`) | `fleetringd db drop <db>` |
+| Create a database | `db_create` (`name`, `description`, `labels`, `expires_in` or `expires_at`, `replication_factor`) | `fleetring db create <db> --description … --label k=v --expires-in 2h` |
+| Find databases | `db_list` (`prefix`, `labels`, `after`, `limit`) | `fleetring db list --prefix agent-42- --label purpose=memory` |
+| See one in detail | `db_show` (`name`, `schema`, `count_limit`) | `fleetring db show <db>` |
+| Read rows | `query` (`database`, `sql`, `params`, `max_rows`) | `fleetring db query <db> "<sql>" [params…]` |
+| Write rows or change the schema | `exec` (`database`, `sql`, `params`) | `fleetring db exec <db> "<sql>" [params…]` |
+| Change the description, labels, or expiry | `db_update` (`name`, `description`, `labels`, `expires_in` or `expires_at`, `expected_version`) | `fleetring db edit <db> --description … --label k=v --remove-label k --expires-in 2h --if-version <n>` |
+| Drop a database | `db_drop` (`name`, `confirm`, which repeats `name`) | `fleetring db drop <db>` |
 
 The rest of this page names the MCP tools. Every point applies to the CLI too. A server started with `--read-only` offers only `db_list`, `db_show`, and `query`.
 
@@ -276,7 +276,7 @@ SELECT state, count(*) AS tasks FROM tasks GROUP BY state ORDER BY state;
 
 ### Vectors (planned, FR-069)
 
-Vector search waits for sqlite-vec to be compiled into `fleetringd` (FR-069). Until then, `vec0` tables don't exist, and the adapter refuses to load extensions. Use full-text search instead.
+Vector search waits for sqlite-vec to be compiled into `fleetring` (FR-069). Until then, `vec0` tables don't exist, and the adapter refuses to load extensions. Use full-text search instead.
 
 ```sql planned
 -- Planned (FR-069): a vec0 virtual table beside notes, keyed by note ID, holding one

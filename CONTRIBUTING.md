@@ -5,7 +5,7 @@ Thanks for helping. This page says how a change gets from your branch onto `main
 ## Read first
 
 - **[`docs/lexicon.md`](docs/lexicon.md)**: the names for everything. Code, docs, CLI output, and tickets use its words. A new concept gets an entry there before it gets a type or a flag.
-- **[`docs/cli.md`](docs/cli.md)**: the CLI style guide, for any change to a `fleetringd` command, flag, or output.
+- **[`docs/cli.md`](docs/cli.md)**: the CLI style guide, for any change to a `fleetring` command, flag, or output.
 - **[`docs/adr/`](docs/adr/README.md)**: the decisions behind the code you are changing. Read the ones the index lists for your area.
 - **[GitHub Issues](https://github.com/fleetring/fleetring/issues) and the FleetRing roadmap project**: planned work and its acceptance criteria. [`docs/tickets/`](docs/tickets/README.md) archives the finished tickets and holds the definition of done, and [`docs/plans/`](docs/plans/) holds implementation plans.
 
