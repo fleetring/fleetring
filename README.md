@@ -113,7 +113,7 @@ Run another `db exec` and watch its row arrive in the `tail`. Ctrl-C stops the n
 
 ## Agents
 
-An AI agent can have its own databases: it creates them under its own name prefix, describes and labels them so they can be found again, gives scratch databases an expiry, and drops them when it's done, through `fleetring mcp`, an MCP server, or the CLI. The [agent quickstart](docs/agents/quickstart.md) sets one up on a dev node with a scoped token, and the [agent skill](docs/agents/SKILL.md) is what the agent reads: when to create a database rather than a table, naming, labels, expiry, and SQL patterns for memory, task state, and full-text search. [`llms.txt`](llms.txt) lists the pages an agent should read.
+An AI agent can have its own databases: it creates them under its own name prefix, describes and labels them so they can be found again, gives scratch databases an expiry, and drops them when it's done, through `fleetring mcp`, an MCP server, or the CLI. One command sets one up on a laptop: an MCP client that runs `fleetring mcp --agent 42` gets a dev node and an identity of the agent's own, scoped to its `agent-42-` databases. The [agent quickstart](docs/agents/quickstart.md) walks through it, and says what it doesn't do: agents on one machine run as one user and can read each other's credentials, so this is trusted local development, not isolation. The [agent skill](docs/agents/SKILL.md) is what the agent reads: when to create a database rather than a table, naming, labels, expiry, and SQL patterns for memory, task state, and full-text search. [`llms.txt`](llms.txt) lists the pages an agent should read.
 
 ## The placement crate
 
