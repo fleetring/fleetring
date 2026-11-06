@@ -332,6 +332,27 @@ This is the product contract for agents, and part of the umbrella.
 4. **0.7's `fleetring mcp --agent` is trusted local development** under this definition: dev mode mints identities into `~/.fleetring/agents/`, beside the dev authority, readable by every process of the user. Its documentation says so (point 10, 0.7 requirement 5).
 5. **The acceptance test for a secure mode.** Under the launcher, parent agent A tries to read B's holder key and token, open B's SQLite files, control B's terminal, and launch a child with more than its own ceiling. Every attempt fails, with hostile prompts and auto-accept on. Nothing may be called a secure multi-agent mode until this test passes.
 
+6. **Launcher backends: a design direction, not a commitment.** FleetRing defines the launcher's contract and the credential broker, and runs agents in an existing isolation mechanism behind one interface. It does not build a container runtime or a hypervisor.
+
+   | Backend | Isolation | Where |
+   |---|---|---|
+   | `none` | trusted local development (point 3) | everywhere; the default until a backend ships |
+   | `container` (OCI: Docker, Podman; Apple's `container` on Apple silicon) | namespaces and a restricted filesystem, process view and network. On macOS and Windows these runtimes run a Linux VM, and Apple's runs each container in its own lightweight VM | developer machines on every platform, and Linux servers |
+   | `microvm` (Firecracker or Cloud Hypervisor on Linux; Apple's Virtualization framework on macOS) | a separate guest kernel per agent | servers and clouds, for hostile or multi-tenant agents |
+
+   **The contract every backend implements:**
+   - **Create a sandbox** with only the agent's work directory mounted: no home directory, no host sockets, and never the daemon's data directory, the authority key, or admin credentials.
+   - **Network:** deny by default, except one mounted FleetRing proxy socket.
+   - **Credentials:** the sandbox holds no holder key. A broker outside it proxies requests and binds the caller's identity to the sandbox the launcher created, never to a name or variable the agent supplies.
+   - **Resources:** CPU, memory and disk quotas, plus kill and cleanup.
+   - **`spawn(child)`:** enforces the ceilings of point 2, and the child gets its own sandbox unless the user's policy deliberately trusts the whole lineage.
+
+   **Consequence for MCP:** an MCP client normally spawns its server inside its own process tree, so a sandboxed agent would hold the server's credentials. Under a launcher, `fleetring mcp` runs outside the sandbox, as the broker, and the agent reaches it through the mounted socket. That changes how agents register MCP servers, so it lands with the launcher, not in 0.7.
+
+   **Separate OS users per agent** were considered and are not a primary path: they differ across Windows, macOS and Linux, need administrator rights to create users, and still share one kernel.
+
+   **Order:** after the agent integration proves itself: the broker and `container` backend first, `microvm` second. Existing agent sandboxes are evaluated as backends before anything is built.
+
 ## Alternatives considered
 
 - **Macaroons.** Attenuation is built in, but verification needs the root secret, so every verifying node could mint any token. Rejected for that alone.
@@ -350,6 +371,7 @@ This is the product contract for agents, and part of the umbrella.
 - **Access roles in control state, or evaluated on nodes.** Every edit would be a control command and a fleet feature, and every node would need the registry; compiling at issuance keeps nodes unchanged and verification offline. The cost is that an edited role reaches a principal at its next token, which short lifetimes for people bound, and revocation covers the urgent case.
 - **One fleet per organization only.** Simplest isolation, but nodes couldn't be shared across teams, and every small team would run a control plane. Namespaces in one fleet plus constrained anchors between fleets cover both.
 - **Merging forks back, or overlays into packages, inside FleetRing.** Row merges need conflict rules, which the one-writer-per-database model rejects. Copying back is the application's explicit act.
+- **A separate OS user per agent as the isolation mechanism.** Real file separation, but it differs across Windows, macOS and Linux, needs administrator rights to create users, and shares one kernel. Containers and microVMs behind one launcher interface (point 11.6) are preferred.
 - **Extracting a standalone auth crate now.** Clean, but it would freeze an API before the vocabulary has one real consumer outside this binary.
 
 ## Consequences
