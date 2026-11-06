@@ -50,7 +50,7 @@ fn port_pair() -> TestResult<u16> {
 }
 
 /// What the banner starts with once the node serves.
-const BANNER: &str = "fleetringd is running in dev mode";
+const BANNER: &str = "fleetring is running in dev mode";
 
 /// The variables a developer's shell may hold that would point a command elsewhere.
 const CLIENT_VARS: [&str; 10] = [

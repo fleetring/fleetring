@@ -1,5 +1,5 @@
 //! Dev mode (ADR-0039): one node on loopback, with a local authority and an admin principal that
-//! `fleetringd dev` creates once and reuses.
+//! `fleetring dev` creates once and reuses.
 //!
 //! [`prepare`] creates whatever the directory lacks and loads the configuration it holds; the
 //! binary then runs that configuration as it runs any other. With `dev = true`, validation keeps
@@ -249,7 +249,7 @@ pub enum DevError {
     /// The directory holds something dev mode never writes, and so isn't a dev directory.
     #[error(
         "{dir} isn't a dev mode directory: it holds {entry}, which dev mode never writes, so \
-         `fleetringd dev` won't touch it; pass an empty or new --data-dir"
+         `fleetring dev` won't touch it; pass an empty or new --data-dir"
     )]
     NotDevDir {
         /// The directory.
@@ -297,8 +297,8 @@ pub enum DevError {
     },
     /// The configuration file doesn't say `dev = true`.
     #[error(
-        "{path} isn't a dev mode configuration: it lacks `dev = true`, so `fleetringd dev` won't \
-         run it; run it with `fleetringd --config`, or pass another --data-dir"
+        "{path} isn't a dev mode configuration: it lacks `dev = true`, so `fleetring dev` won't \
+         run it; run it with `fleetring serve --config`, or pass another --data-dir"
     )]
     NotDev {
         /// The file.
@@ -449,7 +449,7 @@ impl Prepared {
         self.dir.join(ENV_FILE)
     }
 
-    /// The banner `fleetringd dev` prints once the node serves on `listen`, with its admin
+    /// The banner `fleetring dev` prints once the node serves on `listen`, with its admin
     /// listener on `admin`: that it is dev mode, where it is, which context points the CLI at it
     /// (`context`), and what to try.
     #[must_use]
@@ -460,7 +460,7 @@ impl Prepared {
         context: &DevContextLine,
     ) -> String {
         let mut text = String::from(
-            "fleetringd is running in dev mode: one node on loopback with a local authority, \
+            "fleetring is running in dev mode: one node on loopback with a local authority, \
              for development only.\n\n",
         );
         let _ = writeln!(text, "  address    {listen}");
@@ -904,8 +904,8 @@ fn config_text(dir: &Path, port: u16) -> Result<String, DevError> {
     };
     let admin = port + 1;
     Ok(format!(
-        "# fleetringd dev mode (ADR-0039): one node on loopback with a local authority, for\n\
-         # development only. `fleetringd dev` wrote this file and never rewrites it. Edit it if you\n\
+        "# fleetring dev mode (ADR-0039): one node on loopback with a local authority, for\n\
+         # development only. `fleetring dev` wrote this file and never rewrites it. Edit it if you\n\
          # like, but every address must stay loopback: with `dev = true`, the daemon refuses any\n\
          # other.\n\
          dev = true\n\
@@ -955,8 +955,8 @@ fn config_text(dir: &Path, port: u16) -> Result<String, DevError> {
 /// commands need no flags. FR-056 replaces it with a `dev` context.
 fn env_text(tls: &Path, control: SocketAddr) -> String {
     format!(
-        "# Points the fleetringd commands at the dev mode node (ADR-0039). Load it with `. <this file>`.\n\
-         # `fleetringd dev` rewrites it from fleetringd.toml at every start.\n\
+        "# Points the fleetring commands at the dev mode node (ADR-0039). Load it with `. <this file>`.\n\
+         # `fleetring dev` rewrites it from fleetringd.toml at every start.\n\
          export FLEETRING_CONTROL={}\n\
          export FLEETRING_TLS_DIR={}\n\
          export FLEETRING_AS={PRINCIPAL}\n",
@@ -1733,7 +1733,7 @@ mod tests {
         let prepared = prepared(&dir);
         let banner = banner_with(&prepared, &DevContextLine::Current);
         assert!(
-            banner.starts_with("fleetringd is running in dev mode"),
+            banner.starts_with("fleetring is running in dev mode"),
             "{banner}"
         );
         assert!(banner.contains("address    127.0.0.1:17400"), "{banner}");
