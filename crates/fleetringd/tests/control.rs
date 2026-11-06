@@ -3468,7 +3468,6 @@ mod expiry {
 mod node_list {
     use std::error::Error;
     use std::net::SocketAddr;
-    use std::process::Command;
     use std::time::Duration;
 
     use fleetring_proto::v1::{DrainRequest, HeartbeatRequest, JoinRequest, Node};
@@ -3567,7 +3566,7 @@ mod node_list {
             let control = self.address.to_string();
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
             let output = tokio::task::spawn_blocking(move || {
-                Command::new(env!("CARGO_BIN_EXE_fleetring"))
+                crate::support::fleetring()
                     .env("FLEETRING_TLS_DIR", tls_dir)
                     .args(["node", "list"])
                     .args(&args)
