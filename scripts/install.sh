@@ -1,5 +1,6 @@
 #!/bin/sh
-# Installs fleetringd from a GitHub release (FR-034).
+# Installs fleetring from a GitHub release (FR-034), with `fleetringd`, its name before 0.7, as a
+# link to it until 1.0 (ADR-0043).
 #
 #   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
@@ -7,7 +8,8 @@
 #
 # It picks the archive for this OS and CPU, checks it against the release's SHA256SUMS (after
 # verifying that file's cosign signature, when cosign is installed), and copies
-# the binary to PREFIX/bin. Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
+# the binary to PREFIX/bin/fleetring, with PREFIX/bin/fleetringd a link to it. A release before
+# 0.7 installs as PREFIX/bin/fleetringd alone, as it always did. Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
 # and ARM64. On Windows, download the .zip from the release page.
 
 set -eu
@@ -19,7 +21,8 @@ base_url="${FLEETRINGD_BASE_URL:-}"
 
 usage() {
     cat <<EOF
-Installs fleetringd from a GitHub release.
+Installs fleetring from a GitHub release, and fleetringd, its name before 0.7, as a link
+to it.
 
 Usage: install.sh [--version VERSION] [--prefix DIR] [--base-url URL]
 
@@ -117,7 +120,7 @@ detect_target() {
     case "$os" in
         Linux)
             if ldd --version 2>&1 | grep -qi musl; then
-                fail "release builds need glibc, and this system uses musl; use the container image ghcr.io/fleetring/fleetringd, or build from source"
+                fail "release builds need glibc, and this system uses musl; use the container image ghcr.io/fleetring/fleetring, or build from source"
             fi
             echo "$arch-unknown-linux-gnu"
             ;;
@@ -154,7 +157,7 @@ esac
 if [ -z "$version" ]; then
     [ -z "$base_url" ] || fail "--base-url needs --version"
     version=$(latest_version) || true
-    [ -n "$version" ] || fail "can't find the newest fleetringd release; pass --version"
+    [ -n "$version" ] || fail "can't find the newest fleetring release; pass --version"
 fi
 if [ -z "$base_url" ]; then
     base_url="https://github.com/$repo/releases/download/fleetringd-v$version"
@@ -172,11 +175,11 @@ bin_dir="$prefix/bin"
 name="fleetringd-$version-$target"
 archive="$name.tar.gz"
 
-tmp=$(mktemp -d 2> /dev/null || mktemp -d -t fleetringd)
+tmp=$(mktemp -d 2> /dev/null || mktemp -d -t fleetring)
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 1' HUP INT TERM
 
-say "downloading fleetringd $version for $target"
+say "downloading fleetring $version for $target"
 download "$base_url/$archive" "$tmp/$archive" || fail "can't download $base_url/$archive"
 download "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" || fail "can't download $base_url/SHA256SUMS"
 
@@ -230,18 +233,43 @@ fi
 say "verified the SHA-256 checksum"
 
 tar -xzf "$tmp/$archive" -C "$tmp"
-[ -f "$tmp/$name/fleetringd" ] || fail "$archive holds no $name/fleetringd"
+# From 0.7 the archive holds `fleetring` (and `fleetringd`, for 0.6 upgraders); before 0.7, only
+# `fleetringd`. Either may be a link from 0.8 on; `[ -f ]` and `cp` follow it.
+if [ -f "$tmp/$name/fleetring" ]; then
+    binary=fleetring
+elif [ -f "$tmp/$name/fleetringd" ]; then
+    binary=fleetringd
+else
+    fail "$archive holds neither $name/fleetring nor $name/fleetringd"
+fi
 
 mkdir -p "$bin_dir" || fail "can't create $bin_dir; pass --prefix, or run as a user who can write there"
-# Copies next to the destination, then renames, so a running fleetringd is never overwritten
-# in place.
-cp "$tmp/$name/fleetringd" "$bin_dir/.fleetringd.new" \
+# Copies next to the destination, then renames, so a running binary is never overwritten in
+# place.
+cp "$tmp/$name/$binary" "$bin_dir/.$binary.new" \
     || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
-chmod 0755 "$bin_dir/.fleetringd.new"
-mv -f "$bin_dir/.fleetringd.new" "$bin_dir/fleetringd"
+chmod 0755 "$bin_dir/.$binary.new"
+mv -f "$bin_dir/.$binary.new" "$bin_dir/$binary"
 
-say "installed $("$bin_dir/fleetringd" --version) to $bin_dir/fleetringd"
+if [ "$binary" = fleetring ]; then
+    # `fleetringd` is a link to `fleetring` until 1.0, replaced atomically, so whatever ran
+    # `fleetringd` (a service unit, a script) runs this binary.
+    ln -sf fleetring "$bin_dir/.fleetringd.new" \
+        || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
+    mv -f "$bin_dir/.fleetringd.new" "$bin_dir/fleetringd"
+    say "installed $("$bin_dir/fleetring" --version) to $bin_dir/fleetring (also as fleetringd)"
+else
+    say "installed $("$bin_dir/fleetringd" --version) to $bin_dir/fleetringd"
+    # A release before 0.7 knows only `fleetringd`. A `fleetring` left by a later install would
+    # run another release, so it follows `fleetringd` instead.
+    if [ -e "$bin_dir/fleetring" ] || [ -L "$bin_dir/fleetring" ]; then
+        ln -sf fleetringd "$bin_dir/.fleetring.new" \
+            || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
+        mv -f "$bin_dir/.fleetring.new" "$bin_dir/fleetring"
+        say "$bin_dir/fleetring is now a link to fleetringd"
+    fi
+fi
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
-    *) say "$bin_dir is not on your PATH; add it, or run $bin_dir/fleetringd" ;;
+    *) say "$bin_dir is not on your PATH; add it, or run $bin_dir/$binary" ;;
 esac
