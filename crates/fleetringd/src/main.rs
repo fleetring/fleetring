@@ -44,8 +44,8 @@ use fleetringd::mcp::{self, Access, McpSettings};
 use fleetringd::observe::log_subscriber;
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{
-    DatabaseReport, MetadataReport, expiry_text, printable, render_archived_metadata, render_text,
-    schema_unavailable,
+    DatabaseReport, MetadataReport, NodeList, expiry_text, printable, render_archived_metadata,
+    render_text, schema_unavailable, table,
 };
 use fleetringd::tls::{
     Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
@@ -190,7 +190,7 @@ enum Command {
     /// didn't know their databases, or held them only at a lower epoch, and the node saw no drop.
     #[command(subcommand)]
     Orphan(OrphanCommand),
-    /// Works with archives without a fleet: restores a database from one offline.
+    /// Shows and verifies a database's archive, and restores a database from one with no fleet.
     #[command(subcommand)]
     Archive(ArchiveCommand),
     /// Installs another release of fleetring in place of this binary, verified with cosign
@@ -325,53 +325,6 @@ fn parse_release(text: &str) -> Result<Release, String> {
 
 #[derive(Debug, Subcommand)]
 enum ArchiveCommand {
-    /// Restores an archived database into a new directory, with no fleet: for disaster
-    /// recovery. The directory then holds a plain SQLite database, `data.db`, that `sqlite3`
-    /// opens directly. Every batch is verified against the hash chain on the way.
-    Restore {
-        /// A daemon's configuration file, whose `[[archive]]` entry names the store.
-        #[arg(long)]
-        config: PathBuf,
-        /// The `[[archive]]` entry's name.
-        #[arg(long)]
-        archive: String,
-        /// The archived database to restore.
-        #[arg(long)]
-        from: DatabaseName,
-        /// The directory to write, which must not exist.
-        #[arg(long)]
-        to: PathBuf,
-        #[command(flatten)]
-        point: PointArgs,
-    },
-}
-
-/// Which point of an archive a command restores: the latest unless one is named.
-#[derive(Debug, Args)]
-struct PointArgs {
-    /// Restores exactly the log up to this position, a transaction boundary, as `db locate` or
-    /// `db archive describe` prints positions.
-    #[arg(long, value_parser = parse_position, conflicts_with = "at_time")]
-    at_position: Option<Position>,
-    /// Restores every segment archived at or before this time, RFC 3339, such as
-    /// `2026-11-03T09:30:00Z`, by the archiving nodes' clocks. The restore may stop up to one
-    /// segment interval before it, and never holds a write acknowledged after it.
-    #[arg(long, value_parser = parse_time)]
-    at_time: Option<u64>,
-}
-
-impl PointArgs {
-    fn target(&self) -> RestoreTarget {
-        match (&self.at_position, self.at_time) {
-            (Some(position), _) => RestoreTarget::Position(position.clone()),
-            (None, Some(ms)) => RestoreTarget::Time(ms),
-            (None, None) => RestoreTarget::Latest,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-enum DbArchiveCommand {
     /// Shows what an archive holds for a database: its snapshots, how far its segments reach,
     /// and anything a restore won't use.
     Show {
@@ -403,6 +356,49 @@ enum DbArchiveCommand {
         #[command(flatten)]
         target: Target,
     },
+    /// Restores an archived database into a new directory, with no fleet: for disaster
+    /// recovery. The directory then holds a plain SQLite database, `data.db`, that `sqlite3`
+    /// opens directly. Every batch is verified against the hash chain on the way. `db restore`
+    /// is the online restore, into the fleet.
+    Restore {
+        /// The archived database to restore.
+        name: DatabaseName,
+        /// The directory to write, which must not exist.
+        #[arg(long)]
+        to: PathBuf,
+        /// A daemon's configuration file, whose `[[archive]]` entry names the store.
+        #[arg(long)]
+        config: PathBuf,
+        /// The `[[archive]]` entry's name.
+        #[arg(long)]
+        archive: String,
+        #[command(flatten)]
+        point: PointArgs,
+    },
+}
+
+/// Which point of an archive a command restores: the latest unless one is named.
+#[derive(Debug, Args)]
+struct PointArgs {
+    /// Restores exactly the log up to this position, a transaction boundary, as `db locate` or
+    /// `archive show` prints positions.
+    #[arg(long, value_parser = parse_position, conflicts_with = "at_time")]
+    at_position: Option<Position>,
+    /// Restores every segment archived at or before this time, RFC 3339, such as
+    /// `2026-11-03T09:30:00Z`, by the archiving nodes' clocks. The restore may stop up to one
+    /// segment interval before it, and never holds a write acknowledged after it.
+    #[arg(long, value_parser = parse_time)]
+    at_time: Option<u64>,
+}
+
+impl PointArgs {
+    fn target(&self) -> RestoreTarget {
+        match (&self.at_position, self.at_time) {
+            (Some(position), _) => RestoreTarget::Position(position.clone()),
+            (None, Some(ms)) => RestoreTarget::Time(ms),
+            (None, None) => RestoreTarget::Latest,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -702,9 +698,6 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Shows and verifies a database's archive.
-    #[command(subcommand)]
-    Archive(DbArchiveCommand),
     /// Drops a database for good: every replica that is up deletes its copy, and one that is
     /// down or unreachable keeps it as an orphan for `orphan remove`.
     Drop {
@@ -721,6 +714,16 @@ enum DbCommand {
 
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
+    /// Lists the members with their liveness, drain state and release, as the control plane sees
+    /// them.
+    ///
+    /// Every member is a data node: membership records no role, so there is no role column.
+    List {
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        target: Target,
+    },
     /// Hands every database the node is primary for to a follower, without waiting for a
     /// failover. The node gets no new primaries afterwards, and stays a follower until it stops
     /// or restarts; stopping it then costs clients only a redirect.
@@ -1401,7 +1404,7 @@ fn main() -> ExitCode {
     let (cli, invocation) = match parse(raw, name) {
         Ok(parsed) => parsed,
         Err(error) => {
-            let hint = edit::removed_verb_hint(&error);
+            let hint = edit::removed_verb_hint(&error).or_else(|| edit::renamed_hint(&error));
             let code = error.exit_code();
             // Help and version requests are not errors; clap prints them to stdout.
             let _ = error.print();
@@ -1877,12 +1880,12 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             }
             output
         }
-        Command::Db(DbCommand::Archive(DbArchiveCommand::Show {
+        Command::Archive(ArchiveCommand::Show {
             name,
             archive,
             address,
             target,
-        })) => {
+        }) => {
             let client = target.client()?;
             let address = archive_node(&client, address).await?;
             let description = client
@@ -1891,13 +1894,13 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .map_err(failed)?;
             format_archive(&archive, &description)
         }
-        Command::Db(DbCommand::Archive(DbArchiveCommand::Verify {
+        Command::Archive(ArchiveCommand::Verify {
             name,
             archive,
             address,
             point,
             target,
-        })) => {
+        }) => {
             let progress = Progress::start(
                 format!("verifying the archive of {}\u{2026}", shown(&name)),
                 &spinner_surroundings(MachineOutput::No),
@@ -1909,10 +1912,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             report
         }
         Command::Archive(ArchiveCommand::Restore {
+            name: from,
+            to,
             config,
             archive,
-            from,
-            to,
             point,
         }) => {
             let progress = Progress::start(
@@ -1933,6 +1936,13 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .await
                 .map_err(failed)?;
             format!("dropped {} at epoch {}\n", shown(&name), epoch.get())
+        }
+        Command::Node(NodeCommand::List { output, target }) => {
+            let nodes = NodeList::from_view(&target.client()?.status().await.map_err(failed)?);
+            match output.format() {
+                OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&nodes)?),
+                OutputFormat::Table => nodes.text(),
+            }
         }
         Command::Node(NodeCommand::Drain { id, target }) => {
             let client = target.client()?;
@@ -2159,7 +2169,7 @@ fn format_restored(
     )
 }
 
-/// `db archive describe`'s report.
+/// `archive show`'s report.
 fn format_archive(archive: &str, description: &ArchiveDescription) -> String {
     let mut output = format!(
         "database: {}\narchive: {archive}\nlatest: {}\nlast segment archived: {}\n\
@@ -2202,7 +2212,7 @@ fn format_archive(archive: &str, description: &ArchiveDescription) -> String {
     output
 }
 
-/// Runs `db archive verify`: a scratch restore on a data node, then each live replica's hash at
+/// Runs `archive verify`: a scratch restore on a data node, then each live replica's hash at
 /// the restored position, compared with the archive's.
 async fn verify_archive(
     client: &Client,
@@ -2839,7 +2849,6 @@ fn format_orphans(orphans: &[(String, Orphan)]) -> String {
     if orphans.is_empty() {
         return "no orphans\n".to_owned();
     }
-    let header = ["NODE", "DATABASE", "EPOCH", "BYTES"];
     let rows: Vec<[String; 4]> = orphans
         .iter()
         .map(|(node, orphan)| {
@@ -2851,32 +2860,7 @@ fn format_orphans(orphans: &[(String, Orphan)]) -> String {
             ]
         })
         .collect();
-    let mut widths = header.map(str::len);
-    for row in &rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    let mut output = String::new();
-    let mut line = |cells: [&str; 4]| {
-        let mut text = String::new();
-        for (index, cell) in cells.iter().enumerate() {
-            if index > 0 {
-                text.push_str("  ");
-            }
-            text.push_str(cell);
-            if index + 1 < cells.len() {
-                text.push_str(&" ".repeat(widths[index].saturating_sub(cell.chars().count())));
-            }
-        }
-        output.push_str(&text);
-        output.push('\n');
-    };
-    line(header);
-    for row in &rows {
-        line([&row[0], &row[1], &row[2], &row[3]]);
-    }
-    output
+    table(["NODE", "DATABASE", "EPOCH", "BYTES"], &rows)
 }
 
 fn confirm_remove(id: &NodeId, place: &str) -> Result<(), Box<dyn Error>> {

@@ -3462,3 +3462,210 @@ mod expiry {
         Ok(())
     }
 }
+
+/// `node list` (ADR-0043): the members with their liveness, drain state and release, as the
+/// real binary prints them.
+mod node_list {
+    use std::error::Error;
+    use std::net::SocketAddr;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use fleetring_proto::v1::{DrainRequest, HeartbeatRequest, JoinRequest, Node};
+    use fleetringd::{Config, Daemon};
+    use serde_json::json;
+
+    use super::{TestResult, join_request, node_client, reporting, secure_client};
+    use crate::support::Tls;
+
+    /// How long a member stays live without a heartbeat in these tests.
+    const HEARTBEAT_TIMEOUT_MS: u64 = 400;
+
+    /// A control daemon with three members: `node-a` (live, on 0.3.1, with every attribute),
+    /// `node-b` (live, draining, on the 0.3.0 a member that reports no software runs), and
+    /// `node-c` (down).
+    struct Fleet {
+        _dir: tempfile::TempDir,
+        tls: Tls,
+        daemon: Daemon,
+        address: SocketAddr,
+        heartbeats: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Fleet {
+        async fn start() -> Result<Self, Box<dyn Error>> {
+            let dir = tempfile::tempdir()?;
+            let tls = Tls::create(dir.path())?;
+            let config = format!(
+                "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \
+                 \"control-1\"\n\n[control]\nheartbeat_timeout_ms = {HEARTBEAT_TIMEOUT_MS}\n{}",
+                dir.path().join("data"),
+                tls.node_table("control-1")?,
+            );
+            let daemon = Daemon::start(Config::from_toml(&config)?).await?;
+            let address = daemon.control_address().ok_or("no control address")?;
+            let control = secure_client(address, &tls)?;
+
+            // node-c joins first and never beats again, so it is down by the time the others
+            // have joined.
+            node_client(address, &tls, "node-c")?
+                .join(join_request("node-c"))
+                .await?;
+            tokio::time::sleep(Duration::from_millis(HEARTBEAT_TIMEOUT_MS * 2)).await;
+            node_client(address, &tls, "node-a")?
+                .join(JoinRequest {
+                    node: Some(Node {
+                        id: "node-a".into(),
+                        zone: Some("zone-1".into()),
+                        host: Some("host-1".into()),
+                        weight: 2,
+                        address: Some("10.0.0.1:7400".into()),
+                    }),
+                    software: Some(reporting("0.3.1")),
+                    ..join_request("node-a")
+                })
+                .await?;
+            node_client(address, &tls, "node-b")?
+                .join(join_request("node-b"))
+                .await?;
+            control
+                .drain(DrainRequest {
+                    node_id: "node-b".into(),
+                })
+                .await?;
+
+            let heartbeats = ["node-a", "node-b"]
+                .into_iter()
+                .map(|id| {
+                    let client = node_client(address, &tls, id)?;
+                    Ok(tokio::spawn(async move {
+                        loop {
+                            let _ = client
+                                .heartbeat(HeartbeatRequest {
+                                    node_id: id.into(),
+                                    databases: Vec::new(),
+                                    software: None,
+                                })
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }))
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            Ok(Self {
+                _dir: dir,
+                tls,
+                daemon,
+                address,
+                heartbeats,
+            })
+        }
+
+        /// Runs `fleetring node list` with `args`, and returns its stdout.
+        async fn node_list(&self, args: &[&str]) -> Result<String, Box<dyn Error>> {
+            let tls_dir = self.tls.dir().to_owned();
+            let control = self.address.to_string();
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            let output = tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_fleetring"))
+                    .env("FLEETRING_TLS_DIR", tls_dir)
+                    .args(["node", "list"])
+                    .args(&args)
+                    .args(["--control", &control])
+                    .output()
+            })
+            .await??;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            Ok(String::from_utf8(output.stdout)?)
+        }
+
+        async fn stop(self) {
+            for heartbeat in &self.heartbeats {
+                heartbeat.abort();
+            }
+            self.daemon.run_until(std::future::ready(())).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_list_shows_every_member_with_liveness_drain_and_release() -> TestResult {
+        let fleet = Fleet::start().await?;
+        let printed = fleet.node_list(&[]).await?;
+        let rows: Vec<Vec<&str>> = printed
+            .lines()
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                [
+                    "NODE", "ADDRESS", "ZONE", "HOST", "WEIGHT", "LIVENESS", "DRAINING", "RELEASE"
+                ]
+                .to_vec(),
+                [
+                    "node-a",
+                    "10.0.0.1:7400",
+                    "zone-1",
+                    "host-1",
+                    "2",
+                    "live",
+                    "no",
+                    "0.3.1"
+                ]
+                .to_vec(),
+                ["node-b", "-", "-", "-", "1", "live", "yes", "0.3.0"].to_vec(),
+                ["node-c", "-", "-", "-", "1", "down", "no", "0.3.0"].to_vec(),
+            ],
+            "{printed}"
+        );
+        fleet.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_list_json_is_pinned() -> TestResult {
+        let fleet = Fleet::start().await?;
+        let printed = fleet.node_list(&["--json"]).await?;
+        let parsed: serde_json::Value = serde_json::from_str(&printed)?;
+        assert_eq!(
+            parsed,
+            json!({"nodes": [
+                {
+                    "node": "node-a",
+                    "address": "10.0.0.1:7400",
+                    "zone": "zone-1",
+                    "host": "host-1",
+                    "weight": 2,
+                    "liveness": "live",
+                    "draining": false,
+                    "release": "0.3.1",
+                },
+                {
+                    "node": "node-b",
+                    "address": null,
+                    "zone": null,
+                    "host": null,
+                    "weight": 1,
+                    "liveness": "live",
+                    "draining": true,
+                    "release": "0.3.0",
+                },
+                {
+                    "node": "node-c",
+                    "address": null,
+                    "zone": null,
+                    "host": null,
+                    "weight": 1,
+                    "liveness": "down",
+                    "draining": false,
+                    "release": "0.3.0",
+                },
+            ]})
+        );
+        // `-o json` is the same output.
+        assert_eq!(fleet.node_list(&["-o", "json"]).await?, printed);
+        fleet.stop().await;
+        Ok(())
+    }
+}

@@ -310,6 +310,38 @@ pub(crate) fn removed_verb_hint(error: &clap::Error) -> Option<&'static str> {
     }
 }
 
+/// The `hint:` line for a parse error about an archive command spelled as 0.6 did, naming the
+/// 0.7 spelling, or `None` for any other error (ADR-0043, point 2).
+///
+/// Like the removed `db set-*` verbs, the old spellings fail as any unknown command or flag does
+/// (ADR-0032).
+pub(crate) fn renamed_hint(error: &clap::Error) -> Option<&'static str> {
+    let usage = match error.get(ContextKind::Usage) {
+        Some(ContextValue::StyledStr(usage)) => usage.to_string(),
+        _ => String::new(),
+    };
+    match error.kind() {
+        // `fleetring db archive show|verify`.
+        ErrorKind::InvalidSubcommand => {
+            let Some(ContextValue::String(verb)) = error.get(ContextKind::InvalidSubcommand) else {
+                return None;
+            };
+            (verb == "archive" && usage.contains(" db "))
+                .then_some("hint: `db archive show|verify` is now `fleetring archive show|verify`")
+        }
+        // `fleetring archive restore --from <db> --to <dir>`.
+        ErrorKind::UnknownArgument => {
+            let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg) else {
+                return None;
+            };
+            (argument.starts_with("--from") && usage.contains(" archive restore")).then_some(
+                "hint: `--from <db>` is now the argument: `fleetring archive restore <db> --to <dir>`",
+            )
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -502,6 +534,62 @@ mod tests {
         }
         let other = Cli::try_parse_from(["fleetringd", "db", "frobnicate"]).expect_err("unknown");
         assert_eq!(removed_verb_hint(&other), None);
+    }
+
+    #[test]
+    fn the_old_archive_spellings_get_a_hint_naming_the_new_one() {
+        for (words, hint) in [
+            (
+                &["fleetring", "db", "archive", "show", "notes"][..],
+                "`fleetring archive show|verify`",
+            ),
+            (
+                &[
+                    "fleetring",
+                    "archive",
+                    "restore",
+                    "--from",
+                    "notes",
+                    "--to",
+                    "out",
+                ],
+                "`fleetring archive restore <db> --to <dir>`",
+            ),
+        ] {
+            let error = Cli::try_parse_from(words).expect_err("the spelling is removed");
+            let found = renamed_hint(&error).expect("a hint");
+            assert!(found.starts_with("hint: "), "{found}");
+            assert!(found.contains(hint), "{words:?}: {found}");
+            assert_eq!(found.lines().count(), 1, "{found}");
+        }
+        // Other mistakes get none, and the new spellings parse.
+        for words in [
+            &["fleetring", "db", "frobnicate"][..],
+            &["fleetring", "archive", "restore", "--bogus"],
+            &["fleetring", "node", "archive"],
+        ] {
+            let error = Cli::try_parse_from(words).expect_err("a usage error");
+            assert_eq!(renamed_hint(&error), None, "{words:?}");
+        }
+        for words in [
+            &["fleetring", "archive", "show", "notes", "--archive", "a"][..],
+            &["fleetring", "archive", "verify", "notes", "--archive", "a"],
+            &[
+                "fleetring",
+                "archive",
+                "restore",
+                "notes",
+                "--config",
+                "c",
+                "--archive",
+                "a",
+                "--to",
+                "out",
+            ],
+            &["fleetring", "node", "list", "--json"],
+        ] {
+            Cli::try_parse_from(words).expect("the new spelling parses");
+        }
     }
 
     fn report(metadata: Option<MetadataReport>, error: Option<&str>) -> EditReport {

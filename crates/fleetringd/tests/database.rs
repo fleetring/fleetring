@@ -3023,7 +3023,7 @@ mod archives {
         assert_eq!(metadata["created_by"], "tester");
         assert_eq!(metadata["expires_at"], serde_json::Value::Null);
 
-        let described = run(&["db", "archive", "show", "ledger", "--archive", ARCHIVE]).await?;
+        let described = run(&["archive", "show", "ledger", "--archive", ARCHIVE]).await?;
         assert!(described.contains("metadata: yes"), "{described}");
 
         // Offline, the object lands beside the database file, byte for byte.
@@ -3042,12 +3042,11 @@ mod archives {
         let words: Vec<String> = [
             "archive",
             "restore",
+            "ledger",
             "--config",
             config.to_str().ok_or("a UTF-8 path")?,
             "--archive",
             ARCHIVE,
-            "--from",
-            "ledger",
             "--to",
             to.to_str().ok_or("a UTF-8 path")?,
         ]
@@ -3074,9 +3073,41 @@ mod archives {
         Ok(())
     }
 
+    /// The 0.6 spellings fail as a usage error, with a hint that names the new one (ADR-0043).
+    #[test]
+    fn the_old_archive_commands_fail_with_a_hint() -> TestResult {
+        for (args, hint) in [
+            (
+                &["db", "archive", "show", "ledger", "--archive", ARCHIVE][..],
+                "`fleetring archive show|verify`",
+            ),
+            (
+                &["db", "archive", "verify", "ledger", "--archive", ARCHIVE],
+                "`fleetring archive show|verify`",
+            ),
+            (
+                &["archive", "restore", "--from", "ledger", "--to", "out"],
+                "`fleetring archive restore <db> --to <dir>`",
+            ),
+        ] {
+            let refused = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
+                .args(args)
+                .output()?;
+            assert_eq!(refused.status.code(), Some(2), "{args:?}");
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line.starts_with("hint: ") && line.contains(hint)),
+                "{args:?}: {stderr}"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn db_archive_verify_agrees_with_the_live_replicas() -> TestResult {
+    async fn archive_verify_agrees_with_the_live_replicas() -> TestResult {
         use super::binary::{args, fleetringd, stdout};
 
         let dir = tempfile::tempdir()?;
@@ -3091,7 +3122,7 @@ mod archives {
             &fleetringd(
                 fleet.tls.dir(),
                 args(
-                    &["db", "archive", "verify", "ledger", "--archive", ARCHIVE],
+                    &["archive", "verify", "ledger", "--archive", ARCHIVE],
                     &control,
                 ),
             )
@@ -3105,7 +3136,7 @@ mod archives {
             &fleetringd(
                 fleet.tls.dir(),
                 args(
-                    &["db", "archive", "show", "ledger", "--archive", ARCHIVE],
+                    &["archive", "show", "ledger", "--archive", ARCHIVE],
                     &control,
                 ),
             )
@@ -3131,12 +3162,11 @@ mod archives {
         let words: Vec<String> = [
             "archive",
             "restore",
+            "ledger",
             "--config",
             config.to_str().ok_or("a UTF-8 path")?,
             "--archive",
             ARCHIVE,
-            "--from",
-            "ledger",
             "--to",
             to.to_str().ok_or("a UTF-8 path")?,
         ]
