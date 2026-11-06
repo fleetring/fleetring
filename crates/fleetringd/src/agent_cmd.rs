@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use fleetring_client::context::{Context, ContextError, ContextName, DEV_NAME, select};
-use fleetring_control::Millis;
+use fleetring_control::Timestamp;
 use fleetring_proto::v1::revocation::Revoked;
-use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
+use fleetring_proto::v1::{self as proto, RevokeTokenRequest};
 use fleetringd::Network;
 use fleetringd::auth::{MAX_TOKEN_LIFETIME, Scope};
 use fleetringd::clock::{Clock as _, SystemClock};
@@ -33,12 +33,13 @@ use fleetringd::upgrade::{Running, running};
 
 use crate::agent::{
     self, AUTHORITY_CERT_LIFETIME, Acquired, AgentDir, AgentError, AgentId, AgentRecord,
-    DEV_CERT_LIFETIME, IssuedBy, Issuer, MintGrant, RENEW_TOKEN_WITHIN, Renewal,
+    DEV_CERT_LIFETIME, IssuedBy, Issuer, MintGrant, OldToken, RENEW_TOKEN_WITHIN, Renewal,
 };
 use crate::progress::{MachineOutput, Progress};
 use crate::resolve::EnvSnapshot;
 use crate::{
-    OutputArgs, OutputFormat, Target, context_cmd, dev_cmd, failed, parse_ttl, spinner_surroundings,
+    OutputArgs, OutputFormat, Target, context_cmd, dev_cmd, failed, format_time, parse_ttl,
+    spinner_surroundings,
 };
 
 /// What the output says about isolation (ADR-0044, point 11.4; #114).
@@ -309,7 +310,14 @@ pub(crate) fn no_identity(dir: &AgentDir, context: Option<(&ContextName, &Contex
 ///
 /// If the identity doesn't exist outside dev mode, the dev directory fails its check, or the
 /// node can't be started or the identity minted. Nothing is minted on any error before the mint.
-pub(crate) async fn prepare_agent(target: &Target) -> Result<Option<AgentReady>, Box<dyn Error>> {
+///
+/// A first mint gets `access`'s default scope and records it, so `--read-only` on a first start
+/// makes a reading identity. An identity that exists keeps its own scopes and access: `access`
+/// neither widens nor narrows it.
+pub(crate) async fn prepare_agent(
+    target: &Target,
+    access: Access,
+) -> Result<Option<AgentReady>, Box<dyn Error>> {
     let env = EnvSnapshot::capture();
     let Some((id, from)) = target.agent(&env)? else {
         return Ok(None);
@@ -333,7 +341,7 @@ pub(crate) async fn prepare_agent(target: &Target) -> Result<Option<AgentReady>,
     acquire_node(dev_dir, MachineOutput::Yes).await?;
     // Immediately before the mint, whatever found or started the node.
     let checked = dev::check_dev_dir(dev_dir)?;
-    let grant = dev_grant(dir.id(), Vec::new(), Access::ReadWrite, None);
+    let grant = dev_grant(dir.id(), Vec::new(), access, None);
     let acquired = dir.acquire(Issuer::Dev(&checked), &grant, SystemClock.now())?;
     match &acquired {
         Acquired::Minted(_) => eprintln!(
@@ -343,13 +351,14 @@ pub(crate) async fn prepare_agent(target: &Target) -> Result<Option<AgentReady>,
         ),
         Acquired::Renewed { old, renewal, .. } => {
             eprintln!("renewed agent {}'s {}", dir.id(), renewed(*renewal));
-            if matches!(renewal, Renewal::Token | Renewal::Both) {
+            if let Some(old) = old {
                 match dev_admin(&checked) {
-                    Ok(admin) => revoke_old(&admin, old.as_ref()).await,
+                    Ok(admin) => revoke_old(&admin, old).await,
                     Err(error) => eprintln!(
                         "warning: couldn't revoke the old token {} ({error}); it stays valid \
                          until {}",
-                        old.token_id, old.token_expires_at
+                        old.id,
+                        format_time(old.until.as_millis())
                     ),
                 }
             }
@@ -424,7 +433,7 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
     // Before a node is started for it.
     if dir.record()?.is_some() {
         return Err(AgentError::Exists {
-            id: args.id,
+            id: args.id.to_string(),
             dir: dir.tls_dir().to_owned(),
         }
         .into());
@@ -577,20 +586,42 @@ fn dev_admin(checked: &DevChecked) -> Result<Client, Box<dyn Error>> {
     ))
 }
 
-/// Revokes `record`'s token through `client` until it would have expired.
-async fn revoke(client: &Client, record: &AgentRecord) -> Result<(), Box<dyn Error>> {
-    let until = record.token_expiry().unwrap_or_else(|| {
-        SystemClock.now().saturating_add(Millis::new(
-            u64::try_from(MAX_TOKEN_LIFETIME.as_millis()).unwrap_or(u64::MAX),
-        ))
-    });
+/// What [`revoke`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Revocation {
+    /// The fleet refuses the token until this time, as the control node answered.
+    Until(Timestamp),
+    /// The token had expired already, so there was nothing to revoke.
+    Expired,
+}
+
+impl Revocation {
+    /// The words for what happened to `token`.
+    fn describe(self, token: &OldToken) -> String {
+        match self {
+            Self::Until(until) => format!(
+                "revoked token {} until {}",
+                token.id,
+                format_time(until.as_millis())
+            ),
+            Self::Expired => format!("token {} had expired already", token.id),
+        }
+    }
+}
+
+/// Revokes `token` through `client` until the token itself expires, which [`OldToken`] reads
+/// from the token, never from `identity.toml`.
+async fn revoke(client: &Client, token: &OldToken) -> Result<Revocation, Box<dyn Error>> {
+    if token.until <= SystemClock.now() {
+        return Ok(Revocation::Expired);
+    }
     let request = RevokeTokenRequest {
-        revocation: Some(Revocation {
-            revoked: Some(Revoked::TokenId(record.token_id.clone())),
-            until_ms: until.as_millis(),
+        revocation: Some(proto::Revocation {
+            revoked: Some(Revoked::TokenId(token.id.clone())),
+            until_ms: token.until.as_millis(),
         }),
     };
-    tokio::time::timeout(REVOKE_TIMEOUT, client.control().revoke_token(request))
+    let answer = tokio::time::timeout(REVOKE_TIMEOUT, client.control().revoke_token(request))
         .await
         .map_err(|_| {
             format!(
@@ -599,16 +630,17 @@ async fn revoke(client: &Client, record: &AgentRecord) -> Result<(), Box<dyn Err
             )
         })?
         .map_err(failed)?;
-    Ok(())
+    Ok(Revocation::Until(Timestamp::from_millis(answer.until_ms)))
 }
 
 /// Revokes a replaced token, and warns rather than fails if it can't (ADR-0043, point 8.2).
-async fn revoke_old(client: &Client, old: &AgentRecord) {
+async fn revoke_old(client: &Client, old: &OldToken) {
     match revoke(client, old).await {
-        Ok(()) => eprintln!("revoked the old token {}", old.token_id),
+        Ok(revocation) => eprintln!("{}", revocation.describe(old)),
         Err(error) => eprintln!(
             "warning: couldn't revoke the old token {} ({error}); it stays valid until {}",
-            old.token_id, old.token_expires_at
+            old.id,
+            format_time(old.until.as_millis())
         ),
     }
 }
@@ -663,7 +695,8 @@ async fn renew(
         Some(client) => revoke_old(&client, &old).await,
         None => eprintln!(
             "warning: no client to revoke the old token {} with; it stays valid until {}",
-            old.token_id, old.token_expires_at
+            old.id,
+            format_time(old.until.as_millis())
         ),
     }
     Ok(format!(
@@ -699,7 +732,7 @@ async fn remove(
     let dir = AgentDir::new(&situation.agents_dir, id);
     let Some(record) = dir.record()? else {
         return Err(AgentError::NoIdentity {
-            id: dir.id().clone(),
+            id: dir.id().to_string(),
             dir: dir.tls_dir().to_owned(),
         }
         .into());
@@ -707,11 +740,14 @@ async fn remove(
     if confirm == Confirm::Ask {
         confirm_removal(&dir, &record, &situation.place(&record))?;
     }
+    // Read from the token itself before the directory goes.
+    let token = dir.old_token(&record, SystemClock.now());
+    let until = format_time(token.until.as_millis());
     let revoked = match revoke_token {
         Revoke::Skip => {
             eprintln!(
-                "warning: not revoking token {}: it stays valid until {}",
-                record.token_id, record.token_expires_at
+                "warning: not revoking token {}: it stays valid until {until}",
+                token.id
             );
             String::new()
         }
@@ -720,15 +756,15 @@ async fn remove(
                 Some(dev_dir) => dev_admin(&dev::check_dev_dir(dev_dir)?)?,
                 None => target.client()?,
             };
-            revoke(&client, &record).await.map_err(|error| {
+            let revocation = revoke(&client, &token).await.map_err(|error| {
                 format!(
                     "can't revoke token {} ({error}), so nothing was removed\n  hint: pass \
                      --no-revoke to delete the directory anyway; the token then stays valid \
-                     until {}",
-                    record.token_id, record.token_expires_at
+                     until {until}",
+                    token.id
                 )
             })?;
-            format!("revoked token {} and ", record.token_id)
+            format!("{} and ", revocation.describe(&token))
         }
     };
     dir.remove()?;
@@ -823,7 +859,7 @@ fn render_list(
                         dir.id().to_string(),
                         record.principal.clone(),
                         record.scopes.join(","),
-                        yes_no(record.read_only).to_owned(),
+                        read_only_text(record).to_owned(),
                         record.cert_expires_at.clone(),
                         record.token_expires_at.clone(),
                     ]
@@ -882,8 +918,12 @@ fn agent_json(dir: &AgentDir, record: &AgentRecord) -> serde_json::Value {
     })
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+/// Whether the identity serves only the reading tools, in words.
+fn read_only_text(record: &AgentRecord) -> &'static str {
+    match record.access() {
+        Access::ReadOnly => "yes",
+        Access::ReadWrite => "no",
+    }
 }
 
 /// How much [`describe`] says.
@@ -925,7 +965,7 @@ fn describe(
     }
     line("fleet", &record.fleet);
     line("scopes", &record.scopes.join(", "));
-    line("read-only", yes_no(record.read_only));
+    line("read-only", read_only_text(record));
     line("cert expires", &record.cert_expires_at);
     line("token expires", &record.token_expires_at);
     let renew_by = match record.issued_by {
@@ -1033,9 +1073,31 @@ fn on_path(name: &OsString) -> Option<PathBuf> {
         .and_then(|found| std::path::absolute(found).ok())
 }
 
+/// The program `name` on `PATH`, made absolute: on Windows with each of `PATHEXT`'s
+/// extensions, `.exe` and `.cmd` among them.
+fn program_on_path(name: &str) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return on_path(&OsString::from(name));
+    }
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    extensions
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .find_map(|extension| on_path(&OsString::from(format!("{name}{extension}"))))
+}
+
 /// Runs `claude mcp add fleetring -- <command>`, as an argument vector, never through a shell.
 fn install_claude(invocation: &Invocation) -> Result<(), Box<dyn Error>> {
-    let status = std::process::Command::new("claude")
+    // Found on PATH alone and run by its absolute path, never from the working directory, which
+    // Windows' own search would try first.
+    let Some(claude) = program_on_path("claude") else {
+        return Err(
+            "can't run `claude`: it isn't on PATH\n  hint: pass `--print-config claude` \
+                    and run it yourself"
+                .into(),
+        );
+    };
+    let status = std::process::Command::new(claude)
         .args(Invocation::claude_args())
         .arg(&invocation.exe)
         .args(&invocation.args)

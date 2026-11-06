@@ -23,7 +23,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fleetring_client::context::{Context, ContextName};
 use fleetring_client::dirs::{self, DirsError};
 use fleetring_control::{Millis, Timestamp, TokenId};
-use fleetringd::auth::{Grant, IssueError, MAX_TOKEN_LIFETIME, ParseScopeError, Scope};
+use fleetringd::auth::{
+    BearerToken, Grant, IssueError, MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS, ParseScopeError,
+    Scope,
+};
 use fleetringd::dev::{self, DevChecked, DevError};
 use fleetringd::mcp::Access;
 use fleetringd::tls::{
@@ -70,32 +73,35 @@ pub(crate) const RENEW_TOKEN_WITHIN: Duration = Duration::from_secs(7 * SECONDS_
 ///
 /// Neither `-` nor `.` is allowed: the `-` after the ID in `agent-<id>-*` then always ends it,
 /// and `.` is reserved for delegated agents' lineage (ADR-0044, point 1.4).
+///
+/// The principal and the default scopes are built when the ID is parsed, so that using them
+/// can't fail.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct AgentId(String);
+pub(crate) struct AgentId {
+    id: String,
+    principal: Principal,
+    admin: Scope,
+    read: Scope,
+}
 
 impl AgentId {
     /// The ID as text.
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.id
     }
 
     /// The principal `agent-<id>`.
     pub(crate) fn principal(&self) -> Principal {
-        format!("{AGENT_PREFIX}{}", self.0)
-            .parse()
-            .expect("an agent ID makes a valid principal name")
+        self.principal.clone()
     }
 
     /// The scope an identity gets unless `--scope` says otherwise: `admin:agent-<id>-*`, or
     /// `read:agent-<id>-*` for a reading agent.
     pub(crate) fn default_scope(&self, access: Access) -> Scope {
-        let action = match access {
-            Access::ReadOnly => "read",
-            _ => "admin",
-        };
-        format!("{action}:{AGENT_PREFIX}{}-*", self.0)
-            .parse()
-            .expect("an agent ID makes a valid scope pattern")
+        match access {
+            Access::ReadOnly => self.read.clone(),
+            Access::ReadWrite => self.admin.clone(),
+        }
     }
 }
 
@@ -103,24 +109,36 @@ impl FromStr for AgentId {
     type Err = AgentError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || AgentError::InvalidId {
+            id: text.to_owned(),
+        };
         let valid = !text.is_empty()
             && text.len() <= MAX_ID_LEN
             && text
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
-        if valid {
-            Ok(Self(text.to_owned()))
-        } else {
-            Err(AgentError::InvalidId {
-                id: text.to_owned(),
-            })
+        if !valid {
+            return Err(invalid());
         }
+        let scope = |action: &str| -> Result<Scope, AgentError> {
+            format!("{action}:{AGENT_PREFIX}{text}-*")
+                .parse()
+                .map_err(|_| invalid())
+        };
+        Ok(Self {
+            id: text.to_owned(),
+            principal: format!("{AGENT_PREFIX}{text}")
+                .parse()
+                .map_err(|_| invalid())?,
+            admin: scope("admin")?,
+            read: scope("read")?,
+        })
     }
 }
 
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.id)
     }
 }
 
@@ -263,12 +281,34 @@ pub(crate) enum Acquired {
     Minted(AgentRecord),
     /// The identity was used as it was.
     Reused(AgentRecord),
-    /// It renewed part of the identity; `old` is the record before.
+    /// It renewed part of the identity; `old` is the token it replaced, if it replaced the
+    /// token.
     Renewed {
         record: AgentRecord,
-        old: Box<AgentRecord>,
+        old: Option<OldToken>,
         renewal: Renewal,
     },
+}
+
+/// A token to revoke: its ID, and when it stops being valid. Both are read from the token
+/// itself, never from `identity.toml`, which anyone who can write the directory can edit: a
+/// revocation that ended sooner than the token would let it back in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OldToken {
+    /// The token's ID (`jti`).
+    pub(crate) id: String,
+    /// When the token expires (`exp`), or, if the token can't be read, the latest any token
+    /// could.
+    pub(crate) until: Timestamp,
+}
+
+/// Whether [`AgentDir::lock`] creates a missing directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// Create it `0700`, for a mint.
+    Create,
+    /// Refuse, creating nothing, for a command on an identity that must exist.
+    Refuse,
 }
 
 /// What [`AgentDir::write_credentials`] wrote, in the record's words: `None` for what it left.
@@ -412,10 +452,10 @@ impl AgentDir {
         grant: &MintGrant,
         now: Timestamp,
     ) -> Result<AgentRecord, AgentError> {
-        let _lock = self.lock()?;
+        let _lock = self.lock(Missing::Create)?;
         if self.record()?.is_some() {
             return Err(AgentError::Exists {
-                id: self.id.clone(),
+                id: self.id.to_string(),
                 dir: self.dir.clone(),
             });
         }
@@ -437,7 +477,7 @@ impl AgentDir {
         grant: &MintGrant,
         now: Timestamp,
     ) -> Result<Acquired, AgentError> {
-        let _lock = self.lock()?;
+        let _lock = self.lock(Missing::Create)?;
         let Some(old) = self.record()? else {
             return self.write_new(issuer, grant, now).map(Acquired::Minted);
         };
@@ -446,16 +486,19 @@ impl AgentDir {
         if renewal == Renewal::None {
             return Ok(Acquired::Reused(old));
         }
+        // Read before the new token replaces it.
+        let old_token = renewal.token().then(|| self.old_token(&old, now));
         let record = self.reissue(issuer, &old, renewal, grant, now)?;
         Ok(Acquired::Renewed {
             record,
-            old: Box::new(old),
+            old: old_token,
             renewal,
         })
     }
 
     /// Reissues the certificate and the token now, keeping the record's scopes, access, and
-    /// owner, and returns the new record and the old one.
+    /// owner, and returns the new record and the token it replaced. Creates nothing if there is
+    /// no identity.
     ///
     /// # Errors
     ///
@@ -466,17 +509,46 @@ impl AgentDir {
         issuer: Issuer<'_>,
         grant: &MintGrant,
         now: Timestamp,
-    ) -> Result<(AgentRecord, AgentRecord), AgentError> {
-        let _lock = self.lock()?;
+    ) -> Result<(AgentRecord, OldToken), AgentError> {
+        let no_identity = || AgentError::NoIdentity {
+            id: self.id.to_string(),
+            dir: self.dir.clone(),
+        };
+        if self.record()?.is_none() {
+            return Err(no_identity());
+        }
+        let _lock = self.lock(Missing::Refuse)?;
         let Some(old) = self.record()? else {
-            return Err(AgentError::NoIdentity {
-                id: self.id.clone(),
-                dir: self.dir.clone(),
-            });
+            return Err(no_identity());
         };
         self.check_fleet(&old, issuer.authority())?;
+        let old_token = self.old_token(&old, now);
         let record = self.reissue(issuer, &old, Renewal::Both, grant, now)?;
-        Ok((record, old))
+        Ok((record, old_token))
+    }
+
+    /// The token in the directory, to revoke: its ID and expiry, read from the token itself.
+    /// If the token can't be read, the record's ID, revoked until the latest any token issued
+    /// by `now` could last, so the revocation never ends before the token does.
+    pub(crate) fn old_token(&self, record: &AgentRecord, now: Timestamp) -> OldToken {
+        let claimed = fs::read_to_string(self.token_file())
+            .ok()
+            .and_then(|text| BearerToken::new(text.trim()).claimed_id_and_expiry());
+        match claimed {
+            Some((id, until)) => OldToken {
+                id: id.to_string(),
+                until,
+            },
+            None => {
+                let longest =
+                    MAX_TOKEN_LIFETIME.as_millis() + u128::from(NOT_BEFORE_LEEWAY_SECS) * 1_000;
+                OldToken {
+                    id: record.token_id.clone(),
+                    until: now
+                        .saturating_add(Millis::new(u64::try_from(longest).unwrap_or(u64::MAX))),
+                }
+            }
+        }
     }
 
     /// What a start needs to renew (ADR-0043, point 8.2): both credentials if a file is
@@ -569,10 +641,21 @@ impl AgentDir {
         })
     }
 
-    /// Creates the directory `0700` if it is missing, and locks its [`LOCK_FILE`], waiting for
-    /// another holder. Dropping the file releases the lock.
-    fn lock(&self) -> Result<File, AgentError> {
-        create_private_dir(&self.dir)?;
+    /// Locks the directory's [`LOCK_FILE`], waiting for another holder; dropping the file
+    /// releases the lock. A missing directory is created `0700`, or refused, as `missing` says.
+    fn lock(&self, missing: Missing) -> Result<File, AgentError> {
+        match missing {
+            Missing::Create => create_private_dir(&self.dir)?,
+            Missing::Refuse => {
+                refuse_link(&self.dir)?;
+                if !self.dir.is_dir() {
+                    return Err(AgentError::NoIdentity {
+                        id: self.id.to_string(),
+                        dir: self.dir.clone(),
+                    });
+                }
+            }
+        }
         let path = self.dir.join(LOCK_FILE);
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(false);
@@ -813,14 +896,63 @@ pub(crate) fn write_new_private(path: &Path, contents: &str) -> Result<(), Agent
         .map_err(|source| failed("write", source))
 }
 
-/// Creates `dir` and its missing parents `0700` on Unix, refuses a link, and tightens an
-/// existing directory to `0700`.
+/// Readies the directory `cert client --out` writes into. A missing one is created `0700`, with
+/// its missing parents. An existing one must be an empty directory, not a link, and keeps its
+/// mode, since it may be the working or home directory; the warning returned says so if others
+/// can read it.
 ///
 /// # Errors
 ///
-/// [`AgentError::Link`] for a link, and [`AgentError::File`] if it can't be created or
-/// restricted.
-pub(crate) fn create_private_dir(dir: &Path) -> Result<(), AgentError> {
+/// [`AgentError::OutNotEmpty`] for a directory that holds anything, [`AgentError::Link`] for a
+/// link, and [`AgentError::File`] if it can't be read or created.
+pub(crate) fn prepare_out_dir(dir: &Path) -> Result<Option<String>, AgentError> {
+    refuse_link(dir)?;
+    let failed = |action, source| AgentError::File {
+        action,
+        path: dir.to_owned(),
+        source,
+    };
+    let mut entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(dir)
+                .map_err(|source| failed("create", source))?;
+            return Ok(None);
+        }
+        Err(source) => return Err(failed("read", source)),
+    };
+    if entries.next().is_some() {
+        return Err(AgentError::OutNotEmpty {
+            dir: dir.to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(dir)
+            .map_err(|source| failed("check", source))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Ok(Some(format!(
+                "warning: {} is readable by other users, and its mode is left as it is; the key \
+                 is written 0600, but `chmod 700 {}` keeps the directory private",
+                dir.display(),
+                dir.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Creates an agent's directory and its missing parents `0700` on Unix, refuses a link, and
+/// tightens an existing directory to `0700`.
+fn create_private_dir(dir: &Path) -> Result<(), AgentError> {
     refuse_link(dir)?;
     let failed = |action, source| AgentError::File {
         action,
@@ -873,11 +1005,18 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<(), AgentError> {
     let mut file = options
         .open(&temporary)
         .map_err(|source| failed("create", source))?;
-    file.write_all(contents)
+    let written = file
+        .write_all(contents)
         .and_then(|()| file.sync_all())
-        .map_err(|source| failed("write", source))?;
+        .map_err(|source| failed("write", source));
     drop(file);
-    fs::rename(&temporary, path).map_err(|source| failed("replace", source))
+    let replaced = written
+        .and_then(|()| fs::rename(&temporary, path).map_err(|source| failed("replace", source)));
+    if replaced.is_err() {
+        // A partial secret is no use to anyone; best effort, since the write already failed.
+        let _ = fs::remove_file(&temporary);
+    }
+    replaced
 }
 
 /// Syncs `dir`, so the renames into it survive a crash; a no-op where directories can't be
@@ -910,12 +1049,12 @@ pub(crate) enum AgentError {
          to reissue its credentials",
         dir.display()
     )]
-    Exists { id: AgentId, dir: PathBuf },
+    Exists { id: String, dir: PathBuf },
     #[error(
         "agent '{id}' has no identity in {}\n  hint: create it with `fleetring agent add {id}`",
         dir.display()
     )]
-    NoIdentity { id: AgentId, dir: PathBuf },
+    NoIdentity { id: String, dir: PathBuf },
     #[error("{}: this identity was written by a newer fleetring; upgrade", path.display())]
     Newer { path: PathBuf },
     #[error("{} isn't a valid identity file", path.display())]
@@ -939,8 +1078,17 @@ pub(crate) enum AgentError {
         dir.display(), dir.display()
     )]
     MissingCaCert { dir: PathBuf },
-    #[error("{} is a symbolic link; an agent's identity must be a real directory", path.display())]
+    #[error(
+        "{} is a symbolic link; keys are written only into a real directory",
+        path.display()
+    )]
     Link { path: PathBuf },
+    #[error(
+        "{} isn't empty, so `--out` won't write keys into it\n  hint: pass a new or empty \
+         directory",
+        dir.display()
+    )]
+    OutNotEmpty { dir: PathBuf },
     #[error("can't {action} {}", path.display())]
     File {
         action: &'static str,
@@ -1085,6 +1233,51 @@ mod tests {
             dir.renewal(&record, authority("dev").certificate_pem(), now),
             Renewal::Both
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_token_to_revoke_is_read_from_the_token_never_the_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let agent = id("42");
+        let dir = AgentDir::new(root.path(), agent.clone());
+        let issuing = authority("dev");
+        let now = Timestamp::from_millis(1_800_000_000_000);
+        let record = dir.mint(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        let token = BearerToken::new(fs::read_to_string(dir.token_file())?.trim());
+        let (id, exp) = token.claimed_id_and_expiry().ok_or("a token")?;
+        // A record that says the token ends sooner, under another ID, changes nothing.
+        let edited = AgentRecord {
+            token_id: "forged".to_owned(),
+            token_expires_at: crate::format_time(now.as_millis()),
+            ..record.clone()
+        };
+        let old = dir.old_token(&edited, now);
+        assert_eq!(old.id, id.to_string());
+        assert_eq!(old.until, exp);
+        // Without a readable token, the revocation outlasts any token issued by now.
+        fs::write(dir.token_file(), "not a token")?;
+        let old = dir.old_token(&record, now);
+        assert_eq!(old.id, record.token_id);
+        let longest =
+            u64::try_from(MAX_TOKEN_LIFETIME.as_millis())? + NOT_BEFORE_LEEWAY_SECS * 1_000;
+        assert_eq!(old.until, now.saturating_add(Millis::new(longest)));
+        Ok(())
+    }
+
+    #[test]
+    fn renewing_a_missing_identity_creates_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let dir = AgentDir::new(&root.path().join("agents"), id("9"));
+        let issuing = authority("dev");
+        let renewed = dir.renew(
+            Issuer::Authority(&issuing),
+            &grant(&id("9")),
+            Timestamp::from_millis(1_800_000_000_000),
+        );
+        assert!(matches!(renewed, Err(AgentError::NoIdentity { .. })));
+        assert!(!root.path().join("agents").exists());
         Ok(())
     }
 

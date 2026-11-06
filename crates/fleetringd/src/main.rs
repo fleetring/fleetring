@@ -1075,8 +1075,10 @@ impl Target {
                 )
                 .into());
             }
-            for warning in dir.loose_files() {
-                eprintln!("{warning}");
+            if WARNINGS.get() != Some(&Warnings::Silence) {
+                for warning in dir.loose_files() {
+                    eprintln!("{warning}");
+                }
             }
             let principal = Some(dir.id().principal().to_string());
             let token = Some(TokenSource::File(dir.token_file()));
@@ -1834,7 +1836,15 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             target,
         }) => {
             // `--agent`: in dev mode, a node and an identity first (ADR-0043, point 8.1).
-            let ready = agent_cmd::prepare_agent(&target).await?;
+            let ready = agent_cmd::prepare_agent(
+                &target,
+                if read_only {
+                    Access::ReadOnly
+                } else {
+                    Access::ReadWrite
+                },
+            )
+            .await?;
             let client = match &ready {
                 Some(ready) => target.client_or(ready.fallback_control())?,
                 None => target.client()?,
@@ -2746,7 +2756,9 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
                     dir.display()
                 ));
             };
-            agent::create_private_dir(&out)?;
+            if let Some(warning) = agent::prepare_out_dir(&out)? {
+                eprintln!("{warning}");
+            }
             // The copy of `ca.crt` first, so a directory it refuses holds nothing new.
             agent::write_new_private(&out.join(AUTHORITY_CERT_FILE), authority.certificate_pem())?;
             issued.write(&out, &stem)?;

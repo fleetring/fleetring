@@ -81,6 +81,17 @@ impl BearerToken {
         let claims: Claims = decode_json(payload).ok()?;
         claims.sub.parse().ok()
     }
+
+    /// The token's ID (`jti`) and the moment it expires (`exp`), read without verifying the
+    /// token, as [`claimed_principal`](Self::claimed_principal) reads `sub`: for revoking a token
+    /// its holder issued, until the token itself would stop being valid. `None` for text that
+    /// isn't a token.
+    #[must_use]
+    pub fn claimed_id_and_expiry(&self) -> Option<(TokenId, Timestamp)> {
+        let payload = self.0.split('.').nth(1)?;
+        let claims: Claims = decode_json(payload).ok()?;
+        Some((claims.jti.parse().ok()?, from_seconds(claims.exp)))
+    }
 }
 
 impl fmt::Debug for BearerToken {
@@ -591,6 +602,17 @@ mod tests {
             Some("app")
         );
         assert_eq!(BearerToken::new("not.a token").claimed_principal(), None);
+        assert_eq!(
+            issued.claimed_id_and_expiry(),
+            Some((
+                "tok-1".parse().expect("an id"),
+                Timestamp::from_millis(4_600_000)
+            ))
+        );
+        assert_eq!(
+            BearerToken::new("not.a token").claimed_id_and_expiry(),
+            None
+        );
     }
 
     #[test]

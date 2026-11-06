@@ -362,6 +362,26 @@ fn copy_certificate(machine: &Machine, id: &str) -> TestResult<tempfile::TempDir
     Ok(copy)
 }
 
+/// A token's claims, read without verifying it.
+fn claims(token: &str) -> TestResult<Value> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1).ok_or("not a token")?;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload)?;
+    Ok(serde_json::from_slice(&json)?)
+}
+
+/// A token's ID, its `jti` claim.
+fn token_id(token: &str) -> TestResult<String> {
+    Ok(claims(token)?["jti"].as_str().ok_or("no jti")?.to_owned())
+}
+
+/// When a token expires, its `exp` claim, in RFC 3339 as the commands print times.
+fn token_expiry(token: &str) -> TestResult<String> {
+    let exp = claims(token)?["exp"].as_i64().ok_or("no exp")?;
+    Ok(time::OffsetDateTime::from_unix_timestamp(exp)?
+        .format(&time::format_description::well_known::Rfc3339)?)
+}
+
 /// Splits a line as a POSIX shell would split the words `--print-config claude` prints: plain
 /// words and single-quoted ones.
 fn shell_words(line: &str) -> TestResult<Vec<String>> {
@@ -543,13 +563,17 @@ async fn an_expiring_token_is_renewed_in_dev_mode_only() -> TestResult {
         old_token
     );
 
-    // In dev mode, the start renews the token and revokes the old one.
+    // In dev mode, the start renews the token and revokes the old one until the old token
+    // itself expires, not until the record's tomorrow.
     let mut session = machine.mcp(&["--agent", "42"]).await?;
     session.ok("db_list", json!({})).await?;
     let log = session.close().await?;
     assert!(log.contains("renewed agent 42's token"), "{log}");
     assert!(
-        log.contains(&format!("revoked the old token {old_id}")),
+        log.contains(&format!(
+            "revoked token {old_id} until {}",
+            token_expiry(&old_token)?
+        )),
         "{log}"
     );
     let record = machine.record("42")?;
@@ -815,13 +839,45 @@ async fn agent_remove_revokes_and_deletes() -> TestResult {
     assert!(stderr(&refused).contains("--yes"), "{}", printed(&refused));
     assert!(machine.agent_dir("42").exists());
 
+    // The record is no authority on when the token ends: one edited to say it ends in a minute
+    // still gets a revocation that lasts as long as the token itself.
+    let mut record = machine.record("42")?;
+    let soon = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+    record.insert(
+        "token_expires_at".to_owned(),
+        soon.format(&time::format_description::well_known::Rfc3339)?
+            .into(),
+    );
+    fs::write(
+        machine.agent_dir("42").join("identity.toml"),
+        toml::to_string(&record)?,
+    )?;
     let removed = machine.ok(&["agent", "remove", "42", "--yes"])?;
+    let id = token_id(&token)?;
     assert!(
-        removed.starts_with("removed agent 42: revoked token "),
+        removed.starts_with(&format!(
+            "removed agent 42: revoked token {id} until {} and deleted ",
+            token_expiry(&token)?
+        )),
         "{removed}"
     );
     assert!(!machine.agent_dir("42").exists());
     wait_until_revoked(&machine, cert_dir.path(), &token)?;
+
+    // Renewing or removing an agent that has no identity creates nothing.
+    for args in [
+        &["agent", "renew", "9"][..],
+        &["agent", "remove", "9", "--yes"],
+    ] {
+        let missing = machine.run(args)?;
+        assert_eq!(missing.status.code(), Some(1), "{}", printed(&missing));
+        assert!(
+            stderr(&missing).contains("agent '9' has no identity"),
+            "{}",
+            printed(&missing)
+        );
+        assert!(!machine.agent_dir("9").exists(), "{args:?}");
+    }
 
     // With the fleet out of reach, it refuses unless told not to revoke.
     machine.ok(&["agent", "add", "43"])?;
@@ -914,6 +970,16 @@ async fn a_read_only_agent_serves_only_the_reading_tools() -> TestResult {
     let added = machine.ok(&["agent", "add", "42", "--read-only"])?;
     assert!(added.contains("read:agent-42-*"), "{added}");
     let mut session = machine.mcp(&["--agent", "42"]).await?;
+    assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
+    session.close().await?;
+    Ok(())
+}
+
+/// The tools a read-only server offers.
+const READING_TOOLS: [&str; 3] = ["db_list", "db_show", "query"];
+
+/// The names of the tools `session` offers, sorted.
+async fn tool_names(session: &mut Session) -> TestResult<Vec<String>> {
     let mut tools: Vec<String> = session
         .tools()
         .await?
@@ -921,8 +987,44 @@ async fn a_read_only_agent_serves_only_the_reading_tools() -> TestResult {
         .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
         .collect();
     tools.sort();
-    assert_eq!(tools, ["db_list", "db_show", "query"]);
+    Ok(tools)
+}
+
+/// The scopes and `read_only` an identity records.
+fn recorded_access(machine: &Machine, id: &str) -> TestResult<(Vec<String>, Option<bool>)> {
+    let record = machine.record(id)?;
+    let scopes = record["scopes"]
+        .as_array()
+        .ok_or("no scopes")?
+        .iter()
+        .filter_map(|scope| scope.as_str().map(str::to_owned))
+        .collect();
+    Ok((scopes, record["read_only"].as_bool()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_read_only_mints_a_reading_identity_and_changes_no_existing_one() -> TestResult {
+    let machine = Machine::new()?;
+    // A first start with --read-only mints a reading identity.
+    let mut session = machine.mcp(&["--agent", "42", "--read-only"]).await?;
+    assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
     session.close().await?;
+    let reading = (vec!["read:agent-42-*".to_owned()], Some(true));
+    assert_eq!(recorded_access(&machine, "42")?, reading);
+    // Later starts without it don't widen it.
+    let mut session = machine.mcp(&["--agent", "42"]).await?;
+    assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
+    session.close().await?;
+    assert_eq!(recorded_access(&machine, "42")?, reading);
+
+    // An identity that may write serves read-only for one start, and stays as it was.
+    machine.mcp(&["--agent", "43"]).await?.close().await?;
+    let writing = (vec!["admin:agent-43-*".to_owned()], Some(false));
+    assert_eq!(recorded_access(&machine, "43")?, writing);
+    let mut session = machine.mcp(&["--agent", "43", "--read-only"]).await?;
+    assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
+    session.close().await?;
+    assert_eq!(recorded_access(&machine, "43")?, writing);
     Ok(())
 }
 
@@ -1076,5 +1178,32 @@ fn cert_client_out_writes_a_complete_private_directory() -> TestResult {
     assert_eq!(mode(&out.join("client.ops.key"))?, 0o600);
     assert_eq!(fs::read(out.join("ca.crt"))?, fs::read(tls.join("ca.crt"))?);
     assert!(out.join("client.ops.crt").is_file());
+
+    // A directory that holds anything, such as the working or home directory, is refused, and
+    // its mode is left alone.
+    fs::set_permissions(&out, fs::Permissions::from_mode(0o755))?;
+    let refused = machine.run(&["cert", "client", "dev", "--dir", dir, "--out", out_dir])?;
+    assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
+    assert!(
+        stderr(&refused).contains("isn't empty"),
+        "{}",
+        printed(&refused)
+    );
+    assert_eq!(mode(&out)?, 0o755);
+    assert!(!out.join("client.dev.key").exists());
+    // An empty one is used as it is, with a warning if others can read it.
+    let empty = machine.home().join("empty");
+    fs::create_dir(&empty)?;
+    fs::set_permissions(&empty, fs::Permissions::from_mode(0o755))?;
+    let empty_dir = empty.to_str().ok_or("not UTF-8")?;
+    let output = machine.run(&["cert", "client", "dev", "--dir", dir, "--out", empty_dir])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    assert!(
+        stderr(&output).contains("readable by other users"),
+        "{}",
+        printed(&output)
+    );
+    assert_eq!(mode(&empty)?, 0o755);
+    assert_eq!(mode(&empty.join("client.dev.key"))?, 0o600);
     Ok(())
 }
