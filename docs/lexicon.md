@@ -115,6 +115,14 @@ The HTTP listener a daemon serves `/metrics`, `/healthz`, and `/readyz` on, apar
 - **Code:** `[admin]`, `AdminConfig`, `observe::admin`. **CLI:** none.
 - **Not:** status port, management port, HTTP port, debug server.
 
+### Agent launcher
+
+*Planned* (ADR-0044). The trusted program that starts agents in enforced sandboxes, gives each only its own credential or a *credential proxy* that keeps holder keys outside the sandbox, spawns children within their parent's ceiling and the user's saved policy, and exposes a restricted spawn and report endpoint instead of a terminal's control socket. A secure multi-agent mode needs one; without it, agents run in [trusted local development](#trusted-local-development).
+
+- **Applies to:** docs, CLI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** harness (fine for the program an agent runs in), supervisor, runner.
+
 ### Archive
 
 A database's history kept for recovery: a physical [change stream](#change-stream) plus base [snapshots](#snapshot), written as immutable objects to an object store, with point-in-time [restore](#restore) (ADR-0029, FR-049). Separate from replicas: replicas give availability, an archive gives recovery. Its objects are [segments](#segment), and each base snapshot's *chunks* and *descriptor*; an object's name is its *object key* ([key](#key)).
@@ -946,6 +954,14 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 - **Code:** none yet. **CLI:** none yet.
 - **Not:** root (alone), CA (an [authority](#authority) is one kind of anchor), trust root.
 
+
+### Trusted local development
+
+*Planned* (ADR-0044). Running agents without an [agent launcher](#agent-launcher): each agent's FleetRing requests are scoped, but agents running as the same OS user can read each other's credential files and database files, so it isn't secure separation between agents. 0.7's `fleetring mcp --agent` runs in this mode.
+
+- **Applies to:** docs, CLI.
+- **Code:** none. **CLI:** named in the help of `mcp` and `agent add`.
+- **Not:** sandbox, secure mode, isolated mode.
 ### Upgrade
 
 Moving a node to another [release](#release): verify the release's signature and checksum, swap the binary atomically, and restart the node in place after a [drain](#drain), within the fleet's window of release lines (ADR-0038). A *rolling upgrade* moves a fleet one node at a time.
