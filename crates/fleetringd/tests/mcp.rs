@@ -1084,6 +1084,11 @@ async fn stdout_carries_only_protocol() -> TestResult {
     .await?;
     let stderr = mcp.close().await?;
     assert!(!stderr.is_empty(), "trace logging writes to stderr");
+    // `mcp` never shows a spinner (ADR-0043, point 6): none of its bytes are on stderr either.
+    assert!(
+        !stderr.contains('\r') && !stderr.contains('\u{2713}'),
+        "{stderr:?}"
+    );
     assert!(
         !stderr.contains(&node.token),
         "the token is never logged, even at trace"

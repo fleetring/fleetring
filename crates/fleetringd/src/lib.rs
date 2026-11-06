@@ -173,6 +173,8 @@ const _: () = {
     assert_debug_send_sync::<upgrade::Restart>();
     assert_debug_send_sync::<upgrade::LocalNode>();
     assert_debug_send_sync::<upgrade::StartCommand>();
+    assert_debug_send_sync::<upgrade::Step>();
+    assert_debug_send_sync::<upgrade::Steps>();
     assert_debug_send_sync::<Stored>();
     assert_debug_send_sync::<TlsConfig>();
     assert_debug_send_sync::<tls::Accepted>();

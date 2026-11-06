@@ -21,6 +21,7 @@ mod verify;
 use std::fmt::Write as _;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::NodeId;
@@ -270,6 +271,67 @@ pub struct LocalNode {
     pub data_dir: PathBuf,
 }
 
+/// A step of an upgrade, in the order they happen (ADR-0038, point 8). A command that shows
+/// progress follows the step it is on through [`Options::steps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Step {
+    /// Downloading the release.
+    Download,
+    /// Verifying its signature and checksum.
+    Verify,
+    /// Draining the node, so that it is primary for nothing.
+    Drain,
+    /// Restarting the node in place.
+    Restart,
+    /// Waiting for the node to rejoin the fleet.
+    Rejoin,
+    /// Waiting for the node's replicas to catch up.
+    CatchUp,
+}
+
+impl Step {
+    /// What the step is doing, for a person.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Download => "downloading the release",
+            Self::Verify => "verifying the signature and the checksum",
+            Self::Drain => "draining the node",
+            Self::Restart => "restarting the node",
+            Self::Rejoin => "waiting for the node to rejoin the fleet",
+            Self::CatchUp => "waiting for the node to catch up",
+        }
+    }
+}
+
+/// Where an upgrade reports each [`Step`] as it starts. It ignores them unless the caller gives
+/// it a function.
+#[derive(Clone, Default)]
+pub struct Steps(Option<Arc<dyn Fn(Step) + Send + Sync>>);
+
+impl Steps {
+    /// Reports each step to `observer`.
+    pub fn new(observer: impl Fn(Step) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(observer)))
+    }
+
+    fn begin(&self, step: Step) {
+        if let Some(observer) = &self.0 {
+            observer(step);
+        }
+    }
+}
+
+impl std::fmt::Debug for Steps {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Steps")
+            .field("observed", &self.0.is_some())
+            .finish()
+    }
+}
+
 /// What `fleetring upgrade` was asked to do.
 #[derive(Debug)]
 pub struct Options {
@@ -291,6 +353,8 @@ pub struct Options {
     pub timeout: Duration,
     /// Whether a node that isn't running may have been started with `serve`.
     pub start_command: StartCommand,
+    /// Told each [`Step`] as it starts, so that the command can show it.
+    pub steps: Steps,
 }
 
 /// Runs `fleetring upgrade` and returns its report.
@@ -439,7 +503,7 @@ async fn check(options: &Options) -> Result<Outcome, UpgradeError> {
             Reported::this_binary()
         } else {
             let scratch = scratch()?;
-            software_of(&fetch(&source, &available, scratch.path()).await?)?
+            software_of(&fetch(&source, &available, scratch.path(), &options.steps).await?)?
         };
         verdict = check_features(&view, &software);
     }
@@ -485,14 +549,17 @@ async fn fetch(
     source: &Source,
     release: &Release,
     scratch: &Path,
+    steps: &Steps,
 ) -> Result<PathBuf, UpgradeError> {
     // Verification needs cosign; find it before downloading anything.
     let verifier = Cosign::find()?;
     let target = crate::software::TARGET;
     let archive_file = archive_name(release, target);
+    steps.begin(Step::Download);
     let sums = source.download(release, SUMS, scratch).await?;
     let bundle = source.download(release, BUNDLE, scratch).await?;
     let archive = source.download(release, &archive_file, scratch).await?;
+    steps.begin(Step::Verify);
     verifier.verify(&sums, &bundle)?;
     check_sum(&sums, &archive_file, &archive)?;
     let binary = scratch.join("fleetring");
@@ -524,7 +591,7 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
     }
     installed.check_writable()?;
     let scratch = scratch()?;
-    let binary = fetch(&source, &release, scratch.path()).await?;
+    let binary = fetch(&source, &release, scratch.path(), &options.steps).await?;
     if let Some(view) = &view {
         check_features(view, &software_of(&binary)?)?;
     }
@@ -753,6 +820,7 @@ async fn restart(
         .members()
         .any(|(member, _)| member.id() == &node.id);
     if member {
+        options.steps.begin(Step::Drain);
         let moved = drain(fleet, &node.id, options.timeout).await?;
         let _ = writeln!(report, "drained {}: {moved}", node.id);
     }
@@ -773,6 +841,7 @@ async fn restart(
             node.id, now.pid
         );
     } else {
+        options.steps.begin(Step::Restart);
         process::restart(now.pid)?;
         wait_for_restart(&node.data_dir, &now, options.timeout).await?;
         let _ = writeln!(report, "restarted {} in place (pid {})", node.id, now.pid);
@@ -782,8 +851,10 @@ async fn restart(
         let _ = writeln!(report, "the control plane answers again on {release}");
         return Ok(report);
     }
+    options.steps.begin(Step::Rejoin);
     wait_for_rejoin(fleet, &node.id, release, options.timeout).await?;
     let _ = writeln!(report, "{} rejoined the fleet on {release}", node.id);
+    options.steps.begin(Step::CatchUp);
     let caught_up = catch_up(fleet, &node.id, options.timeout).await?;
     let _ = writeln!(report, "{} caught up: {caught_up}", node.id);
     Ok(report)
@@ -1021,6 +1092,7 @@ mod tests {
                 fleet: None,
                 timeout: Duration::from_secs(1),
                 start_command: StartCommand::Unknown,
+                steps: Steps::default(),
             }
         }
 
