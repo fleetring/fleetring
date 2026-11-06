@@ -209,3 +209,54 @@ fn client_commands_are_the_same_under_both_names() -> TestResult {
     assert_eq!(fleetring, fleetringd);
     Ok(())
 }
+
+/// 0.6 spelled the archive commands `db archive show|verify` and `archive restore --from <db>`;
+/// both fail as a usage error, with a `hint:` line naming the 0.7 spelling (ADR-0043, point 2).
+#[test]
+fn the_old_archive_commands_fail_with_a_hint() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for (name, bin) in both_names(dir.path())? {
+        for (args, hint) in [
+            (
+                &["db", "archive", "show", "ledger", "--archive", "backups"][..],
+                "hint: `db archive show|verify` is now `fleetring archive show|verify`",
+            ),
+            (
+                &["db", "archive", "verify", "ledger", "--archive", "backups"],
+                "hint: `db archive show|verify` is now `fleetring archive show|verify`",
+            ),
+            (
+                &[
+                    "archive",
+                    "restore",
+                    "--config",
+                    "node.toml",
+                    "--archive",
+                    "backups",
+                    "--from",
+                    "ledger",
+                    "--to",
+                    "out",
+                ],
+                "hint: `--from <db>` is now the argument: `fleetring archive restore <db> --to <dir>`",
+            ),
+        ] {
+            let refused = run(&bin, args)?;
+            assert_eq!(refused.status.code(), Some(2), "{name} {args:?}");
+            assert!(stdout(&refused).is_empty(), "{name} {args:?}");
+            let text = stderr(&refused);
+            assert!(text.trim_end().ends_with(hint), "{name} {args:?}: {text}");
+        }
+        // The new spellings are not refused for their names.
+        for args in [
+            &["archive", "show", "--help"][..],
+            &["archive", "verify", "--help"],
+            &["archive", "restore", "--help"],
+            &["node", "list", "--help"],
+        ] {
+            let help = run(&bin, args)?;
+            assert!(help.status.success(), "{name} {args:?}: {}", stderr(&help));
+        }
+    }
+    Ok(())
+}

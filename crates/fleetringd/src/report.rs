@@ -14,6 +14,7 @@ use std::io;
 use fleetring_control::{Liveness, ReplicaRole, Timestamp};
 use serde::Serialize;
 
+use crate::MembershipView;
 use crate::data::{Location, MetadataView, SchemaView, is_invisible};
 use crate::engine::{ObjectKind, RowCount, SchemaObject};
 
@@ -644,6 +645,123 @@ fn duration(ms: u64) -> String {
     }
 }
 
+/// One member of the fleet, as `node list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct NodeReport {
+    /// The node's ID.
+    pub node: String,
+    /// The address data clients dial, `host:port`, if the node has one.
+    pub address: Option<String>,
+    /// The zone the node reports, if any.
+    pub zone: Option<String>,
+    /// The host the node reports, if any.
+    pub host: Option<String>,
+    /// The node's weight in placement.
+    pub weight: u32,
+    /// `live` or `down`, as the control plane sees the node's heartbeats.
+    pub liveness: &'static str,
+    /// Whether the node is handing its leases over before it leaves, and gets no new ones.
+    pub draining: bool,
+    /// The release the node runs; a member that reports no software runs 0.3.0 (ADR-0038).
+    pub release: String,
+}
+
+/// `node list`'s result: every member, in node ID order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct NodeList {
+    /// The members.
+    pub nodes: Vec<NodeReport>,
+}
+
+impl NodeList {
+    /// The members of `view`, with their liveness and drain state.
+    #[must_use]
+    pub fn from_view(view: &MembershipView) -> Self {
+        let mut nodes: Vec<NodeReport> = view
+            .members()
+            .map(|(member, liveness)| NodeReport {
+                node: member.id().to_string(),
+                address: member.address().map(str::to_owned),
+                zone: member.zone().map(ToString::to_string),
+                host: member.host().map(ToString::to_string),
+                weight: member.weight().get(),
+                liveness: match liveness {
+                    Liveness::Live => "live",
+                    Liveness::Down => "down",
+                },
+                draining: view.is_draining(member.id()),
+                release: member.running().release().to_string(),
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.node.cmp(&b.node));
+        Self { nodes }
+    }
+
+    /// The table `node list` prints: one row per member under `NODE`, `ADDRESS`, `ZONE`, `HOST`,
+    /// `WEIGHT`, `LIVENESS`, `DRAINING` and `RELEASE`, with `-` for what a member doesn't report.
+    #[must_use]
+    pub fn text(&self) -> String {
+        if self.nodes.is_empty() {
+            return "no nodes\n".to_owned();
+        }
+        let absent = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".to_owned());
+        let rows: Vec<[String; 8]> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                [
+                    printable(&node.node),
+                    absent(&node.address),
+                    absent(&node.zone),
+                    absent(&node.host),
+                    node.weight.to_string(),
+                    node.liveness.to_owned(),
+                    if node.draining { "yes" } else { "no" }.to_owned(),
+                    node.release.clone(),
+                ]
+            })
+            .collect();
+        table(
+            [
+                "NODE", "ADDRESS", "ZONE", "HOST", "WEIGHT", "LIVENESS", "DRAINING", "RELEASE",
+            ],
+            &rows,
+        )
+    }
+}
+
+/// A table: `header`, then one line per row, each column padded to its widest cell and separated
+/// by two spaces, with no trailing padding.
+#[must_use]
+pub fn table<const COLUMNS: usize>(header: [&str; COLUMNS], rows: &[[String; COLUMNS]]) -> String {
+    let mut widths = header.map(str::len);
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut output = String::new();
+    let mut line = |cells: &[&str; COLUMNS]| {
+        for (index, cell) in cells.iter().enumerate() {
+            if index > 0 {
+                output.push_str("  ");
+            }
+            output.push_str(cell);
+            if index + 1 < COLUMNS {
+                output.push_str(&" ".repeat(widths[index].saturating_sub(cell.chars().count())));
+            }
+        }
+        output.push('\n');
+    };
+    line(&header);
+    for row in rows {
+        line(&std::array::from_fn(|index| row[index].as_str()));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +799,23 @@ mod tests {
             schema: None,
             schema_unavailable: None,
         }
+    }
+
+    #[test]
+    fn a_table_pads_every_column_but_the_last() {
+        let rows = [
+            ["a".to_owned(), "long cell".to_owned(), "1".to_owned()],
+            ["bbb".to_owned(), "x".to_owned(), "22".to_owned()],
+        ];
+        assert_eq!(
+            table(["ID", "NAME", "N"], &rows),
+            "ID   NAME       N\na    long cell  1\nbbb  x          22\n"
+        );
+    }
+
+    #[test]
+    fn no_members_print_no_nodes() {
+        assert_eq!(NodeList { nodes: Vec::new() }.text(), "no nodes\n");
     }
 
     fn text(report: &DatabaseReport, reader: Option<&str>) -> String {

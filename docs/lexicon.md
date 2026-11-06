@@ -108,7 +108,7 @@ The HTTP listener a daemon serves `/metrics`, `/healthz`, and `/readyz` on, apar
 A database's history kept for recovery: a physical [change stream](#change-stream) plus base [snapshots](#snapshot), written as immutable objects to an object store, with point-in-time [restore](#restore) (ADR-0029, FR-049). Separate from replicas: replicas give availability, an archive gives recovery. Its objects are [segments](#segment), and each base snapshot's *chunks* and *descriptor*; an object's name is its *object key* ([key](#key)).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `[[archive]]` in config, `durability::Archive`, `ArchiveConfig`, `ArchiveKeys`, `ObjectStore`, `S3Store`, `DirectoryStore`, `MemoryStore`. **CLI:** `--archive <name>` on `db restore`, `db archive show`, `db archive verify`, and `archive restore`.
+- **Code:** `[[archive]]` in config, `durability::Archive`, `ArchiveConfig`, `ArchiveKeys`, `ObjectStore`, `S3Store`, `DirectoryStore`, `MemoryStore`. **CLI:** the `archive` group (`archive show`, `archive verify`, `archive restore`), and `--archive <name>` on those and on `db restore`.
 - **Not:** backup (as the mechanism's name), dump, export, durability sink. ADR-0016, point 3, says "durability sink" for the same idea; the ADR is accepted and keeps its words, and everything else says archive.
 
 ### Audit line
@@ -739,7 +739,7 @@ A principal whose client certificate may read `/metrics` on an [admin listener](
 One immutable archive object holding a run of delivered batches between two positions (ADR-0029): one delivery of an archive's change stream, with the hash chain at both ends.
 
 - **Applies to:** daemon, CLI.
-- **Code:** `durability::SegmentName`, `SegmentHeader`, `encode_segment`; objects under `<prefix>/<db>/segments/`. **CLI:** `segments` in `db archive show` and in a restore's report.
+- **Code:** `durability::SegmentName`, `SegmentHeader`, `encode_segment`; objects under `<prefix>/<db>/segments/`. **CLI:** `segments` in `archive show` and in a restore's report.
 - **Not:** WAL file, log file, chunk, part.
 
 ### Sink
@@ -763,7 +763,7 @@ The page an AI agent reads to use FleetRing well, [`docs/agents/SKILL.md`](agent
 A consistent copy of state at one point. Always say which: a *database snapshot* seeds or re-seeds a replica (FR-032); a *base snapshot* starts an archive's restore chain (ADR-0029); a *control snapshot* compacts the control log. The leases a node holds when a `WatchLeases` stream opens aren't a snapshot; they are its *held leases*.
 
 - **Applies to:** daemon, UI.
-- **Code:** `engine::DatabaseSnapshot`, `Replication.Snapshot` (whose messages, `SnapshotRequest` and `SnapshotChunk`, only ever carry a database snapshot); `durability::SnapshotDescriptor`, `SnapshotEntry`, and protocol `ArchivedSnapshot` for base snapshots; the control log's `snapshots` table and its "control snapshot" errors; protocol `HeldLeases` for the leases. **CLI:** `snapshots` in `db archive show`, and `snapshot` in a restore's report, both base snapshots.
+- **Code:** `engine::DatabaseSnapshot`, `Replication.Snapshot` (whose messages, `SnapshotRequest` and `SnapshotChunk`, only ever carry a database snapshot); `durability::SnapshotDescriptor`, `SnapshotEntry`, and protocol `ArchivedSnapshot` for base snapshots; the control log's `snapshots` table and its "control snapshot" errors; protocol `HeldLeases` for the leases. **CLI:** `snapshots` in `archive show`, and `snapshot` in a restore's report, both base snapshots.
 - **Not:** backup, dump, image, checkpoint.
 
 ### Software
