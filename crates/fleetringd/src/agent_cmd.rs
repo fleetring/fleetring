@@ -12,7 +12,6 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -35,12 +34,11 @@ use crate::agent::{
     self, AUTHORITY_CERT_LIFETIME, Acquired, AgentDir, AgentError, AgentId, AgentRecord,
     DEV_CERT_LIFETIME, IssuedBy, Issuer, MintGrant, OldToken, RENEW_TOKEN_WITHIN, Renewal,
 };
+use crate::confirm::{self, Place};
+use crate::format::{self, OutputArgs, OutputFormat};
 use crate::progress::{MachineOutput, Progress};
 use crate::resolve::EnvSnapshot;
-use crate::{
-    OutputArgs, OutputFormat, Target, context_cmd, dev_cmd, failed, format_time, parse_ttl,
-    spinner_surroundings,
-};
+use crate::{Target, context_cmd, dev_cmd, format_time, note, parse_ttl, spinner_surroundings};
 
 /// What the output says about isolation (ADR-0044, point 11.4; #114).
 const TRUSTED_LOCAL: &str =
@@ -212,11 +210,15 @@ impl Situation {
             .map_or_else(|| DEV_NAME.to_owned(), |(name, _)| name.to_string())
     }
 
-    /// Where the command acts, for a prompt: the fleet and the context.
-    fn place(&self, record: &AgentRecord) -> String {
-        match &self.context {
-            Some((name, _)) => format!("on fleet '{}' (context '{name}')", record.fleet),
-            None => format!("on fleet '{}'", record.fleet),
+    /// Where the command acts, for a prompt: the fleet and the context, or the agents
+    /// directory when no context is in use.
+    fn place(&self, record: &AgentRecord) -> Place {
+        Place {
+            fleet: Some(record.fleet.clone()),
+            via: match &self.context {
+                Some((name, _)) => format!("context '{name}'"),
+                None => format!("agents directory {}", self.agents_dir.display()),
+            },
         }
     }
 }
@@ -344,22 +346,26 @@ pub(crate) async fn prepare_agent(
     let grant = dev_grant(dir.id(), Vec::new(), access, None);
     let acquired = dir.acquire(Issuer::Dev(&checked), &grant, SystemClock.now())?;
     match &acquired {
-        Acquired::Minted(_) => eprintln!(
+        Acquired::Minted(_) => note(format!(
             "minted agent {}'s identity in {}",
             dir.id(),
             dir.tls_dir().display()
-        ),
+        )),
         Acquired::Renewed { old, renewal, .. } => {
-            eprintln!("renewed agent {}'s {}", dir.id(), renewed(*renewal));
+            note(format!(
+                "renewed agent {}'s {}",
+                dir.id(),
+                renewed(*renewal)
+            ));
             if let Some(old) = old {
                 match dev_admin(&checked) {
                     Ok(admin) => revoke_old(&admin, old).await,
-                    Err(error) => eprintln!(
+                    Err(error) => note(format!(
                         "warning: couldn't revoke the old token {} ({error}); it stays valid \
                          until {}",
                         old.id,
                         format_time(old.until.as_millis())
-                    ),
+                    )),
                 }
             }
         }
@@ -422,7 +428,7 @@ fn situation(target: &Target) -> Result<Situation, Box<dyn Error>> {
 async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
     let situation = situation(&args.target)?;
     for warning in args.scopes.iter().filter_map(Scope::separator_warning) {
-        eprintln!("warning: {warning}");
+        note(format!("warning: {warning}"));
     }
     let access = if args.read_only {
         Access::ReadOnly
@@ -557,12 +563,12 @@ async fn acquire_node(dev_dir: &Path, machine: MachineOutput) -> Result<(), Box<
     progress.finish_err();
     let context = context_cmd::write_dev_context(&prepared);
     if let Detached::Started { pid } = detached {
-        eprintln!(
+        note(format!(
             "started the dev node (pid {pid}) in {}; context {}; stop it with `fleetring dev \
              stop`",
             prepared.dir().display(),
             context.describe()
-        );
+        ));
     }
     Ok(())
 }
@@ -629,19 +635,19 @@ async fn revoke(client: &Client, token: &OldToken) -> Result<Revocation, Box<dyn
                 REVOKE_TIMEOUT.as_secs()
             )
         })?
-        .map_err(failed)?;
+        .map_err(|status| crate::exit::describe(&status))?;
     Ok(Revocation::Until(Timestamp::from_millis(answer.until_ms)))
 }
 
 /// Revokes a replaced token, and warns rather than fails if it can't (ADR-0043, point 8.2).
 async fn revoke_old(client: &Client, old: &OldToken) {
     match revoke(client, old).await {
-        Ok(revocation) => eprintln!("{}", revocation.describe(old)),
-        Err(error) => eprintln!(
+        Ok(revocation) => note(revocation.describe(old)),
+        Err(error) => note(format!(
             "warning: couldn't revoke the old token {} ({error}); it stays valid until {}",
             old.id,
             format_time(old.until.as_millis())
-        ),
+        )),
     }
 }
 
@@ -693,11 +699,11 @@ async fn renew(
     };
     match client {
         Some(client) => revoke_old(&client, &old).await,
-        None => eprintln!(
+        None => note(format!(
             "warning: no client to revoke the old token {} with; it stays valid until {}",
             old.id,
             format_time(old.until.as_millis())
-        ),
+        )),
     }
     Ok(format!(
         "renewed agent {}: certificate expires {}, token expires {}\n",
@@ -745,10 +751,10 @@ async fn remove(
     let until = format_time(token.until.as_millis());
     let revoked = match revoke_token {
         Revoke::Skip => {
-            eprintln!(
+            note(format!(
                 "warning: not revoking token {}: it stays valid until {until}",
                 token.id
-            );
+            ));
             String::new()
         }
         Revoke::Required => {
@@ -779,29 +785,14 @@ async fn remove(
 fn confirm_removal(
     dir: &AgentDir,
     record: &AgentRecord,
-    place: &str,
+    place: &Place,
 ) -> Result<(), Box<dyn Error>> {
-    let id = dir.id();
-    let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        return Err(format!("pass --yes to remove agent '{id}' without a prompt").into());
-    }
-    let mut stderr = std::io::stderr();
-    write!(
-        stderr,
-        "remove agent '{id}' ({}) {place}: revoke its token and delete {}? type the ID to \
-         confirm: ",
-        record.principal,
-        dir.tls_dir().display()
-    )?;
-    stderr.flush()?;
-    let mut answer = String::new();
-    stdin.lock().read_line(&mut answer)?;
-    if answer.trim() == id.as_str() {
-        Ok(())
-    } else {
-        Err(format!("not removing agent '{id}'").into())
-    }
+    confirm::confirm(&confirm::remove_agent(
+        dir.id().as_str(),
+        &record.principal,
+        &dir.tls_dir().display().to_string(),
+        place,
+    ))
 }
 
 /// `agent list`.
@@ -829,7 +820,7 @@ fn list(situation: &Situation, format: OutputFormat) -> Result<String, Box<dyn E
         match dir.record() {
             Ok(Some(record)) => agents.push((dir, record)),
             Ok(None) => {}
-            Err(error) => eprintln!("warning: skipping agent '{}': {error}", dir.id()),
+            Err(error) => note(format!("warning: skipping agent '{}': {error}", dir.id())),
         }
     }
     agents.sort_by(|(left, _), (right, _)| left.id().cmp(right.id()));
@@ -840,44 +831,36 @@ fn render_list(
     agents: &[(AgentDir, AgentRecord)],
     format: OutputFormat,
 ) -> Result<String, Box<dyn Error>> {
-    match format {
-        OutputFormat::Json => {
-            let agents: Vec<serde_json::Value> = agents
-                .iter()
-                .map(|(dir, record)| agent_json(dir, record))
-                .collect();
-            Ok(format!(
-                "{}\n",
-                serde_json::to_string_pretty(&serde_json::json!({ "agents": agents }))?
-            ))
-        }
-        OutputFormat::Table => {
-            let rows: Vec<[String; 6]> = agents
-                .iter()
-                .map(|(dir, record)| {
-                    [
-                        dir.id().to_string(),
-                        record.principal.clone(),
-                        record.scopes.join(","),
-                        read_only_text(record).to_owned(),
-                        record.cert_expires_at.clone(),
-                        record.token_expires_at.clone(),
-                    ]
-                })
-                .collect();
-            Ok(table(
+    let listed: Vec<serde_json::Value> = agents
+        .iter()
+        .map(|(dir, record)| agent_json(dir, record))
+        .collect();
+    format::render(format, &serde_json::json!({ "agents": listed }), |_| {
+        let rows: Vec<[String; 6]> = agents
+            .iter()
+            .map(|(dir, record)| {
                 [
-                    "ID",
-                    "PRINCIPAL",
-                    "SCOPES",
-                    "READ-ONLY",
-                    "CERT EXPIRES",
-                    "TOKEN EXPIRES",
-                ],
-                &rows,
-            ))
-        }
-    }
+                    dir.id().to_string(),
+                    record.principal.clone(),
+                    record.scopes.join(","),
+                    read_only_text(record).to_owned(),
+                    record.cert_expires_at.clone(),
+                    record.token_expires_at.clone(),
+                ]
+            })
+            .collect();
+        Ok(table(
+            [
+                "ID",
+                "PRINCIPAL",
+                "SCOPES",
+                "READ-ONLY",
+                "CERT EXPIRES",
+                "TOKEN EXPIRES",
+            ],
+            &rows,
+        ))
+    })
 }
 
 /// `agent show`.
@@ -890,19 +873,12 @@ fn show(
     let Some(record) = dir.record()? else {
         return Err(no_identity(&dir, situation.selected()).into());
     };
-    match format {
-        OutputFormat::Json => Ok(format!(
-            "{}\n",
-            serde_json::to_string_pretty(
-                &serde_json::json!({ "agents": [agent_json(&dir, &record)] })
-            )?
-        )),
-        OutputFormat::Table => {
-            let context = situation.pinned();
-            let invocation = Invocation::of(dir.id(), &context)?;
-            Ok(describe(&dir, &record, &context, &invocation, Detail::Full))
-        }
-    }
+    let shown = serde_json::json!({ "agents": [agent_json(&dir, &record)] });
+    format::render(format, &shown, |_| {
+        let context = situation.pinned();
+        let invocation = Invocation::of(dir.id(), &context)?;
+        Ok(describe(&dir, &record, &context, &invocation, Detail::Full))
+    })
 }
 
 fn agent_json(dir: &AgentDir, record: &AgentRecord) -> serde_json::Value {
@@ -1170,6 +1146,45 @@ mod tests {
             invocation.config(ConfigFormat::Cursor)?,
             invocation.config(ConfigFormat::Json)?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_list_json_pins_its_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let dir = AgentDir::new(root.path(), "42".parse()?);
+        let record = AgentRecord {
+            version: 1,
+            principal: "agent-42".to_owned(),
+            owner: "admin".to_owned(),
+            parent: None,
+            fleet: "dev".to_owned(),
+            scopes: vec!["admin:agent-42-*".to_owned()],
+            read_only: false,
+            token_id: "t1".to_owned(),
+            token_expires_at: "2026-12-01T00:00:00Z".to_owned(),
+            cert_expires_at: "2027-11-01T00:00:00Z".to_owned(),
+            issued_by: IssuedBy::Dev,
+        };
+        let listed: serde_json::Value =
+            serde_json::from_str(&render_list(&[(dir, record)], OutputFormat::Json)?)?;
+        let item = listed["agents"][0].as_object().ok_or("an agent")?;
+        let keys: Vec<&str> = item.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "cert_expires_at",
+                "dir",
+                "id",
+                "issued_by",
+                "principal",
+                "read_only",
+                "scopes",
+                "token_expires_at"
+            ]
+        );
+        assert_eq!(item["id"], "42");
+        assert_eq!(item["read_only"], false);
         Ok(())
     }
 

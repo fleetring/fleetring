@@ -20,7 +20,7 @@ use fleetringd::report::{metadata_report, render_metadata};
 use serde::Serialize;
 
 use super::{
-    ExpiryArgs, OutputArgs, OutputFormat, Target, description_arg, failed, parse_label_arg, shown,
+    ExpiryArgs, OutputArgs, Target, description_arg, failed, format, parse_label_arg, shown,
     updated_failed,
 };
 
@@ -261,13 +261,12 @@ pub(crate) async fn run(args: EditArgs) -> Result<String, Box<dyn Error>> {
             }
         }
     }
-    let printed = match output.format() {
-        OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Table => report.text(target.principal().as_deref())?,
-    };
+    let printed = format::render(output.format(), &report, |report| {
+        report.text(target.principal().as_deref())
+    })?;
     match &report.metadata_error {
         Some(error) => {
-            print!("{printed}");
+            crate::emit(&printed)?;
             Err(format!(
                 "the durability change of {} was applied, but the metadata update failed: {error}",
                 shown(&name)
