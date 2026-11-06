@@ -251,7 +251,7 @@ async fn a_configured_file_sink_is_fed_and_reported_in_the_node_status() -> Test
     let tls_dir = tls.dir().to_owned();
     let command_address = address.to_string();
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        crate::support::fleetring()
             .env("FLEETRING_TLS_DIR", tls_dir)
             .args(["status", "--address", &command_address])
             .output()

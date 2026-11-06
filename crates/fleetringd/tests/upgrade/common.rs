@@ -540,6 +540,7 @@ impl ProcessFleet {
             .append(true)
             .open(&node.log)?;
         let mut command = Command::new(&node.bin);
+        crate::support::isolate(&mut command);
         if self.launch == Launch::Serve {
             command.arg("serve");
         }
@@ -573,6 +574,7 @@ impl ProcessFleet {
     /// Runs `bin` with `args` as the test principal, with `path` as `PATH`.
     pub(crate) fn command(&self, bin: &Path, path: &str) -> Command {
         let mut command = Command::new(bin);
+        crate::support::isolate(&mut command);
         command
             .env("FLEETRING_TLS_DIR", self.tls.dir())
             .env("PATH", path)

@@ -5,6 +5,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 /// This build, copied into `dir` as `file_name`, with the platform's executable suffix.
@@ -17,6 +19,7 @@ fn copy_as(dir: &Path, file_name: &str) -> Result<PathBuf, Box<dyn Error>> {
 /// Runs `bin` with `args`, with no client variables to change what a command does.
 fn run(bin: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
     let mut command = Command::new(bin);
+    support::isolate(&mut command);
     command.args(args);
     for variable in [
         "FLEETRING_CONTROL",

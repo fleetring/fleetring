@@ -242,7 +242,7 @@ mod binary {
     }
 
     fn start(config: &std::path::Path) -> Result<Started, Box<dyn std::error::Error>> {
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        let mut daemon = crate::support::fleetring()
             .args(["serve", "--config"])
             .arg(config)
             .env("RUST_LOG", "info")
@@ -274,7 +274,7 @@ mod binary {
     /// refused because the fleet has no members, so the create is retried until the join lands.
     fn create_database(dir: &std::path::Path, control: &str) -> TestResult {
         for attempt in 0..600 {
-            let created = Command::new(env!("CARGO_BIN_EXE_fleetring"))
+            let created = crate::support::fleetring()
                 .env("FLEETRING_TLS_DIR", dir.join("tls"))
                 .args([
                     "db",
@@ -380,7 +380,7 @@ mod binary {
     fn starts_logs_and_exits_cleanly_on_sigint_while_a_second_daemon_is_refused() -> TestResult {
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path())?;
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        let mut daemon = crate::support::fleetring()
             .arg("--config")
             .arg(&config)
             .env("RUST_LOG", "info")
@@ -401,7 +401,7 @@ mod binary {
             "{before:?}"
         );
 
-        let second = Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        let second = crate::support::fleetring()
             .args(["serve", "--config"])
             .arg(&config)
             .output()?;
@@ -433,7 +433,7 @@ mod binary {
             // Each child shares this process's open files, the lock's included, from fork to exec.
             let spawner = scope.spawn(|| {
                 while spawned.load(Ordering::Relaxed) < CHILDREN {
-                    Command::new(env!("CARGO_BIN_EXE_fleetring"))
+                    crate::support::fleetring()
                         .arg("--version")
                         .stdout(Stdio::null())
                         .status()?;
