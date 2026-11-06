@@ -662,7 +662,7 @@ impl Failed {
             }
         };
         let hint = match self {
-            Self::Status(status) => feature_hint(status),
+            Self::Status(status) => feature_hint(status).or_else(|| credential_hint(status)),
             _ => None,
         };
         ErrorBody {
@@ -699,6 +699,16 @@ fn feature_hint(status: &Status) -> Option<&'static str> {
              member",
         )
     }
+}
+
+/// The next step after the nodes refused the server's own credentials: a session that outlives
+/// its token has to start again, and `fleetring mcp --agent` renews the token at start in dev
+/// mode (ADR-0043, point 8.2).
+fn credential_hint(status: &Status) -> Option<&'static str> {
+    (status.code() == Code::Unauthenticated).then_some(
+        "the server's credentials were refused; if its token expired, restart the MCP server \
+         (`fleetring mcp --agent <id>` renews the token at start in dev mode)",
+    )
 }
 
 /// `code` in snake case, as the gRPC status codes are named.
@@ -1031,6 +1041,19 @@ mod tests {
         );
         let other = Failed::Status(Status::failed_precondition("no primary yet")).body();
         assert_eq!(other.hint, None);
+    }
+
+    #[test]
+    fn a_refused_credential_says_to_restart_the_server() {
+        let expired = Failed::Status(Status::unauthenticated("the token has expired")).body();
+        assert_eq!(expired.code, "unauthenticated");
+        assert!(
+            expired
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("restart the MCP server")),
+            "{expired:?}"
+        );
     }
 
     #[test]

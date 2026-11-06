@@ -142,6 +142,7 @@ const _: () = {
     assert_debug_send_sync::<report::SchemaObjectReport>();
     assert_debug_send_sync::<report::SchemaReport>();
     assert_debug_send_sync::<dev::Detached>();
+    assert_debug_send_sync::<dev::DevChecked>();
     assert_debug_send_sync::<dev::DevContextLine>();
     assert_debug_send_sync::<dev::DevError>();
     assert_debug_send_sync::<dev::DevMode>();

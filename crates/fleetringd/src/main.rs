@@ -12,8 +12,6 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_client::context::{ContextName, Contexts, select};
@@ -48,8 +46,8 @@ use fleetringd::report::{
     render_text, schema_unavailable, table,
 };
 use fleetringd::tls::{
-    Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME,
-    FleetName, Identity, Peer, Principal, Security, Validity,
+    AUTHORITY_CERT_FILE, Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
+    DEFAULT_NODE_LIFETIME, FleetName, Identity, Peer, Principal, Security, Validity,
 };
 use fleetringd::transport::Credentials;
 #[cfg(unix)]
@@ -59,10 +57,11 @@ use fleetringd::{
     Config, Daemon, LogFormat, MembershipView, Network, NodeRole, ParseLogFormatError, Plaintext,
     Stop,
 };
-use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod agent;
+mod agent_cmd;
 mod compat;
 mod context_cmd;
 mod dev_cmd;
@@ -71,6 +70,8 @@ mod progress;
 mod resolve;
 mod stop;
 
+use agent::{AgentDir, AgentId};
+use agent_cmd::AgentCommand;
 use compat::{Invocation, ProgramName};
 use context_cmd::ContextCommand;
 use dev_cmd::DevArgs;
@@ -86,9 +87,6 @@ const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
 
 /// The exit code for a usage error, as clap's own.
 const USAGE_ERROR: u8 = 2;
-
-/// How many random bytes a token's ID holds.
-const TOKEN_ID_BYTES: usize = 16;
 
 /// What `fleetring --help` says below the commands: the compatibility names (ADR-0043, point 1.5).
 const COMPAT_HELP: &str = "\
@@ -216,6 +214,12 @@ enum Command {
     /// closes stdin. stdout carries the protocol alone; logs go to stderr.
     #[command(after_long_help = MCP_HELP)]
     Mcp(McpArgs),
+    /// Adds, lists, shows, renews, and removes agents' identities: a principal `agent-<id>`
+    /// with a certificate and a scoped token, kept in a directory per agent (ADR-0043, point 8).
+    /// In dev mode, `fleetring mcp --agent <id>` adds one by itself. Trusted local development:
+    /// agents running as the same user can read each other's credentials.
+    #[command(subcommand)]
+    Agent(AgentCommand),
     /// Shows the members with their liveness, release, the membership epoch, and the ring
     /// fingerprint, as the control plane sees them; with `--node` or `--address`, as one data
     /// node sees them.
@@ -252,16 +256,21 @@ struct McpArgs {
 
 /// What `fleetring mcp --help` adds below the flags: how an MCP client starts the server.
 const MCP_HELP: &str = "\
-An MCP client starts the server as a command. With a scoped token and dev mode's
-certificates, a client configuration (Claude Code's .mcp.json, Cursor's mcp.json) reads:
+An MCP client starts the server as a command. `--agent <id>` is the whole setup: in dev
+mode it starts a dev node if none runs, mints the agent's identity (agent-<id>, scoped
+admin:agent-<id>-*) on first use, and renews it at start when it is close to expiring.
+The configuration holds no secret (Claude Code's .mcp.json, Cursor's mcp.json):
 
-  {\"mcpServers\": {\"fleetring\": {\"command\": \"fleetring\", \"args\": [\"mcp\"],
-    \"env\": {\"FLEETRING_CONTROL\": \"127.0.0.1:7400\",
-            \"FLEETRING_TLS_DIR\": \"/home/me/.fleetring/tls\",
-            \"FLEETRING_AS\": \"agent-42\", \"FLEETRING_TOKEN\": \"<token>\"}}}}
+  {\"mcpServers\": {\"fleetring\": {\"command\": \"/usr/local/bin/fleetring\",
+    \"args\": [\"mcp\", \"--agent\", \"42\", \"--context\", \"dev\"]}}}
 
-The token is a secret: keep the file private. Give an agent a token scoped to its own
-prefix (token issue --scope admin:agent-42-*), never the admin certificate.";
+`fleetring agent add 42 --print-config json` prints it with this binary's path, and
+`claude mcp add fleetring -- fleetring mcp --agent 42 --context dev` registers it with
+Claude Code. For a fleet that isn't dev mode's, `fleetring agent add 42 --context <name>
+--authority <dir>` mints the identity where the authority is.
+
+This is trusted local development: agents on this machine can read each other's
+credentials, so separate identities don't isolate agents from each other.";
 
 /// `fleetring upgrade`'s flags (ADR-0038).
 #[derive(Debug, Args)]
@@ -464,7 +473,8 @@ enum TokenCommand {
     /// off the nodes; nodes verify the token with `ca.crt` alone.
     Issue {
         /// The principal the token names. A client sending it must connect with a certificate
-        /// for the same principal, unless that principal forwards tokens.
+        /// for the same principal, unless that principal forwards tokens. A name that starts
+        /// with `agent-` may not contain `.`, which is reserved for delegated agents.
         #[arg(long)]
         principal: Principal,
         /// A scope the token carries: `<action>:<pattern>`, with the action `read`, `write`,
@@ -540,13 +550,19 @@ enum CertCommand {
         ttl: Option<Duration>,
     },
     /// Issues a client certificate: `client.<principal>.crt` and `client.<principal>.key` in
-    /// the directory, naming the principal the client acts as.
+    /// the directory, or in `--out`, naming the principal the client acts as.
     Client {
-        /// The principal's name.
+        /// The principal's name. A name that starts with `agent-` may not contain `.`, which
+        /// is reserved for delegated agents.
         principal: Principal,
-        /// The directory with `ca.crt` and `ca.key`, which the new files go into.
+        /// The directory with `ca.crt` and `ca.key`, which the new files go into unless `--out`
+        /// names another.
         #[arg(long)]
         dir: PathBuf,
+        /// Writes the certificate, its key, and a copy of `ca.crt` into this directory, created
+        /// private to you, instead of the authority's: a complete TLS directory for the client.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
         /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; 7 days by
         /// default.
         #[arg(long, value_parser = parse_ttl)]
@@ -943,6 +959,26 @@ struct TlsArgs {
     /// or else the context's `token_file`.
     #[arg(long, value_name = "PATH")]
     token_file: Option<PathBuf>,
+    /// Acts as the agent with this ID, using the identity `fleetring agent add` or `fleetring
+    /// mcp --agent` minted: `agent-<id>`, its certificate, and its token, from its directory
+    /// under the context's agents directory. Defaults to `FLEETRING_AGENT`.
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = [
+            "principal", "cert", "key", "tls_dir", "token", "token_file", "insecure_plaintext"
+        ]
+    )]
+    agent: Option<AgentId>,
+}
+
+/// Where the agent a command acts as was named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentFrom {
+    /// `--agent`.
+    Flag,
+    /// `FLEETRING_AGENT`.
+    Variable,
 }
 
 /// What a command with no control address anywhere says.
@@ -1012,6 +1048,7 @@ impl Target {
             } else {
                 Wire::Tls
             },
+            agent: None,
         })
     }
 
@@ -1021,23 +1058,62 @@ impl Target {
         if let Some(resolved) = self.resolved.get() {
             return Ok(resolved);
         }
-        let env = EnvSnapshot::capture();
-        let flags = self.flags()?;
-        let named = self.context.is_some() || env.context.is_some();
-        let contexts = match context_cmd::store() {
-            // `FLEETRING_CONTEXT=` skips the file, unless `--context` needs it.
-            Ok(_) if env.contexts == ContextsFile::Skip && self.context.is_none() => {
-                Contexts::empty()
-            }
-            Ok(store) => store.load().map_err(|source| ContextsUnusable {
-                path: store.path().to_owned(),
-                source,
-            })?,
-            // No home directory means no contexts, which only matters if one was asked for.
-            Err(_) if !named => Contexts::empty(),
-            Err(error) => return Err(error.into()),
-        };
+        let mut env = EnvSnapshot::capture();
+        let mut flags = self.flags()?;
+        let contexts = self.contexts(&env)?;
         let selected = select(&contexts, self.context.as_ref(), env.context.as_deref())?;
+        if let Some((id, from)) = self.agent(&env)? {
+            let agents_dir = agent::agents_dir(
+                selected.map(|(name, context, _)| (name, context)),
+                &|name| std::env::var_os(name),
+            )?;
+            let dir = AgentDir::new(&agents_dir, id);
+            if dir.record()?.is_none() {
+                return Err(agent_cmd::no_identity(
+                    &dir,
+                    selected.map(|(name, context, _)| (name, context)),
+                )
+                .into());
+            }
+            for warning in dir.loose_files() {
+                eprintln!("{warning}");
+            }
+            let principal = Some(dir.id().principal().to_string());
+            let token = Some(TokenSource::File(dir.token_file()));
+            let label = Some(dir.id().to_string());
+            match from {
+                AgentFrom::Flag => {
+                    flags.tls_dir = Some(dir.tls_dir().to_owned());
+                    flags.principal = principal;
+                    flags.token = token;
+                    flags.agent = label;
+                    env.agent = None;
+                }
+                AgentFrom::Variable => {
+                    let clash = [
+                        (env.tls_dir.is_some(), resolve::TLS_DIR_VAR),
+                        (env.ca.is_some(), resolve::CA_VAR),
+                        (env.cert.is_some(), resolve::CERT_VAR),
+                        (env.key.is_some(), resolve::KEY_VAR),
+                        (env.principal.is_some(), resolve::AS_VAR),
+                        (env.token.is_some(), resolve::TOKEN_VAR),
+                        (env.token_file.is_some(), resolve::TOKEN_FILE_VAR),
+                    ]
+                    .into_iter()
+                    .find_map(|(set, name)| set.then_some(name));
+                    if let Some(name) = clash {
+                        return Err(format!(
+                            "{} and {name} both name an identity; unset one",
+                            resolve::AGENT_VAR
+                        )
+                        .into());
+                    }
+                    env.tls_dir = Some(dir.tls_dir().to_owned());
+                    env.principal = principal;
+                    env.token_file = Some(dir.token_file());
+                }
+            }
+        }
         let mut resolved = resolve::resolve(&flags, &env, selected);
         if WARNINGS.get() != Some(&Warnings::Silence) {
             for warning in &resolved.warnings {
@@ -1049,6 +1125,72 @@ impl Target {
             resolved.token = Some(TokenSource::Value(TokenSource::Stdin.read()?));
         }
         Ok(self.resolved.get_or_init(|| Box::new(resolved)))
+    }
+
+    /// The contexts file, unless `FLEETRING_CONTEXT=` skips it and `--context` doesn't need it,
+    /// or there is no home directory and no context was asked for.
+    fn contexts(&self, env: &EnvSnapshot) -> Result<Contexts, Box<dyn Error>> {
+        let named = self.context.is_some() || env.context.is_some();
+        Ok(match context_cmd::store() {
+            Ok(_) if env.contexts == ContextsFile::Skip && self.context.is_none() => {
+                Contexts::empty()
+            }
+            Ok(store) => store.load().map_err(|source| ContextsUnusable {
+                path: store.path().to_owned(),
+                source,
+            })?,
+            Err(_) if !named => Contexts::empty(),
+            Err(error) => return Err(error.into()),
+        })
+    }
+
+    /// The agent `--agent` or else `FLEETRING_AGENT` names, and which.
+    fn agent(&self, env: &EnvSnapshot) -> Result<Option<(AgentId, AgentFrom)>, Box<dyn Error>> {
+        if let Some(id) = &self.tls.agent {
+            return Ok(Some((id.clone(), AgentFrom::Flag)));
+        }
+        Ok(match &env.agent {
+            Some(text) => Some((text.parse()?, AgentFrom::Variable)),
+            None => None,
+        })
+    }
+
+    /// Whether the command line or the environment names any part of a connection: a control
+    /// address or any part of an identity. Without a context, none means dev mode (ADR-0043,
+    /// point 8.1).
+    fn names_a_connection(&self, env: &EnvSnapshot) -> bool {
+        let tls = &self.tls;
+        self.control.is_some()
+            || self.config.is_some()
+            || tls.tls_dir.is_some()
+            || tls.ca.is_some()
+            || tls.cert.is_some()
+            || tls.key.is_some()
+            || tls.principal.is_some()
+            || tls.insecure_plaintext
+            || tls.token.is_some()
+            || tls.token_file.is_some()
+            || env.control.is_some()
+            || env.tls_dir.is_some()
+            || env.ca.is_some()
+            || env.cert.is_some()
+            || env.key.is_some()
+            || env.principal.is_some()
+            || env.token.is_some()
+            || env.token_file.is_some()
+    }
+
+    /// A client for the control address the settings resolve to, or for `fallback` when they
+    /// resolve to none.
+    fn client_or(&self, fallback: Option<String>) -> Result<Client, Box<dyn Error>> {
+        let resolved = self.resolved()?;
+        let control = if resolved.control.is_empty() {
+            fallback.ok_or(NO_CONTROL)?
+        } else {
+            first_reachable(&resolved.control)
+        };
+        let security = self.security()?;
+        Ok(Client::new(control, self.network_with(security)?))
     }
 
     /// The identity the command connects with, loaded and checked: its certificate must name
@@ -1691,24 +1833,34 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             max_result_bytes,
             target,
         }) => {
-            let client = target.client()?;
+            // `--agent`: in dev mode, a node and an identity first (ADR-0043, point 8.1).
+            let ready = agent_cmd::prepare_agent(&target).await?;
+            let client = match &ready {
+                Some(ready) => target.client_or(ready.fallback_control())?,
+                None => target.client()?,
+            };
             // The principal the credentials name, read as `db show` reads it, so that only its
             // own descriptions are trusted.
             let principal = target
                 .principal()
                 .and_then(|principal| principal.parse().ok());
+            let access = match &ready {
+                _ if read_only => Access::ReadOnly,
+                Some(ready) => ready.record().access(),
+                None => Access::ReadWrite,
+            };
+            if let Some(ready) = &ready {
+                eprint!("{}", ready.start_text(target.resolved()?.context.as_ref()));
+            }
             let settings = McpSettings {
-                access: if read_only {
-                    Access::ReadOnly
-                } else {
-                    Access::ReadWrite
-                },
+                access,
                 max_result_bytes,
                 principal,
             };
             mcp::serve(client, settings).await?;
             String::new()
         }
+        Command::Agent(command) => agent_cmd::run(command).await?,
         Command::Db(DbCommand::Create {
             name,
             replication_factor,
@@ -2467,6 +2619,7 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             dir,
         } => {
             let ttl = ttl.unwrap_or(DEFAULT_TOKEN_LIFETIME);
+            principal.refuse_reserved()?;
             for warning in scopes.iter().filter_map(Scope::separator_warning) {
                 eprintln!("warning: {warning}");
             }
@@ -2477,12 +2630,8 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                 )
                 .into());
             }
-            let signer = Authority::load(&dir)?.token_signer()?;
-            let mut random = [0_u8; TOKEN_ID_BYTES];
-            SystemRandom::new()
-                .fill(&mut random)
-                .map_err(|_| "the system's random number generator failed")?;
-            let id: TokenId = URL_SAFE_NO_PAD.encode(random).parse()?;
+            let signer = agent::load_authority(&dir)?.token_signer()?;
+            let id = agent::new_token_id()?;
             let not_before = SystemClock.now();
             let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
             let grant = Grant {
@@ -2563,7 +2712,7 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
             dir,
             ttl,
         } => {
-            let authority = Authority::load(&dir)?;
+            let authority = agent::load_authority(&dir)?;
             let issued = authority.issue_node(
                 &id,
                 &addresses,
@@ -2581,17 +2730,30 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
         CertCommand::Client {
             principal,
             dir,
+            out,
             ttl,
         } => {
-            let authority = Authority::load(&dir)?;
+            principal.refuse_reserved()?;
+            let authority = agent::load_authority(&dir)?;
             let issued = authority
                 .issue_client(&principal, validity(ttl.unwrap_or(DEFAULT_CLIENT_LIFETIME)))?;
             let stem = format!("client.{principal}");
-            issued.write(&dir, &stem)?;
+            let Some(out) = out else {
+                issued.write(&dir, &stem)?;
+                return Ok(format!(
+                    "issued {} in {}: {stem}.crt and {stem}.key\n",
+                    issued.subject(),
+                    dir.display()
+                ));
+            };
+            agent::create_private_dir(&out)?;
+            // The copy of `ca.crt` first, so a directory it refuses holds nothing new.
+            agent::write_new_private(&out.join(AUTHORITY_CERT_FILE), authority.certificate_pem())?;
+            issued.write(&out, &stem)?;
             Ok(format!(
-                "issued {} in {}: {stem}.crt and {stem}.key\n",
+                "issued {} in {}: {stem}.crt, {stem}.key, and a copy of ca.crt\n",
                 issued.subject(),
-                dir.display()
+                out.display()
             ))
         }
     }

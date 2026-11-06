@@ -15,6 +15,8 @@ use fleetringd::Network;
 use fleetringd::tls::{Authority, Identity, Issued, Security, Validity};
 use fleetringd::transport::TransportConfig;
 
+pub(crate) mod mcp;
+
 /// The fleet every test authority issues for.
 pub(crate) const FLEET: &str = "test";
 
@@ -35,7 +37,8 @@ pub(crate) const ADMIN: &str = "\n[admin]\nlisten = \"127.0.0.1:0\"\n";
 
 /// Every variable the command line reads to find a fleet, an identity or a context. A test that
 /// runs the binary starts from none of them (ADR-0043, point 4.4).
-pub(crate) const CLIENT_VARS: [&str; 10] = [
+pub(crate) const CLIENT_VARS: [&str; 11] = [
+    "FLEETRING_AGENT",
     "FLEETRING_CONTEXT",
     "FLEETRING_CONTROL",
     "FLEETRING_TLS_DIR",
@@ -49,7 +52,7 @@ pub(crate) const CLIENT_VARS: [&str; 10] = [
 ];
 
 /// A home that nothing creates: the binary run by [`fleetring`] has its home, its configuration
-/// directory and its contexts here, never the developer's own.
+/// and data directories, its contexts and its agents here, never the developer's own.
 pub(crate) fn scratch_home() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-home")
 }
@@ -62,7 +65,10 @@ pub(crate) fn isolate(command: &mut std::process::Command) -> &mut std::process:
     command
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join("xdg"))
-        .env("APPDATA", home.join("appdata"));
+        .env("XDG_DATA_HOME", home.join("xdg-data"))
+        .env("APPDATA", home.join("appdata"))
+        .env("LOCALAPPDATA", home.join("localappdata"))
+        .env("USERPROFILE", &home);
     for variable in CLIENT_VARS {
         command.env_remove(variable);
     }
