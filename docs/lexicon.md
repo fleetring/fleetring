@@ -712,6 +712,14 @@ A named identity a client acts as, with the scopes its `[[principal]]` entry or 
 - **Code:** `tls::Principal`, `[[principal]]`. **CLI:** `cert client <principal>`, `token issue --principal`, *planned* `--as <principal>` (FR-055).
 - **Not:** user, account, role, service account, subject (the token claim `sub` holds it).
 
+### Process file
+
+`fleetringd.process` in a node's data directory, which a running node writes and removes when it stops: its process ID, binary, release, arguments, restart count, and, when they apply, its [supervisor](#supervisor) and `started_by = "detach"` for a node `dev -d` started (ADR-0038, ADR-0043 point 5). A node runs when its process file names a process that holds the data directory's lock; a file whose process doesn't is stale. `upgrade` restarts a node through it, and `stop` and `dev stop` stop one. Its name is kept until 1.0.
+
+- **Applies to:** daemon, CLI.
+- **Code:** `upgrade::ProcessFile`, `upgrade::running`, `upgrade::Running`. **CLI:** `fleetring stop (--data-dir <dir> | --config <file>)`, `dev stop`, `dev status`.
+- **Not:** PID file, lock file (that is `fleetringd.lock`), state file.
+
 ### Promotion
 
 Making a follower the primary at the next lease epoch: the control plane starts it, the candidate fences a quorum, adopts the most advanced log, and completes it (ADR-0022). Failovers and transfers are both promotions.
@@ -913,6 +921,14 @@ The placement spec: the normative description of placement that every implementa
 - **Applies to:** crate.
 - **Code:** `RingSpec`, `CellsSpec`, `NodeSpec`. **CLI:** none.
 - **Not:** schema, config, manifest.
+
+### Supervisor
+
+The service manager that started a node and restarts it: systemd (a system or user unit) or launchd (a Homebrew service). A node records one in its [process file](#process-file) only when the supervisor's variable is set *and* the supervisor is its parent, since shells inherit the variables. `stop` and `dev stop` refuse a supervised node, naming the supervisor's own stop command, unless `dev -d` started it (ADR-0043, point 5.5).
+
+- **Applies to:** daemon, CLI.
+- **Code:** `upgrade::Supervisor`, `ProcessFile::supervisor`. **CLI:** the hint `systemctl stop <unit>` or `brew services stop fleetring`.
+- **Not:** service manager (in prose about one product, its own name), init system, daemon manager.
 
 ### Surface
 
