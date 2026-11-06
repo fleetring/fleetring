@@ -18,7 +18,9 @@ use fleetring_control::{DatabaseName, Liveness};
 use fleetring_proto::v1::{ExecuteRequest, FenceRequest};
 use fleetringd::data::Client;
 use fleetringd::engine::Statement;
-use fleetringd::observe::{ALLOWED_LABELS, FAMILIES, Kind, closed_values, log_subscriber};
+use fleetringd::observe::{
+    ALLOWED_LABELS, FAMILIES, Kind, LogColour, closed_values, log_subscriber,
+};
 use fleetringd::tls::Issued;
 use fleetringd::transport::{database_client, replication_client};
 use fleetringd::{Config, ConfigError, Daemon, LogFormat, StartError};
@@ -1297,6 +1299,7 @@ fn percentile(sorted: &[Duration], per_mille: usize) -> Duration {
 async fn rpc_latency_through_the_daemon() -> TestResult {
     let _installed = tracing::subscriber::set_global_default(log_subscriber(
         LogFormat::Text,
+        LogColour::Plain,
         tracing_subscriber::EnvFilter::new("info"),
         std::io::sink,
     ));

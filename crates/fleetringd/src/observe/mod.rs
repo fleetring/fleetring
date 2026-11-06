@@ -28,7 +28,7 @@ pub(crate) mod request_id;
 pub(crate) mod sampler;
 mod trace;
 
-pub use logs::log_subscriber;
+pub use logs::{LogColour, log_subscriber};
 pub(crate) use metrics::DataMetrics;
 pub use metrics::{
     ChangeMetrics, ControlMetrics, MembershipMetrics, Metrics, NodeInfo, ReplicationMetrics,

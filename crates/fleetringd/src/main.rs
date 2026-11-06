@@ -41,7 +41,7 @@ use fleetringd::engine::{
     Value,
 };
 use fleetringd::mcp::{self, Access, McpSettings};
-use fleetringd::observe::log_subscriber;
+use fleetringd::observe::{LogColour, log_subscriber};
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{
     DatabaseReport, MetadataReport, NodeList, expiry_text, printable, render_archived_metadata,
@@ -65,17 +65,21 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod compat;
 mod context_cmd;
+mod dev_cmd;
 mod edit;
 mod progress;
 mod resolve;
+mod stop;
 
 use compat::{Invocation, ProgramName};
 use context_cmd::ContextCommand;
+use dev_cmd::DevArgs;
 use progress::{MachineOutput, Progress, Quiet, Stepped, Surroundings, SuspendingStderr};
 use resolve::{
     ContextsFile, ContextsUnusable, EnvSnapshot, Resolved, SecurityFiles, TargetFlags, TokenSource,
     Wire,
 };
+use stop::StopArgs;
 
 /// The environment variable that chooses the log format when `--log-format` isn't given.
 const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
@@ -156,8 +160,13 @@ enum Command {
     /// Runs one node for development, on loopback only, with a local authority and an admin
     /// principal that every command can act as (ADR-0039). The first run creates them, with the
     /// node's configuration, in the directory; later runs reuse them. Load `<dir>/env` in another
-    /// terminal to point the commands at the node. Not for production.
+    /// terminal to point the commands at the node. `-d` runs it in the background; `dev stop`,
+    /// `dev status` and `dev logs` act on that node. Not for production.
     Dev(DevArgs),
+    /// Stops a node started in a terminal or a script: sends it SIGTERM through its process
+    /// file, which drains it, and waits until it has exited. Refuses a node a supervisor runs.
+    /// `dev stop` stops the dev node.
+    Stop(StopArgs),
     /// Names, lists and selects contexts: a fleet's control addresses, certificates and
     /// principal, so that commands need no flags for them (ADR-0043).
     #[command(subcommand)]
@@ -252,20 +261,6 @@ certificates, a client configuration (Claude Code's .mcp.json, Cursor's mcp.json
 
 The token is a secret: keep the file private. Give an agent a token scoped to its own
 prefix (token issue --scope admin:agent-42-*), never the admin certificate.";
-
-/// `fleetring dev`'s flags (ADR-0039).
-#[derive(Debug, Args)]
-struct DevArgs {
-    /// The directory that holds the authority, the certificates, the configuration, and the
-    /// databases; `~/.fleetring` by default.
-    #[arg(long)]
-    data_dir: Option<PathBuf>,
-    /// The loopback port the node serves on, 7400 by default; the admin listener takes the next
-    /// one. Only the first run chooses it: later runs read it from `<dir>/fleetringd.toml`, and
-    /// refuse a different one.
-    #[arg(long)]
-    port: Option<u16>,
-}
 
 /// `fleetring upgrade`'s flags (ADR-0038).
 #[derive(Debug, Args)]
@@ -1368,6 +1363,8 @@ fn hex(text: &str) -> Result<Vec<u8>, String> {
 enum Run {
     /// A command that talks to a fleet, or works offline.
     Command(Box<Command>),
+    /// `dev -d`, `dev stop`, `dev status` or `dev logs`, which choose their own exit code.
+    Dev(Box<DevArgs>),
     /// The daemon, from a configuration file with `serve`'s flags applied, or from dev mode's
     /// directory.
     Daemon {
@@ -1398,13 +1395,21 @@ fn parse(raw: Vec<OsString>, name: ProgramName) -> Result<(Cli, Invocation), cla
 }
 
 fn main() -> ExitCode {
+    // A node `dev -d` started leaves the terminal's session first, so that closing the terminal
+    // sends it no SIGHUP, which would restart it in place (ADR-0043, point 5.2).
+    #[cfg(unix)]
+    if dev::started_detached() {
+        leave_the_session();
+    }
     let raw: Vec<OsString> = std::env::args_os().collect();
     let name = ProgramName::from_arg0(raw.first().map(OsString::as_os_str));
     PROGRAM.get_or_init(|| name);
     let (cli, invocation) = match parse(raw, name) {
         Ok(parsed) => parsed,
         Err(error) => {
-            let hint = edit::removed_verb_hint(&error).or_else(|| edit::renamed_hint(&error));
+            let hint = edit::removed_verb_hint(&error)
+                .or_else(|| edit::renamed_hint(&error))
+                .or_else(|| stop::target_hint(&error));
             let code = error.exit_code();
             // Help and version requests are not errors; clap prints them to stdout.
             let _ = error.print();
@@ -1443,7 +1448,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
-        Command::Dev(args) => match prepare_dev(&args) {
+        Command::Dev(args) if args.runs_in_foreground() => match prepare_dev(&args) {
             Ok(prepared) => Run::Daemon {
                 config: Box::new(prepared.config().clone()),
                 dev: Some(Box::new(prepared)),
@@ -1453,11 +1458,12 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        Command::Dev(args) => Run::Dev(Box::new(args)),
         command => Run::Command(Box::new(command)),
     };
     let config = match &run {
         Run::Daemon { config, .. } => Some(config.as_ref()),
-        Run::Command(_) => None,
+        Run::Command(_) | Run::Dev(_) => None,
     };
     let variable = std::env::var(LOG_FORMAT_VAR).ok();
     let format = match log_format(format_flag, variable.as_deref(), config) {
@@ -1472,11 +1478,17 @@ fn main() -> ExitCode {
     };
     // The daemon logs at info; a command prints its result and logs only warnings.
     let default_filter = match run {
-        Run::Command(_) => "warn",
+        Run::Command(_) | Run::Dev(_) => "warn",
         Run::Daemon { .. } => "info",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
-    if let Err(error) = log_subscriber(format, filter, SuspendingStderr).try_init() {
+    // A detached node's log, a journal, or a pipe gets no escape sequences.
+    let colour = if std::io::stderr().is_terminal() {
+        LogColour::Ansi
+    } else {
+        LogColour::Plain
+    };
+    if let Err(error) = log_subscriber(format, colour, filter, SuspendingStderr).try_init() {
         report(&error);
         return ExitCode::FAILURE;
     }
@@ -1496,6 +1508,11 @@ fn main() -> ExitCode {
         Run::Command(command) => runtime
             .block_on(run_command(*command))
             .map(|()| Stopped::Exit),
+        Run::Dev(args) => {
+            let code = finish(runtime.block_on(dev_cmd::run(*args)));
+            runtime.shutdown_timeout(RUNTIME_GRACE);
+            return code;
+        }
         Run::Daemon { config, dev } => {
             runtime.block_on(run_daemon(*config, dev.map(|prepared| *prepared)))
         }
@@ -1577,6 +1594,16 @@ fn restart_in_place(_: &Path, _: u32) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Leaves the terminal's session, as `setsid` does: a process that already leads one gets
+/// `EPERM`, which leaves it where it is, as after a restart in place.
+#[cfg(unix)]
+fn leave_the_session() {
+    match rustix::process::setsid() {
+        Ok(_) | Err(rustix::io::Errno::PERM) => {}
+        Err(error) => eprintln!("{}: can't leave the terminal's session: {error}", program()),
+    }
+}
+
 /// Prepares dev mode's directory: creates what it lacks, and loads its configuration.
 fn prepare_dev(args: &DevArgs) -> Result<Prepared, DevError> {
     let dir = match &args.data_dir {
@@ -1643,6 +1670,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Context(_) | Command::Switch { .. } => {
             return Err("context and switch don't talk to a fleet".into());
         }
+        Command::Stop(args) => stop::run(args).await?,
         Command::Cert(command) => run_cert(command)?,
         Command::Token(command) => run_token(command).await?,
         Command::Status {

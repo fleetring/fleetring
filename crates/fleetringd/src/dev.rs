@@ -5,9 +5,10 @@
 //! binary then runs that configuration as it runs any other. With `dev = true`, validation keeps
 //! every address on loopback, however the node is started.
 
+use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,11 +16,12 @@ use std::time::Duration;
 use fleetring_control::Timestamp;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
-use crate::config::{AdminListener, Config, ConfigError, NodeRole, Plaintext};
+use crate::config::{AdminListener, AdminTls, Config, ConfigError, NodeRole, Plaintext};
 use crate::tls::{Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME, Validity};
+use crate::upgrade::{PROCESS_FILE, ProcessFile, Running, running};
 
 /// The port dev mode serves gRPC on unless `--port` says otherwise; the admin listener takes the
 /// next one.
@@ -51,6 +53,51 @@ const CHANGES_DIR: &str = "changes";
 
 /// The dev directory's name, in the home directory.
 const DIR_NAME: &str = ".fleetring";
+
+/// The log a detached dev node writes its output to, in the dev directory.
+pub const LOG_FILE: &str = "fleetring.log";
+
+/// The log as it was before the last rotation, in the dev directory.
+pub const LOG_FILE_OLD: &str = "fleetring.log.1";
+
+/// The lock `dev -d` holds while it starts a node, so that two at once start one, in the dev
+/// directory.
+pub const START_LOCK: &str = "fleetring.start.lock";
+
+/// Where agents' identities live, in the dev directory.
+pub const AGENTS_DIR: &str = "agents";
+
+/// The variable a detached child is started with; internal, not a CLI setting.
+pub const DETACHED_VAR: &str = "FLEETRING_DEV_DETACHED";
+
+/// A log over this many bytes is renamed to [`LOG_FILE_OLD`] when a detached node starts.
+const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The variables a supervisor hands the processes it starts. A detached node's environment has
+/// none, so that it neither looks supervised nor talks to a supervisor that didn't start it.
+const SUPERVISOR_VARS: [&str; 9] = [
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "NOTIFY_SOCKET",
+    "LISTEN_PID",
+    "LISTEN_FDS",
+    "LISTEN_FDNAMES",
+    "WATCHDOG_PID",
+    "WATCHDOG_USEC",
+    "XPC_SERVICE_NAME",
+];
+
+/// How often `dev -d` checks whether the node it started is ready.
+const READY_POLL: Duration = Duration::from_millis(100);
+
+/// How long one readiness probe may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many of the log's last lines a failed start shows.
+const TAIL_LINES: usize = 20;
+
+/// How much of the log's end a failed start reads to find them.
+const TAIL_BYTES: u64 = 64 * 1024;
 
 /// How long dev mode's node and admin certificates last: a year, since nobody renews
 /// certificates on a laptop.
@@ -277,6 +324,31 @@ pub enum DevError {
         /// The configuration file.
         path: PathBuf,
     },
+    /// The node `dev -d` started exited before it was ready.
+    #[error("the dev node exited before it was ready; the last lines of {log}:\n{tail}")]
+    Exited {
+        /// The log it wrote.
+        log: PathBuf,
+        /// The log's last lines.
+        tail: String,
+    },
+    /// The node `dev -d` started wasn't ready in time; it may still be starting.
+    #[error(
+        "the dev node wasn't ready within {timeout:?}; it may still be starting: see {log}, or \
+         stop it with `fleetring dev stop`"
+    )]
+    NotReady {
+        /// The log it writes.
+        log: PathBuf,
+        /// How long `dev -d` waited.
+        timeout: Duration,
+    },
+    /// Running the dev node in the background needs Unix.
+    #[error(
+        "running the dev node in the background isn't available on Windows yet; run `fleetring \
+         dev` in its own terminal, and press Ctrl-C there to stop it"
+    )]
+    Unsupported,
 }
 
 /// What [`prepare`] created rather than found.
@@ -463,7 +535,8 @@ pub fn default_dir() -> Result<PathBuf, DevError> {
 ///
 /// It refuses a directory that isn't dev mode's before it writes anything: one whose
 /// `fleetringd.toml` lacks `dev = true`, one without that file that holds anything but `tls/`,
-/// `data/`, `changes/`, and `env` (what a partial dev state leaves), one whose `tls/` holds a
+/// `data/`, `changes/`, `env`, `agents/`, and a detached node's log and start lock (what a
+/// partial dev state leaves), one whose `tls/` holds a
 /// file dev mode never writes, and one whose authority is another fleet's.
 ///
 /// On Unix, directories are created `0700` and private keys `0600`.
@@ -575,7 +648,16 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
 
 /// The entries a dev directory may hold before it has a configuration: what an interrupted or
 /// partly removed dev mode state leaves.
-const PARTIAL_ENTRIES: [&str; 4] = [TLS_DIR, DATA_DIR, CHANGES_DIR, ENV_FILE];
+const PARTIAL_ENTRIES: [&str; 8] = [
+    TLS_DIR,
+    DATA_DIR,
+    CHANGES_DIR,
+    ENV_FILE,
+    LOG_FILE,
+    LOG_FILE_OLD,
+    START_LOCK,
+    AGENTS_DIR,
+];
 
 /// The files dev mode writes into its TLS directory, and the only ones it may hold.
 const TLS_FILES: [&str; 6] = [
@@ -914,6 +996,336 @@ fn toml_string(text: &str) -> String {
     quoted
 }
 
+/// Whether this process is a node `dev -d` started: [`DETACHED_VAR`] is set and not empty.
+#[must_use]
+pub fn started_detached() -> bool {
+    std::env::var_os(DETACHED_VAR).is_some_and(|value| !value.is_empty())
+}
+
+/// What [`detach`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detached {
+    /// It started a node, which is now ready.
+    Started {
+        /// The node's process ID.
+        pid: u32,
+    },
+    /// A node already ran from the directory, so it started none.
+    AlreadyRunning {
+        /// The running node's process ID.
+        pid: u32,
+    },
+}
+
+impl Detached {
+    /// The node's process ID, started or found.
+    #[must_use]
+    pub fn pid(self) -> u32 {
+        match self {
+            Self::Started { pid } | Self::AlreadyRunning { pid } => pid,
+        }
+    }
+}
+
+/// Starts a dev node in the background from `prepared`, unless one already runs from its
+/// directory, and waits until it is ready (ADR-0043, point 5.2).
+///
+/// The node is `exe` run as `dev --data-dir <dir>`, with `--port <port>` if given and `argv[0]`
+/// set to `arg0`, with stdin from `/dev/null`, stdout and stderr appended to [`LOG_FILE`] in the
+/// dev directory, [`DETACHED_VAR`] set, and no supervisor's variables. It is ready once its
+/// process file names it and its admin listener's `/readyz` answers 200, or, without an admin
+/// listener, once its `listen` address accepts a connection. A start that would find the log over
+/// 16 MiB first renames it to [`LOG_FILE_OLD`].
+///
+/// # Errors
+///
+/// [`DevError::Exited`] if the node exits first, [`DevError::NotReady`] if it isn't ready within
+/// `timeout` (it is left running), [`DevError::File`] if the start lock, the log, or the process
+/// file can't be used or the binary can't be started, and [`DevError::Unsupported`] at once on
+/// Windows.
+pub async fn detach(
+    prepared: &Prepared,
+    exe: &Path,
+    arg0: &OsStr,
+    port: Option<u16>,
+    timeout: Duration,
+) -> Result<Detached, DevError> {
+    // Windows has no SIGTERM to drain a detached node with, nor `setsid` (ADR-0043, point 5.6).
+    if cfg!(not(unix)) {
+        return Err(DevError::Unsupported);
+    }
+    let dir = prepared.dir();
+    let data_dir = &prepared.config().data_dir;
+    // Held until the node is ready or has failed, so that a second `dev -d` waits for this one
+    // and then finds its node running. Closing the file releases it.
+    let lock_path = dir.join(START_LOCK);
+    let start_lock = open_private(
+        &lock_path,
+        OpenOptions::new().write(true).create(true).truncate(false),
+    )?;
+    start_lock.lock().map_err(|source| DevError::File {
+        action: "lock",
+        path: lock_path,
+        source,
+    })?;
+    if let Running::Yes(file) = running_in(data_dir)? {
+        return Ok(Detached::AlreadyRunning { pid: file.pid });
+    }
+    let log_path = dir.join(LOG_FILE);
+    rotate(&log_path, &dir.join(LOG_FILE_OLD))?;
+    let log = open_private(&log_path, OpenOptions::new().append(true).create(true))?;
+    let mut child = spawn(exe, arg0, dir, port, log)?;
+    let pid = child.id();
+    let probe = Probe::of(prepared.config());
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let exited = child.try_wait().map_err(|source| DevError::File {
+            action: "wait for",
+            path: exe.to_owned(),
+            source,
+        })?;
+        if exited.is_some() {
+            return Err(DevError::Exited {
+                tail: tail(&log_path),
+                log: log_path,
+            });
+        }
+        if probe.ready(data_dir, pid).await {
+            // Dropping the handle neither kills nor waits for the node.
+            drop(child);
+            return Ok(Detached::Started { pid });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DevError::NotReady {
+                log: log_path,
+                timeout,
+            });
+        }
+        tokio::time::sleep(READY_POLL).await;
+    }
+}
+
+/// Starts the detached node, writing its output to `log`.
+fn spawn(
+    exe: &Path,
+    arg0: &OsStr,
+    dir: &Path,
+    port: Option<u16>,
+    log: File,
+) -> Result<std::process::Child, DevError> {
+    let failed = |action, source| DevError::File {
+        action,
+        path: exe.to_owned(),
+        source,
+    };
+    let stderr = log
+        .try_clone()
+        .map_err(|source| failed("open the log for", source))?;
+    let mut command = std::process::Command::new(exe);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::arg0(&mut command, arg0);
+    #[cfg(not(unix))]
+    let _ = arg0;
+    command.arg("dev").arg("--data-dir").arg(dir);
+    if let Some(port) = port {
+        command.arg("--port").arg(port.to_string());
+    }
+    command.env(DETACHED_VAR, "1");
+    for name in SUPERVISOR_VARS {
+        command.env_remove(name);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(stderr)
+        .spawn()
+        .map_err(|source| failed("start", source))
+}
+
+/// Opens `path` with `options`, `0600` on Unix if it is created.
+fn open_private(path: &Path, options: &mut OpenOptions) -> Result<File, DevError> {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+    options.open(path).map_err(|source| DevError::File {
+        action: "open",
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Renames `log` to `old` if it is over [`LOG_ROTATE_BYTES`].
+fn rotate(log: &Path, old: &Path) -> Result<(), DevError> {
+    match fs::metadata(log) {
+        Ok(metadata) if metadata.len() > LOG_ROTATE_BYTES => {
+            fs::rename(log, old).map_err(|source| DevError::File {
+                action: "rotate",
+                path: log.to_owned(),
+                source,
+            })
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DevError::File {
+            action: "check",
+            path: log.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// The last [`TAIL_LINES`] lines of the log at `path`, indented, or why they can't be read.
+fn tail(path: &Path) -> String {
+    let read = || -> io::Result<String> {
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(io::SeekFrom::Start(length.saturating_sub(TAIL_BYTES)))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    match read() {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let last = lines.get(lines.len().saturating_sub(TAIL_LINES)..);
+            last.unwrap_or_default()
+                .iter()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Err(error) => format!("  (can't read it: {error})"),
+    }
+}
+
+/// How `dev -d` tells that the node it started serves.
+enum Probe {
+    /// `GET /readyz` on the admin listener answers 200.
+    Readyz {
+        /// Boxed: the client is large, and there is one probe per `dev -d`.
+        client: Box<crate::https::HttpClient>,
+        uri: hyper::Uri,
+    },
+    /// The node's `listen` address accepts a connection.
+    Connect(SocketAddr),
+}
+
+impl Probe {
+    /// The probe for a node running `config`: its admin listener's `/readyz`, over HTTPS if the
+    /// listener serves it; a connection to `listen` if it has no admin listener.
+    fn of(config: &Config) -> Self {
+        let connect = Self::Connect(config.listen);
+        if config.admin.enabled != AdminListener::Enabled || config.admin.listen.port() == 0 {
+            return connect;
+        }
+        let (scheme, ca, policy) = match config.admin.tls {
+            AdminTls::Off => ("http", None, crate::https::HttpPolicy::AllowHttp),
+            AdminTls::NodeIdentity => (
+                "https",
+                config.tls.as_ref().map(|tls| tls.ca.as_path()),
+                crate::https::HttpPolicy::HttpsOnly,
+            ),
+        };
+        let uri = format!("{scheme}://{}/readyz", config.admin.listen).parse();
+        match (crate::https::client(ca, None, policy), uri) {
+            (Ok(client), Ok(uri)) => Self::Readyz {
+                client: Box::new(client),
+                uri,
+            },
+            _ => connect,
+        }
+    }
+
+    /// Whether the node `pid`, running from `data_dir`, is ready: its process file names it and
+    /// the probe succeeds.
+    async fn ready(&self, data_dir: &Path, pid: u32) -> bool {
+        if !matches!(ProcessFile::read(data_dir), Ok(Some(file)) if file.pid == pid) {
+            return false;
+        }
+        match self {
+            Self::Readyz { client, uri } => {
+                let Ok(request) = hyper::Request::get(uri.clone())
+                    .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+                else {
+                    return false;
+                };
+                matches!(
+                    tokio::time::timeout(PROBE_TIMEOUT, client.request(request)).await,
+                    Ok(Ok(response)) if response.status() == hyper::StatusCode::OK
+                )
+            }
+            Self::Connect(address) => matches!(
+                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(address)).await,
+                Ok(Ok(_))
+            ),
+        }
+    }
+}
+
+/// [`running`] for `data_dir`, with its error as a [`DevError`].
+fn running_in(data_dir: &Path) -> Result<Running, DevError> {
+    running(data_dir).map_err(|source| DevError::File {
+        action: "read",
+        path: data_dir.join(PROCESS_FILE),
+        source,
+    })
+}
+
+/// A dev node's state, for `fleetring dev status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DevStatus {
+    /// Whether a node runs from the directory.
+    pub running: bool,
+    /// The running node's process ID.
+    pub pid: Option<u32>,
+    /// The address the running node serves on.
+    pub address: Option<SocketAddr>,
+    /// The running node's release.
+    pub release: Option<String>,
+    /// The dev directory.
+    pub data_dir: PathBuf,
+    /// The log a detached node writes, if there is one.
+    pub log: Option<PathBuf>,
+}
+
+/// The state of the dev node of the dev directory `dir`: whether it runs, and what it says about
+/// itself if it does. A directory with no configuration has no node running.
+///
+/// # Errors
+///
+/// [`DevError`] if the directory's configuration can't be read or isn't dev mode's, or its
+/// process file can't be read.
+pub fn status(dir: &Path) -> Result<DevStatus, DevError> {
+    let path = dir.join(CONFIG_FILE);
+    let config = if exists(&path)? {
+        Some(load_dev_config(&path, None)?)
+    } else {
+        None
+    };
+    let data_dir = config
+        .as_ref()
+        .map_or_else(|| dir.join(DATA_DIR), |config| config.data_dir.clone());
+    let log = dir.join(LOG_FILE);
+    let log = exists(&log)?.then_some(log);
+    Ok(match running_in(&data_dir)? {
+        Running::Yes(file) => DevStatus {
+            running: true,
+            pid: Some(file.pid),
+            address: config.map(|config| config.listen),
+            release: Some(file.version),
+            data_dir: dir.to_owned(),
+            log,
+        },
+        Running::No | Running::Stale { .. } => DevStatus {
+            running: false,
+            pid: None,
+            address: None,
+            release: None,
+            data_dir: dir.to_owned(),
+            log,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1545,103 @@ mod tests {
         fs::write(dir.join(ENV_FILE), "").expect("a file");
         let completed = prepare(&dir, Some(17_400), NOW).expect("a partial dev state");
         assert_eq!(completed.created().len(), 4);
+    }
+
+    #[test]
+    fn a_partial_state_may_hold_the_log_the_start_lock_and_agents() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("dev");
+        fs::create_dir_all(dir.join(AGENTS_DIR)).expect("a directory");
+        for file in [LOG_FILE, LOG_FILE_OLD, START_LOCK] {
+            fs::write(dir.join(file), "").expect("a file");
+        }
+        let completed = prepare(&dir, Some(17_400), NOW).expect("a partial dev state");
+        assert_eq!(completed.created().len(), 4);
+        // Anything else is still refused.
+        let other = root.path().join("other");
+        fs::create_dir_all(&other).expect("a directory");
+        fs::write(other.join("fleetring.log.2"), "").expect("a file");
+        let error = prepare(&other, Some(17_400), NOW).expect_err("a stranger's file");
+        assert!(matches!(error, DevError::NotDevDir { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_log_rotates_only_past_its_limit() {
+        let root = tempfile::tempdir().expect("a directory");
+        let log = root.path().join(LOG_FILE);
+        let old = root.path().join(LOG_FILE_OLD);
+        rotate(&log, &old).expect("nothing to rotate");
+        assert!(!old.exists());
+        // Each handle is closed before the rename: Windows renames no open file.
+        let sized = |length| {
+            File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&log)
+                .and_then(|file| file.set_len(length))
+                .expect("sized");
+        };
+        sized(LOG_ROTATE_BYTES);
+        rotate(&log, &old).expect("at the limit");
+        assert!(log.exists() && !old.exists());
+        sized(LOG_ROTATE_BYTES + 1);
+        rotate(&log, &old).expect("past the limit");
+        assert!(!log.exists());
+        assert_eq!(
+            fs::metadata(&old).expect("rotated").len(),
+            LOG_ROTATE_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn a_failed_start_shows_the_logs_last_lines() {
+        let root = tempfile::tempdir().expect("a directory");
+        let log = root.path().join(LOG_FILE);
+        let text: String = (1..=30).map(|line| format!("line {line}\n")).collect();
+        fs::write(&log, text).expect("a log");
+        let last = tail(&log);
+        assert!(last.starts_with("  line 11\n"), "{last}");
+        assert!(last.ends_with("  line 30"), "{last}");
+        assert_eq!(last.lines().count(), TAIL_LINES);
+        assert!(tail(&root.path().join("none")).contains("can't read it"));
+    }
+
+    #[test]
+    fn a_directory_without_a_node_is_not_running() {
+        let root = tempfile::tempdir().expect("a directory");
+        let missing = status(&root.path().join("none")).expect("a status");
+        assert!(!missing.running && missing.pid.is_none() && missing.log.is_none());
+        let dir = root.path().join("dev");
+        prepared(&dir);
+        fs::write(dir.join(LOG_FILE), "").expect("a log");
+        let stopped = status(&dir).expect("a status");
+        assert!(!stopped.running, "{stopped:?}");
+        assert_eq!(stopped.log, Some(dir.join(LOG_FILE)));
+        assert_eq!(stopped.data_dir, dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_to_detach() {
+        let root = tempfile::tempdir().expect("a directory");
+        let prepared = prepared(&root.path().join("dev"));
+        let error = detach(
+            &prepared,
+            Path::new("fleetring.exe"),
+            OsStr::new("fleetring"),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("not on Windows");
+        assert!(matches!(error, DevError::Unsupported), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("run `fleetring dev` in its own terminal"),
+            "{error}"
+        );
     }
 
     fn generated() -> String {

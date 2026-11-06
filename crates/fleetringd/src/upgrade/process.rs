@@ -1,6 +1,8 @@
 //! A running daemon as `upgrade` finds it: the process file it writes, and the signal that
 //! restarts it in place (ADR-0038, point 8).
 
+use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,6 +41,145 @@ pub struct ProcessFile {
     /// before 0.7 wrote.
     #[serde(default)]
     pub args: Vec<String>,
+    /// The supervisor that started it, if one did: `stop` refuses such a node, since the
+    /// supervisor would start it again. Absent in a file a release before 0.7 wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<Supervisor>,
+    /// Set when `fleetring dev -d` started it: `stop` and `dev stop` always stop such a node,
+    /// whatever [`supervisor`](Self::supervisor) says (ADR-0043, point 5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<StartedBy>,
+}
+
+/// A service manager that runs a node and restarts it, so that only it should stop the node
+/// (ADR-0043, point 5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Supervisor {
+    /// systemd, the system manager or a user's.
+    Systemd,
+    /// launchd, through a Homebrew service.
+    Launchd,
+}
+
+impl Supervisor {
+    /// The supervisor that started this process, judged from its environment `env` and its
+    /// parent `parent`.
+    ///
+    /// `Systemd` if `INVOCATION_ID` is set and not empty *and* the parent is PID 1 or its `comm`
+    /// is `systemd` (the user manager); `Launchd` if `XPC_SERVICE_NAME` starts with
+    /// `homebrew.mxcl.` *and* the parent is PID 1. Variables alone are never enough: shells
+    /// under gnome-terminal or VS Code inherit `INVOCATION_ID`.
+    #[must_use]
+    pub fn detect(env: &dyn Fn(&str) -> Option<OsString>, parent: &ParentProcess) -> Option<Self> {
+        let parent_is_init = parent.pid == Some(1);
+        let invocation = env("INVOCATION_ID").is_some_and(|value| !value.is_empty());
+        if invocation && (parent_is_init || parent.comm.as_deref() == Some("systemd")) {
+            return Some(Self::Systemd);
+        }
+        let homebrew = env("XPC_SERVICE_NAME")
+            .is_some_and(|name| name.to_string_lossy().starts_with("homebrew.mxcl."));
+        (homebrew && parent_is_init).then_some(Self::Launchd)
+    }
+
+    /// The command that stops a node this supervisor runs, for a refusal's hint.
+    #[must_use]
+    pub fn stop_hint(self) -> &'static str {
+        match self {
+            Self::Systemd => "systemctl stop <unit>",
+            Self::Launchd => "brew services stop fleetring",
+        }
+    }
+}
+
+impl fmt::Display for Supervisor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Systemd => "systemd",
+            Self::Launchd => "launchd",
+        })
+    }
+}
+
+/// Who started a node, when it wasn't a person or a supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartedBy {
+    /// `fleetring dev -d`, which started it in the background.
+    Detach,
+}
+
+/// A process's parent, as it was when the process started: enough to tell a supervisor from a
+/// shell that inherited its variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentProcess {
+    /// The parent's process ID, if there is one to see.
+    pub pid: Option<u32>,
+    /// The parent's command name, from `/proc/<pid>/comm`; Linux only.
+    pub comm: Option<String>,
+}
+
+impl ParentProcess {
+    /// This process's parent.
+    #[must_use]
+    pub fn current() -> Self {
+        #[cfg(unix)]
+        let pid = rustix::process::getppid()
+            .and_then(|pid| u32::try_from(pid.as_raw_nonzero().get()).ok());
+        #[cfg(not(unix))]
+        let pid = None;
+        #[cfg(target_os = "linux")]
+        let comm = pid.and_then(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .ok()
+                .map(|comm| comm.trim_end().to_owned())
+        });
+        #[cfg(not(target_os = "linux"))]
+        let comm = None;
+        Self { pid, comm }
+    }
+}
+
+/// Whether a daemon runs from a data directory, as its process file and lock say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Running {
+    /// There is no process file.
+    No,
+    /// A process file names a process that no longer holds the directory's lock.
+    Stale {
+        /// The process ID the file names.
+        pid: u32,
+    },
+    /// A process file names a process, and the directory's lock is held.
+    Yes(ProcessFile),
+}
+
+/// Whether a daemon runs from `data_dir`: it does if its process file exists and the directory's
+/// lock is held. The lock is tried shared and released at once, so this never keeps a daemon
+/// from starting for longer than the try.
+///
+/// # Errors
+///
+/// If the process file can't be read or parsed, or the lock file can't be opened or tried.
+pub fn running(data_dir: &Path) -> io::Result<Running> {
+    let Some(file) = ProcessFile::read(data_dir)? else {
+        return Ok(Running::No);
+    };
+    let lock = match File::open(data_dir.join(LOCK_FILE)) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Running::Stale { pid: file.pid });
+        }
+        Err(error) => return Err(error),
+    };
+    match lock.try_lock_shared() {
+        Ok(()) => {
+            let _unlocked = lock.unlock();
+            Ok(Running::Stale { pid: file.pid })
+        }
+        Err(TryLockError::WouldBlock) => Ok(Running::Yes(file)),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
 }
 
 /// The environment variable a restart in place passes to the binary it executes: how many times
@@ -65,6 +206,11 @@ impl ProcessFile {
                 .skip(1)
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect(),
+            supervisor: Supervisor::detect(
+                &|name| std::env::var_os(name),
+                &ParentProcess::current(),
+            ),
+            started_by: crate::dev::started_detached().then_some(StartedBy::Detach),
         }
     }
 
@@ -262,6 +408,8 @@ mod tests {
             version: "0.7.0".into(),
             restarts: 0,
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            supervisor: None,
+            started_by: None,
         };
         for args in [
             &["serve", "--config", "x"][..],
@@ -279,6 +427,124 @@ mod tests {
         ] {
             assert!(!file(args).started_with_serve(), "{args:?}");
         }
+    }
+
+    /// An environment holding `vars`, for [`Supervisor::detect`].
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(set, _)| set == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    fn parent(pid: u32, comm: &str) -> ParentProcess {
+        ParentProcess {
+            pid: Some(pid),
+            comm: Some(comm.to_owned()),
+        }
+    }
+
+    #[test]
+    fn an_inherited_invocation_id_with_a_shell_parent_is_not_systemd() {
+        let env = env_of(&[("INVOCATION_ID", "0123abcd"), ("JOURNAL_STREAM", "8:42")]);
+        assert_eq!(Supervisor::detect(&env, &parent(4242, "bash")), None);
+        assert_eq!(
+            Supervisor::detect(
+                &env,
+                &ParentProcess {
+                    pid: None,
+                    comm: None
+                }
+            ),
+            None
+        );
+        // Empty is unset.
+        let empty = env_of(&[("INVOCATION_ID", "")]);
+        assert_eq!(Supervisor::detect(&empty, &parent(1, "systemd")), None);
+    }
+
+    #[test]
+    fn invocation_id_with_systemd_as_parent_is_systemd() {
+        let env = env_of(&[("INVOCATION_ID", "0123abcd")]);
+        assert_eq!(
+            Supervisor::detect(&env, &parent(1, "systemd")),
+            Some(Supervisor::Systemd)
+        );
+        // A user manager is a `systemd` process that isn't PID 1.
+        assert_eq!(
+            Supervisor::detect(&env, &parent(1717, "systemd")),
+            Some(Supervisor::Systemd)
+        );
+        // Without the variable, PID 1 as the parent says nothing.
+        assert_eq!(
+            Supervisor::detect(&env_of(&[]), &parent(1, "systemd")),
+            None
+        );
+        assert_eq!(Supervisor::Systemd.stop_hint(), "systemctl stop <unit>");
+    }
+
+    #[test]
+    fn xpc_service_name_needs_launchd_as_parent() {
+        let env = env_of(&[("XPC_SERVICE_NAME", "homebrew.mxcl.fleetring")]);
+        assert_eq!(
+            Supervisor::detect(&env, &parent(1, "launchd")),
+            Some(Supervisor::Launchd)
+        );
+        assert_eq!(Supervisor::detect(&env, &parent(4242, "zsh")), None);
+        // Terminal.app and other apps set their own service name.
+        let terminal = env_of(&[("XPC_SERVICE_NAME", "application.com.apple.Terminal.1")]);
+        assert_eq!(Supervisor::detect(&terminal, &parent(1, "launchd")), None);
+        assert_eq!(
+            Supervisor::Launchd.stop_hint(),
+            "brew services stop fleetring"
+        );
+    }
+
+    #[test]
+    fn the_supervisor_and_starter_are_written_in_lowercase_and_only_when_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plain = ProcessFile {
+            supervisor: None,
+            started_by: None,
+            ..ProcessFile::this_process(PathBuf::from("fleetring"))
+        };
+        let text = serde_json::to_string(&plain)?;
+        assert!(
+            !text.contains("supervisor") && !text.contains("started_by"),
+            "{text}"
+        );
+        let marked = ProcessFile {
+            supervisor: Some(Supervisor::Systemd),
+            started_by: Some(StartedBy::Detach),
+            ..plain
+        };
+        let text = serde_json::to_string(&marked)?;
+        assert!(text.contains(r#""supervisor":"systemd""#), "{text}");
+        assert!(text.contains(r#""started_by":"detach""#), "{text}");
+        assert_eq!(serde_json::from_str::<ProcessFile>(&text)?, marked);
+        Ok(())
+    }
+
+    #[test]
+    fn running_tells_a_live_daemon_from_a_stale_file() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(running(dir.path())?, Running::No);
+        let file = ProcessFile::this_process(PathBuf::from("fleetring"));
+        file.write(dir.path())?;
+        // No lock file at all: nobody holds it.
+        assert_eq!(running(dir.path())?, Running::Stale { pid: file.pid });
+        let locked = crate::DataDir::lock(dir.path())?;
+        assert_eq!(running(dir.path())?, Running::Yes(file.clone()));
+        drop(locked);
+        assert_eq!(running(dir.path())?, Running::Stale { pid: file.pid });
+        // Trying the lock doesn't keep it.
+        let _relocked = crate::DataDir::lock(dir.path())?;
+        Ok(())
     }
 
     #[test]
