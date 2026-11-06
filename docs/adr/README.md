@@ -52,6 +52,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0041](0041-agent-kit-metadata-expiry-and-mcp.md) | Databases carry a description, labels, a creator, and an expiry in control state, gated as fleet features and expired by stamped commands; `db show` adds the schema through the engine adapter; `fleetringd mcp` acts on them as one principal | Accepted |
 | [0042](0042-no-deletion-by-absence.md) | A data node deletes a copy only after it saw the database's drop, told by the control node that applied it, and keeps every other copy the control plane doesn't know as an orphan for an operator to remove | Accepted |
 | [0043](0043-the-fleetring-cli.md) | One binary named `fleetring`, with `fleetringd` as its compatibility name until 1.0; contexts and `switch`; a detached dev node and `stop`; agents that mint their own dev identity; spinners and help that fits a screen (amends 0025, 0032, 0033, 0038, 0039) | Accepted |
+| [0044](0044-identity-delegation-and-forking-for-agents.md) | Principals have kinds and agents record an owner and a parent; `fork` and `grant` join the actions; holders delegate narrower biscuit tokens bound to the child's key without the authority, revoked by block or by principal; a fork is a new database that records its source, position, and signed head; OIDC logins and access roles compile into tokens at an issuer; constrained trust anchors for issuers and other fleets, and publisher keys for provenance only (amends 0025, 0026, 0037) | Proposed |
 
 ## Template
 
