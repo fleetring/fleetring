@@ -1,6 +1,6 @@
 # ADR-0044: Principals have kinds, agents record an owner and a parent, holders delegate narrower biscuit tokens without the authority's key, and a fork is a new database that records where it came from
 
-- **Status:** Proposed. The umbrella model is one decision; four specifications are proposed here and accepted separately (see "How this ADR is accepted" below).
+- **Status:** Umbrella **accepted** (2026-11-06, the owner took U1–U5). The four specifications (S1 tokens, S2 forking, S3 federation, S4 packages) remain **Proposed**, each accepted separately (see "How this ADR is accepted" below).
 - **Date:** 2026-11-05
 - **Related:** ADR-0017 (control state), ADR-0020 (simulation), ADR-0021 (engines), ADR-0025 and ADR-0026 (principals, scopes, tokens; this ADR amends 0025 points 1 and 3 and 0026 points 3 and 5 once accepted), ADR-0029 (archives), ADR-0031 (node calls bound to placement), ADR-0037 (router; point 2 amended by point 6.4 below), ADR-0038 (fleet features), ADR-0039 (dev mode), ADR-0041 (agent kit), ADR-0042 (no deletion by absence), ADR-0043 (the `fleetring` CLI, accepted: agent identities in `identity.toml` with `owner` and `parent`, and `fork` and `grant` reserved; point 10 adds five 0.7 requirements to its plan); tickets FR-079 (#114), FR-074 (#99), FR-077 (#105), FR-066 (#69), FR-070 (#76), FR-049 (#52)
 
@@ -390,6 +390,8 @@ This is the product contract for agents, and part of the umbrella.
 - The lexicon gains, marked *planned*: access role, delegation (with delegated token and attenuation), fork, group, holder key, identity registry, issuer, organization, overlay, owner (of an agent only), package (with package version, package manifest, and latest statement), parent, principal kind, publisher, revocation ID, signed head, trust anchor, agent launcher (with credential proxy), and trusted local development; the entries for action, principal, token, and denylist note what is planned; and "Words we don't use" gains capability, branch and copy (for a fork), checkpoint (for a signed head), release (for a package's version), and role alone (now also access role).
 
 ## Open questions for the owner
+
+Decided on 2026-11-06: the owner accepted the umbrella with U1–U5 as recommended. The specifications' questions stay open until each specification is accepted.
 
 Grouped by part (see "How this ADR is accepted"). Each has a recommendation, and the body is written as if it is taken. Only the umbrella's questions block it; each specification's are answered when that specification is accepted.
 
