@@ -45,7 +45,9 @@ fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
     let bin = scratch.join("baseline").join("fleetringd");
     fs::create_dir_all(bin.parent().ok_or("no parent")?)?;
     fs::copy(env!("CARGO_BIN_EXE_fleetring"), &bin)?;
-    let installed = Command::new(&bin)
+    let mut install = Command::new(&bin);
+    crate::support::isolate(&mut install);
+    let installed = install
         .args(["upgrade", "--version", &version, "--no-restart", "--yes"])
         .output()?;
     assert!(installed.status.success(), "{}", printed(&installed));
@@ -55,11 +57,9 @@ fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
 
 /// Whether the binary at `bin` has the `upgrade` command.
 fn has_upgrade(bin: &Path) -> TestResult<bool> {
-    Ok(Command::new(bin)
-        .args(["upgrade", "--help"])
-        .output()?
-        .status
-        .success())
+    let mut help = Command::new(bin);
+    crate::support::isolate(&mut help);
+    Ok(help.args(["upgrade", "--help"]).output()?.status.success())
 }
 
 /// Replaces the binary at `bin` with this build, atomically, as `install.sh` does.

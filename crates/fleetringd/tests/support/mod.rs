@@ -33,6 +33,55 @@ pub(crate) const OPERATOR: &str =
 /// daemons running at once never contend for the default 7401.
 pub(crate) const ADMIN: &str = "\n[admin]\nlisten = \"127.0.0.1:0\"\n";
 
+/// Every variable the command line reads to find a fleet, an identity or a context. A test that
+/// runs the binary starts from none of them (ADR-0043, point 4.4).
+pub(crate) const CLIENT_VARS: [&str; 10] = [
+    "FLEETRING_CONTEXT",
+    "FLEETRING_CONTROL",
+    "FLEETRING_TLS_DIR",
+    "FLEETRING_AS",
+    "FLEETRING_CA",
+    "FLEETRING_CERT",
+    "FLEETRING_KEY",
+    "FLEETRING_TOKEN",
+    "FLEETRING_TOKEN_FILE",
+    "FLEETRING_LOG_FORMAT",
+];
+
+/// A home that nothing creates: the binary run by [`fleetring`] has its home, its configuration
+/// directory and its contexts here, never the developer's own.
+pub(crate) fn scratch_home() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-home")
+}
+
+/// Points `command` at [`scratch_home`] and clears every variable in [`CLIENT_VARS`], so that it
+/// never reads the developer's contexts or sends a credential from their shell. Call it before
+/// setting the variables a test wants.
+pub(crate) fn isolate(command: &mut std::process::Command) -> &mut std::process::Command {
+    let home = scratch_home();
+    command
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
+        .env("APPDATA", home.join("appdata"));
+    for variable in CLIENT_VARS {
+        command.env_remove(variable);
+    }
+    command
+}
+
+/// The binary, isolated by [`isolate`]. Every integration test runs it through this (or through
+/// [`isolate`]); `tests/contexts.rs` fails if one doesn't.
+pub(crate) fn fleetring() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"));
+    isolate(&mut command);
+    command
+}
+
+/// [`fleetring`] for a test that waits on the process with tokio.
+pub(crate) fn fleetring_tokio() -> tokio::process::Command {
+    tokio::process::Command::from(fleetring())
+}
+
 /// A certificate authority written under a test's directory.
 #[derive(Debug)]
 pub(crate) struct Tls {

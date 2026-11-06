@@ -92,7 +92,9 @@ impl Bench {
 
     /// Runs this install's binary, or `bin`, with `args` and `path`.
     fn run_as(&self, bin: &Path, args: &[&str], path: &str) -> TestResult<Output> {
-        Ok(std::process::Command::new(bin)
+        let mut command = std::process::Command::new(bin);
+        crate::support::isolate(&mut command);
+        Ok(command
             .args(args)
             .env("PATH", path)
             .env_remove("FLEETRING_BASE_URL")
