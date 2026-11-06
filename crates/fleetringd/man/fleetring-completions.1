@@ -1,0 +1,72 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-completions 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-completions \- Prints a completion script for bash, zsh, fish, or powershell
+.SH SYNOPSIS
+\fBfleetring completions\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fISHELL\fR> 
+.SH DESCRIPTION
+Prints a completion script for bash, zsh, fish, or powershell
+.PP
+The script completes commands, flags and values, with context names and agent IDs read from this machine\*(Aqs files.
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fISHELL\fR>
+The shell to print the script for
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+bash: GNU Bash
+.IP \(bu 2
+zsh: Z shell
+.IP \(bu 2
+fish: The friendly interactive shell
+.IP \(bu 2
+powershell: PowerShell, on any platform
+.RE
+.SH EXTRA
+Add the line for your shell to its startup file:
+
+  bash, in ~/.bashrc:
+    source <(fleetring completions bash)
+  zsh, in ~/.zshrc, after compinit:
+    source <(fleetring completions zsh)
+  fish, in ~/.config/fish/config.fish:
+    fleetring completions fish | source
+  PowerShell, in $PROFILE:
+    fleetring completions powershell | Out\-String | Invoke\-Expression
+
+The script runs this binary on each Tab, so it follows upgrades.

@@ -1,0 +1,48 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-dev-logs 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-dev\-logs \- Prints the log `dev \-d` writes
+.SH SYNOPSIS
+\fBfleetring dev logs\fR [\fB\-\-data\-dir\fR] [\fB\-f\fR|\fB\-\-follow\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Prints the log `dev \-d` writes
+.PP
+It rotates only when the node starts, so during one long run it grows without bound; `fleetring dev stop && fleetring dev \-d` rotates it.
+.SH OPTIONS
+.TP
+\fB\-\-data\-dir\fR \fI<DATA_DIR>\fR
+The dev directory; `~/.fleetring` by default
+.TP
+\fB\-f\fR, \fB\-\-follow\fR
+Keeps printing new lines as the node writes them, until Ctrl\-C
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

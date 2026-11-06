@@ -1,0 +1,62 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-cert-client 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-cert\-client \- Issues a client certificate, naming the principal the client acts as
+.SH SYNOPSIS
+\fBfleetring cert client\fR [\fB\-\-out\fR] [\fB\-\-ttl\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-dir\fR> <\fIPRINCIPAL\fR> 
+.SH DESCRIPTION
+Issues a client certificate, naming the principal the client acts as
+.PP
+The files are `client.<principal>.crt` and `client.<principal>.key`, in the directory or in `\-\-out`.
+.SH OPTIONS
+.TP
+\fB\-\-dir\fR \fI<DIR>\fR
+The directory with `ca.crt` and `ca.key`
+
+The new files go into it unless `\-\-out` names another.
+.TP
+\fB\-\-out\fR \fI<DIR>\fR
+Writes the files into this directory instead: a complete TLS directory
+
+The certificate, its key, and a copy of `ca.crt` go into it, created private to you, instead of the authority\*(Aqs directory.
+.TP
+\fB\-\-ttl\fR \fI<TTL>\fR
+How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+
+7 days by default.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIPRINCIPAL\fR>
+The principal\*(Aqs name
+
+A name that starts with `agent\-` may not contain `.`, which is reserved for delegated agents.

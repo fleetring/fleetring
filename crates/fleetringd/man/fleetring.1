@@ -1,0 +1,107 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring \- Places, replicates, and fails over SQLite databases across machines you own
+.SH SYNOPSIS
+\fBfleetring\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Places, replicates, and fails over SQLite databases across machines you own.
+.PP
+`serve` runs a node. The other commands talk to a running fleet.
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+fleetring\-serve(1)
+Runs a node
+.TP
+fleetring\-dev(1)
+Runs a node for development; `\-d` runs it in the background
+.TP
+fleetring\-stop(1)
+Stops a node started in a terminal or a script, after it drains
+.TP
+fleetring\-context(1)
+Names, lists and selects contexts, so commands need no flags
+.TP
+fleetring\-switch(1)
+Makes another context current
+.TP
+fleetring\-completions(1)
+Prints a completion script for bash, zsh, fish, or powershell
+.TP
+fleetring\-cert(1)
+Creates the authority, and issues node and client certificates
+.TP
+fleetring\-token(1)
+Issues and revokes bearer tokens
+.TP
+fleetring\-db(1)
+Creates, lists, writes, reads, locates, and drops databases
+.TP
+fleetring\-node(1)
+Lists, drains, undrains, and removes the fleet\*(Aqs members
+.TP
+fleetring\-lease(1)
+Follows the leases data nodes hold
+.TP
+fleetring\-orphan(1)
+Lists and removes orphans: copies the control plane doesn\*(Aqt know
+.TP
+fleetring\-archive(1)
+Shows and verifies archives, and restores from one with no fleet
+.TP
+fleetring\-upgrade(1)
+Installs another release in place of this binary
+.TP
+fleetring\-mcp(1)
+Serves the Model Context Protocol on stdio, as one principal
+.TP
+fleetring\-agent(1)
+Adds, lists, shows, renews, and removes agents\*(Aq identities
+.TP
+fleetring\-status(1)
+Shows the fleet\*(Aqs members and ring, or one data node\*(Aqs view
+.SH EXTRA
+Exit codes:
+  0    success
+  1    the command failed
+  2    usage: a bad flag or argument, or a confirmation without a terminal
+  3    refused: unauthenticated, or not permitted
+  4    unavailable, and a retry may succeed
+  130  interrupted
+
+`fleetringd` is the same program, kept until 1.0; `fleetringd \-\-config <file>` runs `serve`.

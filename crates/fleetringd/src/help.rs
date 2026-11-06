@@ -17,7 +17,7 @@ use crate::compat::ProgramName;
 pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     (
         "Getting started",
-        &["dev", "serve", "stop", "switch", "context"],
+        &["dev", "serve", "stop", "switch", "context", "completions"],
     ),
     ("Databases", &["db"]),
     ("Fleet", &["status", "node", "orphan", "upgrade", "lease"]),

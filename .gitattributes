@@ -4,3 +4,5 @@
 *.lock text eol=lf
 # Golden text fixtures are compared byte for byte too.
 crates/fleetringd/tests/fixtures/** text eol=lf
+# The man pages are compared byte for byte with what the command tree renders.
+crates/fleetringd/man/** text eol=lf

@@ -1,0 +1,49 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-token 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-token \- Issues and revokes bearer tokens
+.SH SYNOPSIS
+\fBfleetring token\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Issues and revokes bearer tokens
+.PP
+A token is a signed, expiring credential that names a principal and carries its scopes.
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+fleetring\-token\-issue(1)
+Issues a token signed with the authority\*(Aqs key, and prints it
+.TP
+fleetring\-token\-revoke(1)
+Revokes a token by its ID, or every token a signing key issued

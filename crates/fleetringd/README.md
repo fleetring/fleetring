@@ -454,6 +454,18 @@ Every request runs in an `rpc` span with `service`, `method`, and `request_id`, 
 
 The install script and the image install `fleetring` with `fleetringd` as a link to it, and each archive holds both (two copies on Windows). The release archives keep their names, `fleetringd-<version>-<target>`, so that a 0.6 `upgrade` finds them.
 
+**Shell completions.** `fleetring completions bash|zsh|fish|powershell` prints a script that completes commands, flags, and values, with context names and agent IDs read from this machine's files. Load it from the shell's startup file:
+
+```sh
+echo 'source <(fleetring completions bash)' >> ~/.bashrc                 # bash
+echo 'source <(fleetring completions zsh)' >> ~/.zshrc                   # zsh, after compinit
+echo 'fleetring completions fish | source' >> ~/.config/fish/config.fish # fish
+```
+
+In PowerShell, add `fleetring completions powershell | Out-String | Invoke-Expression` to `$PROFILE`. The script runs the binary on each Tab, so it follows upgrades.
+
+**Man pages.** Each archive holds one page per command under `man/`: `fleetring.1`, `fleetring-db-create.1`, and so on. Copy them to a directory `man` reads, such as `/usr/local/share/man/man1`, then `man fleetring-db-create`. They are the same text as `--help`.
+
 ## Upgrading
 
 **Which releases run together** (ADR-0038). A release's line is its `MAJOR.MINOR`. A fleet runs at most two adjacent lines at once, such as 0.3.x beside 0.4.x, and never 0.3.x beside 0.5.x, so upgrade one line at a time; patch releases of a line always mix. Every node reports its release, protocol, control-log format, and fleet features in `Join` and `Heartbeat`, and `fleetring status` prints each member's `version=`. A node that reports nothing runs 0.3.0, the first release a rolling upgrade starts from. The control plane refuses a join outside the window with `FAILED_PRECONDITION`, naming both nodes and releases; the refused node keeps retrying and logs why. Moving from 0.2 to 0.3 isn't a rolling upgrade: upgrade every node, then reissue fleet-scoped tokens, as the 0.3.0 release notes say.

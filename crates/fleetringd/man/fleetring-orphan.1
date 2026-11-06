@@ -1,0 +1,49 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-orphan 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-orphan \- Lists and removes orphans: copies the control plane doesn\*(Aqt know
+.SH SYNOPSIS
+\fBfleetring orphan\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Lists and removes orphans: copies the control plane doesn\*(Aqt know
+.PP
+An orphan is a copy a data node keeps, closed, because the control plane didn\*(Aqt know its database, or held it only at a lower epoch, and the node saw no drop (ADR\-0042).
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+fleetring\-orphan\-list(1)
+Lists the orphans each data node keeps, or one node\*(Aqs
+.TP
+fleetring\-orphan\-remove(1)
+Deletes a data node\*(Aqs orphan copy of a database, for good

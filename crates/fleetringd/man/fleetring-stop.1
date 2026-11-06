@@ -1,0 +1,55 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-stop 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-stop \- Stops a node started in a terminal or a script, after it drains
+.SH SYNOPSIS
+\fBfleetring stop\fR [\fB\-\-timeout\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-data\-dir\fR|\fB\-\-config\fR> 
+.SH DESCRIPTION
+Stops a node started in a terminal or a script, after it drains
+.PP
+Sends the node SIGTERM through its process file, which drains it, and waits until it has exited. Refuses a node a supervisor runs. `dev stop` stops the dev node.
+.SH OPTIONS
+.TP
+\fB\-\-data\-dir\fR \fI<DIR>\fR
+The node\*(Aqs data directory, or a directory holding a `fleetringd.toml`
+
+With a `fleetringd.toml`, its `data_dir` is used: a dev directory and its `data/` both work.
+.TP
+\fB\-\-config\fR \fI<FILE>\fR
+The node\*(Aqs configuration file, whose `data_dir` is used
+.TP
+\fB\-\-timeout\fR \fI<TIMEOUT>\fR
+How long to wait for the node to drain and exit: `<n>m` or `<n>s`
+
+2m by default. The node keeps draining after that.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

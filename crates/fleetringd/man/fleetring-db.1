@@ -1,0 +1,71 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-db 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-db \- Creates, lists, writes, reads, locates, and drops databases
+.SH SYNOPSIS
+\fBfleetring db\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Creates, lists, writes, reads, locates, and drops databases
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+fleetring\-db\-create(1)
+Creates a SQLite database, places it with the ring, and opens it on its primary
+.TP
+fleetring\-db\-show(1)
+Shows a database in detail: placement, description, labels, expiry, schema
+.TP
+fleetring\-db\-edit(1)
+Changes a database\*(Aqs description, labels, expiry, or durability
+.TP
+fleetring\-db\-exec(1)
+Runs one write statement on the database\*(Aqs primary
+.TP
+fleetring\-db\-query(1)
+Runs one read\-only query on the database\*(Aqs primary
+.TP
+fleetring\-db\-locate(1)
+Shows where a database lives: its primary, followers, and epoch
+.TP
+fleetring\-db\-list(1)
+Lists the databases, with their placement and durability
+.TP
+fleetring\-db\-verify(1)
+Checks that every replica of a database holds the same log
+.TP
+fleetring\-db\-restore(1)
+Creates a new database from an archived one
+.TP
+fleetring\-db\-drop(1)
+Drops a database for good

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
+use clap_complete::engine::ArgValueCandidates;
 use fleetring_client::context::{Context, ContextError, ContextName, DEV_NAME, select};
 use fleetring_control::Timestamp;
 use fleetring_proto::v1::revocation::Revoked;
@@ -38,7 +39,9 @@ use crate::confirm::{self, Place};
 use crate::format::{self, OutputArgs, OutputFormat};
 use crate::progress::{MachineOutput, Progress};
 use crate::resolve::EnvSnapshot;
-use crate::{Target, context_cmd, dev_cmd, format_time, note, parse_ttl, spinner_surroundings};
+use crate::{
+    Target, completions, context_cmd, dev_cmd, format_time, note, parse_ttl, spinner_surroundings,
+};
 
 /// What the output says about isolation (ADR-0044, point 11.4; #114).
 const TRUSTED_LOCAL: &str =
@@ -71,6 +74,7 @@ pub(crate) enum AgentCommand {
     /// renewed by.
     Show {
         /// The agent's ID.
+        #[arg(add = ArgValueCandidates::new(completions::agent_ids))]
         id: AgentId,
         #[command(flatten)]
         output: OutputArgs,
@@ -80,6 +84,7 @@ pub(crate) enum AgentCommand {
     /// Reissues an agent's certificate and token now, and revokes the old token
     Renew {
         /// The agent's ID.
+        #[arg(add = ArgValueCandidates::new(completions::agent_ids))]
         id: AgentId,
         /// The directory with the fleet's `ca.crt` and `ca.key`
         ///
@@ -95,6 +100,7 @@ pub(crate) enum AgentCommand {
     /// revoke the token.
     Remove {
         /// The agent's ID.
+        #[arg(add = ArgValueCandidates::new(completions::agent_ids))]
         id: AgentId,
         /// Removes it without a prompt
         #[arg(long)]

@@ -1,0 +1,61 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-context 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-context \- Names, lists and selects contexts, so commands need no flags
+.SH SYNOPSIS
+\fBfleetring context\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Names, lists and selects contexts, so commands need no flags
+.PP
+A context names a fleet\*(Aqs control addresses, certificates and principal (ADR\-0043).
+.SH OPTIONS
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+fleetring\-context\-list(1)
+Lists the contexts, marking the current one
+.TP
+fleetring\-context\-show(1)
+Shows one context: the current one unless a name is given
+.TP
+fleetring\-context\-current(1)
+Prints the current context\*(Aqs name and nothing else, for a shell prompt
+.TP
+fleetring\-context\-add(1)
+Adds a context: a name for a fleet\*(Aqs control addresses and identity
+.TP
+fleetring\-context\-use(1)
+Makes a context current
+.TP
+fleetring\-context\-remove(1)
+Removes a context, but never the files it names

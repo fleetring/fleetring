@@ -1,0 +1,79 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-context-add 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-context\-add \- Adds a context: a name for a fleet\*(Aqs control addresses and identity
+.SH SYNOPSIS
+\fBfleetring context add\fR [\fB\-\-fleet\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-token\-file\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-control\fR> <\fINAME\fR> 
+.SH DESCRIPTION
+Adds a context: a name for a fleet\*(Aqs control addresses and identity
+.PP
+The identity is its certificates and principal. The first context added becomes current.
+.SH OPTIONS
+.TP
+\fB\-\-control\fR \fI<CONTROL>\fR
+A control node\*(Aqs address, `host:port`
+
+Repeat it for more; they are tried in order.
+.TP
+\fB\-\-fleet\fR \fI<FLEET>\fR
+The fleet\*(Aqs name
+
+Defaults to the fleet the client certificate names.
+.TP
+\fB\-\-tls\-dir\fR \fI<TLS_DIR>\fR
+A directory with `ca.crt` and the client certificates `cert client` writes
+.TP
+\fB\-\-ca\fR \fI<CA>\fR
+The trusted authority certificate, PEM
+.TP
+\fB\-\-cert\fR \fI<CERT>\fR
+The client certificate, PEM
+.TP
+\fB\-\-key\fR \fI<KEY>\fR
+The client certificate\*(Aqs private key, PEM
+.TP
+\fB\-\-as\fR \fI<PRINCIPAL>\fR
+The principal to act as
+
+With `\-\-tls\-dir`, `client.<principal>.crt` is the certificate.
+.TP
+\fB\-\-token\-file\fR \fI<TOKEN_FILE>\fR
+A file that holds a bearer token
+
+The context stores the path, never the token.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fINAME\fR>
+The new context\*(Aqs name
+
+1 to 63 lowercase letters, digits, \*(Aq\-\*(Aq, \*(Aq_\*(Aq or \*(Aq.\*(Aq.

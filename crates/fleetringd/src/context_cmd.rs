@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
+use clap_complete::engine::ArgValueCandidates;
 use dialoguer::FuzzySelect;
 use dialoguer::theme::{ColorfulTheme, SimpleTheme, Theme};
 use fleetring_client::context::{
@@ -20,7 +21,7 @@ use fleetringd::tls::{Identity, Principal};
 use crate::exit::{INTERRUPTED, USAGE};
 use crate::format::{self, OutputArgs, OutputFormat};
 use crate::progress::{MachineOutput, Quiet, Surroundings};
-use crate::{color, note, program};
+use crate::{color, completions, note, program};
 
 /// `fleetring context`'s commands.
 #[derive(Debug, Subcommand)]
@@ -33,6 +34,7 @@ pub(crate) enum ContextCommand {
     /// Shows one context: the current one unless a name is given.
     Show {
         /// The context to show.
+        #[arg(add = ArgValueCandidates::new(completions::context_names))]
         name: Option<ContextName>,
         #[command(flatten)]
         output: OutputArgs,
@@ -50,6 +52,7 @@ pub(crate) enum ContextCommand {
     /// It remembers the one it replaces for `fleetring switch -`.
     Use {
         /// The context to use.
+        #[arg(add = ArgValueCandidates::new(completions::context_names))]
         name: ContextName,
     },
     /// Removes a context, but never the files it names
@@ -57,6 +60,7 @@ pub(crate) enum ContextCommand {
     /// It deletes only the context's entry.
     Remove {
         /// The context to remove.
+        #[arg(add = ArgValueCandidates::new(completions::context_names))]
         name: ContextName,
     },
 }
