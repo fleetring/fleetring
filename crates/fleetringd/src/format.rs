@@ -16,8 +16,10 @@ use crate::progress::MachineOutput;
 /// How a command prints its result: `-o table|json|jsonl`, or `--json`.
 #[derive(Debug, Args)]
 pub(crate) struct OutputArgs {
-    /// The output format: `table`, for people; `json`, one object with stable snake_case fields;
-    /// or `jsonl`, the same object on one line. A watch prints one object per line for either.
+    /// The output format: `table`, `json`, or `jsonl`
+    ///
+    /// `table` is for people; `json` is one object with stable snake_case fields; `jsonl` is the
+    /// same object on one line. A watch prints one object per line for either.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
     /// Short for `-o json`.

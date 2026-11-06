@@ -31,9 +31,11 @@ pub(crate) struct EditArgs {
     name: DatabaseName,
     #[command(flatten)]
     settings: Settings,
-    /// Changes the metadata (description, labels, expiry) only if it is still at this version, as
-    /// `db show` prints it; refused otherwise, so a value read first isn't overwritten by mistake.
-    /// It guards the metadata update only: durability changes regardless.
+    /// Changes the metadata only if it is still at this version
+    ///
+    /// The metadata is the description, labels, and expiry, and the version is as `db show`
+    /// prints it. The edit is refused otherwise, so a value read first isn't overwritten by
+    /// mistake. It guards the metadata update only: durability changes regardless.
     #[arg(long, value_name = "VERSION")]
     if_version: Option<u64>,
     #[command(flatten)]
@@ -45,16 +47,19 @@ pub(crate) struct EditArgs {
 /// The settings `db edit` changes. A setting that isn't named stays as it is.
 #[derive(Debug, Args)]
 struct Settings {
-    /// The description: what the database holds and how it was set up, at most 1 KiB of text;
-    /// tab and line feed are allowed, other control and invisible characters aren't. `-` reads it
-    /// from stdin, without its trailing line feeds. The control node records you as its author.
+    /// The description: what the database holds; `-` reads it from stdin
+    ///
+    /// What the database holds and how it was set up, at most 1 KiB of text; tab and line feed
+    /// are allowed, other control and invisible characters aren't. From stdin, its trailing line
+    /// feeds are dropped. The control node records you as its author.
     #[arg(long, value_name = "TEXT|-", allow_hyphen_values = true)]
     description: Option<String>,
     /// Removes the description.
     #[arg(long, conflicts_with = "description")]
     clear_description: bool,
-    /// A label to set, `key=value`, replacing the key's value if the database has it. Repeat it
-    /// for several. Labels it doesn't name stay as they are.
+    /// A label to set, `key=value`, replacing the key's value if the database has it
+    ///
+    /// Repeat it for several. Labels it doesn't name stay as they are.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label_arg)]
     labels: Vec<(LabelKey, LabelValue)>,
     /// A label key to remove. Repeat it for several.
@@ -65,11 +70,15 @@ struct Settings {
     /// Removes the expiry: the database stays until it is dropped.
     #[arg(long, conflicts_with_all = ["expires_in", "expires_at"])]
     clear_expiry: bool,
-    /// The durability's acknowledgement mode: `quorum`, `all`, or `local`. It takes effect at the
-    /// database's next epoch; the current primary keeps the settings it holds the lease under.
+    /// The durability's acknowledgement mode: `quorum`, `all`, or `local`
+    ///
+    /// It takes effect at the database's next epoch; the current primary keeps the settings it
+    /// holds the lease under.
     #[arg(long)]
     acks: Option<Acks>,
-    /// The floor on reachable replicas; the mode's write quorum if unset. Needs `--acks`.
+    /// The floor on reachable replicas; the mode's write quorum if unset
+    ///
+    /// Needs `--acks`.
     #[arg(long, requires = "acks")]
     min_replicas: Option<u8>,
 }

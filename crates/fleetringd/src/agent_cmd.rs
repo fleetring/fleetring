@@ -50,21 +50,25 @@ const REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `fleetring agent`'s commands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum AgentCommand {
-    /// Mints an agent's identity: a certificate for `agent-<id>` and a token scoped
-    /// `admin:agent-<id>-*`, kept private in a directory of its own. In dev mode it starts the
-    /// dev node if none runs, and signs with dev mode's authority; for another fleet, pass
-    /// `--authority`.
+    /// Mints an agent's identity: a certificate and a scoped token
+    ///
+    /// A certificate for `agent-<id>` and a token scoped `admin:agent-<id>-*`, kept private in a
+    /// directory of its own. In dev mode it starts the dev node if none runs, and signs with dev
+    /// mode's authority; for another fleet, pass `--authority`.
     Add(AgentAddArgs),
-    /// Lists the agents of the context: their principals, scopes, and when their credentials
-    /// expire.
+    /// Lists the context's agents, with their scopes and expiries
+    ///
+    /// Their principals, scopes, and when their credentials expire.
     List {
         #[command(flatten)]
         output: OutputArgs,
         #[command(flatten)]
         target: Target,
     },
-    /// Shows one agent: its principal, scopes, expiries, files, the MCP command that serves
-    /// as it, and when its token must be renewed by.
+    /// Shows one agent: its principal, scopes, expiries, files, and MCP command
+    ///
+    /// The MCP command is the one that serves as the agent. It also shows when its token must be
+    /// renewed by.
     Show {
         /// The agent's ID.
         id: AgentId,
@@ -73,27 +77,31 @@ pub(crate) enum AgentCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Reissues an agent's certificate and token now, and revokes the old token.
+    /// Reissues an agent's certificate and token now, and revokes the old token
     Renew {
         /// The agent's ID.
         id: AgentId,
-        /// The directory with the fleet's `ca.crt` and `ca.key`; dev mode's own in dev mode,
-        /// and required elsewhere.
+        /// The directory with the fleet's `ca.crt` and `ca.key`
+        ///
+        /// Dev mode's own in dev mode, and required elsewhere.
         #[arg(long, value_name = "DIR")]
         authority: Option<PathBuf>,
         #[command(flatten)]
         target: Target,
     },
-    /// Revokes an agent's token and deletes its directory, after the ID is typed on a
-    /// terminal. Refuses if the fleet can't be reached to revoke the token.
+    /// Revokes an agent's token and deletes its directory
+    ///
+    /// Asks for the ID to be typed on a terminal first. Refuses if the fleet can't be reached to
+    /// revoke the token.
     Remove {
         /// The agent's ID.
         id: AgentId,
-        /// Removes it without a prompt.
+        /// Removes it without a prompt
         #[arg(long)]
         yes: bool,
-        /// Deletes the directory without revoking the token, which then stays valid until it
-        /// expires.
+        /// Deletes the directory without revoking the token
+        ///
+        /// The token then stays valid until it expires.
         #[arg(long)]
         no_revoke: bool,
         #[command(flatten)]
@@ -104,30 +112,38 @@ pub(crate) enum AgentCommand {
 /// `fleetring agent add`'s arguments (ADR-0043, point 8.7).
 #[derive(Debug, Args)]
 pub(crate) struct AgentAddArgs {
-    /// The agent's ID: 1 to 32 lowercase letters, digits, or '_'. Its principal is
-    /// `agent-<id>`.
+    /// The agent's ID: 1 to 32 lowercase letters, digits, or '_'
+    ///
+    /// Its principal is `agent-<id>`.
     id: AgentId,
-    /// A scope the token carries instead of the default `admin:agent-<id>-*`. Repeat it for
-    /// more.
+    /// A scope the token carries instead of the default `admin:agent-<id>-*`
+    ///
+    /// Repeat it for more.
     #[arg(long = "scope", value_name = "SCOPE")]
     scopes: Vec<Scope>,
-    /// Makes the default scope `read:agent-<id>-*`, and records the identity as read-only, so
-    /// that `mcp --agent` offers only the tools that read.
+    /// Records the identity as read-only, with the default scope `read:agent-<id>-*`
+    ///
+    /// `mcp --agent` then offers only the tools that read.
     #[arg(long)]
     read_only: bool,
-    /// The directory with the fleet's `ca.crt` and `ca.key`. In dev mode, dev mode's own;
-    /// elsewhere, required.
+    /// The directory with the fleet's `ca.crt` and `ca.key`
+    ///
+    /// In dev mode, dev mode's own; elsewhere, required.
     #[arg(long, value_name = "DIR")]
     authority: Option<PathBuf>,
-    /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; a year in dev mode and
-    /// 30 days with `--authority`. The token lasts as long, or 30 days if that is shorter.
+    /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+    ///
+    /// A year in dev mode, and 30 days with `--authority`. The token lasts as long, or 30 days if
+    /// that is shorter.
     #[arg(long, value_parser = parse_ttl)]
     ttl: Option<Duration>,
-    /// Prints an MCP client's configuration that runs `mcp --agent <id>`: `claude`, a `claude
-    /// mcp add` command; `cursor` or `json`, an `mcpServers` object. It holds no secret.
+    /// Prints an MCP client's configuration that runs `mcp --agent <id>`
+    ///
+    /// `claude` prints a `claude mcp add` command; `cursor` and `json` an `mcpServers` object. It
+    /// holds no secret.
     #[arg(long, value_enum, value_name = "CLIENT", conflicts_with = "install")]
     print_config: Option<ConfigFormat>,
-    /// Registers the server with an MCP client: `claude` runs `claude mcp add`.
+    /// Registers the server with an MCP client: `claude` runs `claude mcp add`
     #[arg(long, value_enum, value_name = "CLIENT")]
     install: Option<McpClient>,
     #[command(flatten)]

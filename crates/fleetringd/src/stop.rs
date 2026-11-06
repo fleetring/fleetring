@@ -30,15 +30,18 @@ const CONFIG_FILE: &str = "fleetringd.toml";
         .required(true)
 ))]
 pub(crate) struct StopArgs {
-    /// The node's data directory, or a directory holding a `fleetringd.toml`, whose `data_dir`
-    /// is then used: a dev directory and its `data/` both work.
+    /// The node's data directory, or a directory holding a `fleetringd.toml`
+    ///
+    /// With a `fleetringd.toml`, its `data_dir` is used: a dev directory and its `data/` both
+    /// work.
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
-    /// The node's configuration file, whose `data_dir` is used.
+    /// The node's configuration file, whose `data_dir` is used
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// How long to wait for the node to drain and exit: `<n>m` or `<n>s`; 2m by default. It
-    /// keeps draining after that.
+    /// How long to wait for the node to drain and exit: `<n>m` or `<n>s`
+    ///
+    /// 2m by default. The node keeps draining after that.
     #[arg(long, value_parser = parse_ttl)]
     timeout: Option<Duration>,
 }

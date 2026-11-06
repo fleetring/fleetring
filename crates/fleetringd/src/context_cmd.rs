@@ -37,18 +37,24 @@ pub(crate) enum ContextCommand {
         #[command(flatten)]
         output: OutputArgs,
     },
-    /// Prints the current context's name and nothing else, for a shell prompt. Prints nothing
-    /// and exits 1 if no context is current.
+    /// Prints the current context's name and nothing else, for a shell prompt
+    ///
+    /// Prints nothing and exits 1 if no context is current.
     Current,
-    /// Adds a context: a name for a fleet's control addresses, certificates and principal. The
-    /// first context added becomes current.
+    /// Adds a context: a name for a fleet's control addresses and identity
+    ///
+    /// The identity is its certificates and principal. The first context added becomes current.
     Add(ContextAddArgs),
-    /// Makes a context current, and remembers the one it replaces for `fleetring switch -`.
+    /// Makes a context current
+    ///
+    /// It remembers the one it replaces for `fleetring switch -`.
     Use {
         /// The context to use.
         name: ContextName,
     },
-    /// Removes a context. It deletes only the context's entry, never the files it names.
+    /// Removes a context, but never the files it names
+    ///
+    /// It deletes only the context's entry.
     Remove {
         /// The context to remove.
         name: ContextName,
@@ -58,15 +64,21 @@ pub(crate) enum ContextCommand {
 /// `fleetring context add`'s arguments.
 #[derive(Debug, Args)]
 pub(crate) struct ContextAddArgs {
-    /// The new context's name: 1 to 63 lowercase letters, digits, '-', '_' or '.'.
+    /// The new context's name
+    ///
+    /// 1 to 63 lowercase letters, digits, '-', '_' or '.'.
     name: ContextName,
-    /// A control node's address, `host:port`. Repeat it for more; they are tried in order.
+    /// A control node's address, `host:port`
+    ///
+    /// Repeat it for more; they are tried in order.
     #[arg(long, required = true)]
     control: Vec<String>,
-    /// The fleet's name. Defaults to the fleet the client certificate names.
+    /// The fleet's name
+    ///
+    /// Defaults to the fleet the client certificate names.
     #[arg(long)]
     fleet: Option<String>,
-    /// A directory with `ca.crt` and the client certificates `cert client` writes.
+    /// A directory with `ca.crt` and the client certificates `cert client` writes
     #[arg(long, conflicts_with_all = ["ca", "cert", "key"])]
     tls_dir: Option<PathBuf>,
     /// The trusted authority certificate, PEM.
@@ -78,10 +90,14 @@ pub(crate) struct ContextAddArgs {
     /// The client certificate's private key, PEM.
     #[arg(long)]
     key: Option<PathBuf>,
-    /// The principal to act as: with `--tls-dir`, `client.<principal>.crt` is the certificate.
+    /// The principal to act as
+    ///
+    /// With `--tls-dir`, `client.<principal>.crt` is the certificate.
     #[arg(long = "as", value_name = "PRINCIPAL")]
     principal: Option<Principal>,
-    /// A file that holds a bearer token. The context stores the path, never the token.
+    /// A file that holds a bearer token
+    ///
+    /// The context stores the path, never the token.
     #[arg(long)]
     token_file: Option<PathBuf>,
 }
