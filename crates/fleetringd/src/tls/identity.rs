@@ -110,6 +110,8 @@ pub(crate) struct Loaded {
     client: Arc<ClientConfig>,
     /// The trusted authorities' Ed25519 keys, which sign the bearer tokens nodes accept.
     token_keys: Vec<VerifyingKey>,
+    /// The fleets the trusted authorities name; empty for an authority from outside.
+    authority_fleets: Vec<FleetName>,
     stamp: Stamp,
 }
 
@@ -141,6 +143,13 @@ impl Loaded {
             _ => return Err(IdentityError::Authority),
         };
         let token_keys = authorities.iter().filter_map(token_key).collect();
+        let authority_fleets = authorities
+            .iter()
+            .filter_map(|authority| match SubjectUri::of_certificate(authority) {
+                Ok(SubjectUri::Authority { fleet }) => Some(fleet),
+                _ => None,
+            })
+            .collect();
         let mut roots = RootCertStore::empty();
         for authority in authorities {
             roots.add(authority)?;
@@ -174,6 +183,7 @@ impl Loaded {
             admin_server: Arc::new(admin_server),
             client: Arc::new(client),
             token_keys,
+            authority_fleets,
             stamp,
         })
     }
@@ -320,6 +330,14 @@ impl Identity {
     #[must_use]
     pub fn fleet(&self) -> FleetName {
         self.inner.loaded.load().subject.fleet().clone()
+    }
+
+    /// Returns the fleets the trusted authority certificates name, as of the last reload: empty
+    /// when none is one of FleetRing's own. A client whose certificate names a fleet that isn't
+    /// among them is misconfigured.
+    #[must_use]
+    pub fn authority_fleets(&self) -> Vec<FleetName> {
+        self.current().authority_fleets.clone()
     }
 
     /// Returns what bearer tokens are checked against: this fleet, and the Ed25519 keys of

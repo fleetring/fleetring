@@ -727,7 +727,7 @@ async fn fleetringd(
         .collect();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     Ok(tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        crate::support::fleetring()
             .env("FLEETRING_TLS_DIR", &tls_dir)
             .env_remove("FLEETRING_TOKEN")
             .env_remove("FLEETRING_AS")
@@ -1144,7 +1144,7 @@ async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> 
 
     // `--as` without a directory says what it needs.
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
+        crate::support::fleetring()
             .env_remove("FLEETRING_TLS_DIR")
             .env_remove("FLEETRING_AS")
             .args(["status", "--control", "127.0.0.1:1", "--as", "reader"])

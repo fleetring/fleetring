@@ -491,7 +491,17 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
-    builder.create(dir)
+    builder.create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A directory that was there before may be looser than the mode above.
+        let mode = fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 /// Why a context couldn't be read, changed or selected.
@@ -961,6 +971,25 @@ token_file = "/home/me/.config/fleetring/tokens/home"
             !config.join("contexts.toml.tmp").exists(),
             "the temporary file was renamed away"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_looser_directory_is_tightened_by_the_next_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("fleetring");
+        fs::create_dir(&config).expect("a directory");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o755)).expect("chmod");
+        ContextStore::at(&config)
+            .update(|_| Ok(()))
+            .expect("update");
+        let mode = fs::metadata(&config)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[cfg(unix)]
