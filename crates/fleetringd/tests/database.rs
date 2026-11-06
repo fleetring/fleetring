@@ -3090,9 +3090,7 @@ mod archives {
                 "`fleetring archive restore <db> --to <dir>`",
             ),
         ] {
-            let refused = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
-                .args(args)
-                .output()?;
+            let refused = crate::support::fleetring().args(args).output()?;
             assert_eq!(refused.status.code(), Some(2), "{args:?}");
             let stderr = String::from_utf8_lossy(&refused.stderr);
             assert!(

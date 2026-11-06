@@ -6,7 +6,7 @@
 //! `src/progress.rs`, so the suite never needs a pty.
 
 use std::error::Error;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use fleetringd::{Config, Daemon};
 
@@ -18,7 +18,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 /// Runs `fleetring` with `args` against the node at `control`, both output streams piped.
 fn fleetring(tls: &Tls, control: &str, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_fleetring"))
+    Ok(crate::support::fleetring()
         .env("FLEETRING_TLS_DIR", tls.dir())
         .env_remove("CI")
         .env_remove("NO_COLOR")
