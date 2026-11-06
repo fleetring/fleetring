@@ -76,7 +76,7 @@ const STATE: [&str; 7] = [
 ];
 
 fn binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_fleetringd"))
+    Path::new(env!("CARGO_BIN_EXE_fleetring"))
 }
 
 /// `fleetringd` with `args`, in a clean environment whose home is `home`.
@@ -333,7 +333,7 @@ fn a_non_loopback_address_is_refused_from_the_config_and_from_flags() -> TestRes
     };
 
     // `--listen` on top of the generated configuration.
-    let output = fleetringd(root.path(), &["--config"])
+    let output = fleetringd(root.path(), &["serve", "--config"])
         .arg(&config)
         .args(["--listen", &format!("0.0.0.0:{port}")])
         .output()?;
@@ -353,7 +353,7 @@ fn a_non_loopback_address_is_refused_from_the_config_and_from_flags() -> TestRes
         "{}",
         printed(&output)
     );
-    let output = fleetringd(root.path(), &["--config"])
+    let output = fleetringd(root.path(), &["serve", "--config"])
         .arg(&config)
         .output()?;
     refused(&output, "listen");
@@ -413,7 +413,7 @@ fn the_same_client_code_runs_against_dev_mode_and_a_three_node_fleet() -> TestRe
     Ok(())
 }
 
-/// Runs `script` in `sh` with this build's `fleetringd` first on `PATH`.
+/// Runs `script` in `sh` with this build's `fleetring` first on `PATH`.
 fn shell(home: &Path, script: &str) -> TestResult<Output> {
     let bin = binary().parent().ok_or("no directory")?;
     let path = format!(
@@ -445,7 +445,7 @@ fn the_quickstart_runs_as_documented() -> TestResult {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     };
     let status = wait_for("the node is a live member", || {
-        run("fleetringd status")
+        run("fleetring status")
             .ok()
             .filter(|status| status.contains(" live "))
     })?;
@@ -453,20 +453,20 @@ fn the_quickstart_runs_as_documented() -> TestResult {
         status.starts_with("dev mode: one node on loopback, for development only\n"),
         "{status}"
     );
-    let created = run("fleetringd db create notes")?;
+    let created = run("fleetring db create notes")?;
     assert!(created.starts_with("created notes\n"), "{created}");
     assert!(created.contains("\nreplication factor: 1\n"), "{created}");
     wait_for("notes takes a write", || {
-        run("fleetringd db exec notes \"CREATE TABLE note (body TEXT)\"").ok()
+        run("fleetring db exec notes \"CREATE TABLE note (body TEXT)\"").ok()
     })?;
-    let written = run("fleetringd db exec notes \"INSERT INTO note VALUES (?)\" hello")?;
+    let written = run("fleetring db exec notes \"INSERT INTO note VALUES (?)\" hello")?;
     assert_eq!(
         written,
         "1 row affected; acknowledged by 1 of 1 replica\n",
         "{}",
         node.log_text()
     );
-    let read = run("fleetringd db query notes \"SELECT body FROM note\"")?;
+    let read = run("fleetring db query notes \"SELECT body FROM note\"")?;
     assert_eq!(read, "body\nhello\n");
     let changes = dir.join("changes").join("notes.ndjson");
     let streamed = wait_for("the change reaches the dev sink", || {
@@ -479,7 +479,7 @@ fn the_quickstart_runs_as_documented() -> TestResult {
     // `status` doesn't warn that the one-node ring replicates fewer ways than a fleet's ring.
     let status = shell(
         root.path(),
-        &format!(". '{}' && fleetringd status", env.display()),
+        &format!(". '{}' && fleetring status", env.display()),
     )?;
     let warnings = String::from_utf8_lossy(&status.stderr);
     assert!(!warnings.contains("replicates"), "{warnings}");
@@ -488,7 +488,7 @@ fn the_quickstart_runs_as_documented() -> TestResult {
     let wide = shell(
         root.path(),
         &format!(
-            ". '{}' && fleetringd db create wide --replication-factor 3",
+            ". '{}' && fleetring db create wide --replication-factor 3",
             env.display()
         ),
     )?;

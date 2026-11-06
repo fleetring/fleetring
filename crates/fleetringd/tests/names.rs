@@ -1,0 +1,208 @@
+//! FR-075: one binary, `fleetring`, that also runs as `fleetringd` until 1.0 (ADR-0043, point 1).
+//! The name it runs as changes what it calls itself, and nothing else.
+
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+/// This build, copied into `dir` as `file_name`, with the platform's executable suffix.
+fn copy_as(dir: &Path, file_name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = dir.join(format!("{file_name}{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_fleetring"), &path)?;
+    Ok(path)
+}
+
+/// Runs `bin` with `args`, with no client variables to change what a command does.
+fn run(bin: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new(bin);
+    command.args(args);
+    for variable in [
+        "FLEETRING_CONTROL",
+        "FLEETRING_TLS_DIR",
+        "FLEETRING_TOKEN",
+        "FLEETRING_AS",
+        "FLEETRING_CA",
+        "FLEETRING_CERT",
+        "FLEETRING_KEY",
+        "FLEETRING_LOG_FORMAT",
+        "RUST_LOG",
+    ] {
+        command.env_remove(variable);
+    }
+    Ok(command.output()?)
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The binary as `fleetring` and as `fleetringd` in a scratch directory, each with its name.
+fn both_names(dir: &Path) -> Result<[(&'static str, PathBuf); 2], Box<dyn Error>> {
+    Ok([
+        ("fleetring", copy_as(dir, "fleetring")?),
+        ("fleetringd", copy_as(dir, "fleetringd")?),
+    ])
+}
+
+#[test]
+fn version_prints_the_name_it_ran_as() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for (name, bin) in both_names(dir.path())? {
+        for flag in ["--version", "-V"] {
+            let printed = run(&bin, &[flag])?;
+            assert!(printed.status.success(), "{name} {flag}: {printed:?}");
+            assert_eq!(
+                stdout(&printed),
+                format!("{name} {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A symbolic link named `fleetringd`, as `install.sh` and the image make it, is `fleetringd`
+/// too.
+#[cfg(unix)]
+#[test]
+fn a_fleetringd_link_is_fleetringd() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let real = copy_as(dir.path(), "fleetring")?;
+    let link = dir.path().join("fleetringd");
+    std::os::unix::fs::symlink("fleetring", &link)?;
+    let printed = run(&link, &["--version"])?;
+    assert_eq!(
+        stdout(&printed),
+        format!("fleetringd {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let printed = run(&real, &["--version"])?;
+    assert_eq!(
+        stdout(&printed),
+        format!("fleetring {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    Ok(())
+}
+
+/// 0.6 ran a node as `fleetringd --config <file>`, and a 0.6 daemon's restart in place runs the
+/// new binary with those arguments: they mean `serve` under either name.
+#[test]
+fn both_names_run_serve_from_bare_daemon_flags() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let missing = dir.path().join("nonexistent.toml");
+    let missing = missing.to_str().ok_or("a UTF-8 path")?;
+    for (name, bin) in both_names(dir.path())? {
+        for args in [
+            &["--config", missing][..],
+            &["--config", missing, "--node-id", "n1"],
+            &["--log-format", "json", "--config", missing],
+            &["serve", "--config", missing],
+        ] {
+            let refused = run(&bin, args)?;
+            // The configuration's error, from `serve`: not a usage error.
+            assert_eq!(
+                refused.status.code(),
+                Some(1),
+                "{name} {args:?}: {refused:?}"
+            );
+            assert!(
+                stderr(&refused).starts_with(&format!("{name}: can't read config file {missing}")),
+                "{name} {args:?}: {}",
+                stderr(&refused)
+            );
+        }
+        // `serve` needs `--config`.
+        let usage = run(&bin, &["serve"])?;
+        assert_eq!(usage.status.code(), Some(2), "{name}: {usage:?}");
+        assert!(
+            stderr(&usage).contains("--config <CONFIG>"),
+            "{}",
+            stderr(&usage)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn no_arguments_prints_help_and_exits_2() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for (name, bin) in both_names(dir.path())? {
+        let help = run(&bin, &[])?;
+        assert_eq!(help.status.code(), Some(2), "{name}: {help:?}");
+        let text = format!("{}{}", stdout(&help), stderr(&help));
+        assert!(text.contains(&format!("Usage: {name} ")), "{name}: {text}");
+        assert!(text.contains("serve "), "{name}: {text}");
+        assert!(
+            text.contains("`fleetringd` is another name"),
+            "{name}: {text}"
+        );
+    }
+    Ok(())
+}
+
+/// clap would take usage lines from the file name verbatim: an upgrader's scratch or kept copy
+/// must still say `fleetringd`, or `fleetring`.
+#[cfg(unix)]
+#[test]
+fn usage_never_shows_the_file_name() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for (file_name, name) in [
+        ("fleetringd.previous", "fleetringd"),
+        (".fleetringd.new", "fleetringd"),
+        ("fleetring.previous", "fleetring"),
+        ("fleetring", "fleetring"),
+    ] {
+        let bin = copy_as(dir.path(), file_name)?;
+        for args in [&["--bogus"][..], &["db", "list", "--bogus"]] {
+            let refused = run(&bin, args)?;
+            assert_eq!(refused.status.code(), Some(2), "{file_name}: {refused:?}");
+            let text = stderr(&refused);
+            assert!(
+                text.contains(&format!("Usage: {name} ")),
+                "{file_name}: {text}"
+            );
+            assert!(
+                !text.contains(".previous") && !text.contains(".new"),
+                "{file_name}: {text}"
+            );
+        }
+        let version = run(&bin, &["--version"])?;
+        assert_eq!(
+            stdout(&version),
+            format!("{name} {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn client_commands_are_the_same_under_both_names() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let outcomes = both_names(dir.path())?.map(|(name, bin)| -> Result<_, Box<dyn Error>> {
+        let output = run(
+            &bin,
+            &[
+                "db",
+                "list",
+                "--control",
+                "127.0.0.1:1",
+                "--insecure-plaintext",
+            ],
+        )?;
+        let text = stderr(&output);
+        let message = text
+            .strip_prefix(&format!("{name}: "))
+            .ok_or_else(|| format!("{name}'s error doesn't start with its name: {text}"))?
+            .to_owned();
+        Ok((output.status.code(), stdout(&output), message))
+    });
+    let [fleetring, fleetringd] = outcomes;
+    let (fleetring, fleetringd) = (fleetring?, fleetringd?);
+    assert_eq!(fleetring.0, Some(1), "{fleetring:?}");
+    assert_eq!(fleetring, fleetringd);
+    Ok(())
+}

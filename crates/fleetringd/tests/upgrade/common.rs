@@ -47,10 +47,23 @@ pub(crate) fn line_behind() -> Release {
     Release::new(major, minor.saturating_sub(1), 0)
 }
 
-/// Runs `fleetringd node <args>` against `fleet`'s control node as the test principal.
+/// The release the binary at `bin` says it is, from `--version`: `fleetring <version>`, or
+/// `fleetringd <version>` from a release before 0.7 or a binary named `fleetringd`.
+pub(crate) fn release_of(bin: &Path) -> TestResult<Release> {
+    let printed = Command::new(bin).arg("--version").output()?;
+    let text = String::from_utf8_lossy(&printed.stdout);
+    let text = text.trim();
+    Ok(text
+        .strip_prefix("fleetring ")
+        .or_else(|| text.strip_prefix("fleetringd "))
+        .ok_or_else(|| format!("{} --version printed '{text}'", bin.display()))?
+        .parse()?)
+}
+
+/// Runs `fleetring node <args>` against `fleet`'s control node as the test principal.
 pub(crate) fn node_command(fleet: &ProcessFleet, args: &[&str]) -> TestResult<Output> {
     Ok(fleet
-        .command(Path::new(env!("CARGO_BIN_EXE_fleetringd")), "/usr/bin:/bin")
+        .command(Path::new(env!("CARGO_BIN_EXE_fleetring")), "/usr/bin:/bin")
         .arg("node")
         .args(args)
         .args(["--control", &fleet.control])
@@ -108,13 +121,25 @@ pub(crate) enum Defect {
     Checksum,
 }
 
+/// Which names a fake release's archive holds the binary under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveLayout {
+    /// From 0.7, as the release workflow packs it: `fleetring`, and a regular copy named
+    /// `fleetringd` that a 0.6 upgrader extracts (ADR-0043, point 3.1).
+    Both,
+    /// Before 0.7: `fleetringd` alone.
+    Before07,
+}
+
 /// Writes a release of `binary`, as `release`, for this build's target into `dir`: the archive,
-/// `SHA256SUMS`, and a bundle the fake cosign accepts unless `defect` says otherwise.
+/// laid out as `layout` says, `SHA256SUMS`, and a bundle the fake cosign accepts unless `defect`
+/// says otherwise.
 pub(crate) fn write_release(
     dir: &Path,
     release: &Release,
     binary: &[u8],
     defect: Defect,
+    layout: ArchiveLayout,
 ) -> TestResult {
     fs::create_dir_all(dir)?;
     let name = format!("fleetringd-{release}-{TARGET}");
@@ -123,11 +148,17 @@ pub(crate) fn write_release(
         Vec::new(),
         flate2::Compression::fast(),
     ));
-    let mut header = tar::Header::new_gnu();
-    header.set_size(u64::try_from(binary.len())?);
-    header.set_mode(0o755);
-    header.set_cksum();
-    archive.append_data(&mut header, format!("{name}/fleetringd"), binary)?;
+    let names: &[&str] = match layout {
+        ArchiveLayout::Both => &["fleetring", "fleetringd"],
+        ArchiveLayout::Before07 => &["fleetringd"],
+    };
+    for file in names {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(binary.len())?);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append_data(&mut header, format!("{name}/{file}"), binary)?;
+    }
     let archive = archive.into_inner()?.finish()?;
     fs::write(dir.join(&archive_name), &archive)?;
     let listed = if defect == Defect::Checksum {
@@ -157,8 +188,8 @@ pub(crate) fn write_release(
     Ok(())
 }
 
-/// A shell script that answers `--version` as `release` and nothing else: a binary that is
-/// recognisably not the one it replaced.
+/// A shell script that answers `--version` as `release` and nothing else, as a release before
+/// 0.7 does: a binary that is recognisably not the one it replaced.
 pub(crate) fn fake_binary(release: &Release) -> Vec<u8> {
     format!("#!/bin/sh\necho \"fleetringd {release}\"\n").into_bytes()
 }
@@ -365,32 +396,55 @@ impl NodeProcess {
     }
 }
 
+/// How a fleet's nodes are installed and started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Launch {
+    /// As 0.6 installs and starts a node, and a host upgraded from it keeps doing: the binary is
+    /// `bin/fleetringd`, run as `fleetringd --config <file>`.
+    Before07,
+    /// As 0.7 does: `bin/fleetring`, run as `fleetring serve --config <file>`.
+    Serve,
+}
+
+impl Launch {
+    /// The binary's file name.
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Before07 => "fleetringd",
+            Self::Serve => "fleetring",
+        }
+    }
+}
+
 /// A fleet of real daemon processes: `node-1` runs both roles and the others data only, each from
 /// its own copy of a binary, over TLS from one test authority.
 pub(crate) struct ProcessFleet {
     pub(crate) tls: Tls,
     pub(crate) control: String,
     pub(crate) nodes: Vec<NodeProcess>,
+    launch: Launch,
 }
 
 impl ProcessFleet {
-    /// Starts `count` nodes, each running a copy of `binary`, and waits until every one is a
-    /// live member.
+    /// Starts `count` nodes, each running a copy of `binary` installed and started as 0.6 does
+    /// ([`Launch::Before07`]), and waits until every one is a live member.
     pub(crate) fn start(root: &Path, binary: &Path, count: usize) -> TestResult<Self> {
         Self::start_with(root, binary, count, "both")
+    }
+
+    /// Starts a fleet as [`ProcessFleet::start`] does, with each node installed and started as
+    /// 0.7 does ([`Launch::Serve`]).
+    pub(crate) fn start_serving(root: &Path, binary: &Path, count: usize) -> TestResult<Self> {
+        Self::start_as(root, binary, count, "both", true, Launch::Serve)
     }
 
     /// Starts a fleet of the release `binary` is, as [`ProcessFleet::start`] does. A release
     /// before 0.4.0 has no admin listener and refuses an `[admin]` table, so its nodes get none
     /// until [`ProcessFleet::enable_admin`] moves them to this build.
     pub(crate) fn start_release(root: &Path, binary: &Path, count: usize) -> TestResult<Self> {
-        let printed = Command::new(binary).arg("--version").output()?;
-        let release: Release = String::from_utf8_lossy(&printed.stdout)
-            .trim()
-            .trim_start_matches("fleetringd ")
-            .parse()?;
+        let release = release_of(binary)?;
         let admin = release >= Release::new(0, 4, 0);
-        Self::start_as(root, binary, count, "both", admin)
+        Self::start_as(root, binary, count, "both", admin, Launch::Before07)
     }
 
     /// Starts a fleet as [`ProcessFleet::start`] does, with `node-1` in `first_role`: `both`, or
@@ -401,17 +455,18 @@ impl ProcessFleet {
         count: usize,
         first_role: &str,
     ) -> TestResult<Self> {
-        Self::start_as(root, binary, count, first_role, true)
+        Self::start_as(root, binary, count, first_role, true, Launch::Before07)
     }
 
     /// Starts a fleet as [`ProcessFleet::start_with`] does, giving each node an admin listener
-    /// on a port of its own if `admin`.
+    /// on a port of its own if `admin`, installed and started as `launch` says.
     fn start_as(
         root: &Path,
         binary: &Path,
         count: usize,
         first_role: &str,
         admin: bool,
+        launch: Launch,
     ) -> TestResult<Self> {
         let tls = Tls::create(root)?;
         let control = format!("127.0.0.1:{}", free_port()?);
@@ -419,7 +474,7 @@ impl ProcessFleet {
         for index in 1..=count {
             let id = format!("node-{index}");
             let dir = root.join(&id);
-            let bin = dir.join("bin").join("fleetringd");
+            let bin = dir.join("bin").join(launch.file_name());
             fs::create_dir_all(bin.parent().ok_or("no parent")?)?;
             fs::copy(binary, &bin)?;
             let data_dir = dir.join("data");
@@ -457,6 +512,7 @@ impl ProcessFleet {
             tls,
             control,
             nodes,
+            launch,
         };
         for index in 0..count {
             fleet.spawn(index)?;
@@ -483,7 +539,11 @@ impl ProcessFleet {
             .create(true)
             .append(true)
             .open(&node.log)?;
-        let child = Command::new(&node.bin)
+        let mut command = Command::new(&node.bin);
+        if self.launch == Launch::Serve {
+            command.arg("serve");
+        }
+        let child = command
             .arg("--config")
             .arg(&node.config)
             .env("RUST_LOG", "info")

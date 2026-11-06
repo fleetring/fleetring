@@ -7,16 +7,21 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::data_dir::LOCK_FILE;
 use crate::upgrade::UpgradeError;
 
 /// The file a daemon writes in its data directory while it runs.
+///
+/// Its name is kept until 1.0, as are [`RESTARTS_VAR`] and the data directory's lock file: a 0.6
+/// upgrader waits on all three when it restarts a node onto a later release, and a 0.6 daemon
+/// passes the variable to the binary it executes (ADR-0043, point 1.7).
 pub const PROCESS_FILE: &str = "fleetringd.process";
 
-/// The lock file [`DataDir`](crate::DataDir) holds while a daemon runs.
-const LOCK_FILE: &str = "fleetringd.lock";
-
 /// What a running daemon says about itself in `<data_dir>/fleetringd.process`: enough for
-/// `fleetringd upgrade` to restart it in place.
+/// `fleetring upgrade` to restart it in place.
+///
+/// A 0.6 upgrader reads it too, so fields are only ever added, each optional, and unknown ones are
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessFile {
     /// The daemon's process ID.
@@ -29,10 +34,16 @@ pub struct ProcessFile {
     /// restarted daemon from the one it signalled: they share a process ID.
     #[serde(default)]
     pub restarts: u32,
+    /// The arguments it was started with, after the program, so that a rollback can tell a node
+    /// started with `serve`, which a release before 0.7 can't run. Empty in a file a release
+    /// before 0.7 wrote.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// The environment variable a restart in place passes to the binary it executes: how many times
-/// the process has restarted, for [`ProcessFile::restarts`].
+/// the process has restarted, for [`ProcessFile::restarts`]. Its name is kept until 1.0, as
+/// [`PROCESS_FILE`] says.
 pub const RESTARTS_VAR: &str = "FLEETRINGD_RESTARTS";
 
 impl ProcessFile {
@@ -48,6 +59,26 @@ impl ProcessFile {
                 .ok()
                 .and_then(|restarts| restarts.parse().ok())
                 .unwrap_or(0),
+            args: std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+
+    /// Whether the daemon was started with `serve`, after any leading `--log-format` and its
+    /// value: a release before 0.7 can't run that command line.
+    #[must_use]
+    pub fn started_with_serve(&self) -> bool {
+        let mut args = self.args.iter().map(String::as_str);
+        loop {
+            match args.next() {
+                Some("--log-format") => {
+                    args.next();
+                }
+                Some(arg) if arg.starts_with("--log-format=") => {}
+                first => return first == Some("serve"),
+            }
         }
     }
 
@@ -149,6 +180,66 @@ mod tests {
         written.remove(dir.path());
         assert_eq!(ProcessFile::read(dir.path())?, None);
         Ok(())
+    }
+
+    #[test]
+    fn the_names_a_0_6_upgrader_uses_are_kept() {
+        assert_eq!(PROCESS_FILE, "fleetringd.process");
+        assert_eq!(LOCK_FILE, "fleetringd.lock");
+        assert_eq!(RESTARTS_VAR, "FLEETRINGD_RESTARTS");
+    }
+
+    #[test]
+    fn a_0_6_process_file_reads_and_a_0_6_reader_skips_the_arguments() -> io::Result<()> {
+        // What 0.6.0 writes, and what it reads: no `args`, and unknown fields ignored.
+        let old: ProcessFile = serde_json::from_str(
+            r#"{"pid":7,"exe":"/usr/local/bin/fleetringd","version":"0.6.0","restarts":1}"#,
+        )?;
+        assert!(old.args.is_empty());
+        assert!(!old.started_with_serve());
+        #[derive(Deserialize)]
+        #[expect(dead_code, reason = "the fields 0.6.0 reads, which must still parse")]
+        struct ReadBy06 {
+            pid: u32,
+            exe: PathBuf,
+            version: String,
+            #[serde(default)]
+            restarts: u32,
+        }
+        let written = serde_json::to_vec(&ProcessFile {
+            args: vec!["serve".into(), "--config".into(), "x".into()],
+            ..old
+        })?;
+        let read: ReadBy06 = serde_json::from_slice(&written)?;
+        assert_eq!(read.restarts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_is_found_after_the_log_format() {
+        let file = |args: &[&str]| ProcessFile {
+            pid: 1,
+            exe: PathBuf::from("fleetring"),
+            version: "0.7.0".into(),
+            restarts: 0,
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        };
+        for args in [
+            &["serve", "--config", "x"][..],
+            &["--log-format", "json", "serve", "--config", "x"],
+            &["--log-format=json", "serve"],
+        ] {
+            assert!(file(args).started_with_serve(), "{args:?}");
+        }
+        for args in [
+            &["--config", "x"][..],
+            &["--log-format", "json", "--config", "x"],
+            &["dev"],
+            &["--log-format", "serve"],
+            &[],
+        ] {
+            assert!(!file(args).started_with_serve(), "{args:?}");
+        }
     }
 
     #[test]

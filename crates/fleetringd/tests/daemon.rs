@@ -242,8 +242,8 @@ mod binary {
     }
 
     fn start(config: &std::path::Path) -> Result<Started, Box<dyn std::error::Error>> {
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
-            .arg("--config")
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetring"))
+            .args(["serve", "--config"])
             .arg(config)
             .env("RUST_LOG", "info")
             .stderr(Stdio::piped())
@@ -274,7 +274,7 @@ mod binary {
     /// refused because the fleet has no members, so the create is retried until the join lands.
     fn create_database(dir: &std::path::Path, control: &str) -> TestResult {
         for attempt in 0..600 {
-            let created = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+            let created = Command::new(env!("CARGO_BIN_EXE_fleetring"))
                 .env("FLEETRING_TLS_DIR", dir.join("tls"))
                 .args([
                     "db",
@@ -374,26 +374,35 @@ mod binary {
         Ok(())
     }
 
+    /// Started as 0.6 started a node, without `serve`: it runs, and warns once (ADR-0043, point
+    /// 1.4).
     #[test]
     fn starts_logs_and_exits_cleanly_on_sigint_while_a_second_daemon_is_refused() -> TestResult {
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path())?;
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_fleetring"))
             .arg("--config")
             .arg(&config)
             .env("RUST_LOG", "info")
             .stderr(Stdio::piped())
             .spawn()?;
         let mut lines = BufReader::new(daemon.stderr.take().ok_or("no stderr")?).lines();
-        let started = lines
+        let before: Vec<String> = lines
             .by_ref()
             .map_while(Result::ok)
-            .find(|line| line.contains("fleetringd started"))
-            .ok_or("daemon never logged its start")?;
-        assert!(started.contains("node-1"), "{started}");
+            .take_while(|line| !line.contains("fleetringd started"))
+            .collect();
+        let warnings: Vec<&String> = before.iter().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{before:?}");
+        assert!(
+            warnings[0].contains(
+                "starting without `serve` is kept until 1.0; run `fleetring serve --config <file>`"
+            ),
+            "{before:?}"
+        );
 
-        let second = Command::new(env!("CARGO_BIN_EXE_fleetringd"))
-            .arg("--config")
+        let second = Command::new(env!("CARGO_BIN_EXE_fleetring"))
+            .args(["serve", "--config"])
             .arg(&config)
             .output()?;
         assert!(!second.status.success());
@@ -424,7 +433,7 @@ mod binary {
             // Each child shares this process's open files, the lock's included, from fork to exec.
             let spawner = scope.spawn(|| {
                 while spawned.load(Ordering::Relaxed) < CHILDREN {
-                    Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+                    Command::new(env!("CARGO_BIN_EXE_fleetring"))
                         .arg("--version")
                         .stdout(Stdio::null())
                         .status()?;

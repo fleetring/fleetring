@@ -428,7 +428,7 @@ async fn certificates_from_0_2_still_connect() -> TestResult {
 fn cert_init_names_the_fleet_and_refuses_the_old_flag() -> TestResult {
     let dir = tempfile::tempdir()?;
     let run = |flag: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
             .args(["cert", "init", flag, "home", "--dir"])
             .arg(dir.path())
             .output()
@@ -439,7 +439,7 @@ fn cert_init_names_the_fleet_and_refuses_the_old_flag() -> TestResult {
     assert!(String::from_utf8(created.stdout)?.contains("for fleet home"));
     assert_eq!(Authority::load(dir.path())?.fleet().as_str(), "home");
 
-    let node = std::process::Command::new(env!("CARGO_BIN_EXE_fleetringd"))
+    let node = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
         .args([
             "cert",
             "node",

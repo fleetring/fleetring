@@ -1,18 +1,20 @@
-//! The `fleetringd` binary: the daemon, and the commands that talk to a running fleet.
+//! The `fleetring` binary: a node, and the commands that talk to a running fleet. It also runs as
+//! `fleetringd`, its compatibility name until 1.0 (ADR-0043).
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{BufRead as _, IsTerminal as _, Read, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use clap::error::ErrorKind;
-use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{
     Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, ReplicaRole,
@@ -51,7 +53,7 @@ use fleetringd::tls::{
 use fleetringd::transport::Credentials;
 #[cfg(unix)]
 use fleetringd::upgrade::RESTARTS_VAR;
-use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, Restart};
+use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, Restart, StartCommand};
 use fleetringd::{
     Config, Daemon, LogFormat, MembershipView, Network, NodeRole, ParseLogFormatError, Plaintext,
     Stop,
@@ -60,7 +62,10 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod compat;
 mod edit;
+
+use compat::{Invocation, ProgramName};
 
 /// The environment variable that names a directory with `ca.crt`, `client.crt`, and
 /// `client.key`, and the `client.<principal>.crt` and `.key` files `--as` picks from. It supplies
@@ -83,28 +88,31 @@ const USAGE_ERROR: u8 = 2;
 /// How many random bytes a token's ID holds.
 const TOKEN_ID_BYTES: usize = 16;
 
+/// What `fleetring --help` says below the commands: the compatibility names (ADR-0043, point 1.5).
+const COMPAT_HELP: &str = "\
+Until 1.0, `fleetringd` is another name for this binary, and `--config <file>` without `serve`
+still runs a node.";
+
 /// Places, replicates, and fails over SQLite databases across machines you own.
 ///
-/// With `--config`, runs the daemon. The subcommands talk to a running fleet.
+/// `serve` runs a node. The other commands talk to a running fleet.
 #[derive(Debug, Parser)]
-#[command(version, subcommand_negates_reqs = true)]
+#[command(name = "fleetring", version, arg_required_else_help = true, after_help = COMPAT_HELP)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
-    #[command(flatten)]
-    daemon: DaemonArgs,
+    command: Command,
     /// Writes log lines as `text` or `json`. Overrides FLEETRING_LOG_FORMAT and the config file's
     /// `[log] format`.
     #[arg(long, global = true, value_parser = parse_log_format)]
     log_format: Option<LogFormat>,
 }
 
-/// Runs the daemon.
+/// `fleetring serve`'s flags.
 #[derive(Debug, Args)]
 struct DaemonArgs {
     /// The TOML configuration file.
-    #[arg(long, required = true)]
-    config: Option<PathBuf>,
+    #[arg(long)]
+    config: PathBuf,
     /// Overrides `node.id`.
     #[arg(long)]
     node_id: Option<NodeId>,
@@ -129,8 +137,21 @@ struct DaemonArgs {
     insecure_plaintext: bool,
 }
 
+/// What `fleetring serve --help` says: the details, and the compatibility form (ADR-0043,
+/// point 1.4).
+const SERVE_HELP: &str = "\
+Runs a node.
+
+Runs a node of a fleet from its configuration file; the flags override the file's settings.
+
+Until 1.0, the flags without `serve` (`fleetring --config <file>`, or `fleetringd --config
+<file>`, as 0.6 ran a node) also run a node, and log a warning.";
+
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Runs a node
+    #[command(long_about = SERVE_HELP)]
+    Serve(DaemonArgs),
     /// Runs one node for development, on loopback only, with a local authority and an admin
     /// principal that every command can act as (ADR-0039). The first run creates them, with the
     /// node's configuration, in the directory; later runs reuse them. Load `<dir>/env` in another
@@ -159,9 +180,9 @@ enum Command {
     /// Works with archives without a fleet: restores a database from one offline.
     #[command(subcommand)]
     Archive(ArchiveCommand),
-    /// Installs another release of fleetringd in place of this binary, verified with cosign
+    /// Installs another release of fleetring in place of this binary, verified with cosign
     /// against the release workflow's identity and then by checksum, and keeps this one as
-    /// `fleetringd.previous`. With `--config` naming a running node, first checks that the fleet
+    /// `<name>.previous`. With `--config` naming a running node, first checks that the fleet
     /// allows the release, then drains the node, restarts it in place, and waits until it has
     /// rejoined and caught up.
     Upgrade(UpgradeArgs),
@@ -190,7 +211,7 @@ enum Command {
     },
 }
 
-/// `fleetringd mcp`'s flags (ADR-0041, point 9).
+/// `fleetring mcp`'s flags (ADR-0041, point 9).
 #[derive(Debug, Args)]
 struct McpArgs {
     /// Offers only the tools that read: db_list, db_show, and query. The principal's scopes
@@ -206,12 +227,12 @@ struct McpArgs {
     target: Target,
 }
 
-/// What `fleetringd mcp --help` adds below the flags: how an MCP client starts the server.
+/// What `fleetring mcp --help` adds below the flags: how an MCP client starts the server.
 const MCP_HELP: &str = "\
 An MCP client starts the server as a command. With a scoped token and dev mode's
 certificates, a client configuration (Claude Code's .mcp.json, Cursor's mcp.json) reads:
 
-  {\"mcpServers\": {\"fleetring\": {\"command\": \"fleetringd\", \"args\": [\"mcp\"],
+  {\"mcpServers\": {\"fleetring\": {\"command\": \"fleetring\", \"args\": [\"mcp\"],
     \"env\": {\"FLEETRING_CONTROL\": \"127.0.0.1:7400\",
             \"FLEETRING_TLS_DIR\": \"/home/me/.fleetring/tls\",
             \"FLEETRING_AS\": \"agent-42\", \"FLEETRING_TOKEN\": \"<token>\"}}}}
@@ -219,7 +240,7 @@ certificates, a client configuration (Claude Code's .mcp.json, Cursor's mcp.json
 The token is a secret: keep the file private. Give an agent a token scoped to its own
 prefix (token issue --scope admin:agent-42-*), never the admin certificate.";
 
-/// `fleetringd dev`'s flags (ADR-0039).
+/// `fleetring dev`'s flags (ADR-0039).
 #[derive(Debug, Args)]
 struct DevArgs {
     /// The directory that holds the authority, the certificates, the configuration, and the
@@ -233,7 +254,7 @@ struct DevArgs {
     port: Option<u16>,
 }
 
-/// `fleetringd upgrade`'s flags (ADR-0038).
+/// `fleetring upgrade`'s flags (ADR-0038).
 #[derive(Debug, Args)]
 struct UpgradeArgs {
     /// The release to install, such as 0.4.0; the newest final release by default. Naming the
@@ -247,7 +268,7 @@ struct UpgradeArgs {
     /// Replaces the binary, but leaves the running node on the release it runs.
     #[arg(long)]
     no_restart: bool,
-    /// Swaps the binary with the one the last upgrade replaced, `fleetringd.previous`, and
+    /// Swaps the binary with the one the last upgrade replaced, `<name>.previous`, and
     /// restarts the node as an upgrade does. A second rollback rolls forward again.
     #[arg(long, conflicts_with_all = ["version", "base_url", "releases_url"])]
     rollback: bool,
@@ -268,6 +289,11 @@ struct UpgradeArgs {
     /// before it installs it, to check the fleet's features.
     #[arg(long, exclusive = true)]
     software: bool,
+    /// Confirms, without a prompt, that no node on this machine starts with `fleetring serve`,
+    /// when installing or rolling back to a release before 0.7, which can't run it, and no
+    /// --config names a running node to check.
+    #[arg(long, conflicts_with = "check")]
+    yes: bool,
     #[command(flatten)]
     target: Target,
 }
@@ -1002,7 +1028,7 @@ fn principal_files(
     }
     Err(format!(
         "no client identity for principal '{principal}': looked for {} and {}\n  \
-         hint: create it with `fleetringd cert client {principal} --dir {}`",
+         hint: create it with `fleetring cert client {principal} --dir {}`",
         cert.display(),
         key.display(),
         dir.display(),
@@ -1226,19 +1252,42 @@ fn hex(text: &str) -> Result<Vec<u8>, String> {
 #[derive(Debug)]
 enum Run {
     /// A command that talks to a fleet, or works offline.
-    Command(Command),
-    /// The daemon, from a configuration file or from dev mode's directory.
+    Command(Box<Command>),
+    /// The daemon, from a configuration file with `serve`'s flags applied, or from dev mode's
+    /// directory.
     Daemon {
-        args: DaemonArgs,
         config: Box<Config>,
         /// Set in dev mode: the prepared directory, for the banner.
         dev: Option<Box<Prepared>>,
     },
 }
 
+/// Parses `raw`, the process's arguments with the program first, as the binary named `name`:
+/// that name prefixes `--version` and usage lines, and 0.6's bare daemon flags mean `serve`
+/// (ADR-0043, point 1).
+///
+/// # Errors
+///
+/// clap's error, which prints help, the version, or a usage error.
+fn parse(raw: Vec<OsString>, name: ProgramName) -> Result<(Cli, Invocation), clap::Error> {
+    let (args, invocation) = compat::imply_serve(raw);
+    // Both: `display_name` sets `--version`; usage lines come from `bin_name`, which clap would
+    // otherwise take from argv[0] verbatim (`fleetringd.previous`, `.fleetringd.new`).
+    let mut command = Cli::command()
+        .display_name(name.as_str())
+        .bin_name(name.as_str());
+    let mut matches = command.try_get_matches_from_mut(args)?;
+    let cli =
+        Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut command))?;
+    Ok((cli, invocation))
+}
+
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
+    let raw: Vec<OsString> = std::env::args_os().collect();
+    let name = ProgramName::from_arg0(raw.first().map(OsString::as_os_str));
+    PROGRAM.get_or_init(|| name);
+    let (cli, invocation) = match parse(raw, name) {
+        Ok(parsed) => parsed,
         Err(error) => {
             let hint = edit::removed_verb_hint(&error);
             let code = error.exit_code();
@@ -1250,20 +1299,25 @@ fn main() -> ExitCode {
             return ExitCode::from(u8::try_from(code).unwrap_or(USAGE_ERROR));
         }
     };
-    if let Err(error) = cli.check() {
-        error.exit();
-    }
     let Cli {
         command,
-        daemon,
         log_format: format_flag,
     } = cli;
     // The daemon reads its configuration before logging starts, since it may name the format;
     // dev mode prepares its directory first, since the configuration is in it.
-    let run = match (command, daemon.config.clone()) {
-        (Some(Command::Dev(args)), _) => match prepare_dev(&args) {
+    let run = match command {
+        Command::Serve(args) => match Config::load(&args.config) {
+            Ok(config) => Run::Daemon {
+                config: Box::new(args.apply(config)),
+                dev: None,
+            },
+            Err(error) => {
+                report(&error);
+                return ExitCode::FAILURE;
+            }
+        },
+        Command::Dev(args) => match prepare_dev(&args) {
             Ok(prepared) => Run::Daemon {
-                args: daemon,
                 config: Box::new(prepared.config().clone()),
                 dev: Some(Box::new(prepared)),
             },
@@ -1272,22 +1326,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
-        (Some(command), _) => Run::Command(command),
-        (None, Some(path)) => match Config::load(path) {
-            Ok(config) => Run::Daemon {
-                args: daemon,
-                config: Box::new(config),
-                dev: None,
-            },
-            Err(error) => {
-                report(&error);
-                return ExitCode::FAILURE;
-            }
-        },
-        (None, None) => {
-            eprintln!("fleetringd: --config is required");
-            return ExitCode::FAILURE;
-        }
+        command => Run::Command(Box::new(command)),
     };
     let config = match &run {
         Run::Daemon { config, .. } => Some(config.as_ref()),
@@ -1297,7 +1336,10 @@ fn main() -> ExitCode {
     let format = match log_format(format_flag, variable.as_deref(), config) {
         Ok(format) => format,
         Err(value) => {
-            eprintln!("fleetringd: invalid {LOG_FORMAT_VAR} '{value}'; use text or json");
+            eprintln!(
+                "{}: invalid {LOG_FORMAT_VAR} '{value}'; use text or json",
+                program()
+            );
             return ExitCode::from(USAGE_ERROR);
         }
     };
@@ -1311,6 +1353,11 @@ fn main() -> ExitCode {
         report(&error);
         return ExitCode::FAILURE;
     }
+    if invocation == Invocation::ServeImplied {
+        tracing::warn!(
+            "starting without `serve` is kept until 1.0; run `fleetring serve --config <file>`"
+        );
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1320,10 +1367,10 @@ fn main() -> ExitCode {
     };
     let result = match run {
         Run::Command(command) => runtime
-            .block_on(run_command(command))
+            .block_on(run_command(*command))
             .map(|()| Stopped::Exit),
-        Run::Daemon { args, config, dev } => {
-            runtime.block_on(run_daemon(args, *config, dev.map(|prepared| *prepared)))
+        Run::Daemon { config, dev } => {
+            runtime.block_on(run_daemon(*config, dev.map(|prepared| *prepared)))
         }
     };
     // Every task, connection, and database is closed by now; the runtime's threads go too,
@@ -1338,34 +1385,6 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
-    }
-}
-
-impl Cli {
-    /// Refuses the daemon's options next to a subcommand. `--log-format` is the one option both
-    /// take, which is why clap's own conflict rule, which would refuse it too, isn't used.
-    ///
-    /// # Errors
-    ///
-    /// A usage error naming the conflict.
-    fn check(&self) -> Result<(), clap::Error> {
-        let daemon = &self.daemon;
-        let given = daemon.config.is_some()
-            || daemon.node_id.is_some()
-            || daemon.data_dir.is_some()
-            || daemon.listen.is_some()
-            || daemon.advertise.is_some()
-            || daemon.control.is_some()
-            || daemon.role.is_some()
-            || daemon.insecure_plaintext;
-        if self.command.is_some() && given {
-            return Err(Self::command().error(
-                ErrorKind::ArgumentConflict,
-                "the daemon's options can't be used with a subcommand; put a command's options \
-                 after its name",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -1397,14 +1416,20 @@ fn parse_log_format(text: &str) -> Result<LogFormat, String> {
 /// How long the runtime's remaining threads get to finish once the daemon has stopped.
 const RUNTIME_GRACE: Duration = Duration::from_secs(10);
 
-/// Executes `exe`, the binary the daemon started from, with the same arguments, keeping the
-/// process ID, so that systemd, a container, or a terminal sees the same process (ADR-0038).
-/// Returns only if that fails.
+/// Executes `exe`, the binary the daemon started from, with the same arguments and the same
+/// `argv[0]`, keeping the process ID, so that systemd, a container, or a terminal sees the same
+/// process (ADR-0038), and a node started as `fleetringd` still calls itself that (ADR-0043,
+/// point 3.6). Returns only if that fails.
 #[cfg(unix)]
 fn restart_in_place(exe: &Path, restarts: u32) -> ExitCode {
     use std::os::unix::process::CommandExt as _;
     tracing::info!(exe = %exe.display(), "restarting in place");
     let error = std::process::Command::new(exe)
+        .arg0(
+            std::env::args_os()
+                .next()
+                .unwrap_or_else(|| exe.as_os_str().to_owned()),
+        )
         .args(std::env::args_os().skip(1))
         .env(RESTARTS_VAR, restarts.saturating_add(1).to_string())
         .exec();
@@ -1426,12 +1451,7 @@ fn prepare_dev(args: &DevArgs) -> Result<Prepared, DevError> {
     dev::prepare(&dir, args.port, SystemClock.now())
 }
 
-async fn run_daemon(
-    args: DaemonArgs,
-    config: Config,
-    dev: Option<Prepared>,
-) -> Result<Stopped, Box<dyn Error>> {
-    let config = args.apply(config);
+async fn run_daemon(config: Config, dev: Option<Prepared>) -> Result<Stopped, Box<dyn Error>> {
     // Read before an upgrade can replace the file: the path a restart executes again.
     let exe = std::env::current_exe()?;
     let data_dir = config.data_dir.clone();
@@ -1447,7 +1467,7 @@ async fn run_daemon(
     }
     let process = ProcessFile::this_process(exe.clone());
     if let Err(error) = process.write(&data_dir) {
-        tracing::warn!(%error, "can't write the process file; `fleetringd upgrade` can't restart this node in place");
+        tracing::warn!(%error, "can't write the process file; `fleetring upgrade` can't restart this node in place");
     }
     let (told, why) = tokio::sync::oneshot::channel();
     daemon
@@ -1469,7 +1489,9 @@ async fn run_daemon(
 
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     let output = match command {
-        Command::Dev(_) => return Err("fleetringd dev runs the daemon, not a command".into()),
+        Command::Serve(_) | Command::Dev(_) => {
+            return Err("serve and dev run a node, not a command".into());
+        }
         Command::Cert(command) => run_cert(command)?,
         Command::Token(command) => run_token(command).await?,
         Command::Status {
@@ -1683,7 +1705,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                         "warning: the database was restored without its expiry: {}",
                         printable(message)
                     );
-                    eprintln!("hint: fleetringd db edit {} --expires-in <d>", shown(&name));
+                    eprintln!("hint: fleetring db edit {} --expires-in <d>", shown(&name));
                     return Err(AlreadyReported.into());
                 }
                 _ => {}
@@ -1869,6 +1891,13 @@ async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
         node,
         fleet,
         timeout: args.timeout.unwrap_or(UPGRADE_TIMEOUT),
+        start_command: if args.yes {
+            StartCommand::Confirmed
+        } else if std::io::stdin().is_terminal() {
+            StartCommand::Ask
+        } else {
+            StartCommand::Unknown
+        },
     })
     .await?;
     if outcome.blocked {
@@ -2555,7 +2584,7 @@ async fn list_orphans(
                 );
             }
             Err(status) if asked_one => return Err(failed(status)),
-            Err(status) => eprintln!("fleetringd: can't ask {label}: {}", status.message()),
+            Err(status) => eprintln!("{}: can't ask {label}: {}", program(), status.message()),
         }
     }
     Ok(orphans)
@@ -2858,7 +2887,7 @@ fn format_node_status(status: &NodeStatus) -> String {
     for orphan in &status.orphans {
         let _ = writeln!(
             output,
-            "  {} epoch={} bytes={} (closed; `fleetringd orphan remove` deletes it)",
+            "  {} epoch={} bytes={} (closed; `fleetring orphan remove` deletes it)",
             shown(&orphan.database),
             orphan.epoch.get(),
             orphan.bytes,
@@ -3051,7 +3080,7 @@ fn updated_failed(status: tonic::Status, if_version: Option<u64>) -> Box<dyn Err
     match if_version {
         Some(version) if status.code() == tonic::Code::Aborted => format!(
             "the database's metadata changed since version {version}; read it again with \
-             fleetringd db show"
+             fleetring db show"
         )
         .into(),
         _ => metadata_failed(status),
@@ -3096,9 +3125,21 @@ impl std::fmt::Display for AlreadyReported {
 
 impl Error for AlreadyReported {}
 
+/// The name the binary was run as, set once at the start of `main`.
+static PROGRAM: OnceLock<ProgramName> = OnceLock::new();
+
+/// The name errors start with: the one the binary was run as (ADR-0043, point 1.3).
+fn program() -> &'static str {
+    PROGRAM
+        .get()
+        .copied()
+        .unwrap_or(ProgramName::Fleetring)
+        .as_str()
+}
+
 /// Prints an error and its causes, one per line.
 fn report(error: &dyn Error) {
-    eprintln!("fleetringd: {error}");
+    eprintln!("{}: {error}", program());
     let mut source = error.source();
     while let Some(cause) = source {
         eprintln!("  caused by: {cause}");
@@ -3195,6 +3236,8 @@ impl StopSignals {
 
 #[cfg(test)]
 mod tests {
+    use clap::error::ErrorKind;
+
     use super::*;
 
     #[test]
@@ -3220,20 +3263,73 @@ mod tests {
                 "fleetringd",
                 "--log-format",
                 "json",
+                "serve",
                 "--config",
                 "fleetring.toml",
+            ],
+            &[
+                "fleetringd",
+                "serve",
+                "--config",
+                "fleetring.toml",
+                "--log-format",
+                "json",
             ],
         ] {
             let cli = Cli::try_parse_from(words).expect("the flag parses");
             assert_eq!(cli.log_format, Some(LogFormat::Json), "{words:?}");
         }
-        let cli = Cli::try_parse_from(["fleetringd", "--config", "fleetring.toml"])
+        let cli = Cli::try_parse_from(["fleetringd", "serve", "--config", "fleetring.toml"])
             .expect("no flag parses");
         assert_eq!(cli.log_format, None);
     }
 
+    /// Parses `words` as `main` does, as the binary named by `words[0]`.
+    fn parse_as_main(words: &[&str]) -> Result<(Cli, Invocation), clap::Error> {
+        let raw: Vec<OsString> = words.iter().map(OsString::from).collect();
+        let name = ProgramName::from_arg0(raw.first().map(OsString::as_os_str));
+        parse(raw, name)
+    }
+
     #[test]
-    fn daemon_options_are_refused_next_to_a_subcommand() {
+    fn bare_daemon_flags_run_serve_under_either_name() {
+        for program in [
+            "fleetring",
+            "fleetringd",
+            "/usr/local/bin/fleetringd.previous",
+        ] {
+            for words in [
+                &[program, "--config", "f.toml", "--node-id", "n1"][..],
+                &[
+                    program,
+                    "--log-format",
+                    "json",
+                    "--config=f.toml",
+                    "--node-id=n1",
+                ],
+                &[program, "--node-id", "n1", "--config", "f.toml"],
+            ] {
+                let (cli, invocation) = parse_as_main(words).expect("the 0.6 form parses");
+                assert_eq!(invocation, Invocation::ServeImplied, "{words:?}");
+                let Command::Serve(args) = cli.command else {
+                    panic!("not serve: {:?}", cli.command);
+                };
+                assert_eq!(args.config, PathBuf::from("f.toml"), "{words:?}");
+                assert_eq!(args.node_id.map(|id| id.to_string()).as_deref(), Some("n1"));
+            }
+            let (cli, invocation) =
+                parse_as_main(&[program, "serve", "--config", "f.toml"]).expect("serve parses");
+            assert_eq!(invocation, Invocation::AsWritten);
+            assert!(
+                matches!(cli.command, Command::Serve(_)),
+                "{:?}",
+                cli.command
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_options_are_refused_next_to_another_command() {
         for words in [
             &["fleetringd", "--config", "fleetring.toml", "status"][..],
             &["fleetringd", "--control", "127.0.0.1:7400", "status"],
@@ -3245,10 +3341,11 @@ mod tests {
                 "--control",
                 "127.0.0.1:1",
             ],
+            &["fleetring", "serve", "--config", "fleetring.toml", "status"],
+            &["fleetring", "serve"],
         ] {
-            let cli = Cli::try_parse_from(words).expect("clap parses it");
-            let refused = cli.check().expect_err("a daemon option and a subcommand");
-            assert_eq!(refused.kind(), ErrorKind::ArgumentConflict, "{words:?}");
+            let refused = parse_as_main(words).expect_err("a daemon option and a command");
+            assert_eq!(refused.exit_code(), 2, "{words:?}");
         }
         for words in [
             &["fleetringd", "status", "--control", "127.0.0.1:7400"][..],
@@ -3268,8 +3365,54 @@ mod tests {
                 "json",
             ],
         ] {
-            let cli = Cli::try_parse_from(words).expect("clap parses it");
-            assert!(cli.check().is_ok(), "{words:?}");
+            assert!(parse_as_main(words).is_ok(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn no_command_prints_help_and_is_a_usage_error() {
+        let refused = parse_as_main(&["fleetring"]).expect_err("a command is required");
+        assert_eq!(
+            refused.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(refused.exit_code(), 2);
+    }
+
+    #[test]
+    fn the_version_and_usage_name_the_program_not_its_file() {
+        let version = env!("CARGO_PKG_VERSION");
+        for (program, name) in [
+            ("/usr/bin/fleetring", "fleetring"),
+            ("/usr/bin/fleetringd", "fleetringd"),
+            ("/usr/bin/fleetringd.previous", "fleetringd"),
+            ("/usr/bin/.fleetringd.new", "fleetringd"),
+            ("/usr/bin/fleetring.previous", "fleetring"),
+        ] {
+            let printed = parse_as_main(&[program, "--version"]).expect_err("--version exits");
+            assert_eq!(printed.kind(), ErrorKind::DisplayVersion);
+            assert_eq!(
+                printed.to_string(),
+                format!("{name} {version}\n"),
+                "{program}"
+            );
+            let usage = parse_as_main(&[program, "--bogus"]).expect_err("an unknown flag");
+            let text = usage.to_string();
+            assert!(
+                text.contains(&format!("Usage: {name} ")),
+                "{program}: {text}"
+            );
+            assert!(
+                !text.contains(".previous") && !text.contains(".new"),
+                "{text}"
+            );
+            let nested = parse_as_main(&[program, "db", "list", "--bogus"]).expect_err("unknown");
+            assert!(
+                nested
+                    .to_string()
+                    .contains(&format!("Usage: {name} db list")),
+                "{program}: {nested}"
+            );
         }
     }
 
@@ -3277,16 +3420,12 @@ mod tests {
     fn dev_takes_a_directory_and_a_port_and_no_daemon_options() {
         let cli = Cli::try_parse_from(["fleetringd", "dev", "--data-dir", "d", "--port", "7410"])
             .expect("dev parses");
-        assert!(cli.check().is_ok());
-        let Some(Command::Dev(args)) = cli.command else {
+        let Command::Dev(args) = cli.command else {
             panic!("not dev: {:?}", cli.command);
         };
         assert_eq!(args.data_dir, Some(PathBuf::from("d")));
         assert_eq!(args.port, Some(7410));
-        let cli = Cli::try_parse_from(["fleetringd", "--listen", "0.0.0.0:7400", "dev"])
-            .expect("clap parses it");
-        let refused = cli.check().expect_err("a daemon option beside dev");
-        assert_eq!(refused.kind(), ErrorKind::ArgumentConflict);
+        assert!(parse_as_main(&["fleetringd", "--listen", "0.0.0.0:7400", "dev"]).is_err());
         assert!(Cli::try_parse_from(["fleetringd", "dev", "--listen", "0.0.0.0:7400"]).is_err());
     }
 
@@ -3294,7 +3433,7 @@ mod tests {
     fn db_create_parses_labels_and_reads_a_description_from_stdin_when_dash() {
         let metadata = |words: &[&str]| {
             let cli = Cli::try_parse_from(words).expect("db create parses");
-            let Some(Command::Db(DbCommand::Create { metadata, .. })) = cli.command else {
+            let Command::Db(DbCommand::Create { metadata, .. }) = cli.command else {
                 panic!("not db create: {:?}", cli.command);
             };
             metadata
@@ -3438,9 +3577,9 @@ mod tests {
         assert!(Cli::try_parse_from([&remove[..], &control[..]].concat()).is_err());
         let cli = Cli::try_parse_from([&remove[..], &["--node", "data-1"], &control[..]].concat())
             .expect("orphan remove parses");
-        let Some(Command::Orphan(OrphanCommand::Remove {
+        let Command::Orphan(OrphanCommand::Remove {
             name, node, yes, ..
-        })) = cli.command
+        }) = cli.command
         else {
             panic!("not orphan remove: {:?}", cli.command);
         };
@@ -3460,7 +3599,7 @@ mod tests {
     fn db_show_takes_json_as_a_flag_or_an_output_format() {
         let format = |words: &[&str]| {
             let cli = Cli::try_parse_from(words).expect("db show parses");
-            let Some(Command::Db(DbCommand::Show { output, .. })) = cli.command else {
+            let Command::Db(DbCommand::Show { output, .. }) = cli.command else {
                 panic!("not db show: {:?}", cli.command);
             };
             output.format()
@@ -3501,12 +3640,12 @@ mod tests {
             ]
             .concat();
             let cli = Cli::try_parse_from(words).expect("db show parses");
-            let Some(Command::Db(DbCommand::Show {
+            let Command::Db(DbCommand::Show {
                 no_schema,
                 count_limit,
                 all,
                 ..
-            })) = cli.command
+            }) = cli.command
             else {
                 panic!("not db show: {:?}", cli.command);
             };
@@ -3574,7 +3713,7 @@ mod tests {
         };
         let expiry = |flags: &[&str]| {
             let cli = create(flags).expect("db create parses");
-            let Some(Command::Db(DbCommand::Create { metadata, .. })) = cli.command else {
+            let Command::Db(DbCommand::Create { metadata, .. }) = cli.command else {
                 panic!("not db create: {:?}", cli.command);
             };
             metadata.read(&b""[..]).expect("valid").expiry
@@ -3611,7 +3750,7 @@ mod tests {
             .concat(),
         )
         .expect("db restore parses");
-        let Some(Command::Db(DbCommand::Restore { metadata, .. })) = restore.command else {
+        let Command::Db(DbCommand::Restore { metadata, .. }) = restore.command else {
             panic!("not db restore");
         };
         assert_eq!(
@@ -3624,9 +3763,9 @@ mod tests {
     fn db_create_leaves_the_replication_factor_to_the_fleet_unless_given() {
         let factor = |words: &[&str]| {
             let cli = Cli::try_parse_from(words).expect("db create parses");
-            let Some(Command::Db(DbCommand::Create {
+            let Command::Db(DbCommand::Create {
                 replication_factor, ..
-            })) = cli.command
+            }) = cli.command
             else {
                 panic!("not db create: {:?}", cli.command);
             };
@@ -3803,7 +3942,7 @@ mod tests {
             );
             assert!(
                 error.contains(&format!(
-                    "hint: create it with `fleetringd cert client {name} --dir"
+                    "hint: create it with `fleetring cert client {name} --dir"
                 )),
                 "{error}"
             );

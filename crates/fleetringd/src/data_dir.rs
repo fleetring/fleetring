@@ -4,7 +4,9 @@ use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
-const LOCK_FILE: &str = "fleetringd.lock";
+/// The lock file in the data directory. Its name is kept until 1.0: a 0.6 upgrader checks it to
+/// tell whether a daemon runs (ADR-0043, point 1.7).
+pub(crate) const LOCK_FILE: &str = "fleetringd.lock";
 
 /// A data directory that this process holds an exclusive lock on.
 ///

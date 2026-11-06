@@ -1,4 +1,4 @@
-//! `fleetringd db edit`: one command for every setting of a database, and the hints that point
+//! `fleetring db edit`: one command for every setting of a database, and the hints that point
 //! the removed `db set-*` verbs at it (ADR-0032, ADR-0041).
 //!
 //! The metadata settings (description, labels, expiry) travel in one `UpdateDatabase` request.
@@ -291,19 +291,19 @@ pub(crate) fn removed_verb_hint(error: &clap::Error) -> Option<&'static str> {
     };
     match verb.as_str() {
         "set-description" => Some(
-            "hint: use 'fleetringd db edit <db> --description <text|->', or '--clear-description' \
+            "hint: use 'fleetring db edit <db> --description <text|->', or '--clear-description' \
              to remove it",
         ),
         "set-labels" => Some(
-            "hint: use 'fleetringd db edit <db> --label <key=value>' to set a label and \
+            "hint: use 'fleetring db edit <db> --label <key=value>' to set a label and \
              '--remove-label <key>' to remove one",
         ),
         "set-expiry" => Some(
-            "hint: use 'fleetringd db edit <db> --expires-in <duration>', '--expires-at <time>', \
+            "hint: use 'fleetring db edit <db> --expires-in <duration>', '--expires-at <time>', \
              or '--clear-expiry'",
         ),
         "set-durability" => Some(
-            "hint: use 'fleetringd db edit <db> --acks <quorum|all|local>', with \
+            "hint: use 'fleetring db edit <db> --acks <quorum|all|local>', with \
              '--min-replicas <n>' for the floor",
         ),
         _ => None,
@@ -328,7 +328,7 @@ mod tests {
 
     fn edit(flags: &[&str]) -> EditArgs {
         let cli = parse(flags).expect("db edit parses");
-        let Some(Command::Db(DbCommand::Edit(args))) = cli.command else {
+        let Command::Db(DbCommand::Edit(args)) = cli.command else {
             panic!("not db edit: {:?}", cli.command);
         };
         args
@@ -494,7 +494,7 @@ mod tests {
             .expect_err("the verb is removed");
             let hint = removed_verb_hint(&error).expect("a hint");
             assert!(
-                hint.starts_with("hint: use 'fleetringd db edit <db> "),
+                hint.starts_with("hint: use 'fleetring db edit <db> "),
                 "{hint}"
             );
             assert!(hint.contains(flags), "{verb}: {hint}");

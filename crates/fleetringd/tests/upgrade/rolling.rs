@@ -1,15 +1,18 @@
 //! The rolling upgrade from the previous release to this build (FR-054, ADR-0038 point 9).
 //!
-//! A three-node fleet starts on the previous release's binary. A client writes and reads
+//! A three-node fleet starts on the previous release's binary, installed as `fleetringd` and run
+//! as `fleetringd --config <file>`, as every release before 0.7 runs. A client writes and reads
 //! throughout while each node in turn, the control node last, moves to this build, and the whole
 //! history is checked at the end: no write failed beyond its one retry, no read was stale, and no
-//! acknowledged write was lost.
+//! acknowledged write was lost. A previous release with `upgrade` installs this build itself, from
+//! an archive laid out as the release workflow lays it out, with `fleetring` and a regular copy
+//! named `fleetringd` (ADR-0043, point 3).
 //!
 //! The previous release comes from one of:
 //!
-//! - `FLEETRINGD_BASELINE_VERSION`, such as `0.3.0`: this build's own `fleetringd upgrade
-//!   --version <it> --no-restart` downloads the release from GitHub and verifies it with the real
-//!   cosign, into a scratch directory. The nightly workflow uses this.
+//! - `FLEETRINGD_BASELINE_VERSION`, such as `0.6.0`: this build's own `fleetring upgrade
+//!   --version <it> --no-restart --yes` downloads the release from GitHub and verifies it with
+//!   the real cosign, into a scratch directory. The nightly workflow uses this.
 //! - `FLEETRINGD_BASELINE_BIN`: a binary built locally, as before the release exists.
 //!
 //! With neither, the test says so and passes. It is `#[ignore]`d: a run takes minutes.
@@ -23,9 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fleetring::NodeId;
 
 use crate::common::{
-    Defect, ProcessFleet, ReleaseServer, TestResult, check_history, create_history_database,
-    current, fake_cosign, path_with, printed, progress, wait_for_members, wait_for_reported,
-    write_release, write_until,
+    ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, check_history,
+    create_history_database, current, fake_cosign, path_with, printed, progress, release_of,
+    wait_for_members, wait_for_reported, write_release, write_until,
 };
 
 /// The previous release's binary, from the environment, or `None` to skip.
@@ -37,25 +40,17 @@ fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
         return Ok(None);
     };
     // This build installs the release over a scratch copy of itself, verifying it as any
-    // upgrade does, with the cosign on the real PATH.
+    // upgrade does, with the cosign on the real PATH. No node runs here, so `--yes` says that
+    // none starts with `serve`, which a release before 0.7 can't run.
     let bin = scratch.join("baseline").join("fleetringd");
     fs::create_dir_all(bin.parent().ok_or("no parent")?)?;
-    fs::copy(env!("CARGO_BIN_EXE_fleetringd"), &bin)?;
+    fs::copy(env!("CARGO_BIN_EXE_fleetring"), &bin)?;
     let installed = Command::new(&bin)
-        .args(["upgrade", "--version", &version, "--no-restart"])
+        .args(["upgrade", "--version", &version, "--no-restart", "--yes"])
         .output()?;
     assert!(installed.status.success(), "{}", printed(&installed));
     progress(&format!("downloaded and verified fleetringd {version}"));
     Ok(Some(bin))
-}
-
-/// The release `bin` says it is.
-fn release_of(bin: &Path) -> TestResult<fleetring_control::Release> {
-    let printed = Command::new(bin).arg("--version").output()?;
-    Ok(String::from_utf8_lossy(&printed.stdout)
-        .trim()
-        .trim_start_matches("fleetringd ")
-        .parse()?)
 }
 
 /// Whether the binary at `bin` has the `upgrade` command.
@@ -70,7 +65,7 @@ fn has_upgrade(bin: &Path) -> TestResult<bool> {
 /// Replaces the binary at `bin` with this build, atomically, as `install.sh` does.
 fn install_this_build(bin: &Path) -> TestResult {
     let staged = bin.with_file_name(".fleetringd.new");
-    fs::copy(env!("CARGO_BIN_EXE_fleetringd"), &staged)?;
+    fs::copy(env!("CARGO_BIN_EXE_fleetring"), &staged)?;
     fs::rename(&staged, bin)?;
     Ok(())
 }
@@ -109,15 +104,16 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     write_release(
         &releases.join(&tag),
         &current(),
-        &fs::read(env!("CARGO_BIN_EXE_fleetringd"))?,
+        &fs::read(env!("CARGO_BIN_EXE_fleetring"))?,
         Defect::None,
+        ArchiveLayout::Both,
     )?;
     let server = ReleaseServer::serve(&releases)?;
     let url = server.url(&tag);
     let cosign = scratch.path().join("cosign");
     fake_cosign(&cosign, "2.4.3")?;
     let path = path_with(&cosign);
-    let this_build = PathBuf::from(env!("CARGO_BIN_EXE_fleetringd"));
+    let this_build = PathBuf::from(env!("CARGO_BIN_EXE_fleetring"));
 
     // The data nodes first, then the control node.
     for index in [2, 1, 0] {
@@ -173,6 +169,12 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         // upgraded, the rejoin is all there is to see; then every member reports this build.
         let expected = (index == 0).then(current);
         runtime.block_on(wait_for_members(&client, &[id.as_str()], expected.as_ref()))?;
+        // Whatever installed it, the node's file is still `fleetringd`, and says so.
+        let printed_version = Command::new(&bin).arg("--version").output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&printed_version.stdout).trim(),
+            format!("fleetringd {}", current())
+        );
         progress(&format!("{id} runs {}", current()));
 
         if index == 2 && baseline_lacks_undrain {
@@ -209,12 +211,22 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         .arg("--config")
         .arg(&node.config)
         .output()?;
+    let stdout = String::from_utf8_lossy(&reinstalled.stdout);
     assert!(
         reinstalled.status.success()
-            && String::from_utf8_lossy(&reinstalled.stdout).contains("caught up"),
+            && stdout.contains("caught up")
+            && stdout.contains("added fleetring beside fleetringd"),
         "{}\n{}",
         printed(&reinstalled),
         fleet.logs()
+    );
+    // The name this build added is the same file.
+    let printed_version = Command::new(node.bin.with_file_name("fleetring"))
+        .arg("--version")
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&printed_version.stdout).trim(),
+        format!("fleetring {}", current())
     );
 
     stop.store(true, Ordering::SeqCst);
