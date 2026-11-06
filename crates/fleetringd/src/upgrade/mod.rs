@@ -588,8 +588,8 @@ fn knows_serve(release: &Release) -> bool {
 /// # Errors
 ///
 /// [`UpgradeError::StartedWithServe`] if the node was started with `serve`, or the answer on the
-/// terminal says one was, and [`UpgradeError::StartCommandUnknown`] if it can't tell and can't
-/// ask.
+/// terminal isn't an explicit yes that none was, and [`UpgradeError::StartCommandUnknown`] if it
+/// can't tell and can't ask.
 fn check_start_command(
     options: &Options,
     running: Option<&Option<ProcessFile>>,
@@ -612,19 +612,20 @@ fn check_start_command(
                 release: release.clone(),
             }),
             StartCommand::Ask => {
-                if ask_whether_serve(release)? {
-                    Err(refused())
-                } else {
+                if ask_none_starts_with_serve(release)? {
                     Ok(())
+                } else {
+                    Err(refused())
                 }
             }
         },
     }
 }
 
-/// Asks on the terminal whether any node on this machine starts with `fleetring serve`, and
-/// returns the answer: yes unless it is `n` or `no`, or empty, the default.
-fn ask_whether_serve(release: &Release) -> Result<bool, UpgradeError> {
+/// Asks on the terminal to confirm that no node on this machine starts with `fleetring serve`,
+/// and returns whether the answer confirms it. Only `y` or `yes` does: Enter, `n`, or anything
+/// else refuses, as without a terminal; `--yes` confirms without asking.
+fn ask_none_starts_with_serve(release: &Release) -> Result<bool, UpgradeError> {
     let unknown = |_| UpgradeError::StartCommandUnknown {
         release: release.clone(),
     };
@@ -637,17 +638,20 @@ fn ask_whether_serve(release: &Release) -> Result<bool, UpgradeError> {
     let mut stderr = std::io::stderr();
     write!(
         stderr,
-        "does any node on this machine start with 'fleetring serve'? fleetring {release} can't \
-         run it [y/N] "
+        "fleetring {release} can't run 'fleetring serve'. Is every node on this machine started \
+         without it? [y/N] "
     )
     .and_then(|()| stderr.flush())
     .map_err(unknown)?;
     let mut answer = String::new();
     stdin.lock().read_line(&mut answer).map_err(unknown)?;
+    Ok(confirms(&answer))
+}
+
+/// Whether a `[y/N]` answer is an explicit yes: `y` or `yes`, in any case. Enter is no.
+fn confirms(answer: &str) -> bool {
     let answer = answer.trim();
-    Ok(!(answer.is_empty()
-        || answer.eq_ignore_ascii_case("n")
-        || answer.eq_ignore_ascii_case("no")))
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 /// Puts the `fleetring` name beside a binary installed as `fleetringd` (ADR-0043, point 3.4), and
@@ -1064,6 +1068,25 @@ mod tests {
         let options = scratch.options(Mode::Rollback, Restart::No, None);
         roll_back(&options, &scratch.installed).await?;
         Ok(())
+    }
+
+    #[test]
+    fn only_an_explicit_yes_confirms_that_no_node_starts_with_serve() {
+        for answer in ["y\n", "Y\n", "yes\n", " YES \n", "y"] {
+            assert!(confirms(answer), "{answer:?}");
+        }
+        for answer in [
+            "",
+            "\n",
+            "n\n",
+            "no\n",
+            "N",
+            "maybe\n",
+            "yes please\n",
+            "ye\n",
+        ] {
+            assert!(!confirms(answer), "{answer:?}");
+        }
     }
 
     #[tokio::test]
