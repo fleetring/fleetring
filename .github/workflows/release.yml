@@ -1,7 +1,12 @@
-# Release builds of `fleetringd` (FR-034). A `fleetringd-vX.Y.Z` tag builds the daemon for every
-# target on a native runner, packages each build with the licenses and a README, checksums the
-# archives, and attaches them to the tag's GitHub release. A manual run is a dry run: it builds
-# and packages everything as workflow artifacts and publishes nothing.
+# Release builds of the `fleetring` binary, from the `fleetringd` package (FR-034). A
+# `fleetringd-vX.Y.Z` tag builds it for every target on a native runner, packages each build with
+# the licenses and a README, checksums the archives, and attaches them to the tag's GitHub
+# release. A manual run is a dry run: it builds and packages everything as workflow artifacts and
+# publishes nothing.
+#
+# The tags and archives keep the `fleetringd` names, and each archive holds the binary as
+# `fleetring` and as a regular copy named `fleetringd`, because a 0.6 upgrader looks for that file
+# (ADR-0043, point 3).
 #
 # The `fleetring` crate is released separately, to crates.io, from `fleetring-v*` tags
 # (RELEASING.md).
@@ -33,7 +38,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The tag names the version `fleetringd --version` prints, so they must agree.
+      # The tag names the version `fleetring --version` prints, so they must agree.
       - id: version
         name: read the version and check it against the tag
         run: |
@@ -106,15 +111,25 @@ jobs:
           fi
           RUSTFLAGS="$rustflags" cargo build --locked --release -p fleetringd --target "$TARGET"
 
-      # Every target but Intel macOS runs on its runner.
+      # Every target but Intel macOS runs on its runner. The binary names itself after the file it
+      # runs as: `fleetring`, or `fleetringd`, its name until 1.0.
       - name: smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: |
           case "$TARGET" in *-windows-*) exe=.exe ;; *) exe="" ;; esac
-          printed=$("target/$TARGET/release/fleetringd$exe" --version)
+          printed=$("target/$TARGET/release/fleetring$exe" --version)
+          echo "$printed"
+          test "$printed" = "fleetring $VERSION"
+          mkdir -p smoke
+          cp "target/$TARGET/release/fleetring$exe" "smoke/fleetringd$exe"
+          printed=$("smoke/fleetringd$exe" --version)
           echo "$printed"
           test "$printed" = "fleetringd $VERSION"
+          rm -r smoke
 
+      # The directory keeps its `fleetringd-` name. It holds `fleetring` and a second regular copy
+      # named `fleetringd`: a 0.6 upgrader extracts only a regular file at that path, so neither a
+      # hard link nor a symbolic link will do (ADR-0043, point 3.1). Windows gets two copies too.
       - name: package
         run: |
           name="fleetringd-$VERSION-$TARGET"
@@ -124,20 +139,28 @@ jobs:
           cd dist
           case "$TARGET" in
             *-windows-*)
-              cp "../target/$TARGET/release/fleetringd.exe" "$name/"
+              cp "../target/$TARGET/release/fleetring.exe" "$name/fleetring.exe"
+              cp "../target/$TARGET/release/fleetring.exe" "$name/fleetringd.exe"
               7z a -tzip "$name.zip" "$name" > /dev/null
               ;;
             *-linux-*)
-              cp "../target/$TARGET/release/fleetringd" "$name/"
+              cp "../target/$TARGET/release/fleetring" "$name/fleetring"
+              cp "../target/$TARGET/release/fleetring" "$name/fleetringd"
               tar --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
               ;;
             *)
-              cp "../target/$TARGET/release/fleetringd" "$name/"
+              cp "../target/$TARGET/release/fleetring" "$name/fleetring"
+              cp "../target/$TARGET/release/fleetring" "$name/fleetringd"
               tar --uid 0 --gid 0 --numeric-owner -czf "$name.tar.gz" "$name"
               ;;
           esac
           rm -r "$name"
           ls -l
+
+      # Both entries regular files, identical, each naming itself; run where the runner can.
+      - name: check the archive
+        if: runner.os != 'Windows'
+        run: scripts/check-archive.sh "dist/fleetringd-$VERSION-$TARGET.tar.gz" "$VERSION" "$TARGET"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -217,7 +240,8 @@ jobs:
           flags=()
           case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
           cat > notes.md <<EOF
-          The \`fleetringd\` daemon, version $VERSION.
+          FleetRing's \`fleetring\` binary, version $VERSION. Until 1.0 it is also installed as
+          \`fleetringd\`, its name before 0.7.
 
           Install the binary for this machine, verified against \`SHA256SUMS\`:
 
@@ -225,7 +249,7 @@ jobs:
           curl -fsSL https://github.com/$GH_REPO/releases/download/$TAG/install.sh | sh -s -- --version $VERSION
           \`\`\`
 
-          Or run the container image: \`docker run ghcr.io/fleetring/fleetringd:$VERSION\`.
+          Or run the container image: \`docker run ghcr.io/fleetring/fleetring:$VERSION\`.
 
           \`SHA256SUMS\` is signed by this repository's release workflow, and every archive and
           \`install.sh\` has build provenance. To verify a download:
@@ -237,5 +261,5 @@ jobs:
           gh attestation verify <file> --repo $GH_REPO
           \`\`\`
           EOF
-          gh release create "$TAG" dist/* --verify-tag --title "fleetringd $VERSION" \
+          gh release create "$TAG" dist/* --verify-tag --title "fleetring $VERSION" \
             --notes-file notes.md "${flags[@]}"
