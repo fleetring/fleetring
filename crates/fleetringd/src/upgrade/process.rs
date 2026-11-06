@@ -59,6 +59,8 @@ impl ProcessFile {
                 .ok()
                 .and_then(|restarts| restarts.parse().ok())
                 .unwrap_or(0),
+            // The daemon's command line, as `ps` shows it. No daemon flag may carry a secret:
+            // this file is only as private as `write` makes it.
             args: std::env::args_os()
                 .skip(1)
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -84,13 +86,31 @@ impl ProcessFile {
 
     /// Writes the file into `data_dir`, replacing any earlier one.
     ///
+    /// On Unix only its owner may read it (mode 0600), whatever the umask: it holds the daemon's
+    /// arguments. Whoever acts on it, an upgrade's `SIGHUP` or `stop`'s `SIGTERM`, must be the
+    /// daemon's user or root to signal it anyway, as 0.6's upgrader had to be.
+    ///
     /// # Errors
     ///
     /// If the file can't be written.
     pub fn write(&self, data_dir: &Path) -> io::Result<()> {
         let path = data_dir.join(PROCESS_FILE);
         let staged = data_dir.join(format!(".{PROCESS_FILE}"));
-        fs::write(&staged, serde_json::to_vec(self).map_err(io::Error::other)?)?;
+        // A file left by an earlier writer keeps its mode when truncated, so start afresh.
+        match fs::remove_file(&staged) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&staged)?;
+        io::Write::write_all(
+            &mut file,
+            &serde_json::to_vec(self).map_err(io::Error::other)?,
+        )?;
+        drop(file);
         fs::rename(staged, path)
     }
 
@@ -179,6 +199,25 @@ mod tests {
         assert!(ProcessFile::read(dir.path())?.is_some());
         written.remove(dir.path());
         assert_eq!(ProcessFile::read(dir.path())?, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_its_owner_reads_the_process_file() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        // A world-readable file left where the staged copy goes doesn't lend it its mode.
+        let staged = dir.path().join(format!(".{PROCESS_FILE}"));
+        fs::write(&staged, b"{}")?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o644))?;
+        let written = ProcessFile::this_process(PathBuf::from("/usr/local/bin/fleetring"));
+        written.write(dir.path())?;
+        let mode = fs::metadata(dir.path().join(PROCESS_FILE))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert_eq!(ProcessFile::read(dir.path())?, Some(written));
         Ok(())
     }
 
