@@ -7,7 +7,8 @@
 # `fleetringd` as regular files (a 0.6 upgrader extracts only a regular file named `fleetringd`;
 # a hard link or a symbolic link fails it), identical byte for byte. Where this machine runs the
 # target, each must print its own name and the version: `fleetring <version>` and
-# `fleetringd <version>`. Exits 1 on the first failure, saying which.
+# `fleetringd <version>`. It must also hold the man pages under `man/`, `man/fleetring.1` among
+# them. Exits 1 on the first failure, saying which.
 
 set -eu
 
@@ -63,6 +64,11 @@ for name in fleetring fleetringd; do
         *" link to "* | *" -> "*) fail "$path is a link: $line" ;;
     esac
 done
+
+# The man pages, which `crates/fleetringd/man/` holds (docs/cli.md, section 9).
+page="$dir/man/fleetring.1"
+printf '%s\n' "$listing" | awk -v path="$page" '{ for (i = 1; i <= NF; i++) if ($i == path) found = 1 } END { exit !found }' ||
+    fail "$archive holds no $page"
 
 tmp=$(mktemp -d 2> /dev/null || mktemp -d -t check-archive)
 trap 'rm -rf "$tmp"' EXIT

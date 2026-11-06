@@ -9,32 +9,33 @@ Examples:
   fleetring switch prod              talk to another fleet
 
 Getting started:
-  dev      Runs a node for development; `-d` runs it in the background
-  serve    Runs a node
-  stop     Stops a node started in a terminal or a script, after it drains
-  switch   Makes another context current
-  context  Names, lists and selects contexts, so that commands need no flags
+  dev          Runs a node for development; `-d` runs it in the background
+  serve        Runs a node
+  stop         Stops a node started in a terminal or a script, after it drains
+  switch       Makes another context current
+  context      Names, lists and selects contexts, so commands need no flags
+  completions  Prints a completion script for bash, zsh, fish, or powershell
 
 Databases:
-  db       Creates, lists, writes, reads, locates, and drops databases
+  db           Creates, lists, writes, reads, locates, and drops databases
 
 Fleet:
-  status   Shows the fleet's members and ring, or one data node's view
-  node     Lists, drains, undrains, and removes the fleet's members
-  orphan   Lists and removes orphans: copies the control plane doesn't know
-  upgrade  Installs another release in place of this binary
-  lease    Follows the leases data nodes hold
+  status       Shows the fleet's members and ring, or one data node's view
+  node         Lists, drains, undrains, and removes the fleet's members
+  orphan       Lists and removes orphans: copies the control plane doesn't know
+  upgrade      Installs another release in place of this binary
+  lease        Follows the leases data nodes hold
 
 Security:
-  cert     Creates the authority, and issues node and client certificates
-  token    Issues and revokes bearer tokens
+  cert         Creates the authority, and issues node and client certificates
+  token        Issues and revokes bearer tokens
 
 Agents:
-  mcp      Serves the Model Context Protocol on stdio, as one principal
-  agent    Adds, lists, shows, renews, and removes agents' identities
+  mcp          Serves the Model Context Protocol on stdio, as one principal
+  agent        Adds, lists, shows, renews, and removes agents' identities
 
 Recovery:
-  archive  Shows and verifies archives, and restores from one with no fleet
+  archive      Shows and verifies archives, and restores from one with no fleet
 
 Options:
       --log-format <LOG_FORMAT>  Writes log lines as `text` or `json`

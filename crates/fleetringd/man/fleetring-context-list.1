@@ -1,0 +1,60 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-context-list 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-context\-list \- Lists the contexts, marking the current one
+.SH SYNOPSIS
+\fBfleetring context list\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Lists the contexts, marking the current one
+.SH OPTIONS
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: table]
+The output format: `table`, `json`, or `jsonl`
+
+`table` is for people; `json` is one object with stable snake_case fields; `jsonl` is the same object on one line. A watch prints one object per line for either.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+table: For people: a table, or key and value lines for one item
+.IP \(bu 2
+json: For programs: one JSON object, indented
+.IP \(bu 2
+jsonl: For programs: one JSON object per line
+.RE
+.TP
+\fB\-\-json\fR
+Short for `\-o json`
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -1,0 +1,141 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-upgrade 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-upgrade \- Installs another release in place of this binary
+.SH SYNOPSIS
+\fBfleetring upgrade\fR [\fB\-\-version\fR] [\fB\-\-check\fR] [\fB\-\-no\-restart\fR] [\fB\-\-rollback\fR] [\fB\-\-base\-url\fR] [\fB\-\-releases\-url\fR] [\fB\-\-timeout\fR] [\fB\-\-software\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-token\fR] [\fB\-\-color\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Installs another release in place of this binary
+.PP
+The release is verified with cosign against the release workflow\*(Aqs identity, and then by checksum; this binary is kept as `<name>.previous`. With `\-\-config` naming a running node, it first checks that the fleet allows the release, then drains the node, restarts it in place, and waits until it has rejoined and caught up (ADR\-0038).
+.SH OPTIONS
+.TP
+\fB\-\-version\fR \fI<VERSION>\fR
+The release to install, such as 0.4.0; the newest final release by default
+
+Naming the installed release reinstalls it.
+.TP
+\fB\-\-check\fR
+Reports the installed and the newest release, and changes nothing
+
+It also reports whether the fleet allows the newest release, and exits 1 if a newer release exists that the fleet doesn\*(Aqt allow.
+.TP
+\fB\-\-no\-restart\fR
+Replaces the binary, but leaves the running node on the release it runs
+.TP
+\fB\-\-rollback\fR
+Swaps back the binary the last upgrade replaced, `<name>.previous`
+
+It restarts the node as an upgrade does. A second rollback rolls forward again.
+.TP
+\fB\-\-base\-url\fR \fI<BASE_URL>\fR
+Downloads the release\*(Aqs files from this mirror URL instead of GitHub
+
+A mirror\*(Aqs directory for one release, as `install.sh \-\-base\-url` takes it. Needs `\-\-version`.
+.TP
+\fB\-\-releases\-url\fR \fI<RELEASES_URL>\fR
+Reads the list of releases from this URL instead of GitHub\*(Aqs
+
+The list is the JSON GitHub\*(Aqs API returns; a mirror\*(Aqs lets `upgrade` find its newest release.
+.TP
+\fB\-\-timeout\fR \fI<TIMEOUT>\fR
+How long each step may take: `<n>m` or `<n>s`; 5m by default
+
+The steps are each download, the drain, the rejoin, and the catch\-up.
+.TP
+\fB\-\-software\fR
+Prints what this binary runs as one JSON object, and changes nothing
+
+The object holds its release, protocol, control\-log format, and fleet features. An upgrade asks a release\*(Aqs binary this before it installs it, to check the fleet\*(Aqs features.
+.TP
+\fB\-\-yes\fR
+Confirms without a prompt that no node here starts with `fleetring serve`
+
+Needed to install or roll back to a release before 0.7, which can\*(Aqt run `serve`, when no `\-\-config` names a running node to check.
+.TP
+\fB\-\-control\fR \fI<CONTROL>\fR
+The control node\*(Aqs address, `host:port`
+
+The node that runs the control role, not any node in the fleet; a data\-only node answers with the control node\*(Aqs address. Defaults to `FLEETRING_CONTROL`, or else the context\*(Aqs `control`, when neither this nor `\-\-config` is given.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+A daemon\*(Aqs configuration file, to take the control node\*(Aqs address from
+.TP
+\fB\-\-context\fR \fI<NAME>\fR
+Uses this context for every setting it names, instead of the current one
+
+It outranks the environment variables; `FLEETRING_CONTEXT`, and else the current context, rank below them.
+.TP
+\fB\-\-tls\-dir\fR \fI<DIR>\fR
+A directory with `ca.crt` and the client certificates `cert client` writes
+
+`client.crt` and `client.key`, and the `client.<principal>.crt` and `.key` files `\-\-as` picks from. Defaults to `FLEETRING_TLS_DIR`, or else the context\*(Aqs `tls_dir`.
+.TP
+\fB\-\-ca\fR \fI<CA>\fR
+The trusted authority certificates, PEM
+
+Defaults to `FLEETRING_CA`, the context\*(Aqs `ca`, or `ca.crt` in the TLS directory.
+.TP
+\fB\-\-cert\fR \fI<CERT>\fR
+The client certificate, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_CERT`, the context\*(Aqs `cert`, or `client.crt` in the TLS directory.
+.TP
+\fB\-\-key\fR \fI<KEY>\fR
+The client certificate\*(Aqs private key, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_KEY`, the context\*(Aqs `key`, or `client.key` in the TLS directory.
+.TP
+\fB\-\-as\fR \fI<PRINCIPAL>\fR
+Acts as this principal, with its certificate in the TLS directory
+
+Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as `cert client <principal>` writes them. An explicit certificate or key at the same step wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults to `FLEETRING_AS`, or else the context\*(Aqs `as`.
+.TP
+\fB\-\-insecure\-plaintext\fR
+Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+A bearer token from `token issue`, sent with every request
+
+The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-\-token\-file\fR \fI<PATH>\fR
+A file that holds a bearer token, or `\-` for stdin
+
+Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
+.TP
+\fB\-\-agent\fR \fI<ID>\fR
+Acts as the agent with this ID, with the identity minted for it
+
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

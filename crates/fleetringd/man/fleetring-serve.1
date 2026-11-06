@@ -1,0 +1,71 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-serve 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-serve \- Runs a node
+.SH SYNOPSIS
+\fBfleetring serve\fR [\fB\-\-node\-id\fR] [\fB\-\-data\-dir\fR] [\fB\-\-listen\fR] [\fB\-\-advertise\fR] [\fB\-\-control\fR] [\fB\-\-role\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-config\fR> 
+.SH DESCRIPTION
+Runs a node.
+.PP
+Runs a node of a fleet from its configuration file; the flags override the file\*(Aqs settings.
+.PP
+Until 1.0, the flags without `serve` (`fleetring \-\-config <file>`, or `fleetringd \-\-config
+<file>`, as 0.6 ran a node) also run a node, and log a warning.
+.SH OPTIONS
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+The TOML configuration file
+.TP
+\fB\-\-node\-id\fR \fI<NODE_ID>\fR
+Overrides `node.id`
+.TP
+\fB\-\-data\-dir\fR \fI<DATA_DIR>\fR
+Overrides `data_dir`
+.TP
+\fB\-\-listen\fR \fI<LISTEN>\fR
+Overrides `listen`
+.TP
+\fB\-\-advertise\fR \fI<ADVERTISE>\fR
+Overrides `node.advertise`
+.TP
+\fB\-\-control\fR \fI<CONTROL>\fR
+Overrides `control.address`
+.TP
+\fB\-\-role\fR \fI<ROLE>\fR
+Overrides `role`: `both`, `data`, or `control`
+.TP
+\fB\-\-insecure\-plaintext\fR
+Runs without a `[tls]` table, in plaintext, for local experiments only
+
+Nothing on the wire is authenticated or encrypted.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

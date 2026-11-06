@@ -1,0 +1,53 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-cert-init 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-cert\-init \- Creates the authority: `ca.crt` and `ca.key` in the directory
+.SH SYNOPSIS
+\fBfleetring cert init\fR [\fB\-\-ttl\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-fleet\fR> <\fB\-\-dir\fR> 
+.SH DESCRIPTION
+Creates the authority: `ca.crt` and `ca.key` in the directory
+.PP
+Keep `ca.key` off every node; it is the one secret that issues certificates.
+.SH OPTIONS
+.TP
+\fB\-\-fleet\fR \fI<FLEET>\fR
+The fleet\*(Aqs name, which every certificate the authority issues names
+.TP
+\fB\-\-dir\fR \fI<DIR>\fR
+The directory to write into; created if missing
+.TP
+\fB\-\-ttl\fR \fI<TTL>\fR
+How long the authority\*(Aqs certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+
+Ten years by default.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -64,6 +64,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod agent;
 mod agent_cmd;
 mod compat;
+mod completions;
 mod confirm;
 mod context_cmd;
 mod dev_cmd;
@@ -71,13 +72,17 @@ mod edit;
 mod exit;
 mod format;
 mod help;
+#[cfg(test)]
+mod man;
 mod progress;
 mod resolve;
 mod stop;
 
 use agent::{AgentDir, AgentId};
 use agent_cmd::AgentCommand;
+use clap_complete::engine::ArgValueCandidates;
 use compat::{Invocation, ProgramName};
+use completions::CompletionsArgs;
 use confirm::Place;
 use context_cmd::ContextCommand;
 use dev_cmd::DevArgs;
@@ -186,7 +191,7 @@ enum Command {
     /// Sends the node SIGTERM through its process file, which drains it, and waits until it has
     /// exited. Refuses a node a supervisor runs. `dev stop` stops the dev node.
     Stop(StopArgs),
-    /// Names, lists and selects contexts, so that commands need no flags
+    /// Names, lists and selects contexts, so commands need no flags
     ///
     /// A context names a fleet's control addresses, certificates and principal (ADR-0043).
     #[command(subcommand)]
@@ -197,9 +202,15 @@ enum Command {
     /// terminal and without a name it lists the contexts and exits 2.
     Switch {
         /// The context to switch to, or `-` for the previous one.
-        #[arg(allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true, add = ArgValueCandidates::new(completions::context_names))]
         target: Option<String>,
     },
+    /// Prints a completion script for bash, zsh, fish, or powershell
+    ///
+    /// The script completes commands, flags and values, with context names and agent IDs read
+    /// from this machine's files.
+    #[command(after_long_help = completions::COMPLETIONS_HELP)]
+    Completions(CompletionsArgs),
     /// Creates the authority, and issues node and client certificates
     #[command(subcommand)]
     Cert(CertCommand),
@@ -1041,7 +1052,11 @@ struct Target {
     ///
     /// It outranks the environment variables; `FLEETRING_CONTEXT`, and else the current context,
     /// rank below them.
-    #[arg(long, value_name = "NAME")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        add = ArgValueCandidates::new(completions::context_names)
+    )]
     context: Option<ContextName>,
     #[command(flatten)]
     tls: TlsArgs,
@@ -1114,7 +1129,8 @@ struct TlsArgs {
         value_name = "ID",
         conflicts_with_all = [
             "principal", "cert", "key", "tls_dir", "token", "token_file", "insecure_plaintext"
-        ]
+        ],
+        add = ArgValueCandidates::new(completions::agent_ids)
     )]
     agent: Option<AgentId>,
 }
@@ -1706,6 +1722,9 @@ fn main() -> ExitCode {
     let raw: Vec<OsString> = std::env::args_os().collect();
     let name = ProgramName::from_arg0(raw.first().map(OsString::as_os_str));
     PROGRAM.get_or_init(|| name);
+    // A shell's completion script runs the binary with `FLEETRING_COMPLETE` set: answer, and exit.
+    completions::complete_if_asked(name);
+    let arg0 = raw.first().cloned();
     let (cli, invocation) = match parse(raw, name) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -1733,6 +1752,7 @@ fn main() -> ExitCode {
     let command = match command {
         Command::Context(command) => return finish(context_cmd::run(command)),
         Command::Switch { target } => return finish(context_cmd::switch(target.as_deref())),
+        Command::Completions(args) => return finish(completions::print(&args, name, arg0)),
         command => command,
     };
     // The daemon reads its configuration before logging starts, since it may name the format;
@@ -1969,8 +1989,8 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Serve(_) | Command::Dev(_) => {
             return Err("serve and dev run a node, not a command".into());
         }
-        Command::Context(_) | Command::Switch { .. } => {
-            return Err("context and switch don't talk to a fleet".into());
+        Command::Context(_) | Command::Switch { .. } | Command::Completions(_) => {
+            return Err("context, switch and completions don't talk to a fleet".into());
         }
         Command::Stop(args) => stop::run(args).await?,
         Command::Cert(command) => run_cert(command)?,

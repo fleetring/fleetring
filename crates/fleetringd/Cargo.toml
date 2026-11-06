@@ -16,6 +16,9 @@ arc-swap.workspace = true
 base64 = "0.22"
 blake3.workspace = true
 clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+# `fleetring completions`: the shell runs the binary again on each Tab, so context names and
+# agent IDs complete from this machine's files (docs/cli.md, section 9).
+clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # The picker `fleetring switch` opens on a terminal (ADR-0043, point 12).
 dialoguer = { version = "0.12", default-features = false, features = ["fuzzy-select"] }
 fleetring = { path = "../fleetring", features = ["serde"] }
@@ -93,6 +96,8 @@ name = "observe"
 harness = false
 
 [dev-dependencies]
+# Renders the man pages checked in under `man/`, in a test (docs/cli.md, section 9).
+clap_mangen = "0.3.3"
 divan.workspace = true
 hyper = { version = "1", features = ["server", "http1"] }
 tempfile = "3.27.0"

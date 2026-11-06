@@ -136,6 +136,8 @@ jobs:
           mkdir -p "dist/$name"
           cp LICENSE-APACHE LICENSE-MIT "dist/$name/"
           cp crates/fleetringd/README.md "dist/$name/README.md"
+          # The man pages, one per command, rendered from the command tree and checked in.
+          cp -R crates/fleetringd/man "dist/$name/man"
           cd dist
           case "$TARGET" in
             *-windows-*)

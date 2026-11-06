@@ -1,0 +1,134 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-db-create 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-db\-create \- Creates a SQLite database, places it with the ring, and opens it on its primary
+.SH SYNOPSIS
+\fBfleetring db create\fR [\fB\-\-replication\-factor\fR] [\fB\-\-acks\fR] [\fB\-\-min\-replicas\fR] [\fB\-\-description\fR] [\fB\-\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-log\-format\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+.SH DESCRIPTION
+Creates a SQLite database, places it with the ring, and opens it on its primary
+.SH OPTIONS
+.TP
+\fB\-\-replication\-factor\fR \fI<REPLICATION_FACTOR>\fR
+How many replicas it has, the primary included
+
+The fleet\*(Aqs default if unset: the control node\*(Aqs `[replication] replication_factor`, which is 3 unless its configuration says otherwise, and 1 on a dev node.
+.TP
+\fB\-\-acks\fR \fI<ACKS>\fR
+How many replicas must store a write before it is acknowledged
+
+`quorum` (a majority), `all` (every replica), or `local` (the primary alone; a failover may lose acknowledged writes). The fleet\*(Aqs default if unset.
+.TP
+\fB\-\-min\-replicas\fR \fI<MIN_REPLICAS>\fR
+How many replicas must be reachable for a write to run
+
+The primary included; below it, writes are refused before anything commits. Between the write quorum and the replication factor; the fleet\*(Aqs default if unset, which is the write quorum unless the control node\*(Aqs configuration says otherwise.
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+What the database holds and how it was set up; `\-` reads it from stdin
+
+At most 1 KiB of text; tab and line feed are allowed, other control and invisible characters aren\*(Aqt. From stdin, its trailing line feeds are dropped. The control node records you as the creator.
+.TP
+\fB\-\-label\fR \fI<KEY=VALUE>\fR
+A label, `key=value`, to find the database by (`db list \-\-label`)
+
+Repeat it for several, at most 32.
+.TP
+\fB\-\-expires\-in\fR \fI<DURATION>\fR
+Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+
+At least 1m. The control node counts it from its own clock. Every copy is deleted; an archive keeps the database as of what reached it, and without one it is gone. Extend it with `db edit`.
+.TP
+\fB\-\-expires\-at\fR \fI<TIME>\fR
+Drops the database at this time, in RFC 3339
+
+Such as `2026\-11\-05T10:00:00Z`: at least a minute from now by the control node\*(Aqs clock.
+.TP
+\fB\-\-control\fR \fI<CONTROL>\fR
+The control node\*(Aqs address, `host:port`
+
+The node that runs the control role, not any node in the fleet; a data\-only node answers with the control node\*(Aqs address. Defaults to `FLEETRING_CONTROL`, or else the context\*(Aqs `control`, when neither this nor `\-\-config` is given.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+A daemon\*(Aqs configuration file, to take the control node\*(Aqs address from
+.TP
+\fB\-\-context\fR \fI<NAME>\fR
+Uses this context for every setting it names, instead of the current one
+
+It outranks the environment variables; `FLEETRING_CONTEXT`, and else the current context, rank below them.
+.TP
+\fB\-\-tls\-dir\fR \fI<DIR>\fR
+A directory with `ca.crt` and the client certificates `cert client` writes
+
+`client.crt` and `client.key`, and the `client.<principal>.crt` and `.key` files `\-\-as` picks from. Defaults to `FLEETRING_TLS_DIR`, or else the context\*(Aqs `tls_dir`.
+.TP
+\fB\-\-ca\fR \fI<CA>\fR
+The trusted authority certificates, PEM
+
+Defaults to `FLEETRING_CA`, the context\*(Aqs `ca`, or `ca.crt` in the TLS directory.
+.TP
+\fB\-\-cert\fR \fI<CERT>\fR
+The client certificate, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_CERT`, the context\*(Aqs `cert`, or `client.crt` in the TLS directory.
+.TP
+\fB\-\-key\fR \fI<KEY>\fR
+The client certificate\*(Aqs private key, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_KEY`, the context\*(Aqs `key`, or `client.key` in the TLS directory.
+.TP
+\fB\-\-as\fR \fI<PRINCIPAL>\fR
+Acts as this principal, with its certificate in the TLS directory
+
+Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as `cert client <principal>` writes them. An explicit certificate or key at the same step wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults to `FLEETRING_AS`, or else the context\*(Aqs `as`.
+.TP
+\fB\-\-insecure\-plaintext\fR
+Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+A bearer token from `token issue`, sent with every request
+
+The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-\-token\-file\fR \fI<PATH>\fR
+A file that holds a bearer token, or `\-` for stdin
+
+Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
+.TP
+\fB\-\-agent\fR \fI<ID>\fR
+Acts as the agent with this ID, with the identity minted for it
+
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fINAME\fR>
+The database\*(Aqs name

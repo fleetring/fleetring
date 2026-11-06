@@ -277,8 +277,16 @@ Documented in `--help` and the man page, and the same for every command. One fun
 
 - **Budget:** `fleetring -h` at 100 columns is at most 50 lines, none wider than 100 columns. A snapshot test pins it.
 - **The compatibility line** closes the top-level `--help`: `fleetringd is the same program, kept until 1.0; fleetringd --config <file> runs serve.`
-- **Completions** come from `fleetring completions bash|zsh|fish|powershell`, generated with `clap_complete`. They include dynamic values where cheap: context names and agent IDs, but not database names, which need a network call.
-- **Man pages** are generated with `clap_mangen` at build time and shipped in the release archives, one per subcommand (`fleetring-db-create(1)`).
+- **Completions** come from `fleetring completions bash|zsh|fish|powershell`, generated with `clap_complete`'s dynamic engine. The script is a small shim: on each Tab it runs the binary with `FLEETRING_COMPLETE` set, and the binary answers from its own command tree before it parses anything, so completions follow upgrades. They include dynamic values where cheap: context names, and the selected context's agent IDs, from this machine's files; not database names, which need a network call. To install them, add the line for the shell to its startup file:
+
+  ```sh
+  source <(fleetring completions bash)                               # ~/.bashrc
+  source <(fleetring completions zsh)                                # ~/.zshrc, after compinit
+  fleetring completions fish | source                                # ~/.config/fish/config.fish
+  fleetring completions powershell | Out-String | Invoke-Expression  # $PROFILE
+  ```
+
+- **Man pages** are rendered with `clap_mangen` from the command tree, one per command (`fleetring(1)`, `fleetring-db-create(1)`), and checked in under `crates/fleetringd/man/`. A test fails when they differ from the tree; `UPDATE_GOLDEN=1 cargo test -p fleetringd --bin fleetring man::` regenerates them, and the reviewer reads the diff. They name no release, so a version bump leaves them alone. The release workflow copies them into every archive's `man/` directory, and `fleetring(1)` carries the exit codes.
 - **The READMEs, the quickstarts and the site** show commands only in forms `--help` documents, and only as `fleetring`.
 
 ## 10. Stdin and stdout
@@ -372,7 +380,7 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | Confirmation and `--yes` | `db drop`, `node remove` and `orphan remove` ask on a terminal and refuse elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask. | Done (phase G1): `token revoke --key-id` and a drain of an only replica ask too; every destructive prompt names the fleet and the context, and refuses with exit 2 without a terminal. |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | Done (phase G1): 0, 1, 2, 3, 4 and 130, listed in `--help`. |
 | Help fits one screen, grouped | One long paragraph per summary; sixteen commands, ungrouped. | Done (FR-075, phase D2): one-line summaries, the grouped list with examples, and a snapshot of `fleetring -h`. |
-| Completions and man pages | None. | Phase G (FR-056) |
+| Completions and man pages | None. | Done (FR-056, phase G2): `fleetring completions`, and a man page per command in every archive. |
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin. `mcp` speaks the protocol on stdin and stdout. | Phase G (FR-056) |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | Done: `--token-file` (phase B), and the warning (phase G1). |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0 and FR-076's for 0.6.0. | 0.7.0's list: phase A, in the release notes |

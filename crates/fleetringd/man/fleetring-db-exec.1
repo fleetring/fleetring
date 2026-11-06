@@ -1,0 +1,117 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-db-exec 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-db\-exec \- Runs one write statement on the database\*(Aqs primary
+.SH SYNOPSIS
+\fBfleetring db exec\fR [\fB\-\-node\fR] [\fB\-\-address\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> <\fISQL\fR> [\fIPARAMS\fR] 
+.SH DESCRIPTION
+Runs one write statement on the database\*(Aqs primary
+.SH OPTIONS
+.TP
+\fB\-\-node\fR \fI<NODE>\fR
+Sends the request to this data node instead of the primary
+
+The command follows the node\*(Aqs redirect. Its address comes from the control plane\*(Aqs membership.
+.TP
+\fB\-\-address\fR \fI<ADDRESS>\fR
+Sends the request to the data node at `host:port` instead of the primary
+
+The command follows the node\*(Aqs redirect.
+.TP
+\fB\-\-control\fR \fI<CONTROL>\fR
+The control node\*(Aqs address, `host:port`
+
+The node that runs the control role, not any node in the fleet; a data\-only node answers with the control node\*(Aqs address. Defaults to `FLEETRING_CONTROL`, or else the context\*(Aqs `control`, when neither this nor `\-\-config` is given.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+A daemon\*(Aqs configuration file, to take the control node\*(Aqs address from
+.TP
+\fB\-\-context\fR \fI<NAME>\fR
+Uses this context for every setting it names, instead of the current one
+
+It outranks the environment variables; `FLEETRING_CONTEXT`, and else the current context, rank below them.
+.TP
+\fB\-\-tls\-dir\fR \fI<DIR>\fR
+A directory with `ca.crt` and the client certificates `cert client` writes
+
+`client.crt` and `client.key`, and the `client.<principal>.crt` and `.key` files `\-\-as` picks from. Defaults to `FLEETRING_TLS_DIR`, or else the context\*(Aqs `tls_dir`.
+.TP
+\fB\-\-ca\fR \fI<CA>\fR
+The trusted authority certificates, PEM
+
+Defaults to `FLEETRING_CA`, the context\*(Aqs `ca`, or `ca.crt` in the TLS directory.
+.TP
+\fB\-\-cert\fR \fI<CERT>\fR
+The client certificate, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_CERT`, the context\*(Aqs `cert`, or `client.crt` in the TLS directory.
+.TP
+\fB\-\-key\fR \fI<KEY>\fR
+The client certificate\*(Aqs private key, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_KEY`, the context\*(Aqs `key`, or `client.key` in the TLS directory.
+.TP
+\fB\-\-as\fR \fI<PRINCIPAL>\fR
+Acts as this principal, with its certificate in the TLS directory
+
+Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as `cert client <principal>` writes them. An explicit certificate or key at the same step wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults to `FLEETRING_AS`, or else the context\*(Aqs `as`.
+.TP
+\fB\-\-insecure\-plaintext\fR
+Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+A bearer token from `token issue`, sent with every request
+
+The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
+.TP
+\fB\-\-token\-file\fR \fI<PATH>\fR
+A file that holds a bearer token, or `\-` for stdin
+
+Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
+.TP
+\fB\-\-agent\fR \fI<ID>\fR
+Acts as the agent with this ID, with the identity minted for it
+
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fINAME\fR>
+The database\*(Aqs name
+.TP
+<\fISQL\fR>
+One SQL statement, with `?` for each parameter
+.TP
+[\fIPARAMS\fR]
+The parameters, in order: `null`, an integer, a decimal number, or text
+
+Prefix one with `text:`, `int:`, `real:`, or `blob:` (hex digits) to choose its type.

@@ -1,0 +1,64 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-archive-restore 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-archive\-restore \- Restores an archived database into a new directory, with no fleet
+.SH SYNOPSIS
+\fBfleetring archive restore\fR [\fB\-\-at\-position\fR] [\fB\-\-at\-time\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-to\fR> <\fB\-\-config\fR> <\fB\-\-archive\fR> <\fINAME\fR> 
+.SH DESCRIPTION
+Restores an archived database into a new directory, with no fleet
+.PP
+For disaster recovery. The directory then holds a plain SQLite database, `data.db`, that `sqlite3` opens directly. Every batch is verified against the hash chain on the way. `db restore` is the online restore, into the fleet.
+.SH OPTIONS
+.TP
+\fB\-\-to\fR \fI<TO>\fR
+The directory to write, which must not exist
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+A daemon\*(Aqs configuration file, whose `[[archive]]` entry names the store
+.TP
+\fB\-\-archive\fR \fI<ARCHIVE>\fR
+The `[[archive]]` entry\*(Aqs name
+.TP
+\fB\-\-at\-position\fR \fI<AT_POSITION>\fR
+Restores exactly the log up to this position, a transaction boundary
+
+Positions are hex, as `db locate` and `archive show` print them.
+.TP
+\fB\-\-at\-time\fR \fI<AT_TIME>\fR
+Restores every segment archived at or before this time, in RFC 3339
+
+Such as `2026\-11\-03T09:30:00Z`, by the archiving nodes\*(Aq clocks. The restore may stop up to one segment interval before it, and never holds a write acknowledged after it.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fINAME\fR>
+The archived database to restore
