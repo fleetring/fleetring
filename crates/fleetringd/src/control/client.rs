@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use fleetring_client::redirect::leader_hint;
 use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
@@ -20,7 +21,6 @@ use fleetring_proto::v1::{
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
 
-use crate::control::redirect::leader_hint;
 use crate::transport::{
     Backoff, CredentialedChannel, Credentials, TransportConfig, control_client_with, retry,
 };
@@ -32,9 +32,9 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 
 /// A `Control` client that finds the leader on its own.
 ///
-/// - **Redirects:** a reply of "not the leader, try X" (see [`not_leader`](super::not_leader))
-///   switches the client to X and repeats the call there, so callers never see it. Later calls
-///   go straight to X.
+/// - **Redirects:** a reply of "not the leader, try X" (see
+///   [`not_leader`](fleetring_client::redirect::not_leader)) switches the client to X and repeats
+///   the call there, so callers never see it. Later calls go straight to X.
 /// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `list_databases`,
 ///   `renew_lease`, `record_fenced`, `drain`, and opening `watch_membership`) retry transient
 ///   failures with [`retry`]. `create_database`, `create_database_with_metadata`,

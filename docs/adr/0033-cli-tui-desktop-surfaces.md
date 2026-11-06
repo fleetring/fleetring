@@ -1,6 +1,6 @@
 # ADR-0033: The CLI, a TUI, and a desktop app are separate surfaces over one client crate
 
-- **Status:** Accepted (2026-11-03)
+- **Status:** Accepted (2026-11-03); decision 1 refined by the [amendment](#amendment-2026-11-06-fr-056) below
 - **Date:** 2026-11-03
 - **Related:** ADR-0015 (crate layout), ADR-0019 (gRPC), ADR-0025 and ADR-0026 (principals and scopes), ADR-0032 (fleet); tickets FR-042, FR-055, FR-056, FR-057, FR-058; [lexicon](../lexicon.md), [CLI style guide](../cli.md)
 
@@ -65,3 +65,15 @@ The protocol already has what live views need: `Database.WatchLeases` streams on
   - **`WatchLeases` is per node**, so the fleet-wide leases view opens one stream per live node; at E4's scale (thousands of nodes) that needs a fleet-wide stream from the control plane.
   - **`WatchMembership` needs the fleet scope**, so a principal without it sees no nodes view, only its databases.
 - The lexicon becomes a review checklist for UI changes as well as code.
+- *Amended 2026-11-06, with FR-056:* the CLI takes its typed results and the redirect replies from the client crate; its connections still come from `fleetringd`'s clients until the amendment's follow-up moves them.
+
+## Amendment (2026-11-06, FR-056)
+
+Decision 1 left FR-056 to decide whether the daemon's control client moves into `fleetring-client`. Building the crate's client half showed that the decision turns on the types the clients share with the daemon, not on the clients themselves. The decision above stands; this records what moves when.
+
+1. **In `fleetring-client` now:**
+   - contexts, as ADR-0043 point 4.10 placed them;
+   - the redirect replies, `fleetring_client::redirect`: the metadata keys, the statuses a control node that isn't the leader and a data node that isn't a database's primary answer with, and the functions that read them. The daemon builds these replies and every client follows them, so they have one definition;
+   - the typed results the read commands print, `fleetring_client::output`, and the escaping of names a principal chose. They are plain structs with public fields, so the surface that fetched the data builds them: `fleetringd::report` fills them from the daemon's types and draws the CLI's text, and the TUI and the desktop app will fill them from theirs and draw their own, as decision 1 keeps drawing out of the crate.
+2. **The daemon's control client stays in `fleetringd`.** It is a node's own client: it joins, sends heartbeats, renews and transfers leases, and drives promotions, and in the simulation it dials through turmoil's network (ADR-0020). None of that belongs to a surface, and moving it would bring the simulation's connector into the client crate. A surface's control calls are the few the CLI makes today (status, membership, drains, revocations), and they move with the data client.
+3. **`data::Client`, the transport's client half and identity loading stay in `fleetringd` for 0.7.0.** They share types and code with the daemon's server side: the engine's positions, rows and statements; the metadata, schema and membership views; the proto conversions in `data::convert`, which both directions use; the bearer-token parsing in `auth`; and `tls::Identity`, which builds the server's TLS configuration from the same files. Moving the clients first needs those value types in a crate that both `fleetringd` and `fleetring-client` depend on. That extraction is a follow-up of its own, and FR-057's TUI waits for it. Until then the CLI builds every connection in one place, `Target` in the binary, through `data::Client`.

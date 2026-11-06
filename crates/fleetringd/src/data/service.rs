@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU32;
 
+use fleetring_client::redirect::primary_hint;
 use fleetring_control::DatabaseName;
 use fleetring_proto::v1::database_server::Database;
 use fleetring_proto::v1::restore_point::Point;
@@ -22,13 +23,12 @@ use crate::data::convert::{
 };
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
-use crate::data::redirect::primary_hint;
 use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
-/// the rest (see [`not_primary`](crate::data::not_primary)).
+/// the rest (see [`not_primary`](fleetring_client::redirect::not_primary)).
 #[derive(Debug, Clone)]
 pub(crate) struct DatabaseService {
     node: DataNode,

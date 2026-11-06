@@ -47,7 +47,7 @@ use crate::mcp::tools::{
     UntrustedText, UpdateOut,
 };
 use crate::mcp::{Access, McpSettings};
-use crate::report::{DatabaseReport, schema_unavailable};
+use crate::report::{database_report, schema_report, schema_unavailable};
 
 /// What the server tells a client about itself when the session starts. Fixed text: it says
 /// what every result's notice says, and where the conventions are (ADR-0041, point 9).
@@ -338,7 +338,7 @@ impl FleetringMcp {
         }
         .map_err(Failed::status)?;
         let now = SystemClock.now();
-        let report = DatabaseReport::from_location(&location, now);
+        let report = database_report(&location, now);
         Ok(database_out(
             report,
             location.metadata.as_ref(),
@@ -392,7 +392,7 @@ impl FleetringMcp {
         let name = database_name(&input.name)?;
         let location = self.client.locate(&name).await.map_err(Failed::status)?;
         let now = SystemClock.now();
-        let mut report = DatabaseReport::from_location(&location, now);
+        let mut report = database_report(&location, now);
         if input.schema.unwrap_or(true) {
             let request = SchemaRequest {
                 count_limit: input
@@ -402,7 +402,7 @@ impl FleetringMcp {
                 internal: Internal::Hide,
             };
             report = match self.client.schema(&name, request).await {
-                Ok(view) => report.with_schema(&view),
+                Ok(view) => report.with_schema(schema_report(&view)),
                 Err(status) => match schema_unavailable(&status) {
                     Some(reason) => report.without_schema(reason),
                     None => return Err(Failed::status(status)),

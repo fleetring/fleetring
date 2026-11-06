@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::ReplicationFactor;
+use fleetring_client::redirect::primary_hint;
 use fleetring_control::{Acks, DatabaseName, Durability, LeaseEpoch, Liveness, ReplicaRole};
 use fleetring_proto::v1::{self as proto, ExecuteRequest};
-use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, LeaseUpdates, Location, primary_hint};
+use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate, LeaseUpdates, Location};
 use fleetringd::engine::{Internal, ObjectKind, RowCount, SchemaRequest, Statement, Value};
 use fleetringd::replication::{LeaseChange, LeaseEvent};
 use fleetringd::transport::database_client;
