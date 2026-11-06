@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use dialoguer::FuzzySelect;
-use dialoguer::theme::ColorfulTheme;
+use dialoguer::theme::{ColorfulTheme, SimpleTheme, Theme};
 use fleetring_client::context::{
     Context, ContextError, ContextName, ContextStore, Contexts, DEV_NAME, DevContextOutcome,
     WasCurrent,
@@ -17,10 +17,10 @@ use fleetring_client::dirs;
 use fleetringd::dev::{self, DevContextLine, Prepared};
 use fleetringd::tls::{Identity, Principal};
 
-use crate::{OutputArgs, OutputFormat, USAGE_ERROR, program};
-
-/// The exit code of a cancelled picker, as an interrupt.
-const CANCELLED: u8 = 130;
+use crate::exit::{INTERRUPTED, USAGE};
+use crate::format::{self, OutputArgs, OutputFormat};
+use crate::progress::{MachineOutput, Quiet, Surroundings};
+use crate::{color, note, program};
 
 /// `fleetring context`'s commands.
 #[derive(Debug, Subcommand)]
@@ -102,7 +102,7 @@ pub(crate) fn run(command: ContextCommand) -> Result<ExitCode, Box<dyn Error>> {
     match command {
         ContextCommand::List { output } => {
             let contexts = store.load()?;
-            print!("{}", render_list(&contexts, output.format())?);
+            crate::emit(&render_list(&contexts, output.format())?)?;
         }
         ContextCommand::Show { name, output } => {
             let contexts = store.load()?;
@@ -131,7 +131,7 @@ pub(crate) fn run(command: ContextCommand) -> Result<ExitCode, Box<dyn Error>> {
                     (name.clone(), context, true)
                 }
             };
-            print!("{}", render_one(&name, context, current, output.format())?);
+            crate::emit(&render_one(&name, context, current, output.format())?)?;
         }
         ContextCommand::Current => {
             let contexts = store.load()?;
@@ -147,12 +147,12 @@ pub(crate) fn run(command: ContextCommand) -> Result<ExitCode, Box<dyn Error>> {
         ContextCommand::Use { name } => use_context(&store, &name)?,
         ContextCommand::Remove { name } => {
             let was = store.update(|contexts| contexts.remove(&name))?;
-            eprintln!("removed context '{name}'");
+            note(format!("removed context '{name}'"));
             if was == WasCurrent::Yes {
-                eprintln!(
+                note(format!(
                     "no context is current now; pick one with `{} switch`",
                     program()
-                );
+                ));
             }
         }
     }
@@ -180,7 +180,7 @@ pub(crate) fn switch(target: Option<&str>) -> Result<ExitCode, Box<dyn Error>> {
             }
             Err(error) => {
                 eprintln!("{}: {error}", program());
-                Ok(ExitCode::from(USAGE_ERROR))
+                Ok(ExitCode::from(USAGE))
             }
         },
         None => pick(&store),
@@ -198,8 +198,8 @@ fn use_context(store: &ContextStore, name: &ContextName) -> Result<(), Box<dyn E
 
 fn announce_switch(name: &ContextName, fleet: Option<&str>) {
     match fleet {
-        Some(fleet) => eprintln!("switched to context '{name}' (fleet '{fleet}')"),
-        None => eprintln!("switched to context '{name}'"),
+        Some(fleet) => note(format!("switched to context '{name}' (fleet '{fleet}')")),
+        None => note(format!("switched to context '{name}'")),
     }
 }
 
@@ -215,7 +215,7 @@ fn pick(store: &ContextStore) -> Result<ExitCode, Box<dyn Error>> {
             program(),
             program()
         );
-        return Ok(ExitCode::from(USAGE_ERROR));
+        return Ok(ExitCode::from(USAGE));
     }
     if contexts.contexts.is_empty() {
         return Err(format!(
@@ -247,13 +247,17 @@ fn pick(store: &ContextStore) -> Result<ExitCode, Box<dyn Error>> {
         .as_ref()
         .and_then(|current| names.iter().position(|name| *name == current))
         .unwrap_or(0);
-    let chosen = FuzzySelect::with_theme(&ColorfulTheme::default())
+    let coloured = Surroundings::capture(MachineOutput::No, Quiet::No).colour(color());
+    let colourful = ColorfulTheme::default();
+    let plain = SimpleTheme;
+    let theme: &dyn Theme = if coloured { &colourful } else { &plain };
+    let chosen = FuzzySelect::with_theme(theme)
         .with_prompt("switch to context")
         .items(&items)
         .default(default)
         .interact_opt()?;
     let Some(chosen) = chosen else {
-        return Ok(ExitCode::from(CANCELLED));
+        return Ok(ExitCode::from(INTERRUPTED));
     };
     let Some(name) = names.get(chosen).map(|name| (*name).clone()) else {
         return Err("the picker returned a context that doesn't exist".into());
@@ -264,35 +268,25 @@ fn pick(store: &ContextStore) -> Result<ExitCode, Box<dyn Error>> {
 
 /// `context list`'s output.
 fn render_list(contexts: &Contexts, format: OutputFormat) -> Result<String, Box<dyn Error>> {
-    match format {
-        OutputFormat::Json => {
-            let list: Vec<serde_json::Value> = contexts
-                .contexts
-                .iter()
-                .map(|(name, context)| {
-                    context_json(name, context, contexts.current.as_ref() == Some(name))
-                })
-                .collect();
-            Ok(format!(
-                "{}\n",
-                serde_json::to_string_pretty(&serde_json::json!({ "contexts": list }))?
-            ))
+    let list: Vec<serde_json::Value> = contexts
+        .contexts
+        .iter()
+        .map(|(name, context)| context_json(name, context, contexts.current.as_ref() == Some(name)))
+        .collect();
+    format::render(format, &serde_json::json!({ "contexts": list }), |_| {
+        let mut rows = vec![["CURRENT", "NAME", "FLEET", "CONTROL", "AS"].map(str::to_owned)];
+        for (name, context) in &contexts.contexts {
+            let current = contexts.current.as_ref() == Some(name);
+            rows.push([
+                if current { "*" } else { "" }.to_owned(),
+                name.to_string(),
+                context.fleet.clone().unwrap_or_default(),
+                context.control.join(","),
+                context.principal.clone().unwrap_or_default(),
+            ]);
         }
-        OutputFormat::Table => {
-            let mut rows = vec![["CURRENT", "NAME", "FLEET", "CONTROL", "AS"].map(str::to_owned)];
-            for (name, context) in &contexts.contexts {
-                let current = contexts.current.as_ref() == Some(name);
-                rows.push([
-                    if current { "*" } else { "" }.to_owned(),
-                    name.to_string(),
-                    context.fleet.clone().unwrap_or_default(),
-                    context.control.join(","),
-                    context.principal.clone().unwrap_or_default(),
-                ]);
-            }
-            Ok(table(&rows))
-        }
-    }
+        Ok(table(&rows))
+    })
 }
 
 /// `context show`'s output.
@@ -302,39 +296,32 @@ fn render_one(
     current: bool,
     format: OutputFormat,
 ) -> Result<String, Box<dyn Error>> {
-    match format {
-        OutputFormat::Json => Ok(format!(
-            "{}\n",
-            serde_json::to_string_pretty(&context_json(name, context, current))?
-        )),
-        OutputFormat::Table => {
-            let mut text = format!(
-                "name: {name}\ncurrent: {}\n",
-                if current { "yes" } else { "no" }
-            );
-            let mut line = |key: &str, value: Option<String>| {
-                if let Some(value) = value {
-                    text.push_str(&format!("{key}: {value}\n"));
-                }
-            };
-            let path =
-                |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string());
-            line("fleet", context.fleet.clone());
-            line(
-                "control",
-                (!context.control.is_empty()).then(|| context.control.join(", ")),
-            );
-            line("tls dir", path(&context.tls_dir));
-            line("ca", path(&context.ca));
-            line("cert", path(&context.cert));
-            line("key", path(&context.key));
-            line("as", context.principal.clone());
-            line("token file", path(&context.token_file));
-            line("dev dir", path(&context.dev_dir));
-            line("agents dir", path(&context.agents_dir));
-            Ok(text)
-        }
-    }
+    format::render(format, &context_json(name, context, current), |_| {
+        let mut text = format!(
+            "name: {name}\ncurrent: {}\n",
+            if current { "yes" } else { "no" }
+        );
+        let mut line = |key: &str, value: Option<String>| {
+            if let Some(value) = value {
+                text.push_str(&format!("{key}: {value}\n"));
+            }
+        };
+        let path = |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string());
+        line("fleet", context.fleet.clone());
+        line(
+            "control",
+            (!context.control.is_empty()).then(|| context.control.join(", ")),
+        );
+        line("tls dir", path(&context.tls_dir));
+        line("ca", path(&context.ca));
+        line("cert", path(&context.cert));
+        line("key", path(&context.key));
+        line("as", context.principal.clone());
+        line("token file", path(&context.token_file));
+        line("dev dir", path(&context.dev_dir));
+        line("agents dir", path(&context.agents_dir));
+        Ok(text)
+    })
 }
 
 /// A context as JSON: the fields of `context list`, with absent ones `null`.
@@ -414,9 +401,9 @@ fn add(store: &ContextStore, args: ContextAddArgs) -> Result<(), Box<dyn Error>>
             other => Box::new(other) as Box<dyn Error>,
         })?;
     if was_current {
-        eprintln!("added context '{name}', now current");
+        note(format!("added context '{name}', now current"));
     } else {
-        eprintln!("added context '{name}'");
+        note(format!("added context '{name}'"));
     }
     Ok(())
 }

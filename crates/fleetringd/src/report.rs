@@ -10,15 +10,24 @@
 
 use std::io;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use fleetring_client::output::{
-    DatabaseReport, MetadataReport, NodeList, NodeReport, PlacementReport, ReplicaReport,
-    SchemaObjectReport, SchemaReport, printable,
+    ArchiveReport, DatabaseLocation, DatabaseReport, FleetStatus, LeaseEventReport, MetadataReport,
+    NodeList, NodeReport, NodeStatusReport, OrphanReport, PlacementReport, QueryResult,
+    ReplicaReport, SchemaObjectReport, SchemaReport, ServedReport, SinkReport, SnapshotReport,
+    ValueReport, printable,
 };
 use fleetring_control::{Liveness, ReplicaRole, Timestamp};
 
 use crate::MembershipView;
-use crate::data::{Location, MetadataView, SchemaView};
-use crate::engine::{ObjectKind, RowCount, SchemaObject};
+use crate::changes::MarkHome;
+use crate::data::{
+    ArchiveDescription, LeaseUpdate, Location, MetadataView, NodeStatus, Orphan, SchemaView,
+};
+use crate::dev::DevMode;
+use crate::engine::{ObjectKind, RowCount, Rows, SchemaObject, Value};
+use crate::replication::LeaseChange;
 
 /// The report on `location`, with the time to expiry counted from `now`.
 #[must_use]
@@ -149,6 +158,174 @@ pub fn node_list(view: &MembershipView) -> NodeList {
         .collect();
     nodes.sort_by(|a, b| a.node.cmp(&b.node));
     NodeList { nodes }
+}
+
+/// One database and where it lives, as `db locate` and `db list` print it in JSON.
+#[must_use]
+pub fn database_location(location: &Location, now: Timestamp) -> DatabaseLocation {
+    DatabaseLocation {
+        database: location.database.to_string(),
+        placement: placement_report(location),
+        metadata: location
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata_report(metadata, now)),
+    }
+}
+
+/// The fleet as `status` reports it.
+#[must_use]
+pub fn fleet_status(view: &MembershipView) -> FleetStatus {
+    FleetStatus {
+        dev_mode: view.dev_mode() == DevMode::On,
+        membership_epoch: view.epoch().get(),
+        ring_fingerprint: view
+            .fingerprint()
+            .map(|fingerprint| fingerprint.to_string()),
+        members: node_list(view).nodes,
+    }
+}
+
+/// One data node's view of itself, as `status --node` reports it.
+#[must_use]
+pub fn node_status(status: &NodeStatus) -> NodeStatusReport {
+    let node = status.node.to_string();
+    NodeStatusReport {
+        membership_epoch: status.membership_epoch.get(),
+        ring_fingerprint: status
+            .fingerprint
+            .map(|fingerprint| fingerprint.to_string()),
+        databases: status
+            .databases
+            .iter()
+            .map(|served| ServedReport {
+                database: served.database.to_string(),
+                role: match served.role {
+                    ReplicaRole::Primary => "primary",
+                    ReplicaRole::Follower => "follower",
+                    _ => "unknown",
+                },
+                lease_epoch: served.epoch.get(),
+                position: served.position.as_ref().map(ToString::to_string),
+            })
+            .collect(),
+        orphans: status
+            .orphans
+            .iter()
+            .map(|orphan| orphan_report(&node, orphan))
+            .collect(),
+        sinks: status
+            .sinks
+            .iter()
+            .map(|sink| SinkReport {
+                sink: sink.sink.clone(),
+                database: sink.database.to_string(),
+                position: sink.position.as_ref().map(ToString::to_string),
+                mark: match sink.home {
+                    Some(MarkHome::Replicated) => "replicated",
+                    _ => "local",
+                },
+                acknowledged: sink.acknowledged.as_ref().map(ToString::to_string),
+                backlog: sink.backlog,
+                failures: sink.failures,
+                resets: sink.resets,
+                last_error: sink.last_error.clone(),
+            })
+            .collect(),
+        node,
+    }
+}
+
+/// The orphan copy `node` keeps.
+#[must_use]
+pub fn orphan_report(node: &str, orphan: &Orphan) -> OrphanReport {
+    OrphanReport {
+        node: node.to_owned(),
+        database: orphan.database.to_string(),
+        epoch: orphan.epoch.get(),
+        bytes: orphan.bytes,
+    }
+}
+
+/// A query's rows, with each blob in base64 as the MCP server writes it.
+#[must_use]
+pub fn query_result(rows: &Rows) -> QueryResult {
+    QueryResult {
+        columns: rows.columns.clone(),
+        rows: rows
+            .rows
+            .iter()
+            .map(|row| row.iter().map(value_report).collect())
+            .collect(),
+        truncated: rows.truncated,
+    }
+}
+
+fn value_report(value: &Value) -> ValueReport {
+    match value {
+        Value::Null => ValueReport::Null,
+        Value::Integer(integer) => ValueReport::Integer(*integer),
+        Value::Real(real) => ValueReport::Real(*real),
+        Value::Text(text) => ValueReport::Text(text.clone()),
+        Value::Blob(bytes) => ValueReport::Blob {
+            blob: STANDARD.encode(bytes),
+        },
+    }
+}
+
+/// What the archive `archive` holds, as `archive show` reports it.
+#[must_use]
+pub fn archive_report(archive: &str, description: &ArchiveDescription) -> ArchiveReport {
+    ArchiveReport {
+        database: description.database.to_string(),
+        archive: archive.to_owned(),
+        latest: description.latest.as_ref().map(ToString::to_string),
+        latest_archived_at: description
+            .latest_ms
+            .map(|ms| rfc3339(Timestamp::from_millis(ms))),
+        segments: description.segments,
+        segment_bytes: description.segment_bytes,
+        snapshots: description
+            .snapshots
+            .iter()
+            .map(|snapshot| SnapshotReport {
+                id: snapshot.id.clone(),
+                position: snapshot.position.as_ref().map(ToString::to_string),
+                lease_epoch: snapshot.epoch.get(),
+                taken_at: rfc3339(Timestamp::from_millis(snapshot.taken_at_ms)),
+                bytes: snapshot.bytes,
+                has_metadata: snapshot.has_metadata,
+            })
+            .collect(),
+        incomplete: description.incomplete,
+        unusable: description.damaged.clone(),
+    }
+}
+
+/// The lines `lease watch -o jsonl` prints for `update`: one per lease held when the stream
+/// opened, or one for an event. `node` is the node the stream's first message named.
+#[must_use]
+pub fn lease_events(update: &LeaseUpdate, node: Option<&str>) -> Vec<LeaseEventReport> {
+    match update {
+        LeaseUpdate::Held { node: held, leases } => leases
+            .iter()
+            .map(|(database, epoch)| LeaseEventReport {
+                event: "held",
+                node: Some(held.to_string()),
+                database: database.to_string(),
+                lease_epoch: epoch.get(),
+            })
+            .collect(),
+        LeaseUpdate::Event(event) => vec![LeaseEventReport {
+            event: match event.change {
+                LeaseChange::Gained => "gained",
+                LeaseChange::Lost => "lost",
+            },
+            node: node.map(str::to_owned),
+            database: event.database.to_string(),
+            lease_epoch: event.epoch.get(),
+        }],
+    }
 }
 
 /// The table `node list` prints for `list`: one row per member under `NODE`, `ADDRESS`, `ZONE`,
@@ -956,5 +1133,171 @@ mod tests {
         assert_eq!(duration(59_000), "59s");
         assert_eq!(duration(3_600_000 + 120_000), "1h 2m");
         assert_eq!(duration(86_400_000 * 2 + 5_000), "2d");
+    }
+
+    /// A value's shape: every leaf replaced by its JSON type's name.
+    fn shape(value: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match value {
+            Value::Null => "null".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Number(_) => "number".into(),
+            Value::String(_) => "string".into(),
+            Value::Array(items) => Value::Array(items.iter().map(shape).collect()),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), shape(value)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn name(text: &str) -> fleetring_control::DatabaseName {
+        text.parse().expect("a database name")
+    }
+
+    #[test]
+    fn a_node_status_names_its_sinks_and_orphans() {
+        let status = NodeStatus {
+            node: "node-1".parse().expect("a node ID"),
+            membership_epoch: fleetring::Epoch::new(3),
+            fingerprint: None,
+            databases: Vec::new(),
+            sinks: vec![crate::changes::SinkStatus {
+                sink: "archive".to_owned(),
+                database: name("notes"),
+                position: Some(crate::engine::Position::from(vec![0, 1])),
+                home: Some(MarkHome::Replicated),
+                acknowledged: None,
+                backlog: 2,
+                failures: 1,
+                resets: 0,
+                last_error: Some("refused".to_owned()),
+            }],
+            orphans: vec![Orphan {
+                database: name("old"),
+                epoch: fleetring_control::LeaseEpoch::new(4),
+                bytes: 4096,
+            }],
+        };
+        let json = serde_json::to_value(node_status(&status)).expect("serializes");
+        assert_eq!(
+            shape(&json),
+            serde_json::json!({
+                "databases": [],
+                "membership_epoch": "number",
+                "node": "string",
+                "orphans": [{ "bytes": "number", "database": "string", "epoch": "number", "node": "string" }],
+                "ring_fingerprint": "null",
+                "sinks": [{
+                    "acknowledged": "null",
+                    "backlog": "number",
+                    "database": "string",
+                    "failures": "number",
+                    "last_error": "string",
+                    "mark": "string",
+                    "position": "string",
+                    "resets": "number",
+                    "sink": "string",
+                }],
+            })
+        );
+        assert_eq!(json["sinks"][0]["mark"], "replicated");
+        assert_eq!(json["orphans"][0]["node"], "node-1");
+    }
+
+    #[test]
+    fn an_archive_report_has_its_snapshots_and_times() {
+        let description = ArchiveDescription {
+            database: name("notes"),
+            snapshots: vec![crate::data::ArchivedSnapshot {
+                id: "s1".to_owned(),
+                epoch: fleetring_control::LeaseEpoch::new(2),
+                position: None,
+                taken_at_ms: 1_000,
+                bytes: 10,
+                has_metadata: true,
+            }],
+            latest: Some(crate::engine::Position::from(vec![0xab])),
+            latest_ms: Some(2_000),
+            segments: 3,
+            segment_bytes: 300,
+            incomplete: 1,
+            damaged: vec!["segment 9: checksum".to_owned()],
+        };
+        let json =
+            serde_json::to_value(archive_report("offsite", &description)).expect("serializes");
+        assert_eq!(
+            shape(&json),
+            serde_json::json!({
+                "archive": "string",
+                "database": "string",
+                "incomplete": "number",
+                "latest": "string",
+                "latest_archived_at": "string",
+                "segment_bytes": "number",
+                "segments": "number",
+                "snapshots": [{
+                    "bytes": "number",
+                    "has_metadata": "bool",
+                    "id": "string",
+                    "lease_epoch": "number",
+                    "position": "null",
+                    "taken_at": "string",
+                }],
+                "unusable": ["string"],
+            })
+        );
+        assert_eq!(json["latest_archived_at"], "1970-01-01T00:00:02Z");
+        assert_eq!(json["snapshots"][0]["taken_at"], "1970-01-01T00:00:01Z");
+    }
+
+    #[test]
+    fn lease_events_carry_the_node_the_stream_named() {
+        let held = LeaseUpdate::Held {
+            node: "node-1".parse().expect("a node ID"),
+            leases: std::collections::BTreeMap::from([(
+                name("notes"),
+                fleetring_control::LeaseEpoch::new(5),
+            )]),
+        };
+        let held = lease_events(&held, None);
+        assert_eq!(
+            serde_json::to_value(&held).expect("serializes"),
+            serde_json::json!([{ "event": "held", "node": "node-1", "database": "notes", "lease_epoch": 5 }])
+        );
+        let lost = LeaseUpdate::Event(crate::replication::LeaseEvent::new(
+            name("notes"),
+            fleetring_control::LeaseEpoch::new(5),
+            LeaseChange::Lost,
+        ));
+        assert_eq!(
+            serde_json::to_value(lease_events(&lost, Some("node-1"))).expect("serializes"),
+            serde_json::json!([{ "event": "lost", "node": "node-1", "database": "notes", "lease_epoch": 5 }])
+        );
+    }
+
+    #[test]
+    fn query_values_are_json_values_and_blobs_base64() {
+        let rows = Rows {
+            columns: vec!["a".to_owned()],
+            rows: vec![vec![
+                Value::Null,
+                Value::Integer(-1),
+                Value::Real(1.5),
+                Value::Text("x".to_owned()),
+                Value::Blob(vec![0, 255]),
+            ]],
+            truncated: true,
+        };
+        assert_eq!(
+            serde_json::to_value(query_result(&rows)).expect("serializes"),
+            serde_json::json!({
+                "columns": ["a"],
+                "rows": [[null, -1, 1.5, "x", { "blob": "AP8=" }]],
+                "truncated": true,
+            })
+        );
     }
 }

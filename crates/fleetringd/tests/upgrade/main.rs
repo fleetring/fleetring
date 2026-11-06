@@ -671,11 +671,11 @@ fn removing_a_member_that_is_gone_unblocks_the_fleet() -> TestResult {
         false
     });
     assert!(down, "'old' never went down\n{}", fleet.logs());
-    // Without a terminal, removing needs --yes.
+    // Without a terminal, removing needs --yes: a usage error.
     let unconfirmed = node_command(&fleet, &["remove", "old"])?;
     assert_eq!(
         unconfirmed.status.code(),
-        Some(1),
+        Some(2),
         "{}",
         printed(&unconfirmed)
     );

@@ -12,18 +12,17 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use fleetringd::dev::{self, DevContextLine, DevError, DevStatus, Prepared};
 
+use crate::exit::INTERRUPTED;
+use crate::format::{self, OutputArgs, OutputFormat};
 use crate::progress::{MachineOutput, Progress};
 use crate::stop::{self, StopTarget};
-use crate::{OutputArgs, OutputFormat, context_cmd, parse_ttl, program, spinner_surroundings};
+use crate::{context_cmd, parse_ttl, program, spinner_surroundings};
 
 /// How long `dev -d` waits for the node to be ready unless `--timeout` says otherwise.
 pub(crate) const DETACH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often `dev logs -f` looks for new lines.
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
-
-/// The exit code of a command ended by Ctrl-C.
-const INTERRUPTED: u8 = 130;
 
 /// `fleetring dev`'s flags (ADR-0039, ADR-0043 point 5).
 #[derive(Debug, Args)]
@@ -211,13 +210,9 @@ async fn stop_dev(
 fn status(data_dir: Option<PathBuf>, format: OutputFormat) -> Result<ExitCode, Box<dyn Error>> {
     let dir = dir(data_dir)?;
     let status = dev::status(&dir)?;
-    match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
-        OutputFormat::Table => print!(
-            "{}",
-            status_text(&status, &context_cmd::dev_context_status(&dir))
-        ),
-    }
+    crate::emit(&format::render(format, &status, |status| {
+        Ok(status_text(status, &context_cmd::dev_context_status(&dir)))
+    })?)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -296,6 +291,25 @@ mod tests {
 
     use super::*;
     use crate::{Cli, Command};
+
+    #[test]
+    fn dev_status_json_pins_its_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let status = fleetringd::dev::status(&tempfile::tempdir()?.path().join("dev"))?;
+        let json = format::render(OutputFormat::Jsonl, &status, |_| Ok(String::new()))?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let keys: Vec<&str> = value
+            .as_object()
+            .ok_or("an object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["address", "data_dir", "log", "pid", "release", "running"]
+        );
+        assert_eq!(value["running"], false);
+        Ok(())
+    }
 
     fn dev_args(words: &[&str]) -> Result<DevArgs, clap::Error> {
         let cli = Cli::try_parse_from([&["fleetring", "dev"][..], words].concat())?;

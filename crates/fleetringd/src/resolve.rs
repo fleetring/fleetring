@@ -236,8 +236,9 @@ pub(crate) struct Resolved {
 #[non_exhaustive]
 pub(crate) enum ResolveError {
     #[error(
-        "pass --{flag} (or set {TLS_DIR_VAR} to a directory with ca.crt, client.crt, and \
-         client.key, or give the context a tls_dir), or --insecure-plaintext"
+        "no client identity: nothing names a TLS directory or --{flag}\n  hint: pass --tls-dir \
+         <dir> or set {TLS_DIR_VAR} (a directory with ca.crt, client.crt, and client.key), give \
+         the context a tls_dir, or pass --insecure-plaintext for a plaintext node"
     )]
     NoDirectory { flag: &'static str },
     #[error(
@@ -1033,7 +1034,9 @@ mod tests {
             Some((&name("bare"), &bare, SelectedBy::Current)),
         ));
         assert!(
-            error.starts_with("pass --cert (or set FLEETRING_TLS_DIR"),
+            error.starts_with(
+                "no client identity: nothing names a TLS directory or --cert\n  hint:"
+            ),
             "{error}"
         );
     }
@@ -1241,7 +1244,9 @@ mod tests {
             None,
         ));
         assert!(
-            error.starts_with("pass --cert (or set FLEETRING_TLS_DIR"),
+            error.starts_with(
+                "no client identity: nothing names a TLS directory or --cert\n  hint:"
+            ),
             "{error}"
         );
     }

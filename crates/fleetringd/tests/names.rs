@@ -205,7 +205,8 @@ fn client_commands_are_the_same_under_both_names() -> TestResult {
     });
     let [fleetring, fleetringd] = outcomes;
     let (fleetring, fleetringd) = (fleetring?, fleetringd?);
-    assert_eq!(fleetring.0, Some(1), "{fleetring:?}");
+    // Nothing listens there: unavailable, which a retry may fix.
+    assert_eq!(fleetring.0, Some(4), "{fleetring:?}");
     assert_eq!(fleetring, fleetringd);
     Ok(())
 }

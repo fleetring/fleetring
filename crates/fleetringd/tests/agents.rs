@@ -833,9 +833,9 @@ async fn agent_remove_revokes_and_deletes() -> TestResult {
     machine.mcp(&["--agent", "42"]).await?.close().await?;
     let token = machine.token("42")?;
     let cert_dir = copy_certificate(&machine, "42")?;
-    // Without a terminal, it asks for --yes and keeps everything.
+    // Without a terminal, it asks for --yes, a usage error, and keeps everything.
     let refused = machine.run(&["agent", "remove", "42"])?;
-    assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
+    assert_eq!(refused.status.code(), Some(2), "{}", printed(&refused));
     assert!(stderr(&refused).contains("--yes"), "{}", printed(&refused));
     assert!(machine.agent_dir("42").exists());
 
@@ -933,7 +933,8 @@ async fn db_list_with_agent_uses_its_scopes() -> TestResult {
     assert!(everything.contains("operators-notes"), "{everything}");
 
     let outside = machine.run(&["db", "create", "agent-43-x", "--agent", "42"])?;
-    assert_eq!(outside.status.code(), Some(1), "{}", printed(&outside));
+    // A refusal exits 3.
+    assert_eq!(outside.status.code(), Some(3), "{}", printed(&outside));
     assert!(
         stderr(&outside).to_lowercase().contains("permission"),
         "{}",

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::io::{BufRead as _, IsTerminal as _, Read, Write as _};
+use std::io::{IsTerminal as _, Read, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,23 +15,23 @@ use std::time::Duration;
 use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_client::context::{ContextName, Contexts, select};
-use fleetring_client::output::printable;
+use fleetring_client::output::{
+    DatabaseList, FleetStatus, NodeStatusReport, OrphanList, ReplicaHash, VerifyReport, printable,
+};
 use fleetring_control::{
-    Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, ReplicaRole,
-    parse_label,
+    Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, parse_label,
 };
 use fleetring_control::{KeyId, Millis, ParseReleaseError, Release, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
 use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIFETIME, Scope};
-use fleetringd::changes::MarkHome;
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
-    ArchiveDescription, Client, DatabaseSpec, Expiry, LabelRequirement, LeaseUpdate, ListFilter,
-    Location, MetadataView, NewMetadata, NodeStatus, Orphan, ReplicaInfo, Restoration,
-    RestoredExpiry, Verification, restored_metadata,
+    ArchiveDescription, Client, DatabaseSpec, Expiry, LabelRequirement, LeaseUpdate, LeaseUpdates,
+    ListFilter, Location, MetadataView, NewMetadata, Orphan, ReplicaInfo, Restoration,
+    RestoredExpiry, restored_metadata,
 };
-use fleetringd::dev::{self, DevError, DevMode, Prepared};
+use fleetringd::dev::{self, DevError, Prepared};
 use fleetringd::durability::{
     ArchiveKeys, RestoreTarget, build_store, encode_metadata, finish_offline, restore_into,
 };
@@ -43,8 +43,9 @@ use fleetringd::mcp::{self, Access, McpSettings};
 use fleetringd::observe::{LogColour, log_subscriber};
 use fleetringd::replication::ChainHash;
 use fleetringd::report::{
-    database_report, expiry_text, metadata_report, node_list, node_list_text,
-    render_archived_metadata, render_text, schema_report, schema_unavailable, table,
+    archive_report, database_location, database_report, expiry_text, fleet_status, lease_events,
+    liveness_name, metadata_report, node_list, node_list_text, node_status, orphan_report,
+    query_result, render_archived_metadata, render_text, schema_report, schema_unavailable, table,
 };
 use fleetringd::tls::{
     AUTHORITY_CERT_FILE, Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
@@ -55,8 +56,7 @@ use fleetringd::transport::Credentials;
 use fleetringd::upgrade::RESTARTS_VAR;
 use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, Restart, StartCommand};
 use fleetringd::{
-    Config, Daemon, LogFormat, MembershipView, Network, NodeRole, ParseLogFormatError, Plaintext,
-    Stop,
+    Config, Daemon, LogFormat, Network, NodeRole, ParseLogFormatError, Plaintext, Stop,
 };
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -64,9 +64,12 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod agent;
 mod agent_cmd;
 mod compat;
+mod confirm;
 mod context_cmd;
 mod dev_cmd;
 mod edit;
+mod exit;
+mod format;
 mod progress;
 mod resolve;
 mod stop;
@@ -74,9 +77,14 @@ mod stop;
 use agent::{AgentDir, AgentId};
 use agent_cmd::AgentCommand;
 use compat::{Invocation, ProgramName};
+use confirm::Place;
 use context_cmd::ContextCommand;
 use dev_cmd::DevArgs;
-use progress::{MachineOutput, Progress, Quiet, Stepped, Surroundings, SuspendingStderr};
+use exit::Failed;
+use format::{OutputArgs, OutputFormat};
+use progress::{
+    ColorChoice, MachineOutput, Progress, Quiet, Stepped, Surroundings, SuspendingStderr,
+};
 use resolve::{
     ContextsFile, ContextsUnusable, EnvSnapshot, Resolved, SecurityFiles, TargetFlags, TokenSource,
     Wire,
@@ -86,11 +94,22 @@ use stop::StopArgs;
 /// The environment variable that chooses the log format when `--log-format` isn't given.
 const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
 
-/// The exit code for a usage error, as clap's own.
-const USAGE_ERROR: u8 = 2;
-
-/// What `fleetring --help` says below the commands: the compatibility names (ADR-0043, point 1.5).
+/// What `fleetring -h` says below the commands: the compatibility names (ADR-0043, point 1.5).
 const COMPAT_HELP: &str = "\
+Until 1.0, `fleetringd` is another name for this binary, and `--config <file>` without `serve`
+still runs a node.";
+
+/// What `fleetring --help` says below the commands: the exit codes (`docs/cli.md`, section 8),
+/// then the compatibility names.
+const LONG_HELP: &str = "\
+Exit codes:
+  0    success
+  1    the command failed
+  2    usage: a bad flag or argument, or a confirmation needed without a terminal
+  3    refused: unauthenticated, or not permitted
+  4    unavailable, and a retry may succeed
+  130  interrupted
+
 Until 1.0, `fleetringd` is another name for this binary, and `--config <file>` without `serve`
 still runs a node.";
 
@@ -98,7 +117,13 @@ still runs a node.";
 ///
 /// `serve` runs a node. The other commands talk to a running fleet.
 #[derive(Debug, Parser)]
-#[command(name = "fleetring", version, arg_required_else_help = true, after_help = COMPAT_HELP)]
+#[command(
+    name = "fleetring",
+    version,
+    arg_required_else_help = true,
+    after_help = COMPAT_HELP,
+    after_long_help = LONG_HELP
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -106,9 +131,14 @@ struct Cli {
     /// `[log] format`.
     #[arg(long, global = true, value_parser = parse_log_format)]
     log_format: Option<LogFormat>,
-    /// Leaves out the warnings about environment variables that override a context.
+    /// Prints the result and errors only: no progress, notes, warnings or override warnings. A
+    /// command with no result then prints nothing.
     #[arg(short, long, global = true)]
     quiet: bool,
+    /// When to colour log lines and the picker: `auto`, on a terminal unless NO_COLOR is set or
+    /// TERM is dumb; `always`; or `never`.
+    #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
 }
 
 /// `fleetring serve`'s flags.
@@ -235,6 +265,8 @@ enum Command {
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
         #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
         target: Target,
     },
 }
@@ -343,6 +375,8 @@ enum ArchiveCommand {
         #[arg(long)]
         address: Option<String>,
         #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
         target: Target,
     },
     /// Restores an archived database into a scratch copy on a data node, verifying every batch
@@ -410,7 +444,8 @@ impl PointArgs {
 #[derive(Debug, Subcommand)]
 enum LeaseCommand {
     /// Follows the leases one data node holds: first `held <database> epoch <n>` for each
-    /// database it serves, then `gained` or `lost` lines as leases move, until the stream ends.
+    /// database it serves, then `gained` or `lost` lines as leases move, until the stream ends or
+    /// Ctrl-C (exit 130). `-o jsonl` prints one object per line, flushed as each arrives.
     Watch {
         /// The data node to follow. Its address comes from the control plane's membership, so
         /// `--control` or `--config` is needed too.
@@ -419,6 +454,8 @@ enum LeaseCommand {
         /// The address of the data node to follow, `host:port`. Nothing else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
         #[command(flatten)]
         target: Target,
     },
@@ -512,6 +549,10 @@ enum TokenCommand {
         /// (the longest a token lasts) by default.
         #[arg(long, value_parser = parse_ttl, conflicts_with = "key_id")]
         ttl: Option<Duration>,
+        /// Revokes a signing key without asking. Without it, `--key-id` asks first on a
+        /// terminal, and refuses elsewhere; `--token-id` never asks.
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         target: Target,
     },
@@ -643,12 +684,14 @@ enum DbCommand {
     /// Runs one write statement on the database's primary.
     Exec(SqlArgs),
     /// Runs one read-only query on the database's primary.
-    Query(SqlArgs),
+    Query(QueryArgs),
     /// Shows the database's primary, followers, epoch, durability settings, and replica
     /// positions.
     Locate {
         /// The database's name.
         name: DatabaseName,
+        #[command(flatten)]
+        output: OutputArgs,
         #[command(flatten)]
         target: Target,
     },
@@ -666,6 +709,8 @@ enum DbCommand {
         #[arg(long)]
         prefix: Option<String>,
         #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
         target: Target,
     },
     /// Asks every replica of a database for its hash chain at one position, the latest they all
@@ -682,6 +727,8 @@ enum DbCommand {
         /// still hashes to it, that is, whether nothing changed since.
         #[arg(long)]
         expect: Option<ChainHash>,
+        #[command(flatten)]
+        output: OutputArgs,
         #[command(flatten)]
         target: Target,
     },
@@ -743,6 +790,10 @@ enum NodeCommand {
     Drain {
         /// The node's ID.
         id: NodeId,
+        /// Drains without asking. Without it, a drain of a node that holds a database's only
+        /// replica asks first on a terminal, and refuses elsewhere.
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         target: Target,
     },
@@ -831,37 +882,6 @@ impl ExpiryArgs {
     }
 }
 
-/// How a command prints its result: `-o table|json`, or `--json`.
-#[derive(Debug, Args)]
-struct OutputArgs {
-    /// The output format: `table`, key and value lines for one item, or `json`, one object
-    /// with stable snake_case fields.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    output: OutputFormat,
-    /// Short for `-o json`.
-    #[arg(long, conflicts_with = "output")]
-    json: bool,
-}
-
-impl OutputArgs {
-    fn format(&self) -> OutputFormat {
-        if self.json {
-            OutputFormat::Json
-        } else {
-            self.output
-        }
-    }
-}
-
-/// An output format (`docs/cli.md`, section 5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum OutputFormat {
-    /// For people.
-    Table,
-    /// For programs.
-    Json,
-}
-
 #[derive(Debug, Args)]
 struct SqlArgs {
     /// The database's name.
@@ -882,6 +902,15 @@ struct SqlArgs {
     address: Option<String>,
     #[command(flatten)]
     target: Target,
+}
+
+/// `db query`'s arguments: the statement, and how to print its rows.
+#[derive(Debug, Args)]
+struct QueryArgs {
+    #[command(flatten)]
+    sql: SqlArgs,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 /// How a command finds the control plane, and who it acts as. Commands talk to the control node,
@@ -989,15 +1018,33 @@ const NO_CONTROL: &str = "no control address\n  hint: run `fleetring dev -d` for
 /// How long to wait for one control address before trying the next.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Whether the override warnings print: `-q` silences them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Warnings {
-    Print,
-    Silence,
+/// Set once at the start of `main`, from `-q`.
+static QUIET: OnceLock<Quiet> = OnceLock::new();
+
+/// Set once at the start of `main`, from `--color`.
+static COLOR: OnceLock<ColorChoice> = OnceLock::new();
+
+/// What `--color` asked for.
+fn color() -> ColorChoice {
+    COLOR.get().copied().unwrap_or(ColorChoice::Auto)
 }
 
-/// Set once at the start of `main`, from `-q`.
-static WARNINGS: OnceLock<Warnings> = OnceLock::new();
+/// Whether `-q` was given.
+fn quiet() -> Quiet {
+    QUIET.get().copied().unwrap_or(Quiet::No)
+}
+
+/// Prints `line` on stderr unless `-q` was given: a warning, a note, anything but the result and
+/// an error (`docs/cli.md`, section 5).
+fn note(line: impl std::fmt::Display) {
+    if quiet() == Quiet::No {
+        eprintln!("{line}");
+    }
+}
+
+/// What a command warns when a token arrives on the command line (`docs/cli.md`, section 11).
+const TOKEN_ON_ARGV: &str = "warning: --token on the command line is visible to other processes; \
+                             use FLEETRING_TOKEN or --token-file";
 
 /// The first of `addresses` that accepts a connection, or the first if none does, so the usual
 /// connection error names it. A single address is returned as it is, without a probe.
@@ -1076,10 +1123,8 @@ impl Target {
                 )
                 .into());
             }
-            if WARNINGS.get() != Some(&Warnings::Silence) {
-                for warning in dir.loose_files() {
-                    eprintln!("{warning}");
-                }
+            for warning in dir.loose_files() {
+                note(warning);
             }
             let principal = Some(dir.id().principal().to_string());
             let token = Some(TokenSource::File(dir.token_file()));
@@ -1118,10 +1163,11 @@ impl Target {
             }
         }
         let mut resolved = resolve::resolve(&flags, &env, selected);
-        if WARNINGS.get() != Some(&Warnings::Silence) {
-            for warning in &resolved.warnings {
-                eprintln!("{warning}");
-            }
+        for warning in &resolved.warnings {
+            note(warning);
+        }
+        if self.tls.token.is_some() {
+            note(TOKEN_ON_ARGV);
         }
         // Stdin can be read once, and a command may ask for the token more than once.
         if resolved.token == Some(TokenSource::Stdin) {
@@ -1276,7 +1322,7 @@ impl Target {
 
     /// Where the command acts, for a confirmation: the fleet and the context, or the fleet and
     /// the control address when no context is in use (ADR-0043, point 4.6).
-    fn place(&self) -> Result<String, Box<dyn Error>> {
+    fn place(&self) -> Result<Place, Box<dyn Error>> {
         let resolved = self.resolved()?;
         let fleet = match (&resolved.fleet, self.security()) {
             (Some(fleet), _) => Some(fleet.clone()),
@@ -1290,10 +1336,7 @@ impl Target {
                 |control| format!("control {control}"),
             ),
         };
-        Ok(match fleet {
-            Some(fleet) => format!("on fleet '{fleet}' ({via})"),
-            None => format!("on the fleet at {via}"),
-        })
+        Ok(Place { fleet, via })
     }
 
     fn client(&self) -> Result<Client, Box<dyn Error>> {
@@ -1562,19 +1605,17 @@ fn main() -> ExitCode {
             if let Some(hint) = hint {
                 eprintln!("{hint}");
             }
-            return ExitCode::from(u8::try_from(code).unwrap_or(USAGE_ERROR));
+            return ExitCode::from(u8::try_from(code).unwrap_or(exit::USAGE));
         }
     };
     let Cli {
         command,
         log_format: format_flag,
         quiet,
+        color,
     } = cli;
-    let _ = WARNINGS.set(if quiet {
-        Warnings::Silence
-    } else {
-        Warnings::Print
-    });
+    let _ = QUIET.set(if quiet { Quiet::Yes } else { Quiet::No });
+    let _ = COLOR.set(color);
     // Contexts are files: no logging, no runtime, no network.
     let command = match command {
         Command::Context(command) => return finish(context_cmd::run(command)),
@@ -1619,7 +1660,7 @@ fn main() -> ExitCode {
                 "{}: invalid {LOG_FORMAT_VAR} '{value}'; use text or json",
                 program()
             );
-            return ExitCode::from(USAGE_ERROR);
+            return ExitCode::from(exit::USAGE);
         }
     };
     // The daemon logs at info; a command prints its result and logs only warnings.
@@ -1628,8 +1669,9 @@ fn main() -> ExitCode {
         Run::Daemon { .. } => "info",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
-    // A detached node's log, a journal, or a pipe gets no escape sequences.
-    let colour = if std::io::stderr().is_terminal() {
+    // A detached node's log, a journal, or a pipe gets no escape sequences unless `--color
+    // always` asks for them.
+    let colour = if Surroundings::capture(MachineOutput::No, Quiet::No).colour(color) {
         LogColour::Ansi
     } else {
         LogColour::Plain
@@ -1669,21 +1711,22 @@ fn main() -> ExitCode {
     match result {
         Ok(Stopped::Restart { exe, restarts }) => restart_in_place(&exe, restarts),
         Ok(Stopped::Exit) => ExitCode::SUCCESS,
-        Err(error) => {
-            if !error.is::<AlreadyReported>() {
-                report(error.as_ref());
-            }
-            ExitCode::FAILURE
-        }
+        Err(error) => failure(error.as_ref()),
     }
 }
 
 /// The exit code of a command that ran without a runtime, reporting its error.
 fn finish(result: Result<ExitCode, Box<dyn Error>>) -> ExitCode {
-    result.unwrap_or_else(|error| {
-        report(error.as_ref());
-        ExitCode::FAILURE
-    })
+    result.unwrap_or_else(|error| failure(error.as_ref()))
+}
+
+/// Reports `error`, unless the command has said all there is to say, and returns its exit code
+/// (`docs/cli.md`, section 8).
+fn failure(error: &(dyn Error + 'static)) -> ExitCode {
+    if !error.is::<exit::Silent>() {
+        report(error);
+    }
+    ExitCode::from(exit::code_of(error))
 }
 
 /// The log format: `--log-format`, else `FLEETRING_LOG_FORMAT`, else the daemon's `[log]
@@ -1822,14 +1865,21 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Status {
             node,
             address,
+            output,
             target,
         } => match node_address(node.as_ref(), address, &target).await? {
             Some(address) => {
                 // The node answers on its own, about itself.
                 let client = Client::new(address.clone(), target.network()?);
-                format_node_status(&client.node_status(&address).await.map_err(failed)?)
+                let status = node_status(&client.node_status(&address).await.map_err(failed)?);
+                format::render(output.format(), &status, |status| {
+                    Ok(format_node_status(status))
+                })?
             }
-            None => format_status(&target.client()?.status().await.map_err(failed)?),
+            None => {
+                let status = fleet_status(&target.client()?.status().await.map_err(failed)?);
+                format::render(output.format(), &status, |status| Ok(format_status(status)))?
+            }
         },
         Command::Mcp(McpArgs {
             read_only,
@@ -1860,7 +1910,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 Some(ready) => ready.record().access(),
                 None => Access::ReadWrite,
             };
-            if let Some(ready) = &ready {
+            if let Some(ready) = &ready
+                && quiet() == Quiet::No
+            {
                 eprint!("{}", ready.start_text(target.resolved()?.context.as_ref()));
             }
             let settings = McpSettings {
@@ -1934,14 +1986,11 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                     },
                 };
             }
-            match output.format() {
-                OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&report)?),
-                OutputFormat::Table => {
-                    let mut text = Vec::new();
-                    render_text(&report, target.principal().as_deref(), &mut text)?;
-                    String::from_utf8(text)?
-                }
-            }
+            format::render(output.format(), &report, |report| {
+                let mut text = Vec::new();
+                render_text(report, target.principal().as_deref(), &mut text)?;
+                Ok(String::from_utf8(text)?)
+            })?
         }
         Command::Db(DbCommand::Edit(args)) => edit::run(args).await?,
         Command::Db(DbCommand::Exec(args)) => {
@@ -1961,17 +2010,30 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             output.push('\n');
             output
         }
-        Command::Db(DbCommand::Query(args)) => {
-            let (client, name, statement) = args.into_parts().await?;
-            format_rows(&client.query(&name, statement).await.map_err(failed)?)
+        Command::Db(DbCommand::Query(QueryArgs { sql, output })) => {
+            let (client, name, statement) = sql.into_parts().await?;
+            let rows = client.query(&name, statement).await.map_err(failed)?;
+            format::render(output.format(), &query_result(&rows), |_| {
+                Ok(format_rows(&rows))
+            })?
         }
-        Command::Db(DbCommand::Locate { name, target }) => {
-            format_location(&target.client()?.locate(&name).await.map_err(failed)?)
+        Command::Db(DbCommand::Locate {
+            name,
+            output,
+            target,
+        }) => {
+            let location = target.client()?.locate(&name).await.map_err(failed)?;
+            format::render(
+                output.format(),
+                &database_location(&location, SystemClock.now()),
+                |_| Ok(format_location(&location)),
+            )?
         }
         Command::Db(DbCommand::List {
             node,
             labels,
             prefix,
+            output,
             target,
         }) => {
             let filter = ListFilter {
@@ -1988,21 +2050,46 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             if let Some(node) = &node {
                 databases.retain(|location| location.primary.as_ref() == Some(node));
             }
-            format_databases(&databases)
+            let now = SystemClock.now();
+            let mut list = DatabaseList {
+                databases: databases
+                    .iter()
+                    .map(|location| database_location(location, now))
+                    .collect(),
+            };
+            list.databases.sort_by(|a, b| a.database.cmp(&b.database));
+            format::render(output.format(), &list, |_| Ok(format_databases(&databases)))?
         }
         Command::Db(DbCommand::Verify {
             name,
             at,
             expect,
+            output,
             target,
         }) => {
+            let format = output.format();
             let progress = Progress::start(
                 format!("verifying {}\u{2026}", shown(&name)),
-                &spinner_surroundings(MachineOutput::No),
+                &spinner_surroundings(format.machine()),
             );
             let report = verify(&target.client()?, &name, at, expect).await?;
-            progress.finish_ok(format!("verified {}", shown(&name)));
-            report
+            let Some(problem) = verify_problem(&report) else {
+                progress.finish_ok(format!("verified {}", shown(&name)));
+                return emit(&format::render(format, &report, |report| {
+                    Ok(verify_text(report))
+                })?);
+            };
+            progress.finish_err();
+            match format {
+                // The report is the result, and the failed check the exit code.
+                OutputFormat::Json | OutputFormat::Jsonl => {
+                    emit(&format::render(format, &report, |_| Ok(String::new()))?)?;
+                    return Err(problem.into());
+                }
+                OutputFormat::Table => {
+                    return Err(format!("{}{problem}", verify_text(&report)).into());
+                }
+            }
         }
         Command::Db(DbCommand::Restore {
             name,
@@ -2060,13 +2147,13 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                     let _ = writeln!(output, "expires: {}", format_time(at.as_millis()));
                 }
                 RestoredExpiry::Failed { message, .. } => {
-                    print!("{output}");
+                    emit(&output)?;
                     eprintln!(
                         "warning: the database was restored without its expiry: {}",
                         printable(message)
                     );
                     eprintln!("hint: fleetring db edit {} --expires-in <d>", shown(&name));
-                    return Err(AlreadyReported.into());
+                    return Err(exit::Silent(exit::FAILURE).into());
                 }
                 _ => {}
             }
@@ -2076,6 +2163,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             name,
             archive,
             address,
+            output,
             target,
         }) => {
             let client = target.client()?;
@@ -2084,7 +2172,11 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .describe_archive(&address, &archive, &name)
                 .await
                 .map_err(failed)?;
-            format_archive(&archive, &description)
+            format::render(
+                output.format(),
+                &archive_report(&archive, &description),
+                |_| Ok(format_archive(&archive, &description)),
+            )?
         }
         Command::Archive(ArchiveCommand::Verify {
             name,
@@ -2120,7 +2212,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         }
         Command::Db(DbCommand::Drop { name, yes, target }) => {
             if !yes {
-                confirm_drop(&name, &target.place()?)?;
+                confirm::confirm(&confirm::drop_database(&shown(&name), &target.place()?))?;
             }
             let epoch = target
                 .client()?
@@ -2131,13 +2223,20 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         }
         Command::Node(NodeCommand::List { output, target }) => {
             let nodes = node_list(&target.client()?.status().await.map_err(failed)?);
-            match output.format() {
-                OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&nodes)?),
-                OutputFormat::Table => node_list_text(&nodes),
-            }
+            format::render(output.format(), &nodes, |nodes| Ok(node_list_text(nodes)))?
         }
-        Command::Node(NodeCommand::Drain { id, target }) => {
+        Command::Node(NodeCommand::Drain { id, yes, target }) => {
             let client = target.client()?;
+            if !yes {
+                let only = only_replica_of(&client, &id).await?;
+                if !only.is_empty() {
+                    confirm::confirm(&confirm::drain_only_replica(
+                        id.as_str(),
+                        &only,
+                        &target.place()?,
+                    ))?;
+                }
+            }
             let progress = Progress::start(
                 format!("draining {id}\u{2026}"),
                 &spinner_surroundings(MachineOutput::No),
@@ -2168,7 +2267,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .into());
             }
             if !yes {
-                confirm_remove(&id, &target.place()?)?;
+                confirm::confirm(&confirm::remove_node(id.as_str(), &target.place()?))?;
             }
             let epoch = client.remove_node(&id).await.map_err(failed)?;
             format!(
@@ -2187,13 +2286,13 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             target,
         }) => {
             let orphans = list_orphans(node.as_ref(), address, &target).await?;
-            match output.format() {
-                OutputFormat::Json => format!(
-                    "{}\n",
-                    serde_json::to_string_pretty(&orphans_json(&orphans))?
-                ),
-                OutputFormat::Table => format_orphans(&orphans),
-            }
+            let list = OrphanList {
+                orphans: orphans
+                    .iter()
+                    .map(|(node, orphan)| orphan_report(node, orphan))
+                    .collect(),
+            };
+            format::render(output.format(), &list, |_| Ok(format_orphans(&orphans)))?
         }
         Command::Orphan(OrphanCommand::Remove {
             name,
@@ -2207,7 +2306,11 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .ok_or("pass --node or --address")?;
             let label = node.map_or_else(|| address.clone(), |node| node.to_string());
             if !yes {
-                confirm_remove_orphan(&name, &label, &target.place()?)?;
+                confirm::confirm(&confirm::remove_orphan(
+                    &shown(&name),
+                    &label,
+                    &target.place()?,
+                ))?;
             }
             let client = Client::new(address.clone(), target.network()?);
             let progress = Progress::start(
@@ -2228,6 +2331,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Lease(LeaseCommand::Watch {
             node,
             address,
+            output,
             target,
         }) => {
             let address = node_address(node.as_ref(), address, &target)
@@ -2235,17 +2339,68 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .ok_or("pass --node or --address")?;
             // The node answers on its own, about the leases it holds.
             let client = Client::new(address.clone(), target.network()?);
-            let mut updates = client.watch_leases(&address).await.map_err(failed)?;
-            while let Some(update) = updates.next().await.map_err(failed)? {
-                let mut stdout = std::io::stdout().lock();
-                stdout.write_all(format_lease_update(&update).as_bytes())?;
-                stdout.flush()?;
-            }
-            String::new()
+            let updates = client.watch_leases(&address).await.map_err(failed)?;
+            return watch_leases(updates, output.format()).await;
         }
     };
-    print!("{output}");
-    Ok(())
+    emit(&output)
+}
+
+/// Prints `output` on stdout. A reader that has gone away, as `| head` leaves it, ends the
+/// command quietly (`docs/cli.md`, section 10).
+fn emit(output: &str) -> Result<(), Box<dyn Error>> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(output.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
+}
+
+/// Prints each lease update as it arrives, flushed, until the stream ends, stdout closes (exit
+/// 0), or Ctrl-C (exit 130). In `json` and `jsonl` each lease is one object on its own line.
+async fn watch_leases(
+    mut updates: LeaseUpdates,
+    format: OutputFormat,
+) -> Result<(), Box<dyn Error>> {
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
+    // The node names itself in the stream's first message.
+    let mut node: Option<String> = None;
+    loop {
+        let update = tokio::select! {
+            _ = &mut interrupted => return Err(exit::Silent(exit::INTERRUPTED).into()),
+            update = updates.next() => {
+                let update: Result<Option<LeaseUpdate>, tonic::Status> = update;
+                update.map_err(failed)?
+            }
+        };
+        let Some(update) = update else {
+            return Ok(());
+        };
+        let text = match format {
+            OutputFormat::Table => format_lease_update(&update),
+            OutputFormat::Json | OutputFormat::Jsonl => {
+                if let LeaseUpdate::Held { node: held, .. } = &update {
+                    node = Some(held.to_string());
+                }
+                lease_events(&update, node.as_deref())
+                    .iter()
+                    .map(format::line)
+                    .collect::<Result<String, _>>()?
+            }
+        };
+        let mut stdout = std::io::stdout().lock();
+        match stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            other => other?,
+        }
+    }
 }
 
 /// Runs `upgrade` and returns what it prints. A check that finds a newer release the fleet
@@ -2308,15 +2463,15 @@ async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
         Mode::Rollback => "rolled back",
     });
     if outcome.blocked {
-        print!("{}", outcome.report);
+        emit(&outcome.report)?;
         return Err("the fleet doesn't allow the newest release yet".into());
     }
     Ok(outcome.report)
 }
 
-/// What a spinner may show on in this process. No command has `-q` yet (phase G adds it).
+/// What a spinner may show on in this process: none with `-q`, or for machine output.
 fn spinner_surroundings(machine_output: MachineOutput) -> Surroundings {
-    Surroundings::capture(machine_output, Quiet::No)
+    Surroundings::capture(machine_output, quiet())
 }
 
 /// The address of the data node a command asks directly: `address` as given, or the address the
@@ -2455,7 +2610,7 @@ async fn verify_archive(
                 differ.push(replica.node.to_string());
             }
             Err(status) => {
-                let _ = writeln!(output, "  {}: {}", replica.node, failed(status));
+                let _ = writeln!(output, "  {}: {}", replica.node, exit::describe(&status));
                 unanswered.push(replica.node.to_string());
             }
         }
@@ -2496,10 +2651,10 @@ async fn restore_archived_metadata(
     flags: &NewMetadata,
 ) -> String {
     if let Some(reason) = &restored.archived_metadata_skipped {
-        eprintln!(
+        note(format!(
             "warning: the archived metadata was skipped: {}",
             printable(reason)
-        );
+        ));
     }
     let Some(archived) = &restored.archived_metadata else {
         return restored
@@ -2509,15 +2664,15 @@ async fn restore_archived_metadata(
     };
     let restore = restored_metadata(archived, flags);
     for skipped in &restore.skipped {
-        eprintln!("warning: skipped {}", printable(skipped));
+        note(format!("warning: skipped {}", printable(skipped)));
     }
     if !restore.change.is_empty()
         && let Err(status) = client.update_database(name, &restore.change, None).await
     {
-        eprintln!(
+        note(format!(
             "warning: the archived description and labels weren't restored: {}",
-            failed(status)
-        );
+            exit::describe(&status)
+        ));
     }
     let mut report = Vec::new();
     // Writing to a vector can't fail.
@@ -2563,10 +2718,10 @@ async fn restore_offline(
             )
         }
         (None, Some(reason)) => {
-            eprintln!(
+            note(format!(
                 "warning: the archived metadata was skipped: {}",
                 printable(reason)
-            );
+            ));
             "the archived metadata was skipped\n".to_owned()
         }
         (None, None) => String::new(),
@@ -2632,7 +2787,7 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             let ttl = ttl.unwrap_or(DEFAULT_TOKEN_LIFETIME);
             principal.refuse_reserved()?;
             for warning in scopes.iter().filter_map(Scope::separator_warning) {
-                eprintln!("warning: {warning}");
+                note(format!("warning: {warning}"));
             }
             if ttl > MAX_TOKEN_LIFETIME {
                 return Err(format!(
@@ -2653,17 +2808,18 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                 expires_at: not_before.saturating_add(Millis::new(ttl_millis)),
             };
             let token = signer.issue(&grant)?;
-            eprintln!(
+            note(format!(
                 "issued token {id} for {principal}, signed by key {}, for {}s",
                 signer.key_id(),
                 ttl.as_secs()
-            );
+            ));
             Ok(format!("{}\n", token.expose()))
         }
         TokenCommand::Revoke {
             token_id,
             key_id,
             ttl,
+            yes,
             target,
         } => {
             let (revoked, until) = match (token_id, key_id) {
@@ -2682,7 +2838,11 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                 Revoked::TokenId(id) => format!("token {id}"),
                 Revoked::KeyId(id) => format!("signing key {id}"),
             };
-            eprintln!("revoking {what} {}", target.place()?);
+            let place = target.place()?;
+            match &revoked {
+                Revoked::KeyId(id) if !yes => confirm::confirm(&confirm::revoke_key(id, &place))?,
+                _ => note(format!("revoking {what} {}", place.on())),
+            }
             target
                 .client()?
                 .control()
@@ -2758,7 +2918,7 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
                 ));
             };
             if let Some(warning) = agent::prepare_out_dir(&out)? {
-                eprintln!("{warning}");
+                note(warning);
             }
             // The copy of `ca.crt` first, so a directory it refuses holds nothing new.
             agent::write_new_private(&out.join(AUTHORITY_CERT_FILE), authority.certificate_pem())?;
@@ -2790,22 +2950,15 @@ impl SqlArgs {
     }
 }
 
-/// One replica's answer to `db verify`.
-#[derive(Debug)]
-enum Answer {
-    Hash(Verification),
-    Failed(String),
-}
-
 /// Runs `db verify`: asks every replica with an address for its chain hash at `at`, or at the
-/// latest position they all hold, and reports agreement, the first replica that differs, and,
-/// with `expect`, whether the log still hashes to a hash recorded earlier.
+/// latest position they all hold, and reports each answer, whether they agree, and, with
+/// `expect`, whether the log still hashes to a hash recorded earlier.
 async fn verify(
     client: &Client,
     name: &DatabaseName,
     at: Option<Position>,
     expect: Option<ChainHash>,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<VerifyReport, Box<dyn Error>> {
     let location = client.locate(name).await.map_err(failed)?;
     let replicas: Vec<(NodeId, String)> = location
         .replicas
@@ -2820,10 +2973,10 @@ async fn verify(
         async move {
             let mut answers = Vec::with_capacity(replicas.len());
             for (node, address) in replicas {
-                let answer = match client.verify(address, name, at.as_ref()).await {
-                    Ok(verification) => Answer::Hash(verification),
-                    Err(status) => Answer::Failed(failed(status).to_string()),
-                };
+                let answer = client
+                    .verify(address, name, at.as_ref())
+                    .await
+                    .map_err(|status| exit::describe(&status));
                 answers.push((node.clone(), answer));
             }
             answers
@@ -2845,14 +2998,14 @@ async fn verify(
         None => {
             let common = answers
                 .iter()
-                .filter_map(|(_, answer)| match answer {
-                    Answer::Hash(verification) => Some(verification.position.clone()),
-                    Answer::Failed(_) => None,
-                })
+                .filter_map(|(_, answer)| answer.as_ref().ok())
+                .map(|verification| verification.position.clone())
                 .min()
                 .flatten();
             let behind = answers.iter().any(|(_, answer)| {
-                matches!(answer, Answer::Hash(verification) if verification.position != common)
+                answer
+                    .as_ref()
+                    .is_ok_and(|verification| verification.position != common)
             });
             if behind {
                 answers = ask(common.clone()).await;
@@ -2860,127 +3013,127 @@ async fn verify(
             common
         }
     };
-    let position_text = position
-        .as_ref()
-        .map_or_else(|| "empty log".to_owned(), ToString::to_string);
-    let mut output = format!("database: {}\nposition: {position_text}\n", shown(name));
-    let mut agreed: Option<&ChainHash> = None;
-    let mut differs: Option<(&NodeId, String)> = None;
-    for (node, answer) in &answers {
-        match answer {
-            Answer::Hash(verification) => {
-                let _ = writeln!(output, "  {node}: {}", verification.chain_hash);
-                match agreed {
-                    None => agreed = Some(&verification.chain_hash),
-                    Some(hash) if *hash != verification.chain_hash && differs.is_none() => {
-                        differs = Some((node, format!("holds {}", verification.chain_hash)));
-                    }
-                    Some(_) => {}
-                }
-            }
-            Answer::Failed(reason) => {
-                let _ = writeln!(output, "  {node}: {reason}");
-                if differs.is_none() {
-                    differs = Some((node, reason.clone()));
-                }
-            }
-        }
-    }
-    let Some(hash) = agreed else {
-        return Err(format!("{output}no replica of {} could answer", shown(name)).into());
-    };
-    if let Some((node, reason)) = differs {
-        return Err(format!(
-            "{output}replicas of {name} disagree at {position_text}: {node} {reason}",
-            name = shown(name)
-        )
-        .into());
-    }
-    let _ = writeln!(
-        output,
-        "chain hash: {hash}
-all {} replica{} agree",
-        answers.len(),
-        plural(u64::try_from(answers.len()).unwrap_or(u64::MAX))
+    let first = answers
+        .iter()
+        .find_map(|(_, answer)| answer.as_ref().ok())
+        .map(|verification| verification.chain_hash);
+    let agree = first.is_some()
+        && answers.iter().all(|(_, answer)| {
+            answer
+                .as_ref()
+                .is_ok_and(|verification| Some(&verification.chain_hash) == first.as_ref())
+        });
+    Ok(VerifyReport {
+        database: name.to_string(),
+        position: position.as_ref().map(ToString::to_string),
+        replicas: answers
+            .into_iter()
+            .map(|(node, answer)| match answer {
+                Ok(verification) => ReplicaHash {
+                    node: node.to_string(),
+                    chain_hash: Some(verification.chain_hash.to_string()),
+                    error: None,
+                },
+                Err(reason) => ReplicaHash {
+                    node: node.to_string(),
+                    chain_hash: None,
+                    error: Some(reason),
+                },
+            })
+            .collect(),
+        unchanged: expect
+            .as_ref()
+            .filter(|_| agree)
+            .map(|expect| first.as_ref() == Some(expect)),
+        expected: expect.as_ref().map(ToString::to_string),
+        chain_hash: first.as_ref().map(ToString::to_string),
+        agree,
+    })
+}
+
+/// The position `report` verified at, as text output prints it.
+fn verified_at(report: &VerifyReport) -> &str {
+    report.position.as_deref().unwrap_or("empty log")
+}
+
+/// What `db verify` printed for people: the position, each replica's answer, and the outcome.
+fn verify_text(report: &VerifyReport) -> String {
+    let mut output = format!(
+        "database: {}\nposition: {}\n",
+        printable(&report.database),
+        verified_at(report)
     );
-    if let Some(expect) = expect {
-        if expect == *hash {
-            let _ = writeln!(output, "nothing changed since {position_text}");
-        } else {
-            return Err(format!(
-                "{output}the log at {position_text} hashes to {hash}, not the expected {expect}"
-            )
-            .into());
+    for replica in &report.replicas {
+        let answer = replica
+            .chain_hash
+            .as_deref()
+            .or(replica.error.as_deref())
+            .unwrap_or("no answer");
+        let _ = writeln!(output, "  {}: {answer}", replica.node);
+    }
+    if let (true, Some(hash)) = (report.agree, &report.chain_hash) {
+        let count = report.replicas.len();
+        let _ = writeln!(
+            output,
+            "chain hash: {hash}\nall {count} replica{} agree",
+            plural(u64::try_from(count).unwrap_or(u64::MAX))
+        );
+        if report.unchanged == Some(true) {
+            let _ = writeln!(output, "nothing changed since {}", verified_at(report));
         }
     }
-    Ok(output)
+    output
 }
 
-/// What `db drop` asks: the database, where it is dropped, and what is lost (ADR-0043, point
-/// 4.6).
-fn drop_prompt(name: &DatabaseName, place: &str) -> String {
-    format!(
-        "drop database '{}' {place} and every replica's copy, for good? [y/N] ",
-        shown(name)
-    )
-}
-
-/// What `orphan remove` asks.
-fn orphan_prompt(name: &DatabaseName, node: &str, place: &str) -> String {
-    format!(
-        "delete the orphan copy of database '{}' on node {node} {place}? Its files go for good; \
-         copy them first to keep them. [y/N] ",
-        shown(name)
-    )
-}
-
-/// What `node remove` asks.
-fn remove_prompt(id: &NodeId, place: &str) -> String {
-    format!("remove node {id} from the fleet {place}? Its replicas are placed elsewhere. [y/N] ")
-}
-
-/// Asks `prompt` on the terminal and returns whether the answer was yes; refuses, naming
-/// `refusal`, without a terminal.
-fn confirm(prompt: &str, refusal: &str, declined: &str) -> Result<(), Box<dyn Error>> {
-    let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        return Err(refusal.to_owned().into());
+/// Why `report` fails the command, if it does: no replica answered, the replicas disagree (the
+/// first that differs is named), or the log no longer hashes to the expected hash.
+fn verify_problem(report: &VerifyReport) -> Option<String> {
+    let name = printable(&report.database);
+    let Some(hash) = &report.chain_hash else {
+        return Some(format!("no replica of {name} could answer"));
+    };
+    if !report.agree {
+        let differs = report.replicas.iter().find_map(|replica| {
+            match (&replica.chain_hash, &replica.error) {
+                (Some(held), _) if held != hash => Some((&replica.node, format!("holds {held}"))),
+                (None, Some(error)) => Some((&replica.node, error.clone())),
+                _ => None,
+            }
+        });
+        let (node, reason) = differs?;
+        return Some(format!(
+            "replicas of {name} disagree at {}: {node} {reason}",
+            verified_at(report)
+        ));
     }
-    let mut stderr = std::io::stderr();
-    write!(stderr, "{prompt}")?;
-    stderr.flush()?;
-    let mut answer = String::new();
-    stdin.lock().read_line(&mut answer)?;
-    let answer = answer.trim();
-    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        Ok(())
-    } else {
-        Err(declined.to_owned().into())
+    match (&report.expected, report.unchanged) {
+        (Some(expected), Some(false)) => Some(format!(
+            "the log at {} hashes to {hash}, not the expected {expected}",
+            verified_at(report)
+        )),
+        _ => None,
     }
 }
 
-/// Asks on the terminal whether to drop `name`, and refuses without a terminal.
-fn confirm_drop(name: &DatabaseName, place: &str) -> Result<(), Box<dyn Error>> {
-    confirm(
-        &drop_prompt(name, place),
-        &format!("pass --yes to drop {} without a prompt", shown(name)),
-        &format!("not dropping {}", shown(name)),
-    )
-}
-
-fn confirm_remove_orphan(
-    name: &DatabaseName,
-    node: &str,
-    place: &str,
-) -> Result<(), Box<dyn Error>> {
-    confirm(
-        &orphan_prompt(name, node, place),
-        &format!(
-            "pass --yes to delete the orphan copy of {} without a prompt",
-            shown(name)
-        ),
-        &format!("not deleting the orphan copy of {}", shown(name)),
-    )
+/// The databases whose only replica is on `node`, which a drain leaves unavailable until the
+/// node returns (`docs/cli.md`, section 7).
+async fn only_replica_of(client: &Client, node: &NodeId) -> Result<Vec<String>, Box<dyn Error>> {
+    let listing = client
+        .list_databases_where(&ListFilter::default())
+        .await
+        .map_err(failed)?;
+    Ok(listing
+        .databases
+        .iter()
+        .filter(|location| {
+            location.replicas.len() == 1
+                && location
+                    .replicas
+                    .first()
+                    .is_some_and(|replica| &replica.node == node)
+        })
+        .map(|location| shown(&location.database))
+        .collect())
 }
 
 /// The orphans `orphan list` reports, each with the node that keeps it, in node and then name
@@ -3026,26 +3179,13 @@ async fn list_orphans(
                 );
             }
             Err(status) if asked_one => return Err(failed(status)),
-            Err(status) => eprintln!("{}: can't ask {label}: {}", program(), status.message()),
+            Err(status) => note(format!(
+                "warning: can't ask {label}: {}",
+                printable(status.message())
+            )),
         }
     }
     Ok(orphans)
-}
-
-/// `orphan list --json`: `{"orphans": [{"node", "database", "epoch", "bytes"}]}`.
-fn orphans_json(orphans: &[(String, Orphan)]) -> serde_json::Value {
-    let listed: Vec<serde_json::Value> = orphans
-        .iter()
-        .map(|(node, orphan)| {
-            serde_json::json!({
-                "node": node,
-                "database": orphan.database.as_str(),
-                "epoch": orphan.epoch.get(),
-                "bytes": orphan.bytes,
-            })
-        })
-        .collect();
-    serde_json::json!({ "orphans": listed })
 }
 
 /// `orphan list`'s table: one row per orphan, under `NODE`, `DATABASE`, `EPOCH`, and `BYTES`.
@@ -3065,14 +3205,6 @@ fn format_orphans(orphans: &[(String, Orphan)]) -> String {
         })
         .collect();
     table(["NODE", "DATABASE", "EPOCH", "BYTES"], &rows)
-}
-
-fn confirm_remove(id: &NodeId, place: &str) -> Result<(), Box<dyn Error>> {
-    confirm(
-        &remove_prompt(id, place),
-        &format!("pass --yes to remove {id} without a prompt"),
-        &format!("not removing {id}"),
-    )
 }
 
 fn plural(count: u64) -> &'static str {
@@ -3255,33 +3387,25 @@ fn format_drain(id: &NodeId, primaries: &[DatabaseName]) -> String {
     output
 }
 
-fn format_node_status(status: &NodeStatus) -> String {
-    let fingerprint = status
-        .fingerprint
-        .map_or_else(|| "none".to_owned(), |fingerprint| fingerprint.to_string());
+/// `status --node`'s text: the node, its epoch and ring, then what it serves, keeps and sends.
+fn format_node_status(status: &NodeStatusReport) -> String {
     let mut output = format!(
-        "node: {}\nmembership epoch: {}\nring fingerprint: {fingerprint}\ndatabases:\n",
-        status.node,
-        status.membership_epoch.get(),
+        "node: {}\nmembership epoch: {}\nring fingerprint: {}\ndatabases:\n",
+        printable(&status.node),
+        status.membership_epoch,
+        status.ring_fingerprint.as_deref().unwrap_or("none"),
     );
     if status.databases.is_empty() {
         output.push_str("  none\n");
     }
     for database in &status.databases {
-        let role = match database.role {
-            ReplicaRole::Primary => "primary",
-            ReplicaRole::Follower => "follower",
-            _ => "unknown",
-        };
-        let position = database
-            .position
-            .as_ref()
-            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
         let _ = writeln!(
             output,
-            "  {} {role} epoch={} position={position}",
-            shown(&database.database),
-            database.epoch.get(),
+            "  {} {} epoch={} position={}",
+            printable(&database.database),
+            database.role,
+            database.lease_epoch,
+            database.position.as_deref().unwrap_or("unknown"),
         );
     }
     if !status.orphans.is_empty() {
@@ -3291,8 +3415,8 @@ fn format_node_status(status: &NodeStatus) -> String {
         let _ = writeln!(
             output,
             "  {} epoch={} bytes={} (closed; `fleetring orphan remove` deletes it)",
-            shown(&orphan.database),
-            orphan.epoch.get(),
+            printable(&orphan.database),
+            orphan.epoch,
             orphan.bytes,
         );
     }
@@ -3300,23 +3424,14 @@ fn format_node_status(status: &NodeStatus) -> String {
         output.push_str("change sinks:\n");
     }
     for sink in &status.sinks {
-        let position = sink
-            .position
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), ToString::to_string);
-        let acknowledged = sink
-            .acknowledged
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), ToString::to_string);
-        let kept = match sink.home {
-            Some(MarkHome::Replicated) => "replicated",
-            _ => "local",
-        };
         let _ = write!(
             output,
-            "  {} {} position={position} ({kept}) acknowledged={acknowledged} backlog={} failures={} resets={}",
+            "  {} {} position={} ({}) acknowledged={} backlog={} failures={} resets={}",
             sink.sink,
-            shown(&sink.database),
+            printable(&sink.database),
+            sink.position.as_deref().unwrap_or("none"),
+            sink.mark,
+            sink.acknowledged.as_deref().unwrap_or("none"),
             sink.backlog,
             sink.failures,
             sink.resets
@@ -3330,44 +3445,38 @@ fn format_node_status(status: &NodeStatus) -> String {
 }
 
 fn liveness(liveness: Liveness) -> &'static str {
-    match liveness {
-        Liveness::Live => "live",
-        Liveness::Down => "down",
-    }
+    liveness_name(liveness)
 }
 
-fn format_status(view: &MembershipView) -> String {
-    let fingerprint = view
-        .fingerprint()
-        .map_or_else(|| "none".to_owned(), |fingerprint| fingerprint.to_string());
+/// `status`'s text: dev mode, the epoch and ring, then one line per member.
+fn format_status(status: &FleetStatus) -> String {
     let mut output = String::new();
-    if view.dev_mode() == DevMode::On {
+    if status.dev_mode {
         output.push_str("dev mode: one node on loopback, for development only\n");
     }
     let _ = write!(
         output,
-        "membership epoch: {}\nring fingerprint: {fingerprint}\nmembers:\n",
-        view.epoch().get()
+        "membership epoch: {}\nring fingerprint: {}\nmembers:\n",
+        status.membership_epoch,
+        status.ring_fingerprint.as_deref().unwrap_or("none"),
     );
-    for (member, live) in view.members() {
+    for member in &status.members {
         let _ = write!(
             output,
             "  {} {} weight={}",
-            member.id(),
-            liveness(live),
-            member.weight().get()
+            member.node, member.liveness, member.weight
         );
-        if let Some(zone) = member.zone() {
+        if let Some(zone) = &member.zone {
             let _ = write!(output, " zone={zone}");
         }
-        if let Some(host) = member.host() {
+        if let Some(host) = &member.host {
             let _ = write!(output, " host={host}");
         }
-        if let Some(address) = member.address() {
+        if let Some(address) = &member.address {
             let _ = write!(output, " address={address}");
         }
         // A member that reports no software runs 0.3.0 (ADR-0038).
-        let _ = write!(output, " version={}", member.running().release());
+        let _ = write!(output, " version={}", member.release);
         output.push('\n');
     }
     output
@@ -3389,7 +3498,7 @@ fn database_spec(replication_factor: Option<u8>) -> Result<DatabaseSpec, Box<dyn
 /// as nodes join (ADR-0039).
 fn warn_if_under_replicated(location: &Location) {
     if let Some(warning) = under_replicated(location) {
-        eprintln!("warning: {warning}");
+        note(format!("warning: {warning}"));
     }
 }
 
@@ -3430,15 +3539,10 @@ fn shown(name: &impl std::fmt::Display) -> String {
 /// How many rows `db show` counts in each table before it says "more than" (ADR-0041, point 6).
 const SCHEMA_COUNT_LIMIT: u64 = 10_000;
 
-/// A failed call as one readable line: what kind of failure, and the server's message.
+/// A failed call as one readable line, `<kind of failure>: <the server's message>`, with the
+/// next step for the common failures; its gRPC code chooses the exit code.
 fn failed(status: tonic::Status) -> Box<dyn Error> {
-    // The message may name a database, whose name a principal chose.
-    format!(
-        "{}: {}",
-        status.code().description(),
-        printable(status.message())
-    )
-    .into()
+    Failed::new(&status).into()
 }
 
 /// The next step after a refusal of a creation or update with metadata for want of the
@@ -3472,7 +3576,7 @@ fn metadata_hint(status: &tonic::Status) -> Option<&'static str> {
 /// fleet can't use the `metadata` feature yet.
 fn metadata_failed(status: tonic::Status) -> Box<dyn Error> {
     match metadata_hint(&status) {
-        Some(hint) => format!("{}\n  hint: {hint}", failed(status)).into(),
+        Some(hint) => Failed::new(&status).with_hint(hint).into(),
         None => failed(status),
     }
 }
@@ -3514,19 +3618,6 @@ fn format_metadata_summary(metadata: &MetadataView) -> String {
         metadata.version
     )
 }
-
-/// The error of a command that has printed its own message, as a restore that couldn't set
-/// its expiry does: it only makes the process exit with 1.
-#[derive(Debug)]
-struct AlreadyReported;
-
-impl std::fmt::Display for AlreadyReported {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the command failed")
-    }
-}
-
-impl Error for AlreadyReported {}
 
 /// The name the binary was run as, set once at the start of `main`.
 static PROGRAM: OnceLock<ProgramName> = OnceLock::new();
@@ -3995,7 +4086,13 @@ mod tests {
         );
 
         assert_eq!(format_orphans(&[]), "no orphans\n");
-        assert_eq!(orphans_json(&[]), serde_json::json!({ "orphans": [] }));
+        assert_eq!(
+            serde_json::to_value(OrphanList {
+                orphans: Vec::new()
+            })
+            .expect("serializes"),
+            serde_json::json!({ "orphans": [] })
+        );
     }
 
     #[test]
@@ -4257,29 +4354,6 @@ mod tests {
         for bad in ["int:x", "real:", "blob:0", "blob:zz"] {
             assert!(parse_param(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn the_destructive_prompts_name_the_fleet_and_the_context() {
-        let place = "on fleet 'home' (context 'home')";
-        let notes: DatabaseName = "notes".parse().expect("name");
-        assert_eq!(
-            drop_prompt(&notes, place),
-            "drop database 'notes' on fleet 'home' (context 'home') and every replica's copy, \
-             for good? [y/N] "
-        );
-        assert!(
-            orphan_prompt(&notes, "node-2", place)
-                .starts_with("delete the orphan copy of database 'notes' on node node-2 on fleet 'home' (context 'home')?"),
-            "{}",
-            orphan_prompt(&notes, "node-2", place)
-        );
-        let id: NodeId = "node-3".parse().expect("id");
-        assert_eq!(
-            remove_prompt(&id, "on fleet 'home' (control 10.0.0.2:7400)"),
-            "remove node node-3 from the fleet on fleet 'home' (control 10.0.0.2:7400)? Its \
-             replicas are placed elsewhere. [y/N] "
-        );
     }
 
     #[test]

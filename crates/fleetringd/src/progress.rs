@@ -40,7 +40,19 @@ pub(crate) enum Quiet {
     Yes,
 }
 
-/// What decides whether a spinner may show, captured once (`docs/cli.md`, section 5).
+/// `--color`'s values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ColorChoice {
+    /// On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`.
+    Auto,
+    /// Always, even into a pipe or a file.
+    Always,
+    /// Never.
+    Never,
+}
+
+/// What decides whether a spinner may show, and whether stderr gets colour, captured once
+/// (`docs/cli.md`, section 5).
 #[expect(
     clippy::struct_excessive_bools,
     reason = "a snapshot of independent facts about the process, decided by one pure function"
@@ -89,6 +101,17 @@ impl Surroundings {
             && !self.no_color
             && !self.term_dumb
             && !self.ci
+    }
+
+    /// Whether stderr, where log lines, prompts and the picker go, gets colour: `--color always`
+    /// forces it and `never` forbids it; otherwise stderr is a terminal, `NO_COLOR` is unset or
+    /// empty, and `TERM` isn't `dumb`.
+    pub(crate) fn colour(&self, choice: ColorChoice) -> bool {
+        match choice {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => self.stderr_terminal && !self.no_color && !self.term_dumb,
+        }
     }
 }
 
@@ -380,6 +403,59 @@ mod tests {
         ];
         for (name, surroundings) in each {
             assert!(!surroundings.spinners(), "{name}");
+        }
+    }
+
+    #[test]
+    fn colour_needs_a_terminal_and_no_no_color_unless_forced() {
+        assert!(ALLOWED.colour(ColorChoice::Auto));
+        let off = [
+            (
+                "pipe",
+                Surroundings {
+                    stderr_terminal: false,
+                    ..ALLOWED
+                },
+            ),
+            (
+                "no color",
+                Surroundings {
+                    no_color: true,
+                    ..ALLOWED
+                },
+            ),
+            (
+                "dumb terminal",
+                Surroundings {
+                    term_dumb: true,
+                    ..ALLOWED
+                },
+            ),
+        ];
+        for (name, surroundings) in off {
+            assert!(!surroundings.colour(ColorChoice::Auto), "{name}");
+            assert!(
+                surroundings.colour(ColorChoice::Always),
+                "{name}: always forces it"
+            );
+        }
+        assert!(!ALLOWED.colour(ColorChoice::Never));
+        // Machine output, -q and CI keep spinners off, not colour.
+        for surroundings in [
+            Surroundings {
+                machine_output: true,
+                ..ALLOWED
+            },
+            Surroundings {
+                quiet: true,
+                ..ALLOWED
+            },
+            Surroundings {
+                ci: true,
+                ..ALLOWED
+            },
+        ] {
+            assert!(surroundings.colour(ColorChoice::Auto));
         }
     }
 
