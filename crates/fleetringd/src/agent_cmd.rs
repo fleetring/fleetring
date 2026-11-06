@@ -1187,8 +1187,12 @@ mod tests {
         let dir = AgentDir::new(Path::new("/data/agents/prod"), "42".parse().expect("an ID"));
         let name: ContextName = "prod".parse().expect("a name");
         let text = no_identity(&dir, Some((&name, &Context::default())));
+        let path = Path::new("/data/agents/prod").join("42");
         assert!(
-            text.starts_with("agent '42' has no identity in /data/agents/prod/42\n  hint: "),
+            text.starts_with(&format!(
+                "agent '42' has no identity in {}\n  hint: ",
+                path.display()
+            )),
             "{text}"
         );
         assert!(
