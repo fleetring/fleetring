@@ -65,10 +65,10 @@ Placement compatibility is separate from API compatibility. `cargo semver-checks
 
 # Releasing `fleetringd`
 
-The daemon is released separately from the crate (FR-034). It isn't published to crates.io (`publish = false`); a release is a set of prebuilt binaries and a container image, made by CI from a `fleetringd-vX.Y.Z` tag. Two workflows run on the tag:
+The daemon is released separately from the crate (FR-034). Its package is `fleetringd`, and it builds the `fleetring` binary; the package, its `fleetringd-vX.Y.Z` tags and its archive names keep the old name until 1.0, because a 0.6 `upgrade` looks for them (ADR-0043, point 1.7). It isn't published to crates.io (`publish = false`); a release is a set of prebuilt binaries and a container image, made by CI from a `fleetringd-vX.Y.Z` tag. Two workflows run on the tag:
 
-- `.github/workflows/release.yml` builds `fleetringd` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. It packages each with the licenses and `crates/fleetringd/README.md`, writes `SHA256SUMS` and a `.sha256` per file, signs `SHA256SUMS` keylessly with cosign (one bundle, `SHA256SUMS.sigstore.json`, holding the signature, the certificate, and the transparency-log proof), attests the archives and `scripts/install.sh`, and attaches everything to the tag's GitHub release, creating it if needed. It runs `cargo audit` first and fails on an unresolved advisory.
-- `.github/workflows/container.yml` builds the `Dockerfile` natively for `linux/amd64` and `linux/arm64` and pushes one manifest to `ghcr.io/fleetring/fleetringd`, tagged `X.Y.Z`. A final release also moves `X.Y` and `latest`; a prerelease (`X.Y.Z-rc.1`) gets its own tag only.
+- `.github/workflows/release.yml` builds `fleetring` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. It packages each as `fleetringd-<version>-<target>.tar.gz` (`.zip` on Windows), whose directory holds `fleetring` and a regular copy named `fleetringd`, with the licenses and `crates/fleetringd/README.md`; `scripts/check-archive.sh` fails the build unless both copies are identical and each prints its own name and the version. It writes `SHA256SUMS` and a `.sha256` per file, signs `SHA256SUMS` keylessly with cosign (one bundle, `SHA256SUMS.sigstore.json`, holding the signature, the certificate, and the transparency-log proof), attests the archives and `scripts/install.sh`, and attaches everything to the tag's GitHub release, creating it if needed. It runs `cargo audit` first and fails on an unresolved advisory.
+- `.github/workflows/container.yml` builds the `Dockerfile` natively for `linux/amd64` and `linux/arm64` and pushes one manifest to `ghcr.io/fleetring/fleetring`, and the same manifest to `ghcr.io/fleetring/fleetringd` until 1.0, tagged `X.Y.Z`. A final release also moves `X.Y` and `latest`; a prerelease (`X.Y.Z-rc.1`) gets its own tag only.
 
 ## 1. Pre-flight
 
@@ -78,6 +78,8 @@ The daemon is released separately from the crate (FR-034). It isn't published to
   ```sh
   FLEETRINGD_BASELINE_VERSION=<previous> cargo test -p fleetringd --test upgrade -- --ignored --nocapture rolling
   ```
+
+  **0.7.0 only:** run it with `FLEETRINGD_BASELINE_VERSION=0.6.0`, so that 0.6's own `upgrade` installs the 0.7 archive across the rename (ADR-0043, point 3.2). It must pass before 0.7.0 is tagged.
 
   If the release changes the protocol, the control log, or a command that older members can't read, its notes say which releases it runs beside, and a new control command is a fleet feature (ADR-0038, point 4).
 - [ ] `RUST_VERSION` agrees in `.github/workflows/release.yml` and the `Dockerfile`.
@@ -94,10 +96,11 @@ The daemon is released separately from the crate (FR-034). It isn't published to
 
 ## 2. Version
 
-- [ ] Set `version` in `crates/fleetringd/Cargo.toml` to exactly the version the tag will name; `fleetringd --version` prints it. Both workflows fail unless the tag is `fleetringd-v` followed by that version, character for character.
+- [ ] Set `version` in `crates/fleetringd/Cargo.toml` to exactly the version the tag will name; `fleetring --version` prints it. Both workflows fail unless the tag is `fleetringd-v` followed by that version, character for character.
   - **A release candidate** sets it to `X.Y.Z-rc.N` first, and is tagged `fleetringd-vX.Y.Z-rc.N`. The release is marked a prerelease, and the image gets only its own tag.
   - Tagging `-rc.N` while `Cargo.toml` still says `X.Y.Z` fails the `version` job. That is why 0.2.0's `rc.1` tag failed.
   - The final release sets `X.Y.Z` in a commit of its own.
+  - **0.7.0's version bump** also removes `knows_serve`'s own-line clause, `|| release.line() >= this_release().line()`, from `crates/fleetringd/src/upgrade/mod.rs`. It only lets a build that still says 0.6.0 reinstall itself over a `serve` node, and does nothing once the version is 0.7.0.
 - [ ] Commit: `chore(release): fleetringd X.Y.Z` (or `X.Y.Z-rc.N`).
 
 `CHANGELOG.md` documents the `fleetring` crate only; the daemon's notes go in its GitHub release.
@@ -136,25 +139,28 @@ for file in fleetringd-$V-*.tar.gz fleetringd-$V-*.zip install.sh; do
 done
 
 # 4. Provenance for the container image.
+gh attestation verify oci://ghcr.io/fleetring/fleetring:$V --repo fleetring/fleetring
 gh attestation verify oci://ghcr.io/fleetring/fleetringd:$V --repo fleetring/fleetring
 
 # 5. The install script installs this version.
 curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh \
   | sh -s -- --version $V --prefix "$PWD/prefix"
-"$PWD/prefix/bin/fleetringd" --version
+"$PWD/prefix/bin/fleetring" --version
+"$PWD/prefix/bin/fleetringd" --version   # the link, until 1.0
 
 # 6. The image runs on both architectures.
-docker run --rm --platform linux/amd64 ghcr.io/fleetring/fleetringd:$V --version
-docker run --rm --platform linux/arm64 ghcr.io/fleetring/fleetringd:$V --version
+docker run --rm --platform linux/amd64 ghcr.io/fleetring/fleetring:$V --version
+docker run --rm --platform linux/arm64 ghcr.io/fleetring/fleetring:$V --version
+docker run --rm --platform linux/amd64 --entrypoint /usr/local/bin/fleetringd ghcr.io/fleetring/fleetringd:$V --version
 ```
 
-- [ ] The release lists five archives, `SHA256SUMS` with its `.sigstore.json` bundle, a `.sha256` for each file, and `install.sh`.
+- [ ] The release lists five archives, each holding `fleetring` and `fleetringd` (`.exe` on Windows), `SHA256SUMS` with its `.sigstore.json` bundle, a `.sha256` for each file, and `install.sh`.
 - [ ] Every checksum passes.
 - [ ] `cosign verify-blob` prints `Verified OK`.
 - [ ] `gh attestation verify` succeeds for every archive, `install.sh`, and the image.
-- [ ] The installed binary prints `fleetringd X.Y.Z`.
-- [ ] Both `docker run` commands print `fleetringd X.Y.Z`. On a machine of one architecture, the other runs under emulation (Docker Desktop has it; on Linux, `docker run --privileged --rm tonistiigi/binfmt --install all` adds it).
-- [ ] The first time only: make the `fleetringd` package public in the organization's GitHub package settings, and link it to this repository.
+- [ ] The installed `fleetring` prints `fleetring X.Y.Z`, and `fleetringd` prints `fleetringd X.Y.Z`.
+- [ ] The first two `docker run` commands print `fleetring X.Y.Z`, and the third `fleetringd X.Y.Z`. On a machine of one architecture, the other runs under emulation (Docker Desktop has it; on Linux, `docker run --privileged --rm tonistiigi/binfmt --install all` adds it).
+- [ ] The first time only: make the `fleetring` and `fleetringd` container packages public in the organization's GitHub package settings, and link them to this repository. 0.7.0 is the first release of `ghcr.io/fleetring/fleetring`.
 - [ ] Replace the release's notes with the [template](#5-release-notes).
 - [ ] If the release fixes a vulnerability, publish its advisory now ([`SECURITY.md`](SECURITY.md#publishing-an-advisory)).
 
@@ -191,13 +197,38 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum --check --ignore-missing SHA256SUMS
 gh attestation verify fleetringd-X.Y.Z-<target>.tar.gz --repo fleetring/fleetring
-gh attestation verify oci://ghcr.io/fleetring/fleetringd:X.Y.Z --repo fleetring/fleetring
+gh attestation verify oci://ghcr.io/fleetring/fleetring:X.Y.Z --repo fleetring/fleetring
 ```
 ````
 
 ### 0.7.0: upgrading across the rename
 
 A draft for 0.7.0's notes, under "Breaking changes" (ADR-0043, points 1 and 3). The binary is `fleetring`; `fleetringd` stays a name for it until 1.0, and `fleetringd --config <file>`, without `serve`, still runs a node, with a warning.
+
+**Renamed.** Each old spelling but the two compatibility names fails like any unknown command or flag, with a `hint:` line naming the new one:
+
+| 0.6 | 0.7.0 |
+|---|---|
+| `fleetringd …` (the binary) | `fleetring …`; `fleetringd` stays a name for it until 1.0 |
+| `fleetringd --config <file> [daemon flags]` | `fleetring serve --config <file> [daemon flags]`; the old form still runs a node until 1.0, with a warning |
+| `fleetringd db archive show <db> --archive <a>` | `fleetring archive show <db> --archive <a>` |
+| `fleetringd db archive verify <db> --archive <a>` | `fleetring archive verify <db> --archive <a>` |
+| `fleetringd archive restore --from <db> --to <dir> …` | `fleetring archive restore <db> --to <dir> …` (the database is the argument) |
+| `--version` prints `fleetringd X.Y.Z` | prints `fleetring X.Y.Z`, or `fleetringd X.Y.Z` when run as `fleetringd` |
+| errors start `fleetringd:` | start `fleetring:`, or `fleetringd:` when run as `fleetringd` |
+| the dev banner says `. ~/.fleetring/env` | it names the `dev` context; `~/.fleetring/env` is still written, for scripts |
+| `ghcr.io/fleetring/fleetringd`, `ENTRYPOINT fleetringd`, `CMD --config …` | `ghcr.io/fleetring/fleetring` (the old name is pushed too until 1.0), `ENTRYPOINT fleetring`, `CMD serve --config …` |
+| `deploy/dev/fleetringd-dev.service`, `homebrew.mxcl.fleetringd`, `opt_bin/"fleetringd"` | `fleetring-dev.service`, `homebrew.mxcl.fleetring`, `opt_bin/"fleetring"` |
+| the previous binary is kept as `fleetringd.previous` | it is kept as `<name>.previous` beside the real file: still `fleetringd.previous` on a host upgraded from 0.6, `fleetring.previous` on a fresh 0.7 install |
+
+**Not renamed**, because a 0.6 binary or an existing directory depends on them; they are decided at 1.0:
+
+- the `fleetringd` package and crate (`cargo install … fleetringd`, `-p fleetringd`), whose log targets stay `fleetringd::audit` and `RUST_LOG=fleetringd=debug`;
+- the `fleetringd-vX.Y.Z` release tags and the `fleetringd-<version>-<target>.tar.gz` and `.zip` archives;
+- `<data_dir>/fleetringd.process`, `<data_dir>/fleetringd.lock` and `FLEETRINGD_RESTARTS`;
+- `fleetringd.toml`, dev mode's configuration file, and `deploy/fleetringd.toml`.
+
+**Upgrading from 0.6:**
 
 - **Upgrade from 0.6 as usual,** with `fleetringd upgrade` or `install.sh`. The archives keep their names and hold the binary under both names, so 0.6's `upgrade` installs 0.7 over `fleetringd` and restarts the node in place on its 0.6 arguments.
 - **Add the new name.** A host upgraded by 0.6's `upgrade` has no `fleetring`. Add it with `ln -s fleetringd "$(dirname "$(command -v fleetringd)")/fleetring"`, or rerun `install.sh`. A 0.7 `upgrade` or `upgrade --rollback` adds the link itself, and says so. On such a host the real file stays `fleetringd`, and the previous binary is kept as `fleetringd.previous`.
