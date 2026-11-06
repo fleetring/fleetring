@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
+use clap::{Args, FromArgMatches as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
 use fleetring_client::context::{ContextName, Contexts, select};
 use fleetring_client::output::{
@@ -70,6 +70,7 @@ mod dev_cmd;
 mod edit;
 mod exit;
 mod format;
+mod help;
 mod progress;
 mod resolve;
 mod stop;
@@ -94,25 +95,6 @@ use stop::StopArgs;
 /// The environment variable that chooses the log format when `--log-format` isn't given.
 const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
 
-/// What `fleetring -h` says below the commands: the compatibility names (ADR-0043, point 1.5).
-const COMPAT_HELP: &str = "\
-Until 1.0, `fleetringd` is another name for this binary, and `--config <file>` without `serve`
-still runs a node.";
-
-/// What `fleetring --help` says below the commands: the exit codes (`docs/cli.md`, section 8),
-/// then the compatibility names.
-const LONG_HELP: &str = "\
-Exit codes:
-  0    success
-  1    the command failed
-  2    usage: a bad flag or argument, or a confirmation needed without a terminal
-  3    refused: unauthenticated, or not permitted
-  4    unavailable, and a retry may succeed
-  130  interrupted
-
-Until 1.0, `fleetringd` is another name for this binary, and `--config <file>` without `serve`
-still runs a node.";
-
 /// Places, replicates, and fails over SQLite databases across machines you own.
 ///
 /// `serve` runs a node. The other commands talk to a running fleet.
@@ -121,22 +103,26 @@ still runs a node.";
     name = "fleetring",
     version,
     arg_required_else_help = true,
-    after_help = COMPAT_HELP,
-    after_long_help = LONG_HELP
+    max_term_width = 100
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Writes log lines as `text` or `json`. Overrides FLEETRING_LOG_FORMAT and the config file's
-    /// `[log] format`.
+    /// Writes log lines as `text` or `json`
+    ///
+    /// Overrides `FLEETRING_LOG_FORMAT` and the configuration file's `[log] format`.
     #[arg(long, global = true, value_parser = parse_log_format)]
     log_format: Option<LogFormat>,
-    /// Prints the result and errors only: no progress, notes, warnings or override warnings. A
-    /// command with no result then prints nothing.
+    /// Prints the result and errors only
+    ///
+    /// No progress, notes, warnings or override warnings. A command with no result then prints
+    /// nothing.
     #[arg(short, long, global = true)]
     quiet: bool,
-    /// When to colour log lines and the picker: `auto`, on a terminal unless NO_COLOR is set or
-    /// TERM is dumb; `always`; or `never`.
+    /// When to colour log lines and the picker
+    ///
+    /// `auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and
+    /// `never` do as they say.
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
     color: ColorChoice,
 }
@@ -165,8 +151,9 @@ struct DaemonArgs {
     /// Overrides `role`: `both`, `data`, or `control`.
     #[arg(long, value_parser = parse_role)]
     role: Option<NodeRole>,
-    /// Runs without a `[tls]` table, in plaintext: nothing on the wire is authenticated or
-    /// encrypted. For local experiments only.
+    /// Runs without a `[tls]` table, in plaintext, for local experiments only
+    ///
+    /// Nothing on the wire is authenticated or encrypted.
     #[arg(long)]
     insecure_plaintext: bool,
 }
@@ -186,82 +173,98 @@ enum Command {
     /// Runs a node
     #[command(long_about = SERVE_HELP)]
     Serve(DaemonArgs),
-    /// Runs one node for development, on loopback only, with a local authority and an admin
-    /// principal that every command can act as (ADR-0039). The first run creates them, with the
-    /// node's configuration, in the directory; later runs reuse them. Every start writes the
-    /// `dev` context and makes it current unless another context is, so the other commands need
-    /// no flags. `-d` runs it in the background; `dev stop`, `dev status` and `dev logs` act on
-    /// that node. Not for production.
+    /// Runs a node for development; `-d` runs it in the background
+    ///
+    /// One node, on loopback only, with a local authority and an admin principal that every
+    /// command can act as (ADR-0039). The first run creates them, with the node's configuration,
+    /// in the directory; later runs reuse them. Every start writes the `dev` context and makes it
+    /// current unless another context is, so the other commands need no flags. `dev stop`, `dev
+    /// status` and `dev logs` act on the node `-d` started. Not for production.
     Dev(DevArgs),
-    /// Stops a node started in a terminal or a script: sends it SIGTERM through its process
-    /// file, which drains it, and waits until it has exited. Refuses a node a supervisor runs.
-    /// `dev stop` stops the dev node.
+    /// Stops a node started in a terminal or a script, after it drains
+    ///
+    /// Sends the node SIGTERM through its process file, which drains it, and waits until it has
+    /// exited. Refuses a node a supervisor runs. `dev stop` stops the dev node.
     Stop(StopArgs),
-    /// Names, lists and selects contexts: a fleet's control addresses, certificates and
-    /// principal, so that commands need no flags for them (ADR-0043).
+    /// Names, lists and selects contexts, so that commands need no flags
+    ///
+    /// A context names a fleet's control addresses, certificates and principal (ADR-0043).
     #[command(subcommand)]
     Context(ContextCommand),
-    /// Makes another context current: by name, `-` for the previous one, or with no name a
-    /// picker on a terminal. Without a terminal and without a name it lists the contexts and
-    /// exits 2.
+    /// Makes another context current
+    ///
+    /// By name, `-` for the previous one, or with no name a picker on a terminal. Without a
+    /// terminal and without a name it lists the contexts and exits 2.
     Switch {
         /// The context to switch to, or `-` for the previous one.
         #[arg(allow_hyphen_values = true)]
         target: Option<String>,
     },
-    /// Creates the fleet's certificate authority and issues node and client certificates.
+    /// Creates the authority, and issues node and client certificates
     #[command(subcommand)]
     Cert(CertCommand),
-    /// Issues and revokes bearer tokens: signed, expiring credentials that name a principal and
-    /// carry its scopes.
+    /// Issues and revokes bearer tokens
+    ///
+    /// A token is a signed, expiring credential that names a principal and carries its scopes.
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Creates, lists, writes, reads, locates, and drops databases.
+    /// Creates, lists, writes, reads, locates, and drops databases
     #[command(subcommand)]
     Db(DbCommand),
-    /// Drains a node, clears its draining mark, or removes it from the fleet.
+    /// Lists, drains, undrains, and removes the fleet's members
     #[command(subcommand)]
     Node(NodeCommand),
-    /// Follows the leases data nodes hold.
+    /// Follows the leases data nodes hold
     #[command(subcommand)]
     Lease(LeaseCommand),
-    /// Lists and removes orphans: copies a data node keeps, closed, because the control plane
-    /// didn't know their databases, or held them only at a lower epoch, and the node saw no drop.
+    /// Lists and removes orphans: copies the control plane doesn't know
+    ///
+    /// An orphan is a copy a data node keeps, closed, because the control plane didn't know its
+    /// database, or held it only at a lower epoch, and the node saw no drop (ADR-0042).
     #[command(subcommand)]
     Orphan(OrphanCommand),
-    /// Shows and verifies a database's archive, and restores a database from one with no fleet.
+    /// Shows and verifies archives, and restores from one with no fleet
     #[command(subcommand)]
     Archive(ArchiveCommand),
-    /// Installs another release of fleetring in place of this binary, verified with cosign
-    /// against the release workflow's identity and then by checksum, and keeps this one as
-    /// `<name>.previous`. With `--config` naming a running node, first checks that the fleet
-    /// allows the release, then drains the node, restarts it in place, and waits until it has
-    /// rejoined and caught up.
+    /// Installs another release in place of this binary
+    ///
+    /// The release is verified with cosign against the release workflow's identity, and then by
+    /// checksum; this binary is kept as `<name>.previous`. With `--config` naming a running node,
+    /// it first checks that the fleet allows the release, then drains the node, restarts it in
+    /// place, and waits until it has rejoined and caught up (ADR-0038).
     Upgrade(UpgradeArgs),
-    /// Serves the Model Context Protocol on stdin and stdout, so that an agent's MCP client can
-    /// create, find, use, describe, and drop databases, acting as the one principal these
-    /// credentials name and within its scopes (ADR-0041). It reads the same flags and variables
-    /// as every other command, never credentials from the client, and runs until the client
-    /// closes stdin. stdout carries the protocol alone; logs go to stderr.
+    /// Serves the Model Context Protocol on stdio, as one principal
+    ///
+    /// An agent's MCP client can then create, find, use, describe, and drop databases, acting as
+    /// the one principal these credentials name and within its scopes (ADR-0041). It reads the
+    /// same flags and variables as every other command, never credentials from the client, and
+    /// runs until the client closes stdin. stdout carries the protocol alone; logs go to stderr.
     #[command(after_long_help = MCP_HELP)]
     Mcp(McpArgs),
-    /// Adds, lists, shows, renews, and removes agents' identities: a principal `agent-<id>`
-    /// with a certificate and a scoped token, kept in a directory per agent (ADR-0043, point 8).
-    /// In dev mode, `fleetring mcp --agent <id>` adds one by itself. Trusted local development:
-    /// agents running as the same user can read each other's credentials.
+    /// Adds, lists, shows, renews, and removes agents' identities
+    ///
+    /// An identity is a principal `agent-<id>` with a certificate and a scoped token, kept in a
+    /// directory per agent (ADR-0043, point 8). In dev mode, `fleetring mcp --agent <id>` adds
+    /// one by itself. Trusted local development: agents running as the same user can read each
+    /// other's credentials.
     #[command(subcommand)]
     Agent(AgentCommand),
-    /// Shows the members with their liveness, release, the membership epoch, and the ring
+    /// Shows the fleet's members and ring, or one data node's view
+    ///
+    /// The members with their liveness and release, the membership epoch, and the ring
     /// fingerprint, as the control plane sees them; with `--node` or `--address`, as one data
     /// node sees them.
     Status {
-        /// Asks this data node instead of the control plane: its membership epoch, ring
-        /// fingerprint, and the databases it serves. Its address comes from the control plane's
-        /// membership, so `--control` or `--config` is needed too.
+        /// Asks this data node instead of the control plane
+        ///
+        /// It reports its membership epoch, ring fingerprint, and the databases it serves. Its
+        /// address comes from the control plane's membership, so `--control` or `--config` is
+        /// needed too.
         #[arg(long, conflicts_with = "address")]
         node: Option<NodeId>,
-        /// Asks the data node at this address, `host:port`, instead of the control plane. Nothing
-        /// else is needed.
+        /// Asks the data node at `host:port` instead of the control plane
+        ///
+        /// Nothing else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
         #[command(flatten)]
@@ -274,13 +277,15 @@ enum Command {
 /// `fleetring mcp`'s flags (ADR-0041, point 9).
 #[derive(Debug, Args)]
 struct McpArgs {
-    /// Offers only the tools that read: db_list, db_show, and query. The principal's scopes
-    /// still bound what they read.
+    /// Offers only the tools that read: `db_list`, `db_show`, and `query`
+    ///
+    /// The principal's scopes still bound what they read.
     #[arg(long)]
     read_only: bool,
-    /// The most bytes one result's JSON holds, with an optional KiB or MiB: from 64KiB to
-    /// 4MiB. Rows, listed databases, and schema objects past it are left out, and the result
-    /// says so.
+    /// The most bytes one result's JSON holds: from 64KiB to 4MiB
+    ///
+    /// Bytes, with an optional KiB or MiB. Rows, listed databases, and schema objects past it are
+    /// left out, and the result says so.
     #[arg(long, value_parser = parse_result_size, default_value = "256KiB")]
     max_result_bytes: usize,
     #[command(flatten)]
@@ -308,41 +313,53 @@ credentials, so separate identities don't isolate agents from each other.";
 /// `fleetring upgrade`'s flags (ADR-0038).
 #[derive(Debug, Args)]
 struct UpgradeArgs {
-    /// The release to install, such as 0.4.0; the newest final release by default. Naming the
-    /// installed release reinstalls it.
+    /// The release to install, such as 0.4.0; the newest final release by default
+    ///
+    /// Naming the installed release reinstalls it.
     #[arg(long, value_parser = parse_release)]
     version: Option<Release>,
-    /// Reports the installed release, the newest one, and whether the fleet allows it, and
-    /// changes nothing. Exits 1 if a newer release exists that the fleet doesn't allow.
+    /// Reports the installed and the newest release, and changes nothing
+    ///
+    /// It also reports whether the fleet allows the newest release, and exits 1 if a newer
+    /// release exists that the fleet doesn't allow.
     #[arg(long, conflicts_with_all = ["rollback", "no_restart"])]
     check: bool,
-    /// Replaces the binary, but leaves the running node on the release it runs.
+    /// Replaces the binary, but leaves the running node on the release it runs
     #[arg(long)]
     no_restart: bool,
-    /// Swaps the binary with the one the last upgrade replaced, `<name>.previous`, and
-    /// restarts the node as an upgrade does. A second rollback rolls forward again.
+    /// Swaps back the binary the last upgrade replaced, `<name>.previous`
+    ///
+    /// It restarts the node as an upgrade does. A second rollback rolls forward again.
     #[arg(long, conflicts_with_all = ["version", "base_url", "releases_url"])]
     rollback: bool,
-    /// Downloads the release's files from this URL, a mirror's directory for one release as
-    /// `install.sh --base-url` takes it, instead of GitHub. Needs --version.
+    /// Downloads the release's files from this mirror URL instead of GitHub
+    ///
+    /// A mirror's directory for one release, as `install.sh --base-url` takes it. Needs
+    /// `--version`.
     #[arg(long, env = "FLEETRING_BASE_URL", requires = "version")]
     base_url: Option<String>,
-    /// Reads the list of releases, in the JSON GitHub's API returns, from this URL instead of
-    /// GitHub's, to find the newest release on a mirror.
+    /// Reads the list of releases from this URL instead of GitHub's
+    ///
+    /// The list is the JSON GitHub's API returns; a mirror's lets `upgrade` find its newest
+    /// release.
     #[arg(long, env = "FLEETRING_RELEASES_URL")]
     releases_url: Option<String>,
-    /// How long each download, the drain, the rejoin, and the catch-up may take: `<n>m` or
-    /// `<n>s`; 5m by default.
+    /// How long each step may take: `<n>m` or `<n>s`; 5m by default
+    ///
+    /// The steps are each download, the drain, the rejoin, and the catch-up.
     #[arg(long, value_parser = parse_ttl)]
     timeout: Option<Duration>,
-    /// Prints what this binary runs, as one JSON object (its release, protocol, control-log
-    /// format, and fleet features), and changes nothing. An upgrade asks a release's binary this
-    /// before it installs it, to check the fleet's features.
+    /// Prints what this binary runs as one JSON object, and changes nothing
+    ///
+    /// The object holds its release, protocol, control-log format, and fleet features. An
+    /// upgrade asks a release's binary this before it installs it, to check the fleet's
+    /// features.
     #[arg(long, exclusive = true)]
     software: bool,
-    /// Confirms, without a prompt, that no node on this machine starts with `fleetring serve`,
-    /// when installing or rolling back to a release before 0.7, which can't run it, and no
-    /// --config names a running node to check.
+    /// Confirms without a prompt that no node here starts with `fleetring serve`
+    ///
+    /// Needed to install or roll back to a release before 0.7, which can't run `serve`, when no
+    /// `--config` names a running node to check.
     #[arg(long, conflicts_with = "check")]
     yes: bool,
     #[command(flatten)]
@@ -363,15 +380,16 @@ fn parse_release(text: &str) -> Result<Release, String> {
 
 #[derive(Debug, Subcommand)]
 enum ArchiveCommand {
-    /// Shows what an archive holds for a database: its snapshots, how far its segments reach,
-    /// and anything a restore won't use.
+    /// Shows what an archive holds for a database
+    ///
+    /// Its snapshots, how far its segments reach, and anything a restore won't use.
     Show {
         /// The archived database.
         name: DatabaseName,
         /// The `[[archive]]` entry's name.
         #[arg(long)]
         archive: String,
-        /// Asks the data node at this address, `host:port`, instead of the first live member.
+        /// Asks the data node at `host:port` instead of the first live member
         #[arg(long)]
         address: Option<String>,
         #[command(flatten)]
@@ -379,16 +397,18 @@ enum ArchiveCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Restores an archived database into a scratch copy on a data node, verifying every batch
-    /// against the hash chain, and discards it; then asks each live replica for its hash at the
-    /// restored position and reports whether they agree with the archive.
+    /// Restores an archive into a scratch copy, and compares it with the replicas
+    ///
+    /// A data node restores the archived database into a scratch copy, verifying every batch
+    /// against the hash chain, and discards it. The command then asks each live replica for its
+    /// hash at the restored position, and reports whether they agree with the archive.
     Verify {
         /// The archived database.
         name: DatabaseName,
         /// The `[[archive]]` entry's name.
         #[arg(long)]
         archive: String,
-        /// Asks the data node at this address, `host:port`, instead of the first live member.
+        /// Asks the data node at `host:port` instead of the first live member
         #[arg(long)]
         address: Option<String>,
         #[command(flatten)]
@@ -396,10 +416,11 @@ enum ArchiveCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Restores an archived database into a new directory, with no fleet: for disaster
-    /// recovery. The directory then holds a plain SQLite database, `data.db`, that `sqlite3`
-    /// opens directly. Every batch is verified against the hash chain on the way. `db restore`
-    /// is the online restore, into the fleet.
+    /// Restores an archived database into a new directory, with no fleet
+    ///
+    /// For disaster recovery. The directory then holds a plain SQLite database, `data.db`, that
+    /// `sqlite3` opens directly. Every batch is verified against the hash chain on the way. `db
+    /// restore` is the online restore, into the fleet.
     Restore {
         /// The archived database to restore.
         name: DatabaseName,
@@ -420,13 +441,15 @@ enum ArchiveCommand {
 /// Which point of an archive a command restores: the latest unless one is named.
 #[derive(Debug, Args)]
 struct PointArgs {
-    /// Restores exactly the log up to this position, a transaction boundary, as `db locate` or
-    /// `archive show` prints positions.
+    /// Restores exactly the log up to this position, a transaction boundary
+    ///
+    /// Positions are hex, as `db locate` and `archive show` print them.
     #[arg(long, value_parser = parse_position, conflicts_with = "at_time")]
     at_position: Option<Position>,
-    /// Restores every segment archived at or before this time, RFC 3339, such as
-    /// `2026-11-03T09:30:00Z`, by the archiving nodes' clocks. The restore may stop up to one
-    /// segment interval before it, and never holds a write acknowledged after it.
+    /// Restores every segment archived at or before this time, in RFC 3339
+    ///
+    /// Such as `2026-11-03T09:30:00Z`, by the archiving nodes' clocks. The restore may stop up to
+    /// one segment interval before it, and never holds a write acknowledged after it.
     #[arg(long, value_parser = parse_time)]
     at_time: Option<u64>,
 }
@@ -443,15 +466,21 @@ impl PointArgs {
 
 #[derive(Debug, Subcommand)]
 enum LeaseCommand {
-    /// Follows the leases one data node holds: first `held <database> epoch <n>` for each
-    /// database it serves, then `gained` or `lost` lines as leases move, until the stream ends or
-    /// Ctrl-C (exit 130). `-o jsonl` prints one object per line, flushed as each arrives.
+    /// Follows the leases one data node holds, until Ctrl-C
+    ///
+    /// First `held <database> epoch <n>` for each database it serves, then `gained` or `lost`
+    /// lines as leases move, until the stream ends or Ctrl-C (exit 130). `-o jsonl` prints one
+    /// object per line, flushed as each arrives.
     Watch {
-        /// The data node to follow. Its address comes from the control plane's membership, so
-        /// `--control` or `--config` is needed too.
+        /// The data node to follow
+        ///
+        /// Its address comes from the control plane's membership, so `--control` or `--config` is
+        /// needed too.
         #[arg(long, required_unless_present = "address", conflicts_with = "address")]
         node: Option<NodeId>,
-        /// The address of the data node to follow, `host:port`. Nothing else is needed.
+        /// The address of the data node to follow, `host:port`
+        ///
+        /// Nothing else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
         #[command(flatten)]
@@ -463,14 +492,20 @@ enum LeaseCommand {
 
 #[derive(Debug, Subcommand)]
 enum OrphanCommand {
-    /// Lists the orphans each data node keeps, with the epoch each copy recorded and its size;
-    /// with `--node` or `--address`, one node's.
+    /// Lists the orphans each data node keeps, or one node's
+    ///
+    /// Each with the epoch the copy recorded and its size. `--node` or `--address` names one
+    /// node.
     List {
-        /// The data node to ask. Its address comes from the control plane's membership, so
-        /// `--control` or `--config` is needed too.
+        /// The data node to ask
+        ///
+        /// Its address comes from the control plane's membership, so `--control` or `--config` is
+        /// needed too.
         #[arg(long, conflicts_with = "address")]
         node: Option<NodeId>,
-        /// The address of the data node to ask, `host:port`. Nothing else is needed.
+        /// The address of the data node to ask, `host:port`
+        ///
+        /// Nothing else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
         #[command(flatten)]
@@ -478,22 +513,27 @@ enum OrphanCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Deletes a data node's orphan copy of a database, for good: its files and its epochs.
-    /// Refuses a name the node serves, follows, or is retiring. Needs the `fleet` scope. Asks
-    /// first on a terminal.
+    /// Deletes a data node's orphan copy of a database, for good
+    ///
+    /// Deletes its files and its epochs. Refuses a name the node serves, follows, or is
+    /// retiring. Needs the `fleet` scope. Asks first on a terminal.
     Remove {
         /// The database the orphan copy is of.
         name: DatabaseName,
-        /// The data node that keeps the orphan. Its address comes from the control plane's
-        /// membership, so `--control` or `--config` is needed too.
+        /// The data node that keeps the orphan
+        ///
+        /// Its address comes from the control plane's membership, so `--control` or `--config` is
+        /// needed too.
         #[arg(long, required_unless_present = "address", conflicts_with = "address")]
         node: Option<NodeId>,
-        /// The address of the data node that keeps the orphan, `host:port`. Nothing else is
-        /// needed.
+        /// The address of the data node that keeps the orphan, `host:port`
+        ///
+        /// Nothing else is needed.
         #[arg(long, conflicts_with_all = ["control", "config"])]
         address: Option<String>,
-        /// Deletes without asking. Without it, the command asks first on a terminal, and
-        /// refuses elsewhere.
+        /// Deletes without asking
+        ///
+        /// Without it, the command asks first on a terminal, and refuses elsewhere.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -507,29 +547,35 @@ enum OrphanCommand {
     reason = "a command is parsed once per process, and clap can't box a flattened `Target`"
 )]
 enum TokenCommand {
-    /// Issues a token signed with the authority's key and prints it. Run it where `ca.key` is,
-    /// off the nodes; nodes verify the token with `ca.crt` alone.
+    /// Issues a token signed with the authority's key, and prints it
+    ///
+    /// Run it where `ca.key` is, off the nodes; nodes verify the token with `ca.crt` alone.
     Issue {
-        /// The principal the token names. A client sending it must connect with a certificate
-        /// for the same principal, unless that principal forwards tokens. A name that starts
-        /// with `agent-` may not contain `.`, which is reserved for delegated agents.
+        /// The principal the token names
+        ///
+        /// A client sending it must connect with a certificate for the same principal, unless that
+        /// principal forwards tokens. A name that starts with `agent-` may not contain `.`, which
+        /// is reserved for delegated agents.
         #[arg(long)]
         principal: Principal,
-        /// A scope the token carries: `<action>:<pattern>`, with the action `read`, `write`,
-        /// `admin`, or `stream` and the pattern a database name or a prefix ending in `*`; or
-        /// `fleet`. Repeat it for more.
+        /// A scope the token carries: `<action>:<pattern>`, or `fleet`
+        ///
+        /// The action is `read`, `write`, `admin`, or `stream`, and the pattern a database name or
+        /// a prefix ending in `*`. Repeat it for more.
         #[arg(long = "scope", required = true)]
         scopes: Vec<Scope>,
-        /// How long the token lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; one hour by default, 30
-        /// days at most.
+        /// How long the token lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+        ///
+        /// One hour by default, and 30 days at most.
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<Duration>,
         /// The directory with `ca.crt` and `ca.key`.
         #[arg(long)]
         dir: PathBuf,
     },
-    /// Revokes a token by its ID, or every token a signing key issued. Every node refuses it
-    /// within one heartbeat interval.
+    /// Revokes a token by its ID, or every token a signing key issued
+    ///
+    /// Every node refuses it within one heartbeat interval.
     Revoke {
         /// The token's ID, as `token issue` printed it (its `jti` claim).
         ///
@@ -541,16 +587,20 @@ enum TokenCommand {
             conflicts_with = "key_id"
         )]
         token_id: Option<TokenId>,
-        /// A signing key's ID (the token header's `kid`): revokes every token that key signed,
-        /// for good.
+        /// A signing key's ID, to revoke every token it signed, for good
+        ///
+        /// The ID is the token header's `kid`.
         #[arg(long, allow_hyphen_values = true)]
         key_id: Option<KeyId>,
-        /// How long to keep a token's revocation, at least what remains of its lifetime: 30 days
-        /// (the longest a token lasts) by default.
+        /// How long to keep a token's revocation; 30 days by default
+        ///
+        /// At least what remains of the token's lifetime. 30 days is the longest a token lasts.
         #[arg(long, value_parser = parse_ttl, conflicts_with = "key_id")]
         ttl: Option<Duration>,
-        /// Revokes a signing key without asking. Without it, `--key-id` asks first on a
-        /// terminal, and refuses elsewhere; `--token-id` never asks.
+        /// Revokes a signing key without asking
+        ///
+        /// Without it, `--key-id` asks first on a terminal, and refuses elsewhere; `--token-id`
+        /// never asks.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -560,8 +610,9 @@ enum TokenCommand {
 
 #[derive(Debug, Subcommand)]
 enum CertCommand {
-    /// Creates the authority: `ca.crt` and `ca.key` in the directory. Keep `ca.key` off every
-    /// node; it is the one secret that issues certificates.
+    /// Creates the authority: `ca.crt` and `ca.key` in the directory
+    ///
+    /// Keep `ca.key` off every node; it is the one secret that issues certificates.
     Init {
         /// The fleet's name, which every certificate the authority issues names.
         #[arg(long)]
@@ -569,44 +620,57 @@ enum CertCommand {
         /// The directory to write into; created if missing.
         #[arg(long)]
         dir: PathBuf,
-        /// How long the authority's certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; ten
-        /// years by default.
+        /// How long the authority's certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+        ///
+        /// Ten years by default.
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<Duration>,
     },
-    /// Issues a node certificate: `node.<id>.crt` and `node.<id>.key` in the directory, naming
-    /// the node's ID and the addresses it is reached at.
+    /// Issues a node certificate: `node.<id>.crt` and `node.<id>.key`
+    ///
+    /// The files go into the directory, and the certificate names the node's ID and the
+    /// addresses it is reached at.
     Node {
         /// The node's ID, as `[node] id` in its configuration.
         id: NodeId,
-        /// The IP addresses and DNS names peers and clients dial the node at, comma-separated.
-        /// Not the `[node] host` placement label.
+        /// The IP addresses and DNS names peers and clients dial the node at
+        ///
+        /// Comma-separated. Not the `[node] host` placement label.
         #[arg(long, value_delimiter = ',', required = true)]
         addresses: Vec<String>,
         /// The directory with `ca.crt` and `ca.key`, which the new files go into.
         #[arg(long)]
         dir: PathBuf,
-        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; 30 days by
-        /// default.
+        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+        ///
+        /// 30 days by default.
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<Duration>,
     },
-    /// Issues a client certificate: `client.<principal>.crt` and `client.<principal>.key` in
-    /// the directory, or in `--out`, naming the principal the client acts as.
+    /// Issues a client certificate, naming the principal the client acts as
+    ///
+    /// The files are `client.<principal>.crt` and `client.<principal>.key`, in the directory or
+    /// in `--out`.
     Client {
-        /// The principal's name. A name that starts with `agent-` may not contain `.`, which
-        /// is reserved for delegated agents.
+        /// The principal's name
+        ///
+        /// A name that starts with `agent-` may not contain `.`, which is reserved for delegated
+        /// agents.
         principal: Principal,
-        /// The directory with `ca.crt` and `ca.key`, which the new files go into unless `--out`
-        /// names another.
+        /// The directory with `ca.crt` and `ca.key`
+        ///
+        /// The new files go into it unless `--out` names another.
         #[arg(long)]
         dir: PathBuf,
-        /// Writes the certificate, its key, and a copy of `ca.crt` into this directory, created
-        /// private to you, instead of the authority's: a complete TLS directory for the client.
+        /// Writes the files into this directory instead: a complete TLS directory
+        ///
+        /// The certificate, its key, and a copy of `ca.crt` go into it, created private to you,
+        /// instead of the authority's directory.
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
-        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`; 7 days by
-        /// default.
+        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+        ///
+        /// 7 days by default.
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<Duration>,
     },
@@ -614,24 +678,27 @@ enum CertCommand {
 
 #[derive(Debug, Subcommand)]
 enum DbCommand {
-    /// Creates a SQLite database, places it with the ring, and opens it on its primary.
+    /// Creates a SQLite database, places it with the ring, and opens it on its primary
     Create {
         /// The database's name.
         name: DatabaseName,
-        /// How many replicas it has, the primary included. The fleet's default if unset: the
-        /// control node's `[replication] replication_factor`, which is 3 unless its configuration
-        /// says otherwise, and 1 on a dev node.
+        /// How many replicas it has, the primary included
+        ///
+        /// The fleet's default if unset: the control node's `[replication] replication_factor`,
+        /// which is 3 unless its configuration says otherwise, and 1 on a dev node.
         #[arg(long)]
         replication_factor: Option<u8>,
-        /// How many replicas must store a write before it is acknowledged: `quorum` (a
-        /// majority), `all` (every replica), or `local` (the primary alone; a failover may lose
-        /// acknowledged writes). The fleet's default if unset.
+        /// How many replicas must store a write before it is acknowledged
+        ///
+        /// `quorum` (a majority), `all` (every replica), or `local` (the primary alone; a failover
+        /// may lose acknowledged writes). The fleet's default if unset.
         #[arg(long)]
         acks: Option<Acks>,
-        /// How many replicas, the primary included, must be reachable for a write to run;
-        /// below it, writes are refused before anything commits. Between the write quorum and
-        /// the replication factor; the fleet's default if unset, which is the write quorum
-        /// unless the control node's configuration says otherwise.
+        /// How many replicas must be reachable for a write to run
+        ///
+        /// The primary included; below it, writes are refused before anything commits. Between the
+        /// write quorum and the replication factor; the fleet's default if unset, which is the
+        /// write quorum unless the control node's configuration says otherwise.
         #[arg(long)]
         min_replicas: Option<u8>,
         #[command(flatten)]
@@ -639,8 +706,10 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Shows a database in detail: where it lives, as `db locate` prints it, its description,
-    /// labels, creator, expiry, and metadata version, and its schema.
+    /// Shows a database in detail: placement, description, labels, expiry, schema
+    ///
+    /// Where it lives, as `db locate` prints it, its description, labels, creator, expiry, and
+    /// metadata version, and its schema.
     ///
     /// A description is text a principal wrote: it prints as a block, each line indented and
     /// prefixed with `| `, and one written by another principal, or by nobody that can be
@@ -651,12 +720,14 @@ enum DbCommand {
     Show {
         /// The database's name.
         name: DatabaseName,
-        /// Leaves the schema out and asks the primary for nothing.
+        /// Leaves the schema out and asks the primary for nothing
         #[arg(long)]
         no_schema: bool,
-        /// Counts each table's rows up to this many, and reports "more than" beyond it; 0
-        /// counts nothing. At most 1,000,000, which is also the most rows one request counts
-        /// across all tables; counting delays writes queued on the database while it runs.
+        /// Counts each table's rows up to this many; 0 counts nothing
+        ///
+        /// Beyond it, the count reports "more than". At most 1,000,000, which is also the most rows
+        /// one request counts across all tables; counting delays writes queued on the database
+        /// while it runs.
         #[arg(
             long,
             default_value_t = SCHEMA_COUNT_LIMIT,
@@ -671,8 +742,9 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Changes a database's settings: its description, labels, expiry, and durability. Only the
-    /// settings you name change.
+    /// Changes a database's description, labels, expiry, or durability
+    ///
+    /// Only the settings you name change.
     ///
     /// The metadata settings (description, labels, expiry) go in one update. Durability is a
     /// separate change that takes effect at the database's next epoch: the current primary keeps
@@ -685,8 +757,9 @@ enum DbCommand {
     Exec(SqlArgs),
     /// Runs one read-only query on the database's primary.
     Query(QueryArgs),
-    /// Shows the database's primary, followers, epoch, durability settings, and replica
-    /// positions.
+    /// Shows where a database lives: its primary, followers, and epoch
+    ///
+    /// With its durability settings and its replicas' positions.
     Locate {
         /// The database's name.
         name: DatabaseName,
@@ -695,14 +768,17 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Lists every database with its engine, epoch, replication factor, durability settings,
-    /// primary, and replicas.
+    /// Lists the databases, with their placement and durability
+    ///
+    /// Each with its engine, epoch, replication factor, durability settings, primary, and
+    /// replicas.
     List {
         /// Lists only the databases this node is primary for.
         #[arg(long)]
         node: Option<NodeId>,
-        /// Lists only the databases with this label: `key=value`, or `key` for any value.
-        /// Repeat it to require several.
+        /// Lists only the databases with this label: `key=value`, or `key`
+        ///
+        /// `key` alone matches any value. Repeat it to require several.
         #[arg(long = "label", value_name = "KEY=VALUE|KEY")]
         labels: Vec<LabelRequirement>,
         /// Lists only the databases whose names start with this.
@@ -713,18 +789,22 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Asks every replica of a database for its hash chain at one position, the latest they all
-    /// hold unless `--at` names one, and reports whether they agree. Each replica recomputes
-    /// the hash from its log on disk, so a copy that changed since it was written is named.
+    /// Checks that every replica of a database holds the same log
+    ///
+    /// Asks every replica for its hash chain at one position, the latest they all hold unless
+    /// `--at` names one, and reports whether they agree. Each replica recomputes the hash from
+    /// its log on disk, so a copy that changed since it was written is named.
     Verify {
         /// The database's name.
         name: DatabaseName,
-        /// The position to verify at, as `db locate` prints it, instead of the latest every
-        /// replica holds.
+        /// The position to verify at, as `db locate` prints it
+        ///
+        /// Instead of the latest position every replica holds.
         #[arg(long, value_parser = parse_position)]
         at: Option<Position>,
-        /// A hash recorded earlier at that position: the command also reports whether the log
-        /// still hashes to it, that is, whether nothing changed since.
+        /// A hash recorded earlier at that position, to check that nothing changed since
+        ///
+        /// The command also reports whether the log still hashes to it.
         #[arg(long)]
         expect: Option<ChainHash>,
         #[command(flatten)]
@@ -732,9 +812,11 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Creates a new database from an archived one: the first live member of its replica set
-    /// restores it, verifying every batch against the hash chain, and serves it. The archived
-    /// database needs not exist any more; restoring under its own name needs it dropped first.
+    /// Creates a new database from an archived one
+    ///
+    /// The first live member of its replica set restores it, verifying every batch against the
+    /// hash chain, and serves it. The archived database needs not exist any more; restoring under
+    /// its own name needs it dropped first.
     Restore {
         /// The new database's name.
         name: DatabaseName,
@@ -746,8 +828,9 @@ enum DbCommand {
         from: DatabaseName,
         #[command(flatten)]
         point: PointArgs,
-        /// How many replicas the new database has, the primary included; the fleet's default if
-        /// unset, as for `db create`.
+        /// How many replicas the new database has, the primary included
+        ///
+        /// The fleet's default if unset, as for `db create`.
         #[arg(long)]
         replication_factor: Option<u8>,
         /// The acknowledgement mode, as for `db create`; the fleet's default if unset.
@@ -758,13 +841,16 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Drops a database for good: every replica that is up deletes its copy, and one that is
-    /// down or unreachable keeps it as an orphan for `orphan remove`.
+    /// Drops a database for good
+    ///
+    /// Every replica that is up deletes its copy; one that is down or unreachable keeps it as an
+    /// orphan for `orphan remove`.
     Drop {
         /// The database's name.
         name: DatabaseName,
-        /// Drops without asking. Without it, the command asks first on a terminal, and refuses
-        /// elsewhere.
+        /// Drops without asking
+        ///
+        /// Without it, the command asks first on a terminal, and refuses elsewhere.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -774,8 +860,9 @@ enum DbCommand {
 
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
-    /// Lists the members with their liveness, drain state and release, as the control plane sees
-    /// them.
+    /// Lists the members, with their liveness, drain state and release
+    ///
+    /// As the control plane sees them.
     ///
     /// Every member is a data node: membership records no role, so there is no role column.
     List {
@@ -784,39 +871,47 @@ enum NodeCommand {
         #[command(flatten)]
         target: Target,
     },
-    /// Hands every database the node is primary for to a follower, without waiting for a
-    /// failover. The node gets no new primaries afterwards, and stays a follower until it stops
-    /// or restarts; stopping it then costs clients only a redirect.
+    /// Hands the node's primaries to followers, and gives it no new ones
+    ///
+    /// Every database the node is primary for moves to a follower, without waiting for a
+    /// failover. The node stays a follower until it stops or restarts, or `node undrain`;
+    /// stopping it then costs clients only a redirect.
     Drain {
         /// The node's ID.
         id: NodeId,
-        /// Drains without asking. Without it, a drain of a node that holds a database's only
-        /// replica asks first on a terminal, and refuses elsewhere.
+        /// Drains without asking
+        ///
+        /// Without it, a drain of a node that holds a database's only replica asks first on a
+        /// terminal, and refuses elsewhere.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
         target: Target,
     },
-    /// Clears a node's draining mark, so that it may take primaries again without a restart, as
-    /// after a drain that turned out not to be needed. Refused until every member runs a release
-    /// that supports it.
+    /// Clears a node's draining mark, so that it may take primaries again
+    ///
+    /// Without a restart, as after a drain that turned out not to be needed. Refused until every
+    /// member runs a release that supports it.
     Undrain {
         /// The node's ID.
         id: NodeId,
         #[command(flatten)]
         target: Target,
     },
-    /// Removes a member that is gone for good from the fleet, as a node that leaves on shutdown
-    /// does, so that its release no longer holds the fleet back. Refuses a live member unless
-    /// `--force`; a live node joins again at its next heartbeat anyway. Asks first on a terminal.
+    /// Removes a member that is gone for good from the fleet
+    ///
+    /// As a node that leaves on shutdown does, so that its release no longer holds the fleet
+    /// back. Refuses a live member unless `--force`; a live node joins again at its next heartbeat
+    /// anyway. Asks first on a terminal.
     Remove {
         /// The node's ID.
         id: NodeId,
         /// Removes the member even though it is live.
         #[arg(long)]
         force: bool,
-        /// Removes without asking. Without it, the command asks first on a terminal, and
-        /// refuses elsewhere.
+        /// Removes without asking
+        ///
+        /// Without it, the command asks first on a terminal, and refuses elsewhere.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -827,13 +922,16 @@ enum NodeCommand {
 /// What `db create` and `db restore` record about the new database besides its placement.
 #[derive(Debug, Args)]
 struct MetadataArgs {
-    /// What the database holds and how it was set up, at most 1 KiB of text; tab and line feed
-    /// are allowed, other control and invisible characters aren't. `-` reads it from stdin,
-    /// without its trailing line feeds. The control node records you as the creator.
+    /// What the database holds and how it was set up; `-` reads it from stdin
+    ///
+    /// At most 1 KiB of text; tab and line feed are allowed, other control and invisible
+    /// characters aren't. From stdin, its trailing line feeds are dropped. The control node
+    /// records you as the creator.
     #[arg(long, allow_hyphen_values = true)]
     description: Option<String>,
-    /// A label, `key=value`, to find the database by (`db list --label`). Repeat it for
-    /// several, at most 32.
+    /// A label, `key=value`, to find the database by (`db list --label`)
+    ///
+    /// Repeat it for several, at most 32.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label_arg)]
     labels: Vec<(LabelKey, LabelValue)>,
     #[command(flatten)]
@@ -859,14 +957,16 @@ impl MetadataArgs {
 /// When a new database is dropped, if it is: `--expires-in` or `--expires-at`.
 #[derive(Debug, Args)]
 struct ExpiryArgs {
-    /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`, at least 1m.
-    /// The control node counts it from its own clock. Every copy is deleted; an archive keeps
-    /// the database as of what reached it, and without one it is gone. Extend it with
-    /// `db edit`.
+    /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+    ///
+    /// At least 1m. The control node counts it from its own clock. Every copy is deleted; an
+    /// archive keeps the database as of what reached it, and without one it is gone. Extend it
+    /// with `db edit`.
     #[arg(long, value_name = "DURATION", value_parser = parse_ttl, conflicts_with = "expires_at")]
     expires_in: Option<Duration>,
-    /// Drops the database at this time, in RFC 3339, such as 2026-11-05T10:00:00Z: at least a
-    /// minute from now by the control node's clock.
+    /// Drops the database at this time, in RFC 3339
+    ///
+    /// Such as `2026-11-05T10:00:00Z`: at least a minute from now by the control node's clock.
     #[arg(long, value_name = "TIME", value_parser = parse_rfc3339)]
     expires_at: Option<Timestamp>,
 }
@@ -888,16 +988,20 @@ struct SqlArgs {
     name: DatabaseName,
     /// One SQL statement, with `?` for each parameter.
     sql: String,
-    /// The parameters, in order: `null`, an integer, a decimal number, or text. Prefix one with
-    /// `text:`, `int:`, `real:`, or `blob:` (hex digits) to choose its type.
+    /// The parameters, in order: `null`, an integer, a decimal number, or text
+    ///
+    /// Prefix one with `text:`, `int:`, `real:`, or `blob:` (hex digits) to choose its type.
     #[arg(allow_negative_numbers = true, value_parser = parse_param)]
     params: Vec<Value>,
-    /// Sends the request to this data node instead of the primary, and follows its redirect.
-    /// Its address comes from the control plane's membership.
+    /// Sends the request to this data node instead of the primary
+    ///
+    /// The command follows the node's redirect. Its address comes from the control plane's
+    /// membership.
     #[arg(long, conflicts_with = "address")]
     node: Option<NodeId>,
-    /// Sends the request to the data node at this address, `host:port`, instead of the
-    /// primary, and follows its redirect.
+    /// Sends the request to the data node at `host:port` instead of the primary
+    ///
+    /// The command follows the node's redirect.
     #[arg(long)]
     address: Option<String>,
     #[command(flatten)]
@@ -923,17 +1027,20 @@ struct QueryArgs {
 /// (`docs/cli.md`, section 3).
 #[derive(Debug, Args)]
 struct Target {
-    /// The control node's address, `host:port`: the node that runs the control role, not any node
-    /// in the fleet. A data-only node answers with the control node's address. Defaults to
-    /// `FLEETRING_CONTROL`, or else the context's `control`, when neither this nor `--config` is
-    /// given.
+    /// The control node's address, `host:port`
+    ///
+    /// The node that runs the control role, not any node in the fleet; a data-only node answers
+    /// with the control node's address. Defaults to `FLEETRING_CONTROL`, or else the context's
+    /// `control`, when neither this nor `--config` is given.
     #[arg(long, conflicts_with = "config")]
     control: Option<String>,
-    /// A daemon's configuration file, to take the control node's address from.
+    /// A daemon's configuration file, to take the control node's address from
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Uses this context for every setting it names, instead of the current one. It outranks
-    /// the environment variables, which `FLEETRING_CONTEXT` and the current context do not.
+    /// Uses this context for every setting it names, instead of the current one
+    ///
+    /// It outranks the environment variables; `FLEETRING_CONTEXT`, and else the current context,
+    /// rank below them.
     #[arg(long, value_name = "NAME")]
     context: Option<ContextName>,
     #[command(flatten)]
@@ -952,46 +1059,56 @@ struct Target {
 /// above it that names only `--as` picks among its files.
 #[derive(Debug, Args)]
 struct TlsArgs {
-    /// A directory with `ca.crt`, `client.crt` and `client.key`, and the
-    /// `client.<principal>.crt` and `.key` files `--as` picks from. Defaults to
-    /// `FLEETRING_TLS_DIR`, or else the context's `tls_dir`.
+    /// A directory with `ca.crt` and the client certificates `cert client` writes
+    ///
+    /// `client.crt` and `client.key`, and the `client.<principal>.crt` and `.key` files `--as`
+    /// picks from. Defaults to `FLEETRING_TLS_DIR`, or else the context's `tls_dir`.
     #[arg(long, value_name = "DIR")]
     tls_dir: Option<PathBuf>,
-    /// The trusted authority certificates, PEM. Defaults to `FLEETRING_CA`, the context's `ca`,
-    /// or `ca.crt` in the TLS directory.
+    /// The trusted authority certificates, PEM
+    ///
+    /// Defaults to `FLEETRING_CA`, the context's `ca`, or `ca.crt` in the TLS directory.
     #[arg(long)]
     ca: Option<PathBuf>,
-    /// The client certificate, PEM. Overrides `--as`. Defaults to `FLEETRING_CERT`, the
-    /// context's `cert`, or `client.crt` in the TLS directory.
+    /// The client certificate, PEM; overrides `--as`
+    ///
+    /// Defaults to `FLEETRING_CERT`, the context's `cert`, or `client.crt` in the TLS directory.
     #[arg(long)]
     cert: Option<PathBuf>,
-    /// The client certificate's private key, PEM. Overrides `--as`. Defaults to `FLEETRING_KEY`,
-    /// the context's `key`, or `client.key` in the TLS directory.
+    /// The client certificate's private key, PEM; overrides `--as`
+    ///
+    /// Defaults to `FLEETRING_KEY`, the context's `key`, or `client.key` in the TLS directory.
     #[arg(long)]
     key: Option<PathBuf>,
-    /// Acts as this principal, using `client.<principal>.crt` and `client.<principal>.key` under
-    /// the TLS directory, as `cert client <principal>` writes them. An explicit certificate or
-    /// key at the same step wins over this for that file, and this wins over `client.crt` and
-    /// `client.key`. Defaults to `FLEETRING_AS`, or else the context's `as`.
+    /// Acts as this principal, with its certificate in the TLS directory
+    ///
+    /// Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as
+    /// `cert client <principal>` writes them. An explicit certificate or key at the same step
+    /// wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults
+    /// to `FLEETRING_AS`, or else the context's `as`.
     #[arg(long = "as", value_name = "PRINCIPAL")]
     principal: Option<Principal>,
-    /// Connects in plaintext, to a daemon started with `--insecure-plaintext`.
+    /// Connects in plaintext, to a daemon started with `--insecure-plaintext`
     #[arg(
         long,
         conflicts_with_all = ["ca", "cert", "key", "principal", "tls_dir"]
     )]
     insecure_plaintext: bool,
-    /// A bearer token from `token issue`, sent with every request; the request then acts with
-    /// the token's scopes. Defaults to `FLEETRING_TOKEN`, if set.
+    /// A bearer token from `token issue`, sent with every request
+    ///
+    /// The request then acts with the token's scopes. Defaults to `FLEETRING_TOKEN`, if set.
     #[arg(long, conflicts_with = "token_file")]
     token: Option<String>,
-    /// A file that holds a bearer token, or `-` for stdin. Defaults to `FLEETRING_TOKEN_FILE`,
-    /// or else the context's `token_file`.
+    /// A file that holds a bearer token, or `-` for stdin
+    ///
+    /// Defaults to `FLEETRING_TOKEN_FILE`, or else the context's `token_file`.
     #[arg(long, value_name = "PATH")]
     token_file: Option<PathBuf>,
-    /// Acts as the agent with this ID, using the identity `fleetring agent add` or `fleetring
-    /// mcp --agent` minted: `agent-<id>`, its certificate, and its token, from its directory
-    /// under the context's agents directory. Defaults to `FLEETRING_AGENT`.
+    /// Acts as the agent with this ID, with the identity minted for it
+    ///
+    /// The identity `fleetring agent add` or `fleetring mcp --agent` minted: `agent-<id>`, its
+    /// certificate, and its token, from its directory under the context's agents directory.
+    /// Defaults to `FLEETRING_AGENT`.
     #[arg(
         long,
         value_name = "ID",
@@ -1572,11 +1689,7 @@ enum Run {
 /// clap's error, which prints help, the version, or a usage error.
 fn parse(raw: Vec<OsString>, name: ProgramName) -> Result<(Cli, Invocation), clap::Error> {
     let (args, invocation) = compat::imply_serve(raw);
-    // Both: `display_name` sets `--version`; usage lines come from `bin_name`, which clap would
-    // otherwise take from argv[0] verbatim (`fleetringd.previous`, `.fleetringd.new`).
-    let mut command = Cli::command()
-        .display_name(name.as_str())
-        .bin_name(name.as_str());
+    let mut command = help::root_command(name);
     let mut matches = command.try_get_matches_from_mut(args)?;
     let cli =
         Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut command))?;

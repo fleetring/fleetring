@@ -140,7 +140,7 @@ fn no_arguments_prints_help_and_exits_2() -> TestResult {
         assert!(text.contains(&format!("Usage: {name} ")), "{name}: {text}");
         assert!(text.contains("serve "), "{name}: {text}");
         assert!(
-            text.contains("`fleetringd` is another name"),
+            text.contains("`fleetringd` is the same program"),
             "{name}: {text}"
         );
     }

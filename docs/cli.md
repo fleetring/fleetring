@@ -371,7 +371,7 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | Errors with the next step | `fleetringd: <error>` with `caused by:` lines; `hint:` lines in a few places. | Done (phase G1): `hint:` lines for no control address, no identity, an unknown database, a refusal and an unavailable fleet. |
 | Confirmation and `--yes` | `db drop`, `node remove` and `orphan remove` ask on a terminal and refuse elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask. | Done (phase G1): `token revoke --key-id` and a drain of an only replica ask too; every destructive prompt names the fleet and the context, and refuses with exit 2 without a terminal. |
 | Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | Done (phase G1): 0, 1, 2, 3, 4 and 130, listed in `--help`. |
-| Help fits one screen, grouped | One long paragraph per summary; sixteen commands, ungrouped. | Phase D (FR-075) |
+| Help fits one screen, grouped | One long paragraph per summary; sixteen commands, ungrouped. | Done (FR-075, phase D2): one-line summaries, the grouped list with examples, and a snapshot of `fleetring -h`. |
 | Completions and man pages | None. | Phase G (FR-056) |
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin. `mcp` speaks the protocol on stdin and stdout. | Phase G (FR-056) |
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | Done: `--token-file` (phase B), and the warning (phase G1). |

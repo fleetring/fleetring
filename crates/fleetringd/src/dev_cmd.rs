@@ -30,20 +30,25 @@ const FOLLOW_POLL: Duration = Duration::from_millis(200);
 pub(crate) struct DevArgs {
     #[command(subcommand)]
     pub(crate) command: Option<DevCommand>,
-    /// The directory that holds the authority, the certificates, the configuration, and the
-    /// databases; `~/.fleetring` by default.
+    /// The dev directory; `~/.fleetring` by default
+    ///
+    /// It holds the authority, the certificates, the configuration, and the databases.
     #[arg(long)]
     pub(crate) data_dir: Option<PathBuf>,
-    /// The loopback port the node serves on, 7400 by default; the admin listener takes the next
-    /// one. Only the first run chooses it: later runs read it from `<dir>/fleetringd.toml`, and
-    /// refuse a different one.
+    /// The loopback port the node serves on; 7400 by default
+    ///
+    /// The admin listener takes the next one. Only the first run chooses it: later runs read it
+    /// from `<dir>/fleetringd.toml`, and refuse a different one.
     #[arg(long)]
     pub(crate) port: Option<u16>,
-    /// Runs the dev node in the background and returns once it is ready. Its output goes to
-    /// `<dir>/fleetring.log`.
+    /// Runs the dev node in the background, and returns once it is ready
+    ///
+    /// Its output goes to `<dir>/fleetring.log`.
     #[arg(short = 'd', long)]
     pub(crate) detach: bool,
-    /// How long `-d` waits for the node to be ready: `<n>m` or `<n>s`; 60s by default.
+    /// How long `-d` waits for the node to be ready: `<n>m` or `<n>s`
+    ///
+    /// 60s by default.
     #[arg(long, value_parser = parse_ttl, requires = "detach")]
     pub(crate) timeout: Option<Duration>,
 }
@@ -51,17 +56,20 @@ pub(crate) struct DevArgs {
 /// `fleetring dev`'s subcommands, for the node `dev -d` started.
 #[derive(Debug, Subcommand)]
 pub(crate) enum DevCommand {
-    /// Stops the dev node: drains it, and waits until it has exited.
+    /// Stops the dev node: drains it, and waits until it has exited
     Stop {
         /// The dev directory; `~/.fleetring` by default.
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// How long to wait for the node to drain and exit: `<n>m` or `<n>s`; 2m by default.
+        /// How long to wait for the node to drain and exit: `<n>m` or `<n>s`
+        ///
+        /// 2m by default.
         #[arg(long, value_parser = parse_ttl)]
         timeout: Option<Duration>,
     },
-    /// Says whether the dev node runs, with its PID, address, release, log and context. Exits 0
-    /// either way.
+    /// Says whether the dev node runs, with its PID, address and release
+    ///
+    /// It also names the node's log and context. Exits 0 either way.
     Status {
         /// The dev directory; `~/.fleetring` by default.
         #[arg(long)]
@@ -69,13 +77,15 @@ pub(crate) enum DevCommand {
         #[command(flatten)]
         output: OutputArgs,
     },
-    /// Prints the log `dev -d` writes. It rotates only when the node starts, so during one long
-    /// run it grows without bound; `fleetring dev stop && fleetring dev -d` rotates it.
+    /// Prints the log `dev -d` writes
+    ///
+    /// It rotates only when the node starts, so during one long run it grows without bound;
+    /// `fleetring dev stop && fleetring dev -d` rotates it.
     Logs {
         /// The dev directory; `~/.fleetring` by default.
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Keeps printing new lines as the node writes them, until Ctrl-C.
+        /// Keeps printing new lines as the node writes them, until Ctrl-C
         #[arg(short = 'f', long)]
         follow: bool,
     },
