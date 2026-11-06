@@ -159,9 +159,10 @@ enum Command {
     Serve(DaemonArgs),
     /// Runs one node for development, on loopback only, with a local authority and an admin
     /// principal that every command can act as (ADR-0039). The first run creates them, with the
-    /// node's configuration, in the directory; later runs reuse them. Load `<dir>/env` in another
-    /// terminal to point the commands at the node. `-d` runs it in the background; `dev stop`,
-    /// `dev status` and `dev logs` act on that node. Not for production.
+    /// node's configuration, in the directory; later runs reuse them. Every start writes the
+    /// `dev` context and makes it current unless another context is, so the other commands need
+    /// no flags. `-d` runs it in the background; `dev stop`, `dev status` and `dev logs` act on
+    /// that node. Not for production.
     Dev(DevArgs),
     /// Stops a node started in a terminal or a script: sends it SIGTERM through its process
     /// file, which drains it, and waits until it has exited. Refuses a node a supervisor runs.

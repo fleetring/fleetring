@@ -20,7 +20,7 @@ mod support;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// What the dev node's banner starts with once it serves.
-const BANNER: &str = "fleetringd is running in dev mode";
+const BANNER: &str = "fleetring is running in dev mode";
 
 /// How long to wait between checks, and how many to make: about 30 seconds.
 const POLL: Duration = Duration::from_millis(50);
