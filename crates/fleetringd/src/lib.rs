@@ -141,9 +141,11 @@ const _: () = {
     assert_debug_send_sync::<report::ReplicaReport>();
     assert_debug_send_sync::<report::SchemaObjectReport>();
     assert_debug_send_sync::<report::SchemaReport>();
+    assert_debug_send_sync::<dev::Detached>();
     assert_debug_send_sync::<dev::DevContextLine>();
     assert_debug_send_sync::<dev::DevError>();
     assert_debug_send_sync::<dev::DevMode>();
+    assert_debug_send_sync::<dev::DevStatus>();
     assert_debug_send_sync::<dev::Prepared>();
     assert_debug_send_sync::<Environment>();
     assert_debug_send_sync::<Network>();
@@ -156,6 +158,7 @@ const _: () = {
     assert_debug_send_sync::<observe::ControlMetrics>();
     assert_debug_send_sync::<observe::FamilySpec>();
     assert_debug_send_sync::<observe::Kind>();
+    assert_debug_send_sync::<observe::LogColour>();
     assert_debug_send_sync::<observe::MembershipMetrics>();
     assert_debug_send_sync::<observe::Metrics>();
     assert_debug_send_sync::<observe::NodeInfo>();
@@ -168,7 +171,11 @@ const _: () = {
     assert_debug_send_sync::<StartError>();
     assert_debug_send_sync::<Stop>();
     assert_debug_send_sync::<upgrade::UpgradeError>();
+    assert_debug_send_sync::<upgrade::ParentProcess>();
     assert_debug_send_sync::<upgrade::ProcessFile>();
+    assert_debug_send_sync::<upgrade::Running>();
+    assert_debug_send_sync::<upgrade::StartedBy>();
+    assert_debug_send_sync::<upgrade::Supervisor>();
     assert_debug_send_sync::<upgrade::Options>();
     assert_debug_send_sync::<upgrade::Outcome>();
     assert_debug_send_sync::<upgrade::Mode>();

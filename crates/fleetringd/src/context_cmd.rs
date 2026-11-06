@@ -3,14 +3,15 @@
 
 use std::error::Error;
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use dialoguer::FuzzySelect;
 use dialoguer::theme::ColorfulTheme;
 use fleetring_client::context::{
-    Context, ContextError, ContextName, ContextStore, Contexts, DevContextOutcome, WasCurrent,
+    Context, ContextError, ContextName, ContextStore, Contexts, DEV_NAME, DevContextOutcome,
+    WasCurrent,
 };
 use fleetring_client::dirs;
 use fleetringd::dev::{self, DevContextLine, Prepared};
@@ -486,6 +487,40 @@ pub(crate) fn write_dev_context(prepared: &Prepared) -> DevContextLine {
             reason: one_line(error.as_ref()),
         },
     }
+}
+
+/// What the contexts file says about dev mode's context for the dev directory `dir`, for `dev
+/// status`'s context line. It reads the file and changes nothing.
+pub(crate) fn dev_context_status(dir: &Path) -> String {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    let loaded = (|| -> Result<Contexts, Box<dyn Error>> { Ok(store()?.load()?) })();
+    let contexts = match loaded {
+        Ok(contexts) => contexts,
+        Err(error) => return format!("unknown ({})", one_line(error.as_ref())),
+    };
+    let Ok(name) = DEV_NAME.parse::<ContextName>() else {
+        return "unknown".to_owned();
+    };
+    let line = match contexts.contexts.get(&name) {
+        None => return "none yet: the dev node writes it when it starts".to_owned(),
+        Some(context) => match &context.dev_dir {
+            None => DevContextLine::Kept,
+            Some(points_at) if *points_at != dir => {
+                return format!(
+                    "dev (points at another dev directory, {})",
+                    points_at.display()
+                );
+            }
+            Some(_) => match contexts.current() {
+                Some((current, _)) if *current == name => DevContextLine::Current,
+                Some((current, _)) => DevContextLine::NotCurrent {
+                    current: current.to_string(),
+                },
+                None => return "dev (not current: none is; run fleetring switch dev)".to_owned(),
+            },
+        },
+    };
+    line.describe()
 }
 
 /// An error and its causes on one line.

@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 
 use divan::Bencher;
 use fleetringd::LogFormat;
-use fleetringd::observe::{Metrics, NodeInfo, TraceLayer, log_subscriber};
+use fleetringd::observe::{LogColour, Metrics, NodeInfo, TraceLayer, log_subscriber};
 use http_body::{Body, Frame};
 use http_body_util::BodyExt as _;
 use tonic::codegen::Bytes;
@@ -106,7 +106,12 @@ const LEVELS: &[Level] = &[Level::Info, Level::Debug];
 
 fn subscriber(level: Level) -> tracing::subscriber::DefaultGuard {
     let filter = tracing_subscriber::EnvFilter::new(level.to_string());
-    tracing::subscriber::set_default(log_subscriber(LogFormat::Text, filter, std::io::sink))
+    tracing::subscriber::set_default(log_subscriber(
+        LogFormat::Text,
+        LogColour::Ansi,
+        filter,
+        std::io::sink,
+    ))
 }
 
 fn runtime() -> tokio::runtime::Runtime {

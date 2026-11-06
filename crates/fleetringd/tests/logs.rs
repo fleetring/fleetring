@@ -24,7 +24,7 @@ use fleetringd::changes::{
 use fleetringd::data::Client;
 use fleetringd::durability::HttpPolicy;
 use fleetringd::engine::Position;
-use fleetringd::observe::log_subscriber;
+use fleetringd::observe::{LogColour, log_subscriber};
 use fleetringd::transport::database_client;
 use fleetringd::{Config, Daemon, LogFormat};
 
@@ -74,6 +74,7 @@ fn lines() -> &'static Lines {
         let filter = tracing_subscriber::EnvFilter::new("info,fleetringd=debug");
         tracing::subscriber::set_global_default(log_subscriber(
             LogFormat::Json,
+            LogColour::Plain,
             filter,
             lines.clone(),
         ))

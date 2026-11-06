@@ -28,7 +28,9 @@ use fleetring::NodeId;
 use fleetring_control::{Liveness, Release};
 use tonic::Status;
 
-pub use process::{PROCESS_FILE, ProcessFile, RESTARTS_VAR};
+pub use process::{
+    PROCESS_FILE, ParentProcess, ProcessFile, RESTARTS_VAR, Running, StartedBy, Supervisor, running,
+};
 
 use crate::MembershipView;
 use crate::data::Client;
@@ -1073,6 +1075,8 @@ mod tests {
                 version: "0.7.0".to_owned(),
                 restarts: 0,
                 args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                supervisor: None,
+                started_by: None,
             }
             .write(&self.data_dir())?;
             Ok(lock)
