@@ -149,7 +149,7 @@ PS1='$(fleetring context current) $ '
   - `context add` infers `--fleet` from the certificate. The first context added becomes current.
   - `context use <name>` and `switch <name>` record the context they replace as `previous`, for `switch -`.
   - `context remove` doesn't ask.
-- **The picker.** `switch` with no name opens a picker when stdin and stderr are terminals: arrows, type to filter, the current context marked and preselected, Esc to cancel. Without a terminal it prints `context list` instead.
+- **The picker.** `switch` with no name opens a picker when stdin and stderr are terminals: arrows, type to filter, the current context marked and preselected, Esc to cancel. Without a terminal it prints `context list` on stderr and exits 2, with a hint to pass a name.
 - **The dev context.** `fleetring dev` writes a context named `dev` on every start (control `127.0.0.1:<port>`, the dev directory's `tls/`, `as = "admin"`), and makes it current unless another context is current. It rewrites only a `dev` context it wrote itself, and its banner says `context: dev (current)` or how to switch to it.
 - **Checked on use.** A context whose fleet name doesn't match the fleet its certificate names fails with both names.
 
@@ -183,7 +183,7 @@ Each of these is decided once, from a snapshot of the process's surroundings, by
 |---|---|
 | Colour | the stream is a terminal, `NO_COLOR` is unset or empty, `TERM` isn't `dumb`, and `--color` isn't `never`. `--color always` forces it |
 | Spinners and check marks | stdout and stderr are both terminals; the output is human (not `-o json`, `jsonl`, or `--json`); there's no `-q`; `NO_COLOR` is unset or empty; `TERM` isn't `dumb`; and `CI` is unset or empty |
-| Prompts and the `switch` picker | stdin and stderr are terminals. Otherwise a command that must ask refuses with exit 2 (§7), and `switch` prints the list |
+| Prompts and the `switch` picker | stdin and stderr are terminals. Otherwise a command that must ask refuses with exit 2 (§7), and `switch` with no name prints the list and exits 2 |
 | Override warnings and `hint:` lines meant for people | stderr is a terminal, and there's no `-q` |
 
 `-q, --quiet` drops everything but the result and errors. A command with no result then prints nothing.
@@ -226,7 +226,7 @@ Documented in `--help` and the man page, and the same for every command:
 |---|---|
 | 0 | Success. `dev -d` when the dev node already runs, `dev status` either way. |
 | 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`), no node to `stop`, or an agent with no identity outside dev mode. |
-| 2 | Usage: a bad flag or argument, or a confirmation needed without a terminal. |
+| 2 | Usage: a bad flag or argument, a confirmation needed without a terminal, or `switch` with no name and no terminal. |
 | 3 | Authentication or authorization: `UNAUTHENTICATED` or `PERMISSION_DENIED`. |
 | 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, a timeout, no leader yet. |
 | 130 | Interrupted (Ctrl-C). A `watch`, `dev logs -f`, and a cancelled picker end this way normally. |
@@ -276,9 +276,10 @@ Documented in `--help` and the man page, and the same for every command:
 - **Ctrl-C** stops cleanly. A drain stops after the database it is handing over, and says what it moved and what it left.
 - **Timeouts** have a flag (`--timeout 30s`) and a stated default: 60s for `dev -d` to be ready, 2m for `stop` to drain, 5m for each `upgrade` step.
 - **A background process is a `docker run -d`:**
-  - `dev -d` returns once the node is ready, prints its address, data directory and log path on stdout, and is idempotent.
+  - `dev -d` returns once the node is ready, prints its address, data directory and log path on stdout, and is idempotent. The log rotates only when the node starts, so it grows during one long run.
+  - The process file records a node `dev -d` started, and `dev stop` always stops it.
   - It is stopped by `dev stop` or `stop`, which send `SIGTERM` through the process file and wait for the drain. They never send `SIGKILL`.
-  - A node that systemd or `brew services` runs is stopped by that supervisor. `stop` refuses it, naming the supervisor's command.
+  - A node that systemd or `brew services` runs is stopped by that supervisor. `stop` refuses it, naming the supervisor's command. A node counts as supervised only when its parent is the supervisor, never because of variables a shell inherited.
   - On Windows, `dev -d` and `stop` aren't available yet. Run `fleetring dev` in its own terminal.
 
 ## 13. Logging
@@ -314,6 +315,10 @@ These names don't change in 0.7.0, because a 0.6 binary or an existing directory
 - `fleetringd.process`, `fleetringd.lock` and `FLEETRINGD_RESTARTS`;
 - `fleetringd.toml`;
 - the crate's log targets.
+
+A host upgraded from 0.6 keeps its real file named `fleetringd` and its previous binary as `fleetringd.previous`; only a fresh 0.7 install has `fleetring.previous`.
+
+After switching a unit to `fleetring serve`, rolling back to 0.6 requires reverting the unit to `fleetringd --config` first. A 0.6 binary doesn't know `serve`, and `fleetringd.previous upgrade --rollback`, run as 0.6, can't check for it (ADR-0043, point 3.5).
 
 How renames work after 1.0 is decided with 1.0's compatibility promise, and 1.0 removes the compatibility names.
 
