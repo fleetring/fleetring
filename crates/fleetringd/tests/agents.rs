@@ -9,6 +9,7 @@
 //! running.
 #![cfg(unix)]
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
@@ -141,7 +142,8 @@ fn mode(path: &Path) -> TestResult<u32> {
 /// configuration and data directories, and the port its dev node takes.
 struct Machine {
     root: tempfile::TempDir,
-    port: u16,
+    /// The port, which a first start that loses it to another process replaces.
+    port: Cell<u16>,
 }
 
 impl Machine {
@@ -150,7 +152,7 @@ impl Machine {
     fn new() -> TestResult<Self> {
         let machine = Self {
             root: tempfile::tempdir()?,
-            port: port_pair()?,
+            port: Cell::new(port_pair()?),
         };
         machine.seed()?;
         Ok(machine)
@@ -162,7 +164,7 @@ impl Machine {
         if free(7400) && free(7401) {
             return Ok(Self {
                 root: tempfile::tempdir()?,
-                port: 7400,
+                port: Cell::new(7400),
             });
         }
         Self::new()
@@ -186,11 +188,27 @@ impl Machine {
             tls.join("ca.crt"),
             tls.join("node.dev.crt"),
             tls.join("node.dev.key"),
-            port = self.port,
-            admin = self.port + 1,
+            port = self.port(),
+            admin = self.port() + 1,
         );
         fs::write(dir.join("fleetringd.toml"), config)?;
         Ok(())
+    }
+
+    fn port(&self) -> u16 {
+        self.port.get()
+    }
+
+    /// Whether a failed first start lost its port to another process, so that it may start
+    /// again on another: no node runs, and the failure says the address was in use.
+    fn lost_port(&self, failure: &str) -> TestResult<bool> {
+        Ok(failure.contains("Address already in use") && self.process_file()?.is_none())
+    }
+
+    /// Moves the dev directory's configuration to a new pair of ports.
+    fn reseed(&self) -> TestResult {
+        self.port.set(port_pair()?);
+        self.seed()
     }
 
     fn home(&self) -> &Path {
@@ -230,8 +248,18 @@ impl Machine {
         command
     }
 
+    /// Runs `args`; a command that starts the dev node and loses its port runs again on
+    /// another, up to five times.
     fn run(&self, args: &[&str]) -> TestResult<Output> {
-        Ok(self.command(args).output()?)
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let output = self.command(args).output()?;
+            if output.status.success() || attempts >= 5 || !self.lost_port(&stderr(&output))? {
+                return Ok(output);
+            }
+            self.reseed()?;
+        }
     }
 
     /// Runs `args`, which must succeed, and returns stdout.
@@ -245,7 +273,16 @@ impl Machine {
     async fn mcp(&self, args: &[&str]) -> TestResult<Session> {
         let mut command = vec!["mcp"];
         command.extend_from_slice(args);
-        Session::spawn(tokio::process::Command::from(self.command(&command))).await
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match Session::spawn(tokio::process::Command::from(self.command(&command))).await {
+                Err(error) if attempts < 5 && self.lost_port(&error.to_string())? => {
+                    self.reseed()?;
+                }
+                started => return started,
+            }
+        }
     }
 
     fn process_file(&self) -> TestResult<Option<ProcessFile>> {
@@ -490,7 +527,7 @@ async fn an_expiring_token_is_renewed_in_dev_mode_only() -> TestResult {
     let contexts = fs::read_to_string(machine.config_dir().join("contexts.toml"))?;
     machine.contexts(&format!(
         "{contexts}\n[contexts.prod]\nfleet = \"dev\"\ncontrol = [\"127.0.0.1:{}\"]\n",
-        machine.port
+        machine.port()
     ))?;
     let mut prod = machine.mcp(&["--agent", "42", "--context", "prod"]).await?;
     prod.ok("db_list", json!({})).await?;
@@ -542,7 +579,7 @@ async fn a_context_pointing_dev_dir_at_a_non_dev_directory_mints_nothing() -> Te
         format!(
             "data_dir = {:?}\nlisten = \"127.0.0.1:{}\"\n\n[node]\nid = \"prod-1\"\n",
             prod.join("data"),
-            machine.port
+            machine.port()
         ),
     )?;
     let data = prod.join("data");
@@ -552,7 +589,9 @@ async fn a_context_pointing_dev_dir_at_a_non_dev_directory_mints_nothing() -> Te
     machine.contexts(&format!(
         "version = 1\ncurrent = \"dev\"\n\n[contexts.dev]\nfleet = \"dev\"\n\
          control = [\"127.0.0.1:{}\"]\ntls_dir = {:?}\nas = \"admin\"\ndev_dir = {:?}\n",
-        machine.port, tls, prod
+        machine.port(),
+        tls,
+        prod
     ))?;
     let before = snapshot(&prod)?;
     let output = machine.run(&["mcp", "--agent", "42"])?;
