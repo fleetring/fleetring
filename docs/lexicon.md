@@ -54,14 +54,26 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | sink (for where committed batches go to be replicated) | [batch publisher](#batch-publisher) | A [sink](#sink) is only a change stream's destination. |
 | snapshot (alone) | [database snapshot, base snapshot, or control snapshot](#snapshot) | Say which state is copied. |
 | key (for a database, in the daemon) | [database](#database) | "Key" alone is the placement key; other keys say which: private key, signing key, lease key. |
-| role (alone) | [node role](#node-role) or [replica role](#replica-role) | |
+| role (alone) | [node role](#node-role), [replica role](#replica-role), or [access role](#access-role) | |
+| capability (for a scope or an action) | [scope](#scope), [action](#action) | Fine in prose about capability-based security in general. |
+| branch, copy (for a fork) | [fork](#fork) | "Clone" is fine for the file-system mechanism. |
+| checkpoint (for a co-signed chain head) | [signed head](#signed-head) | A [checkpoint](#checkpoint) is the engine's. |
+| release (for a package's version) | package version ([package](#package)) | A [release](#release) is a version of `fleetringd`. |
 | API key, password | [token](#token) or [certificate](#certificate) | |
 | health (for a member's liveness) | [liveness](#liveness) | `/healthz` is about the process; liveness is the control plane's view. |
 | tag | [label](#label) | ADR-0041. |
-| owner (of a database) | [creator](#creator) | Being the creator grants nothing; scopes decide. "Owner" is refused for a lease holder and a primary too. |
+| owner (of a database) | [creator](#creator) | Being the creator grants nothing; scopes decide. "Owner" is refused for a lease holder and a primary too; it is kept for an agent's [owner](#owner) (planned). |
 | TTL (as a field or flag) | [expiry](#expiry) | "TTL" is fine in prose for the duration. |
 
 ## Terms
+
+### Access role
+
+*Planned* (ADR-0044). A named bundle of scope templates, such as `developer = ["admin:team-{team}-*", "read:org-*"]`, assigned to principals and groups in the identity registry. The issuer expands a principal's access roles into plain scopes when it issues a token; nodes never see one.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** role (alone), permission set, policy, profile.
 
 ### Acknowledgement mode
 
@@ -73,7 +85,7 @@ How many replicas must store a write before it is acknowledged: `quorum` (a majo
 
 ### Action
 
-The verb half of a [scope](#scope): `read`, `write`, `admin`, or `stream`. `write` implies `read`, `admin` implies both, and `stream` stands alone (ADR-0025).
+The verb half of a [scope](#scope): `read`, `write`, `admin`, or `stream`. `write` implies `read`, `admin` implies both, and `stream` stands alone (ADR-0025). *Planned* (ADR-0044): `fork`, which implies `read` and which `admin` implies, and `grant`, which lets a holder delegate its other scopes narrowed to its pattern, and implies and is implied by nothing.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::Action`. **CLI:** the part before `:` in `--scope read:notes`.
@@ -264,9 +276,17 @@ One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, re
 - **Code:** `fleetring_control::Database`, `DatabaseName`. **CLI:** the noun `db` (`fleetringd db create`), the argument `<database>`; "database" in output headers.
 - **Not:** shard, partition, tenant, keyspace, namespace, table, instance.
 
+### Delegation
+
+*Planned* (ADR-0044). A holder handing a narrower copy of its token to another holder, offline and without the authority: it appends a block to its biscuit token that names the new holder's principal, its parent, and its holder key, with scopes and an expiry that can only narrow. It needs the `grant` action. A *delegated token* is one with such a block; *attenuation* is appending a block that narrows without naming a new holder.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet; the token vocabulary is specified in `docs/spec/tokens-v1.md` when built. **CLI:** none yet.
+- **Not:** impersonation, sub-token, child token, token exchange (an online protocol FleetRing doesn't use for this).
+
 ### Denylist
 
-The set of revoked tokens and signing keys the control plane keeps and publishes to data nodes with every heartbeat reply. A node refuses a token on it.
+The set of revoked tokens and signing keys the control plane keeps and publishes to data nodes with every heartbeat reply. A node refuses a token on it. *Planned* (ADR-0044): it also holds [revocation IDs](#revocation-id) of token blocks, and principals whose earlier tokens are revoked.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Revocations`, `Revoked`, protocol `Revocation`. **CLI:** `fleetringd token revoke`.
@@ -404,6 +424,22 @@ A replica that isn't the primary: it applies the primary's batches and can be pr
 - **Code:** `ReplicaRole::Follower`, `replication::follower`. **CLI:** "followers" in `db locate`.
 - **Not:** slave, secondary, standby, read replica, backup, replica (when only non-primaries are meant).
 
+### Fork
+
+*Planned* (ADR-0044). A new database seeded from a source database's snapshot at a position, independent afterwards, that records its source in `forked_from` (the source, the position, its chain hash, and a signed head or a package manifest when there is one). Needs `fork` on the source and `admin` on the target. Also the action `fork`, which implies `read`.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet (`ForkDatabase`, `Feature::Fork`, `Metadata::forked_from` when built). **CLI:** none yet (`db fork`).
+- **Not:** branch, clone (fine for the file-system mechanism), copy, snapshot.
+
+### Group
+
+*Planned* (ADR-0044). A named set of principals in the identity registry, to which access roles are assigned. Membership is expanded into a token's scopes at issuance, never looked up by a node.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** team (a team is a prefix tier, `team-<team>-`, usually with a group of the same name), role.
+
 ### Hash chain
 
 One BLAKE3 hash per transaction over the replication log, each folding in the one before, so the hash at a position commits every byte before it (FR-044). One value of it is a *chain hash*.
@@ -428,6 +464,14 @@ Who holds a lease: for a database lease, the primary; for a keyed lease, the nam
 - **Code:** `Lease::holder`, binding `holder`. **CLI:** none yet.
 - **Not:** owner, leader, master, lessee.
 
+### Holder key
+
+*Planned* (ADR-0044). The Ed25519 key a delegated token is bound to: the holder generates it on its own machine, the delegation block names its public key, and the holder presents it as a self-signed client certificate. A node accepts the token only on a connection with that key, or through a relay with `forward_tokens` for a bearer delegation.
+
+- **Applies to:** daemon, CLI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** private key (alone), session key, proof key.
+
 ### Host
 
 A placement label for the machine a node runs on, when several nodes share one; replicas spread across hosts after zones (ADR-0006). "Host" also keeps its network sense inside `host:port`, but the names a node is dialed at are its [addresses](#address) (`cert node --addresses`).
@@ -435,6 +479,22 @@ A placement label for the machine a node runs on, when several nodes share one; 
 - **Applies to:** crate, daemon, CLI, UI.
 - **Code:** `Host`, `[node] host`. **CLI:** `host=` after each member in `status`.
 - **Not:** node (a host can run several nodes), server, machine (fine in prose), instance, VM.
+
+### Identity registry
+
+*Planned* (ADR-0044). The issuer's state: principals' kinds, owners, and login mappings, groups, access roles, and organizations, kept in the reserved database `_fleetring/identity`. Nodes never read it.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** user store, directory (a [directory](#directory) maps prefixes to cells), IAM.
+
+### Issuer
+
+*Planned* (ADR-0044). The service that turns a login (OIDC, later passkeys or a wallet) into a FleetRing token, signing it with an issuer key that the authority certifies as a constrained trust anchor. It runs in the router first. The token claim `iss` names the fleet, not the issuer.
+
+- **Applies to:** daemon, CLI.
+- **Code:** none yet. **CLI:** none yet (`fleetring login`).
+- **Not:** authority, identity provider (that is the OIDC side), auth server.
 
 ### Join
 
@@ -548,6 +608,14 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 - **Code:** `fleetringd::NodeRole`, `role` in config. **CLI:** `--role data|control|both`.
 - **Not:** role alone (say whose), mode, type, kind, function.
 
+### Organization
+
+*Planned* (ADR-0044). A namespace of principals and databases in a fleet that serves several: its databases are under `<org>/`, its principals are named `<org>.<name>`, and its administrators edit its groups and access roles. A fleet that serves one organization needs none. `org-` in a database name is the organization-wide tier.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** tenant (a naming convention for an application's customers), account, workspace, project.
+
 ### Orphan
 
 A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused.
@@ -555,6 +623,38 @@ A copy of a database that a data node keeps on disk, closed, because the control
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Replication::orphan`, `data::Orphan`, protocol `OrphanStatus` and `Database.RemoveOrphan`. **CLI:** `fleetringd orphan list`, `fleetringd orphan remove <database> --node <id>`.
 - **Not:** stale copy, leftover, stray, zombie, dangling replica.
+
+### Overlay
+
+*Planned* (ADR-0044). A reader's own database beside an installed package, holding its notes, corrections, and private constraints about it. It is never merged into the package; upgrading the package replaces the package's database and leaves the overlay alone.
+
+- **Applies to:** docs, CLI, UI.
+- **Code:** none. **CLI:** none.
+- **Not:** patch, layer, fork (an overlay starts empty).
+
+### Owner
+
+*Planned* (ADR-0044). The principal an agent acts for and answers to: the principal the command that created the root agent ran as, or `authority` when only the authority's key was used (ADR-0043). A child agent inherits its parent's owner. Recorded in the agent's identity record and its token; it grants nothing. Only agents have owners: a database has a [creator](#creator), a lease a [holder](#holder).
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet (`owner` in `identity.toml` from 0.7, ADR-0043). **CLI:** `agent show`.
+- **Not:** creator, sponsor, user (as a field).
+
+### Package
+
+*Planned* (ADR-0044). A database a publisher releases in versions for others to read or fork. A *package version* is described by a *package manifest*: the publisher, the package, the version, the engine, the digests of its files, its position and chain hash, and the previous version's manifest digest, signed by the publisher's key and verifiable offline with that key alone. "Verified" means the publisher's identity, never the content's truth or safety, and a package's content is untrusted data.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** release (a [release](#release) is a version of `fleetringd`), dataset, bundle, image.
+
+### Parent
+
+*Planned* (ADR-0044). The agent that spawned an agent, recorded by agent ID in the child's `identity.toml` and by principal in the delegation block that created its token. A child's ID extends its parent's with `.` (`42.c7`), so its databases, `agent-42.c7-…`, fall under its parent's subtree scope `agent-42.*`. It grants nothing by itself.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet (`parent` in `identity.toml` from 0.7, ADR-0043, as the parent's agent ID). **CLI:** `agent show`.
+- **Not:** creator, owner, ancestor (fine in prose for any agent above).
 
 ### Placement
 
@@ -598,7 +698,7 @@ The replica that holds a database's lease at its current lease epoch, and the on
 
 ### Principal
 
-A named identity a client acts as, with the scopes its `[[principal]]` entry or its token grants (ADR-0025).
+A named identity a client acts as, with the scopes its `[[principal]]` entry or its token grants (ADR-0025). *Planned* (ADR-0044): every principal has a *principal kind*, `user`, `agent`, or `service` (the default); a node is not a principal. An agent records an [owner](#owner) and, if another agent spawned it, a [parent](#parent).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `tls::Principal`, `[[principal]]`. **CLI:** `cert client <principal>`, `token issue --principal`, *planned* `--as <principal>` (FR-055).
@@ -611,6 +711,14 @@ Making a follower the primary at the next lease epoch: the control plane starts 
 - **Applies to:** daemon, UI.
 - **Code:** `Promotion`, `StartPromotion`, `CompletePromotion`, `Replication.Promote`. **CLI:** "promotion" in `db locate`.
 - **Not:** election, takeover, failover (when it is a transfer).
+
+### Publisher
+
+*Planned* (ADR-0044). An Ed25519 key with a name, held by a principal of the publishing fleet, that signs package manifests. A reader pins publisher keys in its trust store as provenance anchors; a publisher key never authorizes a request in any fleet.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** author (that is a description's), vendor, maintainer, signer (alone).
 
 ### Quorum
 
@@ -686,6 +794,14 @@ A restore also returns the [metadata](#metadata) the archive holds for the snaps
 - **Code:** `durability::restore_into`, `RestoreTarget`, `Restored`, `RestorePlan`, `ArchivedMetadata`; protocol `Database.Restore`, `RestorePoint`, `RestoreResponse.archived_metadata`. **CLI:** `db restore`, `archive restore`, `--at-position`, `--at-time`.
 - **Not:** recover (that is what a failover does), import, rollback, rewind.
 
+### Revocation ID
+
+*Planned* (ADR-0044). The SHA-256 of one block's signature in a biscuit token, base64url. Putting it on the denylist refuses every token that contains the block, so revoking a parent's token, or the block that delegated to a child, revokes everything derived from it.
+
+- **Applies to:** daemon, CLI.
+- **Code:** none yet (`Revoked::Block`). **CLI:** none yet.
+- **Not:** token ID (that is `jti`), key ID.
+
 ### Ring
 
 The placement structure over a set of nodes, with a strategy (weighted rendezvous by default, or a vnode ring), a seed, and a fingerprint. One per cell; one per fleet when there are no cells.
@@ -741,6 +857,14 @@ One immutable archive object holding a run of delivered batches between two posi
 - **Applies to:** daemon, CLI.
 - **Code:** `durability::SegmentName`, `SegmentHeader`, `encode_segment`; objects under `<prefix>/<db>/segments/`. **CLI:** `segments` in `archive show` and in a restore's report.
 - **Not:** WAL file, log file, chunk, part.
+
+### Signed head
+
+*Planned* (FR-074, ADR-0044). A database's chain hash at a position, signed by the node keys of a write quorum of its replicas, so anyone with the fleet's authority certificate can check offline that the fleet held that history. FR-074's ticket calls it a co-signed checkpoint; "checkpoint" stays the engine's.
+
+- **Applies to:** daemon, CLI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** checkpoint, attestation, seal.
 
 ### Sink
 
@@ -800,7 +924,7 @@ Not a FleetRing object. A tenant is a naming convention for keys, `tenant:<name>
 
 ### Token
 
-A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`.
+A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`. *Planned* (ADR-0044): a token may also be a biscuit in FleetRing's fixed vocabulary, which a holder can narrow and [delegate](#delegation) without the authority.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::BearerToken`, `TokenId`, `KeyId`. **CLI:** `fleetringd token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
@@ -813,6 +937,14 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 - **Applies to:** daemon, UI.
 - **Code:** `Control.TransferLease`. **CLI:** none yet ("hands over" in drain output).
 - **Not:** handoff (as a name; "hand over" is fine in prose), switchover, migration (moving the data itself), step down.
+
+### Trust anchor
+
+*Planned* (ADR-0044). A public key a fleet or a reader trusts, with a purpose and a constraint. Authorization anchors sign tokens: the fleet's authority (unconstrained), issuer keys, and other fleets' authorities (each limited to the patterns and actions it may vouch for). Provenance anchors, publisher keys, only verify content and never authorize.
+
+- **Applies to:** daemon, CLI.
+- **Code:** none yet. **CLI:** none yet.
+- **Not:** root (alone), CA (an [authority](#authority) is one kind of anchor), trust root.
 
 ### Upgrade
 
