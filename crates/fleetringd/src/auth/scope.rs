@@ -238,7 +238,17 @@ pub enum ParseScopeError {
         /// The text.
         scope: String,
     },
+    /// The scope is `fork` or `grant`, alone or as an action, which delegation will use
+    /// (ADR-0043, point 8.11).
+    #[error("'{word}' is reserved for delegation, which this release doesn't support")]
+    Reserved {
+        /// The reserved word.
+        word: &'static str,
+    },
 }
+
+/// The words reserved for delegation, as a bare scope and as an action (ADR-0043, point 8.11).
+const RESERVED: [&str; 2] = ["fork", "grant"];
 
 impl FromStr for Scope {
     type Err = ParseScopeError;
@@ -246,6 +256,10 @@ impl FromStr for Scope {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         if text == FLEET {
             return Ok(Self::fleet());
+        }
+        let word = text.split_once(':').map_or(text, |(action, _)| action);
+        if let Some(word) = RESERVED.into_iter().find(|reserved| *reserved == word) {
+            return Err(ParseScopeError::Reserved { word });
         }
         let Some((action, pattern)) = text.split_once(':') else {
             return Err(ParseScopeError::Shape {
@@ -376,6 +390,31 @@ mod tests {
 
     fn scopes(texts: &[&str]) -> Scopes {
         texts.iter().map(|text| scope(text)).collect()
+    }
+
+    #[test]
+    fn reserved_scope_words_are_refused() {
+        for (text, word) in [
+            ("fork", "fork"),
+            ("grant", "grant"),
+            ("fork:agent-42-*", "fork"),
+            ("grant:agent-42.*", "grant"),
+            ("grant:", "grant"),
+        ] {
+            let error = text.parse::<Scope>().expect_err(text);
+            assert_eq!(error, ParseScopeError::Reserved { word }, "{text}");
+            assert_eq!(
+                error.to_string(),
+                format!("'{word}' is reserved for delegation, which this release doesn't support")
+            );
+        }
+        // A pattern may still hold the words; only the action is reserved.
+        for text in ["read:fork", "admin:grant-*", "forks:x"] {
+            assert!(
+                !matches!(text.parse::<Scope>(), Err(ParseScopeError::Reserved { .. })),
+                "{text}"
+            );
+        }
     }
 
     #[test]
