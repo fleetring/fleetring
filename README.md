@@ -97,10 +97,9 @@ Five minutes on a laptop, with no certificates or configuration to write. Instal
 fleetringd dev
 ```
 
-It prints where it listens and the line that points the commands at it. In another terminal:
+It prints where it listens, and writes a `dev` context that points the commands at it, making it current unless another context is. In another terminal:
 
 ```sh
-. ~/.fleetring/env                       # FLEETRING_CONTROL, FLEETRING_TLS_DIR, FLEETRING_AS
 fleetringd status                        # starts with "dev mode: one node on loopback, ..."
 fleetringd db create notes               # one replica, a dev node's default
 fleetringd db exec notes "CREATE TABLE note (body TEXT)"

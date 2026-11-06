@@ -16,7 +16,10 @@ arc-swap.workspace = true
 base64 = "0.22"
 blake3.workspace = true
 clap = { version = "4.6.7", features = ["derive", "env"] }
+# The picker `fleetring switch` opens on a terminal (ADR-0043, point 12).
+dialoguer = { version = "0.12", default-features = false, features = ["fuzzy-select"] }
 fleetring = { path = "../fleetring", features = ["serde"] }
+fleetring-client = { version = "0.0.0", path = "../fleetring-client" }
 fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
 fleetring-proto = { version = "0.0.0", path = "../fleetring-proto" }
 fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }

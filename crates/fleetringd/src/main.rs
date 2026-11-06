@@ -16,6 +16,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use fleetring::{NodeId, ReplicationFactor};
+use fleetring_client::context::{ContextName, Contexts, select};
 use fleetring_control::{
     Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, ReplicaRole,
     parse_label,
@@ -63,21 +64,13 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod compat;
+mod context_cmd;
 mod edit;
+mod resolve;
 
 use compat::{Invocation, ProgramName};
-
-/// The environment variable that names a directory with `ca.crt`, `client.crt`, and
-/// `client.key`, and the `client.<principal>.crt` and `.key` files `--as` picks from. It supplies
-/// whatever `--ca`, `--cert`, `--key`, and `--as` (and their variables) leave open.
-const TLS_DIR_VAR: &str = "FLEETRING_TLS_DIR";
-
-/// The environment variable that holds a bearer token, used when `--token` isn't given.
-const TOKEN_VAR: &str = "FLEETRING_TOKEN";
-
-/// The environment variable that names the control node's address, used when neither
-/// `--control` nor `--config` is given. Dev mode's environment file sets it (ADR-0039).
-const CONTROL_VAR: &str = "FLEETRING_CONTROL";
+use context_cmd::ContextCommand;
+use resolve::{EnvSnapshot, Resolved, SecurityFiles, TargetFlags, TokenSource, Wire};
 
 /// The environment variable that chooses the log format when `--log-format` isn't given.
 const LOG_FORMAT_VAR: &str = "FLEETRING_LOG_FORMAT";
@@ -105,6 +98,9 @@ struct Cli {
     /// `[log] format`.
     #[arg(long, global = true, value_parser = parse_log_format)]
     log_format: Option<LogFormat>,
+    /// Leaves out the warnings about environment variables that override a context.
+    #[arg(short, long, global = true)]
+    quiet: bool,
 }
 
 /// `fleetring serve`'s flags.
@@ -157,6 +153,18 @@ enum Command {
     /// node's configuration, in the directory; later runs reuse them. Load `<dir>/env` in another
     /// terminal to point the commands at the node. Not for production.
     Dev(DevArgs),
+    /// Names, lists and selects contexts: a fleet's control addresses, certificates and
+    /// principal, so that commands need no flags for them (ADR-0043).
+    #[command(subcommand)]
+    Context(ContextCommand),
+    /// Makes another context current: by name, `-` for the previous one, or with no name a
+    /// picker on a terminal. Without a terminal and without a name it lists the contexts and
+    /// exits 2.
+    Switch {
+        /// The context to switch to, or `-` for the previous one.
+        #[arg(allow_hyphen_values = true)]
+        target: Option<String>,
+    },
     /// Creates the fleet's certificate authority and issues node and client certificates.
     #[command(subcommand)]
     Cert(CertCommand),
@@ -450,6 +458,10 @@ enum OrphanCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a command is parsed once per process, and clap can't box a flattened `Target`"
+)]
 enum TokenCommand {
     /// Issues a token signed with the authority's key and prints it. Run it where `ca.key` is,
     /// off the nodes; nodes verify the token with `ca.crt` alone.
@@ -851,127 +863,215 @@ struct SqlArgs {
     target: Target,
 }
 
-/// How a command finds the control plane. Commands talk to the control node, which knows every
-/// database's placement; data nodes redirect database calls to the right primary on their own.
+/// How a command finds the control plane, and who it acts as. Commands talk to the control node,
+/// which knows every database's placement; data nodes redirect database calls to the right
+/// primary on their own.
+///
+/// Each setting is resolved on its own, and the first of these wins: the setting's flag, the
+/// context `--context` names, the setting's environment variable, the context
+/// `FLEETRING_CONTEXT` names or else the current context, and the built-in default
+/// (`docs/cli.md`, section 3).
 #[derive(Debug, Args)]
 struct Target {
     /// The control node's address, `host:port`: the node that runs the control role, not any node
     /// in the fleet. A data-only node answers with the control node's address. Defaults to
-    /// `FLEETRING_CONTROL` when neither this nor `--config` is given.
+    /// `FLEETRING_CONTROL`, or else the context's `control`, when neither this nor `--config` is
+    /// given.
     #[arg(long, conflicts_with = "config")]
     control: Option<String>,
     /// A daemon's configuration file, to take the control node's address from.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Uses this context for every setting it names, instead of the current one. It outranks
+    /// the environment variables, which `FLEETRING_CONTEXT` and the current context do not.
+    #[arg(long, value_name = "NAME")]
+    context: Option<ContextName>,
     #[command(flatten)]
     tls: TlsArgs,
+    /// The settings, resolved the first time a command needs them.
+    #[arg(skip)]
+    resolved: OnceLock<Box<Resolved>>,
 }
 
 /// The identity a command connects with: a client certificate from `cert client`.
 ///
-/// Each of the three files is the first of these that names it: the flag, the environment
-/// variable, `--as` (or `FLEETRING_AS`) for the certificate and key, and the default under
-/// `FLEETRING_TLS_DIR`.
+/// Each of the three files is the first of these that names it, at each step of the order
+/// (flag, `--context`, variable, current context): its path, then the principal's file under the
+/// TLS directory, and finally the directory's default.
 #[derive(Debug, Args)]
 struct TlsArgs {
-    /// The trusted authority certificates, PEM. Defaults to `$FLEETRING_TLS_DIR/ca.crt`.
-    #[arg(long, env = "FLEETRING_CA")]
+    /// A directory with `ca.crt`, `client.crt` and `client.key`, and the
+    /// `client.<principal>.crt` and `.key` files `--as` picks from. Defaults to
+    /// `FLEETRING_TLS_DIR`, or else the context's `tls_dir`.
+    #[arg(long, value_name = "DIR")]
+    tls_dir: Option<PathBuf>,
+    /// The trusted authority certificates, PEM. Defaults to `FLEETRING_CA`, the context's `ca`,
+    /// or `ca.crt` in the TLS directory.
+    #[arg(long)]
     ca: Option<PathBuf>,
-    /// The client certificate, PEM. Overrides `--as`. Defaults to
-    /// `$FLEETRING_TLS_DIR/client.crt`.
-    #[arg(long, env = "FLEETRING_CERT")]
+    /// The client certificate, PEM. Overrides `--as`. Defaults to `FLEETRING_CERT`, the
+    /// context's `cert`, or `client.crt` in the TLS directory.
+    #[arg(long)]
     cert: Option<PathBuf>,
-    /// The client certificate's private key, PEM. Overrides `--as`. Defaults to
-    /// `$FLEETRING_TLS_DIR/client.key`.
-    #[arg(long, env = "FLEETRING_KEY")]
+    /// The client certificate's private key, PEM. Overrides `--as`. Defaults to `FLEETRING_KEY`,
+    /// the context's `key`, or `client.key` in the TLS directory.
+    #[arg(long)]
     key: Option<PathBuf>,
     /// Acts as this principal, using `client.<principal>.crt` and `client.<principal>.key` under
-    /// `FLEETRING_TLS_DIR`, as `cert client <principal>` writes them. An explicit `--cert` or
-    /// `--key`, or its environment variable, wins over this for that file, and this wins over
-    /// `client.crt` and `client.key`.
-    #[arg(long = "as", env = "FLEETRING_AS", value_name = "PRINCIPAL")]
+    /// the TLS directory, as `cert client <principal>` writes them. An explicit certificate or
+    /// key at the same step wins over this for that file, and this wins over `client.crt` and
+    /// `client.key`. Defaults to `FLEETRING_AS`, or else the context's `as`.
+    #[arg(long = "as", value_name = "PRINCIPAL")]
     principal: Option<Principal>,
     /// Connects in plaintext, to a daemon started with `--insecure-plaintext`.
-    #[arg(long, conflicts_with_all = ["ca", "cert", "key", "principal"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["ca", "cert", "key", "principal", "tls_dir"]
+    )]
     insecure_plaintext: bool,
     /// A bearer token from `token issue`, sent with every request; the request then acts with
     /// the token's scopes. Defaults to `FLEETRING_TOKEN`, if set.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "token_file")]
     token: Option<String>,
+    /// A file that holds a bearer token, or `-` for stdin. Defaults to `FLEETRING_TOKEN_FILE`,
+    /// or else the context's `token_file`.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
 }
 
-/// The three files a command's identity is loaded from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IdentityFiles {
-    ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
+/// What a command with no control address anywhere says.
+const NO_CONTROL: &str = "no control address\n  hint: run `fleetring dev -d` for a local node, or \
+                          `fleetring context add <name> --control <host:port> …`";
+
+/// How long to wait for one control address before trying the next.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether the override warnings print: `-q` silences them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Warnings {
+    Print,
+    Silence,
 }
 
-impl TlsArgs {
-    fn security(&self) -> Result<Security, Box<dyn Error>> {
-        if self.insecure_plaintext {
-            return Ok(Security::Plaintext);
-        }
-        let dir = std::env::var_os(TLS_DIR_VAR).map(PathBuf::from);
-        let files = self.files(dir.as_deref())?;
-        Ok(Security::Tls(Identity::load(
-            &files.ca,
-            &files.cert,
-            &files.key,
-        )?))
+/// Set once at the start of `main`, from `-q`.
+static WARNINGS: OnceLock<Warnings> = OnceLock::new();
+
+/// The first of `addresses` that accepts a connection, or the first if none does, so the usual
+/// connection error names it. A single address is returned as it is, without a probe.
+fn first_reachable(addresses: &[String]) -> String {
+    use std::net::{TcpStream, ToSocketAddrs as _};
+    let Some(first) = addresses.first() else {
+        return String::new();
+    };
+    if addresses.len() == 1 {
+        return first.clone();
+    }
+    let reachable = |address: &&String| {
+        address.to_socket_addrs().is_ok_and(|mut found| {
+            found.any(|to| TcpStream::connect_timeout(&to, PROBE_TIMEOUT).is_ok())
+        })
+    };
+    addresses.iter().find(reachable).unwrap_or(first).clone()
+}
+
+impl Target {
+    /// What the command line gave, as the precedence sees it.
+    fn flags(&self) -> Result<TargetFlags, Box<dyn Error>> {
+        let config = match &self.config {
+            Some(path) => Some(
+                Config::load(path)?
+                    .control_target()
+                    .ok_or("the configuration names no control address; pass --control")?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        let token = match (&self.tls.token, &self.tls.token_file) {
+            (Some(token), _) => Some(TokenSource::Value(token.clone())),
+            (None, Some(path)) if path == Path::new("-") => Some(TokenSource::Stdin),
+            (None, Some(path)) => Some(TokenSource::File(path.clone())),
+            (None, None) => None,
+        };
+        Ok(TargetFlags {
+            control: self.control.clone(),
+            config,
+            tls_dir: self.tls.tls_dir.clone(),
+            ca: self.tls.ca.clone(),
+            cert: self.tls.cert.clone(),
+            key: self.tls.key.clone(),
+            principal: self.tls.principal.as_ref().map(ToString::to_string),
+            token,
+            wire: if self.tls.insecure_plaintext {
+                Wire::Plaintext
+            } else {
+                Wire::Tls
+            },
+        })
     }
 
-    /// Picks the identity files. Each takes the first of: its flag or environment variable (clap
-    /// has already merged the two), the principal's file under `dir` if `--as` names one, and
-    /// the default name under `dir`.
-    ///
-    /// # Errors
-    ///
-    /// If a file has none of those and `dir` is unset; if `--as` is needed and `dir` is unset;
-    /// or if `--as` is needed and the principal's certificate or key is missing from `dir`.
-    fn files(&self, dir: Option<&Path>) -> Result<IdentityFiles, Box<dyn Error>> {
-        let in_dir = |name: &str, flag: &str| -> Result<PathBuf, Box<dyn Error>> {
-            dir.map(|dir| dir.join(name)).ok_or_else(|| {
-                format!(
-                    "pass --{flag} (or set {TLS_DIR_VAR} to a directory with ca.crt, \
-                     client.crt, and client.key), or --insecure-plaintext"
-                )
-                .into()
-            })
+    /// Selects the context and resolves the settings, once; prints the override warnings
+    /// unless `-q` was given, terminal or not.
+    fn resolved(&self) -> Result<&Resolved, Box<dyn Error>> {
+        if let Some(resolved) = self.resolved.get() {
+            return Ok(resolved);
+        }
+        let env = EnvSnapshot::capture();
+        let flags = self.flags()?;
+        let named = self.context.is_some() || env.context.is_some();
+        let contexts = match context_cmd::store() {
+            Ok(store) => store.load()?,
+            // No home directory means no contexts, which only matters if one was asked for.
+            Err(_) if !named => Contexts::empty(),
+            Err(error) => return Err(error.into()),
         };
-        // `--as` only matters for a file nothing more explicit names.
-        let named = match (&self.principal, &self.cert, &self.key) {
-            (Some(principal), None, _) | (Some(principal), _, None) => {
-                Some(principal_files(principal, dir)?)
+        let selected = select(&contexts, self.context.as_ref(), env.context.as_deref())?;
+        let mut resolved = resolve::resolve(&flags, &env, selected);
+        if WARNINGS.get() != Some(&Warnings::Silence) {
+            for warning in &resolved.warnings {
+                eprintln!("{warning}");
             }
-            _ => None,
-        };
-        let ca = match &self.ca {
-            Some(ca) => ca.clone(),
-            None => in_dir("ca.crt", "ca")?,
-        };
-        let cert = match (&self.cert, &named) {
-            (Some(cert), _) => cert.clone(),
-            (None, Some((cert, _))) => cert.clone(),
-            (None, None) => in_dir("client.crt", "cert")?,
-        };
-        let key = match (&self.key, &named) {
-            (Some(key), _) => key.clone(),
-            (None, Some((_, key))) => key.clone(),
-            (None, None) => in_dir("client.key", "key")?,
-        };
-        Ok(IdentityFiles { ca, cert, key })
+        }
+        // Stdin can be read once, and a command may ask for the token more than once.
+        if resolved.token == Some(TokenSource::Stdin) {
+            resolved.token = Some(TokenSource::Value(TokenSource::Stdin.read()?));
+        }
+        Ok(self.resolved.get_or_init(|| Box::new(resolved)))
     }
 
-    /// The bearer token the command sends: `--token`, else `FLEETRING_TOKEN`, if set.
-    fn token(&self) -> Option<String> {
-        match &self.token {
-            Some(token) => Some(token.clone()),
-            None => std::env::var(TOKEN_VAR)
-                .ok()
-                .filter(|token| !token.is_empty()),
+    fn security(&self) -> Result<Security, Box<dyn Error>> {
+        match &self.resolved()?.security {
+            SecurityFiles::Plaintext => Ok(Security::Plaintext),
+            SecurityFiles::Unresolved(why) => Err(why.clone().into()),
+            SecurityFiles::Tls(files) => Ok(Security::Tls(Identity::load(
+                &files.ca,
+                &files.cert,
+                &files.key,
+            )?)),
         }
+    }
+
+    /// The bearer token the command sends, if any.
+    fn token(&self) -> Result<Option<String>, Box<dyn Error>> {
+        Ok(self
+            .resolved()?
+            .token
+            .as_ref()
+            .map(TokenSource::read)
+            .transpose()?)
+    }
+
+    fn network_with(&self, security: Security) -> Result<Network, Box<dyn Error>> {
+        let network = Network::default().with_security(security);
+        Ok(match self.token()? {
+            Some(token) => {
+                network.with_credentials(Credentials::bearer(&BearerToken::new(token.trim()))?)
+            }
+            None => network,
+        })
+    }
+
+    fn network(&self) -> Result<Network, Box<dyn Error>> {
+        self.network_with(self.security()?)
     }
 
     /// The principal the command acts as, so that what others wrote can be told apart from
@@ -979,7 +1079,7 @@ impl TlsArgs {
     /// without verifying; the nodes verify. `None` in plaintext without a token, or when
     /// neither can be read.
     fn principal(&self) -> Option<String> {
-        if let Some(token) = self.token() {
+        if let Some(token) = self.token().ok()? {
             return BearerToken::new(token.trim())
                 .claimed_principal()
                 .map(|principal| principal.to_string());
@@ -993,63 +1093,50 @@ impl TlsArgs {
         }
     }
 
-    fn network(&self) -> Result<Network, Box<dyn Error>> {
-        let network = Network::default().with_security(self.security()?);
-        let token = self.token();
-        Ok(match token {
-            Some(token) => {
-                network.with_credentials(Credentials::bearer(&BearerToken::new(token.trim()))?)
-            }
-            None => network,
+    /// Where the command acts, for a confirmation: the fleet and the context, or the fleet and
+    /// the control address when no context is in use (ADR-0043, point 4.6).
+    fn place(&self) -> Result<String, Box<dyn Error>> {
+        let resolved = self.resolved()?;
+        let fleet = match (&resolved.fleet, self.security()) {
+            (Some(fleet), _) => Some(fleet.clone()),
+            (None, Ok(Security::Tls(identity))) => Some(identity.fleet().to_string()),
+            _ => None,
+        };
+        let via = match &resolved.context {
+            Some(context) => format!("context '{context}'"),
+            None => resolved.control.first().map_or_else(
+                || "no control address".to_owned(),
+                |control| format!("control {control}"),
+            ),
+        };
+        Ok(match fleet {
+            Some(fleet) => format!("on fleet '{fleet}' ({via})"),
+            None => format!("on the fleet at {via}"),
         })
     }
-}
 
-/// The certificate and key `cert client <principal>` writes under `dir`.
-///
-/// # Errors
-///
-/// If `dir` is unset, or either file is missing; the message names both files.
-fn principal_files(
-    principal: &Principal,
-    dir: Option<&Path>,
-) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
-    let Some(dir) = dir else {
-        return Err(format!(
-            "--as {principal} needs {TLS_DIR_VAR} to find client.{principal}.crt and \
-             client.{principal}.key; set it, or pass --cert and --key"
-        )
-        .into());
-    };
-    let cert = dir.join(format!("client.{principal}.crt"));
-    let key = dir.join(format!("client.{principal}.key"));
-    if cert.is_file() && key.is_file() {
-        return Ok((cert, key));
-    }
-    Err(format!(
-        "no client identity for principal '{principal}': looked for {} and {}\n  \
-         hint: create it with `fleetring cert client {principal} --dir {}`",
-        cert.display(),
-        key.display(),
-        dir.display(),
-    )
-    .into())
-}
-
-impl Target {
     fn client(&self) -> Result<Client, Box<dyn Error>> {
-        let control = match (&self.control, &self.config) {
-            (Some(control), _) => control.clone(),
-            (None, Some(path)) => Config::load(path)?
-                .control_target()
-                .ok_or("the configuration names no control address; pass --control")?
-                .to_string(),
-            (None, None) => std::env::var(CONTROL_VAR)
-                .ok()
-                .filter(|control| !control.is_empty())
-                .ok_or_else(|| format!("pass --control or --config, or set {CONTROL_VAR}"))?,
-        };
-        Ok(Client::new(control, self.tls.network()?))
+        let resolved = self.resolved()?;
+        if resolved.control.is_empty() {
+            return Err(NO_CONTROL.into());
+        }
+        let security = self.security()?;
+        if let (Some(fleet), Some(context), Security::Tls(identity)) =
+            (&resolved.fleet, &resolved.context, &security)
+        {
+            let found = identity.fleet();
+            if found.as_str() != fleet {
+                return Err(format!(
+                    "context '{context}' is for fleet '{fleet}', but its certificate is for \
+                     fleet '{found}'"
+                )
+                .into());
+            }
+        }
+        Ok(Client::new(
+            first_reachable(&resolved.control),
+            self.network_with(security)?,
+        ))
     }
 }
 
@@ -1302,7 +1389,19 @@ fn main() -> ExitCode {
     let Cli {
         command,
         log_format: format_flag,
+        quiet,
     } = cli;
+    let _ = WARNINGS.set(if quiet {
+        Warnings::Silence
+    } else {
+        Warnings::Print
+    });
+    // Contexts are files: no logging, no runtime, no network.
+    let command = match command {
+        Command::Context(command) => return finish(context_cmd::run(command)),
+        Command::Switch { target } => return finish(context_cmd::switch(target.as_deref())),
+        command => command,
+    };
     // The daemon reads its configuration before logging starts, since it may name the format;
     // dev mode prepares its directory first, since the configuration is in it.
     let run = match command {
@@ -1388,6 +1487,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// The exit code of a command that ran without a runtime, reporting its error.
+fn finish(result: Result<ExitCode, Box<dyn Error>>) -> ExitCode {
+    result.unwrap_or_else(|error| {
+        report(error.as_ref());
+        ExitCode::FAILURE
+    })
+}
+
 /// The log format: `--log-format`, else `FLEETRING_LOG_FORMAT`, else the daemon's `[log]
 /// format`, else text.
 ///
@@ -1460,9 +1567,11 @@ async fn run_daemon(config: Config, dev: Option<Prepared>) -> Result<Stopped, Bo
     let signals = StopSignals::listen();
     let daemon = Daemon::start(config).await?;
     if let Some(prepared) = &dev {
+        // Written once the node serves, so a start that fails leaves the contexts alone.
+        let context = context_cmd::write_dev_context(prepared);
         eprint!(
             "\n{}\n",
-            prepared.banner(daemon.listen_address(), daemon.admin_address())
+            prepared.banner(daemon.listen_address(), daemon.admin_address(), &context)
         );
     }
     let process = ProcessFile::this_process(exe.clone());
@@ -1492,6 +1601,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Serve(_) | Command::Dev(_) => {
             return Err("serve and dev run a node, not a command".into());
         }
+        Command::Context(_) | Command::Switch { .. } => {
+            return Err("context and switch don't talk to a fleet".into());
+        }
         Command::Cert(command) => run_cert(command)?,
         Command::Token(command) => run_token(command).await?,
         Command::Status {
@@ -1501,7 +1613,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         } => match node_address(node.as_ref(), address, &target).await? {
             Some(address) => {
                 // The node answers on its own, about itself.
-                let client = Client::new(address.clone(), target.tls.network()?);
+                let client = Client::new(address.clone(), target.network()?);
                 format_node_status(&client.node_status(&address).await.map_err(failed)?)
             }
             None => format_status(&target.client()?.status().await.map_err(failed)?),
@@ -1515,7 +1627,6 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             // The principal the credentials name, read as `db show` reads it, so that only its
             // own descriptions are trusted.
             let principal = target
-                .tls
                 .principal()
                 .and_then(|principal| principal.parse().ok());
             let settings = McpSettings {
@@ -1591,7 +1702,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&report)?),
                 OutputFormat::Table => {
                     let mut text = Vec::new();
-                    render_text(&report, target.tls.principal().as_deref(), &mut text)?;
+                    render_text(&report, target.principal().as_deref(), &mut text)?;
                     String::from_utf8(text)?
                 }
             }
@@ -1742,7 +1853,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         }) => restore_offline(&config, &archive, &from, &to, &point.target()).await?,
         Command::Db(DbCommand::Drop { name, yes, target }) => {
             if !yes {
-                confirm_drop(&name)?;
+                confirm_drop(&name, &target.place()?)?;
             }
             let epoch = target
                 .client()?
@@ -1775,7 +1886,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .into());
             }
             if !yes {
-                confirm_remove(&id)?;
+                confirm_remove(&id, &target.place()?)?;
             }
             let epoch = client.remove_node(&id).await.map_err(failed)?;
             format!(
@@ -1814,9 +1925,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .ok_or("pass --node or --address")?;
             let label = node.map_or_else(|| address.clone(), |node| node.to_string());
             if !yes {
-                confirm_remove_orphan(&name, &label)?;
+                confirm_remove_orphan(&name, &label, &target.place()?)?;
             }
-            let client = Client::new(address.clone(), target.tls.network()?);
+            let client = Client::new(address.clone(), target.network()?);
             let epoch = client
                 .remove_orphan(&address, &name)
                 .await
@@ -1836,7 +1947,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 .await?
                 .ok_or("pass --node or --address")?;
             // The node answers on its own, about the leases it holds.
-            let client = Client::new(address.clone(), target.tls.network()?);
+            let client = Client::new(address.clone(), target.network()?);
             let mut updates = client.watch_leases(&address).await.map_err(failed)?;
             while let Some(update) = updates.next().await.map_err(failed)? {
                 let mut stdout = std::io::stdout().lock();
@@ -2273,6 +2384,7 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                 Revoked::TokenId(id) => format!("token {id}"),
                 Revoked::KeyId(id) => format!("signing key {id}"),
             };
+            eprintln!("revoking {what} {}", target.place()?);
             target
                 .client()?
                 .control()
@@ -2491,18 +2603,38 @@ all {} replica{} agree",
     Ok(output)
 }
 
-/// Asks on the terminal whether to drop `name`, and refuses without a terminal.
-fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
+/// What `db drop` asks: the database, where it is dropped, and what is lost (ADR-0043, point
+/// 4.6).
+fn drop_prompt(name: &DatabaseName, place: &str) -> String {
+    format!(
+        "drop database '{}' {place} and every replica's copy, for good? [y/N] ",
+        shown(name)
+    )
+}
+
+/// What `orphan remove` asks.
+fn orphan_prompt(name: &DatabaseName, node: &str, place: &str) -> String {
+    format!(
+        "delete the orphan copy of database '{}' on node {node} {place}? Its files go for good; \
+         copy them first to keep them. [y/N] ",
+        shown(name)
+    )
+}
+
+/// What `node remove` asks.
+fn remove_prompt(id: &NodeId, place: &str) -> String {
+    format!("remove node {id} from the fleet {place}? Its replicas are placed elsewhere. [y/N] ")
+}
+
+/// Asks `prompt` on the terminal and returns whether the answer was yes; refuses, naming
+/// `refusal`, without a terminal.
+fn confirm(prompt: &str, refusal: &str, declined: &str) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
-        return Err(format!("pass --yes to drop {} without a prompt", shown(name)).into());
+        return Err(refusal.to_owned().into());
     }
     let mut stderr = std::io::stderr();
-    write!(
-        stderr,
-        "drop {}? Every replica deletes its copy, for good. [y/N] ",
-        shown(name)
-    )?;
+    write!(stderr, "{prompt}")?;
     stderr.flush()?;
     let mut answer = String::new();
     stdin.lock().read_line(&mut answer)?;
@@ -2510,35 +2642,32 @@ fn confirm_drop(name: &DatabaseName) -> Result<(), Box<dyn Error>> {
     if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
         Ok(())
     } else {
-        Err(format!("not dropping {}", shown(name)).into())
+        Err(declined.to_owned().into())
     }
 }
 
-fn confirm_remove_orphan(name: &DatabaseName, node: &str) -> Result<(), Box<dyn Error>> {
-    let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        return Err(format!(
+/// Asks on the terminal whether to drop `name`, and refuses without a terminal.
+fn confirm_drop(name: &DatabaseName, place: &str) -> Result<(), Box<dyn Error>> {
+    confirm(
+        &drop_prompt(name, place),
+        &format!("pass --yes to drop {} without a prompt", shown(name)),
+        &format!("not dropping {}", shown(name)),
+    )
+}
+
+fn confirm_remove_orphan(
+    name: &DatabaseName,
+    node: &str,
+    place: &str,
+) -> Result<(), Box<dyn Error>> {
+    confirm(
+        &orphan_prompt(name, node, place),
+        &format!(
             "pass --yes to delete the orphan copy of {} without a prompt",
             shown(name)
-        )
-        .into());
-    }
-    let mut stderr = std::io::stderr();
-    write!(
-        stderr,
-        "delete the orphan copy of {} on {node}? Its files go for good; copy them first to keep \
-         them. [y/N] ",
-        shown(name)
-    )?;
-    stderr.flush()?;
-    let mut answer = String::new();
-    stdin.lock().read_line(&mut answer)?;
-    let answer = answer.trim();
-    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        Ok(())
-    } else {
-        Err(format!("not deleting the orphan copy of {}", shown(name)).into())
-    }
+        ),
+        &format!("not deleting the orphan copy of {}", shown(name)),
+    )
 }
 
 /// The orphans `orphan list` reports, each with the node that keeps it, in node and then name
@@ -2549,7 +2678,7 @@ async fn list_orphans(
     address: Option<String>,
     target: &Target,
 ) -> Result<Vec<(String, Orphan)>, Box<dyn Error>> {
-    let network = target.tls.network()?;
+    let network = target.network()?;
     let nodes: Vec<(String, String)> = match (node, address) {
         (Some(node), _) => vec![(
             node.to_string(),
@@ -2651,25 +2780,12 @@ fn format_orphans(orphans: &[(String, Orphan)]) -> String {
     output
 }
 
-fn confirm_remove(id: &NodeId) -> Result<(), Box<dyn Error>> {
-    let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        return Err(format!("pass --yes to remove {id} without a prompt").into());
-    }
-    let mut stderr = std::io::stderr();
-    write!(
-        stderr,
-        "remove {id} from the fleet? Its replicas are placed elsewhere. [y/N] "
-    )?;
-    stderr.flush()?;
-    let mut answer = String::new();
-    stdin.lock().read_line(&mut answer)?;
-    let answer = answer.trim();
-    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        Ok(())
-    } else {
-        Err(format!("not removing {id}").into())
-    }
+fn confirm_remove(id: &NodeId, place: &str) -> Result<(), Box<dyn Error>> {
+    confirm(
+        &remove_prompt(id, place),
+        &format!("pass --yes to remove {id} without a prompt"),
+        &format!("not removing {id}"),
+    )
 }
 
 fn plural(count: u64) -> &'static str {
@@ -3856,117 +3972,90 @@ mod tests {
         }
     }
 
-    /// Identity arguments as the command line, after clap has merged each flag with its variable.
-    fn tls_args(cert: Option<&str>, key: Option<&str>, principal: Option<&str>) -> TlsArgs {
-        TlsArgs {
-            ca: None,
-            cert: cert.map(PathBuf::from),
-            key: key.map(PathBuf::from),
-            principal: principal.map(|name| name.parse().expect("a principal")),
-            insecure_plaintext: false,
-            token: None,
-        }
-    }
-
-    fn files(ca: &str, cert: &str, key: &str) -> IdentityFiles {
-        IdentityFiles {
-            ca: PathBuf::from(ca),
-            cert: PathBuf::from(cert),
-            key: PathBuf::from(key),
-        }
-    }
-
     #[test]
-    fn the_identity_files_come_from_a_flag_then_as_then_the_directory() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let root = dir.path();
-        for name in ["client.app.crt", "client.app.key"] {
-            std::fs::write(root.join(name), "").expect("a file");
-        }
-        let at = |name: &str| root.join(name).to_str().expect("a UTF-8 path").to_owned();
-
-        // The directory's defaults.
+    fn the_destructive_prompts_name_the_fleet_and_the_context() {
+        let place = "on fleet 'home' (context 'home')";
+        let notes: DatabaseName = "notes".parse().expect("name");
         assert_eq!(
-            tls_args(None, None, None).files(Some(root)).expect("files"),
-            files(&at("ca.crt"), &at("client.crt"), &at("client.key")),
+            drop_prompt(&notes, place),
+            "drop database 'notes' on fleet 'home' (context 'home') and every replica's copy, \
+             for good? [y/N] "
         );
-        // `--as` replaces the certificate and the key, not the authority.
-        assert_eq!(
-            tls_args(None, None, Some("app"))
-                .files(Some(root))
-                .expect("files"),
-            files(&at("ca.crt"), &at("client.app.crt"), &at("client.app.key")),
+        assert!(
+            orphan_prompt(&notes, "node-2", place)
+                .starts_with("delete the orphan copy of database 'notes' on node node-2 on fleet 'home' (context 'home')?"),
+            "{}",
+            orphan_prompt(&notes, "node-2", place)
         );
-        // An explicit file beats `--as`, one file at a time.
+        let id: NodeId = "node-3".parse().expect("id");
         assert_eq!(
-            tls_args(Some("c.crt"), None, Some("app"))
-                .files(Some(root))
-                .expect("files"),
-            files(&at("ca.crt"), "c.crt", &at("client.app.key")),
-        );
-        assert_eq!(
-            tls_args(None, Some("c.key"), Some("app"))
-                .files(Some(root))
-                .expect("files"),
-            files(&at("ca.crt"), &at("client.app.crt"), "c.key"),
-        );
-        // With both named, `--as` isn't consulted: its files needn't exist, nor the directory.
-        let mut explicit = tls_args(Some("c.crt"), Some("c.key"), Some("nobody"));
-        explicit.ca = Some(PathBuf::from("ca.pem"));
-        assert_eq!(
-            explicit.files(None).expect("files"),
-            files("ca.pem", "c.crt", "c.key"),
+            remove_prompt(&id, "on fleet 'home' (control 10.0.0.2:7400)"),
+            "remove node node-3 from the fleet on fleet 'home' (control 10.0.0.2:7400)? Its \
+             replicas are placed elsewhere. [y/N] "
         );
     }
 
     #[test]
-    fn an_unknown_principal_names_the_files_it_looked_for() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let root = dir.path();
-        // A certificate without its key is as unknown as neither.
-        std::fs::write(root.join("client.half.crt"), "").expect("a file");
-        for name in ["nobody", "half"] {
-            let error = tls_args(None, None, Some(name))
-                .files(Some(root))
-                .expect_err("unknown principal")
-                .to_string();
-            let cert = root.join(format!("client.{name}.crt"));
-            let key = root.join(format!("client.{name}.key"));
+    fn context_flags_parse_and_conflict_as_documented() {
+        let parses = |words: &[&str]| Cli::try_parse_from([&["fleetring"][..], words].concat());
+        for words in [
+            &["db", "list", "--context", "home"][..],
+            &[
+                "status",
+                "--context",
+                "home",
+                "--tls-dir",
+                "/t",
+                "--as",
+                "ops",
+            ],
+            &["status", "--token-file", "-"],
+            &["-q", "status"],
+            &["status", "-q"],
+            &["switch"],
+            &["switch", "-"],
+            &["switch", "home"],
+            &["context", "current"],
+            &["context", "list", "--json"],
+            &[
+                "context",
+                "add",
+                "home",
+                "--control",
+                "a:1",
+                "--control",
+                "b:1",
+                "--tls-dir",
+                "/t",
+            ],
+        ] {
             assert!(
-                error.starts_with(&format!(
-                    "no client identity for principal '{name}': looked for {} and {}",
-                    cert.display(),
-                    key.display()
-                )),
-                "{error}"
-            );
-            assert!(
-                error.contains(&format!(
-                    "hint: create it with `fleetring cert client {name} --dir"
-                )),
-                "{error}"
+                parses(words).is_ok(),
+                "{words:?}: {:?}",
+                parses(words).err()
             );
         }
-    }
-
-    #[test]
-    fn identity_files_need_a_directory_unless_every_file_is_named() {
-        let error = tls_args(None, None, Some("app"))
-            .files(None)
-            .expect_err("no directory")
-            .to_string();
-        assert!(
-            error.starts_with("--as app needs FLEETRING_TLS_DIR to find client.app.crt"),
-            "{error}"
-        );
-        let error = tls_args(None, None, None)
-            .files(None)
-            .expect_err("no directory")
-            .to_string();
-        assert!(
-            error.starts_with("pass --ca (or set FLEETRING_TLS_DIR"),
-            "{error}"
-        );
+        for words in [
+            &["status", "--token", "t", "--token-file", "f"][..],
+            &["status", "--insecure-plaintext", "--tls-dir", "/t"],
+            &["status", "--context", "Not A Name"],
+            &["context", "add", "home"],
+            &[
+                "context",
+                "add",
+                "home",
+                "--control",
+                "a:1",
+                "--tls-dir",
+                "/t",
+                "--cert",
+                "c",
+            ],
+            &["context", "add", "home", "--control", "a:1", "--ca", "ca"],
+            &["context", "use"],
+        ] {
+            assert!(parses(words).is_err(), "{words:?} should be refused");
+        }
     }
 
     #[test]
