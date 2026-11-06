@@ -99,13 +99,15 @@ Groups are the headings `fleetring -h` prints them under (§9).
 
 A client command resolves each setting on its own, and the first match wins:
 
-1. **The flag** on the command line.
-2. **The environment variable**, named `FLEETRING_<FLAG>` in upper snake case: `--token` is `FLEETRING_TOKEN`, `--tls-dir` is `FLEETRING_TLS_DIR`, `--agent` is `FLEETRING_AGENT`.
-3. **The context `--context <name>` names**, or else the one `FLEETRING_CONTEXT` names.
-4. **The current context.**
+1. **The setting's own flag** on the command line.
+2. **The context the `--context <name>` flag names.**
+3. **The setting's environment variable**, named `FLEETRING_<FLAG>` in upper snake case: `--token` is `FLEETRING_TOKEN`, `--tls-dir` is `FLEETRING_TLS_DIR`, `--agent` is `FLEETRING_AGENT`.
+4. **The context `FLEETRING_CONTEXT` names, or else the current context.**
 5. **The built-in default**, if there is a safe one. If there isn't, the command fails, and its hint names a flag, a variable and a context field that would supply it, or `fleetring dev -d` when nothing is set up at all.
 
-Steps 3 and 4 select one context. Fields are never merged from two contexts.
+Steps 2 and 4 select one context. Fields are never merged from two contexts.
+
+This order amends the one #59 stated (flags, then variables, then `--context`): a `--context` flag on the command line is a deliberate choice, while a variable is ambient state, often left by a sourced `env` file (ADR-0043, point 4.4). Without a `--context` flag, variables still override the current context, so scripts that set `FLEETRING_CONTROL` keep working.
 
 | Setting | Flag | Variable | Context field |
 |---|---|---|---|
@@ -120,7 +122,7 @@ Steps 3 and 4 select one context. Fields are never merged from two contexts.
 
 **Identity, per file.** The certificate, its key and the authority each resolve on their own. At each step, an explicit path (`--cert`, `FLEETRING_CERT`, the context's `cert`) wins over a principal at the same step (`--as`, `FLEETRING_AS`, the context's `as`). A principal picks `client.<principal>.crt` and `.key` under the TLS directory. At the last step, the TLS directory's `client.crt` and `client.key` are used. `--agent <id>` is shorthand, at the flag step, for `--tls-dir <agents dir>/<id> --as agent-<id> --token-file <agents dir>/<id>/token`, and it conflicts with the flags it stands for. `--help` states the order for every flag it applies to.
 
-**Overrides are visible.** When a context is in use and an environment variable overrides one of its fields, the command prints one warning per variable on stderr, as `warning: FLEETRING_CONTROL overrides context 'home' (control 10.0.0.2:7400)`. It does so only when stderr is a terminal and `-q` isn't given. A shell that sourced dev mode's `env` file is the usual cause. `--verbose` names the context used and the source of each setting.
+**Overrides are visible.** Every override prints one warning per variable on stderr unless `-q` is given, whether or not stderr is a terminal: `warning: FLEETRING_CONTROL overrides context 'home' (control 10.0.0.2:7400)` when a variable overrides the current context, and `warning: FLEETRING_CONTROL is ignored: --context home sets control` when a `--context` flag outranks it. A shell that sourced dev mode's `env` file is the usual cause. `--verbose` names the context used and the source of each setting.
 
 **Daemon configuration isn't client configuration.** `--config <file>` reads a *daemon's* configuration file, and client commands take only the control address from it. It is a convenience on a node. Contexts replace it everywhere else. `serve`, `dev` and `stop` never read contexts, though `dev` writes one.
 
@@ -184,7 +186,8 @@ Each of these is decided once, from a snapshot of the process's surroundings, by
 | Colour | the stream is a terminal, `NO_COLOR` is unset or empty, `TERM` isn't `dumb`, and `--color` isn't `never`. `--color always` forces it |
 | Spinners and check marks | stdout and stderr are both terminals; the output is human (not `-o json`, `jsonl`, or `--json`); there's no `-q`; `NO_COLOR` is unset or empty; `TERM` isn't `dumb`; and `CI` is unset or empty |
 | Prompts and the `switch` picker | stdin and stderr are terminals. Otherwise a command that must ask refuses with exit 2 (§7), and `switch` with no name prints the list and exits 2 |
-| Override warnings and `hint:` lines meant for people | stderr is a terminal, and there's no `-q` |
+| Override warnings | there's no `-q`, terminal or not |
+| `hint:` lines meant for people | stderr is a terminal, and there's no `-q` |
 
 `-q, --quiet` drops everything but the result and errors. A command with no result then prints nothing.
 
@@ -213,7 +216,7 @@ fleetring: database 'notes' doesn't exist on fleet 'home'
 
 ## 7. Confirmation and `--yes`
 
-- **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost: `drop database 'notes' and every replica's copy? type the name to confirm:`. Irreversible actions ask for the name typed, not `y`.
+- **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost, and where: `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` name the fleet and the context, or the fleet and the control address when no context is in use. Irreversible actions ask for the name typed, not `y`.
 - **`--yes` skips the question.** Without a terminal and without `--yes`, the command refuses with exit code 2 and says to pass `--yes`.
 - **`--dry-run`** shows what would change, where the command can know: a drain lists the databases it would hand over.
 - **Drain asks too** when the node holds a database's only replica, since that database is then unavailable until the node returns.
