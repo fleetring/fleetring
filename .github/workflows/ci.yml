@@ -189,12 +189,12 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo check --workspace --exclude fleetringd --all-features --all-targets
+      - run: cargo check --workspace --exclude fleetringd --exclude fleetring-client --all-features --all-targets
       # The daemon may need a newer toolchain than the libraries (ADR-0015, point 7).
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.89"
-      - run: cargo +1.89 check -p fleetringd --all-features --all-targets
+      - run: cargo +1.89 check -p fleetringd -p fleetring-client --all-features --all-targets
 
   docs:
     name: docs

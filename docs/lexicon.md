@@ -201,10 +201,11 @@ Anything that calls the fleet's RPCs as a [principal](#principal): the CLI, the 
 
 ### Context
 
-*Planned* (FR-056). A named set of client settings: a fleet name, the control address, the TLS files, and a default principal, so a command needs `--context home` instead of repeating flags.
+A named set of client settings: a fleet name, the control addresses, the TLS files, a default principal, and optionally a token file, so a command needs `--context home` instead of repeating flags. It holds paths and names, never a secret. Contexts live in `contexts.toml` in the configuration directory (ADR-0043, point 4).
 
 - **Applies to:** CLI, UI.
-- **Code:** `fleetring_client::Context`. **CLI:** `fleetringd context add|use|list`, `--context`, `FLEETRING_CONTEXT`.
+- **Code:** `fleetring_client::context::Context`. **CLI:** `fleetring context …`, `switch`, `--context`, `FLEETRING_CONTEXT`.
+- **See:** [Current context](#current-context).
 - **Not:** profile, target, environment, connection.
 
 ### Control log
@@ -238,6 +239,14 @@ The [principal](#principal) that created a database, which the control node reco
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Metadata::created_by`, protocol `DatabaseMetadata.created_by`. **CLI:** `creator:` in `db show`; `created_by` in its JSON.
 - **Not:** owner (being the creator grants nothing), author (that is a description's), holder (that is a lease's).
+
+### Current context
+
+The [context](#context) that client commands use when no `--context` flag or `FLEETRING_CONTEXT` names another: the file's `current`. `fleetring switch` and `context use` change it, and keep the one they replace as the previous context, for `switch -`. Environment variables for a single setting override it (ADR-0043, point 4.4).
+
+- **Applies to:** CLI, UI.
+- **Code:** `Contexts::current`. **CLI:** `fleetring context current`, `fleetring switch`.
+- **Not:** default context, active context.
 
 ### Data node
 

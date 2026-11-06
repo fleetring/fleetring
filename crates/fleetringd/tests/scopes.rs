@@ -951,7 +951,7 @@ async fn the_command_line_acts_as_its_certificate_or_its_token() -> TestResult {
 
 /// FR-055: the identity a command acts as comes from the first of its flag, its environment
 /// variable, `--as` (or `FLEETRING_AS`), and the `client.crt` and `client.key` in
-/// `FLEETRING_TLS_DIR`.
+/// `FLEETRING_TLS_DIR`, at each step of the precedence (ADR-0043, point 4.4).
 ///
 /// `reader` may read `tenant:acme/*` and `app` may do nothing, so which of them a command acted
 /// as shows in whether its query was allowed.
@@ -1086,12 +1086,12 @@ async fn the_command_line_picks_its_identity_by_flag_variable_or_principal() -> 
         "--as over FLEETRING_AS",
     )?;
 
-    // The environment variables beat `--as` and `FLEETRING_AS`.
-    failed_with(
+    // A flag outranks every variable (ADR-0043, point 4.4), so `--as` beats FLEETRING_CERT and
+    // FLEETRING_KEY. Within the variables' own step, an explicit path beats `FLEETRING_AS`.
+    succeeded(
         &fleetringd(&tls_dir, &as_app, &with(&query, &["--as", "reader"])).await?,
-        "FLEETRING_CERT and FLEETRING_KEY over --as",
-        denied,
-    );
+        "--as over FLEETRING_CERT and FLEETRING_KEY",
+    )?;
     let over_as = [
         ("FLEETRING_CERT", app_cert.as_str()),
         ("FLEETRING_KEY", app_key.as_str()),

@@ -1102,7 +1102,7 @@ async fn stdout_carries_only_protocol() -> TestResult {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty(), "{:?}", output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("FLEETRING_CONTROL"),
+        String::from_utf8_lossy(&output.stderr).contains("no control address"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

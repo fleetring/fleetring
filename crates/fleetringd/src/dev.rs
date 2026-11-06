@@ -304,6 +304,46 @@ impl fmt::Display for Created {
     }
 }
 
+/// What happened to the `dev` context when the node started (ADR-0043, point 5.1), for the
+/// banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevContextLine {
+    /// The `dev` context was written and is current.
+    Current,
+    /// The `dev` context was written, and another context is current.
+    NotCurrent {
+        /// The context that is current.
+        current: String,
+    },
+    /// A `dev` context the user made exists; it was left alone.
+    Kept,
+    /// The contexts file couldn't be written.
+    NotWritten {
+        /// Why.
+        reason: String,
+    },
+}
+
+impl DevContextLine {
+    /// The banner's text for its context line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Current => "dev (current)".to_owned(),
+            Self::NotCurrent { current } => {
+                format!("dev (not current: '{current}' is; run fleetring switch dev)")
+            }
+            Self::Kept => {
+                "dev (left alone: you made a context named dev; dev mode keeps it)".to_owned()
+            }
+            Self::NotWritten { reason } => {
+                format!("not written ({reason}); load the env file below to point the CLI at it")
+            }
+        }
+    }
+}
+
 /// A prepared dev directory: its configuration, loaded and checked, and what was created.
 #[derive(Debug)]
 pub struct Prepared {
@@ -338,9 +378,15 @@ impl Prepared {
     }
 
     /// The banner `fleetringd dev` prints once the node serves on `listen`, with its admin
-    /// listener on `admin`: that it is dev mode, where it is, and how to point the CLI at it.
+    /// listener on `admin`: that it is dev mode, where it is, which context points the CLI at it
+    /// (`context`), and what to try.
     #[must_use]
-    pub fn banner(&self, listen: SocketAddr, admin: Option<SocketAddr>) -> String {
+    pub fn banner(
+        &self,
+        listen: SocketAddr,
+        admin: Option<SocketAddr>,
+        context: &DevContextLine,
+    ) -> String {
         let mut text = String::from(
             "fleetringd is running in dev mode: one node on loopback with a local authority, \
              for development only.\n\n",
@@ -354,11 +400,19 @@ impl Prepared {
         }
         let _ = writeln!(text, "  data dir   {}", self.dir.display());
         let _ = writeln!(text, "  state      {}", self.state());
+        let _ = writeln!(text, "  context    {}", context.describe());
+        let _ = write!(text, "\nTry it from another terminal:\n\n");
+        if matches!(context, DevContextLine::NotWritten { .. }) {
+            let _ = writeln!(
+                text,
+                "  . {}",
+                shell_quote(&self.env_file().display().to_string())
+            );
+        }
         let _ = write!(
             text,
-            "\nPoint the CLI at it from another terminal:\n\n  . {}\n  fleetringd status\n\n\
+            "  fleetring db create notes\n  fleetring status\n\n\
              Ctrl-C stops it; the next start reuses everything in {}.\n",
-            shell_quote(&self.env_file().display().to_string()),
             self.dir.display(),
         );
         text
@@ -1155,27 +1209,34 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    fn banner_with(prepared: &Prepared, context: &DevContextLine) -> String {
+        prepared.banner(
+            "127.0.0.1:17400".parse().expect("an address"),
+            Some("127.0.0.1:17401".parse().expect("an address")),
+            context,
+        )
+    }
+
     #[test]
-    fn the_banner_says_dev_mode_and_how_to_load_the_env_file() {
+    fn the_banner_says_dev_mode_which_context_and_what_to_try() {
         let root = tempfile::tempdir().expect("a directory");
         let dir = root.path().join("dev");
         let prepared = prepared(&dir);
-        let banner = prepared.banner(
-            "127.0.0.1:17400".parse().expect("an address"),
-            Some("127.0.0.1:17401".parse().expect("an address")),
-        );
+        let banner = banner_with(&prepared, &DevContextLine::Current);
         assert!(
             banner.starts_with("fleetringd is running in dev mode"),
             "{banner}"
         );
         assert!(banner.contains("address    127.0.0.1:17400"), "{banner}");
+        assert!(banner.contains("context    dev (current)\n"), "{banner}");
         assert!(
-            banner.contains(&format!(
-                ". {}",
-                shell_quote(&dir.join(ENV_FILE).display().to_string())
-            )),
+            banner.contains(
+                "Try it from another terminal:\n\n  fleetring db create notes\n  fleetring status\n"
+            ),
             "{banner}"
         );
+        // The env file is for the case where no context was written.
+        assert!(!banner.contains("env"), "{banner}");
         assert!(
             banner.contains(
                 "created the authority, the node certificate, the admin certificate, and \
@@ -1183,5 +1244,48 @@ mod tests {
             ),
             "{banner}"
         );
+    }
+
+    #[test]
+    fn the_banner_names_the_current_context_when_dev_is_not_current() {
+        let root = tempfile::tempdir().expect("a directory");
+        let prepared = prepared(&root.path().join("dev"));
+        let banner = banner_with(
+            &prepared,
+            &DevContextLine::NotCurrent {
+                current: "home".to_owned(),
+            },
+        );
+        assert!(
+            banner.contains("context    dev (not current: 'home' is; run fleetring switch dev)\n"),
+            "{banner}"
+        );
+    }
+
+    #[test]
+    fn the_banner_points_at_the_env_file_only_when_the_context_was_not_written() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("dev");
+        let prepared = prepared(&dir);
+        let banner = banner_with(
+            &prepared,
+            &DevContextLine::NotWritten {
+                reason: "can't read or write /ro/contexts.toml".to_owned(),
+            },
+        );
+        assert!(
+            banner.contains("context    not written (can't read or write /ro/contexts.toml)"),
+            "{banner}"
+        );
+        assert!(
+            banner.contains(&format!(
+                "  . {}\n",
+                shell_quote(&dir.join(ENV_FILE).display().to_string())
+            )),
+            "{banner}"
+        );
+        let kept = banner_with(&prepared, &DevContextLine::Kept);
+        assert!(kept.contains("context    dev (left alone"), "{kept}");
+        assert!(!kept.contains(ENV_FILE), "{kept}");
     }
 }

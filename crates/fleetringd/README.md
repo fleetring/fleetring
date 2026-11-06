@@ -9,10 +9,9 @@ The FleetRing daemon. It places, replicates, and fails over SQLite databases acr
 `fleetringd dev` runs one node on a laptop with no setup ([ADR-0039](https://github.com/fleetring/fleetring/blob/main/docs/adr/0039-dev-mode.md)):
 
 ```sh
-fleetringd dev                           # in one terminal; Ctrl-C stops it
+fleetringd dev                           # in one terminal; Ctrl-C stops it, and it writes the `dev` context
 
-. ~/.fleetring/env                       # in another: points the commands at it
-fleetringd status
+fleetringd status                        # in another: the current context points at the node
 fleetringd db create notes               # one replica, a dev node's default
 fleetringd db exec notes "CREATE TABLE note (body TEXT)"
 fleetringd db exec notes "INSERT INTO note VALUES (?)" "hello"
@@ -24,7 +23,7 @@ The first run creates, in `~/.fleetring` (or `--data-dir <dir>`): an authority f
 
 The node serves gRPC on `127.0.0.1:7400` and its admin listener on `127.0.0.1:7401`; `--port <n>` picks another port on the first run, and the admin listener takes the next one. It is the normal daemon running `~/.fleetring/fleetringd.toml`, so `fleetringd --config ~/.fleetring/fleetringd.toml` runs the same node, and the file may be edited: `dev = true` in it makes the daemon refuse any `listen`, `node.advertise`, `control.address`, or `[admin] listen` that isn't loopback, any role but `both`, and plaintext, however it is started. The configuration keeps the node's databases placed on it across a stop (`[membership] on_shutdown = "stay"`), creates databases with one replica unless `db create` names a `--replication-factor` (`[replication] replication_factor = 1`), and sends every database's row changes to a file sink, `dev`, in `~/.fleetring/changes/`.
 
-`~/.fleetring/env` sets `FLEETRING_CONTROL` (the control address, which `--control` and `--config` override), `FLEETRING_TLS_DIR`, and `FLEETRING_AS=admin`; dev mode rewrites it at every start. `status` against a dev node starts with `dev mode: one node on loopback, for development only`, and doesn't warn that its one-node ring has fewer nodes than a fleet's replication factor. A dev node holds one copy of each database, so a larger `--replication-factor` leaves writes short of their quorum; `db create` accepts it and warns.
+Every start writes a context named `dev` (the node's address, `~/.fleetring/tls`, `as = "admin"`) and makes it current unless another context is; the banner says which (`context    dev (current)`), and `fleetringd switch dev` selects it otherwise. A `dev` context you made yourself is left alone. `~/.fleetring/env`, for scripts and CI, sets `FLEETRING_CONTROL` (the control address, which `--control` and `--config` override), `FLEETRING_TLS_DIR`, and `FLEETRING_AS=admin`; dev mode rewrites it at every start. `status` against a dev node starts with `dev mode: one node on loopback, for development only`, and doesn't warn that its one-node ring has fewer nodes than a fleet's replication factor. A dev node holds one copy of each database, so a larger `--replication-factor` leaves writes short of their quorum; `db create` accepts it and warns.
 
 To give an AI agent its own principal and databases on a dev node, follow the [agent quickstart](https://github.com/fleetring/fleetring/blob/main/docs/agents/quickstart.md).
 
@@ -197,7 +196,7 @@ The JSON that Claude Code reads from a project's `.mcp.json`, and Cursor from `.
 }
 ```
 
-The values are what `~/.fleetring/env` sets, with the agent's principal in place of `admin`, and the token. Claude Code also registers it from the command line: `claude mcp add fleetring --env FLEETRING_CONTROL=127.0.0.1:7400 --env FLEETRING_TLS_DIR=$HOME/.fleetring/tls --env FLEETRING_AS=agent-42 --env FLEETRING_TOKEN=<the token> -- fleetringd mcp`. The token is a secret: keep the file that holds it private, and out of version control. A `--token-file` form arrives with FR-056.
+The values are what `~/.fleetring/env` sets, with the agent's principal in place of `admin`, and the token. Claude Code also registers it from the command line: `claude mcp add fleetring --env FLEETRING_CONTROL=127.0.0.1:7400 --env FLEETRING_TLS_DIR=$HOME/.fleetring/tls --env FLEETRING_AS=agent-42 --env FLEETRING_TOKEN=<the token> -- fleetringd mcp`. The token is a secret: keep the file that holds it private, and out of version control. `--token-file <path>` (or `FLEETRING_TOKEN_FILE`, or a context's `token_file`) reads the token from a file instead.
 
 **Tools.** Inputs are JSON objects that refuse unknown fields; database names and labels are checked by the same rules as the command line's.
 

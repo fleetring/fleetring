@@ -53,7 +53,9 @@ fn port_pair() -> TestResult<u16> {
 const BANNER: &str = "fleetringd is running in dev mode";
 
 /// The variables a developer's shell may hold that would point a command elsewhere.
-const CLIENT_VARS: [&str; 8] = [
+const CLIENT_VARS: [&str; 10] = [
+    "FLEETRING_CONTEXT",
+    "FLEETRING_TOKEN_FILE",
     "FLEETRING_CONTROL",
     "FLEETRING_TLS_DIR",
     "FLEETRING_AS",
@@ -82,7 +84,11 @@ fn binary() -> &'static Path {
 /// `fleetringd` with `args`, in a clean environment whose home is `home`.
 fn fleetringd(home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(binary());
-    command.args(args).env("HOME", home);
+    // Contexts live under `$XDG_CONFIG_HOME`, else `~/.config`: keep them in `home`.
+    command
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME");
     for variable in CLIENT_VARS {
         command.env_remove(variable);
     }
@@ -426,7 +432,8 @@ fn shell(home: &Path, script: &str) -> TestResult<Output> {
         .arg("-c")
         .arg(script)
         .env("HOME", home)
-        .env("PATH", path);
+        .env("PATH", path)
+        .env_remove("XDG_CONFIG_HOME");
     for variable in CLIENT_VARS {
         command.env_remove(variable);
     }
@@ -502,4 +509,134 @@ fn the_quickstart_runs_as_documented() -> TestResult {
         "{warning}"
     );
     Ok(())
+}
+
+/// `fleetring context current` in `home`: the name, or nothing.
+fn current_context(home: &Path) -> TestResult<String> {
+    let output = fleetringd(home, &["context", "current"]).output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn dev_writes_the_dev_context_and_makes_it_current_if_none_is() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join("dev");
+    let mut node = DevNode::start(root.path(), &dir)?;
+    assert!(
+        node.log_text().contains("context    dev (current)\n"),
+        "{}",
+        node.log_text()
+    );
+    assert_eq!(current_context(root.path())?, "dev\n");
+    // The context holds the node's address and the dev directory it came from.
+    let shown = fleetringd(root.path(), &["context", "show"]).output()?;
+    let shown = String::from_utf8_lossy(&shown.stdout).into_owned();
+    assert!(
+        shown.contains(&format!("control: {}\n", node.control())),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("fleet: dev\n") && shown.contains("as: admin\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("dev dir: {}\n", dir.display())),
+        "{shown}"
+    );
+    // With no other flag or variable, a command reaches the node.
+    let status = wait_for("the node is a live member", || {
+        let output = fleetringd(root.path(), &["status"]).output().ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        (output.status.success() && text.contains(" live ")).then_some(text)
+    })?;
+    assert!(status.starts_with("dev mode: "), "{status}");
+
+    // A second start rewrites the same context and leaves it current.
+    node.stop()?;
+    node.spawn(root.path(), None)?;
+    assert_eq!(current_context(root.path())?, "dev\n");
+    node.stop()
+}
+
+#[test]
+fn dev_leaves_another_current_context_current_and_says_so() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let added = fleetringd(
+        root.path(),
+        &[
+            "context",
+            "add",
+            "home",
+            "--control",
+            "10.0.0.9:7400",
+            "--fleet",
+            "home",
+        ],
+    )
+    .output()?;
+    assert!(added.status.success(), "{}", printed(&added));
+    let mut node = DevNode::start(root.path(), &root.path().join("dev"))?;
+    assert!(
+        node.log_text()
+            .contains("context    dev (not current: 'home' is; run fleetring switch dev)\n"),
+        "{}",
+        node.log_text()
+    );
+    assert_eq!(current_context(root.path())?, "home\n");
+    let list = fleetringd(root.path(), &["context", "list"]).output()?;
+    let list = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(list.contains("dev") && list.contains("home"), "{list}");
+    // `switch dev` points the CLI at the node, and `switch -` back.
+    let switched = fleetringd(root.path(), &["switch", "dev"]).output()?;
+    assert!(switched.status.success(), "{}", printed(&switched));
+    assert_eq!(current_context(root.path())?, "dev\n");
+    node.stop()
+}
+
+#[test]
+fn dev_keeps_a_dev_context_the_user_made() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let added = fleetringd(
+        root.path(),
+        &[
+            "context",
+            "add",
+            "dev",
+            "--control",
+            "10.0.0.9:7400",
+            "--fleet",
+            "mine",
+        ],
+    )
+    .output()?;
+    assert!(added.status.success(), "{}", printed(&added));
+    let mut node = DevNode::start(root.path(), &root.path().join("dev"))?;
+    assert!(
+        node.log_text().contains("context    dev (left alone"),
+        "{}",
+        node.log_text()
+    );
+    let shown = fleetringd(root.path(), &["context", "show", "dev"]).output()?;
+    let shown = String::from_utf8_lossy(&shown.stdout).into_owned();
+    assert!(shown.contains("control: 10.0.0.9:7400\n"), "{shown}");
+    node.stop()
+}
+
+#[test]
+fn dev_starts_even_when_the_contexts_cannot_be_written() -> TestResult {
+    let root = tempfile::tempdir()?;
+    // A file where the configuration directory should be.
+    fs::write(root.path().join(".config"), "not a directory")?;
+    let mut node = DevNode::start(root.path(), &root.path().join("dev"))?;
+    let log = node.log_text();
+    assert!(log.contains("context    not written ("), "{log}");
+    assert!(
+        log.contains(&format!("  . {}", dir_env(&root.path().join("dev")))),
+        "{log}"
+    );
+    node.stop()
+}
+
+fn dir_env(dir: &Path) -> String {
+    dir.join("env").display().to_string()
 }

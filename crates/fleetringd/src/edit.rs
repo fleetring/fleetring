@@ -262,7 +262,7 @@ pub(crate) async fn run(args: EditArgs) -> Result<String, Box<dyn Error>> {
     }
     let printed = match output.format() {
         OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Table => report.text(target.tls.principal().as_deref())?,
+        OutputFormat::Table => report.text(target.principal().as_deref())?,
     };
     match &report.metadata_error {
         Some(error) => {
