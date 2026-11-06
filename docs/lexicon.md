@@ -368,6 +368,14 @@ A number that only grows, used to order and fence. Always say which one:
 - **Code and CLI:** as above; output headers say `epoch` only where the kind is clear from the command.
 - **Not:** term, generation (a generation is SQLite's, below the adapter), version (for a lease), round.
 
+### Exit code
+
+The number a `fleetring` command ends with, the same for every command: 0 success, 1 failed, 2 usage, 3 refused, 4 unavailable (a retry may succeed), 130 interrupted (`docs/cli.md`, section 8). A failed call's gRPC status chooses it in one place.
+
+- **Applies to:** CLI.
+- **Code:** the binary's `exit::exit_code` and `exit::code_of`. **CLI:** listed in `fleetring --help`.
+- **Not:** status (a gRPC status is what a call returns), return code, error code.
+
 ### Expiry
 
 The time after which the control plane drops a database, as `db drop` does; part of its [metadata](#metadata) (ADR-0041, point 4). A duration is turned into a time by the control node before it logs the command, at least a minute ahead. The control node's sweep stamps the command that drops it with its own clock, so a control node whose clock runs ahead expires databases early by as much. Before the primary deletes its copy, it flushes the database's change streams, its [archive](#archive) included, for up to 30 seconds. A replica that misses the drop keeps its copy as an [orphan](#orphan).

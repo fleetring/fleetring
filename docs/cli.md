@@ -166,7 +166,7 @@ PS1='$(fleetring context current) $ '
 
 ### Machine output: `-o json` and `--json`
 
-- **Every read command** takes `-o, --output table|json|jsonl`, and `--json` is short for `-o json`. A `watch` command's machine format is `jsonl`, one event per line, flushed as each arrives.
+- **Every read command** takes `-o, --output table|json|jsonl`, and `--json` is short for `-o json`. `json` is one object, indented; `jsonl` is the same object on one line. A `watch` command's machine format is `jsonl`, one event per line, flushed as each arrives, and it prints that for `-o json` and `--json` too, since a stream is never one object.
 - **Fields are stable.** Names are snake_case lexicon terms (`replication_factor`, `lease_epoch`, `membership_epoch`, `primary`, `followers`). Within a minor release, fields are only added, never renamed, retyped or removed. A removal is a breaking change, listed in the release notes. The same structs serialize for the CLI, the TUI's debug view and the desktop app (ADR-0033).
 - **Values are explicit:**
   - enums are lower-case lexicon words (`live`, `down`, `primary`, `quorum`);
@@ -175,7 +175,28 @@ PS1='$(fleetring context current) $ '
   - positions and hashes are the strings the human output prints;
   - an absent value is `null`, never `""` or `"none"`.
 - **Lists are objects**, `{"databases": […]}`, so a field can be added beside the list later.
-- **Errors in machine mode** still go to stderr as text, and the exit code says what happened. stdout stays empty or valid JSON.
+- **Errors in machine mode** still go to stderr as text, and the exit code says what happened. stdout stays empty or valid JSON. A check that fails (`db verify` with replicas that disagree) prints its report on stdout and the failure on stderr, and exits 1.
+- **The types are `fleetring_client::output`'s,** documented field by field in the crate. What each command prints:
+
+  | Command | The object |
+  |---|---|
+  | `status` | `dev_mode`, `membership_epoch`, `ring_fingerprint`, and `members`, each as `node list` prints a node |
+  | `status --node`, `status --address` | `node`, `membership_epoch`, `ring_fingerprint`; `databases`, each `database`, `role`, `lease_epoch` and `position`; `orphans`, each as `orphan list` prints one; `sinks`, each `sink`, `database`, `position`, `mark` (`replicated` or `local`), `acknowledged`, `backlog`, `failures`, `resets` and `last_error` |
+  | `node list` | `nodes`, each `node`, `address`, `zone`, `host`, `weight`, `liveness`, `draining` and `release` |
+  | `db locate` | `database`; `placement`: `engine`, `lease_epoch`, `replication_factor`, `acks`, `min_replicas`, `primary`, `candidate`, `followers`, and `replicas`, each `node`, `address`, `liveness`, `reported_role` and `position`; `metadata`, as `db show` prints it, or `null` |
+  | `db list` | `databases`, each as `db locate` prints one, by name. The description's text is left out |
+  | `db show` | `db locate`'s fields, with `metadata`: `description`, `description_by`, `labels`, `created_by`, `created_at`, `expires_at`, `expires_in_ms` and `version`; `schema`: `objects`, each `kind`, `name`, `table`, `definition`, `rows` and `rows_at_least`, and `truncated`; and `schema_unavailable` |
+  | `db edit` | `database`, `durability` (`acks`, `min_replicas`, `current_acks`, `current_min_replicas`), `metadata` and `metadata_error` |
+  | `db query` | `columns`; `rows`, each a list of values: `null`, a number, a string, or `{"blob": "<base64>"}`; `truncated` |
+  | `db verify` | `database`, `position`, `replicas` (each `node`, `chain_hash` and `error`), `chain_hash`, `agree`, `expected` and `unchanged` |
+  | `lease watch` | one object per line: `event` (`held`, `gained` or `lost`), `node`, `database` and `lease_epoch` |
+  | `orphan list` | `orphans`, each `node`, `database`, `epoch` and `bytes` |
+  | `archive show` | `database`, `archive`, `latest`, `latest_archived_at`, `segments`, `segment_bytes`, `snapshots` (each `id`, `position`, `lease_epoch`, `taken_at`, `bytes` and `has_metadata`), `incomplete` and `unusable` |
+  | `context list`, `context show` | `contexts`, each `name`, `current`, `fleet`, `control`, `tls_dir`, `ca`, `cert`, `key`, `as` and `token_file`; `show` prints one context alone |
+  | `agent list`, `agent show` | `agents`, each `id`, `principal`, `scopes`, `read_only`, `cert_expires_at`, `token_expires_at`, `issued_by` and `dir` |
+  | `dev status` | `running`, `pid`, `address`, `release`, `data_dir` and `log` |
+
+  Tests pin each command's fields and their types, so a rename fails CI: `crates/fleetringd/tests/output.rs` runs the commands against a node, and unit tests beside the code that builds them pin the rest (`archive show`, `status --node`'s sinks, `context`, `agent`, `dev status` and `db edit`).
 
 ### Terminals, pipes and CI
 
@@ -187,12 +208,13 @@ Each of these is decided once, from a snapshot of the process's surroundings, by
 | Spinners and check marks | stdout and stderr are both terminals; the output is human (not `-o json`, `jsonl`, or `--json`); there's no `-q`; `NO_COLOR` is unset or empty; `TERM` isn't `dumb`; and `CI` is unset or empty |
 | Prompts and the `switch` picker | stdin and stderr are terminals. Otherwise a command that must ask refuses with exit 2 (§7), and `switch` with no name prints the list and exits 2 |
 | Override warnings | there's no `-q`, terminal or not |
-| `hint:` lines meant for people | stderr is a terminal, and there's no `-q` |
+| `hint:` lines meant for people | stderr is a terminal, and there's no `-q`. A `hint:` line inside an error is part of the error, and prints with it |
 
-`-q, --quiet` drops everything but the result and errors. A command with no result then prints nothing.
+`-q, --quiet` drops everything but the result and errors: spinners, notes such as `switched to context 'home'`, and warnings, the override warnings included. A command with no result then prints nothing.
 
 ### Colour
 
+- **`--color auto|always|never`** decides it, `auto` by default. `always` colours stderr even into a pipe or a file; `never` keeps it plain on a terminal.
 - **The 16 ANSI colours only**, never 256-colour or RGB values, so output inherits the terminal's theme, as the TUI does (ADR-0033). Colour adds emphasis and is never the only signal: `down` is red *and* says `down`.
 - Log lines on stderr follow the same rules. A detached dev node's log file never holds colour.
 
@@ -219,11 +241,12 @@ fleetring: database 'notes' doesn't exist on fleet 'home'
 - **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost, and where: `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` name the fleet and the context, or the fleet and the control address when no context is in use. Irreversible actions ask for the name typed, not `y`.
 - **`--yes` skips the question.** Without a terminal and without `--yes`, the command refuses with exit code 2 and says to pass `--yes`.
 - **`--dry-run`** shows what would change, where the command can know: a drain lists the databases it would hand over.
-- **Drain asks too** when the node holds a database's only replica, since that database is then unavailable until the node returns.
+- **Drain asks too** when the node holds a database's only replica, since that database is then unavailable until the node returns. A drain can be undone with `undrain`, so it asks for `y`.
+- **`token revoke --token-id`** doesn't ask, since a token expires on its own, at most 30 days after it was issued; it prints the fleet and the context on stderr and acts. `--key-id` asks, since every token the key signed stops working for good.
 
 ## 8. Exit codes
 
-Documented in `--help` and the man page, and the same for every command:
+Documented in `--help` and the man page, and the same for every command. One function maps a gRPC status to its code; every status not named here exits 1:
 
 | Code | Meaning |
 |---|---|
@@ -231,7 +254,7 @@ Documented in `--help` and the man page, and the same for every command:
 | 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`), no node to `stop`, or an agent with no identity outside dev mode. |
 | 2 | Usage: a bad flag or argument, a confirmation needed without a terminal, or `switch` with no name and no terminal. |
 | 3 | Authentication or authorization: `UNAUTHENTICATED` or `PERMISSION_DENIED`. |
-| 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, a timeout, no leader yet. |
+| 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, `DEADLINE_EXCEEDED`, no leader yet. |
 | 130 | Interrupted (Ctrl-C). A `watch`, `dev logs -f`, and a cancelled picker end this way normally. |
 
 ## 9. Help, completions and man pages
@@ -340,18 +363,18 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key`; `--token` has `FLEETRING_TOKEN`; `--control`, then `--config`, then `FLEETRING_CONTROL`. No context step and no `--tls-dir` flag. | Phase B (FR-056). A flag now outranks the variables, so `--as` beats `FLEETRING_CERT` and `FLEETRING_KEY`, which 0.6 had the other way round. |
 | Contexts and `switch` | None. `fleetringd dev` writes `<dir>/env`, which sets the variables for its node (ADR-0039). | Phase B (FR-056) |
 | Agents | Six manual steps (the agent quickstart, step 2); MCP configurations carry a token. | Phase F (FR-079) |
-| `--json` / `-o` with stable fields | `db show` and `orphan list` only; every other command prints for people only. | Phase G (FR-056) |
+| `--json` / `-o` with stable fields | `db show` and `orphan list` only; every other command prints for people only. | Done (FR-056, phase G1): every read command, with `jsonl` for `lease watch`, from `fleetring_client::output`. |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
-| Terminals, pipes and CI | Commands print no progress or colour; logs are warnings only. No `--quiet`. | Phases D and G |
+| Terminals, pipes and CI | Commands print no progress or colour; logs are warnings only. No `--quiet`. | Done (phases D1 and G1): spinners, `-q`, and `--color`. |
 | Spinners | None. | Phase D (FR-075) |
-| `NO_COLOR` | Results have no colour. Log lines on stderr use ANSI colour and honour `NO_COLOR`, but don't check for a terminal. | Phase C (detached logs), phase G |
-| Errors with the next step | `fleetringd: <error>` with `caused by:` lines; `hint:` lines in a few places. | Phase G (FR-056) |
-| Confirmation and `--yes` | `db drop`, `node remove` and `orphan remove` ask on a terminal and refuse elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask. | Phase G (FR-056) |
-| Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | Phase G (FR-056) |
+| `NO_COLOR` | Results have no colour. Log lines on stderr use ANSI colour and honour `NO_COLOR`, but don't check for a terminal. | Done (phase G1): log lines and the picker are coloured only on a terminal, without `NO_COLOR` or `TERM=dumb`, unless `--color always`. |
+| Errors with the next step | `fleetringd: <error>` with `caused by:` lines; `hint:` lines in a few places. | Done (phase G1): `hint:` lines for no control address, no identity, an unknown database, a refusal and an unavailable fleet. |
+| Confirmation and `--yes` | `db drop`, `node remove` and `orphan remove` ask on a terminal and refuse elsewhere without `--yes`. `node drain` and `token revoke --key-id` don't ask. | Done (phase G1): `token revoke --key-id` and a drain of an only replica ask too; every destructive prompt names the fleet and the context, and refuses with exit 2 without a terminal. |
+| Documented exit codes | 0, 1, and clap's 2 for usage; not documented. | Done (phase G1): 0, 1, 2, 3, 4 and 130, listed in `--help`. |
 | Help fits one screen, grouped | One long paragraph per summary; sixteen commands, ungrouped. | Phase D (FR-075) |
 | Completions and man pages | None. | Phase G (FR-056) |
 | Stdin and stdout | Results on stdout, logs on stderr; `token issue` prints the token alone. `--description -` reads a description from stdin. `mcp` speaks the protocol on stdin and stdout. | Phase G (FR-056) |
-| No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | Phase B (`--token-file`), phase G (the warning) |
+| No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | Done: `--token-file` (phase B), and the warning (phase G1). |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0 and FR-076's for 0.6.0. | 0.7.0's list: phase A, in the release notes |
 | `upgrade` | Installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place (ADR-0038). | Phase A: across the rename |
 | `db watch` | None; change streams reach only configured sinks. | Deferred: its own ticket and ADR (ADR-0043, point 9) |
