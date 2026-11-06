@@ -261,13 +261,29 @@ if [ "$binary" = fleetring ]; then
 else
     say "installed $("$bin_dir/fleetringd" --version) to $bin_dir/fleetringd"
     # A release before 0.7 knows only `fleetringd`. A `fleetring` left by a later install would
-    # run another release, so it follows `fleetringd` instead.
-    if [ -e "$bin_dir/fleetring" ] || [ -L "$bin_dir/fleetring" ]; then
-        ln -sf fleetringd "$bin_dir/.fleetring.new" \
-            || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
-        mv -f "$bin_dir/.fleetring.new" "$bin_dir/fleetring"
-        say "$bin_dir/fleetring is now a link to fleetringd"
+    # run another release, so it follows `fleetringd` instead: if it is a link, or a binary that
+    # names itself fleetring or fleetringd. Anything else named `fleetring` isn't ours to replace.
+    if [ -L "$bin_dir/fleetring" ]; then
+        ours=yes
+    elif [ -f "$bin_dir/fleetring" ]; then
+        case "$("$bin_dir/fleetring" --version 2> /dev/null | head -n 1)" in
+            "fleetring "* | "fleetringd "*) ours=yes ;;
+            *) ours=no ;;
+        esac
+    else
+        ours=none
     fi
+    case "$ours" in
+        yes)
+            ln -sf fleetringd "$bin_dir/.fleetring.new" \
+                || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
+            mv -f "$bin_dir/.fleetring.new" "$bin_dir/fleetring"
+            say "$bin_dir/fleetring is now a link to fleetringd"
+            ;;
+        no)
+            say "left $bin_dir/fleetring alone: it isn't a fleetring binary"
+            ;;
+    esac
 fi
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
