@@ -286,7 +286,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
   fleetring completions powershell | Out-String | Invoke-Expression  # $PROFILE
   ```
 
-- **Man pages** are rendered with `clap_mangen` from the command tree, one per command (`fleetring(1)`, `fleetring-db-create(1)`), and checked in under `crates/fleetringd/man/`. A test fails when they differ from the tree; `UPDATE_GOLDEN=1 cargo test -p fleetringd --bin fleetring man::` regenerates them, and the reviewer reads the diff. They name no release, so a version bump leaves them alone. The release workflow copies them into every archive's `man/` directory, and `fleetring(1)` carries the exit codes.
+- **Man pages** are rendered with `clap_mangen` from the command tree, one per command (`fleetring(1)`, `fleetring-db-create(1)`), and checked in under `crates/fleetringd/man/`. A test fails when they differ from the tree; `UPDATE_GOLDEN=1 cargo test -p fleetringd --bin fleetring man::` regenerates them, and the reviewer reads the diff. They name no release, so a version bump leaves them alone. The release workflow copies them into every archive's `man/` directory, `install.sh` installs them to `<prefix>/share/man/man1`, and `fleetring(1)` carries the exit codes.
 - **The READMEs, the quickstarts and the site** show commands only in forms `--help` documents, and only as `fleetring`.
 
 ## 10. Stdin and stdout

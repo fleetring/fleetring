@@ -464,7 +464,7 @@ echo 'fleetring completions fish | source' >> ~/.config/fish/config.fish # fish
 
 In PowerShell, add `fleetring completions powershell | Out-String | Invoke-Expression` to `$PROFILE`. The script runs the binary on each Tab, so it follows upgrades.
 
-**Man pages.** Each archive holds one page per command under `man/`: `fleetring.1`, `fleetring-db-create.1`, and so on. Copy them to a directory `man` reads, such as `/usr/local/share/man/man1`, then `man fleetring-db-create`. They are the same text as `--help`.
+**Man pages.** Each archive holds one page per command under `man/`: `fleetring.1`, `fleetring-db-create.1`, and so on. `install.sh` puts them in `<prefix>/share/man/man1` (`/usr/local/share/man/man1` as root, `~/.local/share/man/man1` otherwise), so `man fleetring-db-create` works where `man` reads that directory. From an archive, copy them there yourself. They are the same text as `--help`.
 
 ## Upgrading
 
