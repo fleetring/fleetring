@@ -8,8 +8,9 @@
 #
 # It picks the archive for this OS and CPU, checks it against the release's SHA256SUMS (after
 # verifying that file's cosign signature, when cosign is installed), and copies
-# the binary to PREFIX/bin/fleetring, with PREFIX/bin/fleetringd a link to it. A release before
-# 0.7 installs as PREFIX/bin/fleetringd alone, as it always did. Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
+# the binary to PREFIX/bin/fleetring, with PREFIX/bin/fleetringd a link to it, and the man pages,
+# when the release has them (0.7 on), to PREFIX/share/man/man1. A release before 0.7 installs as
+# PREFIX/bin/fleetringd alone, as it always did. Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
 # and ARM64. On Windows, download the .zip from the release page.
 
 set -eu
@@ -29,8 +30,9 @@ Usage: install.sh [--version VERSION] [--prefix DIR] [--base-url URL]
 Options:
   --version VERSION  The version to install, such as 0.1.0. Default: the newest release.
                      Also read from FLEETRINGD_VERSION.
-  --prefix DIR       Installs the binary to DIR/bin. Default: /usr/local as root,
-                     \$HOME/.local otherwise. Also read from FLEETRINGD_PREFIX.
+  --prefix DIR       Installs the binary to DIR/bin, and the man pages to DIR/share/man/man1.
+                     Default: /usr/local as root, \$HOME/.local otherwise. Also read from
+                     FLEETRINGD_PREFIX.
   --base-url URL     Downloads the archive and SHA256SUMS from URL instead of the GitHub
                      release, for a mirror. Needs --version. Also read from FLEETRINGD_BASE_URL.
   -h, --help         Prints this help.
@@ -171,6 +173,7 @@ if [ -z "$prefix" ]; then
     fi
 fi
 bin_dir="$prefix/bin"
+man_dir="$prefix/share/man/man1"
 
 name="fleetringd-$version-$target"
 archive="$name.tar.gz"
@@ -285,6 +288,31 @@ else
             ;;
     esac
 fi
+# The man pages, one per command, from 0.7 on. The binary is installed by now, so a failure here
+# warns rather than fails.
+if [ -d "$tmp/$name/man" ]; then
+    pages=0
+    if mkdir -p "$man_dir" 2> /dev/null; then
+        for page in "$tmp/$name/man"/*.1; do
+            [ -f "$page" ] || continue
+            base=$(basename "$page")
+            if cp "$page" "$man_dir/.$base.new" 2> /dev/null && chmod 0644 "$man_dir/.$base.new" \
+                && mv -f "$man_dir/.$base.new" "$man_dir/$base"; then
+                pages=$((pages + 1))
+            else
+                rm -f "$man_dir/.$base.new"
+                say "warning: can't write to $man_dir, so the man pages weren't all installed; they are in the archive's man/"
+                break
+            fi
+        done
+        if [ "$pages" -gt 0 ]; then
+            say "installed $pages man pages to $man_dir (man fleetring)"
+        fi
+    else
+        say "warning: can't create $man_dir, so the man pages weren't installed; they are in the archive's man/"
+    fi
+fi
+
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) say "$bin_dir is not on your PATH; add it, or run $bin_dir/$binary" ;;

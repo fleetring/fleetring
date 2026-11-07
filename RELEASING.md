@@ -147,6 +147,7 @@ curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/in
   | sh -s -- --version $V --prefix "$PWD/prefix"
 "$PWD/prefix/bin/fleetring" --version
 "$PWD/prefix/bin/fleetringd" --version   # the link, until 1.0
+MANPATH="$PWD/prefix/share/man" man -w fleetring   # the man pages, from 0.7.0
 
 # 6. The image runs on both architectures.
 docker run --rm --platform linux/amd64 ghcr.io/fleetring/fleetring:$V --version
@@ -158,7 +159,7 @@ docker run --rm --platform linux/amd64 --entrypoint /usr/local/bin/fleetringd gh
 - [ ] Every checksum passes.
 - [ ] `cosign verify-blob` prints `Verified OK`.
 - [ ] `gh attestation verify` succeeds for every archive, `install.sh`, and the image.
-- [ ] The installed `fleetring` prints `fleetring X.Y.Z`, and `fleetringd` prints `fleetringd X.Y.Z`.
+- [ ] The installed `fleetring` prints `fleetring X.Y.Z`, and `fleetringd` prints `fleetringd X.Y.Z`; `man -w fleetring` finds the installed page.
 - [ ] The first two `docker run` commands print `fleetring X.Y.Z`, and the third `fleetringd X.Y.Z`. On a machine of one architecture, the other runs under emulation (Docker Desktop has it; on Linux, `docker run --privileged --rm tonistiigi/binfmt --install all` adds it).
 - [ ] The first time only: make the `fleetring` and `fleetringd` container packages public in the organization's GitHub package settings, and link them to this repository. 0.7.0 is the first release of `ghcr.io/fleetring/fleetring`.
 - [ ] Replace the release's notes with the [template](#5-release-notes).
