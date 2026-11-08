@@ -143,14 +143,11 @@ pub(crate) fn hint(status: &Status) -> Option<String> {
              `--from`"
                 .to_owned(),
         ),
-        // A statement the primary interrupted, or a call that outran `--timeout` (FR-078):
+        // A statement the primary interrupted, a call that outran `--timeout` (FR-078), or one
+        // the transport's own timeout cut, which tonic reports as `CANCELLED`, `Timeout expired`:
         // retrying the same statement would only time out again.
-        Code::DeadlineExceeded if ran_past_its_deadline(status) => Some(
-            "the statement ran past its deadline; make it cheaper, for one with a `LIMIT` or an \
-             index, or give it longer with `--timeout`, up to the primary's \
-             `[limits] statement_timeout_ms`"
-                .to_owned(),
-        ),
+        Code::DeadlineExceeded if ran_past_its_deadline(status) => Some(DEADLINE_HINT.to_owned()),
+        Code::Cancelled if status.message() == TRANSPORT_TIMEOUT => Some(DEADLINE_HINT.to_owned()),
         Code::Unavailable | Code::DeadlineExceeded => Some(
             "retry; the fleet may be starting or failing over. If it persists, check \
              `fleetring status`, or `fleetring dev status` for a dev node"
@@ -159,6 +156,14 @@ pub(crate) fn hint(status: &Status) -> Option<String> {
         _ => None,
     }
 }
+
+/// The next step for a call that ran past its deadline.
+const DEADLINE_HINT: &str = "the call ran past its deadline; make the statement cheaper, for \
+                             one with a `LIMIT` or an index, or give it longer with `--timeout`, \
+                             up to the primary's `[limits] statement_timeout_ms`";
+
+/// The message tonic's own timeout for a call carries, with `CANCELLED`.
+const TRANSPORT_TIMEOUT: &str = "Timeout expired";
 
 /// Whether `status` says a statement ran past its deadline: the primary interrupted it, or the
 /// command's own `--timeout` passed.
@@ -309,7 +314,12 @@ mod tests {
             assert!(told.contains("--timeout"), "{message}: {told}");
             assert!(!told.starts_with("retry"), "{message}: {told}");
         }
-        let unavailable = hint(&Status::deadline_exceeded("Timeout expired")).unwrap_or_default();
+        // tonic reports its own timeout for a call as a cancellation.
+        let cut = hint(&Status::cancelled("Timeout expired")).unwrap_or_default();
+        assert!(cut.contains("--timeout"), "{cut}");
+        assert_eq!(hint(&Status::cancelled("the caller went away")), None);
+        let unavailable =
+            hint(&Status::deadline_exceeded("the fleet is starting")).unwrap_or_default();
         assert!(unavailable.starts_with("retry"), "{unavailable}");
     }
 }

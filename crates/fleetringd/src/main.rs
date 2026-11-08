@@ -56,7 +56,8 @@ use fleetringd::transport::Credentials;
 use fleetringd::upgrade::RESTARTS_VAR;
 use fleetringd::upgrade::{self, LocalNode, Mode, Options, ProcessFile, Restart, StartCommand};
 use fleetringd::{
-    Config, Daemon, LogFormat, Network, NodeRole, ParseLogFormatError, Plaintext, Stop,
+    Config, Daemon, LimitsConfig, LogFormat, Network, NodeRole, ParseLogFormatError, Plaintext,
+    Stop,
 };
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -1056,11 +1057,12 @@ struct SqlArgs {
     /// The command follows the node's redirect.
     #[arg(long)]
     address: Option<String>,
-    /// How long the statement may take: `<n>m` or `<n>s`
+    /// How long the call may take: `<n>m` or `<n>s`; 30s by default
     ///
-    /// The primary interrupts it once this passes, and the command fails with exit code 4; a
-    /// write then rolls back unless it had committed. Without it, the primary's
-    /// `[limits] statement_timeout_ms` applies, 30s by default, which also caps a longer one.
+    /// The primary interrupts the statement just before this passes, or at its own
+    /// `[limits] statement_timeout_ms` if that comes first (30s unless set), and the command
+    /// fails with exit code 4 and a hint. An interrupted statement changes nothing; a write whose
+    /// replicas' acknowledgement outran the timeout has committed.
     #[arg(long, value_parser = parse_ttl)]
     timeout: Option<Duration>,
     #[command(flatten)]
@@ -3149,9 +3151,12 @@ impl SqlArgs {
         if let Some(entry) = entry {
             client = client.with_entry(entry);
         }
-        if let Some(timeout) = self.timeout {
-            client = client.with_call_timeout(timeout);
-        }
+        // Without `--timeout`, the node's default limit, so that the transport's shorter request
+        // timeout doesn't cut the call first; a node with a lower limit still stops it sooner.
+        let timeout = self
+            .timeout
+            .unwrap_or_else(|| LimitsConfig::default().statement_timeout());
+        client = client.with_call_timeout(timeout);
         Ok((
             client,
             self.name,
