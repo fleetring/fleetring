@@ -1,6 +1,7 @@
 //! The gRPC `Database` service over a data node (ADR-0019).
 
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use fleetring_client::redirect::primary_hint;
 use fleetring_control::DatabaseName;
@@ -14,6 +15,7 @@ use fleetring_proto::v1::{
     SchemaResponse, VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest, VerifyResponse,
     WatchChangesRequest, WatchLeasesRequest,
 };
+use tokio::time::Instant;
 use tonic::{Code, Request, Response, Status};
 
 use crate::auth::{Action, authorized, require_database};
@@ -25,7 +27,7 @@ use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
 use crate::data::watch::{self, ChangeStream};
 use crate::durability::{Listing, RestoreTarget, restore_into};
-use crate::engine::{EngineError, Position, Transaction};
+use crate::engine::{EngineError, Interruption, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
@@ -40,10 +42,17 @@ impl DatabaseService {
         Self { node }
     }
 
+    /// When the statement `request` carries must stop: the node's statement timeout from now,
+    /// or the call's own deadline if it set an earlier one (FR-078).
+    fn deadline<T>(&self, request: &Request<T>) -> Instant {
+        statement_deadline(request, self.node.statement_timeout())
+    }
+
     async fn run_execute(
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        let deadline = self.deadline(&request);
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let request = request.into_inner();
@@ -53,7 +62,7 @@ impl DatabaseService {
         let published = self
             .node
             .registry()
-            .commit(&name, Transaction::from(statement))
+            .commit_until(&name, Transaction::from(statement), Some(deadline))
             .await
             .map_err(|error| database_status(&error))?;
         // The write is in the database's log now, so a drain may step down: it ships the tail,
@@ -83,6 +92,7 @@ impl DatabaseService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
+        let deadline = self.deadline(&request);
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let request = request.into_inner();
@@ -94,7 +104,7 @@ impl DatabaseService {
         let rows = self
             .node
             .registry()
-            .query(&name, statement)
+            .query_until(&name, statement, deadline)
             .await
             .map_err(|error| database_status(&error))?;
         Ok(Response::new(rows_to_proto(rows)))
@@ -104,6 +114,7 @@ impl DatabaseService {
         &self,
         request: Request<SchemaRequest>,
     ) -> Result<Response<SchemaResponse>, Status> {
+        let deadline = self.deadline(&request);
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let schema_request = schema_request_from_proto(request.get_ref());
@@ -112,7 +123,7 @@ impl DatabaseService {
         let schema = self
             .node
             .registry()
-            .schema(&name, schema_request)
+            .schema_until(&name, schema_request, deadline)
             .await
             .map_err(|error| database_status(&error))?;
         Ok(Response::new(schema_to_proto(
@@ -121,6 +132,44 @@ impl DatabaseService {
             self.node.id(),
             lease.epoch,
         )))
+    }
+}
+
+/// The deadline of the statement `request` carries: `limit` from now, or the call's own
+/// `grpc-timeout` if it is shorter. A malformed header is ignored, leaving the limit.
+fn statement_deadline<T>(request: &Request<T>, limit: Duration) -> Instant {
+    let asked = request
+        .metadata()
+        .get(GRPC_TIMEOUT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(grpc_timeout);
+    let timeout = asked.map_or(limit, |asked| asked.min(limit));
+    let now = Instant::now();
+    // A limit too large for the clock means no limit worth keeping: a year stands in for it.
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+/// The header a gRPC client sends its call's timeout in.
+const GRPC_TIMEOUT: &str = "grpc-timeout";
+
+/// A `grpc-timeout` header's duration: at most eight digits and a unit, `H`, `M`, `S`, `m`
+/// (milliseconds), `u` (microseconds), or `n` (nanoseconds), as the gRPC protocol over HTTP/2
+/// defines it.
+fn grpc_timeout(text: &str) -> Option<Duration> {
+    let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    match unit {
+        "H" => Some(Duration::from_secs(value.checked_mul(60 * 60)?)),
+        "M" => Some(Duration::from_secs(value.checked_mul(60)?)),
+        "S" => Some(Duration::from_secs(value)),
+        "m" => Some(Duration::from_millis(value)),
+        "u" => Some(Duration::from_micros(value)),
+        "n" => Some(Duration::from_nanos(value)),
+        _ => None,
     }
 }
 
@@ -142,6 +191,9 @@ fn write_outcome(status: &Status) -> &'static str {
 ///
 /// - `INVALID_ARGUMENT`: the statement failed, or tried to control transactions; nothing
 ///   committed.
+/// - `DEADLINE_EXCEEDED`: the statement ran past its deadline and was interrupted; nothing
+///   committed (FR-078).
+/// - `CANCELLED`: the call was cancelled, which interrupted the statement; nothing committed.
 /// - `UNAVAILABLE`: the database closed before it took the request, or replication refused the
 ///   write because fewer than its `min_replicas` were reachable (ADR-0023); either way it never
 ///   ran; retry.
@@ -180,6 +232,8 @@ fn engine_status(error: &EngineError) -> Status {
         EngineError::Statement { .. } | EngineError::TransactionControl => {
             Status::invalid_argument(message)
         }
+        EngineError::Interrupted(Interruption::Deadline) => Status::deadline_exceeded(message),
+        EngineError::Interrupted(_) => Status::cancelled(message),
         EngineError::NotFound => Status::not_found(message),
         EngineError::AlreadyExists => Status::already_exists(message),
         EngineError::Unsupported { .. } => Status::unimplemented(message),
@@ -541,6 +595,72 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_statement_answers_deadline_exceeded_or_cancelled() {
+        let deadline = database_status(&DatabaseError::Engine(EngineError::Interrupted(
+            Interruption::Deadline,
+        )));
+        assert_eq!(deadline.code(), Code::DeadlineExceeded);
+        assert_eq!(
+            deadline.message(),
+            "statement interrupted: it ran past its deadline"
+        );
+        let cancelled = database_status(&DatabaseError::Engine(EngineError::Interrupted(
+            Interruption::Cancelled,
+        )));
+        assert_eq!(cancelled.code(), Code::Cancelled);
+    }
+
+    #[test]
+    fn grpc_timeouts_parse_as_the_protocol_writes_them() {
+        assert_eq!(grpc_timeout("2H"), Some(Duration::from_secs(7_200)));
+        assert_eq!(grpc_timeout("3M"), Some(Duration::from_secs(180)));
+        assert_eq!(grpc_timeout("60S"), Some(Duration::from_secs(60)));
+        assert_eq!(grpc_timeout("250m"), Some(Duration::from_millis(250)));
+        assert_eq!(
+            grpc_timeout("99999999u"),
+            Some(Duration::from_micros(99_999_999))
+        );
+        assert_eq!(grpc_timeout("5n"), Some(Duration::from_nanos(5)));
+        for malformed in [
+            "",
+            "S",
+            "100",
+            "123456789S",
+            "1s",
+            "-1S",
+            "1.5S",
+            "+1S",
+            "1 S",
+        ] {
+            assert_eq!(grpc_timeout(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_statement_stops_at_the_earlier_of_the_call_deadline_and_the_node_limit() {
+        let limit = Duration::from_secs(30);
+        let now = Instant::now();
+        let mut request = Request::new(());
+        assert_eq!(statement_deadline(&request, limit), now + limit);
+        request.set_timeout(Duration::from_millis(1_500));
+        assert_eq!(
+            statement_deadline(&request, limit),
+            now + Duration::from_millis(1_500)
+        );
+        request.set_timeout(Duration::from_secs(600));
+        assert_eq!(statement_deadline(&request, limit), now + limit);
+        request
+            .metadata_mut()
+            .insert(GRPC_TIMEOUT, "soon".parse().expect("ascii"));
+        assert_eq!(statement_deadline(&request, limit), now + limit);
+        let endless = statement_deadline(&Request::new(()), Duration::MAX);
+        assert!(
+            endless > now + limit,
+            "a limit past the clock's range stays far off"
+        );
+    }
+
+    #[test]
     fn the_default_engine_schema_is_unsupported() {
         use crate::engine::{DatabaseEngine as _, MemoryEngine, OpenMode};
 
@@ -553,7 +673,7 @@ mod tests {
             internal: Internal::Hide,
         };
         assert!(matches!(
-            database.schema(&request),
+            database.schema(&request, &crate::engine::Interrupt::new()),
             Err(EngineError::Unsupported { what: "schema" })
         ));
     }

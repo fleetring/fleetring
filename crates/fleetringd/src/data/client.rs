@@ -510,7 +510,8 @@ pub struct Written {
 ///   ([`not_primary`](fleetring_client::redirect::not_primary)), and the client follows up to
 ///   four of them.
 ///   Database calls are sent once and never retried, because a lost reply leaves a write's
-///   outcome unknown.
+///   outcome unknown. With [`with_call_timeout`](Self::with_call_timeout), `execute`, `query`,
+///   and `schema` carry a deadline, which the primary stops their statement at (FR-078).
 /// - **Creation** registers the database with the control plane, which places it with the ring,
 ///   then asks the first live member of its replica set, in preference order, to become its
 ///   primary: that node takes the first lease and creates the database.
@@ -521,6 +522,7 @@ pub struct Client {
     control: ControlClient,
     network: Network,
     entry: Option<String>,
+    call_timeout: Option<Duration>,
     channels: Arc<Mutex<BTreeMap<String, Channel>>>,
 }
 
@@ -532,6 +534,7 @@ impl Client {
             control: network.control_client(control),
             network,
             entry: None,
+            call_timeout: None,
             channels: Arc::default(),
         }
     }
@@ -549,6 +552,28 @@ impl Client {
     pub fn with_entry(mut self, address: impl Into<String>) -> Self {
         self.entry = Some(address.into());
         self
+    }
+
+    /// Gives each `execute`, `query`, and `schema` call `timeout`, from when it starts: the
+    /// call fails with `DEADLINE_EXCEEDED` once it passes, and carries it to the primary as its
+    /// gRPC deadline, so the primary interrupts the statement then rather than run it to the end
+    /// of its own `[limits] statement_timeout_ms` (FR-078). A write that times out rolls back
+    /// unless it committed first, so its outcome is unknown, as after any lost reply.
+    ///
+    /// The network's request timeout is raised to outlast `timeout` if it is shorter, so that
+    /// the call timeout decides; connections the client had opened are dropped for that.
+    #[must_use]
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = Some(timeout);
+        self.network = self.network.outlasting(timeout);
+        self.channels = Arc::default();
+        self
+    }
+
+    /// The timeout [`with_call_timeout`](Self::with_call_timeout) set, if any.
+    #[must_use]
+    pub fn call_timeout(&self) -> Option<Duration> {
+        self.call_timeout
     }
 
     /// The client's control-plane client.
@@ -1216,14 +1241,14 @@ impl Client {
     ) -> Result<Written, Status> {
         let params = params_to_proto(&statement);
         let response = self
-            .on_primary(name, |mut client| {
-                let request = ExecuteRequest {
+            .within_call_timeout(self.on_primary(name, |mut client| {
+                let request = self.timed(ExecuteRequest {
                     database: name.to_string(),
                     sql: statement.sql().to_owned(),
                     params: params.clone(),
-                };
+                });
                 async move { client.execute(request).await }
-            })
+            }))
             .await?;
         Ok(Written {
             rows_affected: response.rows_affected,
@@ -1243,15 +1268,15 @@ impl Client {
     pub async fn query(&self, name: &DatabaseName, statement: Statement) -> Result<Rows, Status> {
         let params = params_to_proto(&statement);
         let response = self
-            .on_primary(name, |mut client| {
-                let request = QueryRequest {
+            .within_call_timeout(self.on_primary(name, |mut client| {
+                let request = self.timed(QueryRequest {
                     database: name.to_string(),
                     sql: statement.sql().to_owned(),
                     params: params.clone(),
                     max_rows: statement.max_rows().map_or(0, NonZeroU32::get),
-                };
+                });
                 async move { client.query(request).await }
-            })
+            }))
             .await?;
         rows_from_proto(response)
     }
@@ -1297,10 +1322,10 @@ impl Client {
         request: SchemaRequest,
     ) -> Result<SchemaView, Status> {
         let response = self
-            .on_primary(name, |mut client| {
-                let request = schema_request_to_proto(name, &request);
+            .within_call_timeout(self.on_primary(name, |mut client| {
+                let request = self.timed(schema_request_to_proto(name, &request));
                 async move { client.schema(request).await }
-            })
+            }))
             .await
             .map_err(without_schema)?;
         schema_from_proto(response)
@@ -1419,6 +1444,48 @@ impl Client {
             })
             .await?;
         placement_of(response.placement)
+    }
+
+    /// `message` as a request that carries the client's call timeout, if it has one, as its
+    /// gRPC deadline.
+    pub(crate) fn timed<T>(&self, message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        if let Some(timeout) = self.call_timeout {
+            request.set_timeout(timeout);
+        }
+        request
+    }
+
+    /// Runs `call`, failing it with `DEADLINE_EXCEEDED` once the client's call timeout, if it
+    /// has one, passes. Dropping the call cancels it, which interrupts its statement on the node
+    /// if the deadline it carried hasn't already.
+    async fn within_call_timeout<T>(
+        &self,
+        call: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        // A timeout past the clock's range is as good as none.
+        let Some((timeout, deadline)) = self
+            .call_timeout
+            .and_then(|timeout| Some((timeout, tokio::time::Instant::now().checked_add(timeout)?)))
+        else {
+            return call.await;
+        };
+        let exceeded = || {
+            Status::deadline_exceeded(format!(
+                "the call took longer than its timeout of {timeout:?}"
+            ))
+        };
+        match tokio::time::timeout_at(deadline, call).await {
+            // The channel enforces the deadline the call carries too, and reports it as a
+            // cancellation, which can arrive first.
+            Ok(Err(status))
+                if status.code() == Code::Cancelled && tokio::time::Instant::now() >= deadline =>
+            {
+                Err(exceeded())
+            }
+            Ok(result) => result,
+            Err(_elapsed) => Err(exceeded()),
+        }
     }
 
     /// Calls `call` on the database's primary, or on the entry node, following redirects.

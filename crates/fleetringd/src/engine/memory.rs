@@ -10,8 +10,8 @@ use fleetring::NodeId;
 
 use crate::engine::{
     Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot, EngineCapability, EngineError,
-    EngineKind, Executed, OpenMode, Position, ReplicaPosition, Rows, SelfReplicating, Statement,
-    Transaction, Value,
+    EngineKind, Executed, Interrupt, OpenMode, Position, ReplicaPosition, Rows, SelfReplicating,
+    Statement, Transaction, Value,
 };
 
 /// An in-memory key-value engine that replicates itself.
@@ -27,7 +27,8 @@ use crate::engine::{
 /// - `delete` with a text key removes it;
 /// - `get` with a text key returns a `value` column, with one row if the key exists;
 /// - `scan` returns every `key` and `value` in key order;
-/// - `sleep` with an integer number of milliseconds blocks the calling thread;
+/// - `sleep` with an integer number of milliseconds blocks the calling thread, a millisecond at a
+///   time, and stops early once its call's [`Interrupt`] is raised;
 /// - `fail` always fails.
 ///
 /// Positions are the count of committed write transactions, as 8 big-endian bytes.
@@ -36,15 +37,16 @@ use crate::engine::{
 ///
 /// ```
 /// use fleetringd::engine::{
-///     DatabaseEngine, MemoryEngine, OpenMode, Statement, Transaction, Value,
+///     DatabaseEngine, Interrupt, MemoryEngine, OpenMode, Statement, Transaction, Value,
 /// };
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let engine = MemoryEngine::new();
 /// let mut db = engine.open("tenant".as_ref(), OpenMode::Create)?;
 /// let put = Statement::with_params("put", [Value::from("k"), Value::from(7)]);
-/// db.execute(&Transaction::from(put))?;
-/// let rows = db.query(&Statement::with_params("get", [Value::from("k")]))?;
+/// db.execute(&Transaction::from(put), &Interrupt::new())?;
+/// let get = Statement::with_params("get", [Value::from("k")]);
+/// let rows = db.query(&get, &Interrupt::new())?;
 /// assert_eq!(rows.rows, vec![vec![Value::Integer(7)]]);
 /// # Ok(())
 /// # }
@@ -129,11 +131,17 @@ impl MemoryDatabase {
 }
 
 impl Database for MemoryDatabase {
-    fn execute(&mut self, transaction: &Transaction) -> Result<Executed, EngineError> {
+    fn execute(
+        &mut self,
+        transaction: &Transaction,
+        interrupt: &Interrupt,
+    ) -> Result<Executed, EngineError> {
+        interrupt.check()?;
+        // Statements change a working copy, which an interrupted or failed transaction drops.
         let mut working = self.stored()?;
         let mut rows_affected = 0;
         for statement in transaction.statements() {
-            rows_affected += apply(&mut working.rows, statement)?;
+            rows_affected += apply(&mut working.rows, statement, interrupt)?;
         }
         if rows_affected > 0 {
             working.version += 1;
@@ -142,9 +150,10 @@ impl Database for MemoryDatabase {
         Ok(Executed { rows_affected })
     }
 
-    fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError> {
+    fn query(&mut self, statement: &Statement, interrupt: &Interrupt) -> Result<Rows, EngineError> {
+        interrupt.check()?;
         let stored = self.stored()?;
-        read(&stored.rows, statement)
+        read(&stored.rows, statement, interrupt)
     }
 
     fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {
@@ -186,19 +195,27 @@ impl SelfReplicating for MemoryDatabase {
 }
 
 /// Runs one command against `rows`, and returns how many rows it changed.
-fn apply(rows: &mut BTreeMap<String, Value>, statement: &Statement) -> Result<u64, EngineError> {
+fn apply(
+    rows: &mut BTreeMap<String, Value>,
+    statement: &Statement,
+    interrupt: &Interrupt,
+) -> Result<u64, EngineError> {
     match (statement.sql(), statement.params()) {
         ("put", [Value::Text(key), value]) => {
             rows.insert(key.clone(), value.clone());
             Ok(1)
         }
         ("delete", [Value::Text(key)]) => Ok(u64::from(rows.remove(key).is_some())),
-        _ => read(rows, statement).map(|_| 0),
+        _ => read(rows, statement, interrupt).map(|_| 0),
     }
 }
 
 /// Runs one read-only command against `rows`.
-fn read(rows: &BTreeMap<String, Value>, statement: &Statement) -> Result<Rows, EngineError> {
+fn read(
+    rows: &BTreeMap<String, Value>,
+    statement: &Statement,
+    interrupt: &Interrupt,
+) -> Result<Rows, EngineError> {
     match (statement.sql(), statement.params()) {
         ("get", [Value::Text(key)]) => Ok(Rows {
             columns: vec!["value".to_owned()],
@@ -218,7 +235,10 @@ fn read(rows: &BTreeMap<String, Value>, statement: &Statement) -> Result<Rows, E
             truncated: false,
         }),
         ("sleep", [Value::Integer(millis)]) => {
-            thread::sleep(Duration::from_millis(u64::try_from(*millis).unwrap_or(0)));
+            for _ in 0..u64::try_from(*millis).unwrap_or(0) {
+                interrupt.check()?;
+                thread::sleep(Duration::from_millis(1));
+            }
             Ok(Rows::default())
         }
         ("put" | "delete", _) => Err(failed(format!("`{}` writes", statement.sql()))),

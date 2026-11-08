@@ -658,6 +658,185 @@ async fn errors_map_to_statuses() -> TestResult {
     Ok(())
 }
 
+/// A recursive CTE that counts forever: only an interrupt on the node stops it (FR-078).
+const FOREVER: &str =
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c";
+
+/// How long the calls in the statement-deadline tests let a runaway statement run.
+const SHORT: Duration = Duration::from_millis(300);
+
+/// Creates `notes` in `database`, with one row, and waits until both followers hold it.
+/// Returns the primary's committed position.
+async fn one_note_everywhere(
+    fleet: &Fleet,
+    client: &Client,
+    database: &DatabaseName,
+) -> Result<Option<fleetringd::engine::Position>, Box<dyn Error>> {
+    let created = client.create_database(database, three()?).await?;
+    let primary = created.primary.ok_or("no primary after create")?;
+    client
+        .execute(
+            database,
+            Statement::new("CREATE TABLE notes (n INTEGER PRIMARY KEY)"),
+        )
+        .await?;
+    client
+        .execute(database, Statement::new("INSERT INTO notes (n) VALUES (1)"))
+        .await?;
+    let replication = fleet
+        .data_daemon(primary.as_str())?
+        .replication()
+        .ok_or("no replication on the primary")?;
+    let committed = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            if let Some(status) = replication.primary_status(database)
+                && status.committed.is_some()
+                && status.followers.len() == 2
+                && status
+                    .followers
+                    .iter()
+                    .all(|follower| follower.acknowledged == status.committed)
+            {
+                return status.committed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    Ok(committed)
+}
+
+/// How long the statement-deadline tests wait for the primary to answer the next request: less
+/// than the node's default statement timeout of 30 seconds, so that a primary still running a
+/// statement nothing stopped fails the test.
+const FREED: Duration = Duration::from_secs(20);
+
+/// The count of `notes` on the primary, which must answer within [`FREED`].
+async fn note_count(
+    client: &Client,
+    database: &DatabaseName,
+) -> Result<Vec<Vec<Value>>, Box<dyn Error>> {
+    let rows = tokio::time::timeout(
+        FREED,
+        client.query(database, Statement::new("SELECT count(*) FROM notes")),
+    )
+    .await??;
+    Ok(rows.rows)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runaway_statement_stops_at_the_node_statement_timeout_and_leaves_nothing() -> TestResult
+{
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start_configured(
+        dir.path(),
+        "",
+        "",
+        "\n[limits]\nstatement_timeout_ms = 500\n",
+    )
+    .await?;
+    let client = fleet.client()?;
+    let notes = name("runaway")?;
+    let committed = one_note_everywhere(&fleet, &client, &notes).await?;
+
+    let query = client
+        .query(
+            &notes,
+            Statement::new(format!("SELECT count(*) FROM ({FOREVER})")),
+        )
+        .await
+        .expect_err("a query that never ends");
+    assert_eq!(query.code(), Code::DeadlineExceeded, "{query}");
+    assert!(query.message().contains("ran past its deadline"), "{query}");
+    // The primary serves the next request at once: a statement left running would hold it
+    // forever.
+    assert_eq!(note_count(&client, &notes).await?, [[Value::Integer(1)]]);
+
+    let write = client
+        .execute(
+            &notes,
+            Statement::new(format!(
+                "INSERT INTO notes (n) SELECT x + 1 FROM ({FOREVER})"
+            )),
+        )
+        .await
+        .expect_err("a write that never ends");
+    assert_eq!(write.code(), Code::DeadlineExceeded, "{write}");
+    assert_eq!(
+        note_count(&client, &notes).await?,
+        [[Value::Integer(1)]],
+        "the interrupted write left no row"
+    );
+    // Nothing committed, so nothing reached a follower.
+    let primary = client.locate(&notes).await?.primary.ok_or("no primary")?;
+    let status = fleet
+        .data_daemon(primary.as_str())?
+        .replication()
+        .ok_or("no replication on the primary")?
+        .primary_status(&notes)
+        .ok_or("not primary")?;
+    assert_eq!(status.committed, committed, "the primary committed nothing");
+    for follower in &status.followers {
+        assert_eq!(follower.acknowledged, committed, "{follower:?}");
+    }
+    for follower in client.locate(&notes).await?.followers() {
+        let file = database_file(dir.path(), follower.node.as_str(), "runaway");
+        assert_eq!(notes_in(&file)?, [1], "{}'s rows", follower.node);
+    }
+
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_or_timed_out_call_stops_its_statement_on_the_node() -> TestResult {
+    // The node's own limit is the default 30 seconds, so only the call ending can free the
+    // primary within `FREED`.
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(dir.path()).await?;
+    let client = fleet.client()?;
+    let notes = name("cancelled")?;
+    one_note_everywhere(&fleet, &client, &notes).await?;
+    let forever = || Statement::new(format!("SELECT count(*) FROM ({FOREVER})"));
+
+    // Dropping the call cancels it, and the primary stops the statement.
+    assert!(
+        tokio::time::timeout(SHORT, client.query(&notes, forever()))
+            .await
+            .is_err(),
+        "the query runs until the call is dropped"
+    );
+    assert_eq!(note_count(&client, &notes).await?, [[Value::Integer(1)]]);
+
+    // A call timeout travels with the call as its deadline.
+    let timed = client.clone().with_call_timeout(SHORT);
+    let query = timed
+        .query(&notes, forever())
+        .await
+        .expect_err("a query that never ends");
+    assert_eq!(query.code(), Code::DeadlineExceeded, "{query}");
+    assert_eq!(note_count(&client, &notes).await?, [[Value::Integer(1)]]);
+
+    let write = timed
+        .execute(
+            &notes,
+            Statement::new(format!(
+                "INSERT INTO notes (n) SELECT x + 1 FROM ({FOREVER})"
+            )),
+        )
+        .await
+        .expect_err("a write that never ends");
+    assert_eq!(write.code(), Code::DeadlineExceeded, "{write}");
+    assert_eq!(
+        note_count(&client, &notes).await?,
+        [[Value::Integer(1)]],
+        "the interrupted write left no row"
+    );
+
+    fleet.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_shows_the_ring_every_node_publishes() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -1445,6 +1624,36 @@ mod binary {
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(text)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_query_timeout_stops_the_statement_on_the_primary() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = Fleet::start(dir.path()).await?;
+        let control = fleet.control_address()?;
+        let client = fleet.client()?;
+        let notes = name("timed")?;
+        super::one_note_everywhere(&fleet, &client, &notes).await?;
+
+        let forever = format!("SELECT count(*) FROM ({})", super::FOREVER);
+        let output = fleetringd(
+            fleet.tls.dir(),
+            args(
+                &["db", "query", "timed", &forever, "--timeout", "1s"],
+                &control,
+            ),
+        )
+        .await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(4), "{stderr}");
+        assert!(stderr.contains("timeout of 1s"), "{stderr}");
+        // The primary stopped the statement once the command's deadline passed.
+        assert_eq!(
+            super::note_count(&client, &notes).await?,
+            [[Value::Integer(1)]]
+        );
+        fleet.stop().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

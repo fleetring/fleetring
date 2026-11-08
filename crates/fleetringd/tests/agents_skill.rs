@@ -6,7 +6,7 @@ use std::error::Error;
 use std::path::Path;
 
 use fleetringd::engine::{
-    CaptureMode, DatabaseEngine, OpenMode, SqliteEngine, Statement, Transaction, Value,
+    CaptureMode, DatabaseEngine, Interrupt, OpenMode, SqliteEngine, Statement, Transaction, Value,
 };
 use serde_json::Value as Json;
 
@@ -192,8 +192,10 @@ fn run_the_skill(recording: Recording) -> Result<(), Box<dyn Error>> {
         for statement in statements(block)? {
             let prepared = Statement::with_params(statement.sql.clone(), statement.params);
             let outcome = match first_keyword(&statement.sql).as_str() {
-                "SELECT" | "WITH" => db.query(&prepared).map(drop),
-                _ => db.execute(&Transaction::from(prepared)).map(drop),
+                "SELECT" | "WITH" => db.query(&prepared, &Interrupt::new()).map(drop),
+                _ => db
+                    .execute(&Transaction::from(prepared), &Interrupt::new())
+                    .map(drop),
             };
             if let Err(error) = outcome {
                 return Err(
@@ -229,7 +231,7 @@ fn the_skills_patterns_behave_as_described() -> Result<(), Box<dyn Error>> {
         for statement in statements(&block)? {
             if first_keyword(&statement.sql) != "SELECT" {
                 let prepared = Statement::with_params(statement.sql, statement.params);
-                db.execute(&Transaction::from(prepared))?;
+                db.execute(&Transaction::from(prepared), &Interrupt::new())?;
             }
         }
     }
@@ -239,17 +241,27 @@ fn the_skills_patterns_behave_as_described() -> Result<(), Box<dyn Error>> {
          WHERE id = ? AND state = 'todo'",
         [Value::Integer(1), Value::from("task-7f3a")],
     );
-    assert_eq!(db.execute(&Transaction::from(claim))?.rows_affected, 0);
+    assert_eq!(
+        db.execute(&Transaction::from(claim), &Interrupt::new())?
+            .rows_affected,
+        0
+    );
 
     let reopen = Statement::new("UPDATE tasks SET state = 'todo' WHERE id = 'task-7f3a'");
-    assert!(db.execute(&Transaction::from(reopen)).is_err());
+    assert!(
+        db.execute(&Transaction::from(reopen), &Interrupt::new())
+            .is_err()
+    );
 
     let search = Statement::with_params(
         "SELECT n.id FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid \
          WHERE notes_fts MATCH ? ORDER BY bm25(notes_fts)",
         [Value::from("expiry")],
     );
-    assert_eq!(db.query(&search)?.rows, vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        db.query(&search, &Interrupt::new())?.rows,
+        vec![vec![Value::Integer(1)]]
+    );
     db.close()?;
     Ok(())
 }

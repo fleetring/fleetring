@@ -7,9 +7,9 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::engine::{
-    CaptureMode, ChangesAfter, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch,
-    LogicalSupport, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition,
-    RowChange, Rows, Schema, SchemaRequest, Statement, Transaction,
+    CaptureMode, ChangesAfter, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, Interrupt,
+    Interruption, LogicalSupport, PinnedSnapshot, Position, ReadLimit, RecordedTransaction,
+    ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -46,21 +46,37 @@ pub trait DatabaseEngine: fmt::Debug + Send + Sync + 'static {
 ///
 /// Every method blocks. The actor calls them on the database's own thread, or inline under
 /// simulation (ADR-0020).
+///
+/// [`execute`](Self::execute), [`query`](Self::query), and [`schema`](Self::schema) take an
+/// [`Interrupt`] that the caller raises at its deadline or when it goes away (FR-078). The
+/// engine checks it before it starts and while the user's statements run, often enough that a
+/// statement stops soon after it is raised, and then fails the call with
+/// [`EngineError::Interrupted`]. An interrupted write transaction rolls back and commits
+/// nothing. Once the statements have all run, the engine finishes the call whatever the
+/// interrupt says, so a transaction is never cut between its last statement and its commit.
+/// The engine never reads a clock: time stays with whoever raises the interrupt.
 pub trait Database: fmt::Debug + Send {
-    /// Runs `transaction` as one write transaction.
+    /// Runs `transaction` as one write transaction, unless `interrupt` stops it first.
     ///
     /// # Errors
     ///
-    /// [`EngineError::Statement`] if a statement fails, after rolling the transaction back, and
-    /// [`EngineError::Storage`] if storage fails.
-    fn execute(&mut self, transaction: &Transaction) -> Result<Executed, EngineError>;
+    /// [`EngineError::Statement`] if a statement fails, and [`EngineError::Interrupted`] if
+    /// `interrupt` stops one, each after rolling the transaction back; [`EngineError::Storage`]
+    /// if storage fails.
+    fn execute(
+        &mut self,
+        transaction: &Transaction,
+        interrupt: &Interrupt,
+    ) -> Result<Executed, EngineError>;
 
-    /// Runs a read-only query against the latest committed state.
+    /// Runs a read-only query against the latest committed state, unless `interrupt` stops it
+    /// first.
     ///
     /// # Errors
     ///
-    /// [`EngineError::Statement`] if the query fails or tries to write.
-    fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError>;
+    /// [`EngineError::Statement`] if the query fails or tries to write, and
+    /// [`EngineError::Interrupted`] if `interrupt` stops it.
+    fn query(&mut self, statement: &Statement, interrupt: &Interrupt) -> Result<Rows, EngineError>;
 
     /// The database's schema (ADR-0041, point 6): its tables, views, indexes, triggers, and
     /// virtual tables, with the engine's own definitions and row counts capped by the request.
@@ -69,10 +85,15 @@ pub trait Database: fmt::Debug + Send {
     ///
     /// # Errors
     ///
-    /// [`EngineError::Unsupported`] if the engine can't describe its databases, and
-    /// [`EngineError::Storage`] if the catalog can't be read.
-    fn schema(&mut self, request: &SchemaRequest) -> Result<Schema, EngineError> {
-        let _ = request;
+    /// [`EngineError::Unsupported`] if the engine can't describe its databases,
+    /// [`EngineError::Interrupted`] if `interrupt` stops the read, and [`EngineError::Storage`]
+    /// if the catalog can't be read.
+    fn schema(
+        &mut self,
+        request: &SchemaRequest,
+        interrupt: &Interrupt,
+    ) -> Result<Schema, EngineError> {
+        let _ = (request, interrupt);
         Err(EngineError::Unsupported { what: "schema" })
     }
 
@@ -507,6 +528,10 @@ pub enum EngineError {
     /// A statement began, committed, or rolled back a transaction itself.
     #[error("statements must not control transactions")]
     TransactionControl,
+    /// The call's [`Interrupt`] stopped it before it finished; a write transaction rolled back
+    /// (FR-078).
+    #[error("statement interrupted: {0}")]
+    Interrupted(Interruption),
     /// A position isn't one this engine handed out for this log.
     #[error("position {position} does not fit the log")]
     InvalidPosition {

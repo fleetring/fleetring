@@ -18,8 +18,8 @@ use std::hint::black_box;
 
 use divan::Bencher;
 use fleetringd::engine::{
-    CaptureMode, Database, DatabaseCapability, DatabaseEngine, EngineCapability, OpenMode,
-    Position, SqliteEngine, Statement, Transaction, Value,
+    CaptureMode, Database, DatabaseCapability, DatabaseEngine, EngineCapability, Interrupt,
+    OpenMode, Position, SqliteEngine, Statement, Transaction, Value,
 };
 use fleetringd::replication::ChainHash;
 use tempfile::TempDir;
@@ -133,7 +133,7 @@ impl Writer {
             .expect("the database opens");
         db.execute(&Transaction::from(Statement::new(
             "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL, note BLOB)",
-        )))
+        )), &Interrupt::new())
         .expect("the schema applies");
         if let Capture::On(mode) = capture {
             db.logical_changes()
@@ -177,7 +177,7 @@ impl Writer {
                 .stage("sink", mark);
         }
         self.db
-            .execute(&Transaction::new(statements))
+            .execute(&Transaction::new(statements), &Interrupt::new())
             .expect("the write commits");
         self.capture();
         if let (Some(last), Some(logical)) = (self.last.clone(), self.db.logical_changes()) {

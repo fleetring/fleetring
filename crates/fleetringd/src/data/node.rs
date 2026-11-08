@@ -107,6 +107,8 @@ pub(super) struct Inner {
     /// How long a node that starts serving a database waits for its followers' streams before
     /// it takes writes.
     pub(super) writable_wait: Duration,
+    /// The longest a statement runs here: `[limits] statement_timeout_ms` (FR-078).
+    statement_timeout: Duration,
     leases: Mutex<BTreeMap<DatabaseName, HeldLease>>,
     /// The databases this node has started serving and still waits for the followers of, each
     /// with the number of starts waiting.
@@ -233,8 +235,12 @@ impl Admitted<'_> {
 impl DataNode {
     /// A node with ID `id` that keeps its databases in `replication`'s registry, and asks the
     /// control plane through `control`. A database it starts serving waits up to `writable_wait`
-    /// for every live follower, and at least a write quorum, to connect. It counts what it does
-    /// in `metrics`.
+    /// for every live follower, and at least a write quorum, to connect. A statement runs here
+    /// for at most `statement_timeout`. It counts what it does in `metrics`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the node's parts, each built by the daemon; the one caller names them"
+    )]
     pub(crate) fn new(
         id: NodeId,
         replication: Replication,
@@ -242,6 +248,7 @@ impl DataNode {
         control: ControlClient,
         archives: Vec<Archive>,
         writable_wait: Duration,
+        statement_timeout: Duration,
         metrics: DataMetrics,
     ) -> Self {
         Self {
@@ -252,6 +259,7 @@ impl DataNode {
                 control,
                 archives,
                 writable_wait,
+                statement_timeout,
                 leases: Mutex::new(BTreeMap::new()),
                 settling: watch::Sender::new(BTreeMap::new()),
                 refusing: Mutex::new(BTreeSet::new()),
@@ -268,6 +276,12 @@ impl DataNode {
     /// Where the node counts writes, queries, renewals, transfers, and promotions.
     pub(crate) fn metrics(&self) -> &DataMetrics {
         &self.inner.metrics
+    }
+
+    /// The longest a statement runs on this node, and the cap on a deadline its caller asks for
+    /// (FR-078).
+    pub(crate) fn statement_timeout(&self) -> Duration {
+        self.inner.statement_timeout
     }
 
     pub(crate) fn registry(&self) -> &Registry {

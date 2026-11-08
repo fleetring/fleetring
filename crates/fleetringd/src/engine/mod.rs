@@ -8,10 +8,14 @@
 //! - [`SqliteEngine`] is the frame source for plain SQLite. WAL details stay inside it, and user
 //!   statements are confined to the database they name.
 //! - [`MemoryEngine`] is a self-replicating test engine that has no WAL at all.
+//!
+//! A statement stops when its [`Interrupt`] is raised. The caller raises it, at a deadline it
+//! keeps on its own clock or when it goes away, so engines never read a clock (FR-078).
 
 mod adapter;
 mod changes;
 mod config;
+mod interrupt;
 mod memory;
 mod pinned;
 mod position;
@@ -29,6 +33,7 @@ pub use changes::{
     RecordedTransaction, RowChange, RowOperation,
 };
 pub use config::{EngineConfig, Execution};
+pub use interrupt::{Interrupt, Interruption};
 pub use memory::MemoryEngine;
 pub use pinned::{PinnedSnapshot, SnapshotFile, SnapshotGuard};
 pub use position::{
@@ -62,6 +67,8 @@ const _: () = {
     assert_debug_send_sync::<FrameBatch>();
     assert_debug_send_sync::<InvalidPageSizeError>();
     assert_debug_send_sync::<Internal>();
+    assert_debug_send_sync::<Interrupt>();
+    assert_debug_send_sync::<Interruption>();
     assert_debug_send_sync::<ObjectKind>();
     assert_debug_send_sync::<RowCount>();
     assert_debug_send_sync::<Schema>();

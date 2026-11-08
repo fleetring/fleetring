@@ -2,7 +2,9 @@
 //! reports.
 
 use super::*;
-use crate::engine::{Internal, MAX_SCHEMA_OBJECTS, ObjectKind, RowCount, SchemaObject};
+use crate::engine::{
+    Internal, Interruption, MAX_SCHEMA_OBJECTS, ObjectKind, RowCount, SchemaObject,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -15,10 +17,13 @@ fn database(dir: &Path) -> Result<SqliteDatabase, Box<dyn Error>> {
         4096,
         Arc::default(),
     )?;
-    db.execute(&Transaction::new([
-        Statement::new("CREATE TABLE t (v)"),
-        Statement::new("INSERT INTO t VALUES (1)"),
-    ]))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE TABLE t (v)"),
+            Statement::new("INSERT INTO t VALUES (1)"),
+        ]),
+        &Interrupt::new(),
+    )?;
     Ok(db)
 }
 
@@ -31,11 +36,11 @@ fn refusal<T: fmt::Debug>(result: Result<T, EngineError>) -> Result<String, Box<
 }
 
 fn exec(db: &mut SqliteDatabase, sql: &str) -> Result<Executed, EngineError> {
-    db.execute(&Transaction::from(Statement::new(sql)))
+    db.execute(&Transaction::from(Statement::new(sql)), &Interrupt::new())
 }
 
 fn query(db: &mut SqliteDatabase, sql: &str) -> Result<Rows, EngineError> {
-    db.query(&Statement::new(sql))
+    db.query(&Statement::new(sql), &Interrupt::new())
 }
 
 fn values(db: &mut SqliteDatabase) -> Result<Vec<Vec<Value>>, Box<dyn Error>> {
@@ -58,8 +63,8 @@ fn attaching_another_database_is_refused() -> TestResult {
         "ATTACH DATABASE ? AS z",
         [Value::from(path.display().to_string())],
     );
-    refusal(db.execute(&Transaction::from(bound.clone())))?;
-    refusal(db.query(&bound))?;
+    refusal(db.execute(&Transaction::from(bound.clone()), &Interrupt::new()))?;
+    refusal(db.query(&bound, &Interrupt::new()))?;
     let concatenated = format!("ATTACH DATABASE '{}' || '' AS z", path.display());
     refusal(exec(&mut db, &concatenated))?;
 
@@ -303,15 +308,20 @@ fn object<'a>(schema: &'a Schema, name: &str) -> Result<&'a SchemaObject, Box<dy
 fn the_schema_lists_tables_indexes_views_and_triggers_with_their_definitions() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
-    db.execute(&Transaction::new([
-        Statement::new("CREATE TABLE facts (id INTEGER PRIMARY KEY, topic TEXT UNIQUE, body TEXT)"),
-        Statement::new("CREATE INDEX facts_body ON facts (body)"),
-        Statement::new("CREATE TRIGGER facts_seen AFTER INSERT ON facts BEGIN SELECT 1; END"),
-        Statement::new("CREATE VIEW recent AS SELECT body FROM facts ORDER BY id DESC"),
-        Statement::new("INSERT INTO facts (topic, body) VALUES ('a', 'x'), ('b', 'y')"),
-    ]))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new(
+                "CREATE TABLE facts (id INTEGER PRIMARY KEY, topic TEXT UNIQUE, body TEXT)",
+            ),
+            Statement::new("CREATE INDEX facts_body ON facts (body)"),
+            Statement::new("CREATE TRIGGER facts_seen AFTER INSERT ON facts BEGIN SELECT 1; END"),
+            Statement::new("CREATE VIEW recent AS SELECT body FROM facts ORDER BY id DESC"),
+            Statement::new("INSERT INTO facts (topic, body) VALUES ('a', 'x'), ('b', 'y')"),
+        ]),
+        &Interrupt::new(),
+    )?;
 
-    let schema = db.schema(&request(100, Internal::Hide))?;
+    let schema = db.schema(&request(100, Internal::Hide), &Interrupt::new())?;
     assert!(!schema.truncated);
     // Each table is followed by its indexes and triggers; the generated unique index is hidden.
     assert_eq!(
@@ -351,7 +361,7 @@ fn the_schema_lists_tables_indexes_views_and_triggers_with_their_definitions() -
     assert_eq!(view.rows, None, "a view's query isn't run to count it");
 
     // With the engine's own objects shown, the generated index has no definition.
-    let all = db.schema(&request(100, Internal::Show))?;
+    let all = db.schema(&request(100, Internal::Show), &Interrupt::new())?;
     let generated = all
         .objects
         .iter()
@@ -371,7 +381,10 @@ fn an_empty_database_has_an_empty_schema() -> TestResult {
         4096,
         Arc::default(),
     )?;
-    assert_eq!(db.schema(&request(100, Internal::Show))?, Schema::default());
+    assert_eq!(
+        db.schema(&request(100, Internal::Show), &Interrupt::new())?,
+        Schema::default()
+    );
     Ok(())
 }
 
@@ -379,15 +392,18 @@ fn an_empty_database_has_an_empty_schema() -> TestResult {
 fn row_counts_are_exact_below_the_limit_and_a_lower_bound_above_it() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
-    db.execute(&Transaction::new([
-        Statement::new("CREATE TABLE two (v)"),
-        Statement::new("INSERT INTO two VALUES (1), (2)"),
-        Statement::new("CREATE TABLE five (v)"),
-        Statement::new("INSERT INTO five VALUES (1), (2), (3), (4), (5)"),
-        Statement::new("CREATE TABLE three (v)"),
-        Statement::new("INSERT INTO three VALUES (1), (2), (3)"),
-    ]))?;
-    let schema = db.schema(&request(3, Internal::Hide))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE TABLE two (v)"),
+            Statement::new("INSERT INTO two VALUES (1), (2)"),
+            Statement::new("CREATE TABLE five (v)"),
+            Statement::new("INSERT INTO five VALUES (1), (2), (3), (4), (5)"),
+            Statement::new("CREATE TABLE three (v)"),
+            Statement::new("INSERT INTO three VALUES (1), (2), (3)"),
+        ]),
+        &Interrupt::new(),
+    )?;
+    let schema = db.schema(&request(3, Internal::Hide), &Interrupt::new())?;
     assert_eq!(object(&schema, "two")?.rows, Some(RowCount::Exact(2)));
     assert_eq!(
         object(&schema, "three")?.rows,
@@ -402,7 +418,7 @@ fn row_counts_are_exact_below_the_limit_and_a_lower_bound_above_it() -> TestResu
 fn a_count_limit_of_zero_counts_nothing() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
-    let schema = db.schema(&request(0, Internal::Hide))?;
+    let schema = db.schema(&request(0, Internal::Hide), &Interrupt::new())?;
     assert_eq!(listed(&schema), [(ObjectKind::Table, "t")]);
     assert_eq!(object(&schema, "t")?.rows, None);
     Ok(())
@@ -412,12 +428,15 @@ fn a_count_limit_of_zero_counts_nothing() -> TestResult {
 fn the_scan_budget_is_spent_across_tables() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
-    db.execute(&Transaction::new([
-        Statement::new("CREATE TABLE a (v)"),
-        Statement::new("INSERT INTO a VALUES (1), (2), (3), (4)"),
-        Statement::new("CREATE TABLE b (v)"),
-        Statement::new("INSERT INTO b VALUES (1)"),
-    ]))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE TABLE a (v)"),
+            Statement::new("INSERT INTO a VALUES (1), (2), (3), (4)"),
+            Statement::new("CREATE TABLE b (v)"),
+            Statement::new("INSERT INTO b VALUES (1)"),
+        ]),
+        &Interrupt::new(),
+    )?;
     // `a` takes the whole budget, so the tables after it go uncounted, however small.
     let schema = schema::read_within(&db.reader, &request(100, Internal::Hide), 3)?;
     assert_eq!(object(&schema, "a")?.rows, Some(RowCount::AtLeast(3)));
@@ -439,7 +458,7 @@ fn reserved_objects_are_never_shown() -> TestResult {
     )?;
     assert!(reserved > 0, "the recorder keeps a table and triggers");
     for internal in [Internal::Hide, Internal::Show] {
-        let schema = db.schema(&request(100, internal))?;
+        let schema = db.schema(&request(100, internal), &Interrupt::new())?;
         for object in &schema.objects {
             assert!(
                 !object.name.starts_with(RESERVED_PREFIX)
@@ -542,11 +561,14 @@ fn fts5_tables_are_virtual_uncounted_and_hide_their_shadow_tables() -> TestResul
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
     // The bundled SQLite has FTS5, which the agent skill relies on.
-    db.execute(&Transaction::new([
-        Statement::new("CREATE VIRTUAL TABLE docs USING fts5(body)"),
-        Statement::new("INSERT INTO docs VALUES ('alpha'), ('beta')"),
-    ]))?;
-    let schema = db.schema(&request(100, Internal::Hide))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE VIRTUAL TABLE docs USING fts5(body)"),
+            Statement::new("INSERT INTO docs VALUES ('alpha'), ('beta')"),
+        ]),
+        &Interrupt::new(),
+    )?;
+    let schema = db.schema(&request(100, Internal::Hide), &Interrupt::new())?;
     assert_eq!(
         listed(&schema),
         [(ObjectKind::VirtualTable, "docs"), (ObjectKind::Table, "t")]
@@ -559,7 +581,7 @@ fn fts5_tables_are_virtual_uncounted_and_hide_their_shadow_tables() -> TestResul
             .is_some_and(|sql| sql.starts_with("CREATE VIRTUAL TABLE docs USING fts5"))
     );
 
-    let all = db.schema(&request(100, Internal::Show))?;
+    let all = db.schema(&request(100, Internal::Show), &Interrupt::new())?;
     for shadow in [
         "docs_data",
         "docs_idx",
@@ -582,16 +604,16 @@ fn object_lists_past_the_maximum_are_truncated() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
     // `t` and 1,000 more.
-    db.execute(&tables(0))?;
-    let schema = db.schema(&request(10, Internal::Hide))?;
+    db.execute(&tables(0), &Interrupt::new())?;
+    let schema = db.schema(&request(10, Internal::Hide), &Interrupt::new())?;
     assert_eq!(schema.objects.len(), MAX_SCHEMA_OBJECTS);
     assert!(schema.truncated);
 
     // `t` and 999 more are exactly the maximum.
     let other = tempfile::tempdir()?;
     let mut db = database(other.path())?;
-    db.execute(&tables(1))?;
-    let schema = db.schema(&request(10, Internal::Hide))?;
+    db.execute(&tables(1), &Interrupt::new())?;
+    let schema = db.schema(&request(10, Internal::Hide), &Interrupt::new())?;
     assert_eq!(schema.objects.len(), MAX_SCHEMA_OBJECTS);
     assert!(!schema.truncated, "exactly the maximum isn't more");
     Ok(())
@@ -601,11 +623,14 @@ fn object_lists_past_the_maximum_are_truncated() -> TestResult {
 fn identifiers_with_quotes_are_counted_safely() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
-    db.execute(&Transaction::new([
-        Statement::new("CREATE TABLE \"we\"\"ird\" (v)"),
-        Statement::new("INSERT INTO \"we\"\"ird\" VALUES (1), (2)"),
-    ]))?;
-    let schema = db.schema(&request(100, Internal::Hide))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE TABLE \"we\"\"ird\" (v)"),
+            Statement::new("INSERT INTO \"we\"\"ird\" VALUES (1), (2)"),
+        ]),
+        &Interrupt::new(),
+    )?;
+    let schema = db.schema(&request(100, Internal::Hide), &Interrupt::new())?;
     assert_eq!(object(&schema, "we\"ird")?.rows, Some(RowCount::Exact(2)));
     Ok(())
 }
@@ -621,10 +646,10 @@ fn a_query_stops_at_its_row_limit_and_says_so() -> TestResult {
         Ok(Statement::new(all).with_max_rows(max))
     };
 
-    let rows = db.query(&limited(2)?)?;
+    let rows = db.query(&limited(2)?, &Interrupt::new())?;
     assert_eq!(rows.rows, [[Value::Integer(1)], [Value::Integer(2)]]);
     assert!(rows.truncated, "a third row exists");
-    let rows = db.query(&limited(3)?)?;
+    let rows = db.query(&limited(3)?, &Interrupt::new())?;
     assert_eq!(rows.rows.len(), 3);
     assert!(!rows.truncated, "exactly the limit isn't truncated");
     let rows = query(&mut db, all)?;
@@ -699,10 +724,13 @@ fn renaming_a_table_into_the_reserved_namespace_is_refused() -> TestResult {
         assert_eq!(message, reserved_refusal(), "`{sql}`");
     }
     // The refusal rolls back the whole transaction, and the table keeps its name and rows.
-    let message = refusal(db.execute(&Transaction::new([
-        Statement::new("INSERT INTO t VALUES (2)"),
-        Statement::new("ALTER TABLE t RENAME TO _fleetring_sinks"),
-    ])))?;
+    let message = refusal(db.execute(
+        &Transaction::new([
+            Statement::new("INSERT INTO t VALUES (2)"),
+            Statement::new("ALTER TABLE t RENAME TO _fleetring_sinks"),
+        ]),
+        &Interrupt::new(),
+    ))?;
     assert_eq!(message, reserved_refusal());
     assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
     assert_eq!(reserved_objects(&db)?, objects(&[]));
@@ -770,21 +798,27 @@ fn names_in_any_case_are_reserved() -> TestResult {
 fn renaming_and_altering_ordinary_tables_still_works() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;
-    db.execute(&Transaction::new([
-        Statement::new("ALTER TABLE t ADD COLUMN w"),
-        Statement::new("ALTER TABLE t RENAME COLUMN w TO x"),
-        Statement::new("ALTER TABLE t DROP COLUMN x"),
-        Statement::new("CREATE TEMP TABLE scratch (v)"),
-        Statement::new("ALTER TABLE temp.scratch RENAME TO scratched"),
-    ]))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("ALTER TABLE t ADD COLUMN w"),
+            Statement::new("ALTER TABLE t RENAME COLUMN w TO x"),
+            Statement::new("ALTER TABLE t DROP COLUMN x"),
+            Statement::new("CREATE TEMP TABLE scratch (v)"),
+            Statement::new("ALTER TABLE temp.scratch RENAME TO scratched"),
+        ]),
+        &Interrupt::new(),
+    )?;
     db.start_recording(CaptureMode::Full)?;
     db.stage("s", &Position::new([1]));
     exec(&mut db, "INSERT INTO t VALUES (2)")?;
-    db.execute(&Transaction::new([
-        Statement::new("ALTER TABLE t RENAME TO u"),
-        Statement::new("ALTER TABLE u ADD COLUMN w"),
-        Statement::new("ALTER TABLE u RENAME COLUMN w TO x"),
-    ]))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("ALTER TABLE t RENAME TO u"),
+            Statement::new("ALTER TABLE u ADD COLUMN w"),
+            Statement::new("ALTER TABLE u RENAME COLUMN w TO x"),
+        ]),
+        &Interrupt::new(),
+    )?;
     let start = db.position()?;
     exec(&mut db, "INSERT INTO u (v) VALUES (3)")?;
     let end = db.position()?.ok_or("a position after a write")?;
@@ -812,18 +846,21 @@ fn a_table_with_triggers_has_no_route_into_the_reserved_namespace() -> TestResul
     let mut db = database(dir.path())?;
     // The review's attack: a table shaped like the marks table, whose triggers copy every row
     // into a table of the user's, renamed into the namespace before the adapter creates its own.
-    db.execute(&Transaction::new([
-        Statement::new("CREATE TABLE plain (sink TEXT PRIMARY KEY, position BLOB NOT NULL)"),
-        Statement::new("CREATE TABLE stolen (sink, position)"),
-        Statement::new(
-            "CREATE TRIGGER copy_insert AFTER INSERT ON plain BEGIN \
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE TABLE plain (sink TEXT PRIMARY KEY, position BLOB NOT NULL)"),
+            Statement::new("CREATE TABLE stolen (sink, position)"),
+            Statement::new(
+                "CREATE TRIGGER copy_insert AFTER INSERT ON plain BEGIN \
              INSERT INTO stolen VALUES (new.sink, new.position); END",
-        ),
-        Statement::new(
-            "CREATE TRIGGER copy_update AFTER UPDATE ON plain BEGIN \
+            ),
+            Statement::new(
+                "CREATE TRIGGER copy_update AFTER UPDATE ON plain BEGIN \
              INSERT INTO stolen VALUES (new.sink, new.position); END",
-        ),
-    ]))?;
+            ),
+        ]),
+        &Interrupt::new(),
+    )?;
     for sql in [
         "ALTER TABLE plain RENAME TO _fleetring_sinks",
         "ALTER TABLE plain RENAME TO _fleetring_cdc",
@@ -1107,10 +1144,13 @@ fn a_watcher_reads_whole_transactions_with_positions_to_resume_after() -> TestRe
     // A transaction that records nothing first, as a fresh table's creation does: the range is
     // still held, though the first recorded row starts after the watcher's position.
     exec(&mut db, "CREATE TABLE u (w)")?;
-    db.execute(&Transaction::new([
-        Statement::new("INSERT INTO t VALUES (2)"),
-        Statement::new("INSERT INTO t VALUES (3)"),
-    ]))?;
+    db.execute(
+        &Transaction::new([
+            Statement::new("INSERT INTO t VALUES (2)"),
+            Statement::new("INSERT INTO t VALUES (3)"),
+        ]),
+        &Interrupt::new(),
+    )?;
     let between = db.position()?.ok_or("a position")?;
     exec(&mut db, "INSERT INTO t VALUES (4)")?;
     let end = db.position()?.ok_or("a position")?;
@@ -1146,9 +1186,14 @@ fn a_watcher_reads_whole_transactions_with_positions_to_resume_after() -> TestRe
 /// The log's end is read after the write, as the actor does when it captures each batch, so
 /// the next transaction records where it starts.
 fn insert_all(db: &mut SqliteDatabase, values: &[i64]) -> Result<(), EngineError> {
-    db.execute(&Transaction::new(values.iter().map(|value| {
-        Statement::new(format!("INSERT INTO t VALUES ({value})"))
-    })))?;
+    db.execute(
+        &Transaction::new(
+            values
+                .iter()
+                .map(|value| Statement::new(format!("INSERT INTO t VALUES ({value})"))),
+        ),
+        &Interrupt::new(),
+    )?;
     db.position()?;
     Ok(())
 }
@@ -1314,10 +1359,13 @@ fn a_rolled_back_first_recorded_transaction_leaves_recording_working() -> TestRe
     let start = db.position()?;
     // The first transaction recording runs creates the change table and the triggers, then fails
     // and rolls them back with it.
-    let failed = db.execute(&Transaction::new([
-        Statement::new("INSERT INTO t VALUES (2)"),
-        Statement::new("INSERT INTO missing VALUES (1)"),
-    ]));
+    let failed = db.execute(
+        &Transaction::new([
+            Statement::new("INSERT INTO t VALUES (2)"),
+            Statement::new("INSERT INTO missing VALUES (1)"),
+        ]),
+        &Interrupt::new(),
+    );
     assert!(failed.is_err());
     exec(&mut db, "INSERT INTO t VALUES (3)")?;
     let end = db.position()?.ok_or("a position after a write")?;
@@ -1327,5 +1375,187 @@ fn a_rolled_back_first_recorded_transaction_leaves_recording_working() -> TestRe
         1,
         "the insert after the rollback is recorded: {changes:?}"
     );
+    Ok(())
+}
+
+/// A recursive CTE that counts forever, which only an interrupt stops.
+const FOREVER: &str =
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c";
+
+/// Registers `trip(condition)` on `conn`: it returns 1, and raises `interrupt` for `why` once
+/// `condition` holds, so a test stops a statement partway through without a clock.
+fn trip_wire(conn: &Connection, interrupt: &Interrupt, why: Interruption) -> TestResult {
+    let interrupt = interrupt.clone();
+    conn.create_scalar_function(
+        "trip",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        move |context| {
+            if context.get::<bool>(0)? {
+                interrupt.raise(why);
+            }
+            Ok(1)
+        },
+    )?;
+    Ok(())
+}
+
+/// How many rows the change table holds.
+fn change_records(db: &SqliteDatabase) -> Result<i64, Box<dyn Error>> {
+    Ok(db.writer.query_row(
+        &format!("SELECT count(*) FROM {}", changes::CHANGES_TABLE),
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+#[test]
+fn a_query_that_would_run_forever_stops_once_its_interrupt_is_raised() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    let interrupt = Interrupt::new();
+    trip_wire(&db.reader, &interrupt, Interruption::Deadline)?;
+    let forever = Statement::new(format!(
+        "SELECT count(*) FROM ({FOREVER}) WHERE trip(x = 10000)"
+    ));
+
+    let stopped = db.query(&forever, &interrupt);
+    assert!(
+        matches!(
+            stopped,
+            Err(EngineError::Interrupted(Interruption::Deadline))
+        ),
+        "{stopped:?}"
+    );
+    // The connection serves the next query at once, with no interrupt left behind.
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
+    Ok(())
+}
+
+#[test]
+fn an_interrupted_write_rolls_back_with_its_change_records_and_ships_nothing() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    // A recorded write first, so that the change table exists.
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    let records = change_records(&db)?;
+    let before = db.position()?.ok_or("a position after a write")?;
+    let interrupt = Interrupt::new();
+    trip_wire(&db.writer, &interrupt, Interruption::Cancelled)?;
+
+    // Thousands of rows go in, each recorded, before the trip wire stops the insert.
+    let runaway = Transaction::new([
+        Statement::new("INSERT INTO t VALUES (3)"),
+        Statement::new(format!(
+            "INSERT INTO t SELECT x + 100 FROM ({FOREVER}) WHERE trip(x = 5000)"
+        )),
+    ]);
+    let stopped = db.execute(&runaway, &interrupt);
+    assert!(
+        matches!(
+            stopped,
+            Err(EngineError::Interrupted(Interruption::Cancelled))
+        ),
+        "{stopped:?}"
+    );
+    assert!(db.writer.is_autocommit(), "no transaction is left open");
+    assert_eq!(
+        values(&mut db)?,
+        [[Value::Integer(1)], [Value::Integer(2)]],
+        "no row of the interrupted transaction stays"
+    );
+    assert_eq!(change_records(&db)?, records, "no change record stays");
+    assert_eq!(
+        db.position()?.as_ref(),
+        Some(&before),
+        "nothing reached the WAL"
+    );
+    assert!(
+        db.committed_since(Some(&before))?.is_none(),
+        "no batch to ship"
+    );
+
+    // The writer takes the next write at once, and records only it.
+    exec(&mut db, "INSERT INTO t VALUES (4)")?;
+    let after = db.position()?.ok_or("a position after a write")?;
+    let changes = db.changes_between(Some(&before), &after)?;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    Ok(())
+}
+
+#[test]
+fn a_raised_interrupt_stops_a_call_before_it_starts() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    let before = db.position()?;
+    let interrupt = Interrupt::new();
+    interrupt.raise(Interruption::Cancelled);
+
+    let write = db.execute(
+        &Transaction::from(Statement::new("INSERT INTO t VALUES (2)")),
+        &interrupt,
+    );
+    assert!(
+        matches!(
+            write,
+            Err(EngineError::Interrupted(Interruption::Cancelled))
+        ),
+        "{write:?}"
+    );
+    let read = db.query(&Statement::new("SELECT v FROM t"), &interrupt);
+    assert!(matches!(read, Err(EngineError::Interrupted(_))), "{read:?}");
+    let schema = db.schema(&request(10, Internal::Hide), &interrupt);
+    assert!(
+        matches!(schema, Err(EngineError::Interrupted(_))),
+        "{schema:?}"
+    );
+    assert_eq!(db.position()?, before);
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
+    Ok(())
+}
+
+#[test]
+fn the_schema_reads_own_statements_stop_once_its_interrupt_is_raised() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    exec(
+        &mut db,
+        &format!("INSERT INTO t SELECT x + 1 FROM ({FOREVER}) LIMIT 50000"),
+    )?;
+    // Past the check before it starts, as an interrupt raised while the read runs is: the
+    // counting statement runs long enough for the progress handler to see it.
+    let interrupt = Interrupt::new();
+    interrupt.raise(Interruption::Deadline);
+    let read = {
+        let _interruptible = Interruptible::watch(&db.reader, &interrupt);
+        schema::read(&db.reader, &request(100_000, Internal::Hide))
+            .map_err(|error| stopped_by(&interrupt, error))
+    };
+    assert!(
+        matches!(read, Err(EngineError::Interrupted(Interruption::Deadline))),
+        "{read:?}"
+    );
+    // The handler is gone with the guard: the next read counts every row.
+    let schema = db.schema(&request(100_000, Internal::Hide), &Interrupt::new())?;
+    assert_eq!(schema.objects[0].rows, Some(RowCount::Exact(50_001)));
+    Ok(())
+}
+
+#[test]
+fn a_write_whose_statements_finished_commits_whatever_its_interrupt_says_after() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    let interrupt = Interrupt::new();
+    trip_wire(&db.writer, &interrupt, Interruption::Deadline)?;
+    // The statement raises the interrupt as it finishes, too late to stop it, and the
+    // adapter's own statements and the commit that follow run without a check.
+    let executed = db.execute(
+        &Transaction::from(Statement::new("INSERT INTO t VALUES (trip(1) + 1)")),
+        &interrupt,
+    )?;
+    assert_eq!(executed.rows_affected, 1);
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)], [Value::Integer(2)]]);
     Ok(())
 }

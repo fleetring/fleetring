@@ -25,6 +25,16 @@
 //! database, loads an extension, or runs a pragma other than read-only introspection is refused
 //! as a statement error, so it can't reach another database's files or change how this one is
 //! journaled and checkpointed. The connections also run in SQLite's defensive mode.
+//!
+//! A user statement, and a schema read, stop once their call's [`Interrupt`] is raised (FR-078):
+//! while one runs, SQLite's progress handler checks the interrupt every
+//! [`INTERRUPT_CHECK_OPS`] virtual-machine instructions, and fails the statement with
+//! `SQLITE_INTERRUPT` once it is raised. The write transaction the statement ran in then rolls
+//! back, change records and all, as after any failed statement: nothing commits, so no batch
+//! ships, though pages a large transaction spilled may sit in the WAL past its committed end until
+//! the next commit overwrites them. The adapter's own statements around a write, its change
+//! records and sink marks and its `COMMIT`, run with no handler, so a transaction whose
+//! statements finished always commits.
 
 mod changes;
 mod follower;
@@ -37,7 +47,7 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{OsString, c_int};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write as _};
@@ -60,8 +70,8 @@ use self::reserved::{Reserved, is_reserved};
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
     DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
-    FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode,
-    PinnedSnapshot, Position, ReadLimit, RecordedTransaction, RowChange, Rows, Schema,
+    FrameFollower, FrameSource, FrameSourceEngine, Interrupt, LogicalChanges, LogicalSupport,
+    OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, RowChange, Rows, Schema,
     SchemaRequest, SinkMarks, SnapshotFile, Statement, Transaction, Value,
 };
 
@@ -76,6 +86,12 @@ const CHECKPOINT_FILE: &str = "data.db-checkpoint";
 
 /// The smallest and largest page sizes SQLite supports.
 const PAGE_SIZES: std::ops::RangeInclusive<u32> = 512..=65536;
+
+/// How many SQLite virtual-machine instructions run between two checks of a running statement's
+/// [`Interrupt`]. A check reads one atomic flag, so at a thousand instructions, a few
+/// microseconds of work, it costs nothing measurable, and a statement stops within microseconds
+/// of its interrupt.
+const INTERRUPT_CHECK_OPS: c_int = 1_000;
 
 /// Why SQL with a second statement after the first is refused: `Execute` and `Query` run one
 /// statement each, and a batch of several waits for the router's sessions (FR-066). Nothing
@@ -95,13 +111,15 @@ const ONE_STATEMENT: &str = "a call runs one statement; send each in a call of i
 /// # Examples
 ///
 /// ```
-/// use fleetringd::engine::{DatabaseEngine, OpenMode, SqliteEngine, Statement, Transaction};
+/// use fleetringd::engine::{
+///     DatabaseEngine, Interrupt, OpenMode, SqliteEngine, Statement, Transaction,
+/// };
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let dir = tempfile::tempdir()?;
 /// let engine = SqliteEngine::new(4096)?;
 /// let mut db = engine.open(dir.path(), OpenMode::Create)?;
-/// db.execute(&Transaction::from(Statement::new("CREATE TABLE t (v)")))?;
+/// db.execute(&Transaction::from(Statement::new("CREATE TABLE t (v)")), &Interrupt::new())?;
 /// db.close()?;
 /// # Ok(())
 /// # }
@@ -305,12 +323,17 @@ impl SqliteDatabase {
         wal_path(&self.path)
     }
 
-    fn run_statements(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
+    fn run_statements(
+        &mut self,
+        transaction: &Transaction,
+        interrupt: &Interrupt,
+    ) -> Result<(), EngineError> {
         self.reserved.remember(&self.writer)?;
         for statement in transaction.statements() {
             {
                 let _user = UserStatement::enter(&self.writing);
-                run(&self.writer, statement, &self.writing)?;
+                let _interruptible = Interruptible::watch(&self.writer, interrupt);
+                run(&self.writer, statement, &self.writing, interrupt)?;
             }
             // The authorizer sees a renamed table's old name only, so a rename into the reserved
             // namespace shows only in the schema it leaves behind.
@@ -438,7 +461,13 @@ fn frame_batch(batch: &Batch) -> FrameBatch {
 }
 
 impl Database for SqliteDatabase {
-    fn execute(&mut self, transaction: &Transaction) -> Result<Executed, EngineError> {
+    fn execute(
+        &mut self,
+        transaction: &Transaction,
+        interrupt: &Interrupt,
+    ) -> Result<Executed, EngineError> {
+        // A caller that has already gone, or run out of time, gets nothing started.
+        interrupt.check()?;
         self.writer
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(classify)?;
@@ -464,7 +493,7 @@ impl Database for SqliteDatabase {
             return Err(error);
         }
         let before = self.writer.total_changes();
-        if let Err(error) = self.run_statements(transaction) {
+        if let Err(error) = self.run_statements(transaction, interrupt) {
             self.roll_back();
             return Err(error);
         }
@@ -496,11 +525,15 @@ impl Database for SqliteDatabase {
         })
     }
 
-    fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError> {
+    fn query(&mut self, statement: &Statement, interrupt: &Interrupt) -> Result<Rows, EngineError> {
+        interrupt.check()?;
         // Confined while it steps too: SQLite prepares statements of its own while stepping some,
         // such as a pragma table-valued function's pragma, and reprepares after a schema change.
         let _user = UserStatement::enter(&self.reading);
-        let classify = |error| self.reading.classify(error);
+        let _interruptible = Interruptible::watch(&self.reader, interrupt);
+        let classify = |error: rusqlite::Error| {
+            interrupted(&error, interrupt).unwrap_or_else(|| self.reading.classify(error))
+        };
         let mut prepared = self
             .reader
             .prepare_cached(statement.sql())
@@ -540,9 +573,16 @@ impl Database for SqliteDatabase {
         })
     }
 
-    fn schema(&mut self, request: &SchemaRequest) -> Result<Schema, EngineError> {
+    fn schema(
+        &mut self,
+        request: &SchemaRequest,
+        interrupt: &Interrupt,
+    ) -> Result<Schema, EngineError> {
+        interrupt.check()?;
         // The adapter's own statements, on the read connection, with the user confinement off.
-        schema::read(&self.reader, request)
+        // The scan budget bounds the counting; the interrupt bounds it in time as well.
+        let _interruptible = Interruptible::watch(&self.reader, interrupt);
+        schema::read(&self.reader, request).map_err(|error| stopped_by(interrupt, error))
     }
 
     fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {
@@ -1092,13 +1132,57 @@ fn keep_wal_on_close(conn: &Connection) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Runs a user statement on `conn`, which `confinement` confines.
+/// Stops the statements a connection runs once an [`Interrupt`] is raised, while it lives: it
+/// installs SQLite's progress handler, and removes it when dropped.
+struct Interruptible<'c>(&'c Connection);
+
+impl<'c> Interruptible<'c> {
+    fn watch(conn: &'c Connection, interrupt: &Interrupt) -> Self {
+        let interrupt = interrupt.clone();
+        conn.progress_handler(
+            INTERRUPT_CHECK_OPS,
+            Some(move || interrupt.raised().is_some()),
+        );
+        Self(conn)
+    }
+}
+
+impl Drop for Interruptible<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+/// The error for a statement `interrupt` stopped, if `error` is SQLite's report of one.
+fn interrupted(error: &rusqlite::Error, interrupt: &Interrupt) -> Option<EngineError> {
+    if error.sqlite_error_code() != Some(ErrorCode::OperationInterrupted) {
+        return None;
+    }
+    interrupt.raised().map(EngineError::Interrupted)
+}
+
+/// `error`, or [`EngineError::Interrupted`] if it is a storage error that SQLite reported because
+/// `interrupt` stopped one of the adapter's own statements.
+fn stopped_by(interrupt: &Interrupt, error: EngineError) -> EngineError {
+    let stopped = match &error {
+        EngineError::Storage(source) => source
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|source| interrupted(source, interrupt)),
+        _ => None,
+    };
+    stopped.unwrap_or(error)
+}
+
+/// Runs a user statement on `conn`, which `confinement` confines, until `interrupt` stops it.
 fn run(
     conn: &Connection,
     statement: &Statement,
     confinement: &Confinement,
+    interrupt: &Interrupt,
 ) -> Result<(), EngineError> {
-    let classify = |error| confinement.classify(error);
+    let classify = |error: rusqlite::Error| {
+        interrupted(&error, interrupt).unwrap_or_else(|| confinement.classify(error))
+    };
     let mut prepared = conn.prepare_cached(statement.sql()).map_err(classify)?;
     let mut rows = prepared
         .query(rusqlite::params_from_iter(

@@ -1056,6 +1056,13 @@ struct SqlArgs {
     /// The command follows the node's redirect.
     #[arg(long)]
     address: Option<String>,
+    /// How long the statement may take: `<n>m` or `<n>s`
+    ///
+    /// The primary interrupts it once this passes, and the command fails with exit code 4; a
+    /// write then rolls back unless it had committed. Without it, the primary's
+    /// `[limits] statement_timeout_ms` applies, 30s by default, which also caps a longer one.
+    #[arg(long, value_parser = parse_ttl)]
+    timeout: Option<Duration>,
     #[command(flatten)]
     target: Target,
 }
@@ -3141,6 +3148,9 @@ impl SqlArgs {
         };
         if let Some(entry) = entry {
             client = client.with_entry(entry);
+        }
+        if let Some(timeout) = self.timeout {
+            client = client.with_call_timeout(timeout);
         }
         Ok((
             client,
