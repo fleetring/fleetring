@@ -1,6 +1,6 @@
 # fleetringd
 
-The FleetRing daemon and its command line. It places, replicates, and fails over SQLite databases across machines you own. The package builds one binary, `fleetring`: `fleetring serve` runs a data node, the control node, or both (a one-machine fleet), and its other commands talk to a running fleet. The package keeps its name, `fleetringd`, and until 1.0 the binary is also installed under that name, so service units and scripts written for 0.6 keep working ([ADR-0043](https://github.com/fleetring/fleetring/blob/main/docs/adr/0043-the-fleetring-cli.md)).
+The FleetRing daemon and its command line. It places, replicates, and fails over SQLite databases across machines you own. The package builds one binary, `fleetring`: `fleetring serve` runs a data node, the control node, or both (a one-machine fleet), and its other commands talk to a running fleet. The package keeps its name, `fleetringd`, and until 1.0 the binary is also installed under that name, so service units and scripts written for 0.6 keep working, and `fleet` is a permanent short name for it ([ADR-0043](https://github.com/fleetring/fleetring/blob/main/docs/adr/0043-the-fleetring-cli.md)).
 
 > **Status:** early development. Not production-ready.
 
@@ -452,7 +452,7 @@ Every request runs in an `rpc` span with `service`, `method`, and `request_id`, 
 
 - **The container image**, for `linux/amd64` and `linux/arm64`: `ghcr.io/fleetring/fleetring`, also published as `ghcr.io/fleetring/fleetringd` until 1.0. It runs `fleetring serve --config /etc/fleetring/fleetringd.toml`.
 
-The install script and the image install `fleetring` with `fleetringd` as a link to it, and each archive holds both (two copies on Windows). The release archives keep their names, `fleetringd-<version>-<target>`, so that a 0.6 `upgrade` finds them.
+The install script and the image install `fleetring` with `fleetringd` and `fleet` as links to it, and each archive holds `fleetring` and `fleetringd` (two copies on Windows; no `fleet`). The script adds `fleet` only if `PREFIX/bin/fleet` is absent or already a link to fleetring, and no other `fleet` (Rancher Fleet's CLI, JetBrains Fleet's launcher) is on your `PATH`; `--no-alias` or `FLEETRINGD_NO_ALIAS=1` skips it. A host upgraded by `fleetring upgrade` keeps a `fleet` link working, and doesn't gain one: run `install.sh` for that. The release archives keep their names, `fleetringd-<version>-<target>`, so that a 0.6 `upgrade` finds them.
 
 **Shell completions.** `fleetring completions bash|zsh|fish|powershell` prints a script that completes commands, flags, and values, with context names and agent IDs read from this machine's files. Load it from the shell's startup file:
 
