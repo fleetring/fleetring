@@ -41,6 +41,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | Getting started | `dev [-d] [--data-dir <dir>] [--port <n>]` | Runs a dev node on loopback (ADR-0039); `-d` runs it in the background |
 | | `dev stop \| status \| logs [-f]` | Stops, describes, or shows the log of the background dev node |
 | | `serve --config <file> [daemon flags]` | Runs a node |
+| | `serve --config <file> [daemon flags] --check [--json]` | Checks the file and the flags as a start would, and starts nothing (#95) |
 | | `stop (--data-dir <dir> \| --config <file>)` | Stops a node started in a terminal or script: drains, leaves, waits |
 | | `switch [<name> \| -]` | Makes a context current; with no name, a picker; `-` goes back |
 | | `context list \| show \| current \| add \| use \| remove` | Manages contexts (§4) |
@@ -199,8 +200,9 @@ PS1='$(fleetring context current) $ '
   | `context list`, `context show` | `contexts`, each `name`, `current`, `fleet`, `control`, `tls_dir`, `ca`, `cert`, `key`, `as` and `token_file`; `show` prints one context alone |
   | `agent list`, `agent show` | `agents`, each `id`, `principal`, `scopes`, `read_only`, `cert_expires_at`, `token_expires_at`, `issued_by` and `dir` |
   | `dev status` | `running`, `pid`, `address`, `release`, `data_dir` and `log` |
+  | `serve --check` | `config`, the file as given; `valid`; `node` and `role`, with the flags applied, or `null` if the file couldn't be read or parsed; and `problems`, each `field` (dotted, such as `admin.listen`, or `null`), `line` and `column` (from 1, or `null`) and `message`. The check stops at the first problem, as a start does |
 
-  Tests pin each command's fields and their types, so a rename fails CI: `crates/fleetringd/tests/output.rs` runs the commands against a node, `tests/watch.rs` pins `db watch`'s, and unit tests beside the code that builds them pin the rest (`archive show`, `status --node`'s sinks, `context`, `agent`, `dev status` and `db edit`).
+  Tests pin each command's fields and their types, so a rename fails CI: `crates/fleetringd/tests/output.rs` runs the commands against a node, `tests/watch.rs` pins `db watch`'s, and unit tests beside the code that builds them pin the rest (`archive show`, `status --node`'s sinks, `context`, `agent`, `dev status` and `db edit`), and `tests/daemon.rs` pins `serve --check`'s.
 
 ### Terminals, pipes and CI
 
@@ -255,7 +257,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
 | Code | Meaning |
 |---|---|
 | 0 | Success. `dev -d` when the dev node already runs, `dev status` either way. |
-| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`), no node to `stop`, or an agent with no identity outside dev mode. |
+| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, or an agent with no identity outside dev mode. |
 | 2 | Usage: a bad flag or argument, a confirmation needed without a terminal, or `switch` with no name and no terminal. |
 | 3 | Authentication or authorization: `UNAUTHENTICATED` or `PERMISSION_DENIED`. |
 | 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, `DEADLINE_EXCEEDED`, no leader yet. |

@@ -165,6 +165,22 @@ impl Daemon {
         Self::start_with(config, Environment::production()).await
     }
 
+    /// Checks `config` as [`Daemon::start`] does before it reads anything else: the rules
+    /// [`Config::validate`] applies, that the node has an identity or may run in plaintext, that
+    /// `[admin] tls` has an identity to serve, and that `[engine] page_size` is a page size.
+    ///
+    /// It reads no file the configuration names (certificates, keys, token or credentials
+    /// files), no environment variable, and no data directory, and binds nothing: the node reads
+    /// those when it starts. So the answer is the same for whoever asks, which is what
+    /// `fleetring serve --check` and an upgrade checking a node's configuration need.
+    ///
+    /// # Errors
+    ///
+    /// The [`StartError`] [`Daemon::start`] would fail with for these rules.
+    pub fn check(config: &Config) -> Result<(), StartError> {
+        check_with(config, &Security::Plaintext)
+    }
+
     /// Starts the daemon as [`Daemon::start`] does, in `environment`: its listener and peer
     /// connections, replication's included, use the environment's network, the control node and
     /// replication read its clock, and blocking storage calls run as its execution says.
@@ -190,7 +206,7 @@ impl Daemon {
         mut config: Config,
         environment: Environment,
     ) -> Result<Self, StartError> {
-        config.validate()?;
+        check_with(&config, environment.network().security())?;
         // A prefix without a separator covers more than it seems to (ADR-0041, point 5); the
         // scope still loads, since changing what it covers would break existing principals.
         for principal in &config.principals {
@@ -503,6 +519,41 @@ impl Daemon {
     }
 }
 
+/// What [`Daemon::check`] checks, with `provided`, the identity the environment's network
+/// already carries, if any, in place of a `[tls]` table.
+fn check_with(config: &Config, provided: &Security) -> Result<(), StartError> {
+    config.validate()?;
+    let identity = config.tls.is_some() || !provided.is_plaintext();
+    if !identity && config.insecure_plaintext == Plaintext::Refused {
+        return Err(no_identity());
+    }
+    if !identity
+        && config.admin.enabled == AdminListener::Enabled
+        && config.admin.tls != AdminTls::Off
+    {
+        return Err(no_admin_identity());
+    }
+    SqliteEngine::new(config.engine.page_size)?;
+    Ok(())
+}
+
+/// A node with no identity that may not run in plaintext.
+fn no_identity() -> StartError {
+    StartError::Config(ConfigError::Missing {
+        field: "tls",
+        reason: "every connection carries a certificate; add a [tls] table with ca, cert, and key \
+                 (see `fleetringd cert`), or pass --insecure-plaintext to run without one",
+    })
+}
+
+/// `[admin] tls = true` with no identity to serve.
+fn no_admin_identity() -> StartError {
+    StartError::Config(ConfigError::Missing {
+        field: "tls",
+        reason: "admin.tls = true serves the node's certificate; add a [tls] table",
+    })
+}
+
 /// The identity every connection carries: the `[tls]` files, or else the one the environment's
 /// network already has, or else plaintext if the configuration allows it.
 fn security(config: &Config, environment: &Environment) -> Result<Security, StartError> {
@@ -528,12 +579,7 @@ fn security(config: &Config, environment: &Environment) -> Result<Security, Star
             );
             Ok(Security::Plaintext)
         }
-        Plaintext::Refused => Err(StartError::Config(ConfigError::Missing {
-            field: "tls",
-            reason: "every connection carries a certificate; add a [tls] table with ca, cert, \
-                     and key (see `fleetringd cert`), or pass --insecure-plaintext to run \
-                     without one",
-        })),
+        Plaintext::Refused => Err(no_identity()),
     }
 }
 
@@ -567,10 +613,7 @@ fn admin_tls(config: &Config, security: &Security) -> Result<Option<AdminTlsPart
             identity: identity.clone(),
             scrapers: config.admin.scrapers.clone(),
         })),
-        Security::Plaintext => Err(StartError::Config(ConfigError::Missing {
-            field: "tls",
-            reason: "admin.tls = true serves the node's certificate; add a [tls] table",
-        })),
+        Security::Plaintext => Err(no_admin_identity()),
     }
 }
 

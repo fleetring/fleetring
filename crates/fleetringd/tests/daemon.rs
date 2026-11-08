@@ -172,6 +172,208 @@ fn a_locked_data_directory_refuses_a_second_daemon() -> TestResult {
     Err("the data directory stayed locked after the first lock was dropped".into())
 }
 
+/// `fleetring serve --check` (#95): whether a node would start with a configuration and its
+/// flags, without starting anything.
+mod check {
+    use std::path::{Path, PathBuf};
+    use std::process::Output;
+
+    use super::TestResult;
+
+    /// Writes `text` as `dir/node.toml`, with `data_dir` set to `dir/data`, which nothing creates.
+    fn write(dir: &Path, text: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = dir.join("node.toml");
+        let data_dir = dir.join("data");
+        std::fs::write(&path, format!("data_dir = {data_dir:?}\n{text}"))?;
+        Ok(path)
+    }
+
+    /// A configuration a node starts with: plaintext, so it names no file, on `listen`.
+    fn valid(listen: &str) -> String {
+        format!(
+            "listen = \"{listen}\"\ninsecure_plaintext = true\n\n[node]\nid = \"node-1\"\n\n\
+             [admin]\nenabled = false\n"
+        )
+    }
+
+    fn check(config: &Path, extra: &[&str]) -> Result<Output, Box<dyn std::error::Error>> {
+        Ok(crate::support::fleetring()
+            .args(["serve", "--config"])
+            .arg(config)
+            .arg("--check")
+            .args(extra)
+            .output()?)
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn a_valid_configuration_passes_and_nothing_is_started_or_created() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        // The listen address is taken: a check binds nothing, so it doesn't notice.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let config = write(dir.path(), &valid(&taken.local_addr()?.to_string()))?;
+        let output = check(&config, &[])?;
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        assert_eq!(
+            text(&output.stdout),
+            format!("{}: valid for node node-1, role both\n", config.display())
+        );
+        assert_eq!(text(&output.stderr), "");
+        assert!(
+            !dir.path().join("data").exists(),
+            "the data directory was made"
+        );
+        // The flags apply as they do to a start, and the 0.6 form reads as `serve`.
+        let flagged = crate::support::fleetring()
+            .arg("--config")
+            .arg(&config)
+            .args(["--node-id", "node-9", "--role", "control", "--check"])
+            .output()?;
+        assert_eq!(
+            text(&flagged.stdout),
+            format!(
+                "{}: valid for node node-9, role control\n",
+                config.display()
+            ),
+            "{}",
+            text(&flagged.stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_configuration_fails_naming_the_file_and_the_field() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        // A rule across fields, which validation checks after parsing.
+        let config = write(
+            dir.path(),
+            &valid("127.0.0.1:7400").replace("enabled = false", "listen = \"0.0.0.0:7401\""),
+        )?;
+        let output = check(&config, &[])?;
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(text(&output.stdout), "");
+        assert_eq!(
+            text(&output.stderr),
+            format!(
+                "fleetring: {}: field admin.listen: 0.0.0.0:7401 isn't a loopback address; set \
+                 admin.tls = true, or admin.allow_plaintext = true on a network you control\n",
+                config.display()
+            )
+        );
+        // A key the parser refuses is placed by line and column, and named in full.
+        let config = write(
+            dir.path(),
+            &format!("{}port = 7401\n", valid("127.0.0.1:7400")),
+        )?;
+        let output = check(&config, &[])?;
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.starts_with(&format!(
+                "fleetring: {}:10:1: field admin.port: unknown field `port`",
+                config.display()
+            )),
+            "{stderr}"
+        );
+        // A flag that breaks a rule fails as the start would.
+        let config = write(dir.path(), &valid("127.0.0.1:7400"))?;
+        let output = check(&config, &["--role", "data"])?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            text(&output.stderr).contains("field control.address: is required: a data-only node"),
+            "{}",
+            text(&output.stderr)
+        );
+        // Without an identity, and without plaintext, the node has none.
+        let config = write(
+            dir.path(),
+            &valid("127.0.0.1:7400").replace("insecure_plaintext = true\n", ""),
+        )?;
+        let output = check(&config, &[])?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            text(&output.stderr).contains("field tls: is required: every connection carries"),
+            "{}",
+            text(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_file_fails_naming_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("missing.toml");
+        let output = check(&missing, &[])?;
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.starts_with(&format!(
+                "fleetring: {}: can't read it: ",
+                missing.display()
+            )),
+            "{stderr}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_reports_the_result_and_its_problems() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let config = write(dir.path(), &valid("127.0.0.1:7400"))?;
+        let output = check(&config, &["--json"])?;
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "config": config.display().to_string(),
+                "valid": true,
+                "node": "node-1",
+                "role": "both",
+                "problems": [],
+            })
+        );
+
+        let config = write(
+            dir.path(),
+            &valid("127.0.0.1:7400").replace("id = \"node-1\"", "id = \"node-1\"\nweight = 0"),
+        )?;
+        let output = check(&config, &["-o", "json"])?;
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["valid"], false);
+        assert_eq!(report["node"], serde_json::Value::Null);
+        let problem = &report["problems"][0];
+        assert_eq!(problem["field"], "node.weight", "{report}");
+        assert_eq!(problem["line"], 7, "{report}");
+        assert_eq!(problem["column"], 10, "{report}");
+        assert!(problem["message"].is_string(), "{report}");
+        // The failure goes to stderr too, as for any check that fails.
+        assert!(
+            text(&output.stderr).contains("field node.weight"),
+            "{}",
+            text(&output.stderr)
+        );
+
+        // The format flags are the check's: without `--check` they are a usage error.
+        let unchecked = crate::support::fleetring()
+            .args(["serve", "--config"])
+            .arg(&config)
+            .arg("--json")
+            .output()?;
+        assert_eq!(
+            unchecked.status.code(),
+            Some(2),
+            "{}",
+            text(&unchecked.stderr)
+        );
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 mod binary {
     use std::io::{BufRead, BufReader};
