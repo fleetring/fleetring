@@ -497,6 +497,7 @@ fn host_config(
         // The admin listener doesn't start on a simulated network; the sampler runs on its clock.
         admin: crate::AdminConfig::default(),
         log: crate::LogConfig::default(),
+        limits: crate::LimitsConfig::default(),
     })
 }
 

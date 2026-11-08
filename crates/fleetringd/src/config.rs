@@ -51,7 +51,8 @@ use crate::tls::Principal;
 /// The `[replication]` table paces replication, and sets the replication factor and durability
 /// of databases created without them; see [`ReplicationConfig`]. The `[changes]`
 /// table lists the sinks that receive each database's changes; see [`ChangesConfig`]. Each
-/// `[[archive]]` entry writes databases to an object store; see [`ArchiveConfig`].
+/// `[[archive]]` entry writes databases to an object store; see [`ArchiveConfig`]. The
+/// `[limits]` table bounds how long a statement runs on a data node; see [`LimitsConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -105,6 +106,50 @@ pub struct Config {
     /// How the daemon writes its log lines.
     #[serde(default)]
     pub log: LogConfig,
+    /// What one request may take on a data node (FR-078).
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// How long a statement may run on a data node unless `[limits] statement_timeout_ms` says
+/// otherwise: 30 seconds.
+const DEFAULT_STATEMENT_TIMEOUT: NonZeroU64 = NonZeroU64::new(30_000).expect("30000 is nonzero");
+
+/// The `[limits]` table: what one request may take on a data node (FR-078). New in 0.8.0.
+///
+/// ```toml
+/// [limits]
+/// statement_timeout_ms = 30000   # the longest a write, query, or schema read runs
+/// ```
+///
+/// A statement still running at its deadline is interrupted on the node: a query or a schema
+/// read fails, and a write rolls back, committing and replicating nothing. The client gets
+/// `DEADLINE_EXCEEDED`. A request whose call sets its own deadline (the gRPC `grpc-timeout`
+/// header, which `db query --timeout` and `fleetring mcp` send) stops at the earlier of that and
+/// this limit, and one whose call is cancelled stops at once. The deadline counts from when the
+/// node takes the request, so it includes any wait behind the database's other requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// The longest a statement may run, in milliseconds: the default deadline of every write,
+    /// query, and schema read, and the cap on a deadline a client asks for. At least 1.
+    pub statement_timeout_ms: NonZeroU64,
+}
+
+impl LimitsConfig {
+    /// Returns the longest a statement may run.
+    #[must_use]
+    pub fn statement_timeout(&self) -> Duration {
+        Duration::from_millis(self.statement_timeout_ms.get())
+    }
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT,
+        }
+    }
 }
 
 /// The `[log]` table: how the daemon writes its log lines (ADR-0034 point 8).
@@ -1035,6 +1080,22 @@ mod tests {
         assert!(message.contains("nonzero replication factor"), "{message}");
         let large = with("\n[replication]\nreplication_factor = 256\n");
         assert!(large.is_err(), "a factor above 255: {large:?}");
+    }
+
+    #[test]
+    fn the_statement_timeout_defaults_to_thirty_seconds_and_is_at_least_one_millisecond() {
+        let defaults = with("").expect("a minimal config");
+        let empty = with("\n[limits]\n").expect("an empty [limits] table");
+        assert_eq!(defaults.limits, empty.limits);
+        assert_eq!(defaults.limits.statement_timeout(), Duration::from_secs(30));
+        let short = with("\n[limits]\nstatement_timeout_ms = 250\n").expect("a short timeout");
+        assert_eq!(short.limits.statement_timeout(), Duration::from_millis(250));
+        let zero = with("\n[limits]\nstatement_timeout_ms = 0\n").expect_err("a zero timeout");
+        let message = zero.to_string();
+        assert!(matches!(zero, ConfigError::Parse(_)), "{message}");
+        assert!(message.contains("statement_timeout_ms"), "{message}");
+        let unknown = with("\n[limits]\nstatement_timeout = \"30s\"\n");
+        assert!(unknown.is_err(), "unknown fields are refused: {unknown:?}");
     }
 
     #[test]

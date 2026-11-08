@@ -39,9 +39,9 @@ pub mod upgrade;
 pub use actor::{DatabaseError, DatabaseHandle, Stored};
 pub use config::{
     AdminConfig, AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, ControlSettings,
-    HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LogConfig, LogFormat, MembershipSettings,
-    NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext, PrincipalConfig,
-    ReplicationConfig, TlsConfig, TokenForwarding,
+    HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig, LogFormat,
+    MembershipSettings, NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext,
+    PrincipalConfig, ReplicationConfig, TlsConfig, TokenForwarding,
 };
 pub use daemon::{Daemon, StartError, Stop};
 pub use data_dir::{DataDir, DataDirError};
@@ -62,6 +62,7 @@ const _: () = {
     assert_debug_send_sync::<AdminListener>();
     assert_debug_send_sync::<AdminPlaintext>();
     assert_debug_send_sync::<AdminTls>();
+    assert_debug_send_sync::<LimitsConfig>();
     assert_debug_send_sync::<LogConfig>();
     assert_debug_send_sync::<LogFormat>();
     assert_debug_send_sync::<ParseLogFormatError>();

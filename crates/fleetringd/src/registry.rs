@@ -7,6 +7,7 @@ use std::{io, mem};
 
 use fleetring_control::DatabaseName;
 use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 
 use crate::actor::{
     self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Published, Stored,
@@ -186,10 +187,41 @@ impl Registry {
         name: &DatabaseName,
         transaction: Transaction,
     ) -> Result<Published, DatabaseError> {
+        self.commit_until(name, transaction, None).await
+    }
+
+    /// As [`execute`](Self::execute), but the transaction's statements stop at `deadline`,
+    /// waiting in the database's mailbox included, and the transaction then rolls back
+    /// (FR-078).
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Self::execute); a [`DatabaseError::Engine`] with
+    /// [`EngineError::Interrupted`] if the deadline stopped it, when nothing committed.
+    pub async fn execute_until(
+        &self,
+        name: &DatabaseName,
+        transaction: Transaction,
+        deadline: Instant,
+    ) -> Result<Stored, DatabaseError> {
+        self.commit_until(name, transaction, Some(deadline))
+            .await?
+            .stored()
+            .await
+    }
+
+    /// As [`commit`](Self::commit), with the transaction's statements stopped at `deadline` if
+    /// there is one.
+    pub(crate) async fn commit_until(
+        &self,
+        name: &DatabaseName,
+        transaction: Transaction,
+        deadline: Option<Instant>,
+    ) -> Result<Published, DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
-                return handle.commit_reserved(permit, transaction).await;
+                return handle.commit_reserved(permit, transaction, deadline).await;
             }
         }
     }
@@ -204,10 +236,35 @@ impl Registry {
         name: &DatabaseName,
         statement: Statement,
     ) -> Result<Rows, DatabaseError> {
+        self.query_within(name, statement, None).await
+    }
+
+    /// As [`query`](Self::query), but the query stops at `deadline`, waiting in the database's
+    /// mailbox included (FR-078).
+    ///
+    /// # Errors
+    ///
+    /// As [`query`](Self::query); a [`DatabaseError::Engine`] with
+    /// [`EngineError::Interrupted`] if the deadline stopped it.
+    pub async fn query_until(
+        &self,
+        name: &DatabaseName,
+        statement: Statement,
+        deadline: Instant,
+    ) -> Result<Rows, DatabaseError> {
+        self.query_within(name, statement, Some(deadline)).await
+    }
+
+    async fn query_within(
+        &self,
+        name: &DatabaseName,
+        statement: Statement,
+        deadline: Option<Instant>,
+    ) -> Result<Rows, DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
-                return handle.query_reserved(permit, statement).await;
+                return handle.query_reserved(permit, statement, deadline).await;
             }
         }
     }
@@ -222,10 +279,34 @@ impl Registry {
         name: &DatabaseName,
         request: SchemaRequest,
     ) -> Result<Schema, DatabaseError> {
+        self.schema_within(name, request, None).await
+    }
+
+    /// As [`schema`](Self::schema), but the read stops at `deadline` (FR-078).
+    ///
+    /// # Errors
+    ///
+    /// As [`schema`](Self::schema); a [`DatabaseError::Engine`] with
+    /// [`EngineError::Interrupted`] if the deadline stopped it.
+    pub async fn schema_until(
+        &self,
+        name: &DatabaseName,
+        request: SchemaRequest,
+        deadline: Instant,
+    ) -> Result<Schema, DatabaseError> {
+        self.schema_within(name, request, Some(deadline)).await
+    }
+
+    async fn schema_within(
+        &self,
+        name: &DatabaseName,
+        request: SchemaRequest,
+        deadline: Option<Instant>,
+    ) -> Result<Schema, DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
-                return handle.schema_reserved(permit, request).await;
+                return handle.schema_reserved(permit, request, deadline).await;
             }
         }
     }

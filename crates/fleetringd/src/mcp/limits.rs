@@ -43,6 +43,18 @@ pub const DEFAULT_COUNT_LIMIT: u64 = 10_000;
 /// `deadline_exceeded`. A write that times out may still have taken effect.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long the statement of a `query` or an `exec`, or a `db_show`'s schema read, may run on
+/// the primary: its call's gRPC deadline, at which the primary interrupts it and a write rolls
+/// back (FR-078). Well within [`CALL_TIMEOUT`], so that the primary's `deadline_exceeded`
+/// arrives before the call's own, and as long as a request on the server's network took before
+/// statements had deadlines.
+pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+const _: () = assert!(
+    STATEMENT_TIMEOUT.as_secs() < CALL_TIMEOUT.as_secs(),
+    "a statement's deadline falls within its call's"
+);
+
 /// How many transactions `changes` returns unless its `limit` says otherwise.
 pub const DEFAULT_CHANGES_LIMIT: u32 = 20;
 

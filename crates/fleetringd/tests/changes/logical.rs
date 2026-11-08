@@ -428,8 +428,8 @@ mod marks {
 
     use fleetring_wal::Batch;
     use fleetringd::engine::{
-        Database, DatabaseCapability, DatabaseEngine, EngineCapability, OpenMode, Position,
-        SqliteEngine, Statement, Transaction,
+        Database, DatabaseCapability, DatabaseEngine, EngineCapability, Interrupt, OpenMode,
+        Position, SqliteEngine, Statement, Transaction,
     };
     use tempfile::TempDir;
 
@@ -443,9 +443,10 @@ mod marks {
 
     fn open_new(dir: &Path) -> Result<Box<dyn Database>, Box<dyn Error>> {
         let mut db = engine()?.open(dir, OpenMode::Create)?;
-        db.execute(&Transaction::from(Statement::new(
-            "CREATE TABLE t (value INTEGER)",
-        )))?;
+        db.execute(
+            &Transaction::from(Statement::new("CREATE TABLE t (value INTEGER)")),
+            &Interrupt::new(),
+        )?;
         Ok(db)
     }
 
@@ -454,7 +455,7 @@ mod marks {
             "INSERT INTO t (value) VALUES (?1)",
             [value.into()],
         ));
-        Ok(db.execute(&write)?.rows_affected)
+        Ok(db.execute(&write, &Interrupt::new())?.rows_affected)
     }
 
     fn recorded(db: &mut dyn Database) -> Result<Marks, Box<dyn Error>> {
@@ -514,7 +515,7 @@ mod marks {
         // The first write to carry a mark also creates the marks table; rolling back takes the
         // table with it, and the next write creates it again.
         let failing = Transaction::from(Statement::new("INSERT INTO missing VALUES (1)"));
-        assert!(db.execute(&failing).is_err());
+        assert!(db.execute(&failing, &Interrupt::new()).is_err());
         assert!(recorded(&mut *db)?.is_empty(), "nothing committed");
         insert(&mut *db, 1)?;
         assert_eq!(recorded(&mut *db)?, Marks::from([("s".to_owned(), mark)]));
@@ -588,7 +589,7 @@ mod marks {
         ];
         for sql in statements {
             let error = db
-                .execute(&Transaction::from(Statement::new(sql)))
+                .execute(&Transaction::from(Statement::new(sql)), &Interrupt::new())
                 .err()
                 .ok_or_else(|| format!("`{sql}` was accepted on the write connection"))?;
             assert!(error.to_string().contains("reserved"), "`{sql}`: {error}");
@@ -598,7 +599,7 @@ mod marks {
             "SELECT count(*) FROM _fleetring_sinks",
         ] {
             let error = db
-                .query(&Statement::new(sql))
+                .query(&Statement::new(sql), &Interrupt::new())
                 .err()
                 .ok_or_else(|| format!("`{sql}` was accepted on the read connection"))?;
             assert!(error.to_string().contains("reserved"), "`{sql}`: {error}");

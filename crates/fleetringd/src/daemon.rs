@@ -733,6 +733,7 @@ fn start_data(
         control,
         archives,
         settings.ack_timeout,
+        config.limits.statement_timeout(),
         metrics.data().clone(),
     );
     let drain = DrainSettings::new(settings.stall_timeout, settings.ack_timeout);

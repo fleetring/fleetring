@@ -43,7 +43,7 @@ use crate::mcp::limits::{
     CALL_TIMEOUT, CHANGES_QUIET, CHANGES_WAIT, DEFAULT_CHANGES_LIMIT, DEFAULT_COUNT_LIMIT,
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT, MAX_CHANGES_ROWS,
     MAX_CONCURRENT_CHANGES, MAX_LIST_LIMIT, MAX_PARAMS, MAX_POSITION_BYTES, MAX_ROWS,
-    MAX_SQL_BYTES,
+    MAX_SQL_BYTES, STATEMENT_TIMEOUT,
 };
 use crate::mcp::render::{
     Budget, NOTICE, PAGE_HINT, database_out, fit, fit_changes, fit_listing, list_out, metadata_out,
@@ -310,9 +310,11 @@ pub(crate) struct FleetringMcp {
 }
 
 impl FleetringMcp {
+    /// A server acting through `client`. Its statements carry [`STATEMENT_TIMEOUT`] as their
+    /// deadline, so the primary interrupts one before its tool call times out (FR-078).
     pub(crate) fn new(client: Client, settings: McpSettings) -> Self {
         Self {
-            client,
+            client: client.with_call_timeout(STATEMENT_TIMEOUT),
             settings,
             changes_turns: Semaphore::new(MAX_CONCURRENT_CHANGES),
         }
@@ -1299,6 +1301,37 @@ mod tests {
         }
         assert!(!INSTRUCTIONS.contains('{'));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn calls_carry_a_deadline_no_later_than_the_call_timeout() {
+        let client = Client::new(
+            "127.0.0.1:7400",
+            crate::Network::tcp(crate::transport::TransportConfig::default()),
+        );
+        let server = FleetringMcp::new(client, McpSettings::default());
+        assert_eq!(server.client.call_timeout(), Some(STATEMENT_TIMEOUT));
+        let request = server
+            .client
+            .timed(fleetring_proto::v1::QueryRequest::default());
+        let header = request
+            .metadata()
+            .get("grpc-timeout")
+            .and_then(|value| value.to_str().ok())
+            .expect("a query carries a grpc-timeout");
+        let (digits, unit) = header.split_at(header.len() - 1);
+        let value: u64 = digits.parse().expect("digits");
+        let deadline = match unit {
+            "S" => Duration::from_secs(value),
+            "m" => Duration::from_millis(value),
+            "u" => Duration::from_micros(value),
+            "n" => Duration::from_nanos(value),
+            other => panic!("unexpected unit {other} in {header}"),
+        };
+        assert!(
+            deadline > Duration::ZERO && deadline <= CALL_TIMEOUT,
+            "{header} is within {CALL_TIMEOUT:?}"
+        );
     }
 
     #[test]

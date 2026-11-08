@@ -5,6 +5,14 @@
 //! [`BatchPublisher`]. It closes the database when it has been idle for the configured time, or
 //! when the registry evicts it. A database that logical change streams read also records its row
 //! changes from the moment it opens (FR-039).
+//!
+//! A write, a query, or a schema read carries an [`Interrupt`] that stops its statements on the
+//! database's thread (FR-078). The caller's side of the handle raises it: at the request's
+//! deadline, from a `tokio::time` timer, and when the caller stops waiting for the reply, so a
+//! cancelled call frees the database too. The thread only checks the flag, so time never leaves
+//! `tokio::time` and a simulation stays deterministic. Under [`Execution::Inline`] a statement
+//! blocks the task that would raise it, so there only a request whose deadline passed, or whose
+//! caller left, while it waited in the mailbox is stopped, before it starts.
 
 mod executor;
 
@@ -16,15 +24,15 @@ use std::time::Duration;
 
 use fleetring_control::DatabaseName;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time;
+use tokio::time::{self, Instant};
 
 use self::executor::{Executor, OpenRequest};
 use crate::changes::MarkHome;
 use crate::engine::{
     CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot,
-    EngineError, Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode,
-    PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange, Rows,
-    Schema, SchemaRequest, Shape, Statement, Transaction,
+    EngineError, Executed, Execution, FrameBatch, FrameSource, Interrupt, Interruption,
+    LogicalChanges, OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction,
+    ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Shape, Statement, Transaction,
 };
 use crate::publisher::{
     Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
@@ -35,9 +43,13 @@ type Reply<T> = oneshot::Sender<Result<T, DatabaseError>>;
 /// A request in an actor's mailbox.
 pub(crate) enum Request {
     Ready(Reply<()>),
-    Execute(Transaction, Reply<(Executed, Option<Acknowledgement>)>),
-    Query(Statement, Reply<Rows>),
-    Schema(SchemaRequest, Reply<Schema>),
+    Execute(
+        Transaction,
+        Interrupt,
+        Reply<(Executed, Option<Acknowledgement>)>,
+    ),
+    Query(Statement, Interrupt, Reply<Rows>),
+    Schema(SchemaRequest, Interrupt, Reply<Schema>),
     Position(Reply<Option<Position>>),
     CommittedSince(Option<Position>, Reply<Option<FrameBatch>>),
     CommittedBetween(Option<Position>, Position, Reply<Option<FrameBatch>>),
@@ -65,13 +77,13 @@ impl Request {
             Self::Ready(reply) => {
                 let _ = reply.send(Err(error));
             }
-            Self::Execute(_, reply) => {
+            Self::Execute(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
-            Self::Query(_, reply) => {
+            Self::Query(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
-            Self::Schema(_, reply) => {
+            Self::Schema(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::Position(reply) => {
@@ -292,6 +304,9 @@ impl DatabaseHandle {
     /// Runs `transaction` as one write transaction, then waits for replication to acknowledge
     /// its batch.
     ///
+    /// Dropping the returned future before the transaction has run stops its statements, and
+    /// the transaction then rolls back (FR-078). It has no deadline of its own.
+    ///
     /// # Errors
     ///
     /// [`DatabaseError`] if the database is closed, replication refuses the write before it
@@ -299,17 +314,20 @@ impl DatabaseHandle {
     /// committed locally).
     pub async fn execute(&self, transaction: Transaction) -> Result<Stored, DatabaseError> {
         let permit = self.reserve().await.ok_or_else(|| self.closed())?;
-        self.execute_reserved(permit, transaction).await
+        self.execute_reserved(permit, transaction, None).await
     }
 
     /// Runs a read-only query on the read path, against the latest commit.
+    ///
+    /// Dropping the returned future before the query has run stops it (FR-078). It has no
+    /// deadline of its own.
     ///
     /// # Errors
     ///
     /// [`DatabaseError`] if the database is closed or the query fails.
     pub async fn query(&self, statement: Statement) -> Result<Rows, DatabaseError> {
         let permit = self.reserve().await.ok_or_else(|| self.closed())?;
-        self.query_reserved(permit, statement).await
+        self.query_reserved(permit, statement, None).await
     }
 
     /// The database's schema, as the engine reports it (ADR-0041, point 6), read on the read
@@ -321,7 +339,7 @@ impl DatabaseHandle {
     /// engine that can't describe itself fails with [`EngineError::Unsupported`].
     pub async fn schema(&self, request: SchemaRequest) -> Result<Schema, DatabaseError> {
         let permit = self.reserve().await.ok_or_else(|| self.closed())?;
-        self.schema_reserved(permit, request).await
+        self.schema_reserved(permit, request, None).await
     }
 
     /// The position just past the last committed transaction, or `None` for an empty log.
@@ -513,47 +531,89 @@ impl DatabaseHandle {
         &self,
         permit: mpsc::Permit<'_, Request>,
         transaction: Transaction,
+        deadline: Option<Instant>,
     ) -> Result<Stored, DatabaseError> {
-        self.commit_reserved(permit, transaction)
+        self.commit_reserved(permit, transaction, deadline)
             .await?
             .stored()
             .await
     }
 
-    /// Runs `transaction` and returns once its batch, if it committed one, is in replication's
-    /// hands, without waiting for the acknowledgement.
+    /// Runs `transaction`, stopping its statements at `deadline` or once this future is
+    /// dropped, and returns once its batch, if it committed one, is in replication's hands,
+    /// without waiting for the acknowledgement.
     pub(crate) async fn commit_reserved(
         &self,
         permit: mpsc::Permit<'_, Request>,
         transaction: Transaction,
+        deadline: Option<Instant>,
     ) -> Result<Published, DatabaseError> {
-        let (reply, result) = oneshot::channel();
-        permit.send(Request::Execute(transaction, reply));
-        let (executed, acknowledgement) = self.await_reply(result).await?;
+        let (executed, acknowledgement) = self
+            .interruptible(permit, deadline, |interrupt, reply| {
+                Request::Execute(transaction, interrupt, reply)
+            })
+            .await?;
         Ok(Published {
             executed,
             acknowledgement,
         })
     }
 
+    /// Runs `statement`, stopping it at `deadline` or once this future is dropped.
     pub(crate) async fn query_reserved(
         &self,
         permit: mpsc::Permit<'_, Request>,
         statement: Statement,
+        deadline: Option<Instant>,
     ) -> Result<Rows, DatabaseError> {
-        let (reply, result) = oneshot::channel();
-        permit.send(Request::Query(statement, reply));
-        self.await_reply(result).await
+        self.interruptible(permit, deadline, |interrupt, reply| {
+            Request::Query(statement, interrupt, reply)
+        })
+        .await
     }
 
+    /// Reads the schema, stopping at `deadline` or once this future is dropped.
     pub(crate) async fn schema_reserved(
         &self,
         permit: mpsc::Permit<'_, Request>,
         request: SchemaRequest,
+        deadline: Option<Instant>,
     ) -> Result<Schema, DatabaseError> {
-        let (reply, result) = oneshot::channel();
-        permit.send(Request::Schema(request, reply));
-        self.await_reply(result).await
+        self.interruptible(permit, deadline, |interrupt, reply| {
+            Request::Schema(request, interrupt, reply)
+        })
+        .await
+    }
+
+    /// Sends the request `request` makes with a fresh [`Interrupt`], and waits for its reply.
+    ///
+    /// The interrupt is raised with [`Interruption::Deadline`] once `deadline` passes, by a
+    /// `tokio::time` timer, and with [`Interruption::Cancelled`] if this future is dropped before
+    /// the reply arrives, because its caller stopped waiting. Either way the reply that follows
+    /// says what happened: a statement that finished first keeps its result.
+    async fn interruptible<T>(
+        &self,
+        permit: mpsc::Permit<'_, Request>,
+        deadline: Option<Instant>,
+        request: impl FnOnce(Interrupt, Reply<T>) -> Request,
+    ) -> Result<T, DatabaseError> {
+        let interrupt = Interrupt::new();
+        // A deadline already past stops the request before it starts, even where the
+        // database's calls run inline, so that the timer below can't fire first.
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            interrupt.raise(Interruption::Deadline);
+        }
+        let (reply, mut result) = oneshot::channel();
+        permit.send(request(interrupt.clone(), reply));
+        // Once the reply has arrived the statement is done, so raising the flag then is harmless.
+        let _cancel_on_drop = RaiseOnDrop(interrupt.clone());
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                replied = &mut result => return self.replied(replied),
+                () = time::sleep_until(deadline) => interrupt.raise(Interruption::Deadline),
+            }
+        }
+        self.replied(result.await)
     }
 
     async fn call<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, DatabaseError> {
@@ -567,7 +627,14 @@ impl DatabaseHandle {
         &self,
         result: oneshot::Receiver<Result<T, DatabaseError>>,
     ) -> Result<T, DatabaseError> {
-        result.await.map_err(|_| DatabaseError::Interrupted {
+        self.replied(result.await)
+    }
+
+    fn replied<T>(
+        &self,
+        replied: Result<Result<T, DatabaseError>, oneshot::error::RecvError>,
+    ) -> Result<T, DatabaseError> {
+        replied.map_err(|_| DatabaseError::Interrupted {
             name: self.name.clone(),
         })?
     }
@@ -576,6 +643,15 @@ impl DatabaseHandle {
         DatabaseError::Closed {
             name: self.name.clone(),
         }
+    }
+}
+
+/// Raises its interrupt with [`Interruption::Cancelled`] when dropped.
+struct RaiseOnDrop(Interrupt);
+
+impl Drop for RaiseOnDrop {
+    fn drop(&mut self) {
+        self.0.raise(Interruption::Cancelled);
     }
 }
 
@@ -765,19 +841,19 @@ impl Actor {
             Request::Ready(reply) => {
                 let _ = reply.send(Ok(()));
             }
-            Request::Execute(transaction, reply) => {
-                let result = self.execute(transaction).await;
+            Request::Execute(transaction, interrupt, reply) => {
+                let result = self.execute(transaction, interrupt).await;
                 let _ = reply.send(result);
             }
-            Request::Query(statement, reply) => {
+            Request::Query(statement, interrupt, reply) => {
                 let result = self
-                    .call(move |database| Ok(database.query(&statement)?))
+                    .call(move |database| Ok(database.query(&statement, &interrupt)?))
                     .await;
                 let _ = reply.send(result);
             }
-            Request::Schema(request, reply) => {
+            Request::Schema(request, interrupt, reply) => {
                 let result = self
-                    .call(move |database| Ok(database.schema(&request)?))
+                    .call(move |database| Ok(database.schema(&request, &interrupt)?))
                     .await;
                 let _ = reply.send(result);
             }
@@ -910,10 +986,12 @@ impl Actor {
         }
     }
 
-    /// Runs one write transaction and captures its batch, if it committed one.
+    /// Runs one write transaction, unless `interrupt` stops it, and captures its batch, if it
+    /// committed one.
     async fn execute(
         &mut self,
         transaction: Transaction,
+        interrupt: Interrupt,
     ) -> Result<(Executed, Option<Acknowledgement>), DatabaseError> {
         if let Some(source) = &self.failed {
             return Err(DatabaseError::Failed {
@@ -932,9 +1010,10 @@ impl Actor {
         let outcome = self
             .executor
             .run(move |database| {
-                let result = database.execute(&transaction);
+                let result = database.execute(&transaction, &interrupt);
                 // Capture runs whatever the outcome, so a commit is never missed. A rolled-back
-                // transaction leaves no committed frames, so it yields no batch.
+                // transaction, an interrupted one included, leaves no committed frames, so it
+                // yields no batch.
                 let captured = match database.capability() {
                     DatabaseCapability::FrameSource(frames) => {
                         Some(frames.committed_since(last.as_ref()))

@@ -19,8 +19,8 @@ use fleetringd::changes::{
 use fleetringd::clock::SystemClock;
 use fleetringd::engine::{
     CaptureMode, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot, EngineCapability,
-    EngineConfig, EngineError, EngineKind, Executed, Execution, LogicalChanges, LogicalSupport,
-    OpenMode, Rows, SqliteEngine, Statement, Transaction,
+    EngineConfig, EngineError, EngineKind, Executed, Execution, Interrupt, LogicalChanges,
+    LogicalSupport, OpenMode, Rows, SqliteEngine, Statement, Transaction,
 };
 use fleetringd::replication::{
     EpochHolders, PrimaryRole, Replication, ReplicationParts, ReplicationSettings,
@@ -297,12 +297,16 @@ impl DatabaseEngine for NoMarks {
 struct NoMarksDatabase(Box<dyn Database>);
 
 impl Database for NoMarksDatabase {
-    fn execute(&mut self, transaction: &Transaction) -> Result<Executed, EngineError> {
-        self.0.execute(transaction)
+    fn execute(
+        &mut self,
+        transaction: &Transaction,
+        interrupt: &Interrupt,
+    ) -> Result<Executed, EngineError> {
+        self.0.execute(transaction, interrupt)
     }
 
-    fn query(&mut self, statement: &Statement) -> Result<Rows, EngineError> {
-        self.0.query(statement)
+    fn query(&mut self, statement: &Statement, interrupt: &Interrupt) -> Result<Rows, EngineError> {
+        self.0.query(statement, interrupt)
     }
 
     fn snapshot(&mut self, destination: &Path) -> Result<DatabaseSnapshot, EngineError> {

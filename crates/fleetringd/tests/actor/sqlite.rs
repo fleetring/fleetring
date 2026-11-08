@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use fleetring_wal::{Batch, Position as WalPosition};
 use fleetringd::engine::{
-    DatabaseEngine, EngineCapability, EngineError, Execution, FrameFollower, Position,
-    SqliteEngine, Statement, Transaction, Value,
+    DatabaseEngine, EngineCapability, EngineError, Execution, FrameFollower, Interruption,
+    Position, SqliteEngine, Statement, Transaction, Value,
 };
 use fleetringd::{CommittedBatch, DatabaseError};
 use rusqlite::Connection;
+use tokio::time::{Instant, timeout};
 
 use crate::common::{Fixture, Kind, PAGE_SIZE, TestResult, config, name, wal_file};
 
@@ -507,5 +508,158 @@ async fn inline_execution_publishes_the_same_batches() -> TestResult {
         .await
         .expect_err("no such database");
     assert!(matches!(missing, DatabaseError::Open { .. }), "{missing:?}");
+    Ok(())
+}
+
+/// A recursive CTE that counts forever: only an interrupt stops it.
+const FOREVER: &str =
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c";
+
+/// How long these tests let a runaway statement run before its deadline.
+const SHORT: Duration = Duration::from_millis(200);
+
+/// Long enough for any request on a free database; a request stuck behind a statement that
+/// was never stopped waits forever.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
+fn interrupted(error: &DatabaseError) -> Option<Interruption> {
+    match error.engine_error() {
+        Some(EngineError::Interrupted(why)) => Some(*why),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_runaway_query_stops_at_its_deadline_and_the_database_serves_the_next_request_at_once()
+-> TestResult {
+    let fx = sqlite(Execution::Threads);
+    let db = name("runaway");
+    fx.create(&db).await?;
+    let forever = Statement::new(format!("SELECT count(*) FROM ({FOREVER})"));
+
+    let deadline = Instant::now() + SHORT;
+    let error = timeout(HANG_GUARD, fx.registry.query_until(&db, forever, deadline))
+        .await?
+        .expect_err("a query that never ends");
+    assert_eq!(
+        interrupted(&error),
+        Some(Interruption::Deadline),
+        "{error:?}"
+    );
+    assert!(Instant::now() >= deadline, "it ran until its deadline");
+
+    // The database's thread is free: a write and a read go through at once.
+    timeout(
+        HANG_GUARD,
+        fx.registry
+            .execute(&db, Transaction::from(fx.put("next", 1))),
+    )
+    .await??;
+    assert_eq!(fx.value(&db, "next").await?, Some(Value::Integer(1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_a_query_stops_its_statement() -> TestResult {
+    let fx = sqlite(Execution::Threads);
+    let db = name("dropped");
+    fx.create(&db).await?;
+    let forever = Statement::new(format!("SELECT count(*) FROM ({FOREVER})"));
+
+    // No deadline: only the caller giving up stops it.
+    let call = fx.registry.query(&db, forever);
+    assert!(
+        timeout(SHORT, call).await.is_err(),
+        "the query runs until it is dropped"
+    );
+    timeout(
+        HANG_GUARD,
+        fx.registry
+            .execute(&db, Transaction::from(fx.put("next", 1))),
+    )
+    .await??;
+    assert_eq!(fx.value(&db, "next").await?, Some(Value::Integer(1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_interrupted_write_commits_and_publishes_nothing() -> TestResult {
+    let fx = sqlite(Execution::Threads);
+    let db = name("rolled-back");
+    fx.create(&db).await?;
+    fx.registry
+        .execute(&db, Transaction::from(fx.put("kept", 1)))
+        .await?;
+    let published = fx.publisher.take();
+    let last = published.last().ok_or("the writes published batches")?;
+
+    // Inserts rows, without end, until the deadline stops it.
+    let runaway = Transaction::new([
+        fx.put("first", 2),
+        Statement::new(format!(
+            "INSERT INTO kv (k, v) SELECT 'row-' || x, x FROM ({FOREVER})"
+        )),
+    ]);
+    let deadline = Instant::now() + SHORT;
+    let error = timeout(
+        HANG_GUARD,
+        fx.registry.execute_until(&db, runaway, deadline),
+    )
+    .await?
+    .expect_err("a write that never ends");
+    assert_eq!(
+        interrupted(&error),
+        Some(Interruption::Deadline),
+        "{error:?}"
+    );
+
+    assert!(fx.publisher.take().is_empty(), "no batch for followers");
+    // Pages the transaction spilled may sit in the WAL past its end, but nothing committed.
+    let handle = fx.registry.open(&db).await?;
+    assert_eq!(
+        handle.committed_since(Some(last.batch.end.clone())).await?,
+        None,
+        "no committed frame in the WAL"
+    );
+    let rows = fx
+        .registry
+        .query(&db, Statement::new("SELECT k FROM kv ORDER BY k"))
+        .await?;
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::from("kept")]],
+        "no partial effect"
+    );
+
+    // The writer takes the next write at once, and its batch continues the last one.
+    timeout(
+        HANG_GUARD,
+        fx.registry
+            .execute(&db, Transaction::from(fx.put("next", 3))),
+    )
+    .await??;
+    let next = fx.publisher.take();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].batch.start, last.batch.end, "the log has no gap");
+    decode_one_transaction(&next[0]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_execution_stops_a_request_whose_deadline_passed_before_it_ran() -> TestResult {
+    let fx = sqlite(Execution::Inline);
+    let db = name("inline-late");
+    fx.create(&db).await?;
+    let error = fx
+        .registry
+        .execute_until(&db, Transaction::from(fx.put("late", 1)), Instant::now())
+        .await
+        .expect_err("a deadline already past");
+    assert_eq!(
+        interrupted(&error),
+        Some(Interruption::Deadline),
+        "{error:?}"
+    );
+    assert_eq!(fx.value(&db, "late").await?, None);
     Ok(())
 }

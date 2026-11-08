@@ -143,6 +143,14 @@ pub(crate) fn hint(status: &Status) -> Option<String> {
              `--from`"
                 .to_owned(),
         ),
+        // A statement the primary interrupted, or a call that outran `--timeout` (FR-078):
+        // retrying the same statement would only time out again.
+        Code::DeadlineExceeded if ran_past_its_deadline(status) => Some(
+            "the statement ran past its deadline; make it cheaper, for one with a `LIMIT` or an \
+             index, or give it longer with `--timeout`, up to the primary's \
+             `[limits] statement_timeout_ms`"
+                .to_owned(),
+        ),
         Code::Unavailable | Code::DeadlineExceeded => Some(
             "retry; the fleet may be starting or failing over. If it persists, check \
              `fleetring status`, or `fleetring dev status` for a dev node"
@@ -150,6 +158,13 @@ pub(crate) fn hint(status: &Status) -> Option<String> {
         ),
         _ => None,
     }
+}
+
+/// Whether `status` says a statement ran past its deadline: the primary interrupted it, or the
+/// command's own `--timeout` passed.
+fn ran_past_its_deadline(status: &Status) -> bool {
+    let message = status.message();
+    message.starts_with("statement interrupted") || message.contains("longer than its timeout")
 }
 
 /// A usage error: a flag or argument the command can't use, or a confirmation it can't ask.
@@ -282,5 +297,19 @@ mod tests {
             )
         );
         assert_eq!(hint(&Status::internal("x")), None);
+    }
+
+    #[test]
+    fn a_statement_past_its_deadline_is_told_not_to_retry() {
+        for message in [
+            "statement interrupted: it ran past its deadline",
+            "the call took longer than its timeout of 1s",
+        ] {
+            let told = hint(&Status::deadline_exceeded(message)).unwrap_or_default();
+            assert!(told.contains("--timeout"), "{message}: {told}");
+            assert!(!told.starts_with("retry"), "{message}: {told}");
+        }
+        let unavailable = hint(&Status::deadline_exceeded("Timeout expired")).unwrap_or_default();
+        assert!(unavailable.starts_with("retry"), "{unavailable}");
     }
 }

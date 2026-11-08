@@ -19,8 +19,8 @@
 //! - **Bounds.** A result's JSON is at most `max_result_bytes`, with rows, listed databases, or
 //!   schema objects dropped from the end and `truncated` set; a query stops at `max_rows` on the
 //!   primary; `changes` returns at most [`MAX_CHANGES_LIMIT`] transactions and waits at most
-//!   [`CHANGES_WAIT`] for them; a long value is elided; and a call takes at most
-//!   [`CALL_TIMEOUT`].
+//!   [`CHANGES_WAIT`] for them; a long value is elided; a statement runs on the primary for at
+//!   most [`STATEMENT_TIMEOUT`], its call's deadline; and a call takes at most [`CALL_TIMEOUT`].
 //!
 //! `rmcp`, the protocol library, is used in this module only, and pinned exactly, so that
 //! upgrading it is a change to this module alone.
@@ -38,6 +38,7 @@ pub use limits::{
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT,
     MAX_CHANGES_ROWS, MAX_CONCURRENT_CHANGES, MAX_LIST_LIMIT, MAX_MAX_RESULT_BYTES, MAX_PARAMS,
     MAX_POSITION_BYTES, MAX_ROWS, MAX_SQL_BYTES, MAX_VALUE_BYTES, MIN_MAX_RESULT_BYTES,
+    STATEMENT_TIMEOUT,
 };
 
 use crate::data::Client;
