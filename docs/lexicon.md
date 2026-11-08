@@ -940,7 +940,7 @@ The placement spec: the normative description of placement that every implementa
 
 ### Statement deadline
 
-When a write, query, or schema read must stop on its [primary](#primary): the data node's `[limits] statement_timeout_ms` after the node takes the request, or the call's own earlier deadline (FR-078). At the deadline, or once the call is cancelled, the node raises the request's *interrupt*, a flag the engine checks while the statement runs; a write it stops rolls back. Time stays with whoever raises the flag, so engines never read a clock.
+When a write, query, or schema read must stop on its [primary](#primary): the data node's `[limits] statement_timeout_ms` after the node takes the request, or, if earlier, the call's own deadline less a small margin, so the node answers first (FR-078). At the deadline, or once the call is cancelled, the node raises the request's *interrupt*, a flag the engine checks while the statement runs; a write it stops rolls back. Time stays with whoever raises the flag, so engines never read a clock.
 
 - **Applies to:** daemon, CLI.
 - **Code:** `engine::Interrupt`, `engine::Interruption`, `EngineError::Interrupted`, `LimitsConfig::statement_timeout_ms`, `Client::with_call_timeout`, `mcp::STATEMENT_TIMEOUT`. **CLI:** `--timeout` on `db exec` and `db query`; `statement interrupted: …` in messages.
