@@ -1,6 +1,6 @@
 # FleetRing
 
-> FleetRing places, replicates, and fails over fleets of small SQLite databases on machines you own, one database per agent, user, or task. Agents create, find, query, and drop their own databases through `fleetring mcp --agent <id>` (an MCP server that sets up its own identity on a dev node) or the `fleetring` CLI, within the scopes of their token.
+> FleetRing places, replicates, and fails over fleets of small SQLite databases on machines you own, one database per agent, user, or task. Agents create, find, query, follow, and drop their own databases through `fleetring mcp --agent <id>` (an MCP server that sets up its own identity on a dev node) or the `fleetring` CLI, within the scopes of their token.
 
 ## Docs
 

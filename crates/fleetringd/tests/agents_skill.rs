@@ -1,5 +1,6 @@
-//! FR-070 phase 7: the agent skill's SQL runs through the SQLite adapter, its front matter is
-//! valid, and every relative link in `llms.txt` names a file in the repository.
+//! FR-070 phase 7: the agent skill's SQL runs through the SQLite adapter, its tool calls match
+//! the tools' input schemas, its front matter is valid, and every relative link in `llms.txt`
+//! names a file in the repository.
 
 use std::error::Error;
 use std::path::Path;
@@ -7,9 +8,13 @@ use std::path::Path;
 use fleetringd::engine::{
     CaptureMode, DatabaseEngine, OpenMode, SqliteEngine, Statement, Transaction, Value,
 };
+use serde_json::Value as Json;
 
 const SKILL: &str = include_str!("../../../docs/agents/SKILL.md");
+const QUICKSTART: &str = include_str!("../../../docs/agents/quickstart.md");
 const LLMS_TXT: &str = include_str!("../../../llms.txt");
+/// `tools/list` as the server answers it, which `mcp::server`'s tests hold equal.
+const TOOLS: &str = include_str!("fixtures/mcp/tools.json");
 
 /// The fence tag of a block the test runs. A block tagged `sql planned` is skipped.
 const SQL_FENCE: &str = "sql";
@@ -23,8 +28,16 @@ struct SkillStatement {
     params: Vec<Value>,
 }
 
+/// The fence tag of a block of JSON: tool calls, arguments, or a result.
+const JSON_FENCE: &str = "json";
+
 /// The bodies of the fenced blocks tagged exactly `sql`, in order.
 fn sql_blocks(markdown: &str) -> Vec<String> {
+    blocks_tagged(markdown, SQL_FENCE)
+}
+
+/// The bodies of the fenced blocks tagged exactly `fence`, in order.
+fn blocks_tagged(markdown: &str, fence: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current: Option<(bool, String)> = None;
     for line in markdown.lines() {
@@ -32,7 +45,7 @@ fn sql_blocks(markdown: &str) -> Vec<String> {
         match current.take() {
             None => {
                 if let Some(tag) = trimmed.strip_prefix("```") {
-                    current = Some((tag.trim() == SQL_FENCE, String::new()));
+                    current = Some((tag.trim() == fence, String::new()));
                 }
             }
             Some((runs, mut body)) => {
@@ -278,6 +291,202 @@ fn the_skills_statement_splitter_reads_params_and_triggers() -> Result<(), Box<d
     );
     assert!(parsed[1].sql.trim_end().ends_with("END;"));
     assert!(statements("SELECT 1").is_err());
+    Ok(())
+}
+
+/// The JSON values of the `json` blocks of `markdown`: a block that parses whole is one value, a
+/// block that is an object's members, such as `"description": {…}`, is that object, and any
+/// other holds one value per line, as a list of tool calls does.
+fn json_values(markdown: &str) -> Result<Vec<Json>, Box<dyn Error>> {
+    let mut values = Vec::new();
+    for block in blocks_tagged(markdown, JSON_FENCE) {
+        let members = format!("{{{block}}}");
+        if let Ok(value) =
+            serde_json::from_str::<Json>(&block).or_else(|_| serde_json::from_str(&members))
+        {
+            values.push(value);
+            continue;
+        }
+        for line in block.lines().filter(|line| !line.trim().is_empty()) {
+            values
+                .push(serde_json::from_str(line).map_err(|error| {
+                    format!("a json block's line isn't JSON ({error}): {line}")
+                })?);
+        }
+    }
+    Ok(values)
+}
+
+/// The tool called `name`, as `tools/list` describes it.
+fn tool(name: &str) -> Result<Json, Box<dyn Error>> {
+    let tools: Vec<Json> = serde_json::from_str(TOOLS)?;
+    tools
+        .into_iter()
+        .find(|tool| tool["name"] == name)
+        .ok_or_else(|| format!("no tool {name}").into())
+}
+
+/// Whether `value` has one of the JSON Schema types `types` names (a string or a list).
+fn has_type(value: &Json, types: &Json) -> bool {
+    let named: Vec<&str> = match types {
+        Json::String(one) => vec![one.as_str()],
+        Json::Array(many) => many.iter().filter_map(Json::as_str).collect(),
+        _ => return true,
+    };
+    named.iter().any(|name| match *name {
+        "null" => value.is_null(),
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        _ => true,
+    })
+}
+
+/// Checks `arguments` against `tool`'s input schema: no unknown field, every required one, each
+/// of its declared type and within its bounds.
+fn check_arguments(tool: &Json, arguments: &Json) -> Result<(), String> {
+    let name = &tool["name"];
+    let schema = &tool["inputSchema"];
+    let given = arguments
+        .as_object()
+        .ok_or_else(|| format!("{name}'s arguments aren't an object: {arguments}"))?;
+    for required in schema["required"].as_array().into_iter().flatten() {
+        let key = required.as_str().unwrap_or_default();
+        if !given.contains_key(key) {
+            return Err(format!("{name} needs {key}: {arguments}"));
+        }
+    }
+    for (key, value) in given {
+        let property = &schema["properties"][key];
+        if property.is_null() {
+            return Err(format!("{name} takes no {key}: {arguments}"));
+        }
+        if !has_type(value, &property["type"]) {
+            return Err(format!(
+                "{name}'s {key} isn't a {}: {value}",
+                property["type"]
+            ));
+        }
+        if let Some(number) = value.as_f64() {
+            let low = property["minimum"].as_f64().unwrap_or(f64::MIN);
+            let high = property["maximum"].as_f64().unwrap_or(f64::MAX);
+            if number < low || number > high {
+                return Err(format!("{name}'s {key} is outside {low}..={high}: {value}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `text` is a position as `changes` takes one: an even number of hex digits.
+fn is_position(text: &str) -> bool {
+    !text.is_empty()
+        && text.len().is_multiple_of(2)
+        && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[test]
+fn the_tool_calls_in_the_skill_and_the_quickstart_match_the_tools() -> Result<(), Box<dyn Error>> {
+    let mut calls = Vec::new();
+    for (page, markdown) in [("SKILL.md", SKILL), ("quickstart.md", QUICKSTART)] {
+        for value in json_values(markdown)? {
+            let (Some(name), Some(arguments)) = (value["tool"].as_str(), value.get("arguments"))
+            else {
+                continue;
+            };
+            check_arguments(&tool(name)?, arguments).map_err(|error| format!("{page}: {error}"))?;
+            calls.push((page, name.to_owned(), arguments.clone()));
+        }
+    }
+    // The skill's `follow changes` pattern starts without a position and continues after one.
+    let changes: Vec<&Json> = calls
+        .iter()
+        .filter(|(page, name, _)| *page == "SKILL.md" && name == "changes")
+        .map(|(_, _, arguments)| arguments)
+        .collect();
+    assert!(
+        changes
+            .iter()
+            .any(|arguments| arguments.get("after").is_none()),
+        "the skill starts following without after"
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|arguments| arguments.get("after").is_some()),
+        "the skill continues after a position"
+    );
+    for (page, name, arguments) in &calls {
+        if let Some(after) = arguments.get("after") {
+            assert!(
+                after.as_str().is_some_and(is_position),
+                "{page}: {name}'s after isn't a position: {after}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_argument_check_refuses_what_the_server_refuses() -> Result<(), Box<dyn Error>> {
+    let changes = tool("changes")?;
+    let check = |arguments: Json| check_arguments(&changes, &arguments);
+    assert!(check(serde_json::json!({"database": "agent-42-inbox", "limit": 100})).is_ok());
+    for refused in [
+        serde_json::json!({}),
+        serde_json::json!({"database": "agent-42-inbox", "from": "00"}),
+        serde_json::json!({"database": "agent-42-inbox", "limit": 101}),
+        serde_json::json!({"database": "agent-42-inbox", "limit": "20"}),
+        serde_json::json!({"database": 42}),
+    ] {
+        assert!(check(refused.clone()).is_err(), "{refused}");
+    }
+    assert!(!is_position("0") && !is_position("zz") && is_position("00ff"));
+    Ok(())
+}
+
+#[test]
+fn the_skills_changes_result_has_the_tools_fields() -> Result<(), Box<dyn Error>> {
+    let changes = tool("changes")?;
+    let fields = |schema: &Json| -> Vec<String> {
+        let mut keys: Vec<String> = schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    let keys = |value: &Json| -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    let result = json_values(SKILL)?
+        .into_iter()
+        .find(|value| value.get("transactions").is_some())
+        .ok_or("the skill shows no changes result")?;
+    let output = &changes["outputSchema"];
+    assert_eq!(keys(&result), fields(output));
+    let definitions = &output["$defs"];
+    let transaction = &result["transactions"][0];
+    assert_eq!(keys(transaction), fields(&definitions["TransactionOut"]));
+    let change = &transaction["changes"][0];
+    assert_eq!(keys(change), fields(&definitions["RowChangeOut"]));
+    assert_eq!(keys(&change["key"][0]), fields(&definitions["ColumnOut"]));
+    for position in [
+        &transaction["start"],
+        &transaction["position"],
+        &result["next_after"],
+    ] {
+        assert!(position.as_str().is_some_and(is_position), "{position}");
+    }
+    assert_eq!(result["next_after"], transaction["position"]);
     Ok(())
 }
 
