@@ -444,7 +444,7 @@ Label values come from closed sets the code fixes, or from the node's own config
 
 - `service`: `control`, `replication`, `database`, or `unknown`; `method`: an RPC of the table above, or `unknown`; `code`: a gRPC status code in lower snake case (`ok`, `not_found`, `permission_denied`, …).
 - `reason`: `scope`, `binding`, `unauthenticated`, `denylist_stale`, `no_requirement`.
-- `outcome`: heartbeats `recorded`, `failed`; writes `acknowledged`, `refused`, `aborted`, `redirected`, `failed`; queries `ok`, `redirected`, `failed`; renewals `renewed`, `refused`, `failed`; transfers `completed`, `failed`; promotions `completed`, `superseded`, `failed`; control commands `applied`, `rejected`; change deliveries `delivered`, `failed`.
+- `outcome`: heartbeats `recorded`, `failed`; writes `acknowledged`, `refused`, `aborted`, `redirected`, `cancelled` (the call was cancelled, or outran its own deadline, before the node answered), `failed`; queries `ok`, `redirected`, `cancelled`, `failed`; renewals `renewed`, `refused`, `failed`; transfers `completed`, `failed`; promotions `completed`, `superseded`, `failed`; control commands `applied`, `rejected`; change deliveries `delivered`, `failed`.
 - `action`: a control command's action in snake case (`join`, `heartbeat`, `create_database`, …), or `other`.
 - `state`: `caught_up`, `behind`, `disconnected`, `reseeding`; `replica_role`: `primary`, `follower`; `liveness`: `live`, `down`; `node_role`: `data`, `control`, `both`.
 - `sink`: a `[[changes.sink]]` or `[[archive]]` entry's name.

@@ -808,6 +808,33 @@ async fn a_dropped_or_timed_out_call_stops_its_statement_on_the_node() -> TestRe
     );
     assert_eq!(note_count(&client, &notes).await?, [[Value::Integer(1)]]);
 
+    // Any gRPC client's own deadline, here a raw tonic one, stops the statement on the node,
+    // which says so before the call's deadline passes.
+    let primary = client
+        .locate(&notes)
+        .await?
+        .primary_replica()
+        .and_then(|replica| replica.address.clone())
+        .ok_or("the primary's address")?;
+    let mut raw = database_client(network(&fleet.tls)?.channel(&primary)?);
+    let mut request = tonic::Request::new(proto::QueryRequest {
+        database: notes.to_string(),
+        sql: format!("SELECT count(*) FROM ({FOREVER})"),
+        params: Vec::new(),
+        max_rows: 0,
+    });
+    request.set_timeout(Duration::from_secs(1));
+    let raw_query = raw
+        .query(request)
+        .await
+        .expect_err("a query that never ends");
+    assert_eq!(raw_query.code(), Code::DeadlineExceeded, "{raw_query}");
+    assert_eq!(
+        raw_query.message(),
+        "statement interrupted: it ran past its deadline"
+    );
+    assert_eq!(note_count(&client, &notes).await?, [[Value::Integer(1)]]);
+
     // A call timeout travels with the call as its deadline.
     let timed = client.clone().with_call_timeout(SHORT);
     let query = timed

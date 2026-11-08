@@ -81,11 +81,17 @@ pub(crate) const REFUSAL_REASONS: &[&str] = &[
 pub(crate) const OUTCOMES_HEARTBEAT: &[&str] = &["recorded", "failed"];
 
 /// The `outcome` label's values on `fleetring_writes_total`.
-pub(crate) const OUTCOMES_WRITE: &[&str] =
-    &["acknowledged", "refused", "aborted", "redirected", "failed"];
+pub(crate) const OUTCOMES_WRITE: &[&str] = &[
+    "acknowledged",
+    "refused",
+    "aborted",
+    "redirected",
+    "cancelled",
+    "failed",
+];
 
 /// The `outcome` label's values on `fleetring_queries_total`.
-pub(crate) const OUTCOMES_QUERY: &[&str] = &["ok", "redirected", "failed"];
+pub(crate) const OUTCOMES_QUERY: &[&str] = &["ok", "redirected", "cancelled", "failed"];
 
 /// The `outcome` label's values on `fleetring_lease_renewals_total`.
 pub(crate) const OUTCOMES_RENEWAL: &[&str] = &["renewed", "refused", "failed"];
