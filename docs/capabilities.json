@@ -481,7 +481,7 @@
       "component": "fleetringd",
       "area": "operations",
       "title": "fleetring dev",
-      "description": "One command for a local node on a laptop, on loopback only, with its authority, certificates and configuration created on the first run and reused after. `-d` runs it in the background (0.7.0).",
+      "description": "One command for a local node on a laptop, on loopback only, with its authority, certificates and configuration created on the first run and reused after. `-d` runs it in the background.",
       "status": "built",
       "since": "0.5.0",
       "ticket": "FR-068",
