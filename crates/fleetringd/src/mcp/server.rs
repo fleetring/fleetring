@@ -32,25 +32,25 @@ use tokio::time::Instant;
 
 use crate::clock::{Clock as _, SystemClock};
 use crate::data::{
-    ChangeUpdate, ChangeUpdates, ChangedTransaction, Client, DatabaseSpec, Descriptions, Expiry,
-    ExpiryRequest, LabelRequirement, ListFilter, NewMetadata,
+    ChangeUpdate, ChangeUpdates, Client, DatabaseSpec, Descriptions, Expiry, ExpiryRequest,
+    LabelRequirement, ListFilter, NewMetadata,
 };
 use crate::engine::{
     CaptureMode, Internal, MAX_COUNT_LIMIT, Position, SchemaRequest, Statement, Value,
 };
 use crate::mcp::limits::{
     CALL_TIMEOUT, CHANGES_QUIET, CHANGES_WAIT, DEFAULT_CHANGES_LIMIT, DEFAULT_COUNT_LIMIT,
-    DEFAULT_LIST_LIMIT, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT, MAX_LIST_LIMIT, MAX_PARAMS,
-    MAX_POSITION_BYTES, MAX_ROWS, MAX_SQL_BYTES,
+    DEFAULT_LIST_LIMIT, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT, MAX_CHANGES_ROWS, MAX_LIST_LIMIT,
+    MAX_PARAMS, MAX_POSITION_BYTES, MAX_ROWS, MAX_SQL_BYTES,
 };
 use crate::mcp::render::{
-    NOTICE, PAGE_HINT, database_out, fit, fit_changes, fit_listing, list_out, metadata_out,
-    query_out, text, transaction_out,
+    Budget, NOTICE, PAGE_HINT, database_out, fit, fit_changes, fit_listing, list_out, metadata_out,
+    query_out, text, text_len, transaction_out,
 };
 use crate::mcp::tools::{
     ChangesInput, ChangesOut, DatabaseOut, DbCreateInput, DbDropInput, DbListInput, DbShowInput,
     DbUpdateInput, DropOut, ErrorBody, ErrorOut, ExecInput, ExecOut, ListOut, QueryInput, QueryOut,
-    SqlValue, UntrustedText, UpdateOut,
+    SqlValue, TransactionOut, UntrustedText, UpdateOut,
 };
 use crate::mcp::{Access, McpSettings};
 use crate::report::{database_report, schema_report, schema_unavailable};
@@ -490,17 +490,31 @@ impl FleetringMcp {
             .unwrap_or(DEFAULT_CHANGES_LIMIT)
             .clamp(1, MAX_CHANGES_LIMIT);
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        let collected = collect_changes(&self.client, &name, after, limit)
+        // The result's own fields at their longest, so the transactions get what is left.
+        let envelope = text_len(&ChangesOut {
+            database: name.to_string(),
+            capture_mode: Some(CaptureMode::Full.as_str().to_owned()),
+            transactions: Vec::new(),
+            next_after: Some("0".repeat(MAX_POSITION_BYTES * 2)),
+            more: true,
+            notice: NOTICE.to_owned(),
+        })?;
+        let budget = Budget {
+            bytes: self.settings.max_result_bytes.saturating_sub(envelope),
+            rows: MAX_CHANGES_ROWS,
+        };
+        let collected = collect_changes(&self.client, &name, after, limit, budget)
             .await
             .map_err(Failed::status)?;
         let mut out = ChangesOut {
             database: name.to_string(),
             capture_mode: collected.capture.map(|mode| mode.as_str().to_owned()),
-            transactions: collected.transactions.iter().map(transaction_out).collect(),
+            transactions: collected.transactions,
             next_after: collected.next_after.as_ref().map(ToString::to_string),
             more: collected.more,
             notice: NOTICE.to_owned(),
         };
+        // The budget is an estimate made as the transactions arrived; this makes it exact.
         fit_changes(&mut out, self.settings.max_result_bytes)?;
         Ok(out)
     }
@@ -594,17 +608,19 @@ impl FleetringMcp {
 }
 
 /// What [`collect_changes`] gathered.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Collected {
     /// The capture mode the first stream named.
     capture: Option<CaptureMode>,
-    /// The transactions, in commit order, with no repeat.
-    transactions: Vec<ChangedTransaction>,
+    /// The transactions, in commit order, with no repeat, already in the result's form.
+    transactions: Vec<TransactionOut>,
     /// The last transaction's position, or, with none, the position the first stream started
     /// after.
     next_after: Option<Position>,
     /// Whether more transactions may be waiting.
     more: bool,
+    /// What the result may still take.
+    budget: Budget,
 }
 
 /// Collects at most `limit` of `name`'s transactions after `after`, or, without it, after the
@@ -617,6 +633,12 @@ struct Collected {
 /// are returned with `more` set, so the next call meets the error itself if it persists, and
 /// nothing is lost; with none, the call fails with it.
 ///
+/// Each transaction is converted as it arrives, within what is left of `budget`, and dropped,
+/// so the call holds at most one transaction as the node sent it, and the rest only as far as
+/// the result can carry them. A transaction that doesn't fit what is left ends the call with
+/// `more` set, unconverted beyond the budget, and the next call starts with it; the first
+/// transaction always comes back, its later row changes left out if it alone is too large.
+///
 /// # Errors
 ///
 /// The status opening the first stream failed with, or that ended a stream before any
@@ -626,10 +648,14 @@ async fn collect_changes(
     name: &DatabaseName,
     after: Option<Position>,
     limit: usize,
+    budget: Budget,
 ) -> Result<Collected, Status> {
     let mut collected = Collected {
+        capture: None,
+        transactions: Vec::new(),
         next_after: after,
-        ..Collected::default()
+        more: false,
+        budget,
     };
     // Set when the first stream opens.
     let mut until = None;
@@ -728,8 +754,28 @@ async fn read_changes(
                 {
                     continue;
                 }
-                collected.next_after = Some(transaction.position.clone());
-                collected.transactions.push(transaction);
+                let position = transaction.position.clone();
+                let first = collected.transactions.is_empty();
+                let (out, used) = match transaction_out(transaction, collected.budget) {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        tracing::warn!(%error, "a changed transaction couldn't be measured");
+                        return Read::Failed(Status::internal("a result couldn't be measured"));
+                    }
+                };
+                let cut = out.omitted_changes > 0;
+                // Beyond what is left, and not the first: the next call starts with it.
+                if cut && !first {
+                    collected.more = true;
+                    return Read::Done;
+                }
+                collected.budget = collected.budget.less(used);
+                collected.next_after = Some(position);
+                collected.transactions.push(out);
+                if cut {
+                    collected.more = true;
+                    return Read::Done;
+                }
             }
         }
     }

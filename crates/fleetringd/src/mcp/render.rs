@@ -190,9 +190,41 @@ fn elided(bytes: usize) -> serde_json::Value {
     serde_json::json!({ "elided_bytes": bytes })
 }
 
-/// `transaction` as `changes` returns it: every name and value fielded, column names as values
-/// of a `name` field and never as object keys, so nothing a writer chose reaches a key.
-pub(crate) fn transaction_out(transaction: &ChangedTransaction) -> TransactionOut {
+/// What a `changes` result may still take: bytes of its text, and row changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Budget {
+    /// Bytes of the result's text, as [`text`] writes it.
+    pub(crate) bytes: usize,
+    /// Row changes.
+    pub(crate) rows: usize,
+}
+
+impl Budget {
+    /// What is left of this budget after `used`.
+    #[must_use]
+    pub(crate) fn less(self, used: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_sub(used.bytes),
+            rows: self.rows.saturating_sub(used.rows),
+        }
+    }
+}
+
+/// `transaction` as `changes` returns it, with every name and value fielded: column names are
+/// values of a `name` field and never object keys, so nothing a writer chose reaches a key.
+///
+/// The transaction is consumed, and its row changes are converted one at a time while they fit
+/// `budget`, counting each one's text and its comma; the rest are dropped unconverted and
+/// counted in `omitted_changes`. So whatever the transaction holds, what this keeps is bounded
+/// by `budget`. Returns the transaction and what it takes of the budget.
+///
+/// # Errors
+///
+/// If a part can't be serialized to measure it.
+pub(crate) fn transaction_out(
+    transaction: ChangedTransaction,
+    budget: Budget,
+) -> Result<(TransactionOut, Budget), serde_json::Error> {
     let columns = |columns: &[Column]| -> Vec<ColumnOut> {
         columns
             .iter()
@@ -202,24 +234,47 @@ pub(crate) fn transaction_out(transaction: &ChangedTransaction) -> TransactionOu
             })
             .collect()
     };
-    TransactionOut {
-        start: transaction.start.as_ref().map(ToString::to_string),
-        position: transaction.position.to_string(),
-        lease_epoch: transaction.epoch.get(),
-        changes: transaction
-            .changes
-            .iter()
-            .map(|change| RowChangeOut {
-                table: change.table.clone(),
-                operation: change.operation.to_string(),
-                key: columns(&change.key),
-                before: change.before.as_deref().map(columns),
-                after: change.after.as_deref().map(columns),
-                updated: change.updated.clone(),
-            })
-            .collect(),
+    let ChangedTransaction {
+        start,
+        position,
+        epoch,
+        changes,
+        ..
+    } = transaction;
+    let mut out = TransactionOut {
+        start: start.as_ref().map(ToString::to_string),
+        position: position.to_string(),
+        lease_epoch: epoch.get(),
+        changes: Vec::new(),
         omitted_changes: 0,
+    };
+    // The transaction's own fields, and its comma in the list.
+    let mut used = Budget {
+        bytes: text_len(&out)?.saturating_add(1),
+        rows: 0,
+    };
+    let total = changes.len();
+    for (index, change) in changes.into_iter().enumerate() {
+        let row = RowChangeOut {
+            table: change.table,
+            operation: change.operation.to_string(),
+            key: columns(&change.key),
+            before: change.before.as_deref().map(columns),
+            after: change.after.as_deref().map(columns),
+            updated: change.updated,
+        };
+        let bytes = used.bytes.saturating_add(text_len(&row)?.saturating_add(1));
+        if bytes > budget.bytes || used.rows >= budget.rows {
+            out.omitted_changes = u64::try_from(total - index).unwrap_or(u64::MAX);
+            break;
+        }
+        used = Budget {
+            bytes,
+            rows: used.rows + 1,
+        };
+        out.changes.push(row);
     }
+    Ok((out, used))
 }
 
 /// Fits `changes`' result within `max` bytes, and returns whether anything was left out.
@@ -346,7 +401,7 @@ pub(crate) fn fit_listing(
 }
 
 /// The length of `value`'s text, as [`text`] writes it.
-fn text_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
+pub(crate) fn text_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
     let json = serde_json::to_string(value)?;
     Ok(json.chars().map(escaped_len).sum())
 }
@@ -697,11 +752,24 @@ mod tests {
         }
     }
 
+    /// A budget nothing in these tests reaches.
+    const UNBOUNDED: Budget = Budget {
+        bytes: usize::MAX,
+        rows: usize::MAX,
+    };
+
+    fn whole(transaction: &ChangedTransaction) -> Result<TransactionOut, serde_json::Error> {
+        transaction_out(transaction.clone(), UNBOUNDED).map(|(out, _)| out)
+    }
+
     fn changes_out(transactions: &[ChangedTransaction]) -> ChangesOut {
         ChangesOut {
             database: "agent-42-notes".to_owned(),
             capture_mode: Some("after".to_owned()),
-            transactions: transactions.iter().map(transaction_out).collect(),
+            transactions: transactions
+                .iter()
+                .map(|transaction| whole(transaction).expect("serializable"))
+                .collect(),
             next_after: transactions
                 .last()
                 .map(|transaction| transaction.position.to_string()),
@@ -716,7 +784,7 @@ mod tests {
         let mut transaction = inserts(1, 1, hostile);
         transaction.changes[0].table = hostile.to_owned();
         transaction.changes[0].key[0].name = hostile.to_owned();
-        let out = transaction_out(&transaction);
+        let out = whole(&transaction)?;
         let json = serde_json::to_value(&out)?;
         assert_eq!(
             json,
@@ -792,6 +860,51 @@ mod tests {
         let left = first.changes.len();
         assert!(left > 0 && left < 50, "{left}");
         assert_eq!(first.omitted_changes, u64::try_from(50 - left).unwrap_or(0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_transaction_is_converted_only_as_far_as_its_budget() -> Result<(), serde_json::Error> {
+        let body = "w".repeat(1_000);
+        let transaction = inserts(8, 1_000, &body);
+        let whole_len = text_len(&whole(&transaction)?)?;
+        // By bytes: what is kept, with its comma, fits, and the rest is counted.
+        let bytes = Budget {
+            bytes: 20 * 1024,
+            rows: usize::MAX,
+        };
+        let (out, used) = transaction_out(transaction.clone(), bytes)?;
+        let kept = out.changes.len();
+        assert!(kept > 0 && kept < 1_000, "{kept}");
+        assert_eq!(
+            out.omitted_changes,
+            u64::try_from(1_000 - kept).unwrap_or(0)
+        );
+        assert!(used.bytes <= bytes.bytes && used.bytes < whole_len);
+        assert!(text_len(&out)? < bytes.bytes);
+        assert_eq!(used.rows, kept);
+        // By row changes.
+        let rows = Budget {
+            bytes: usize::MAX,
+            rows: 7,
+        };
+        let (out, used) = transaction_out(transaction.clone(), rows)?;
+        assert_eq!(
+            (out.changes.len(), out.omitted_changes, used.rows),
+            (7, 993, 7)
+        );
+        // Nothing left: the transaction comes back with every row change counted as omitted.
+        let none = Budget { bytes: 0, rows: 0 };
+        let (out, _) = transaction_out(transaction, none)?;
+        assert_eq!((out.changes.len(), out.omitted_changes), (0, 1_000));
+        assert_eq!(out.position, "0009");
+        assert_eq!(
+            bytes.less(used),
+            Budget {
+                bytes: bytes.bytes.saturating_sub(used.bytes),
+                rows: usize::MAX - 7,
+            }
+        );
         Ok(())
     }
 }

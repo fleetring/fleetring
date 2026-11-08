@@ -1272,6 +1272,92 @@ async fn changes_honours_limit_and_its_maximum() -> TestResult {
     Ok(())
 }
 
+/// Inserts `rows` notes of 1,000 characters each into the agent's `name`, from `first` on, in
+/// one transaction.
+async fn insert_wide(node: &Node, name: &str, first: i64, rows: i64) -> TestResult {
+    node.agent()?
+        .execute(
+            &name.parse()?,
+            Statement::with_params(
+                "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM n WHERE x + 1 < ?) \
+                 INSERT INTO note (id, body) SELECT ? + x, replace(hex(zeroblob(500)), '0', 'x') \
+                 FROM n",
+                vec![EngineValue::Integer(rows), EngineValue::Integer(first)],
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changes_stay_within_the_result_bound_and_continue_where_they_stopped() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let node = Node::start_with(dir.path(), Setup::Held).await?;
+    let max = 64 * 1024;
+    let mut mcp = node.mcp(&["--max-result-bytes", "64KiB"]).await?;
+    with_notes(&mut mcp, "agent-42-notes").await?;
+    let mut after = next_after(
+        &mcp.ok("changes", json!({"database": "agent-42-notes"}))
+            .await?,
+    )?;
+    // Six transactions of about 27 KiB, two to a result, then one of about 110 KiB, more than a
+    // result holds on its own.
+    for at in 0..6 {
+        insert_wide(&node, "agent-42-notes", at * 25 + 1, 25).await?;
+    }
+    insert_wide(&node, "agent-42-notes", 1_001, 100).await?;
+
+    let mut transactions = Vec::new();
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        assert!(calls <= 10, "the calls never caught up: {transactions:?}");
+        let out = mcp
+            .ok(
+                "changes",
+                json!({"database": "agent-42-notes", "after": after, "limit": 100}),
+            )
+            .await?;
+        let size = serde_json::to_string(&out)?.len();
+        assert!(size <= max, "{size} bytes");
+        let returned = out["transactions"].as_array().ok_or("no transactions")?;
+        if returned.is_empty() {
+            assert_eq!(out["more"], false, "{out}");
+            break;
+        }
+        // Stopped short of the next transaction, so more is waiting.
+        assert_eq!(out["more"], true, "{size} bytes");
+        transactions.extend(returned.iter().cloned());
+        after = next_after(&out)?;
+    }
+    assert_eq!(transactions.len(), 7);
+    assert!(
+        calls <= 6,
+        "{calls} calls: several transactions share a result"
+    );
+    let mut last = String::new();
+    for (index, transaction) in transactions.iter().enumerate() {
+        let start = transaction["start"].as_str().ok_or("no start")?;
+        assert!(start >= last.as_str(), "in order, each once");
+        last = transaction["position"]
+            .as_str()
+            .ok_or("no position")?
+            .to_owned();
+        let kept = transaction["changes"].as_array().map_or(0, Vec::len);
+        let omitted = transaction["omitted_changes"].as_u64().ok_or("no count")?;
+        if index < 6 {
+            assert_eq!((kept, omitted), (25, 0), "whole");
+        } else {
+            // The large one comes back alone, as far as it fits, with the rest counted.
+            assert!(kept > 0 && omitted > 0, "{kept} kept, {omitted} omitted");
+            assert_eq!(u64::try_from(kept)? + omitted, 100);
+        }
+    }
+    mcp.close().await?;
+    node.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changes_maps_each_refusal_to_a_tool_error() -> TestResult {
     let dir = tempfile::tempdir()?;
