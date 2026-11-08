@@ -33,7 +33,8 @@ use fleetringd::upgrade::{Running, running};
 
 use crate::agent::{
     self, AUTHORITY_CERT_LIFETIME, Acquired, AgentDir, AgentError, AgentId, AgentRecord,
-    DEV_CERT_LIFETIME, IssuedBy, Issuer, MintGrant, OldToken, RENEW_TOKEN_WITHIN, Renewal,
+    DEV_CERT_LIFETIME, IssuedBy, Issuer, MintGrant, OldToken, RENEW_TOKEN_WITHIN, Renewal, Renewed,
+    ScopeRenewal, ScopesFrom,
 };
 use crate::confirm::{self, Place};
 use crate::format::{self, OutputArgs, OutputFormat};
@@ -55,8 +56,8 @@ const REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) enum AgentCommand {
     /// Mints an agent's identity: a certificate and a scoped token
     ///
-    /// A certificate for `agent-<id>` and a token scoped `admin:agent-<id>-*`, kept private in a
-    /// directory of its own. In dev mode it starts the dev node if none runs, and signs with dev
+    /// A certificate for `agent-<id>` and a token scoped `admin:agent-<id>-*` and
+    /// `stream:agent-<id>-*`, kept private in a directory of its own. In dev mode it starts the dev node if none runs, and signs with dev
     /// mode's authority; for another fleet, pass `--authority`.
     Add(AgentAddArgs),
     /// Lists the context's agents, with their scopes and expiries
@@ -82,6 +83,10 @@ pub(crate) enum AgentCommand {
         target: Target,
     },
     /// Reissues an agent's certificate and token now, and revokes the old token
+    ///
+    /// An identity that holds exactly the scope 0.7 gave by default, `admin:agent-<id>-*` (or
+    /// `read:agent-<id>-*` for a read-only one), also gets `stream:agent-<id>-*`, today's
+    /// default. Scopes chosen with `--scope` are kept as they are.
     Renew {
         /// The agent's ID.
         #[arg(add = ArgValueCandidates::new(completions::agent_ids))]
@@ -122,14 +127,16 @@ pub(crate) struct AgentAddArgs {
     ///
     /// Its principal is `agent-<id>`.
     id: AgentId,
-    /// A scope the token carries instead of the default `admin:agent-<id>-*`
+    /// A scope the token carries instead of the defaults
     ///
-    /// Repeat it for more.
+    /// The defaults are `admin:agent-<id>-*` and `stream:agent-<id>-*`. Repeat it for more;
+    /// `agent renew` never widens scopes chosen with it.
     #[arg(long = "scope", value_name = "SCOPE")]
     scopes: Vec<Scope>,
-    /// Records the identity as read-only, with the default scope `read:agent-<id>-*`
+    /// Records the identity as read-only, with default scopes that read and stream
     ///
-    /// `mcp --agent` then offers only the tools that read.
+    /// They are `read:agent-<id>-*` and `stream:agent-<id>-*`, and `mcp --agent` offers only the
+    /// tools that read.
     #[arg(long)]
     read_only: bool,
     /// The directory with the fleet's `ca.crt` and `ca.key`
@@ -273,6 +280,18 @@ impl AgentReady {
             |name| format!("context '{name}'"),
         );
         let record = &self.record;
+        let mut text = String::new();
+        // A start never widens an identity; it says how to.
+        if let Some(widened) = self.dir.id().widened(record) {
+            let scopes: Vec<String> = widened.iter().map(ToString::to_string).collect();
+            let _ = writeln!(
+                text,
+                "note: agent {id}'s identity predates the stream scope, so it can't follow its \
+                 databases' changes; `fleetring agent renew {id}` gives it {}",
+                scopes.join(" and "),
+                id = self.dir.id(),
+            );
+        }
         let renewal = if self.dev_control.is_some() {
             "renewed at start when under 7 days".to_owned()
         } else {
@@ -282,9 +301,10 @@ impl AgentReady {
                 self.dir.id()
             )
         };
-        let mut text = format!(
+        let _ = writeln!(
+            text,
             "serving MCP as {} on {context}; certificate expires {}, token expires {} \
-             ({renewal})\n",
+             ({renewal})",
             record.principal, record.cert_expires_at, record.token_expires_at
         );
         if record
@@ -335,9 +355,10 @@ pub(crate) fn no_identity(dir: &AgentDir, context: Option<(&ContextName, &Contex
 /// If the identity doesn't exist outside dev mode, the dev directory fails its check, or the
 /// node can't be started or the identity minted. Nothing is minted on any error before the mint.
 ///
-/// A first mint gets `access`'s default scope and records it, so `--read-only` on a first start
-/// makes a reading identity. An identity that exists keeps its own scopes and access: `access`
-/// neither widens nor narrows it.
+/// A first mint gets `access`'s default scopes and records them, so `--read-only` on a first
+/// start makes a reading identity. An identity that exists keeps its own scopes and access:
+/// `access` neither widens nor narrows it, and only `agent renew` adds `stream` to an identity
+/// minted before it was a default.
 pub(crate) async fn prepare_agent(
     target: &Target,
     access: Access,
@@ -494,8 +515,10 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
                 .principal()
                 .unwrap_or_else(|| "authority".to_owned());
             let cert_ttl = args.ttl.unwrap_or(AUTHORITY_CERT_LIFETIME);
+            let (scopes, scopes_from) = scopes_or_default(&args.id, args.scopes, access);
             let grant = MintGrant {
-                scopes: scopes_or_default(&args.id, args.scopes, access),
+                scopes,
+                scopes_from,
                 access,
                 cert_ttl,
                 token_ttl: cert_ttl.min(MAX_TOKEN_LIFETIME),
@@ -538,12 +561,12 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
     Ok(stdout)
 }
 
-/// The scopes `--scope` gave, or the agent's default for `access`.
-fn scopes_or_default(id: &AgentId, scopes: Vec<Scope>, access: Access) -> Vec<Scope> {
+/// The scopes `--scope` gave, or the agent's defaults for `access`, and which they are.
+fn scopes_or_default(id: &AgentId, scopes: Vec<Scope>, access: Access) -> (Vec<Scope>, ScopesFrom) {
     if scopes.is_empty() {
-        vec![id.default_scope(access)]
+        (id.default_scopes(access), ScopesFrom::Defaults)
     } else {
-        scopes
+        (scopes, ScopesFrom::Flags)
     }
 }
 
@@ -551,8 +574,10 @@ fn scopes_or_default(id: &AgentId, scopes: Vec<Scope>, access: Access) -> Vec<Sc
 /// or `ttl` if that is shorter, signed by dev mode's admin.
 fn dev_grant(id: &AgentId, scopes: Vec<Scope>, access: Access, ttl: Option<Duration>) -> MintGrant {
     let cert_ttl = ttl.unwrap_or(DEV_CERT_LIFETIME);
+    let (scopes, scopes_from) = scopes_or_default(id, scopes, access);
     MintGrant {
-        scopes: scopes_or_default(id, scopes, access),
+        scopes,
+        scopes_from,
         access,
         cert_ttl,
         token_ttl: cert_ttl.min(MAX_TOKEN_LIFETIME),
@@ -682,7 +707,8 @@ fn renewed(renewal: Renewal) -> &'static str {
     }
 }
 
-/// `agent renew`: reissues both credentials and revokes the old token.
+/// `agent renew`: reissues both credentials, revokes the old token, and gives an identity that
+/// holds 0.7's default scope today's defaults.
 async fn renew(
     id: AgentId,
     authority: Option<&Path>,
@@ -691,24 +717,26 @@ async fn renew(
     let situation = situation(target)?;
     let dir = AgentDir::new(&situation.agents_dir, id);
     let now = SystemClock.now();
-    let (record, old, client) = match (authority, &situation.dev_dir) {
+    let (renewed, client) = match (authority, &situation.dev_dir) {
         (Some(authority_dir), _) => {
             let authority = agent::load_authority(authority_dir)?;
+            // A renewal takes the scopes and the access from the record.
             let grant = MintGrant {
                 scopes: Vec::new(),
+                scopes_from: ScopesFrom::Defaults,
                 access: Access::ReadWrite,
                 cert_ttl: AUTHORITY_CERT_LIFETIME,
                 token_ttl: MAX_TOKEN_LIFETIME,
                 owner: String::new(),
             };
-            let (record, old) = dir.renew(Issuer::Authority(&authority), &grant, now)?;
-            (record, old, target.client().ok())
+            let renewed = dir.renew(Issuer::Authority(&authority), &grant, now)?;
+            (renewed, target.client().ok())
         }
         (None, Some(dev_dir)) => {
             let checked = dev::check_dev_dir(dev_dir)?;
             let grant = dev_grant(dir.id(), Vec::new(), Access::ReadWrite, None);
-            let (record, old) = dir.renew(Issuer::Dev(&checked), &grant, now)?;
-            (record, old, dev_admin(&checked).ok())
+            let renewed = dir.renew(Issuer::Dev(&checked), &grant, now)?;
+            (renewed, dev_admin(&checked).ok())
         }
         (None, None) => {
             return Err(format!(
@@ -719,6 +747,11 @@ async fn renew(
             .into());
         }
     };
+    let Renewed {
+        record,
+        old,
+        scopes,
+    } = renewed;
     match client {
         Some(client) => revoke_old(&client, &old).await,
         None => note(format!(
@@ -728,11 +761,28 @@ async fn renew(
         )),
     }
     Ok(format!(
-        "renewed agent {}: certificate expires {}, token expires {}\n",
+        "renewed agent {}: certificate expires {}, token expires {}\n  scopes: {}\n",
         dir.id(),
         record.cert_expires_at,
-        record.token_expires_at
+        record.token_expires_at,
+        renewed_scopes(&record, &scopes)
     ))
+}
+
+/// What `agent renew` says about the scopes the new token carries.
+fn renewed_scopes(record: &AgentRecord, scopes: &ScopeRenewal) -> String {
+    let held = record.scopes.join(", ");
+    match scopes {
+        ScopeRenewal::Widened { added } => format!(
+            "{held} (added {}, a default since 0.8; the identity held only 0.7's default)",
+            added.join(", ")
+        ),
+        ScopeRenewal::Kept if record.scopes_from == ScopesFrom::Flags => format!(
+            "{held} (unchanged: chosen with --scope, which renew never widens; to change them, \
+             remove the agent and add it again)"
+        ),
+        ScopeRenewal::Kept => format!("{held} (unchanged)"),
+    }
 }
 
 /// Whether `agent remove` asks first.
@@ -1182,6 +1232,7 @@ mod tests {
             parent: None,
             fleet: "dev".to_owned(),
             scopes: vec!["admin:agent-42-*".to_owned()],
+            scopes_from: ScopesFrom::Defaults,
             read_only: false,
             token_id: "t1".to_owned(),
             token_expires_at: "2026-12-01T00:00:00Z".to_owned(),

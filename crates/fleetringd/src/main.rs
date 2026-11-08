@@ -308,7 +308,8 @@ struct McpArgs {
 const MCP_HELP: &str = "\
 An MCP client starts the server as a command. `--agent <id>` is the whole setup: in dev
 mode it starts a dev node if none runs, mints the agent's identity (agent-<id>, scoped
-admin:agent-<id>-*) on first use, and renews it at start when it is close to expiring.
+admin:agent-<id>-* and stream:agent-<id>-*) on first use, and renews it at start when it is
+close to expiring.
 The configuration holds no secret (Claude Code's .mcp.json, Cursor's mcp.json):
 
   {\"mcpServers\": {\"fleetring\": {\"command\": \"/usr/local/bin/fleetring\",

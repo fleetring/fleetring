@@ -10,6 +10,7 @@
 //! A mint from dev mode's authority needs a [`DevChecked`], which only
 //! [`dev::check_dev_dir`] makes, so the dev-only rule can't be skipped (point 8.1).
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -48,8 +49,11 @@ pub(crate) const TOKEN_FILE: &str = "token";
 /// The lock every write to an identity's directory holds.
 const LOCK_FILE: &str = ".lock";
 
-/// The `identity.toml` format this release writes and reads (ADR-0044, point 1.7).
-const RECORD_VERSION: u32 = 1;
+/// The newest `identity.toml` format this release reads and writes (ADR-0044, point 1.7).
+///
+/// Version 2 adds `scopes_from`. A record is written at version 2 only when it holds that field,
+/// and at version 1, field for field, when a 0.7 reader can use it as it is.
+const RECORD_VERSION: u32 = 2;
 
 /// How many random bytes a token's ID holds.
 const TOKEN_ID_BYTES: usize = 16;
@@ -82,6 +86,7 @@ pub(crate) struct AgentId {
     principal: Principal,
     admin: Scope,
     read: Scope,
+    stream: Scope,
 }
 
 impl AgentId {
@@ -95,13 +100,34 @@ impl AgentId {
         self.principal.clone()
     }
 
-    /// The scope an identity gets unless `--scope` says otherwise: `admin:agent-<id>-*`, or
-    /// `read:agent-<id>-*` for a reading agent.
-    pub(crate) fn default_scope(&self, access: Access) -> Scope {
+    /// The scopes an identity gets unless `--scope` says otherwise (FR-081): `admin:agent-<id>-*`
+    /// and `stream:agent-<id>-*`, or `read:agent-<id>-*` and `stream:agent-<id>-*` for a reading
+    /// agent. No other action implies `stream` (ADR-0025), and following an agent's own changes
+    /// is reading them, so both get it.
+    pub(crate) fn default_scopes(&self, access: Access) -> Vec<Scope> {
+        vec![self.access_scope(access), self.stream.clone()]
+    }
+
+    /// The scope that gives `access`: `admin:agent-<id>-*` or `read:agent-<id>-*`. It was 0.7's
+    /// only default.
+    fn access_scope(&self, access: Access) -> Scope {
         match access {
             Access::ReadOnly => self.read.clone(),
             Access::ReadWrite => self.admin.clone(),
         }
+    }
+
+    /// The scopes `agent renew` gives `record` in place of its own: this release's defaults, if
+    /// `record` holds exactly 0.7's default for its access and doesn't say `--scope` chose its
+    /// scopes. `None` keeps the scopes as they are, so scopes of an identity's own are never
+    /// widened.
+    pub(crate) fn widened(&self, record: &AgentRecord) -> Option<Vec<Scope>> {
+        if record.scopes_from != ScopesFrom::Defaults {
+            return None;
+        }
+        let old = self.access_scope(record.access()).to_string();
+        let held: BTreeSet<&str> = record.scopes.iter().map(String::as_str).collect();
+        (held == BTreeSet::from([old.as_str()])).then(|| self.default_scopes(record.access()))
     }
 }
 
@@ -132,6 +158,7 @@ impl FromStr for AgentId {
                 .map_err(|_| invalid())?,
             admin: scope("admin")?,
             read: scope("read")?,
+            stream: scope("stream")?,
         })
     }
 }
@@ -160,6 +187,10 @@ pub(crate) struct AgentRecord {
     pub(crate) fleet: String,
     /// The token's scopes.
     pub(crate) scopes: Vec<String>,
+    /// Where the scopes came from. Written only when `--scope` chose them, in a version 2
+    /// record, so that `agent renew` never widens them.
+    #[serde(default, skip_serializing_if = "ScopesFrom::is_defaults")]
+    pub(crate) scopes_from: ScopesFrom,
     /// Whether `mcp --agent` serves only the reading tools.
     pub(crate) read_only: bool,
     /// The token's ID, by which it is revoked.
@@ -193,6 +224,37 @@ impl AgentRecord {
         crate::parse_time(&self.cert_expires_at)
             .ok()
             .map(Timestamp::from_millis)
+    }
+}
+
+/// Where an identity's scopes came from (FR-081).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ScopesFrom {
+    /// The defaults of the release that minted the identity. A version 1 record can't say
+    /// more, so for one that 0.7 wrote this also covers scopes `--scope` chose.
+    #[default]
+    Defaults,
+    /// `--scope`, which replaced the defaults.
+    Flags,
+}
+
+impl ScopesFrom {
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes a reference"
+    )]
+    fn is_defaults(&self) -> bool {
+        *self == Self::Defaults
+    }
+
+    /// The `identity.toml` version a record is written at: 1 without `scopes_from`, so a 0.7
+    /// reader uses it, and 2 with it, which a 0.7 reader refuses with "upgrade".
+    fn record_version(self) -> u32 {
+        match self {
+            Self::Defaults => 1,
+            Self::Flags => 2,
+        }
     }
 }
 
@@ -245,6 +307,8 @@ impl Issuer<'_> {
 pub(crate) struct MintGrant {
     /// The token's scopes.
     pub(crate) scopes: Vec<Scope>,
+    /// Whether they are the defaults or `--scope`'s.
+    pub(crate) scopes_from: ScopesFrom,
     /// Whether `mcp --agent` serves every tool or only the reading ones.
     pub(crate) access: Access,
     /// How long the certificate lasts.
@@ -288,6 +352,27 @@ pub(crate) enum Acquired {
         old: Option<OldToken>,
         renewal: Renewal,
     },
+}
+
+/// What [`AgentDir::renew`] did.
+#[derive(Debug, Clone)]
+pub(crate) struct Renewed {
+    /// The identity's record now.
+    pub(crate) record: AgentRecord,
+    /// The token it replaced, to revoke.
+    pub(crate) old: OldToken,
+    /// What happened to the scopes.
+    pub(crate) scopes: ScopeRenewal,
+}
+
+/// What [`AgentDir::renew`] did to an identity's scopes (FR-081).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScopeRenewal {
+    /// They were 0.7's default and are now this release's defaults; `added` are the scopes
+    /// the renewal added.
+    Widened { added: Vec<String> },
+    /// They were kept: this release's defaults already, or scopes of the identity's own.
+    Kept,
 }
 
 /// A token to revoke: its ID, and when it stops being valid. Both are read from the token
@@ -419,10 +504,14 @@ impl AgentDir {
             return Err(AgentError::Newer { path });
         }
         let record: AgentRecord = toml::from_str(&text).map_err(parse)?;
-        if record.version != RECORD_VERSION {
+        let needs = record.scopes_from.record_version();
+        if record.version < needs {
             return Err(AgentError::Mismatch {
                 path,
-                reason: format!("its version is {}, not {RECORD_VERSION}", record.version),
+                reason: format!(
+                    "its version is {}, but scopes_from needs version {needs}",
+                    record.version
+                ),
             });
         }
         if record.principal != self.id.principal().as_str() {
@@ -496,9 +585,13 @@ impl AgentDir {
         })
     }
 
-    /// Reissues the certificate and the token now, keeping the record's scopes, access, and
-    /// owner, and returns the new record and the token it replaced. Creates nothing if there is
-    /// no identity.
+    /// Reissues the certificate and the token now, keeping the record's access and owner, and
+    /// returns the new record, the token it replaced, and what happened to the scopes. Creates
+    /// nothing if there is no identity.
+    ///
+    /// The scopes are kept, except that an identity holding exactly 0.7's default gets this
+    /// release's defaults, as [`AgentId::widened`] decides: `admin:agent-<id>-*` alone becomes
+    /// that and `stream:agent-<id>-*`. Scopes of an identity's own are never widened.
     ///
     /// # Errors
     ///
@@ -509,7 +602,7 @@ impl AgentDir {
         issuer: Issuer<'_>,
         grant: &MintGrant,
         now: Timestamp,
-    ) -> Result<(AgentRecord, OldToken), AgentError> {
+    ) -> Result<Renewed, AgentError> {
         let no_identity = || AgentError::NoIdentity {
             id: self.id.to_string(),
             dir: self.dir.clone(),
@@ -523,8 +616,29 @@ impl AgentDir {
         };
         self.check_fleet(&old, issuer.authority())?;
         let old_token = self.old_token(&old, now);
+        let (old, scopes) = match self.id.widened(&old) {
+            Some(widened) => {
+                let widened: Vec<String> = widened.iter().map(ToString::to_string).collect();
+                let added = widened
+                    .iter()
+                    .filter(|scope| !old.scopes.contains(scope))
+                    .cloned()
+                    .collect();
+                // Still the defaults, so the record keeps the version a 0.7 reader can use.
+                let record = AgentRecord {
+                    scopes: widened,
+                    ..old
+                };
+                (record, ScopeRenewal::Widened { added })
+            }
+            None => (old, ScopeRenewal::Kept),
+        };
         let record = self.reissue(issuer, &old, Renewal::Both, grant, now)?;
-        Ok((record, old_token))
+        Ok(Renewed {
+            record,
+            old: old_token,
+            scopes,
+        })
     }
 
     /// The token in the directory, to revoke: its ID and expiry, read from the token itself.
@@ -685,12 +799,13 @@ impl AgentDir {
         let written =
             self.write_credentials(authority, Renewal::Both, &grant.scopes, grant, now)?;
         let record = AgentRecord {
-            version: RECORD_VERSION,
+            version: grant.scopes_from.record_version(),
             principal: self.id.principal().to_string(),
             owner: grant.owner.clone(),
             parent: None,
             fleet: authority.fleet().to_string(),
             scopes: grant.scopes.iter().map(ToString::to_string).collect(),
+            scopes_from: grant.scopes_from,
             read_only: grant.access == Access::ReadOnly,
             token_id: written.token_id.unwrap_or_default(),
             token_expires_at: written.token_expires_at.unwrap_or_default(),
@@ -1128,7 +1243,8 @@ mod tests {
 
     fn grant(agent: &AgentId) -> MintGrant {
         MintGrant {
-            scopes: vec![agent.default_scope(Access::ReadWrite)],
+            scopes: agent.default_scopes(Access::ReadWrite),
+            scopes_from: ScopesFrom::Defaults,
             access: Access::ReadWrite,
             cert_ttl: DEV_CERT_LIFETIME,
             token_ttl: MAX_TOKEN_LIFETIME,
@@ -1159,18 +1275,164 @@ mod tests {
         let agent = id("42");
         assert_eq!(agent.principal().as_str(), "agent-42");
         assert!(!agent.principal().is_reserved_agent_name());
+        let shown = |access| -> Vec<String> {
+            agent
+                .default_scopes(access)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
         assert_eq!(
-            agent.default_scope(Access::ReadWrite).to_string(),
-            "admin:agent-42-*"
+            shown(Access::ReadWrite),
+            ["admin:agent-42-*", "stream:agent-42-*"]
         );
         assert_eq!(
-            agent.default_scope(Access::ReadOnly).to_string(),
-            "read:agent-42-*"
+            shown(Access::ReadOnly),
+            ["read:agent-42-*", "stream:agent-42-*"]
+        );
+        for access in [Access::ReadWrite, Access::ReadOnly] {
+            for scope in agent.default_scopes(access) {
+                assert_eq!(scope.separator_warning(), None, "{scope}");
+            }
+        }
+    }
+
+    /// A record of agent 42 with `scopes`, as `scopes_from` says they came.
+    fn record_with(scopes: &[&str], scopes_from: ScopesFrom, access: Access) -> AgentRecord {
+        AgentRecord {
+            version: scopes_from.record_version(),
+            principal: "agent-42".to_owned(),
+            owner: "admin".to_owned(),
+            parent: None,
+            fleet: "dev".to_owned(),
+            scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
+            scopes_from,
+            read_only: access == Access::ReadOnly,
+            token_id: "t1".to_owned(),
+            token_expires_at: "2026-12-01T00:00:00Z".to_owned(),
+            cert_expires_at: "2027-11-01T00:00:00Z".to_owned(),
+            issued_by: IssuedBy::Dev,
+        }
+    }
+
+    #[test]
+    fn only_exactly_the_old_default_is_widened() {
+        let agent = id("42");
+        let widened = |record: &AgentRecord| -> Option<Vec<String>> {
+            agent
+                .widened(record)
+                .map(|scopes| scopes.iter().map(ToString::to_string).collect())
+        };
+        use Access::{ReadOnly, ReadWrite};
+        use ScopesFrom::{Defaults, Flags};
+        // 0.7's defaults become this release's.
+        assert_eq!(
+            widened(&record_with(&["admin:agent-42-*"], Defaults, ReadWrite)),
+            Some(vec![
+                "admin:agent-42-*".to_owned(),
+                "stream:agent-42-*".to_owned()
+            ])
         );
         assert_eq!(
-            agent.default_scope(Access::ReadWrite).separator_warning(),
-            None
+            widened(&record_with(&["read:agent-42-*"], Defaults, ReadOnly)),
+            Some(vec![
+                "read:agent-42-*".to_owned(),
+                "stream:agent-42-*".to_owned()
+            ])
         );
+        // Everything else stays as it is.
+        for record in [
+            // Today's defaults already.
+            record_with(
+                &["admin:agent-42-*", "stream:agent-42-*"],
+                Defaults,
+                ReadWrite,
+            ),
+            // The old default, chosen with --scope.
+            record_with(&["admin:agent-42-*"], Flags, ReadWrite),
+            // Another access's default.
+            record_with(&["read:agent-42-*"], Defaults, ReadWrite),
+            record_with(&["admin:agent-42-*"], Defaults, ReadOnly),
+            // Scopes of its own, narrower, wider, or another agent's.
+            record_with(&["write:agent-42-*"], Defaults, ReadWrite),
+            record_with(&["admin:agent-42-*", "read:x-*"], Defaults, ReadWrite),
+            record_with(&["admin:agent-4-*"], Defaults, ReadWrite),
+            record_with(&[], Defaults, ReadWrite),
+        ] {
+            assert_eq!(widened(&record), None, "{record:?}");
+        }
+    }
+
+    #[test]
+    fn renew_widens_the_old_default_and_keeps_scopes_chosen_with_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let agent = id("42");
+        let issuing = authority("dev");
+        let now = Timestamp::from_millis(1_800_000_000_000);
+        let dir = AgentDir::new(root.path(), agent.clone());
+        // An identity as 0.7 minted it: version 1 and `admin:agent-42-*` alone.
+        let old = MintGrant {
+            scopes: vec!["admin:agent-42-*".parse()?],
+            ..grant(&agent)
+        };
+        dir.mint(Issuer::Authority(&issuing), &old, now)?;
+        let renewed = dir.renew(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        assert_eq!(
+            renewed.scopes,
+            ScopeRenewal::Widened {
+                added: vec!["stream:agent-42-*".to_owned()]
+            }
+        );
+        assert_eq!(
+            renewed.record.scopes,
+            ["admin:agent-42-*", "stream:agent-42-*"]
+        );
+        assert_eq!(renewed.record.version, 1, "a 0.7 reader still reads it");
+        // The token carries the new scope: its claims, read without verifying.
+        let token = fs::read_to_string(dir.token_file())?;
+        let payload = token.trim().split('.').nth(1).ok_or("a token")?;
+        let claims = String::from_utf8(URL_SAFE_NO_PAD.decode(payload)?)?;
+        assert!(claims.contains("stream:agent-42-*"), "{claims}");
+        // A second renewal has nothing to add.
+        let again = dir.renew(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        assert_eq!(again.scopes, ScopeRenewal::Kept);
+        assert_eq!(again.record.scopes, renewed.record.scopes);
+
+        // The same scope chosen with --scope is recorded so, at version 2, and kept.
+        let chosen = AgentDir::new(root.path(), id("43"));
+        let flags = MintGrant {
+            scopes: vec!["admin:agent-43-*".parse()?],
+            scopes_from: ScopesFrom::Flags,
+            ..grant(&id("43"))
+        };
+        let record = chosen.mint(Issuer::Authority(&issuing), &flags, now)?;
+        assert_eq!(record.version, 2);
+        let text = fs::read_to_string(chosen.record_file())?;
+        assert!(text.contains("scopes_from = \"flags\""), "{text}");
+        let kept = chosen.renew(Issuer::Authority(&issuing), &grant(&id("43")), now)?;
+        assert_eq!(kept.scopes, ScopeRenewal::Kept);
+        assert_eq!(kept.record.scopes, ["admin:agent-43-*"]);
+        assert_eq!(kept.record.version, 2);
+        assert_eq!(chosen.record()?, Some(kept.record));
+        Ok(())
+    }
+
+    #[test]
+    fn a_version_1_record_that_says_scopes_from_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let dir = AgentDir::new(root.path(), id("42"));
+        fs::create_dir_all(dir.tls_dir())?;
+        let mut record = record_with(&["admin:agent-42-*"], ScopesFrom::Flags, Access::ReadWrite);
+        record.version = 1;
+        fs::write(dir.record_file(), toml::to_string(&record)?)?;
+        assert!(
+            matches!(dir.record(), Err(AgentError::Mismatch { .. })),
+            "{:?}",
+            dir.record()
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1190,7 +1452,11 @@ mod tests {
         assert_eq!(record.principal, "agent-42");
         assert_eq!(record.owner, "admin");
         assert_eq!(record.parent, None);
-        assert_eq!(record.scopes, ["admin:agent-42-*"]);
+        assert_eq!(record.scopes, ["admin:agent-42-*", "stream:agent-42-*"]);
+        assert_eq!(
+            record.version, 1,
+            "the defaults need nothing a 0.7 reader lacks"
+        );
         assert_eq!(record.issued_by, IssuedBy::Authority);
         let mode = |path: &Path| {
             fs::metadata(path)
@@ -1288,7 +1554,10 @@ mod tests {
         fs::create_dir_all(dir.tls_dir())?;
         fs::write(
             dir.record_file(),
-            "version = 2\nprincipal = \"agent-42\"\nholder_key = \"holder.key\"\n",
+            format!(
+                "version = {}\nprincipal = \"agent-42\"\nholder_key = \"holder.key\"\n",
+                RECORD_VERSION + 1
+            ),
         )?;
         let error = dir.record().expect_err("a newer record");
         assert!(
@@ -1297,8 +1566,17 @@ mod tests {
                 .ends_with("this identity was written by a newer fleetring; upgrade"),
             "{error}"
         );
-        fs::write(dir.record_file(), "version = 1\nunknown = 1\n")?;
-        assert!(matches!(dir.record(), Err(AgentError::Record { .. })));
+        // A version this release knows is read strictly: an unknown field is refused.
+        for version in 1..=RECORD_VERSION {
+            fs::write(
+                dir.record_file(),
+                format!("version = {version}\nunknown = 1\n"),
+            )?;
+            assert!(
+                matches!(dir.record(), Err(AgentError::Record { .. })),
+                "{version}"
+            );
+        }
         Ok(())
     }
 
