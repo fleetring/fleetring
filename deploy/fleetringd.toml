@@ -249,6 +249,15 @@ id = "node-1"
 # allow_plaintext = false
 # sample_interval_ms = 10000     # how often the gauges over databases and members are refreshed
 
+# [limits]
+# What one request may take on a data node (FR-078). New in 0.8.0: a 0.7 node refuses the table,
+# so add it only once the node runs 0.8. A write, query, or schema read still running
+# `statement_timeout_ms` after the node took it is interrupted: a query fails with
+# DEADLINE_EXCEEDED and a write rolls back, committing and replicating nothing. A client that
+# sets an earlier deadline (`db query --timeout`, `fleetring mcp`) gets that one, and a cancelled
+# call stops its statement at once.
+# statement_timeout_ms = 30000
+
 # [log]
 # How log lines are written to stderr: "text" (the default) or "json", one object per line with
 # the current span; every request's lines carry its `rpc` span and `request_id`. `--log-format`

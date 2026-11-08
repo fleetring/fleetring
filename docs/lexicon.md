@@ -938,6 +938,14 @@ The placement spec: the normative description of placement that every implementa
 - **Code:** `RingSpec`, `CellsSpec`, `NodeSpec`. **CLI:** none.
 - **Not:** schema, config, manifest.
 
+### Statement deadline
+
+When a write, query, or schema read must stop on its [primary](#primary): the data node's `[limits] statement_timeout_ms` after the node takes the request, or the call's own earlier deadline (FR-078). At the deadline, or once the call is cancelled, the node raises the request's *interrupt*, a flag the engine checks while the statement runs; a write it stops rolls back. Time stays with whoever raises the flag, so engines never read a clock.
+
+- **Applies to:** daemon, CLI.
+- **Code:** `engine::Interrupt`, `engine::Interruption`, `EngineError::Interrupted`, `LimitsConfig::statement_timeout_ms`, `Client::with_call_timeout`, `mcp::STATEMENT_TIMEOUT`. **CLI:** `--timeout` on `db exec` and `db query`; `statement interrupted: …` in messages.
+- **Not:** query timeout (it covers writes too), statement timeout in prose (the setting's name), kill, abort (a gRPC code that means the outcome is unknown).
+
 ### Supervisor
 
 The service manager that started a node and restarts it: systemd (a system or user unit) or launchd (a Homebrew service). A node records one in its [process file](#process-file) only when the supervisor's variable is set *and* the supervisor is its parent, since shells inherit the variables. `stop` and `dev stop` refuse a supervised node, naming the supervisor's own stop command, unless `dev -d` started it (ADR-0043, point 5.5).
