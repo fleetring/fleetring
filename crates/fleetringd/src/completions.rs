@@ -163,8 +163,12 @@ mod tests {
     #[test]
     fn every_shell_gets_a_script_that_runs_the_binary() -> Result<(), Box<dyn Error>> {
         for shell in Shell::value_variants() {
-            for name in [ProgramName::Fleetring, ProgramName::Fleetringd] {
-                let script = script(*shell, name, "fleetring")?;
+            for name in [
+                ProgramName::Fleetring,
+                ProgramName::Fleetringd,
+                ProgramName::Fleet,
+            ] {
+                let script = script(*shell, name, name.as_str())?;
                 assert!(script.contains(COMPLETE_VAR), "{shell:?}: {script}");
                 assert!(script.contains(name.as_str()), "{shell:?}: {script}");
             }
