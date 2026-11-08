@@ -28,6 +28,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::{Code, Status};
 
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::clock::{Clock as _, SystemClock};
@@ -40,8 +41,9 @@ use crate::engine::{
 };
 use crate::mcp::limits::{
     CALL_TIMEOUT, CHANGES_QUIET, CHANGES_WAIT, DEFAULT_CHANGES_LIMIT, DEFAULT_COUNT_LIMIT,
-    DEFAULT_LIST_LIMIT, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT, MAX_CHANGES_ROWS, MAX_LIST_LIMIT,
-    MAX_PARAMS, MAX_POSITION_BYTES, MAX_ROWS, MAX_SQL_BYTES,
+    DEFAULT_LIST_LIMIT, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT, MAX_CHANGES_ROWS,
+    MAX_CONCURRENT_CHANGES, MAX_LIST_LIMIT, MAX_PARAMS, MAX_POSITION_BYTES, MAX_ROWS,
+    MAX_SQL_BYTES,
 };
 use crate::mcp::render::{
     Budget, NOTICE, PAGE_HINT, database_out, fit, fit_changes, fit_listing, list_out, metadata_out,
@@ -302,11 +304,18 @@ fn unwrapped(schema: &JsonObject) -> Arc<JsonObject> {
 pub(crate) struct FleetringMcp {
     client: Client,
     settings: McpSettings,
+    /// The turns of `changes` calls, [`MAX_CONCURRENT_CHANGES`] of them: calls run in parallel,
+    /// and each holds a watcher slot on the node.
+    changes_turns: Semaphore,
 }
 
 impl FleetringMcp {
     pub(crate) fn new(client: Client, settings: McpSettings) -> Self {
-        Self { client, settings }
+        Self {
+            client,
+            settings,
+            changes_turns: Semaphore::new(MAX_CONCURRENT_CHANGES),
+        }
     }
 
     fn me(&self) -> Option<&PrincipalName> {
@@ -490,6 +499,20 @@ impl FleetringMcp {
             .unwrap_or(DEFAULT_CHANGES_LIMIT)
             .clamp(1, MAX_CHANGES_LIMIT);
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        // Each call holds a watcher slot on the node, so only a few run at once. One that
+        // can't get a turn in time returns nothing, as one that found nothing new does, but
+        // with `more` set, so the next call starts where this one would have.
+        let turn = tokio::time::timeout(CHANGES_WAIT, self.changes_turns.acquire()).await;
+        let Ok(Ok(_turn)) = turn else {
+            return Ok(ChangesOut {
+                database: name.to_string(),
+                capture_mode: None,
+                transactions: Vec::new(),
+                next_after: after.as_ref().map(ToString::to_string),
+                more: true,
+                notice: NOTICE.to_owned(),
+            });
+        };
         // The result's own fields at their longest, so the transactions get what is left.
         let envelope = text_len(&ChangesOut {
             database: name.to_string(),

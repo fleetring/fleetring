@@ -63,5 +63,11 @@ pub const CHANGES_QUIET: Duration = Duration::from_millis(250);
 /// `--max-result-bytes` as well.
 pub const MAX_CHANGES_ROWS: usize = 10_000;
 
+/// How many `changes` calls one server runs at once. Each holds one of the node's watcher
+/// slots while it runs, of which a node has 64 for every client, so one MCP client can't take
+/// them all with calls in parallel. A call over the limit waits up to [`CHANGES_WAIT`] for its
+/// turn, and then returns nothing, with `more` set, rather than take another slot.
+pub const MAX_CONCURRENT_CHANGES: usize = 2;
+
 /// The longest position `changes` takes as `after`, in bytes: more than any engine's.
 pub const MAX_POSITION_BYTES: usize = 64;
