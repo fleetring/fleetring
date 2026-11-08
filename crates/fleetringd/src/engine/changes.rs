@@ -192,6 +192,21 @@ impl FromStr for CaptureMode {
     }
 }
 
+/// "after `<position>`", or "from the log's beginning" for the empty position, as a message about
+/// the recorded changes that follow a position says it.
+#[derive(Debug, Clone, Copy)]
+pub struct ChangesAfter<'position>(pub &'position Position);
+
+impl fmt::Display for ChangesAfter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.as_bytes().is_empty() {
+            f.write_str("from the log's beginning")
+        } else {
+            write!(f, "after {}", self.0)
+        }
+    }
+}
+
 /// One committed transaction's recorded row changes, as a watcher reads them (ADR-0045).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedTransaction {
@@ -229,7 +244,8 @@ impl ReadLimit {
         Self::new(NonZeroUsize::MIN, NonZeroUsize::MIN)
     }
 
-    /// Whether a read that has `transactions` transactions holding `rows` row changes is full.
+    /// Whether a read that has `transactions` whole transactions holding `rows` row changes is
+    /// full. A reader asks only between transactions, never inside one.
     #[must_use]
     pub fn reached(self, transactions: usize, rows: usize) -> bool {
         transactions >= self.transactions.get() || rows >= self.rows.get()
