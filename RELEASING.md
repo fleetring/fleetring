@@ -247,7 +247,7 @@ A draft for 0.7.0's notes, under "Breaking changes" (ADR-0043, points 1 and 3). 
 
 ### 0.8.0: `db watch` and `fleet`
 
-A draft for 0.8.0's notes (ADR-0045; ADR-0043's amendment of 2026-11-07; FR-075, #103; FR-081, #126).
+A draft for 0.8.0's notes (ADR-0045; ADR-0043's amendment of 2026-11-07; ADR-0038's amendment of 2026-11-08; FR-075, #103; FR-081, #126; #95).
 
 **Features:**
 
@@ -256,12 +256,16 @@ A draft for 0.8.0's notes (ADR-0045; ADR-0043's amendment of 2026-11-07; FR-075,
 - **`Database.WatchChanges`** is the protocol call behind it, for clients of their own; `fleetringd::data::Client::watch_changes` opens it.
 - **Agents follow their own databases' changes** (FR-081, #126). A newly minted agent identity gets `stream:agent-<id>-*` beside `admin:agent-<id>-*`, or beside `read:agent-<id>-*` with `--read-only`; `--scope` still replaces the defaults. `fleetring mcp` gains a `changes` tool, offered with and without `--read-only`: `changes(database, after?, limit?)` returns at most `limit` transactions (20 by default, at most 100) recorded after `after`, or after the database's current position without it, and `next_after`, the position to continue from. A call returns once it has `limit` of them or has caught up, and waits at most 2 seconds; table names, column names and values come back only in string fields, with the usual notice. Nothing holds an agent's place between calls, so one that falls behind the sinks' pruning gets `out_of_range` with `oldest_position`. The agent skill and quickstart gain a "follow changes" pattern.
 
+- **`fleetring serve --config <file> --check`** says whether a node would start with a configuration and `serve`'s flags, and starts nothing (#95). It runs the checks a start runs before it touches anything, reads none of the files the configuration names, no environment variable and no data directory, and binds nothing. It exits 0 if the node would start, and otherwise prints the first problem, naming the file, the dotted field, and the line and column, and exits 1. `--json` (or `-o json`) prints `config`, `valid`, `node`, `role` and `problems`, each `field`, `line`, `column` and `message`. 0.6's form, `fleetringd --config <file> --check`, works too.
+- **`fleetring upgrade` asks the new release whether the node would start before it swaps it in** (#95). With `--config`, it runs the release's own `serve --check` on the node's command line, in the directory the node started in, and a configuration the release refuses stops the upgrade with the release's message and the fix: `--no-restart`, edit the configuration until `serve --check` passes, then restart. `--rollback` asks the previous binary the same way. `upgrade --software` gains `config_check: true`, and the process file records the directory a node started in (`cwd`).
+
 **Fixes:**
 
 - **A database recording row changes no longer stops taking writes after its first recorded transaction fails.** The rollback took the change table and the capture triggers with it, and every later write to the database failed with `no such table: _fleetring_cdc` until the node reopened it.
 
 **Upgrading from 0.7:**
 
+- **The configuration check starts with the next upgrade.** 0.7's `upgrade` doesn't know `serve --check`, so an upgrade from 0.7 to 0.8 installs 0.8 without asking it about the node's configuration: run the 0.8 binary's `fleetring serve --config <file> --check` first if a setting changed. Upgrades and rollbacks run by 0.8 and later ask every release that has the check, and install a release before 0.8 with a note that its configuration wasn't checked.
 - **Nodes of 0.7 and 0.8 run side by side;** nothing is gated. A `db watch` whose primary runs 0.7 fails with `the primary runs an older release of fleetring, which can't stream changes; upgrade it`, and a watch that follows its database onto a 0.7 primary ends there with that error and the position to resume after.
 - **The change table gains a floor row** (`_fleetring_cdc`, a commit record whose `table_name` is `_fleetring_floor`), written when recording first meets an empty table and by each prune. 0.7 reads it as a commit record and skips it, so rolling back to 0.7 keeps working. Tooling that reads `_fleetring_cdc` directly should skip commit records (`change_type = 2`).
 - **A node serves at most 64 watchers at once;** the next is refused with `UNAVAILABLE`, exit 4.

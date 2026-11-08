@@ -170,7 +170,8 @@ struct DaemonArgs {
     /// (certificates, keys, tokens, credentials), no environment variable and no data directory,
     /// and binds nothing. It exits 0 if the node would start. Otherwise it prints the first
     /// problem, as the node would stop at it, naming the file, the field, and the line and column
-    /// where the parser gives them, and exits 1.
+    /// where the parser gives them, and exits 1. `fleetring upgrade` runs the new release's check
+    /// on the node's command line before it swaps the binary.
     #[arg(long)]
     check: bool,
     /// The check's output format: `table` or `json`
@@ -262,9 +263,11 @@ enum Command {
     /// Installs another release in place of this binary
     ///
     /// The release is verified with cosign against the release workflow's identity, and then by
-    /// checksum; this binary is kept as `<name>.previous`. With `--config` naming a running node,
-    /// it first checks that the fleet allows the release, then drains the node, restarts it in
-    /// place, and waits until it has rejoined and caught up (ADR-0038).
+    /// checksum; this binary is kept as `<name>.previous`. With `--config`, the release checks the
+    /// node's configuration with `serve --check` before it is swapped in, and one it refuses
+    /// stops the upgrade unless `--no-restart`. With `--config` naming a running node, it first
+    /// checks that the fleet allows the release, then drains the node, restarts it in place, and
+    /// waits until it has rejoined and caught up (ADR-0038).
     Upgrade(UpgradeArgs),
     /// Serves the Model Context Protocol on stdio, as one principal
     ///
@@ -359,6 +362,10 @@ struct UpgradeArgs {
     #[arg(long, conflicts_with_all = ["rollback", "no_restart"])]
     check: bool,
     /// Replaces the binary, but leaves the running node on the release it runs
+    ///
+    /// It also installs a release that refuses the node's configuration, and says so: edit the
+    /// configuration until `fleetring serve --config <file> --check` passes, then restart the
+    /// node.
     #[arg(long)]
     no_restart: bool,
     /// Swaps back the binary the last upgrade replaced, `<name>.previous`
@@ -380,7 +387,8 @@ struct UpgradeArgs {
     releases_url: Option<String>,
     /// How long each step may take: `<n>m` or `<n>s`; 5m by default
     ///
-    /// The steps are each download, the drain, the rejoin, and the catch-up.
+    /// The steps are each download, the configuration check, the drain, the rejoin, and the
+    /// catch-up.
     #[arg(long, value_parser = parse_ttl)]
     timeout: Option<Duration>,
     /// Prints what this binary runs as one JSON object, and changes nothing
@@ -2612,6 +2620,7 @@ async fn run_upgrade(args: UpgradeArgs) -> Result<String, Box<dyn Error>> {
             Some(LocalNode {
                 id: config.node.id.clone(),
                 data_dir: config.data_dir.clone(),
+                config: std::path::absolute(path)?,
             })
         }
         None => None,

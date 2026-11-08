@@ -49,6 +49,11 @@ pub struct ProcessFile {
     /// whatever [`supervisor`](Self::supervisor) says (ADR-0043, point 5.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<StartedBy>,
+    /// The directory it was started in, which relative paths in [`args`](Self::args) are
+    /// relative to: `upgrade` checks the node's command line with a new release there. Absent in
+    /// a file a release before 0.8 wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 /// A service manager that runs a node and restarts it, so that only it should stop the node
@@ -211,6 +216,7 @@ impl ProcessFile {
                 &ParentProcess::current(),
             ),
             started_by: crate::dev::started_detached().then_some(StartedBy::Detach),
+            cwd: std::env::current_dir().ok(),
         }
     }
 
@@ -226,6 +232,25 @@ impl ProcessFile {
                 }
                 Some(arg) if arg.starts_with("--log-format=") => {}
                 first => return first == Some("serve"),
+            }
+        }
+    }
+
+    /// The daemon's arguments if they run a node from a configuration file, with `serve` or with
+    /// 0.6's bare daemon flags: `None` for a dev node, and for a file a release before 0.7 wrote,
+    /// which records no arguments.
+    #[must_use]
+    pub fn serve_args(&self) -> Option<&[String]> {
+        let mut args = self.args.iter().map(String::as_str);
+        loop {
+            match args.next()? {
+                "--log-format" | "--color" => {
+                    args.next();
+                }
+                "-q" | "--quiet" => {}
+                arg if arg.starts_with("--log-format=") || arg.starts_with("--color=") => {}
+                "dev" => return None,
+                _ => return Some(&self.args),
             }
         }
     }
@@ -410,6 +435,7 @@ mod tests {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             supervisor: None,
             started_by: None,
+            cwd: None,
         };
         for args in [
             &["serve", "--config", "x"][..],
@@ -427,6 +453,39 @@ mod tests {
         ] {
             assert!(!file(args).started_with_serve(), "{args:?}");
         }
+        // A node run from a configuration, either way, has arguments to check; a dev node and a
+        // file that records none don't.
+        for args in [
+            &["serve", "--config", "x"][..],
+            &["--config", "x"],
+            &["--log-format", "json", "--config=x"],
+            &["--color", "never", "-q", "serve", "--config", "x"],
+        ] {
+            assert_eq!(
+                file(args).serve_args(),
+                Some(&file(args).args[..]),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["dev"][..],
+            &["--log-format=json", "dev", "--data-dir", "d"],
+            &[],
+            &["--log-format", "json"],
+        ] {
+            assert_eq!(file(args).serve_args(), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_directory_is_recorded_and_a_0_7_file_has_none() -> io::Result<()> {
+        let written = ProcessFile::this_process(PathBuf::from("fleetring"));
+        assert_eq!(written.cwd, std::env::current_dir().ok());
+        let old: ProcessFile = serde_json::from_str(
+            r#"{"pid":7,"exe":"fleetring","version":"0.7.0","restarts":0,"args":["serve"]}"#,
+        )?;
+        assert_eq!(old.cwd, None);
+        Ok(())
     }
 
     /// An environment holding `vars`, for [`Supervisor::detect`].

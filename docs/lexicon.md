@@ -730,7 +730,7 @@ A named identity a client acts as, with the scopes its `[[principal]]` entry or 
 
 ### Process file
 
-`fleetringd.process` in a node's data directory, which a running node writes and removes when it stops: its process ID, binary, release, arguments, restart count, and, when they apply, its [supervisor](#supervisor) and `started_by = "detach"` for a node `dev -d` started (ADR-0038, ADR-0043 point 5). A node runs when its process file names a process that holds the data directory's lock; a file whose process doesn't is stale. `upgrade` restarts a node through it, and `stop` and `dev stop` stop one. Its name is kept until 1.0.
+`fleetringd.process` in a node's data directory, which a running node writes and removes when it stops: its process ID, binary, release, arguments, the directory it started in (from 0.8), restart count, and, when they apply, its [supervisor](#supervisor) and `started_by = "detach"` for a node `dev -d` started (ADR-0038, ADR-0043 point 5). A node runs when its process file names a process that holds the data directory's lock; a file whose process doesn't is stale. `upgrade` restarts a node through it, after the new release's `serve --check` accepts the node's arguments, run in that directory; `stop` and `dev stop` stop one. Its name is kept until 1.0.
 
 - **Applies to:** daemon, CLI.
 - **Code:** `upgrade::ProcessFile`, `upgrade::running`, `upgrade::Running`. **CLI:** `fleetring stop (--data-dir <dir> | --config <file>)`, `dev stop`, `dev status`.

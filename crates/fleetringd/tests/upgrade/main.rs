@@ -25,8 +25,8 @@ use fleetringd::upgrade::ProcessFile;
 use crate::common::{
     ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, check_history,
     create_history_database, current, fake_binary, fake_cosign, line_behind, lines_ahead,
-    node_command, path_with, printed, release_of, wait_for, wait_for_members, write_release,
-    write_releases_list, write_until,
+    node_command, path_with, printed, refusing_release, release_of, wait_for, wait_for_members,
+    write_release, write_releases_list, write_until,
 };
 
 /// A scratch install of this build, a release server, and a stand-in cosign.
@@ -151,7 +151,11 @@ fn an_upgrade_verifies_swaps_atomically_and_rolls_back() -> TestResult {
     assert!(
         stdout.contains(&format!("installed fleetring {release}"))
             && stdout.contains("verified the signature and the checksum")
-            && !stdout.contains("added fleetring"),
+            && !stdout.contains("added fleetring")
+            && stdout.contains(&format!(
+                "no node's configuration was checked; pass --config to check one with fleetring \
+                 {release}"
+            )),
         "{stdout}"
     );
     // cosign was asked about the release workflow's identity, as RELEASING.md names it.
@@ -445,6 +449,10 @@ fn upgrading_a_running_node_drains_restarts_and_rejoins_it() -> TestResult {
     );
     let stdout = String::from_utf8_lossy(&upgraded.stdout);
     for step in [
+        format!(
+            "fleetring {} accepts node {primary}'s configuration",
+            current()
+        ),
         format!("drained {primary}: handed over 1 database"),
         format!("restarted {primary} in place (pid {})", before.pid),
         format!("{primary} rejoined the fleet on {}", current()),
@@ -467,6 +475,140 @@ fn upgrading_a_running_node_drains_restarts_and_rejoins_it() -> TestResult {
     let history = runtime.block_on(writer)?;
     assert!(history.acknowledged.len() > 10, "{history:?}");
     runtime.block_on(check_history(&client, &name, &history))?;
+    Ok(())
+}
+
+/// A release that refuses the node's configuration isn't installed, or rolled back to, and the
+/// node keeps running on the release it runs; the refusal shows what the release said and the
+/// fix. `--no-restart` installs it anyway, and says to edit the configuration before a restart.
+#[test]
+fn a_configuration_the_release_refuses_stops_the_swap_and_the_node_keeps_running() -> TestResult {
+    let bench = Bench::new()?;
+    let fleet = ProcessFleet::start_serving(&bench.dir.path().join("fleet"), &bench.bin, 1)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let client = fleet.client()?;
+    runtime.block_on(wait_for_members(&client, &["node-1"], None))?;
+    let node = &fleet.nodes[0];
+    let before = wait_for("the node writes its process file", || {
+        ProcessFile::read(&node.data_dir).ok().flatten()
+    })?;
+    let installed = fs::read(&node.bin)?;
+    let previous = node.bin.with_file_name("fleetring.previous");
+    let release = current();
+    let url = bench.publish(&release, &refusing_release(), Defect::None)?;
+    let upgrade = |args: &[&str]| -> TestResult<Output> {
+        Ok(fleet
+            .command(&node.bin, &bench.path())
+            .arg("upgrade")
+            .args(args)
+            .arg("--config")
+            .arg(&node.config)
+            .output()?)
+    };
+    let says = format!(
+        "  fleetring {release} says:\n    fleetring: {}: field membership.heartbeat_interval_ms: \
+         200 ms is under this release's minimum, 500 ms",
+        node.config.display()
+    );
+    let hint = format!(
+        "  hint: run the command again with --no-restart, edit the configuration until \
+         `fleetring serve --config {} --check` passes, then restart the node",
+        node.config.display()
+    );
+    let still_running = || -> TestResult {
+        let now = ProcessFile::read(&node.data_dir)?.ok_or("no process file")?;
+        assert_eq!((now.pid, now.restarts), (before.pid, before.restarts));
+        runtime.block_on(wait_for_members(&client, &["node-1"], None))
+    };
+
+    let version = release.to_string();
+    let refused = upgrade(&["--version", &version, "--base-url", &url])?;
+    assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "fleetring: fleetring {release} refuses node node-1's configuration, so the node \
+             wouldn't start on it; nothing was changed\n{says}\n{hint}"
+        )),
+        "{}",
+        printed(&refused)
+    );
+    assert_eq!(fs::read(&node.bin)?, installed, "the binary was replaced");
+    assert!(!previous.exists(), "a previous binary was kept");
+    still_running()?;
+
+    // A rollback to a release that refuses it is refused too, and swaps nothing.
+    fs::write(&previous, refusing_release())?;
+    fs::set_permissions(&previous, fs::Permissions::from_mode(0o755))?;
+    let rollback = upgrade(&["--rollback"])?;
+    assert_eq!(rollback.status.code(), Some(1), "{}", printed(&rollback));
+    assert!(
+        String::from_utf8_lossy(&rollback.stderr).contains(&format!(
+            "refuses node node-1's configuration, so the node wouldn't start on it; nothing was \
+             changed\n{says}"
+        )),
+        "{}",
+        printed(&rollback)
+    );
+    assert_eq!(fs::read(&node.bin)?, installed, "rolled back");
+    assert_eq!(fs::read(&previous)?, refusing_release());
+    fs::remove_file(&previous)?;
+    still_running()?;
+
+    // The way through: install without a restart, then edit, then restart.
+    let anyway = upgrade(&["--version", &version, "--base-url", &url, "--no-restart"])?;
+    assert!(anyway.status.success(), "{}", printed(&anyway));
+    let stdout = String::from_utf8_lossy(&anyway.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "fleetring {release} refuses node node-1's configuration, so the node wouldn't start \
+             on it:\n{says}\nedit the configuration until `fleetring serve --config"
+        )) && stdout.contains("node node-1 still runs"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read(&node.bin)?, refusing_release());
+    assert_eq!(fs::read(&previous)?, installed);
+    still_running()
+}
+
+/// A release before 0.8 has no `serve --check`: a downgrade to one installs, and says that the
+/// node's configuration wasn't checked.
+#[test]
+fn a_release_without_the_check_is_installed_with_a_note() -> TestResult {
+    let bench = Bench::new()?;
+    // Started the 0.6 way, so that a release before 0.7 may run it.
+    let fleet = ProcessFleet::start(&bench.dir.path().join("fleet"), &bench.bin, 1)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_members(&fleet.client()?, &["node-1"], None))?;
+    let node = &fleet.nodes[0];
+    wait_for("the node writes its process file", || {
+        ProcessFile::read(&node.data_dir).ok().flatten()
+    })?;
+    let older = line_behind();
+    let url = bench.publish(&older, &fake_binary(&older), Defect::None)?;
+    let installed = fleet
+        .command(&node.bin, &bench.path())
+        .args([
+            "upgrade",
+            "--version",
+            &older.to_string(),
+            "--base-url",
+            &url,
+            "--no-restart",
+        ])
+        .arg("--config")
+        .arg(&node.config)
+        .output()?;
+    assert!(installed.status.success(), "{}", printed(&installed));
+    assert!(
+        String::from_utf8_lossy(&installed.stdout).contains(&format!(
+            "fleetring {older} has no `serve --check`, so node node-1's configuration wasn't \
+             checked; its release notes say what to change"
+        )),
+        "{}",
+        printed(&installed)
+    );
+    assert_eq!(fs::read(&node.bin)?, fake_binary(&older));
     Ok(())
 }
 

@@ -3,7 +3,8 @@
 //!
 //! It runs what `serve` runs before the node starts, in the same order: [`Config::load`], the
 //! flags, and [`Daemon::check`]. It reads no file the configuration names, no environment
-//! variable, and no data directory, and binds nothing.
+//! variable, and no data directory, and binds nothing. `fleetring upgrade` runs a new release's
+//! check on a node's command line before it swaps the binary.
 
 use std::error::Error;
 use std::fs;

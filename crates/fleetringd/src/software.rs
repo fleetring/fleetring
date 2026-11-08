@@ -38,8 +38,9 @@ pub fn running() -> Software {
 }
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
-/// release, the protocol, the control-log format, and the fleet features, so that an upgrade can
-/// ask a binary it hasn't installed yet what it supports.
+/// release, the protocol, the control-log format, the fleet features, and `config_check`, true
+/// since 0.8, which says that `serve --check` checks a node's command line, so that an upgrade
+/// can ask a binary it hasn't installed yet what it supports.
 #[must_use]
 pub fn running_json() -> String {
     let software = running();
@@ -48,6 +49,7 @@ pub fn running_json() -> String {
         "protocol": format!("{}.{}", PROTOCOL_VERSION.major, PROTOCOL_VERSION.minor),
         "control_format": software.control_format(),
         "features": software.features().map(Feature::as_str).collect::<Vec<_>>(),
+        "config_check": true,
     })
     .to_string()
 }
@@ -118,6 +120,8 @@ mod tests {
             printed["features"],
             serde_json::json!(["undrain", "metadata", "expiry"])
         );
+        // An upgrade runs this build's `serve --check` before it swaps it in (#95).
+        assert_eq!(printed["config_check"], serde_json::json!(true));
     }
 
     #[test]

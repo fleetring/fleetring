@@ -137,11 +137,14 @@ pub(crate) fn version_of(path: &Path) -> Result<Release, UpgradeError> {
         })
 }
 
-/// What a binary says it runs: its release and the fleet features it supports, by name.
+/// What a binary says it runs: its release, the fleet features it supports, by name, and
+/// whether it can check a node's configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reported {
     pub(crate) release: Release,
     pub(crate) features: BTreeSet<String>,
+    /// Whether it has `serve --check`, which a release before 0.8 hasn't.
+    pub(crate) config_check: bool,
 }
 
 impl Reported {
@@ -154,12 +157,14 @@ impl Reported {
                 .features()
                 .map(|feature| feature.as_str().to_owned())
                 .collect(),
+            config_check: true,
         }
     }
 }
 
 /// What the binary at `path` runs, from `--version` and `upgrade --software`. A binary without
-/// `upgrade --software`, such as 0.3.0, supports no fleet features.
+/// `upgrade --software`, such as 0.3.0, supports no fleet features, and one whose answer has no
+/// `config_check`, a release before 0.8, can't check a configuration.
 ///
 /// # Errors
 ///
@@ -171,18 +176,29 @@ pub(crate) fn software_of(path: &Path) -> Result<Reported, UpgradeError> {
         version: String,
         #[serde(default)]
         features: Vec<String>,
+        #[serde(default)]
+        config_check: bool,
     }
     let release = version_of(path)?;
-    let features = Command::new(path)
+    let printed = Command::new(path)
         .args(["upgrade", "--software"])
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| serde_json::from_slice::<Printed>(&output.stdout).ok())
-        .filter(|printed| printed.version == release.to_string())
-        .map(|printed| printed.features.into_iter().collect())
-        .unwrap_or_default();
-    Ok(Reported { release, features })
+        .filter(|printed| printed.version == release.to_string());
+    Ok(match printed {
+        Some(printed) => Reported {
+            release,
+            features: printed.features.into_iter().collect(),
+            config_check: printed.config_check,
+        },
+        None => Reported {
+            release,
+            features: BTreeSet::new(),
+            config_check: false,
+        },
+    })
 }
 
 #[cfg(unix)]
