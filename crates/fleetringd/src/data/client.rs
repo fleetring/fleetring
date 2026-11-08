@@ -1689,6 +1689,28 @@ mod tests {
     }
 
     #[test]
+    fn a_primary_that_cant_stream_changes_is_named_as_an_older_release() {
+        // What a 0.7 node answers: its request boundary doesn't list the call, or, past it, its
+        // service lacks the method.
+        let boundary = Status::permission_denied(
+            "/fleetring.v1.Database/WatchChanges has no scope requirement",
+        );
+        let missing = Status::unimplemented("");
+        for refused in [boundary, missing] {
+            let status = without_watch(refused);
+            assert_eq!(status.code(), Code::Unimplemented);
+            assert_eq!(status.message(), WITHOUT_WATCH);
+        }
+        let scope = Status::permission_denied("WatchChanges needs stream on 'notes'");
+        assert_eq!(without_watch(scope).code(), Code::PermissionDenied);
+        let engine = Status::unimplemented("the engine doesn't support watching changes");
+        assert_eq!(
+            without_watch(engine).message(),
+            "the engine doesn't support watching changes"
+        );
+    }
+
+    #[test]
     fn a_spec_leaves_unset_settings_to_the_fleet() {
         let name: DatabaseName = "notes".parse().expect("a name");
         let request = DatabaseSpec::default().to_request(&name);

@@ -46,6 +46,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `context list \| show \| current \| add \| use \| remove` | Manages contexts (§4) |
 | | `completions bash\|zsh\|fish\|powershell` | Prints a shell completion script |
 | Databases | `db create \| list \| show \| edit \| locate \| exec \| query \| verify \| restore \| drop` | Databases. `db restore` is the online restore into the fleet |
+| | `db watch <db> [--from <position>]` | Follows a database's row changes, one transaction per line (ADR-0045) |
 | Fleet | `status [--node <id> \| --address <host:port>]` | Gives the fleet overview, or one data node's view |
 | | `node list \| drain \| undrain \| remove` | Members, with liveness, release, and drain state |
 | | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042) |
@@ -91,7 +92,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 ## 2. Flags
 
 - **Long flags, kebab-case:** `--replication-factor`, `--min-replicas`. A flag's name is a lexicon term or a field of one.
-- **One flag, one kind of value, everywhere.** `--node` takes a node ID in every command; an address is `--address <host:port>`. A command that dials one node takes either: `--node` looks the address up in the control plane's membership, and `--address` needs nothing else.
+- **One flag, one kind of value, everywhere.** `--node` takes a node ID in every command; an address is `--address <host:port>`. A command that dials one node takes either: `--node` looks the address up in the control plane's membership, and `--address` needs nothing else. One exception, chosen deliberately: `--from` takes a database name in `db restore` and a position in `db watch`, where the stream starts after it (ADR-0045, point 10).
 - **Short flags** only for the universal ones: `-h`, `-V`, `-o`, `-q` and `-v`. There are two more, with the meaning `docker` gives them: `-d` (`--detach`, on `dev`) and `-f` (`--follow`, on `dev logs`). No other single letters, so they never collide.
 - **Booleans** are presence flags (`--yes`, `--insecure-plaintext`). A `--no-<x>` form exists only when the default is on (`agent remove --no-revoke`).
 - **Durations** are `<n>d`, `<n>h`, `<n>m`, or `<n>s`, as `--ttl`, `--timeout` and `--expires-in` take them. Times are RFC 3339, as `--expires-at` and `--at-time` take them. Sizes are bytes with an optional `KiB`, `MiB`, or `GiB`.
@@ -192,13 +193,14 @@ PS1='$(fleetring context current) $ '
   | `db query` | `columns`; `rows`, each a list of values: `null`, a number, a string, or `{"blob": "<base64>"}`; `truncated` |
   | `db verify` | `database`, `position`, `replicas` (each `node`, `chain_hash` and `error`), `chain_hash`, `agree`, `expected` and `unchanged` |
   | `lease watch` | one object per line: `event` (`held`, `gained` or `lost`), `node`, `database` and `lease_epoch` |
+  | `db watch` | one object per transaction, per line: `database`; `start`, the position the transaction started from (`null` for the log's beginning); `position`, where `--from` resumes after it; `lease_epoch`, the serving primary's; and `changes`, each `table`, `operation` (`insert`, `update` or `delete`), `key`, `before`, `after` and `updated`. `key`, `before` and `after` are objects from column name to value in the table's column order, values as `db query` prints them; `before`, `after` and `updated` are `null` when the database's capture mode doesn't record them. Delivery across reconnections is at least once: drop a transaction whose `start` is before the last `position` kept |
   | `orphan list` | `orphans`, each `node`, `database`, `epoch` and `bytes` |
   | `archive show` | `database`, `archive`, `latest`, `latest_archived_at`, `segments`, `segment_bytes`, `snapshots` (each `id`, `position`, `lease_epoch`, `taken_at`, `bytes` and `has_metadata`), `incomplete` and `unusable` |
   | `context list`, `context show` | `contexts`, each `name`, `current`, `fleet`, `control`, `tls_dir`, `ca`, `cert`, `key`, `as` and `token_file`; `show` prints one context alone |
   | `agent list`, `agent show` | `agents`, each `id`, `principal`, `scopes`, `read_only`, `cert_expires_at`, `token_expires_at`, `issued_by` and `dir` |
   | `dev status` | `running`, `pid`, `address`, `release`, `data_dir` and `log` |
 
-  Tests pin each command's fields and their types, so a rename fails CI: `crates/fleetringd/tests/output.rs` runs the commands against a node, and unit tests beside the code that builds them pin the rest (`archive show`, `status --node`'s sinks, `context`, `agent`, `dev status` and `db edit`).
+  Tests pin each command's fields and their types, so a rename fails CI: `crates/fleetringd/tests/output.rs` runs the commands against a node, `tests/watch.rs` pins `db watch`'s, and unit tests beside the code that builds them pin the rest (`archive show`, `status --node`'s sinks, `context`, `agent`, `dev status` and `db edit`).
 
 ### Terminals, pipes and CI
 
@@ -387,4 +389,4 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | No secrets on argv | `--token` is accepted on argv, with `FLEETRING_TOKEN` as the alternative; no `--token-file`, no warning. Keys are always paths. | Done: `--token-file` (phase B), and the warning (phase G1). |
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0 and FR-076's for 0.6.0. | 0.7.0's list: phase A, in the release notes |
 | `upgrade` | Installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place (ADR-0038). | Phase A: across the rename |
-| `db watch` | None; change streams reach only configured sinks. | Deferred: its own ticket and ADR (ADR-0043, point 9) |
+| `db watch` | None; change streams reach only configured sinks. | Done in 0.8.0 (FR-075 item 7, ADR-0045): `db watch <db> [--from <position>]`, with `jsonl`. |

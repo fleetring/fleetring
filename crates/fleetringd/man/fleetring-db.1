@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH fleetring-db 1  FleetRing "FleetRing manual"
 .SH NAME
-fleetring\-db \- Creates, lists, writes, reads, locates, and drops databases
+fleetring\-db \- Creates, lists, writes, reads, watches, and drops databases
 .SH SYNOPSIS
 \fBfleetring db\fR [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
-Creates, lists, writes, reads, locates, and drops databases
+Creates, lists, writes, reads, watches, and drops databases
 .SH OPTIONS
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
@@ -54,6 +54,9 @@ Runs one write statement on the database\*(Aqs primary
 .TP
 fleetring\-db\-query(1)
 Runs one read\-only query on the database\*(Aqs primary
+.TP
+fleetring\-db\-watch(1)
+Follows a database\*(Aqs row changes, one transaction per line, until Ctrl\-C
 .TP
 fleetring\-db\-locate(1)
 Shows where a database lives: its primary, followers, and epoch

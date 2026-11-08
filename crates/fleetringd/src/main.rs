@@ -77,6 +77,7 @@ mod man;
 mod progress;
 mod resolve;
 mod stop;
+mod watch_cmd;
 
 use agent::{AgentDir, AgentId};
 use agent_cmd::AgentCommand;
@@ -219,7 +220,7 @@ enum Command {
     /// A token is a signed, expiring credential that names a principal and carries its scopes.
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Creates, lists, writes, reads, locates, and drops databases
+    /// Creates, lists, writes, reads, watches, and drops databases
     #[command(subcommand)]
     Db(DbCommand),
     /// Lists, drains, undrains, and removes the fleet's members
@@ -768,6 +769,15 @@ enum DbCommand {
     Exec(SqlArgs),
     /// Runs one read-only query on the database's primary.
     Query(QueryArgs),
+    /// Follows a database's row changes, one transaction per line, until Ctrl-C
+    ///
+    /// Streams each committed transaction's inserted, updated and deleted rows from the
+    /// database's primary, as the write quorum acknowledges them (ADR-0045), from now, or after
+    /// the position `--from` names. Needs the `stream` scope on the database, which `read`,
+    /// `write` and `admin` don't grant, and a database that records its changes: one a logical
+    /// change sink names, as dev mode names every database.
+    #[command(after_long_help = watch_cmd::WATCH_HELP)]
+    Watch(watch_cmd::WatchArgs),
     /// Shows where a database lives: its primary, followers, and epoch
     ///
     /// With its durability settings and its replicas' positions.
@@ -2130,6 +2140,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             })?
         }
         Command::Db(DbCommand::Edit(args)) => edit::run(args).await?,
+        Command::Db(DbCommand::Watch(args)) => return watch_cmd::run(args).await,
         Command::Db(DbCommand::Exec(args)) => {
             let (client, name, statement) = args.into_parts().await?;
             let written = client.execute(&name, statement).await.map_err(failed)?;

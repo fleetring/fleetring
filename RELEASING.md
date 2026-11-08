@@ -245,8 +245,22 @@ A draft for 0.7.0's notes, under "Breaking changes" (ADR-0043, points 1 and 3). 
 - **New database names may not start with `_fleetring`,** which is FleetRing's own namespace. A database that already has such a name stays.
 - **Keep service units on `fleetringd --config <file>`** until no node needs to roll back to 0.6. 0.6 doesn't know `serve`. A 0.7 `upgrade --rollback`, or `upgrade --version` with a release before 0.7, refuses to install it over a node started with `serve`, and without a running node to check, it asks, or needs `--yes`. But the 0.6 binary kept as `fleetringd.previous` can't check: `fleetringd.previous upgrade --rollback` installs 0.6 anyway, and a unit that runs `fleetring serve` then fails to start, and its supervisor restarts it in a loop. After switching a unit to `fleetring serve`, rolling back to 0.6 requires reverting the unit to `fleetringd --config` first.
 
-### The release that adds `fleet`
+### 0.8.0: `db watch` and `fleet`
 
-A draft line for the notes of the first release with the alias (ADR-0043, amendment of 2026-11-07), under "Features":
+A draft for 0.8.0's notes (ADR-0045; ADR-0043's amendment of 2026-11-07; FR-075, #103).
 
+**Features:**
+
+- **`fleetring db watch <db>`** follows a database's row changes from its primary, one committed transaction per line, as the write quorum acknowledges them: from now, or after a position with `--from <position>`. `-o jsonl` (and `--json`) prints one object per transaction: `database`, `start`, `position`, `lease_epoch`, and `changes`, each `table`, `operation`, `key`, `before`, `after` and `updated`. When the primary changes, by a failover or a drain, or the command falls behind, it resumes on the new primary after the last position it printed. It needs the `stream` scope on the database, which `read`, `write` and `admin` don't grant, and a database a logical change sink names; dev mode names every database, and its admin has `stream:*`. A resume after changes the sinks have since pruned is refused, naming the oldest position held, and never skips.
 - `fleet` is a permanent short name for `fleetring`: `fleet db list`, `fleet --version`. `install.sh` and the container image link it to `fleetring`; `install.sh` skips it, and says why, if `PREFIX/bin/fleet` is something else or another `fleet` (Rancher Fleet's CLI, JetBrains Fleet's launcher) is on your `PATH`, and `--no-alias` skips it always. The archives are unchanged, and `fleetring upgrade` keeps a `fleet` link working but doesn't add one: rerun `install.sh` for that (#103).
+- **`Database.WatchChanges`** is the protocol call behind it, for clients of their own; `fleetringd::data::Client::watch_changes` opens it.
+
+**Fixes:**
+
+- **A database recording row changes no longer stops taking writes after its first recorded transaction fails.** The rollback took the change table and the capture triggers with it, and every later write to the database failed with `no such table: _fleetring_cdc` until the node reopened it.
+
+**Upgrading from 0.7:**
+
+- **Nodes of 0.7 and 0.8 run side by side;** nothing is gated. A `db watch` whose primary runs 0.7 fails with `the primary runs an older release of fleetring, which can't stream changes; upgrade it`, and a watch that follows its database onto a 0.7 primary ends there with that error and the position to resume after.
+- **The change table gains a floor row** (`_fleetring_cdc`, a commit record whose `table_name` is `_fleetring_floor`), written when recording first meets an empty table and by each prune. 0.7 reads it as a commit record and skips it, so rolling back to 0.7 keeps working. Tooling that reads `_fleetring_cdc` directly should skip commit records (`change_type = 2`).
+- **A node serves at most 64 watchers at once;** the next is refused with `UNAVAILABLE`, exit 4.

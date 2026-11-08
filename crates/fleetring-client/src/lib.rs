@@ -25,6 +25,8 @@ const _: () = {
     assert_debug_send_sync::<context::WasCurrent>();
     assert_debug_send_sync::<dirs::DirsError>();
     assert_debug_send_sync::<output::ArchiveReport>();
+    assert_debug_send_sync::<output::ChangeReport>();
+    assert_debug_send_sync::<output::ColumnsReport>();
     assert_debug_send_sync::<output::DatabaseList>();
     assert_debug_send_sync::<output::DatabaseLocation>();
     assert_debug_send_sync::<output::DatabaseReport>();
@@ -40,6 +42,7 @@ const _: () = {
     assert_debug_send_sync::<output::QueryResult>();
     assert_debug_send_sync::<output::ReplicaHash>();
     assert_debug_send_sync::<output::ReplicaReport>();
+    assert_debug_send_sync::<output::RowChangeReport>();
     assert_debug_send_sync::<output::SchemaObjectReport>();
     assert_debug_send_sync::<output::SchemaReport>();
     assert_debug_send_sync::<output::ServedReport>();
