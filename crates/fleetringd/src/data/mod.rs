@@ -53,6 +53,11 @@
 //!   A worker beside the node acts on the databases the node is primary for and stops when a
 //!   lease moves, without polling the control plane. [`Client::watch_leases`] opens the stream,
 //!   and `fleetringd lease watch` prints it.
+//! - **Change watching:** `WatchChanges` streams a database's recorded row changes from its
+//!   primary, one committed transaction per message, live or resumed after a position the
+//!   primary still holds every change after (ADR-0045). It needs `stream` on the database.
+//!   [`Client::watch_changes`] opens the stream, and `fleetring db watch` prints it, resuming
+//!   on the new primary when the old one stops serving the database.
 
 mod client;
 pub(crate) mod convert;
@@ -63,12 +68,14 @@ mod metadata;
 mod node;
 mod schema;
 mod service;
+mod watch;
 
 pub(crate) use client::unknown_call;
 pub use client::{
-    ArchiveDescription, ArchiveVerification, ArchivedSnapshot, Client, DatabaseSpec,
-    DurabilityChange, LeaseUpdate, LeaseUpdates, Location, NodeStatus, Orphan, ReplicaInfo,
-    Restoration, RestoredExpiry, ServedDatabase, Verification, Written,
+    ArchiveDescription, ArchiveVerification, ArchivedSnapshot, ChangeUpdate, ChangeUpdates,
+    ChangedTransaction, Client, DatabaseSpec, DurabilityChange, LeaseUpdate, LeaseUpdates,
+    Location, NodeStatus, Orphan, ReplicaInfo, Restoration, RestoredExpiry, ServedDatabase,
+    Verification, WITHOUT_WATCH, Written,
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{DROP_FLUSH_LIMIT, LeaseKeeper, LeaseSettings};

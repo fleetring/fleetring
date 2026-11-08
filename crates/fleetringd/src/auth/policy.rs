@@ -327,6 +327,12 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Fleet,
         Binding::None,
     ),
+    // A database's recorded row changes (ADR-0045): `stream`, which no other action implies.
+    rpc(
+        "/fleetring.v1.Database/WatchChanges",
+        Requirement::Database(Action::Stream),
+        Binding::None,
+    ),
 ];
 
 /// The RPC served at `path`, or `None` for a path the table doesn't list, which is refused.

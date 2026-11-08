@@ -1071,3 +1071,191 @@ fn a_user_table_taken_for_a_shadow_table_stays_readable_and_is_kept() -> TestRes
     );
     Ok(())
 }
+
+/// What a watcher reads after `after` up to the log's end, as `(start, inserted values)` per
+/// transaction, with the last transaction's resume position.
+fn watched(
+    db: &mut SqliteDatabase,
+    after: Option<&Position>,
+    limit: ReadLimit,
+) -> Result<Vec<RecordedTransaction>, Box<dyn Error>> {
+    let end = db.position()?.ok_or("a position")?;
+    Ok(db.transactions_after(after, &end, limit)?)
+}
+
+fn inserted_values(transaction: &RecordedTransaction) -> Vec<Value> {
+    transaction
+        .changes
+        .iter()
+        .flat_map(|change| change.values().iter().map(|column| column.value.clone()))
+        .collect()
+}
+
+fn limit(transactions: usize) -> Result<ReadLimit, Box<dyn Error>> {
+    Ok(ReadLimit::new(
+        transactions.try_into()?,
+        std::num::NonZeroUsize::MAX,
+    ))
+}
+
+#[test]
+fn a_watcher_reads_whole_transactions_with_positions_to_resume_after() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    // A transaction that records nothing first, as a fresh table's creation does: the range is
+    // still held, though the first recorded row starts after the watcher's position.
+    exec(&mut db, "CREATE TABLE u (w)")?;
+    db.execute(&Transaction::new([
+        Statement::new("INSERT INTO t VALUES (2)"),
+        Statement::new("INSERT INTO t VALUES (3)"),
+    ]))?;
+    let between = db.position()?.ok_or("a position")?;
+    exec(&mut db, "INSERT INTO t VALUES (4)")?;
+    let end = db.position()?.ok_or("a position")?;
+
+    let all = watched(&mut db, start.as_ref(), limit(10)?)?;
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(
+        inserted_values(&all[0]),
+        [Value::Integer(2), Value::Integer(3)],
+        "one transaction, whole"
+    );
+    assert_eq!(inserted_values(&all[1]), [Value::Integer(4)]);
+    assert_eq!(all[1].start.as_ref(), Some(&between));
+    assert_eq!(
+        all[0].position, between,
+        "a transaction resumes where the next one starts"
+    );
+    assert_eq!(all[1].position, end, "the last resumes at the range's end");
+
+    // A full read stops after whole transactions, and resuming after its last position
+    // continues with the next.
+    let first = watched(&mut db, start.as_ref(), limit(1)?)?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].position, between);
+    let rest = watched(&mut db, Some(&first[0].position), limit(10)?)?;
+    assert_eq!(rest, all[1..]);
+    // Nothing after the end.
+    assert!(watched(&mut db, Some(&end), limit(10)?)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_pruned_range_is_refused_with_the_oldest_position_held() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    let released = db.position()?.ok_or("a position")?;
+    exec(&mut db, "INSERT INTO t VALUES (3)")?;
+    db.release(&released)?;
+    // The prune runs within the next 64 transactions.
+    for value in 4..70 {
+        exec(&mut db, &format!("INSERT INTO t VALUES ({value})"))?;
+    }
+    let refused = watched(&mut db, start.as_ref(), limit(10)?);
+    let Err(error) = refused else {
+        return Err(format!("a pruned range is refused: {refused:?}").into());
+    };
+    match error.downcast_ref::<EngineError>() {
+        Some(EngineError::ChangesReleased { oldest, .. }) => {
+            assert_eq!(oldest.as_ref(), Some(&released), "the floor is the release");
+        }
+        other => return Err(format!("expected ChangesReleased, got {other:?}").into()),
+    }
+    // From the floor on, every transaction is there, the first being the one released after.
+    let held = watched(&mut db, Some(&released), limit(100)?)?;
+    assert_eq!(held.len(), 67, "{}", held.len());
+    assert_eq!(inserted_values(&held[0]), [Value::Integer(3)]);
+    // Sinks still read the range, with the floor skipped.
+    let end = db.position()?.ok_or("a position")?;
+    assert_eq!(db.changes_between(Some(&released), &end)?.len(), 67);
+    Ok(())
+}
+
+#[test]
+fn without_a_floor_the_oldest_row_stands_in_for_one() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    let second = db.position()?.ok_or("a position")?;
+    exec(&mut db, "INSERT INTO t VALUES (3)")?;
+    // As a table an older release pruned: no floor, and the first transaction's rows gone.
+    db.writer.execute(
+        "DELETE FROM _fleetring_cdc WHERE change_id < (SELECT min(change_id) FROM _fleetring_cdc \
+         WHERE start = ?1)",
+        params![second.as_bytes()],
+    )?;
+    let refused = watched(&mut db, start.as_ref(), limit(10)?);
+    assert!(
+        matches!(
+            refused.as_ref().map_err(|error| error.downcast_ref::<EngineError>()),
+            Err(Some(EngineError::ChangesReleased { oldest: Some(oldest), .. })) if *oldest == second
+        ),
+        "{refused:?}"
+    );
+    let held = watched(&mut db, Some(&second), limit(10)?)?;
+    assert_eq!(held.len(), 1);
+    assert_eq!(inserted_values(&held[0]), [Value::Integer(3)]);
+    Ok(())
+}
+
+#[test]
+fn transactions_from_before_recording_are_never_held() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    let before = db.position()?;
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+    db.start_recording(CaptureMode::After)?;
+    let refused = watched(&mut db, before.as_ref(), limit(10)?);
+    assert!(
+        matches!(
+            refused
+                .as_ref()
+                .map_err(|error| error.downcast_ref::<EngineError>()),
+            Err(Some(EngineError::ChangesReleased { oldest: None, .. }))
+        ),
+        "no change table yet: {refused:?}"
+    );
+    let recording = db.position()?;
+    exec(&mut db, "INSERT INTO t VALUES (3)")?;
+    let refused = watched(&mut db, before.as_ref(), limit(10)?);
+    assert!(
+        matches!(
+            refused.as_ref().map_err(|error| error.downcast_ref::<EngineError>()),
+            Err(Some(EngineError::ChangesReleased { oldest: Some(oldest), .. })) if Some(oldest) == recording.as_ref()
+        ),
+        "the floor is where recording began: {refused:?}"
+    );
+    assert_eq!(watched(&mut db, recording.as_ref(), limit(10)?)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_rolled_back_first_recorded_transaction_leaves_recording_working() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    // The first transaction recording runs creates the change table and the triggers, then fails
+    // and rolls them back with it.
+    let failed = db.execute(&Transaction::new([
+        Statement::new("INSERT INTO t VALUES (2)"),
+        Statement::new("INSERT INTO missing VALUES (1)"),
+    ]));
+    assert!(failed.is_err());
+    exec(&mut db, "INSERT INTO t VALUES (3)")?;
+    let end = db.position()?.ok_or("a position after a write")?;
+    let changes = db.changes_between(start.as_ref(), &end)?;
+    assert_eq!(
+        changes.len(),
+        1,
+        "the insert after the rollback is recorded: {changes:?}"
+    );
+    Ok(())
+}

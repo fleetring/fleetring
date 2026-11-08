@@ -52,6 +52,15 @@
 //! database's batches in commit order, each continuing the one before, so a consumer can
 //! discard a batch whose position it has seen.
 //!
+//! # Watchers
+//!
+//! A watcher is a client following a database's recorded row changes through `WatchChanges`
+//! (ADR-0045), served by the database's primary. It is not a sink: it keeps no mark and holds
+//! back no checkpoint, since it reads the change table and not the log. While it is connected,
+//! [`ChangeStreams::watch`] counts its position among those a release of row changes takes the
+//! lowest of, so the sinks don't prune what it is about to read; and at most
+//! [`MAX_WATCHERS`] watch at once on one node.
+//!
 //! # Sinks
 //!
 //! [`FileSink`] appends one JSON line per batch to a file per database, and [`WebhookSink`]
@@ -77,7 +86,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use fleetring_control::{DatabaseName, LeaseEpoch};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -296,6 +305,60 @@ struct Inner {
     /// [`HeldStreams`] keep them.
     held: Mutex<BTreeMap<DatabaseName, usize>>,
     supervisor: Mutex<Option<AbortOnDrop>>,
+    /// The connected watchers, by an ID of their own, each with its database and position.
+    watchers: Mutex<Watchers>,
+    /// One permit per watcher that may connect.
+    watcher_slots: Arc<Semaphore>,
+}
+
+/// The connected watchers, and the ID the next one gets.
+#[derive(Debug, Default)]
+struct Watchers {
+    next: u64,
+    positions: BTreeMap<u64, (DatabaseName, Option<Position>)>,
+}
+
+/// How many watchers one node serves at once (ADR-0045, point 8). The next is refused until one
+/// leaves.
+pub const MAX_WATCHERS: usize = 64;
+
+/// The error [`ChangeStreams::watch`] returns when [`MAX_WATCHERS`] are connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("already serves {limit} change watchers")]
+#[non_exhaustive]
+pub struct TooManyWatchers {
+    /// The limit.
+    pub limit: usize,
+}
+
+/// A connected watcher, counted among the positions that hold back the release of a database's
+/// row changes until it is dropped (ADR-0045, point 7).
+#[derive(Debug)]
+#[must_use = "the watcher stops holding its position once dropped"]
+pub struct Watcher {
+    inner: Arc<Inner>,
+    id: u64,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl Watcher {
+    /// Records that the watcher has read everything up to `position`, so that the release of row
+    /// changes may pass what it has.
+    ///
+    /// # Panics
+    ///
+    /// If the watchers' lock was poisoned by a panic in another thread.
+    pub fn advance(&self, position: Option<Position>) {
+        if let Some(entry) = self.inner.lock_watchers().positions.get_mut(&self.id) {
+            entry.1 = position;
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.inner.lock_watchers().positions.remove(&self.id);
+    }
 }
 
 #[derive(Debug)]
@@ -378,6 +441,8 @@ impl ChangeStreams {
             pumps: Mutex::default(),
             held: Mutex::default(),
             supervisor: Mutex::default(),
+            watchers: Mutex::default(),
+            watcher_slots: Arc::new(Semaphore::new(MAX_WATCHERS)),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner), served));
         *inner.lock_supervisor() = Some(AbortOnDrop(supervisor));
@@ -482,6 +547,50 @@ impl ChangeStreams {
         }
     }
 
+    /// Admits a watcher of `database` that has read up to `position`: from now until the returned
+    /// [`Watcher`] is dropped, a release of the database's row changes doesn't pass its position.
+    ///
+    /// # Errors
+    ///
+    /// [`TooManyWatchers`] if [`MAX_WATCHERS`] are connected already.
+    ///
+    /// # Panics
+    ///
+    /// If the watchers' lock was poisoned by a panic in another thread.
+    pub fn watch(
+        &self,
+        database: &DatabaseName,
+        position: Option<Position>,
+    ) -> Result<Watcher, TooManyWatchers> {
+        let slot = Arc::clone(&self.inner.watcher_slots)
+            .try_acquire_owned()
+            .map_err(|_| TooManyWatchers {
+                limit: MAX_WATCHERS,
+            })?;
+        let id = {
+            let mut watchers = self.inner.lock_watchers();
+            let id = watchers.next;
+            watchers.next += 1;
+            watchers.positions.insert(id, (database.clone(), position));
+            id
+        };
+        Ok(Watcher {
+            inner: Arc::clone(&self.inner),
+            id,
+            _slot: slot,
+        })
+    }
+
+    /// How many watchers are connected to this node.
+    ///
+    /// # Panics
+    ///
+    /// If the watchers' lock was poisoned by a panic in another thread.
+    #[must_use]
+    pub fn watchers(&self) -> usize {
+        self.inner.lock_watchers().positions.len()
+    }
+
     /// Gives the pumps up to `flush` to deliver what is acknowledged, then stops them. Their
     /// positions are recorded, so they continue from there when the node starts again.
     pub async fn stop(&self, flush: Duration) {
@@ -506,6 +615,10 @@ impl Inner {
 
     fn lock_held(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, usize>> {
         self.held.lock().expect("change streams lock poisoned")
+    }
+
+    fn lock_watchers(&self) -> MutexGuard<'_, Watchers> {
+        self.watchers.lock().expect("change watchers lock poisoned")
     }
 
     /// Whether every pump of `database` has delivered the write quorum's position now, as its
@@ -605,8 +718,9 @@ impl Inner {
 }
 
 impl Inner {
-    /// Lets `database` forget the row changes every logical sink has delivered: those up to the
-    /// lowest position among its logical pumps.
+    /// Lets `database` forget the row changes every logical sink has delivered and no connected
+    /// watcher still has to read: those up to the lowest position among its logical pumps and
+    /// its watchers.
     fn release(self: &Arc<Self>, database: &DatabaseName) {
         let lowest = {
             let pumps = self.lock_pumps();
@@ -614,10 +728,17 @@ impl Inner {
                 .iter()
                 .filter(|((_, pumped), pump)| pumped == database && pump.format == Format::Logical)
                 .map(|(_, pump)| pump::lock(&pump.state).position.clone());
-            match positions.next() {
-                None => return,
-                Some(first) => positions.fold(first, |lowest, position| lowest.min(position)),
-            }
+            let Some(first) = positions.next() else {
+                return;
+            };
+            let pumped = positions.fold(first, |lowest, position| lowest.min(position));
+            let watchers = self.lock_watchers();
+            watchers
+                .positions
+                .values()
+                .filter(|(watched, _)| watched == database)
+                .map(|(_, position)| position.clone())
+                .fold(pumped, |lowest, position| lowest.min(position))
         };
         let Some(before) = lowest else {
             return;
@@ -740,6 +861,8 @@ const _: () = {
     assert_debug_send_sync::<SinkKind>();
     assert_debug_send_sync::<SinkStatus>();
     assert_debug_send_sync::<TokenSource>();
+    assert_debug_send_sync::<TooManyWatchers>();
+    assert_debug_send_sync::<Watcher>();
     assert_debug_send_sync::<WebhookConfigError>();
     assert_debug_send_sync::<WebhookSecurity>();
     assert_debug_send_sync::<WebhookSettings>();

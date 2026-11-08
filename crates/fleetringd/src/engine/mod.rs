@@ -25,7 +25,8 @@ pub use adapter::{
     SelfReplicating, Shape, SinkMarks,
 };
 pub use changes::{
-    CaptureMode, Column, LogicalSupport, ParseCaptureModeError, RowChange, RowOperation,
+    CaptureMode, Column, LogicalSupport, ParseCaptureModeError, ReadLimit, RecordedTransaction,
+    RowChange, RowOperation,
 };
 pub use config::{EngineConfig, Execution};
 pub use memory::MemoryEngine;
@@ -48,6 +49,8 @@ const _: () = {
     assert_debug_send_sync::<CaptureMode>();
     assert_debug_send_sync::<Column>();
     assert_debug_send_sync::<LogicalSupport>();
+    assert_debug_send_sync::<ReadLimit>();
+    assert_debug_send_sync::<RecordedTransaction>();
     assert_debug_send_sync::<RowChange>();
     assert_debug_send_sync::<RowOperation>();
     assert_debug_send_sync::<EngineConfig>();

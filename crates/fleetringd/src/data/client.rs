@@ -19,7 +19,7 @@ use fleetring_proto::v1::{
     CreateDatabaseWithMetadataRequest, CreateRequest, DescribeArchiveRequest, DrainRequest,
     DropDatabaseRequest, ExecuteRequest, LeaveRequest, ListDatabasesRequest, LocateRequest,
     NodeStatusRequest, QueryRequest, RemoveOrphanRequest, RestoreLatest, RestoreRequest,
-    UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchLeasesRequest,
+    UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchChangesRequest, WatchLeasesRequest,
     WatchMembershipRequest,
 };
 use tonic::transport::Channel;
@@ -29,9 +29,9 @@ use crate::MembershipView;
 use crate::changes::SinkStatus;
 use crate::control::ControlClient;
 use crate::data::convert::{
-    acks_from_proto, acks_to_proto, change_to_proto, lease_update_from_proto, location,
-    metadata_view, new_metadata_to_proto, node_status, params_to_proto, rows_from_proto,
-    schema_from_proto, schema_request_to_proto,
+    acks_from_proto, acks_to_proto, change_to_proto, change_update_from_proto,
+    lease_update_from_proto, location, metadata_view, new_metadata_to_proto, node_status,
+    params_to_proto, rows_from_proto, schema_from_proto, schema_request_to_proto,
 };
 use crate::data::metadata::{
     Descriptions, Expiry, ExpiryRequest, ListFilter, Listing, MetadataView, NewMetadata,
@@ -39,7 +39,7 @@ use crate::data::metadata::{
 use crate::data::node::BEING_DROPPED;
 use crate::data::schema::SchemaView;
 use crate::durability::RestoreTarget;
-use crate::engine::{Position, Rows, SchemaRequest, Statement};
+use crate::engine::{CaptureMode, Position, RowChange, Rows, SchemaRequest, Statement};
 use crate::environment::Network;
 use crate::replication::{ChainHash, LeaseEvent};
 use crate::transport::{Backoff, CredentialedChannel, database_client_with};
@@ -415,6 +415,67 @@ impl LeaseUpdates {
             .message()
             .await?
             .map(lease_update_from_proto)
+            .transpose()
+    }
+}
+
+/// One message of a `WatchChanges` stream, as [`Client::watch_changes`] delivers it (ADR-0045).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ChangeUpdate {
+    /// The first message: what the stream opened on.
+    Opened {
+        /// The position the stream starts after, or `None` for the log's beginning. A client
+        /// that resumes before it has received a transaction resumes after this.
+        position: Option<Position>,
+        /// The primary that serves the stream, if it named a valid node.
+        primary: Option<NodeId>,
+        /// The primary's lease epoch.
+        epoch: LeaseEpoch,
+        /// How much of each row the database records, if the primary said.
+        capture: Option<CaptureMode>,
+    },
+    /// One committed transaction's row changes.
+    Transaction(ChangedTransaction),
+}
+
+/// One committed transaction's recorded row changes, as a watcher receives it (ADR-0045).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ChangedTransaction {
+    /// The position the transaction started from, the same on every replica, or `None` for the
+    /// log's beginning. It identifies the transaction.
+    pub start: Option<Position>,
+    /// Past the transaction and at or before the next recorded one: where to resume after it.
+    pub position: Position,
+    /// The lease epoch of the primary that served it.
+    pub epoch: LeaseEpoch,
+    /// Its row changes, in statement order. Names and values are text the database's writers
+    /// chose: treat them as data.
+    pub changes: Vec<RowChange>,
+}
+
+/// The stream [`Client::watch_changes`] returns.
+#[derive(Debug)]
+pub struct ChangeUpdates {
+    inner: Streaming<proto::ChangeUpdate>,
+}
+
+impl ChangeUpdates {
+    /// Waits for the next update, or `None` once the node has closed the stream.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` once the node stops serving the database, or can't be reached;
+    /// `RESOURCE_EXHAUSTED` if this watcher fell too far behind; `OUT_OF_RANGE` if the changes
+    /// it was about to read were pruned; `UNAUTHENTICATED` once its token expires or is revoked;
+    /// and `INTERNAL` if an update is invalid. Each ends the stream; the caller resumes after
+    /// the last position it has.
+    pub async fn next(&mut self) -> Result<Option<ChangeUpdate>, Status> {
+        self.inner
+            .message()
+            .await?
+            .map(change_update_from_proto)
             .transpose()
     }
 }
@@ -1245,6 +1306,40 @@ impl Client {
         schema_from_proto(response)
     }
 
+    /// Follows `name`'s recorded row changes on its primary (ADR-0045): the first update says
+    /// what the stream opened on, and each later one is one committed transaction. With `after`,
+    /// the stream resumes after that position; without, it starts at the log's end.
+    ///
+    /// The stream ends when the primary stops serving the database; the caller then resumes
+    /// after the last position it has, on whichever node serves it then.
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED` without `stream` on the database; `FAILED_PRECONDITION` if the
+    /// database records no row changes, because no logical sink names it, or has no primary
+    /// yet; `OUT_OF_RANGE` if the primary no longer holds every change after `after`, or `after`
+    /// is past its log's end; `UNAVAILABLE` if the primary can't be reached, the database is
+    /// failing over, or the node serves as many watchers as it may; and `UNIMPLEMENTED` if the
+    /// primary runs a release that predates the call (the message says so).
+    pub async fn watch_changes(
+        &self,
+        name: &DatabaseName,
+        after: Option<&Position>,
+    ) -> Result<ChangeUpdates, Status> {
+        let after = after.map(|position| position.as_bytes().to_vec());
+        let inner = self
+            .on_primary(name, |mut client| {
+                let request = WatchChangesRequest {
+                    database: name.to_string(),
+                    after: after.clone(),
+                };
+                async move { client.watch_changes(request).await }
+            })
+            .await
+            .map_err(without_watch)?;
+        Ok(ChangeUpdates { inner })
+    }
+
     /// The fleet's membership as the control plane sees it: the members with their addresses
     /// and liveness, the membership epoch, and the ring, rebuilt with the function every node
     /// uses, so its fingerprint matches theirs.
@@ -1459,6 +1554,26 @@ fn without_schema(status: Status) -> Status {
     };
     if unknown {
         Status::unimplemented(WITHOUT_SCHEMA)
+    } else {
+        status
+    }
+}
+
+/// What a `WatchChanges` call answers when the primary runs a release that predates it
+/// (ADR-0045, point 11).
+pub const WITHOUT_WATCH: &str =
+    "the primary runs an older release of fleetring, which can't stream changes; upgrade it";
+
+/// Turns a refusal of a `WatchChanges` call by a node that doesn't know it into `UNIMPLEMENTED`
+/// saying so. A node that knows the call and whose engine can't record changes answers
+/// `UNIMPLEMENTED` with a message of its own, which passes unchanged, as does any other status.
+fn without_watch(status: Status) -> Status {
+    let unknown = match status.code() {
+        Code::Unimplemented => status.message().is_empty(),
+        _ => unknown_call(&status),
+    };
+    if unknown {
+        Status::unimplemented(WITHOUT_WATCH)
     } else {
         status
     }

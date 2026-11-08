@@ -12,7 +12,7 @@ use fleetring_proto::v1::{
     NodeStatusResponse, OrphanStatus, QueryRequest, QueryResponse, RemoveOrphanRequest,
     RemoveOrphanResponse, RestorePoint, RestoreRequest, RestoreResponse, SchemaRequest,
     SchemaResponse, VerifyArchiveRequest, VerifyArchiveResponse, VerifyRequest, VerifyResponse,
-    WatchLeasesRequest,
+    WatchChangesRequest, WatchLeasesRequest,
 };
 use tonic::{Code, Request, Response, Status};
 
@@ -23,6 +23,7 @@ use crate::data::convert::{
 };
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
+use crate::data::watch::{self, ChangeStream};
 use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Position, Transaction};
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
@@ -205,6 +206,29 @@ fn restore_target(point: Option<RestorePoint>) -> Result<RestoreTarget, Status> 
 #[tonic::async_trait]
 impl Database for DatabaseService {
     type WatchLeasesStream = LeaseStream;
+    type WatchChangesStream = ChangeStream;
+
+    /// Streams the database's recorded row changes from its primary (ADR-0045). The request
+    /// boundary has found the caller; this checks `stream` on the database the request names.
+    async fn watch_changes(
+        &self,
+        request: Request<WatchChangesRequest>,
+    ) -> Result<Response<Self::WatchChangesStream>, Status> {
+        let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &name)?;
+        let caller = authorized(&request)?.clone();
+        let after = match request.into_inner().after {
+            None => None,
+            Some(bytes) if bytes.is_empty() => {
+                return Err(Status::invalid_argument(
+                    "`after` is empty; leave it unset for a live tail",
+                ));
+            }
+            Some(bytes) => Some(Position::from(bytes)),
+        };
+        let stream = watch::open(&self.node, &name, after).await?;
+        Ok(Response::new(caller.guard(stream)))
+    }
 
     async fn execute(
         &self,

@@ -6,11 +6,12 @@
 //! database, so that they replicate with the data.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::Value;
+use crate::engine::{Position, Value};
 
 /// What happened to one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -188,6 +189,50 @@ impl FromStr for CaptureMode {
             "full" => Ok(Self::Full),
             _ => Err(ParseCaptureModeError),
         }
+    }
+}
+
+/// One committed transaction's recorded row changes, as a watcher reads them (ADR-0045).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedTransaction {
+    /// The log position the transaction started from, the same on every replica, or `None` for
+    /// the log's beginning.
+    pub start: Option<Position>,
+    /// A position past the transaction and at or before the next recorded one: where a reader
+    /// that has the transaction resumes.
+    pub position: Position,
+    /// Its row changes, in statement order.
+    pub changes: Vec<RowChange>,
+}
+
+/// How much one read of recorded transactions returns at most: `transactions`, and no more
+/// transactions once `rows` row changes are reached. The first transaction is always whole,
+/// however many rows it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadLimit {
+    /// The most transactions.
+    pub transactions: NonZeroUsize,
+    /// The row changes past which no further transaction is added.
+    pub rows: NonZeroUsize,
+}
+
+impl ReadLimit {
+    /// At most `transactions` transactions, and no more once `rows` row changes are reached.
+    #[must_use]
+    pub const fn new(transactions: NonZeroUsize, rows: NonZeroUsize) -> Self {
+        Self { transactions, rows }
+    }
+
+    /// One transaction, whatever its size.
+    #[must_use]
+    pub const fn one() -> Self {
+        Self::new(NonZeroUsize::MIN, NonZeroUsize::MIN)
+    }
+
+    /// Whether a read that has `transactions` transactions holding `rows` row changes is full.
+    #[must_use]
+    pub fn reached(self, transactions: usize, rows: usize) -> bool {
+        transactions >= self.transactions.get() || rows >= self.rows.get()
     }
 }
 
