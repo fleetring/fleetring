@@ -750,9 +750,16 @@ async fn read_changes(
         let update = match tokio::time::timeout_at(quiet.unwrap_or(deadline), updates.next()).await
         {
             Ok(Ok(Some(update))) => update,
-            // Caught up, or out of time with transactions still arriving.
+            // Caught up, or out of time. At the deadline, more is waiting only if the stream is
+            // still delivering: a message already here says so. Taking it costs nothing, since
+            // the next call starts at `next_after`, before it.
             Err(_elapsed) => {
-                collected.more = quiet.is_none() && !collected.transactions.is_empty();
+                collected.more = quiet.is_none()
+                    && !collected.transactions.is_empty()
+                    && matches!(
+                        tokio::time::timeout(Duration::ZERO, updates.next()).await,
+                        Ok(Ok(Some(_)))
+                    );
                 return Read::Done;
             }
             Ok(Ok(None)) => return Read::Failed(Status::unavailable("the change stream ended")),
@@ -956,7 +963,8 @@ fn changes_hint(status: &Status) -> Option<&'static str> {
     match status.code() {
         Code::PermissionDenied if message.starts_with("WatchChanges needs stream") => Some(
             "changes needs the stream scope on the database, which no other scope implies; an \
-             agent identity minted before 0.8 gets it from `fleetring agent renew <id>`",
+             agent identity minted before 0.8 lacks it: ask your operator to run `fleetring \
+             agent renew <id>`, and don't look for other credentials",
         ),
         Code::FailedPrecondition if message.contains("records no row changes") => Some(
             "only a database a logical change sink names on every node records its changes \
@@ -1392,10 +1400,9 @@ mod tests {
         ));
         assert_eq!(no_stream.code, "permission_denied");
         assert!(
-            no_stream
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("agent renew")),
+            no_stream.hint.as_deref().is_some_and(
+                |hint| hint.contains("ask your operator to run `fleetring agent renew <id>`")
+            ),
             "{no_stream:?}"
         );
         let unrecorded = hint(Status::failed_precondition(

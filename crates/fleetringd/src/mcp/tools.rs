@@ -165,7 +165,8 @@ pub(crate) struct ChangesInput {
     /// database's current end and returns only what is written while it waits.
     #[serde(default)]
     pub(crate) after: Option<String>,
-    /// The most transactions to return: 20 if left out, at most 100.
+    /// The most transactions to return: 20 if left out, at most 100. A value outside 1 to 100 is
+    /// taken as the nearer of the two.
     #[serde(default)]
     #[schemars(range(min = 1, max = 100))]
     pub(crate) limit: Option<u32>,
@@ -457,8 +458,9 @@ pub(crate) struct TransactionOut {
     pub(crate) lease_epoch: u64,
     /// Its row changes, in statement order.
     pub(crate) changes: Vec<RowChangeOut>,
-    /// How many of its row changes, from the end, were left out because the transaction alone
-    /// doesn't fit in one result; 0 when none were. Query the tables to see those rows.
+    /// How many of this transaction's later row changes were left out because the transaction
+    /// alone doesn't fit in one result; 0 when none were. They can't be read again: query the
+    /// tables' current state if you need it.
     pub(crate) omitted_changes: u64,
 }
 

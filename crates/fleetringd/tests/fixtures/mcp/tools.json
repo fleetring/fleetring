@@ -1013,7 +1013,7 @@
         },
         "limit": {
           "default": null,
-          "description": "The most transactions to return: 20 if left out, at most 100.",
+          "description": "The most transactions to return: 20 if left out, at most 100. A value outside 1 to 100 is taken as the nearer of the two.",
           "maximum": 100,
           "minimum": 1,
           "type": [
@@ -1118,7 +1118,7 @@
               "type": "integer"
             },
             "omitted_changes": {
-              "description": "How many of its row changes, from the end, were left out because the transaction alone doesn't fit in one result; 0 when none were. Query the tables to see those rows.",
+              "description": "How many of this transaction's later row changes were left out because the transaction alone doesn't fit in one result; 0 when none were. They can't be read again: query the tables' current state if you need it.",
               "minimum": 0,
               "type": "integer"
             },
