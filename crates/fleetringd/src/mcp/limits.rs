@@ -58,5 +58,10 @@ pub const CHANGES_WAIT: Duration = Duration::from_secs(2);
 /// it holds: a backlog arrives at once, so a pause this long means it has caught up.
 pub const CHANGES_QUIET: Duration = Duration::from_millis(250);
 
+/// The most row changes one `changes` result holds, as many as the node reads at once, so a
+/// call never holds more of them than the result could carry. Its bytes are bounded by
+/// `--max-result-bytes` as well.
+pub const MAX_CHANGES_ROWS: usize = 10_000;
+
 /// The longest position `changes` takes as `after`, in bytes: more than any engine's.
 pub const MAX_POSITION_BYTES: usize = 64;
