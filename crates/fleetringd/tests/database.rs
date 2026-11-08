@@ -1673,11 +1673,56 @@ mod binary {
         .await?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(4), "{stderr}");
-        assert!(stderr.contains("timeout of 1s"), "{stderr}");
-        // The primary stopped the statement once the command's deadline passed.
+        // The primary stops the statement just before the deadline the command sent, and says so.
+        assert!(
+            stderr.contains("statement interrupted: it ran past its deadline"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--timeout"), "the hint: {stderr}");
         assert_eq!(
             super::note_count(&client, &notes).await?,
             [[Value::Integer(1)]]
+        );
+        fleet.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_exec_without_a_timeout_stops_at_the_node_limit_with_a_hint() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = Fleet::start_configured(
+            dir.path(),
+            "",
+            "",
+            "\n[limits]\nstatement_timeout_ms = 500\n",
+        )
+        .await?;
+        let control = fleet.control_address()?;
+        let client = fleet.client()?;
+        let notes = name("limited")?;
+        super::one_note_everywhere(&fleet, &client, &notes).await?;
+
+        let forever = format!(
+            "INSERT INTO notes (n) SELECT x + 1 FROM ({})",
+            super::FOREVER
+        );
+        let output = fleetringd(
+            fleet.tls.dir(),
+            args(&["db", "exec", "limited", &forever], &control),
+        )
+        .await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(4), "{stderr}");
+        assert!(
+            stderr.contains("statement interrupted: it ran past its deadline"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("hint:"), "{stderr}");
+        assert!(stderr.contains("--timeout"), "{stderr}");
+        assert_eq!(
+            super::note_count(&client, &notes).await?,
+            [[Value::Integer(1)]],
+            "the interrupted write left no row"
         );
         fleet.stop().await;
         Ok(())

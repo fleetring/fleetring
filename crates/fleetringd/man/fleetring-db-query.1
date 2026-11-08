@@ -20,9 +20,9 @@ Sends the request to the data node at `host:port` instead of the primary
 The command follows the node\*(Aqs redirect.
 .TP
 \fB\-\-timeout\fR \fI<TIMEOUT>\fR
-How long the statement may take: `<n>m` or `<n>s`
+How long the call may take: `<n>m` or `<n>s`; 30s by default
 
-The primary interrupts it once this passes, and the command fails with exit code 4; a write then rolls back unless it had committed. Without it, the primary\*(Aqs `[limits] statement_timeout_ms` applies, 30s by default, which also caps a longer one.
+The primary interrupts the statement just before this passes, or at its own `[limits] statement_timeout_ms` if that comes first (30s unless set), and the command fails with exit code 4 and a hint. An interrupted statement changes nothing; a write whose replicas\*(Aq acknowledgement outran the timeout has committed.
 .TP
 \fB\-\-control\fR \fI<CONTROL>\fR
 The control node\*(Aqs address, `host:port`
