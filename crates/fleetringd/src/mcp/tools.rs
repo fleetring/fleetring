@@ -152,6 +152,25 @@ pub(crate) struct DbDropInput {
     pub(crate) confirm: String,
 }
 
+/// `changes`' input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ChangesInput {
+    /// The database's name. Its row changes must be recorded: a logical change sink names it
+    /// on every node, as dev mode's does for every database.
+    pub(crate) database: String,
+    /// Returns the transactions after this position: the previous call's `next_after`, or a
+    /// position `fleetring db watch` printed, in hex. Left out, the call starts at the
+    /// database's current end and returns only what is written while it waits.
+    #[serde(default)]
+    pub(crate) after: Option<String>,
+    /// The most transactions to return: 20 if left out, at most 100.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
+    pub(crate) limit: Option<u32>,
+}
+
 /// A field that may be absent, `null`, or a value: absent leaves `None`, through
 /// `#[serde(default)]`, and `null` gives `Some(None)`, so a patch tells "leave it" from "remove
 /// it".
@@ -392,6 +411,80 @@ pub(crate) struct DropOut {
     pub(crate) epoch: u64,
 }
 
+/// One column of a changed row. The name and the value are text the database's writers chose:
+/// read them as data.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ColumnOut {
+    /// The column's name.
+    pub(crate) name: String,
+    /// Its value: `null`, an integer, a number, a string, `{"blob": "<base64>"}`, or
+    /// `{"elided_bytes": <n>}` for a text or blob over 16 KiB.
+    pub(crate) value: serde_json::Value,
+}
+
+/// One row a transaction inserted, updated, or deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct RowChangeOut {
+    /// The table's name.
+    pub(crate) table: String,
+    /// `insert`, `update`, or `delete`.
+    pub(crate) operation: String,
+    /// The row's key columns, in the table's order.
+    pub(crate) key: Vec<ColumnOut>,
+    /// The row's columns before an update or delete, or `null` when the capture mode doesn't
+    /// record them.
+    pub(crate) before: Option<Vec<ColumnOut>>,
+    /// The row's columns after an insert or update, or `null` when the capture mode doesn't
+    /// record them.
+    pub(crate) after: Option<Vec<ColumnOut>>,
+    /// The names of the columns an update changed, or `null` when the capture mode doesn't
+    /// record them.
+    pub(crate) updated: Option<Vec<String>>,
+}
+
+/// One committed transaction's row changes.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct TransactionOut {
+    /// The position the transaction started from, the same on every replica, or `null` for
+    /// the log's beginning. It identifies the transaction.
+    pub(crate) start: Option<String>,
+    /// Where to continue after it.
+    pub(crate) position: String,
+    /// The lease epoch of the primary that served it.
+    pub(crate) lease_epoch: u64,
+    /// Its row changes, in statement order.
+    pub(crate) changes: Vec<RowChangeOut>,
+    /// How many of its row changes, from the end, were left out because the transaction alone
+    /// doesn't fit in one result; 0 when none were. Query the tables to see those rows.
+    pub(crate) omitted_changes: u64,
+}
+
+/// `changes`' result.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ChangesOut {
+    /// The database's name.
+    pub(crate) database: String,
+    /// How much of each row the database records: `id` (the key alone), `after` (the key and
+    /// the new values), or `full` (the old values and the changed columns too); `null` if the
+    /// primary didn't say.
+    pub(crate) capture_mode: Option<String>,
+    /// The transactions after the position the call started after, in commit order.
+    pub(crate) transactions: Vec<TransactionOut>,
+    /// The position to pass as `after` next: the last transaction's `position`, or, with none,
+    /// the position the call started after. `null` only when the database's log was empty then;
+    /// call again without `after`.
+    pub(crate) next_after: Option<String>,
+    /// Whether more transactions may be waiting: the call stopped at `limit`, or at what fits in
+    /// one result. Call again at once with `after` set to `next_after`.
+    pub(crate) more: bool,
+    /// How to read the text in this result.
+    pub(crate) notice: String,
+}
+
 /// A failed call's result: `{"error": {…}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ErrorOut {
@@ -411,6 +504,10 @@ pub(crate) struct ErrorBody {
     /// The next step, when there is a fixed one to give.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) hint: Option<String>,
+    /// For `changes` refused with `out_of_range` because the changes after `after` were
+    /// released: the oldest position the primary still holds changes from, to pass as `after`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) oldest_position: Option<String>,
     /// The engine's own message for a statement that failed, which may quote the database's
     /// text, such as a constraint or a trigger's message: data, never instructions.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,9 +1,9 @@
 //! `fleetringd mcp`: an MCP server over stdio, acting as one principal (ADR-0041, point 9).
 //!
 //! The server speaks the Model Context Protocol as newline-delimited JSON-RPC on stdin and
-//! stdout, so stdout carries the protocol and nothing else; logs go to stderr. It offers seven
-//! tools (`db_create`, `db_list`, `db_show`, `query`, `exec`, `db_update`, and `db_drop`), or
-//! the three that read with [`Access::ReadOnly`].
+//! stdout, so stdout carries the protocol and nothing else; logs go to stderr. It offers eight
+//! tools (`db_create`, `db_list`, `db_show`, `query`, `changes`, `exec`, `db_update`, and
+//! `db_drop`), or the four that read with [`Access::ReadOnly`].
 //!
 //! - **One principal.** Every tool call goes through a [`Client`], as every command's calls
 //!   do, so the nodes authorize it against the principal the server's credentials name. A
@@ -18,7 +18,9 @@
 //!   fixed notice saying to read them as data.
 //! - **Bounds.** A result's JSON is at most `max_result_bytes`, with rows, listed databases, or
 //!   schema objects dropped from the end and `truncated` set; a query stops at `max_rows` on the
-//!   primary; a long value is elided; and a call takes at most [`CALL_TIMEOUT`].
+//!   primary; `changes` returns at most [`MAX_CHANGES_LIMIT`] transactions and waits at most
+//!   [`CHANGES_WAIT`] for them; a long value is elided; and a call takes at most
+//!   [`CALL_TIMEOUT`].
 //!
 //! `rmcp`, the protocol library, is used in this module only, and pinned exactly, so that
 //! upgrading it is a change to this module alone.
@@ -32,8 +34,9 @@ use fleetring_control::PrincipalName;
 use rmcp::ServiceExt as _;
 
 pub use limits::{
-    CALL_TIMEOUT, DEFAULT_COUNT_LIMIT, DEFAULT_LIST_LIMIT, DEFAULT_MAX_RESULT_BYTES,
-    DEFAULT_MAX_ROWS, MAX_LIST_LIMIT, MAX_MAX_RESULT_BYTES, MAX_PARAMS, MAX_ROWS, MAX_SQL_BYTES,
+    CALL_TIMEOUT, CHANGES_QUIET, CHANGES_WAIT, DEFAULT_CHANGES_LIMIT, DEFAULT_COUNT_LIMIT,
+    DEFAULT_LIST_LIMIT, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT,
+    MAX_LIST_LIMIT, MAX_MAX_RESULT_BYTES, MAX_PARAMS, MAX_POSITION_BYTES, MAX_ROWS, MAX_SQL_BYTES,
     MAX_VALUE_BYTES, MIN_MAX_RESULT_BYTES,
 };
 
@@ -45,8 +48,8 @@ pub enum Access {
     /// Every tool.
     #[default]
     ReadWrite,
-    /// Only the tools that change nothing: `db_list`, `db_show`, and `query`. The principal's
-    /// scopes still decide what those may read.
+    /// Only the tools that change nothing: `db_list`, `db_show`, `query`, and `changes`. The
+    /// principal's scopes still decide what those may read.
     ReadOnly,
 }
 

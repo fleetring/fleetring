@@ -171,7 +171,7 @@ impl Machine {
     }
 
     /// Writes the dev directory's configuration, as `fleetring dev` would write it, on this
-    /// machine's ports.
+    /// machine's ports, with its change sink that records every database.
     fn seed(&self) -> TestResult {
         let dir = self.dev_dir();
         fs::create_dir_all(&dir)?;
@@ -183,11 +183,13 @@ impl Machine {
              [replication]\nreplication_factor = 1\n\n\
              [tls]\nca = {:?}\ncert = {:?}\nkey = {:?}\n\n\
              [[principal]]\nname = \"admin\"\nscopes = [\"admin:*\", \"stream:*\", \"fleet\"]\n\n\
-             [admin]\nlisten = \"127.0.0.1:{admin}\"\n",
+             [admin]\nlisten = \"127.0.0.1:{admin}\"\n\n\
+             [[changes.sink]]\nname = \"dev\"\nkind = \"file\"\ndatabases = [\"*\"]\npath = {:?}\n",
             dir.join("data"),
             tls.join("ca.crt"),
             tls.join("node.dev.crt"),
             tls.join("node.dev.key"),
+            dir.join("changes"),
             port = self.port(),
             admin = self.port() + 1,
         );
@@ -984,12 +986,93 @@ async fn a_read_only_agent_serves_only_the_reading_tools() -> TestResult {
     );
     let mut session = machine.mcp(&["--agent", "42"]).await?;
     assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
+    // It follows the changes of its databases, which the operator writes: following is
+    // reading.
+    machine.ok(&["db", "create", "agent-42-feed"])?;
+    machine.ok(&[
+        "db",
+        "exec",
+        "agent-42-feed",
+        "CREATE TABLE item (id INTEGER PRIMARY KEY)",
+    ])?;
+    let from = session
+        .ok("changes", json!({"database": "agent-42-feed"}))
+        .await?;
+    machine.ok(&[
+        "db",
+        "exec",
+        "agent-42-feed",
+        "INSERT INTO item (id) VALUES (7)",
+    ])?;
+    let read = session
+        .ok(
+            "changes",
+            json!({"database": "agent-42-feed", "after": from["next_after"]}),
+        )
+        .await?;
+    assert_eq!(
+        read["transactions"][0]["changes"][0]["key"],
+        json!([{"name": "id", "value": 7}]),
+        "{read}"
+    );
+    session.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_agent_follows_its_own_writes_and_no_other_agents() -> TestResult {
+    let machine = Machine::new()?;
+    let mut session = machine.mcp(&["--agent", "42"]).await?;
+    session
+        .ok("db_create", json!({"name": "agent-42-memory"}))
+        .await?;
+    session
+        .ok(
+            "exec",
+            json!({"database": "agent-42-memory", "sql": "CREATE TABLE fact (id INTEGER PRIMARY KEY, body TEXT)"}),
+        )
+        .await?;
+    let from = session
+        .ok("changes", json!({"database": "agent-42-memory"}))
+        .await?;
+    for id in [1, 2] {
+        session
+            .ok(
+                "exec",
+                json!({
+                    "database": "agent-42-memory",
+                    "sql": "INSERT INTO fact (id, body) VALUES (?, 'x')",
+                    "params": [id],
+                }),
+            )
+            .await?;
+    }
+    let read = session
+        .ok(
+            "changes",
+            json!({"database": "agent-42-memory", "after": from["next_after"]}),
+        )
+        .await?;
+    let keys: Vec<&Value> = read["transactions"]
+        .as_array()
+        .ok_or("no transactions")?
+        .iter()
+        .map(|transaction| &transaction["changes"][0]["key"][0]["value"])
+        .collect();
+    assert_eq!(keys, [&json!(1), &json!(2)], "{read}");
+
+    // Another agent's database, recorded like every one in dev mode, is refused.
+    machine.ok(&["db", "create", "agent-43-memory"])?;
+    let refused = session
+        .failed("changes", json!({"database": "agent-43-memory"}))
+        .await?;
+    assert_eq!(refused["code"], "permission_denied", "{refused}");
     session.close().await?;
     Ok(())
 }
 
 /// The tools a read-only server offers.
-const READING_TOOLS: [&str; 3] = ["db_list", "db_show", "query"];
+const READING_TOOLS: [&str; 4] = ["changes", "db_list", "db_show", "query"];
 
 /// The names of the tools `session` offers, sorted.
 async fn tool_names(session: &mut Session) -> TestResult<Vec<String>> {
