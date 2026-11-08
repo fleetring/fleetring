@@ -7,12 +7,16 @@
 //! 3. **Download and verify:** the archive, `SHA256SUMS`, and its Sigstore bundle; the signature
 //!    with cosign against the release workflow's identity, then the archive's checksum, then the
 //!    extracted binary's `--version`. Any failure is a refusal; nothing unverified is installed.
-//! 4. **Swap:** the new binary replaces the installed one atomically, which is kept as
+//! 4. **Check the node's configuration:** with `--config`, the release's own binary runs `serve
+//!    --check` on the node's command line, and a configuration it refuses refuses the swap, unless
+//!    `--no-restart`. A release before 0.8 can't check, and the report says so.
+//! 5. **Swap:** the new binary replaces the installed one atomically, which is kept as
 //!    `<name>.previous` for `--rollback`. A release before 0.7 can't run `serve`, so installing
 //!    one first checks how the node was started (ADR-0043, point 3.5).
-//! 5. **Restart:** with `--config` naming a running node, drain it, send it `SIGHUP` so it
+//! 6. **Restart:** with `--config` naming a running node, drain it, send it `SIGHUP` so it
 //!    restarts in place, and wait until it has rejoined on the new release and caught up.
 
+mod config_check;
 mod install;
 mod process;
 mod release;
@@ -178,6 +182,21 @@ pub enum UpgradeError {
         /// The release that would be installed.
         release: Release,
     },
+    /// The release refuses the node's configuration or command line, or couldn't check it, so
+    /// the node might not start after the restart.
+    #[error(
+        "{summary}; nothing was changed\n{said}\n  hint: run the command again with --no-restart, \
+         edit the configuration until `fleetring serve --config {config} --check` passes, then \
+         restart the node"
+    )]
+    ConfigRefused {
+        /// What happened, naming the release and the node.
+        summary: String,
+        /// What the release said, or why it couldn't answer, indented.
+        said: String,
+        /// The node's configuration file.
+        config: String,
+    },
     /// There is no previous binary to roll back to.
     #[error("there is no previous binary at {path} to roll back to")]
     NoPrevious {
@@ -271,6 +290,9 @@ pub struct LocalNode {
     pub id: NodeId,
     /// Its data directory.
     pub data_dir: PathBuf,
+    /// The configuration file, as an absolute path: a release checks it before it is swapped
+    /// in, if the node's own command line can't be checked instead.
+    pub config: PathBuf,
 }
 
 /// A step of an upgrade, in the order they happen (ADR-0038, point 8). A command that shows
@@ -282,6 +304,8 @@ pub enum Step {
     Download,
     /// Verifying its signature and checksum.
     Verify,
+    /// Checking the node's configuration with the release.
+    CheckConfig,
     /// Draining the node, so that it is primary for nothing.
     Drain,
     /// Restarting the node in place.
@@ -299,6 +323,7 @@ impl Step {
         match self {
             Self::Download => "downloading the release",
             Self::Verify => "verifying the signature and the checksum",
+            Self::CheckConfig => "checking the node's configuration with the release",
             Self::Drain => "draining the node",
             Self::Restart => "restarting the node",
             Self::Rejoin => "waiting for the node to rejoin the fleet",
@@ -594,9 +619,11 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
     installed.check_writable()?;
     let scratch = scratch()?;
     let binary = fetch(&source, &release, scratch.path(), &options.steps).await?;
+    let software = software_of(&binary)?;
     if let Some(view) = &view {
-        check_features(view, &software_of(&binary)?)?;
+        check_features(view, &software)?;
     }
+    let checked = config_check::check(&binary, &software, options, running.as_ref()).await?;
     installed.replace_with(&binary)?;
 
     let mut report = format!(
@@ -605,6 +632,7 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
         installed.path().display(),
         installed.previous().display()
     );
+    report.push_str(&checked);
     report.push_str(&complete_names(installed));
     report.push_str(&restart(options, installed, running, &release).await?);
     Ok(Outcome::done(report))
@@ -628,6 +656,7 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
         check_window(&view, options.node.as_ref().map(|node| &node.id), &release)?;
         check_features(&view, &software)?;
     }
+    let checked = config_check::check(&previous, &software, options, running.as_ref()).await?;
     let current = this_release();
     installed.roll_back()?;
     let mut report = format!(
@@ -635,6 +664,7 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
         installed.path().display(),
         previous.display()
     );
+    report.push_str(&checked);
     report.push_str(&complete_names(installed));
     report.push_str(&restart(options, installed, running, &release).await?);
     Ok(Outcome::done(report))
@@ -1071,6 +1101,7 @@ mod tests {
                 args: args.iter().map(|arg| (*arg).to_owned()).collect(),
                 supervisor: None,
                 started_by: None,
+                cwd: None,
             }
             .write(&self.data_dir())?;
             Ok(lock)
@@ -1086,6 +1117,7 @@ mod tests {
                 node: Some(LocalNode {
                     id: "node-1".parse().expect("a node ID"),
                     data_dir: self.data_dir(),
+                    config: self.dir.path().join("node.toml"),
                 }),
                 fleet: None,
                 timeout: Duration::from_secs(1),

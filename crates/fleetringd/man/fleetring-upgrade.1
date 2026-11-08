@@ -8,7 +8,7 @@ fleetring\-upgrade \- Installs another release in place of this binary
 .SH DESCRIPTION
 Installs another release in place of this binary
 .PP
-The release is verified with cosign against the release workflow\*(Aqs identity, and then by checksum; this binary is kept as `<name>.previous`. With `\-\-config` naming a running node, it first checks that the fleet allows the release, then drains the node, restarts it in place, and waits until it has rejoined and caught up (ADR\-0038).
+The release is verified with cosign against the release workflow\*(Aqs identity, and then by checksum; this binary is kept as `<name>.previous`. With `\-\-config`, the release checks the node\*(Aqs configuration with `serve \-\-check` before it is swapped in, and one it refuses stops the upgrade unless `\-\-no\-restart`. With `\-\-config` naming a running node, it first checks that the fleet allows the release, then drains the node, restarts it in place, and waits until it has rejoined and caught up (ADR\-0038).
 .SH OPTIONS
 .TP
 \fB\-\-version\fR \fI<VERSION>\fR
@@ -23,6 +23,8 @@ It also reports whether the fleet allows the newest release, and exits 1 if a ne
 .TP
 \fB\-\-no\-restart\fR
 Replaces the binary, but leaves the running node on the release it runs
+
+It also installs a release that refuses the node\*(Aqs configuration, and says so: edit the configuration until `fleetring serve \-\-config <file> \-\-check` passes, then restart the node.
 .TP
 \fB\-\-rollback\fR
 Swaps back the binary the last upgrade replaced, `<name>.previous`
@@ -42,7 +44,7 @@ The list is the JSON GitHub\*(Aqs API returns; a mirror\*(Aqs lets `upgrade` fin
 \fB\-\-timeout\fR \fI<TIMEOUT>\fR
 How long each step may take: `<n>m` or `<n>s`; 5m by default
 
-The steps are each download, the drain, the rejoin, and the catch\-up.
+The steps are each download, the configuration check, the drain, the rejoin, and the catch\-up.
 .TP
 \fB\-\-software\fR
 Prints what this binary runs as one JSON object, and changes nothing

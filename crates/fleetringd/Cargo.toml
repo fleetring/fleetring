@@ -51,7 +51,7 @@ tar = { version = "0.4.44", default-features = false }
 tempfile = "3.27.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 thiserror.workspace = true
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time"] }
 toml = "1.1.8"
 tonic = "0.14"
 tower = { version = "0.5", features = ["util"] }

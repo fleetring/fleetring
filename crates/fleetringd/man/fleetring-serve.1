@@ -44,7 +44,7 @@ Nothing on the wire is authenticated or encrypted.
 \fB\-\-check\fR
 Checks the configuration and these flags as `serve` would, and starts nothing
 
-Reads the file, applies the flags, and checks every rule the node checks before it starts, in the same code. It reads none of the files the configuration names (certificates, keys, tokens, credentials), no environment variable and no data directory, and binds nothing. It exits 0 if the node would start. Otherwise it prints the first problem, as the node would stop at it, naming the file, the field, and the line and column where the parser gives them, and exits 1.
+Reads the file, applies the flags, and checks every rule the node checks before it starts, in the same code. It reads none of the files the configuration names (certificates, keys, tokens, credentials), no environment variable and no data directory, and binds nothing. It exits 0 if the node would start. Otherwise it prints the first problem, as the node would stop at it, naming the file, the field, and the line and column where the parser gives them, and exits 1. `fleetring upgrade` runs the new release\*(Aqs check on the node\*(Aqs command line before it swaps the binary.
 .TP
 \fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR
 The check\*(Aqs output format: `table` or `json`

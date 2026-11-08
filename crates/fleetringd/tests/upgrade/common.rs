@@ -194,6 +194,36 @@ pub(crate) fn fake_binary(release: &Release) -> Vec<u8> {
     format!("#!/bin/sh\necho \"fleetringd {release}\"\n").into_bytes()
 }
 
+/// A stand-in for a next release that refuses a configuration this build accepts, as a release
+/// that tightens a rule does: a script that runs this build for everything, except that its
+/// `serve --check` refuses a heartbeat interval of 200 ms, which every [`ProcessFleet`] node's
+/// configuration sets. It names the field as this build's check does, and exits 1.
+pub(crate) fn refusing_release() -> Vec<u8> {
+    let script = r#"#!/bin/sh
+check=no
+config=
+previous=
+for arg in "$@"; do
+    case "$arg" in
+    --check) check=yes ;;
+    --config=*) config="${arg#--config=}" ;;
+    esac
+    if [ "$previous" = "--config" ]; then
+        config="$arg"
+    fi
+    previous="$arg"
+done
+if [ "$check" = yes ] && grep -q '^heartbeat_interval_ms = 200$' "$config"; then
+    echo "fleetring: $config: field membership.heartbeat_interval_ms: 200 ms is under this release's minimum, 500 ms" >&2
+    exit 1
+fi
+exec 'THIS_BUILD' "$@"
+"#;
+    script
+        .replace("THIS_BUILD", env!("CARGO_BIN_EXE_fleetring"))
+        .into_bytes()
+}
+
 /// Writes a stand-in `cosign` into `dir`, reporting `version`. `verify-blob` accepts a bundle
 /// only if its identity matches the `--certificate-identity-regexp` it is given, its issuer is
 /// the `--certificate-oidc-issuer`, and it signs the SHA-256 of the blob, so the arguments

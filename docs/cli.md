@@ -51,7 +51,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | Fleet | `status [--node <id> \| --address <host:port>]` | Gives the fleet overview, or one data node's view |
 | | `node list \| drain \| undrain \| remove` | Members, with liveness, release, and drain state |
 | | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042) |
-| | `upgrade [--check \| --rollback \| --version <v>]` | Installs another release in place (ADR-0038) |
+| | `upgrade [--check \| --rollback \| --version <v>]` | Installs another release in place, once the release's `serve --check` accepts the node's configuration (ADR-0038) |
 | | `lease watch` | Follows the leases a data node holds |
 | Security | `cert init \| node \| client` | Creates the authority and issues certificates |
 | | `token issue \| revoke` | Issues and revokes bearer tokens |
@@ -257,7 +257,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
 | Code | Meaning |
 |---|---|
 | 0 | Success. `dev -d` when the dev node already runs, `dev status` either way. |
-| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, or an agent with no identity outside dev mode. |
+| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, an `upgrade` whose release refuses the node's configuration, or an agent with no identity outside dev mode. |
 | 2 | Usage: a bad flag or argument, a confirmation needed without a terminal, or `switch` with no name and no terminal. |
 | 3 | Authentication or authorization: `UNAUTHENTICATED` or `PERMISSION_DENIED`. |
 | 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, `DEADLINE_EXCEEDED`, no leader yet. |

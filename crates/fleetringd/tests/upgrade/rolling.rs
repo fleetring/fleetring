@@ -6,7 +6,10 @@
 //! history is checked at the end: no write failed beyond its one retry, no read was stale, and no
 //! acknowledged write was lost. A previous release with `upgrade` installs this build itself, from
 //! an archive laid out as the release workflow lays it out, with `fleetring` and a regular copy
-//! named `fleetringd` (ADR-0043, point 3).
+//! named `fleetringd` (ADR-0043, point 3). Once every node runs this build, its `upgrade` refuses
+//! a next release whose `serve --check` refuses a node's configuration, a stand-in that refuses
+//! the heartbeat interval these nodes use, and leaves the node running; this build's own
+//! release, which accepts it, then restarts the node in place.
 //!
 //! The previous release comes from one of:
 //!
@@ -27,8 +30,8 @@ use fleetring::NodeId;
 
 use crate::common::{
     ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, check_history,
-    create_history_database, current, fake_cosign, path_with, printed, progress, release_of,
-    wait_for_members, wait_for_reported, write_release, write_until,
+    create_history_database, current, fake_cosign, path_with, printed, progress, refusing_release,
+    release_of, wait_for_members, wait_for_reported, write_release, write_until,
 };
 
 /// The previous release's binary, from the environment, or `None` to skip.
@@ -205,10 +208,58 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         .output()?;
     assert!(undrained.status.success(), "{}", printed(&undrained));
 
-    // And this build's own upgrade restarts a node in place under the same writes. A previous
-    // release from 0.7 on added the `fleetring` name when it installed this build; otherwise
-    // this upgrade adds it.
+    // A next release that refuses the node's configuration is refused before it is swapped in,
+    // and the node runs on under the writes.
     let node = &fleet.nodes[1];
+    write_release(
+        &releases.join("refusing"),
+        &current(),
+        &refusing_release(),
+        Defect::None,
+        ArchiveLayout::Both,
+    )?;
+    let running = fs::read(&node.bin)?;
+    let refused = fleet
+        .command(&node.bin, &path)
+        .args([
+            "upgrade",
+            "--version",
+            &current().to_string(),
+            "--base-url",
+            &server.url("refusing"),
+        ])
+        .arg("--config")
+        .arg(&node.config)
+        .output()?;
+    assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(&format!(
+            "fleetring {} refuses node {}'s configuration, so the node wouldn't start on it; \
+             nothing was changed",
+            current(),
+            node.id
+        )),
+        "{}",
+        printed(&refused)
+    );
+    assert_eq!(
+        fs::read(&node.bin)?,
+        running,
+        "the refused release was installed"
+    );
+    runtime.block_on(wait_for_members(
+        &client,
+        &[node.id.as_str()],
+        Some(&current()),
+    ))?;
+    progress(&format!(
+        "{} refused a release that refuses its configuration",
+        node.id
+    ));
+
+    // And this build's own upgrade, which accepts it, restarts the node in place under the same
+    // writes. A previous release from 0.7 on added the `fleetring` name when it installed this
+    // build; otherwise this upgrade adds it.
     let named = fs::symlink_metadata(node.bin.with_file_name("fleetring")).is_ok();
     let reinstalled = fleet
         .command(&node.bin, &path)
@@ -225,6 +276,11 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     let stdout = String::from_utf8_lossy(&reinstalled.stdout);
     assert!(
         reinstalled.status.success()
+            && stdout.contains(&format!(
+                "fleetring {} accepts node {}'s configuration",
+                current(),
+                node.id
+            ))
             && stdout.contains("caught up")
             && (named || stdout.contains("added fleetring beside fleetringd")),
         "{}\n{}",
