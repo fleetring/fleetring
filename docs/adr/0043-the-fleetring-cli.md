@@ -1,6 +1,6 @@
 # ADR-0043: One binary named `fleetring`, with `fleetringd` as its compatibility name until 1.0, contexts, a detached dev node, agents that set themselves up, and help that fits a screen
 
-- **Status:** Accepted (2026-11-06)
+- **Status:** Accepted (2026-11-06); the owner's rejection of `fleet` as a name is reversed by the [amendment](#amendment-2026-11-07-the-fleet-alias) below
 - **Date:** 2026-11-05
 - **Related:** ADR-0025 and ADR-0026 (principals, scopes, tokens; the scope grammar's reserved words, point 8.11), ADR-0032 (renames are clean breaks; amended here by points 2 and 6), ADR-0033 (surfaces and the client crate; point 2 amended by point 1), ADR-0034 (admin listener, `/readyz`), ADR-0038 (upgrades; points 6 and 7 amended by point 3), ADR-0039 (dev mode; points 1, 3 and 6 amended by points 5 and 7), ADR-0041 (`mcp`); tickets FR-075 (#103), FR-056 (#59), FR-079 (#114), FR-054 (#57), FR-060 (#62); [CLI style guide](../cli.md)
 
@@ -352,6 +352,24 @@ Decided on 2026-11-06: the owner took every recommendation, and the reviewer's p
 8. **`agent add --authority` for fleets other than dev?** Yes, explicit only, until enrollment's ADR (points 8.6 and 8.7).
 9. **The reviewer's precedence finding.** An explicit `--context` flag wins over the field variables, which still override the current context and `FLEETRING_CONTEXT`'s context. Every override warns (points 4.4 and 4.5).
 
+## Amendment (2026-11-07): the `fleet` alias
+
+The owner reversed the rejection of `fleet` in the Context (point "The name"), for the CLI's short name only (#103). Point 1 stands as written; this adds a third name for the same binary.
+
+- **What it is.** `fleet` is a name for the `fleetring` binary: `fleet db list`, `fleet --version`. When `argv[0]`'s file name is exactly `fleet` (`fleet.exe` on Windows), the binary behaves as `fleetring` and prints `fleet` wherever it prints its own name: usage lines, help, `--version` (`fleet X.Y.Z`), error prefixes, hints that name a command, and the completion script (`fleet completions <shell>` registers `fleet` and runs `fleet`). The match is exact: `fleet-foo` and `fleet.previous` are `fleetring`. Point 1.3's rule is otherwise unchanged.
+- **Why it is permanent.** `fleetringd` is a bridge for 0.6 scripts and goes in 1.0. `fleet` is only a shorter way to type the command, so there is nothing to retire: it is not deprecated, it is not listed as a compatibility name in the renames table, and it has no behaviour of its own. In particular, 0.6 never had a `fleet`, so bare daemon flags are not read as `serve` under it (point 1.4 stays for `fleetring` and `fleetringd`): `fleet --config <file>` is an unknown argument, exit 2.
+- **The noun is unaffected.** "Fleet" the noun (a set of nodes, `docs/lexicon.md`) keeps its meaning; `fleet` in code font and in the CLI is the binary's short name.
+- **Hints.** Under `fleet`, commands named in errors and hints read `fleet dev -d`. Under `fleetringd`, hints keep saying `fleetring`, as before.
+- **The collision rule.** Rancher Fleet's CLI and JetBrains Fleet's launcher also install a `fleet`, and a link must never shadow one or be shadowed by one. `install.sh` creates `PREFIX/bin/fleet`, a symbolic link to `fleetring`, only when:
+  1. it installs a release that holds `fleetring` (0.7 on), and `--no-alias` (or `FLEETRINGD_NO_ALIAS=1`) wasn't given;
+  2. `PREFIX/bin/fleet` doesn't exist, or is a symbolic link whose target, read with `readlink`, is `fleetring` or `fleetringd` (it is then replaced atomically); anything else there is left alone, and the script says so;
+  3. no other `fleet` is found by `command -v fleet` unless it is a link to a fleetring binary. If there is one, the script doesn't create the alias and says where the other `fleet` is.
+
+  The script never executes an unknown `fleet` to inspect it.
+- **Why not in the archives.** The Windows `.zip` and the tarballs hold `fleetring` and `fleetringd` and stay as they are: `check-archive.sh` compares the entries byte for byte, a third copy would be one more binary to keep in step, and an archive can't apply the collision rule, which depends on the machine it is unpacked on. The alias is made where the rule can run: by `install.sh`, and in the container image (`/usr/local/bin/fleet`, a link beside `fleetringd`; nothing else is on that image's `PATH`).
+- **`upgrade`.** A link to the name `fleetring` follows whatever file `upgrade` and `upgrade --rollback` put there, so neither breaks it. `upgrade` doesn't add the alias to a host that lacks it: that needs the collision check, which is `install.sh`'s, and silently adding a name to someone's `PATH` isn't an upgrade's job.
+- **Packages.** The Homebrew formula (FR-060, not built yet) and other packages follow the same rule: link `fleet` to `fleetring` unless another `fleet` is installed, and say so.
+
 ## Revisions
 
 - **2026-11-05, after an independent review, before acceptance.**
@@ -371,3 +389,4 @@ Decided on 2026-11-06: the owner took every recommendation, and the reviewer's p
   - **Point 4.6: `token revoke` in 0.7.** It has no prompt today and adding one would break scripts, so it prints the fleet and the context to stderr and acts. Its prompt, gated by `--yes` and refusing without a terminal, arrives with phase G1.
   - **Point 4.4: a flag outranks the variables for the identity too.** `--as` now beats `FLEETRING_CERT` and `FLEETRING_KEY`; 0.6 merged each flag with its variable, so the variables won. The 0.7.0 release notes say so.
   - **Point 4.2: an unusable contexts file.** Every client command reads the file, so an unreadable one or one from another version fails them all. The error says so and names `FLEETRING_CONTEXT=` (set, and empty) as the way to run without contexts, or to move the file aside.
+- **2026-11-07, an amendment (#103).** `fleet` is a permanent short name for the binary, with an install-time collision rule (see the amendment above).
