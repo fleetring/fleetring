@@ -806,7 +806,9 @@ async fn identity_toml_records_owner_and_no_parent() -> TestResult {
         .iter()
         .filter_map(toml::Value::as_str)
         .collect();
-    assert_eq!(scopes, ["admin:agent-42-*"], "{text}");
+    assert_eq!(scopes, ["admin:agent-42-*", "stream:agent-42-*"], "{text}");
+    // The defaults need no field a 0.7 reader lacks.
+    assert!(!text.contains("scopes_from"), "{text}");
     assert!(!text.contains(&machine.token("42")?), "no token in {text}");
 
     // A record a later release wrote is refused with a message that says to upgrade.
@@ -814,7 +816,7 @@ async fn identity_toml_records_owner_and_no_parent() -> TestResult {
         machine.agent_dir("42").join("identity.toml"),
         text.replace(
             "version = 1\n",
-            "version = 2\nholder_key = \"holder.key\"\n",
+            "version = 3\nholder_key = \"holder.key\"\n",
         ),
     )?;
     let newer = machine.run(&["db", "list", "--agent", "42"])?;
@@ -956,8 +958,15 @@ async fn db_list_with_agent_uses_its_scopes() -> TestResult {
     assert!(list.contains("agent-42"), "{list}");
     let json: Value = serde_json::from_str(&machine.ok(&["agent", "list", "-o", "json"])?)?;
     assert_eq!(json["agents"][0]["id"], "42", "{json}");
-    assert_eq!(json["agents"][0]["scopes"], json!(["admin:agent-42-*"]));
+    assert_eq!(
+        json["agents"][0]["scopes"],
+        json!(["admin:agent-42-*", "stream:agent-42-*"])
+    );
     let shown = machine.ok(&["agent", "show", "42"])?;
+    assert!(
+        shown.contains("scopes       admin:agent-42-*, stream:agent-42-*\n"),
+        "{shown}"
+    );
     assert!(shown.contains("renew by"), "{shown}");
     assert!(shown.contains("mcp --agent 42 --context dev"), "{shown}");
     assert!(shown.contains(TRUSTED_LOCAL), "{shown}");
@@ -969,7 +978,10 @@ async fn db_list_with_agent_uses_its_scopes() -> TestResult {
 async fn a_read_only_agent_serves_only_the_reading_tools() -> TestResult {
     let machine = Machine::new()?;
     let added = machine.ok(&["agent", "add", "42", "--read-only"])?;
-    assert!(added.contains("read:agent-42-*"), "{added}");
+    assert!(
+        added.contains("read:agent-42-*, stream:agent-42-*"),
+        "{added}"
+    );
     let mut session = machine.mcp(&["--agent", "42"]).await?;
     assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
     session.close().await?;
@@ -1010,7 +1022,10 @@ async fn mcp_read_only_mints_a_reading_identity_and_changes_no_existing_one() ->
     let mut session = machine.mcp(&["--agent", "42", "--read-only"]).await?;
     assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
     session.close().await?;
-    let reading = (vec!["read:agent-42-*".to_owned()], Some(true));
+    let reading = (
+        vec!["read:agent-42-*".to_owned(), "stream:agent-42-*".to_owned()],
+        Some(true),
+    );
     assert_eq!(recorded_access(&machine, "42")?, reading);
     // Later starts without it don't widen it.
     let mut session = machine.mcp(&["--agent", "42"]).await?;
@@ -1020,12 +1035,123 @@ async fn mcp_read_only_mints_a_reading_identity_and_changes_no_existing_one() ->
 
     // An identity that may write serves read-only for one start, and stays as it was.
     machine.mcp(&["--agent", "43"]).await?.close().await?;
-    let writing = (vec!["admin:agent-43-*".to_owned()], Some(false));
+    let writing = (
+        vec![
+            "admin:agent-43-*".to_owned(),
+            "stream:agent-43-*".to_owned(),
+        ],
+        Some(false),
+    );
     assert_eq!(recorded_access(&machine, "43")?, writing);
     let mut session = machine.mcp(&["--agent", "43", "--read-only"]).await?;
     assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
     session.close().await?;
     assert_eq!(recorded_access(&machine, "43")?, writing);
+    Ok(())
+}
+
+/// Makes agent `id`'s identity what 0.7 minted: `agent add --scope <scope>` gives the token
+/// that scope alone, and the record then loses `scopes_from` and goes back to version 1.
+fn as_minted_by_0_7(machine: &Machine, id: &str, scope: &str) -> TestResult {
+    machine.ok(&["agent", "add", id, "--scope", scope])?;
+    let file = machine.agent_dir(id).join("identity.toml");
+    let text = fs::read_to_string(&file)?;
+    assert!(text.contains("version = 2\n"), "{text}");
+    assert!(text.contains("scopes_from = \"flags\"\n"), "{text}");
+    let old = text
+        .replace("version = 2\n", "version = 1\n")
+        .replace("scopes_from = \"flags\"\n", "");
+    fs::write(&file, old)?;
+    Ok(())
+}
+
+/// The scopes a token carries, read without verifying it.
+fn token_scopes(token: &str) -> TestResult<Vec<String>> {
+    Ok(claims(token)?["fleetring.scopes"]
+        .as_array()
+        .ok_or("no scopes claim")?
+        .iter()
+        .filter_map(|scope| scope.as_str().map(str::to_owned))
+        .collect())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renew_adds_stream_only_to_the_old_default_and_a_start_never_does() -> TestResult {
+    let machine = Machine::new()?;
+    // Agent 42 as 0.7 minted it by default, 43 as 0.7 minted it with --scope, and 44 with
+    // the old default chosen with --scope in this release, which records that.
+    as_minted_by_0_7(&machine, "42", "admin:agent-42-*")?;
+    as_minted_by_0_7(&machine, "43", "write:agent-43-*")?;
+    machine.ok(&["agent", "add", "44", "--scope", "admin:agent-44-*"])?;
+    let old = (vec!["admin:agent-42-*".to_owned()], Some(false));
+    assert_eq!(recorded_access(&machine, "42")?, old);
+
+    // A start serves with the identity as it is, and says how to widen it.
+    let before = snapshot(&machine.agent_dir("42"))?;
+    let session = machine.mcp(&["--agent", "42"]).await?;
+    let log = session.close().await?;
+    assert!(
+        log.contains(
+            "note: agent 42's identity predates the stream scope, so it can't follow its \
+             databases' changes; `fleetring agent renew 42` gives it admin:agent-42-* and \
+             stream:agent-42-*"
+        ),
+        "{log}"
+    );
+    assert_eq!(
+        snapshot(&machine.agent_dir("42"))?,
+        before,
+        "nothing changed"
+    );
+    for id in ["43", "44"] {
+        let session = machine.mcp(&["--agent", id]).await?;
+        let log = session.close().await?;
+        assert!(!log.contains("predates the stream scope"), "{id}: {log}");
+    }
+
+    // Renew widens exactly the old default, and says so.
+    let renewed = machine.ok(&["agent", "renew", "42"])?;
+    assert!(
+        renewed.contains(
+            "  scopes: admin:agent-42-*, stream:agent-42-* (added stream:agent-42-*, a default \
+             since 0.8; the identity held only 0.7's default)\n"
+        ),
+        "{renewed}"
+    );
+    let widened = (
+        vec![
+            "admin:agent-42-*".to_owned(),
+            "stream:agent-42-*".to_owned(),
+        ],
+        Some(false),
+    );
+    assert_eq!(recorded_access(&machine, "42")?, widened);
+    assert_eq!(machine.record("42")?["version"].as_integer(), Some(1));
+    assert_eq!(token_scopes(&machine.token("42")?)?, widened.0);
+    // Once widened, a renewal has nothing to add.
+    let again = machine.ok(&["agent", "renew", "42"])?;
+    assert!(
+        again.contains("  scopes: admin:agent-42-*, stream:agent-42-* (unchanged)\n"),
+        "{again}"
+    );
+
+    // Scopes of an identity's own are kept, whichever release minted it.
+    let kept = machine.ok(&["agent", "renew", "43"])?;
+    assert!(
+        kept.contains("  scopes: write:agent-43-* (unchanged)\n"),
+        "{kept}"
+    );
+    assert_eq!(token_scopes(&machine.token("43")?)?, ["write:agent-43-*"]);
+    let chosen = machine.ok(&["agent", "renew", "44"])?;
+    assert!(
+        chosen.contains(
+            "  scopes: admin:agent-44-* (unchanged: chosen with --scope, which renew never \
+             widens; to change them, remove the agent and add it again)\n"
+        ),
+        "{chosen}"
+    );
+    assert_eq!(token_scopes(&machine.token("44")?)?, ["admin:agent-44-*"]);
+    assert_eq!(machine.record("44")?["version"].as_integer(), Some(2));
     Ok(())
 }
 

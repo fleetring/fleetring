@@ -8,18 +8,18 @@ fleetring\-agent\-add \- Mints an agent\*(Aqs identity: a certificate and a scop
 .SH DESCRIPTION
 Mints an agent\*(Aqs identity: a certificate and a scoped token
 .PP
-A certificate for `agent\-<id>` and a token scoped `admin:agent\-<id>\-*`, kept private in a directory of its own. In dev mode it starts the dev node if none runs, and signs with dev mode\*(Aqs authority; for another fleet, pass `\-\-authority`.
+A certificate for `agent\-<id>` and a token scoped `admin:agent\-<id>\-*` and `stream:agent\-<id>\-*`, kept private in a directory of its own. In dev mode it starts the dev node if none runs, and signs with dev mode\*(Aqs authority; for another fleet, pass `\-\-authority`.
 .SH OPTIONS
 .TP
 \fB\-\-scope\fR \fI<SCOPE>\fR
-A scope the token carries instead of the default `admin:agent\-<id>\-*`
+A scope the token carries instead of the defaults
 
-Repeat it for more.
+The defaults are `admin:agent\-<id>\-*` and `stream:agent\-<id>\-*`. Repeat it for more; `agent renew` never widens scopes chosen with it.
 .TP
 \fB\-\-read\-only\fR
-Records the identity as read\-only, with the default scope `read:agent\-<id>\-*`
+Records the identity as read\-only, with default scopes that read and stream
 
-`mcp \-\-agent` then offers only the tools that read.
+They are `read:agent\-<id>\-*` and `stream:agent\-<id>\-*`, and `mcp \-\-agent` offers only the tools that read.
 .TP
 \fB\-\-authority\fR \fI<DIR>\fR
 The directory with the fleet\*(Aqs `ca.crt` and `ca.key`

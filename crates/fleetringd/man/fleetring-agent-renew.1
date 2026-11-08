@@ -7,6 +7,8 @@ fleetring\-agent\-renew \- Reissues an agent\*(Aqs certificate and token now, an
 \fBfleetring agent renew\fR [\fB\-\-authority\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
 .SH DESCRIPTION
 Reissues an agent\*(Aqs certificate and token now, and revokes the old token
+.PP
+An identity that holds exactly the scope 0.7 gave by default, `admin:agent\-<id>\-*` (or `read:agent\-<id>\-*` for a read\-only one), also gets `stream:agent\-<id>\-*`, today\*(Aqs default. Scopes chosen with `\-\-scope` are kept as they are.
 .SH OPTIONS
 .TP
 \fB\-\-authority\fR \fI<DIR>\fR
