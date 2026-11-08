@@ -1448,7 +1448,7 @@ async fn changes_maps_each_refusal_to_a_tool_error() -> TestResult {
     assert!(
         refused["hint"]
             .as_str()
-            .is_some_and(|hint| hint.contains("fleetring agent renew")),
+            .is_some_and(|hint| hint.contains("ask your operator to run `fleetring agent renew")),
         "{refused}"
     );
     old.close().await?;
