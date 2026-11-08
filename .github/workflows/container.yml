@@ -81,7 +81,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: fleetring:smoke
-      # The binary names itself after the file it runs as; `fleetringd` is a link to it.
+      # The binary names itself after the file it runs as; `fleetringd` and `fleet` are links to it.
       - name: smoke test
         run: |
           printed=$(docker run --rm fleetring:smoke --version)
@@ -90,6 +90,9 @@ jobs:
           printed=$(docker run --rm --entrypoint /usr/local/bin/fleetringd fleetring:smoke --version)
           echo "$printed"
           test "$printed" = "fleetringd $VERSION"
+          printed=$(docker run --rm --entrypoint /usr/local/bin/fleet fleetring:smoke --version)
+          echo "$printed"
+          test "$printed" = "fleet $VERSION"
           user=$(docker image inspect --format '{{.Config.User}}' fleetring:smoke)
           echo "runs as $user"
           test "$user" = "65532:65532"
