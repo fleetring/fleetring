@@ -83,6 +83,44 @@ pub(crate) fn fleetring() -> std::process::Command {
     command
 }
 
+/// How many times [`output_copied`] and [`spawn_copied`] try a binary Linux reports busy, and how
+/// long they wait between tries.
+const BUSY_TRIES: u32 = 20;
+const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Runs `command` to its end, as [`std::process::Command::output`] does, for a binary the test
+/// has just copied or written. On Linux such a file can be briefly "busy" (ETXTBSY): another
+/// test thread that forks while the copy's write handle is open hands the child a copy of it,
+/// until that child execs. It clears in milliseconds, so a few short retries are enough (#129).
+pub(crate) fn output_copied(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    retry_busy(|| command.output())
+}
+
+/// Starts `command`, as [`std::process::Command::spawn`] does, retrying a just-copied binary
+/// that Linux reports busy, as [`output_copied`] does.
+pub(crate) fn spawn_copied(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    retry_busy(|| command.spawn())
+}
+
+fn retry_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut tries = 1;
+    loop {
+        match run() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < BUSY_TRIES =>
+            {
+                tries += 1;
+                std::thread::sleep(BUSY_PAUSE);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// [`fleetring`] for a test that waits on the process with tokio.
 pub(crate) fn fleetring_tokio() -> tokio::process::Command {
     tokio::process::Command::from(fleetring())

@@ -47,9 +47,13 @@ fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
     fs::copy(env!("CARGO_BIN_EXE_fleetring"), &bin)?;
     let mut install = Command::new(&bin);
     crate::support::isolate(&mut install);
-    let installed = install
-        .args(["upgrade", "--version", &version, "--no-restart", "--yes"])
-        .output()?;
+    let installed = crate::support::output_copied(install.args([
+        "upgrade",
+        "--version",
+        &version,
+        "--no-restart",
+        "--yes",
+    ]))?;
     assert!(installed.status.success(), "{}", printed(&installed));
     progress(&format!("downloaded and verified fleetringd {version}"));
     Ok(Some(bin))
@@ -59,7 +63,11 @@ fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
 fn has_upgrade(bin: &Path) -> TestResult<bool> {
     let mut help = Command::new(bin);
     crate::support::isolate(&mut help);
-    Ok(help.args(["upgrade", "--help"]).output()?.status.success())
+    Ok(
+        crate::support::output_copied(help.args(["upgrade", "--help"]))?
+            .status
+            .success(),
+    )
 }
 
 /// Replaces the binary at `bin` with this build, atomically, as `install.sh` does.
@@ -170,7 +178,7 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         let expected = (index == 0).then(current);
         runtime.block_on(wait_for_members(&client, &[id.as_str()], expected.as_ref()))?;
         // Whatever installed it, the node's file is still `fleetringd`, and says so.
-        let printed_version = Command::new(&bin).arg("--version").output()?;
+        let printed_version = crate::support::output_copied(Command::new(&bin).arg("--version"))?;
         assert_eq!(
             String::from_utf8_lossy(&printed_version.stdout).trim(),
             format!("fleetringd {}", current())
@@ -224,9 +232,9 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         fleet.logs()
     );
     // The name is the same file.
-    let printed_version = Command::new(node.bin.with_file_name("fleetring"))
-        .arg("--version")
-        .output()?;
+    let printed_version = crate::support::output_copied(
+        Command::new(node.bin.with_file_name("fleetring")).arg("--version"),
+    )?;
     assert_eq!(
         String::from_utf8_lossy(&printed_version.stdout).trim(),
         format!("fleetring {}", current())

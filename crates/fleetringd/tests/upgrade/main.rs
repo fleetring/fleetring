@@ -94,12 +94,14 @@ impl Bench {
     fn run_as(&self, bin: &Path, args: &[&str], path: &str) -> TestResult<Output> {
         let mut command = std::process::Command::new(bin);
         crate::support::isolate(&mut command);
-        Ok(command
-            .args(args)
-            .env("PATH", path)
-            .env_remove("FLEETRING_BASE_URL")
-            .env_remove("FLEETRING_RELEASES_URL")
-            .output()?)
+        // The install was just copied, or a test just wrote the binary it runs.
+        Ok(crate::support::output_copied(
+            command
+                .args(args)
+                .env("PATH", path)
+                .env_remove("FLEETRING_BASE_URL")
+                .env_remove("FLEETRING_RELEASES_URL"),
+        )?)
     }
 
     fn run(&self, args: &[&str]) -> TestResult<Output> {

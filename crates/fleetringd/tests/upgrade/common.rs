@@ -50,7 +50,7 @@ pub(crate) fn line_behind() -> Release {
 /// The release the binary at `bin` says it is, from `--version`: `fleetring <version>`, or
 /// `fleetringd <version>` from a release before 0.7 or a binary named `fleetringd`.
 pub(crate) fn release_of(bin: &Path) -> TestResult<Release> {
-    let printed = Command::new(bin).arg("--version").output()?;
+    let printed = crate::support::output_copied(Command::new(bin).arg("--version"))?;
     let text = String::from_utf8_lossy(&printed.stdout);
     let text = text.trim();
     Ok(text
@@ -544,13 +544,15 @@ impl ProcessFleet {
         if self.launch == Launch::Serve {
             command.arg("serve");
         }
-        let child = command
-            .arg("--config")
-            .arg(&node.config)
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()?;
+        // The node's binary was copied as the fleet started.
+        let child = crate::support::spawn_copied(
+            command
+                .arg("--config")
+                .arg(&node.config)
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::null())
+                .stderr(log),
+        )?;
         node.child = Some(child);
         Ok(())
     }
