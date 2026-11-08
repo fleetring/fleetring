@@ -659,6 +659,18 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#mcp-server"
     },
     {
+      "id": "statement-deadlines",
+      "component": "fleetringd",
+      "area": "operations",
+      "title": "Statement deadlines",
+      "description": "A statement that runs past its deadline, or whose call is cancelled, is interrupted on its primary, and a write rolls back, so a runaway query never holds a database.",
+      "status": "built",
+      "since": "0.8.0",
+      "ticket": "FR-078",
+      "issue": 109,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#run-it"
+    },
+    {
       "id": "vectors",
       "component": "fleetringd",
       "area": "access",

@@ -61,3 +61,12 @@ Throughput: one database is limited by SQLite's single writer and one fsync per 
 - SQLite replication is physical, so a primary and its followers agree on page size and file format; the adapter checks both.
 - Moving a database to a different engine, such as SQLite to Postgres, is a logical copy rather than a physical one (ADR-0021).
 - Later adapters, each in its own ticket: libSQL or Turso as frame sources, Turso MVCC, Postgres as self-replicating, and S3 durability sinks.
+
+## Amendment (2026-11-08, FR-078, #109): statements stop at an interrupt
+
+A statement ran on its primary until it finished, whatever its client did. A client's timeout cancelled only its call, so a recursive CTE that never ends held the database's thread, and for a write its writer, for good. Every engine adapter now takes a way to stop one.
+
+1. **`execute`, `query`, and `schema` take an engine-neutral `Interrupt`.** It is a shared flag with a reason, `Deadline` or `Cancelled`, and no clock. The engine checks it before it starts a call and while the user's statements run, and once it is raised fails the call with `EngineError::Interrupted` and the reason. An interrupted write transaction rolls back and commits nothing, so it yields no batch and no row change. Once the statements have all run, the engine finishes the call, its own bookkeeping and commit included, whatever the flag says, so no transaction is cut between its last statement and its commit.
+2. **Time stays above the adapter.** The actor's handle raises the flag: at the request's deadline, from a `tokio::time` timer, and when its caller drops the call. The engine never reads a clock, so a simulation stays deterministic (ADR-0020), and a deadline and a cancellation are one mechanism. Under inline execution the flag can only be raised between calls, so there it stops a request whose deadline passed, or whose caller left, while it waited.
+3. **The SQLite adapter checks the flag from SQLite's progress handler,** every thousand virtual-machine instructions, installed only around user statements and schema reads, and maps `SQLITE_INTERRUPT` to `EngineError::Interrupted`. Its own statements around a write (change records, sink marks, `COMMIT`) run without it.
+4. **A data node's deadline** is its `[limits] statement_timeout_ms` from when it takes the request, or the call's own `grpc-timeout` if earlier; `EngineError::Interrupted` reaches the client as `DEADLINE_EXCEEDED`, or `CANCELLED` for a cancelled call.

@@ -314,7 +314,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
 
 - **Progress** is a spinner on stderr, shown after 150 ms and only where §5's table allows. Long-running commands are dev startup, `dev -d`, `dev stop`, `stop`, `db create`, `db restore`, `db verify`, `archive verify`, `archive restore`, `upgrade`, `node drain`, `orphan remove` and `agent add`. On success the spinner becomes `✓ <what happened>`; on failure it is cleared, and the error prints. A command whose steps differ (`upgrade`) changes the spinner's message per step. Log lines printed meanwhile don't tear the spinner's line.
 - **Ctrl-C** stops cleanly. A drain stops after the database it is handing over, and says what it moved and what it left.
-- **Timeouts** have a flag (`--timeout 30s`) and a stated default: 60s for `dev -d` to be ready, 2m for `stop` to drain, 5m for each `upgrade` step.
+- **Timeouts** have a flag (`--timeout 30s`) and a stated default: 60s for `dev -d` to be ready, 2m for `stop` to drain, 5m for each `upgrade` step, and for `db exec` and `db query` the primary's `[limits] statement_timeout_ms`, 30s unless it says otherwise, which also caps a longer `--timeout`. A statement past its timeout stops on the primary, a write rolling back, and the command exits 4 with a hint to make the statement cheaper or give it longer (FR-078); exit codes are unchanged.
 - **A background process is a `docker run -d`:**
   - `dev -d` returns once the node is ready, prints its address, data directory and log path on stdout, and is idempotent. The log rotates only when the node starts, so it grows during one long run.
   - The process file records a node `dev -d` started, and `dev stop` always stops it.
