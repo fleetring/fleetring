@@ -34,7 +34,21 @@ fn run(bin: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
     ] {
         command.env_remove(variable);
     }
-    Ok(command.output()?)
+    // On Linux a binary these tests have just copied can be briefly "busy" (ETXTBSY): another
+    // test thread that forks while the copy's write handle is open hands the child a copy of it,
+    // until that child execs. It clears in milliseconds, so a few short retries are enough.
+    let mut attempts = 0;
+    loop {
+        match command.output() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => return Ok(result?),
+        }
+    }
 }
 
 fn stdout(output: &Output) -> String {
