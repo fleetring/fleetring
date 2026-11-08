@@ -605,15 +605,20 @@ impl DatabaseHandle {
         }
         let (reply, mut result) = oneshot::channel();
         permit.send(request(interrupt.clone(), reply));
-        // Once the reply has arrived the statement is done, so raising the flag then is harmless.
-        let _cancel_on_drop = RaiseOnDrop(interrupt.clone());
+        // Raised if this future is dropped before the reply arrives: the caller stopped waiting.
+        let cancel_on_drop = RaiseOnDrop::new(&interrupt);
         if let Some(deadline) = deadline {
             tokio::select! {
-                replied = &mut result => return self.replied(replied),
+                replied = &mut result => {
+                    cancel_on_drop.disarm();
+                    return self.replied(replied);
+                }
                 () = time::sleep_until(deadline) => interrupt.raise(Interruption::Deadline),
             }
         }
-        self.replied(result.await)
+        let replied = result.await;
+        cancel_on_drop.disarm();
+        self.replied(replied)
     }
 
     async fn call<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, DatabaseError> {
@@ -647,11 +652,24 @@ impl DatabaseHandle {
 }
 
 /// Raises its interrupt with [`Interruption::Cancelled`] when dropped.
-struct RaiseOnDrop(Interrupt);
+struct RaiseOnDrop(Option<Interrupt>);
+
+impl RaiseOnDrop {
+    fn new(interrupt: &Interrupt) -> Self {
+        Self(Some(interrupt.clone()))
+    }
+
+    /// The reply arrived: the call wasn't cancelled.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for RaiseOnDrop {
     fn drop(&mut self) {
-        self.0.raise(Interruption::Cancelled);
+        if let Some(interrupt) = &self.0 {
+            interrupt.raise(Interruption::Cancelled);
+        }
     }
 }
 
