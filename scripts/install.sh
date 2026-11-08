@@ -10,7 +10,14 @@
 # verifying that file's cosign signature, when cosign is installed), and copies
 # the binary to PREFIX/bin/fleetring, with PREFIX/bin/fleetringd a link to it, and the man pages,
 # when the release has them (0.7 on), to PREFIX/share/man/man1. A release before 0.7 installs as
-# PREFIX/bin/fleetringd alone, as it always did. Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
+# PREFIX/bin/fleetringd alone, as it always did.
+#
+# From 0.7 it also makes PREFIX/bin/fleet, a short name, a link to fleetring, unless --no-alias
+# (or FLEETRINGD_NO_ALIAS=1) says not to. It leaves alone a PREFIX/bin/fleet that isn't a link to
+# fleetring or fleetringd, and adds nothing if another `fleet` is on the PATH (Rancher Fleet and
+# JetBrains Fleet use the name), and says so. It never runs a `fleet` to find out.
+#
+# Supported: Linux (glibc 2.36 or newer) and macOS, each on x86_64
 # and ARM64. On Windows, download the .zip from the release page.
 
 set -eu
@@ -19,13 +26,14 @@ repo="fleetring/fleetring"
 version="${FLEETRINGD_VERSION:-}"
 prefix="${FLEETRINGD_PREFIX:-}"
 base_url="${FLEETRINGD_BASE_URL:-}"
+no_alias="${FLEETRINGD_NO_ALIAS:-}"
 
 usage() {
     cat <<EOF
-Installs fleetring from a GitHub release, and fleetringd, its name before 0.7, as a link
-to it.
+Installs fleetring from a GitHub release, with fleetringd, its name before 0.7, and fleet, a
+short name, as links to it.
 
-Usage: install.sh [--version VERSION] [--prefix DIR] [--base-url URL]
+Usage: install.sh [--version VERSION] [--prefix DIR] [--base-url URL] [--no-alias]
 
 Options:
   --version VERSION  The version to install, such as 0.1.0. Default: the newest release.
@@ -35,6 +43,9 @@ Options:
                      FLEETRINGD_PREFIX.
   --base-url URL     Downloads the archive and SHA256SUMS from URL instead of the GitHub
                      release, for a mirror. Needs --version. Also read from FLEETRINGD_BASE_URL.
+  --no-alias         Doesn't add DIR/bin/fleet, a link to fleetring (0.7 on). It is added only if
+                     DIR/bin/fleet is absent or already a link to fleetring, and no other fleet is
+                     on your PATH. Also set by FLEETRINGD_NO_ALIAS=1.
   -h, --help         Prints this help.
 EOF
 }
@@ -75,6 +86,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --base-url=*)
             base_url="${1#*=}"
+            shift
+            ;;
+        --no-alias)
+            no_alias=1
             shift
             ;;
         -h | --help)
@@ -147,6 +162,42 @@ latest_version() {
         | grep -o '"tag_name": *"fleetringd-v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' \
         | head -n 1 \
         | sed 's/.*"fleetringd-v\([^"]*\)"/\1/'
+}
+
+# The `fleet` alias, a link to `fleetring` (ADR-0043, amendment of 2026-11-07), for a release that
+# has `fleetring`. It must never replace or be shadowed by someone else's `fleet` (Rancher
+# Fleet's CLI, JetBrains Fleet's launcher), so it is made only if PREFIX/bin/fleet is absent or
+# already a link to fleetring or fleetringd, and no other `fleet` is on the PATH. Nothing here
+# runs a `fleet`: links are read with readlink, and anything else is only looked at.
+link_is_ours() {
+    [ -L "$1" ] || return 1
+    case "$(readlink "$1" 2> /dev/null)" in
+        fleetring | fleetringd | */fleetring | */fleetringd) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+add_alias() {
+    alias_path="$bin_dir/fleet"
+    if [ -e "$alias_path" ] || [ -L "$alias_path" ]; then
+        if ! link_is_ours "$alias_path"; then
+            say "left $alias_path alone: it isn't a link to fleetring"
+            return 0
+        fi
+    fi
+    other=$(command -v fleet 2> /dev/null || true)
+    case "$other" in
+        /*)
+            if ! [ "$other" -ef "$alias_path" ] && ! link_is_ours "$other"; then
+                say "another fleet is on your PATH at $other; not adding the fleet alias"
+                return 0
+            fi
+            ;;
+    esac
+    ln -sf fleetring "$bin_dir/.fleet.new" \
+        || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
+    mv -f "$bin_dir/.fleet.new" "$alias_path"
+    say "installed $alias_path, a link to fleetring (--no-alias skips it)"
 }
 
 target=$(detect_target)
@@ -261,6 +312,11 @@ if [ "$binary" = fleetring ]; then
         || fail "can't write to $bin_dir; pass --prefix, or run as a user who can write there"
     mv -f "$bin_dir/.fleetringd.new" "$bin_dir/fleetringd"
     say "installed $("$bin_dir/fleetring" --version) to $bin_dir/fleetring (also as fleetringd)"
+    if [ "$no_alias" = 1 ]; then
+        say "not adding the fleet alias: --no-alias"
+    else
+        add_alias
+    fi
 else
     say "installed $("$bin_dir/fleetringd" --version) to $bin_dir/fleetringd"
     # A release before 0.7 knows only `fleetringd`. A `fleetring` left by a later install would
