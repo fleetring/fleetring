@@ -502,6 +502,31 @@ mod tests {
         Ok(())
     }
 
+    /// The `fleet` alias (ADR-0043, amendment of 2026-11-07) is a link to the name `fleetring`,
+    /// so an upgrade and a rollback, which replace the file, leave it working.
+    #[cfg(unix)]
+    #[test]
+    fn a_fleet_link_survives_an_upgrade_and_a_rollback() -> Result<(), UpgradeError> {
+        let dir = tempfile::tempdir().map_err(io_error(Path::new(".")))?;
+        let fleetring = dir.path().join("fleetring");
+        let fleet = dir.path().join("fleet");
+        let new = dir.path().join("new");
+        fs::write(&fleetring, b"old").map_err(io_error(&fleetring))?;
+        fs::write(&new, b"new").map_err(io_error(&new))?;
+        std::os::unix::fs::symlink("fleetring", &fleet).map_err(io_error(&fleet))?;
+        // Upgrading from the alias replaces the file it points at.
+        let installed = Installed::at(&fleet)?;
+        installed.replace_with(&new)?;
+        assert_eq!(fs::read(&fleet).ok(), Some(b"new".to_vec()));
+        installed.roll_back()?;
+        assert_eq!(fs::read(&fleet).ok(), Some(b"old".to_vec()));
+        assert_eq!(
+            fs::read_link(&fleet).map_err(io_error(&fleet))?,
+            PathBuf::from("fleetring")
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn complete_names_leaves_an_existing_fleetring_alone() -> Result<(), UpgradeError> {

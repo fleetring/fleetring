@@ -45,4 +45,5 @@ Options:
   -h, --help                     Print help (see more with '--help')
   -V, --version                  Print version
 
+`fleet` is a permanent short name for `fleetring`.
 `fleetringd` is the same program, kept until 1.0; `fleetringd --config <file>` runs `serve`.

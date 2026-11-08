@@ -71,8 +71,9 @@ const MORE_EXAMPLES: &[(&str, &str)] = &[
 const EXAMPLE_COLUMN: usize = 35;
 
 /// What `fleetring -h` says below the options: the compatibility names (ADR-0043, point 1.5).
-pub(crate) const COMPAT_HELP: &str =
-    "`fleetringd` is the same program, kept until 1.0; `fleetringd --config <file>` runs `serve`.";
+pub(crate) const COMPAT_HELP: &str = "\
+`fleet` is a permanent short name for `fleetring`.\n\
+`fleetringd` is the same program, kept until 1.0; `fleetringd --config <file>` runs `serve`.";
 
 /// What `fleetring --help` says below the options: the exit codes (`docs/cli.md`, section 8),
 /// then the compatibility names.
@@ -106,7 +107,13 @@ pub(crate) fn grouped(command: &clap::Command, detail: Detail) -> StyledStr {
         Detail::Short => &[],
         Detail::Long => MORE_EXAMPLES,
     };
+    // `fleet` shows its own name in the examples; `fleetringd` has always shown `fleetring`.
+    let program = match command.get_bin_name() {
+        Some("fleet") => "fleet",
+        _ => "fleetring",
+    };
     for (example, what) in EXAMPLES.iter().chain(more) {
+        let example = format!("{program}{}", &example["fleetring".len()..]);
         let _ = if example.len() < EXAMPLE_COLUMN {
             write!(out, "\n  {example:<EXAMPLE_COLUMN$}{what}")
         } else {

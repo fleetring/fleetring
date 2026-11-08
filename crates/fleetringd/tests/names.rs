@@ -261,3 +261,163 @@ fn the_old_archive_commands_fail_with_a_hint() -> TestResult {
     }
     Ok(())
 }
+
+/// `fleet`, the short name (ADR-0043, amendment of 2026-11-07), copied into `dir`.
+fn fleet_in(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    copy_as(dir, "fleet")
+}
+
+#[test]
+fn fleet_prints_its_own_name() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = fleet_in(dir.path())?;
+    for flag in ["--version", "-V"] {
+        let printed = run(&fleet, &[flag])?;
+        assert!(printed.status.success(), "{flag}: {printed:?}");
+        assert_eq!(
+            stdout(&printed),
+            format!("fleet {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+    let help = run(&fleet, &[])?;
+    assert_eq!(help.status.code(), Some(2), "{help:?}");
+    let text = format!("{}{}", stdout(&help), stderr(&help));
+    assert!(text.contains("Usage: fleet "), "{text}");
+    assert!(text.contains("  fleet dev -d "), "{text}");
+    assert!(text.contains("permanent short name"), "{text}");
+    for args in [&["--bogus"][..], &["db", "list", "--bogus"]] {
+        let refused = run(&fleet, args)?;
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&refused).contains("Usage: fleet "), "{args:?}");
+    }
+    Ok(())
+}
+
+/// A symbolic link named `fleet`, as `install.sh` and the image make it, is `fleet` too.
+#[cfg(unix)]
+#[test]
+fn a_fleet_link_is_fleet() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    copy_as(dir.path(), "fleetring")?;
+    let link = dir.path().join("fleet");
+    std::os::unix::fs::symlink("fleetring", &link)?;
+    let printed = run(&link, &["--version"])?;
+    assert_eq!(
+        stdout(&printed),
+        format!("fleet {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    Ok(())
+}
+
+/// Only the exact name: `fleet-foo` and `fleet.previous` are not `fleet`.
+#[test]
+fn only_the_exact_name_is_fleet() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for file_name in ["fleet-foo", "fleet.previous"] {
+        let bin = copy_as(dir.path(), file_name)?;
+        let printed = run(&bin, &["--version"])?;
+        assert_eq!(
+            stdout(&printed),
+            format!("fleetring {}\n", env!("CARGO_PKG_VERSION")),
+            "{file_name}"
+        );
+    }
+    Ok(())
+}
+
+/// Unlike `fleetringd`, `fleet` has no compatibility behaviour: 0.6's bare daemon flags are an
+/// unknown argument, not `serve`.
+#[test]
+fn fleet_does_not_imply_serve() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = fleet_in(dir.path())?;
+    for args in [
+        &["--config", "x"][..],
+        &["--config=x", "--node-id", "n1"],
+        &["--log-format", "json", "--config", "x"],
+    ] {
+        let refused = run(&fleet, args)?;
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
+        let text = stderr(&refused);
+        assert!(text.contains("unexpected argument"), "{args:?}: {text}");
+        assert!(text.contains("Usage: fleet "), "{args:?}: {text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn client_commands_are_the_same_under_fleet_and_fleetring() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleetring = copy_as(dir.path(), "fleetring")?;
+    let fleet = fleet_in(dir.path())?;
+    let outcome = |bin: &Path, name: &str| -> Result<_, Box<dyn Error>> {
+        let output = run(
+            bin,
+            &[
+                "db",
+                "list",
+                "--control",
+                "127.0.0.1:1",
+                "--insecure-plaintext",
+            ],
+        )?;
+        let text = stderr(&output);
+        let message = text
+            .strip_prefix(&format!("{name}: "))
+            .ok_or_else(|| format!("{name}'s error doesn't start with its name: {text}"))?
+            .to_owned();
+        Ok((output.status.code(), stdout(&output), message))
+    };
+    let fleetring = outcome(&fleetring, "fleetring")?;
+    let fleet = outcome(&fleet, "fleet")?;
+    // The hints name the command as it was run; the rest is the same.
+    let fleet = (fleet.0, fleet.1, fleet.2.replace("`fleet ", "`fleetring "));
+    // Nothing listens there: unavailable, which a retry may fix.
+    assert_eq!(fleet.0, Some(4), "{fleet:?}");
+    assert_eq!(fleetring, fleet);
+    Ok(())
+}
+
+/// Hints that name a command say `fleet`, under `fleet`.
+#[test]
+fn fleet_hints_name_fleet() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleetring = copy_as(dir.path(), "fleetring")?;
+    let fleet = fleet_in(dir.path())?;
+    let args = ["db", "list"];
+    let text = stderr(&run(&fleet, &args)?);
+    assert!(text.starts_with("fleet: no control address"), "{text}");
+    assert!(text.contains("`fleet dev -d`"), "{text}");
+    assert!(!text.contains("`fleetring "), "{text}");
+    let text = stderr(&run(&fleetring, &args)?);
+    assert!(text.contains("`fleetring dev -d`"), "{text}");
+    for (bin, name) in [(&fleet, "fleet"), (&fleetring, "fleetring")] {
+        let refused = run(bin, &["db", "archive", "show", "ledger", "--archive", "b"])?;
+        let text = stderr(&refused);
+        let want = format!("is now `{name} archive show|verify`");
+        assert!(text.trim_end().ends_with(&want), "{name}: {text}");
+    }
+    Ok(())
+}
+
+/// `fleet completions <shell>` registers `fleet`, and calls back into `fleet`.
+#[test]
+fn fleet_completions_register_fleet() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleetring = copy_as(dir.path(), "fleetring")?;
+    let fleet = fleet_in(dir.path())?;
+    let fleet_path = fleet.to_string_lossy().into_owned();
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let output = run(&fleet, &["completions", shell])?;
+        assert!(output.status.success(), "{shell}: {}", stderr(&output));
+        let script = stdout(&output);
+        assert!(script.contains("FLEETRING_COMPLETE"), "{shell}: {script}");
+        assert!(script.contains(&fleet_path), "{shell}: {script}");
+    }
+    let bash = stdout(&run(&fleet, &["completions", "bash"])?);
+    assert!(bash.contains("_clap_complete_fleet()"), "{bash}");
+    assert!(!bash.contains("_clap_complete_fleetring()"), "{bash}");
+    let plain = stdout(&run(&fleetring, &["completions", "bash"])?);
+    assert!(plain.contains("_clap_complete_fleetring()"), "{plain}");
+    Ok(())
+}

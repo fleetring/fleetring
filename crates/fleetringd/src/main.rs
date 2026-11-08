@@ -1704,7 +1704,11 @@ enum Run {
 ///
 /// clap's error, which prints help, the version, or a usage error.
 fn parse(raw: Vec<OsString>, name: ProgramName) -> Result<(Cli, Invocation), clap::Error> {
-    let (args, invocation) = compat::imply_serve(raw);
+    // 0.6 never had a `fleet`, so the bare daemon flags are for the other names alone.
+    let (args, invocation) = match name {
+        ProgramName::Fleet => (raw, Invocation::AsWritten),
+        ProgramName::Fleetring | ProgramName::Fleetringd => compat::imply_serve(raw),
+    };
     let mut command = help::root_command(name);
     let mut matches = command.try_get_matches_from_mut(args)?;
     let cli =
@@ -1735,7 +1739,7 @@ fn main() -> ExitCode {
             // Help and version requests are not errors; clap prints them to stdout.
             let _ = error.print();
             if let Some(hint) = hint {
-                eprintln!("{hint}");
+                eprintln!("{}", hinted(hint));
             }
             return ExitCode::from(u8::try_from(code).unwrap_or(exit::USAGE));
         }
@@ -2285,7 +2289,13 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                         "warning: the database was restored without its expiry: {}",
                         printable(message)
                     );
-                    eprintln!("hint: fleetring db edit {} --expires-in <d>", shown(&name));
+                    eprintln!(
+                        "{}",
+                        hinted(&format!(
+                            "hint: fleetring db edit {} --expires-in <d>",
+                            shown(&name)
+                        ))
+                    );
                     return Err(exit::Silent(exit::FAILURE).into());
                 }
                 _ => {}
@@ -3764,12 +3774,20 @@ fn program() -> &'static str {
         .as_str()
 }
 
+/// `text` with the commands it names written as the binary was run: `fleet db list` under `fleet`
+/// (ADR-0043, amendment of 2026-11-07).
+fn hinted(text: &str) -> std::borrow::Cow<'_, str> {
+    let name = PROGRAM.get().copied().unwrap_or(ProgramName::Fleetring);
+    let root = <Cli as clap::CommandFactory>::command();
+    name.in_hints(text, |word| root.find_subcommand(word).is_some())
+}
+
 /// Prints an error and its causes, one per line.
 fn report(error: &dyn Error) {
-    eprintln!("{}: {error}", program());
+    eprintln!("{}: {}", program(), hinted(&error.to_string()));
     let mut source = error.source();
     while let Some(cause) = source {
-        eprintln!("  caused by: {cause}");
+        eprintln!("  caused by: {}", hinted(&cause.to_string()));
         source = cause.source();
     }
 }

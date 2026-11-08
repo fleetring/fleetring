@@ -1,6 +1,7 @@
 //! What keeps 0.6's spellings working until 1.0 (ADR-0043, point 1): the `fleetringd` name, and
 //! the top-level daemon flags that mean `serve`.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -12,21 +13,27 @@ pub(crate) enum ProgramName {
     Fleetring,
     /// `fleetringd`, its compatibility name until 1.0.
     Fleetringd,
+    /// `fleet`, its short name: permanent, and the same as `fleetring` in everything but what it
+    /// calls itself.
+    Fleet,
 }
 
 impl ProgramName {
-    /// `Fleetringd` if `arg0`'s file name, less a leading dot, starts with `fleetringd`
-    /// (`fleetringd`, `fleetringd.exe`, `fleetringd.previous`, an upgrader's `.fleetringd.new`);
-    /// `Fleetring` otherwise, and for `None`.
+    /// `Fleet` if `arg0`'s file name is exactly `fleet` or `fleet.exe`; `Fleetringd` if it, less
+    /// a leading dot, starts with `fleetringd` (`fleetringd`, `fleetringd.exe`,
+    /// `fleetringd.previous`, an upgrader's `.fleetringd.new`); `Fleetring` otherwise, and for
+    /// `None`.
     pub(crate) fn from_arg0(arg0: Option<&OsStr>) -> Self {
-        let named_fleetringd = arg0
-            .and_then(|arg0| Path::new(arg0).file_name())
-            .is_some_and(|name| {
-                let name = name.as_encoded_bytes();
-                name.strip_prefix(b".")
-                    .unwrap_or(name)
-                    .starts_with(b"fleetringd")
-            });
+        let file_name = arg0.and_then(|arg0| Path::new(arg0).file_name());
+        if file_name.is_some_and(|name| name == "fleet" || name == "fleet.exe") {
+            return Self::Fleet;
+        }
+        let named_fleetringd = file_name.is_some_and(|name| {
+            let name = name.as_encoded_bytes();
+            name.strip_prefix(b".")
+                .unwrap_or(name)
+                .starts_with(b"fleetringd")
+        });
         if named_fleetringd {
             Self::Fleetringd
         } else {
@@ -39,7 +46,45 @@ impl ProgramName {
         match self {
             Self::Fleetring => "fleetring",
             Self::Fleetringd => "fleetringd",
+            Self::Fleet => "fleet",
         }
+    }
+
+    /// `text` with each `fleetring <command>` it names as a command to run written as
+    /// `fleet <command>`, if the binary was run as `fleet`; `is_command` says which words are
+    /// commands. Under the other names the text is as it is: `fleetringd` has always shown
+    /// `fleetring` in its hints.
+    pub(crate) fn in_hints<'a>(
+        self,
+        text: &'a str,
+        is_command: impl Fn(&str) -> bool,
+    ) -> Cow<'a, str> {
+        const LONG: &str = "fleetring ";
+        if self != Self::Fleet || !text.contains(LONG) {
+            return Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(LONG) {
+            let (before, after) = rest.split_at(at);
+            out.push_str(&rest[..before.len()]);
+            let after = &after[LONG.len()..];
+            let word = after
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .next()
+                .unwrap_or_default();
+            let whole_word = !before.ends_with(|c: char| {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_')
+            });
+            out.push_str(if whole_word && is_command(word) {
+                "fleet "
+            } else {
+                LONG
+            });
+            rest = after;
+        }
+        out.push_str(rest);
+        Cow::Owned(out)
     }
 }
 
@@ -126,6 +171,11 @@ mod tests {
             ("/tmp/x/.fleetring.new", ProgramName::Fleetring),
             ("fleetring", ProgramName::Fleetring),
             ("fleetring.exe", ProgramName::Fleetring),
+            ("/usr/local/bin/fleet", ProgramName::Fleet),
+            ("fleet.exe", ProgramName::Fleet),
+            ("fleet-foo", ProgramName::Fleetring),
+            ("fleet.previous", ProgramName::Fleetring),
+            ("/opt/fleet/bin/fleetring", ProgramName::Fleetring),
             ("/x/fleetring.previous", ProgramName::Fleetring),
             ("/opt/fleetringd/bin/fleetring", ProgramName::Fleetring),
         ] {
@@ -138,6 +188,21 @@ mod tests {
         assert_eq!(ProgramName::from_arg0(None), ProgramName::Fleetring);
         assert_eq!(ProgramName::Fleetring.as_str(), "fleetring");
         assert_eq!(ProgramName::Fleetringd.as_str(), "fleetringd");
+        assert_eq!(ProgramName::Fleet.as_str(), "fleet");
+    }
+
+    #[test]
+    fn hints_name_fleet_only_for_fleet_and_only_for_commands() {
+        let is_command = |word: &str| matches!(word, "db" | "status" | "dev");
+        let text = "run `fleetring db list`, or fleetring status; fleetring is up; \
+                    /x/fleetring db; fleetringd db";
+        assert_eq!(
+            ProgramName::Fleet.in_hints(text, is_command),
+            "run `fleet db list`, or fleet status; fleetring is up; /x/fleetring db; fleetringd db"
+        );
+        for name in [ProgramName::Fleetring, ProgramName::Fleetringd] {
+            assert_eq!(name.in_hints(text, is_command), text);
+        }
     }
 
     #[test]
