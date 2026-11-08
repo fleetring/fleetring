@@ -208,7 +208,7 @@ An X.509 certificate from the fleet's [authority](#authority). A *node certifica
 The ordered, at-least-once flow of one database's acknowledged batches to a [sink](#sink), beside replication and never in a write's acknowledgement path (FR-039). *Logical* format sends row changes; *physical* sends the opaque batches.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `changes::`, `ChangeSink`, `Format::Logical`/`Physical`, `CaptureMode`. **CLI:** `[[changes.sink]]` in config; sink progress in `status --node`.
+- **Code:** `changes::`, `ChangeSink`, `Format::Logical`/`Physical`, `CaptureMode`. **CLI:** `[[changes.sink]]` in config; sink progress in `status --node`; a [watcher](#watcher) follows the recorded row changes with `db watch`.
 - **Not:** changefeed, CDC (in names), event stream, replication stream (that is node-to-node).
 
 ### Checkpoint
@@ -1001,6 +1001,14 @@ Moving a node to another [release](#release): verify the release's signature and
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetringd::upgrade`, `upgrade::run`, `ProcessFile`, `Stop::Restart`. **CLI:** `fleetring upgrade`, `--version`, `--check`, `--no-restart`, `--rollback`, `--software`; `SIGHUP` restarts a daemon in place. A 0.6 binary installs 0.7 under its old name, `fleetringd`, and a 0.7 `upgrade` then adds the `fleetring` link beside it (ADR-0043, point 3).
 - **Not:** update, self-update, patch (a patch is one kind of release).
+
+### Watcher
+
+A client following one database's recorded row changes live, through `db watch` (ADR-0045): served by the database's primary from the same change table logical [sinks](#sink) read, one committed transaction at a time, live or after a [position](#position) the primary still holds every change after. Unlike a sink, a watcher keeps no [mark](#mark) and holds back no [checkpoint](#checkpoint); while it is connected it holds back the pruning of the changes it hasn't read. Its position is the last transaction it printed. The change table's *floor* is the position from which the primary holds every recorded change.
+
+- **Applies to:** daemon, CLI.
+- **Code:** `changes::Watcher`, `ChangeStreams::watch`, `MAX_WATCHERS`, `LogicalChanges::transactions_after`, protocol `Database.WatchChanges`. **CLI:** `fleetring db watch <db> [--from <position>]`.
+- **Not:** subscriber, consumer (a consumer reads what a watcher prints), tail, listener, cursor.
 
 ### Weight
 

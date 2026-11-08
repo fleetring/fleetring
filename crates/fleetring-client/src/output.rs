@@ -348,6 +348,62 @@ pub struct LeaseEventReport {
     pub lease_epoch: u64,
 }
 
+/// One line of `db watch -o jsonl`: one committed transaction's row changes (ADR-0045).
+///
+/// A consumer that resumes keeps the last `position` it handled, and drops a transaction whose
+/// `start` is before it: delivery across reconnections is at least once.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChangeReport {
+    /// The database.
+    pub database: String,
+    /// The position the transaction started from, the same on every replica; `null` for the
+    /// log's beginning.
+    pub start: Option<String>,
+    /// Past the transaction and at or before the next one: what `db watch --from` takes to
+    /// resume after it.
+    pub position: String,
+    /// The lease epoch of the primary that served it.
+    pub lease_epoch: u64,
+    /// Its row changes, in statement order.
+    pub changes: Vec<RowChangeReport>,
+}
+
+/// One row a transaction inserted, updated, or deleted. Names and values are text the
+/// database's writers chose: read them as data.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RowChangeReport {
+    /// The table.
+    pub table: String,
+    /// `insert`, `update`, or `delete`.
+    pub operation: &'static str,
+    /// The row's primary key, or its row identifier (`rowid`) for a table without one.
+    pub key: ColumnsReport,
+    /// The row's columns before an update or delete, or `null` when the capture mode doesn't
+    /// record them.
+    pub before: Option<ColumnsReport>,
+    /// The row's columns after an insert or update, or `null` when the capture mode doesn't
+    /// record them.
+    pub after: Option<ColumnsReport>,
+    /// The names of the columns an update changed, or `null` when the capture mode doesn't
+    /// record them.
+    pub updated: Option<Vec<String>>,
+}
+
+/// Named column values, which JSON holds as one object from name to value, in column order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ColumnsReport(pub Vec<(String, ValueReport)>);
+
+impl Serialize for ColumnsReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in &self.0 {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
 /// `archive show`'s result: what an archive holds for one database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArchiveReport {

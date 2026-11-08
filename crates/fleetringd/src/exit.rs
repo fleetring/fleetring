@@ -137,6 +137,12 @@ pub(crate) fn hint(status: &Status) -> Option<String> {
              or token may have expired or been revoked"
                 .to_owned(),
         ),
+        // `db watch` after a position whose changes the primary no longer holds (ADR-0045).
+        Code::OutOfRange if status.message().contains("no longer held") => Some(
+            "watch from the oldest position held with `--from <position>`, or from now without \
+             `--from`"
+                .to_owned(),
+        ),
         Code::Unavailable | Code::DeadlineExceeded => Some(
             "retry; the fleet may be starting or failing over. If it persists, check \
              `fleetring status`, or `fleetring dev status` for a dev node"

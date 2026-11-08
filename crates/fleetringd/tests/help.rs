@@ -111,8 +111,8 @@ fn group_help_is_one_line_per_command() -> TestResult {
         .map(|(list, _)| list)
         .ok_or_else(|| format!("no command list:\n{text}"))?;
     let verbs = [
-        "create", "show", "edit", "exec", "query", "locate", "list", "verify", "restore", "drop",
-        "help",
+        "create", "show", "edit", "exec", "query", "watch", "locate", "list", "verify", "restore",
+        "drop", "help",
     ];
     let lines: Vec<&str> = commands.lines().collect();
     assert_eq!(lines.len(), verbs.len(), "{commands}");

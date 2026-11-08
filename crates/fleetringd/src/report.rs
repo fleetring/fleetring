@@ -13,20 +13,21 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use fleetring_client::output::{
-    ArchiveReport, DatabaseLocation, DatabaseReport, FleetStatus, LeaseEventReport, MetadataReport,
-    NodeList, NodeReport, NodeStatusReport, OrphanReport, PlacementReport, QueryResult,
-    ReplicaReport, SchemaObjectReport, SchemaReport, ServedReport, SinkReport, SnapshotReport,
-    ValueReport, printable,
+    ArchiveReport, ChangeReport, ColumnsReport, DatabaseLocation, DatabaseReport, FleetStatus,
+    LeaseEventReport, MetadataReport, NodeList, NodeReport, NodeStatusReport, OrphanReport,
+    PlacementReport, QueryResult, ReplicaReport, RowChangeReport, SchemaObjectReport, SchemaReport,
+    ServedReport, SinkReport, SnapshotReport, ValueReport, printable,
 };
-use fleetring_control::{Liveness, ReplicaRole, Timestamp};
+use fleetring_control::{DatabaseName, Liveness, ReplicaRole, Timestamp};
 
 use crate::MembershipView;
 use crate::changes::MarkHome;
 use crate::data::{
-    ArchiveDescription, LeaseUpdate, Location, MetadataView, NodeStatus, Orphan, SchemaView,
+    ArchiveDescription, ChangedTransaction, LeaseUpdate, Location, MetadataView, NodeStatus,
+    Orphan, SchemaView,
 };
 use crate::dev::DevMode;
-use crate::engine::{ObjectKind, RowCount, Rows, SchemaObject, Value};
+use crate::engine::{Column, ObjectKind, RowCount, RowOperation, Rows, SchemaObject, Value};
 use crate::replication::LeaseChange;
 
 /// The report on `location`, with the time to expiry counted from `now`.
@@ -747,11 +748,195 @@ pub fn render_archived_metadata(
     )
 }
 
+/// The line `db watch -o jsonl` prints for `transaction` of `database` (ADR-0045, point 10).
+#[must_use]
+pub fn change_report(database: &DatabaseName, transaction: &ChangedTransaction) -> ChangeReport {
+    let columns = |columns: &[Column]| {
+        ColumnsReport(
+            columns
+                .iter()
+                .map(|column| (column.name.clone(), value_report(&column.value)))
+                .collect(),
+        )
+    };
+    ChangeReport {
+        database: database.to_string(),
+        start: transaction.start.as_ref().map(ToString::to_string),
+        position: transaction.position.to_string(),
+        lease_epoch: transaction.epoch.get(),
+        changes: transaction
+            .changes
+            .iter()
+            .map(|change| RowChangeReport {
+                table: change.table.clone(),
+                operation: match change.operation {
+                    RowOperation::Insert => "insert",
+                    RowOperation::Update => "update",
+                    RowOperation::Delete => "delete",
+                },
+                key: columns(&change.key),
+                before: change.before.as_deref().map(columns),
+                after: change.after.as_deref().map(columns),
+                updated: change.updated.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The line `db watch` prints for `transaction`, with its line feed: the position, then each
+/// row change, `<operation> <table> (<key>)`, the old values in braces when recorded, and `->`
+/// and the new values in braces when recorded, separated by `; `. Every name and text value is
+/// passed through [`printable`], so a row can't move the cursor or break the line.
+#[must_use]
+pub fn change_text(transaction: &ChangedTransaction) -> String {
+    let rows: Vec<String> = transaction
+        .changes
+        .iter()
+        .map(|change| {
+            let mut row = format!(
+                "{} {} ({})",
+                change.operation,
+                printable(&change.table),
+                sql_columns(&change.key)
+            );
+            if let Some(before) = &change.before {
+                row.push_str(&format!(" {{{}}}", sql_columns(before)));
+            }
+            if let Some(after) = &change.after {
+                row.push_str(&format!(" -> {{{}}}", sql_columns(after)));
+            }
+            row
+        })
+        .collect();
+    if rows.is_empty() {
+        return format!("{}\n", transaction.position);
+    }
+    format!("{} {}\n", transaction.position, rows.join("; "))
+}
+
+/// `name=value` pairs, values as SQL literals.
+fn sql_columns(columns: &[Column]) -> String {
+    columns
+        .iter()
+        .map(|column| format!("{}={}", printable(&column.name), sql_literal(&column.value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `value` as SQL writes it: `NULL`, a number, text in single quotes, a blob as `x'…'`.
+fn sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_owned(),
+        Value::Integer(integer) => integer.to_string(),
+        Value::Real(real) => real.to_string(),
+        Value::Text(text) => format!("'{}'", printable(&text.replace('\'', "''"))),
+        Value::Blob(bytes) => {
+            let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("x'{hex}'")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
+    use fleetring_control::LeaseEpoch;
+
     use super::*;
+    use crate::engine::{Position, RowChange};
+
+    fn transaction() -> ChangedTransaction {
+        let insert = RowChange::new(
+            "note",
+            RowOperation::Insert,
+            [Column::new("id", Value::Integer(1))],
+        )
+        .with_after([
+            Column::new("id", Value::Integer(1)),
+            Column::new("body", Value::Text("it's\n\u{1b}[2J".to_owned())),
+            Column::new("blob", Value::Blob(vec![0xde, 0xad])),
+        ]);
+        let update = RowChange::new(
+            "note",
+            RowOperation::Update,
+            [Column::new("id", Value::Integer(2))],
+        )
+        .with_before([Column::new("score", Value::Real(1.5))])
+        .with_after([Column::new("score", Value::Null)])
+        .with_updated(["score".to_owned()]);
+        let delete = RowChange::new(
+            "evil\u{202E}",
+            RowOperation::Delete,
+            [Column::new("rowid", Value::Integer(3))],
+        );
+        ChangedTransaction {
+            start: Some(Position::new([0, 1])),
+            position: Position::new([0, 2]),
+            epoch: LeaseEpoch::new(4),
+            changes: vec![insert, update, delete],
+        }
+    }
+
+    #[test]
+    fn a_transaction_is_one_line_of_text_with_its_untrusted_text_escaped() {
+        let text = change_text(&transaction());
+        assert_eq!(
+            text,
+            "0002 insert note (id=1) -> {id=1, body='it''s\\u{000A}\\u{001B}[2J', blob=x'dead'}; \
+             update note (id=2) {score=1.5} -> {score=NULL}; delete evil\\u{202E} (rowid=3)\n"
+        );
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn a_transaction_reports_its_fields_in_json_with_columns_in_order()
+    -> Result<(), serde_json::Error> {
+        let database: DatabaseName = "notes".parse().expect("a name");
+        let json = serde_json::to_value(change_report(&database, &transaction()))?;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "database": "notes",
+                "start": "0001",
+                "position": "0002",
+                "lease_epoch": 4,
+                "changes": [
+                    {
+                        "table": "note",
+                        "operation": "insert",
+                        "key": {"id": 1},
+                        "before": null,
+                        "after": {"id": 1, "body": "it's\n\u{1b}[2J", "blob": {"blob": "3q0="}},
+                        "updated": null
+                    },
+                    {
+                        "table": "note",
+                        "operation": "update",
+                        "key": {"id": 2},
+                        "before": {"score": 1.5},
+                        "after": {"score": null},
+                        "updated": ["score"]
+                    },
+                    {
+                        "table": "evil\u{202E}",
+                        "operation": "delete",
+                        "key": {"rowid": 3},
+                        "before": null,
+                        "after": null,
+                        "updated": null
+                    }
+                ]
+            })
+        );
+        let line = serde_json::to_string(&change_report(&database, &transaction()))?;
+        let id = line.find("\"id\":1,\"body\"").expect("the after columns");
+        assert!(
+            line[id..].find("\"blob\":{").is_some(),
+            "in column order: {line}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn an_archived_description_is_a_block_and_its_names_are_claims() {

@@ -17,7 +17,7 @@ Getting started:
   completions  Prints a completion script for bash, zsh, fish, or powershell
 
 Databases:
-  db           Creates, lists, writes, reads, locates, and drops databases
+  db           Creates, lists, writes, reads, watches, and drops databases
 
 Fleet:
   status       Shows the fleet's members and ring, or one data node's view
