@@ -24,7 +24,7 @@ It also reports whether the fleet allows the newest release, and exits 1 if a ne
 \fB\-\-no\-restart\fR
 Replaces the binary, but leaves the running node on the release it runs
 
-It also installs a release that refuses the node\*(Aqs configuration, and says so: edit the configuration until `fleetring serve \-\-config <file> \-\-check` passes, then restart the node.
+It also installs a release that refuses the node\*(Aqs configuration, and says so: edit the configuration until `fleetring serve \-\-config <file> \-\-check` passes, then restart the node. Until then, any restart, by a supervisor, a crash or a reboot, leaves it down.
 .TP
 \fB\-\-rollback\fR
 Swaps back the binary the last upgrade replaced, `<name>.previous`

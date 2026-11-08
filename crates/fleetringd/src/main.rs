@@ -174,10 +174,11 @@ struct DaemonArgs {
     /// on the node's command line before it swaps the binary.
     #[arg(long)]
     check: bool,
-    /// The check's output format: `table` or `json`
+    /// The check's output format: `table`, `json`, or `jsonl`
     ///
-    /// `json` is one object: `config`, `valid`, `node`, `role`, and `problems`, each `field`,
-    /// `line`, `column` and `message`. Needs `--check`.
+    /// `table` is for people; `json` is one object: `config`, `valid`, `node`, `role`, and
+    /// `problems`, each `field`, `line`, `column` and `message`; `jsonl` is the same object on one
+    /// line. Needs `--check`.
     #[arg(short = 'o', long, value_enum, requires = "check")]
     output: Option<OutputFormat>,
     /// Short for `-o json`; needs `--check`
@@ -365,7 +366,7 @@ struct UpgradeArgs {
     ///
     /// It also installs a release that refuses the node's configuration, and says so: edit the
     /// configuration until `fleetring serve --config <file> --check` passes, then restart the
-    /// node.
+    /// node. Until then, any restart, by a supervisor, a crash or a reboot, leaves it down.
     #[arg(long)]
     no_restart: bool,
     /// Swaps back the binary the last upgrade replaced, `<name>.previous`

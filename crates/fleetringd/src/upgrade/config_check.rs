@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use fleetring_client::output::printable;
 use fleetring_control::Release;
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::upgrade::install::Reported;
 use crate::upgrade::{LocalNode, Options, ProcessFile, Restart, Step, UpgradeError};
@@ -32,17 +33,23 @@ pub(crate) struct CheckCommand {
     pub(crate) cwd: Option<PathBuf>,
 }
 
-/// The command line that checks `node`'s configuration as its restart would read it. The running
-/// daemon's own arguments, with `--check` added, in the directory it started in, when its process
-/// file records both and the arguments run a node from a configuration. Otherwise `serve --config
-/// <file> --check` for the file `--config` named, since relative paths in arguments recorded
-/// without their directory can't be resolved, and a dev node's arguments name no file.
+/// The command line that checks `node`'s configuration as its restart would read it: the running
+/// daemon's own arguments, with `--check` added, in the directory it started in. They are used
+/// only if the process file records both, the directory still exists, the arguments run a node
+/// with `serve` and nothing else ([`ProcessFile::serve_args`]), and their `--config` is the file
+/// this command's `--config` named. The process file is the daemon user's, and `upgrade` may
+/// run as root, so a command line it can't vouch for is never run. Otherwise the command line is
+/// `serve --config <file> --check` for the file `--config` named: the arguments of a 0.7 node,
+/// recorded without their directory, hold paths that can't be resolved, and a dev node's name no
+/// file.
 pub(crate) fn check_command(
     node: &LocalNode,
     running: Option<&Option<ProcessFile>>,
 ) -> CheckCommand {
     if let Some(Some(daemon)) = running
         && let (Some(args), Some(cwd)) = (daemon.serve_args(), &daemon.cwd)
+        && cwd.is_dir()
+        && names_the_same_file(recorded_config(args), cwd, &node.config)
     {
         return CheckCommand {
             args: args
@@ -61,6 +68,34 @@ pub(crate) fn check_command(
             OsString::from(CHECK_FLAG),
         ],
         cwd: None,
+    }
+}
+
+/// The value of the last `--config` in `args`, as `--config <file>` or `--config=<file>`.
+fn recorded_config(args: &[String]) -> Option<&str> {
+    let mut found = None;
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            found = args.next();
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            found = Some(value);
+        }
+    }
+    found
+}
+
+/// Whether `recorded`, relative to `cwd`, is the same file as `config`.
+fn names_the_same_file(recorded: Option<&str>, cwd: &Path, config: &Path) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(cwd.join(recorded)),
+        std::fs::canonicalize(config),
+    ) {
+        (Ok(recorded), Ok(config)) => recorded == config,
+        _ => false,
     }
 }
 
@@ -88,27 +123,57 @@ pub(crate) async fn ask(binary: &Path, command: &CheckCommand, limit: Duration) 
     if let Some(cwd) = &command.cwd {
         process.current_dir(cwd);
     }
-    let child = match process.spawn() {
+    let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => return Answer::Unanswered(format!("it doesn't run: {error}")),
     };
-    // Dropping the unfinished wait drops the child, which kills it.
-    match tokio::time::timeout(limit, child.wait_with_output()).await {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let finished = tokio::time::timeout(limit, async {
+        let (stdout, stderr, status) = tokio::join!(kept(stdout), kept(stderr), child.wait());
+        status.map(|status| (stdout, stderr, status))
+    })
+    .await;
+    // On a timeout, the child is dropped on return, which kills it.
+    match finished {
         Err(_) => Answer::Unanswered(format!(
             "it didn't finish within {}s",
             limit.as_secs().max(1)
         )),
         Ok(Err(error)) => Answer::Unanswered(format!("it couldn't be waited for: {error}")),
-        Ok(Ok(output)) if output.status.success() => Answer::Accepted,
-        Ok(Ok(output)) => {
-            let mut said = String::from_utf8_lossy(&output.stdout).into_owned();
-            said.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(Ok((_, _, status))) if status.success() => Answer::Accepted,
+        Ok(Ok((stdout, stderr, status))) => {
+            let mut said = String::from_utf8_lossy(&stdout).into_owned();
+            said.push_str(&String::from_utf8_lossy(&stderr));
             if said.trim().is_empty() {
-                said = format!("nothing, and exited with {}", output.status);
+                said = format!("nothing, and exited with {status}");
             }
             Answer::Refused(said)
         }
     }
+}
+
+/// The most bytes of each of a release's stdout and stderr that a check keeps.
+const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+
+/// The first [`MAX_OUTPUT_BYTES`] of `stream`, with a line saying so if there was more, which is
+/// read to its end and dropped, so the release never blocks on a full pipe.
+async fn kept(stream: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
+    let Some(mut stream) = stream else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    // A stream that fails part way keeps what it gave.
+    let _read = (&mut stream)
+        .take(MAX_OUTPUT_BYTES)
+        .read_to_end(&mut kept)
+        .await;
+    if let Ok(dropped) = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await
+        && dropped > 0
+    {
+        kept.extend_from_slice(format!("\n… {dropped} more bytes dropped\n").as_bytes());
+    }
+    kept
 }
 
 /// What a check found.
@@ -183,8 +248,9 @@ pub(crate) fn decide(
         }),
         Restart::No => Ok(format!(
             "{summary}:\n{said}\nedit the configuration until `fleetring serve --config {config} \
-             --check` passes, then restart node {}\n",
-            node.id
+             --check` passes, then restart node {id}; until then, any restart, by its \
+             supervisor, a crash or a reboot, leaves node {id} down\n",
+            id = node.id
         )),
     }
 }
@@ -260,11 +326,28 @@ mod tests {
         words.iter().map(OsString::from).collect()
     }
 
-    #[test]
-    fn the_running_daemons_command_line_is_checked_where_it_started() -> TestResult {
+    /// A scratch directory holding the node's configuration, `node.toml`, in which the node
+    /// started, and the node.
+    fn started() -> TestResult<(tempfile::TempDir, LocalNode)> {
         let dir = tempfile::tempdir()?;
         let node = node(dir.path())?;
-        let started = dir.path().join("started-here");
+        std::fs::write(&node.config, "")?;
+        Ok((dir, node))
+    }
+
+    /// `serve --config <node's file> --check`, run in this command's directory.
+    fn file_only(node: &LocalNode) -> CheckCommand {
+        let mut args = os(&["serve", "--config"]);
+        args.push(node.config.clone().into_os_string());
+        args.push(OsString::from("--check"));
+        CheckCommand { args, cwd: None }
+    }
+
+    #[test]
+    fn the_running_daemons_command_line_is_checked_where_it_started() -> TestResult {
+        let (dir, node) = started()?;
+        let config = node.config.display().to_string();
+        let equals = format!("--config={config}");
         for args in [
             &[
                 "serve",
@@ -275,24 +358,22 @@ mod tests {
             ][..],
             // 0.6's form, which the release reads as `serve` too.
             &["--log-format", "json", "--config", "node.toml"],
+            &["--color", "never", "-q", "serve", "--node-id", "n", &equals],
         ] {
-            let running = Some(daemon(args, Some(started.clone())));
+            let running = Some(daemon(args, Some(dir.path().to_owned())));
             let command = check_command(&node, Some(&running));
             let mut expected = os(args);
             expected.push(OsString::from("--check"));
             assert_eq!(command.args, expected, "{args:?}");
-            assert_eq!(command.cwd.as_ref(), Some(&started), "{args:?}");
+            assert_eq!(command.cwd.as_deref(), Some(dir.path()), "{args:?}");
         }
         Ok(())
     }
 
     #[test]
     fn otherwise_the_file_config_names_is_checked() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let node = node(dir.path())?;
-        let mut file_only = os(&["serve", "--config"]);
-        file_only.push(node.config.clone().into_os_string());
-        file_only.push(OsString::from("--check"));
+        let (dir, node) = started()?;
+        let here = || Some(dir.path().to_owned());
         let cases = [
             // No node runs.
             None,
@@ -302,17 +383,62 @@ mod tests {
             // resolved.
             Some(Some(daemon(&["serve", "--config", "node.toml"], None))),
             // A file before 0.7, which records no arguments.
-            Some(Some(daemon(&[], Some(dir.path().to_owned())))),
+            Some(Some(daemon(&[], here()))),
             // A dev node, whose arguments name no file.
+            Some(Some(daemon(&["dev", "--data-dir", "d"], here()))),
+            // A directory that is gone: the release couldn't be run in it.
             Some(Some(daemon(
-                &["dev", "--data-dir", "d"],
-                Some(dir.path().to_owned()),
+                &["serve", "--config", "node.toml"],
+                Some(dir.path().join("gone")),
             ))),
         ];
         for running in cases {
             let command = check_command(&node, running.as_ref());
-            assert_eq!(command.args, file_only, "{running:?}");
-            assert_eq!(command.cwd, None, "{running:?}");
+            assert_eq!(command, file_only(&node), "{running:?}");
+        }
+        Ok(())
+    }
+
+    /// The process file is the daemon user's, and `upgrade` may run as root: a command line in it
+    /// that could do anything but check the node's configuration is never run.
+    #[test]
+    fn a_crafted_command_line_is_never_run() -> TestResult {
+        let (dir, node) = started()?;
+        let other = dir.path().join("other.toml");
+        std::fs::write(&other, "")?;
+        let other = other.display().to_string();
+        let crafted: [&[&str]; 13] = [
+            // Another command, which would exit 0, or reach the network as root.
+            &["upgrade", "--software"],
+            &[
+                "upgrade",
+                "--base-url",
+                "http://example.com/x",
+                "--version",
+                "9.9.9",
+            ],
+            &["db", "list"],
+            &["--log-format", "json", "status"],
+            // Help and the version exit 0 without checking anything.
+            &["serve", "--config", "node.toml", "--help"],
+            &["serve", "--config", "node.toml", "-h"],
+            &["serve", "--config", "node.toml", "--version"],
+            &["--config", "node.toml", "-V"],
+            &["serve", "--config", "node.toml", "-qh"],
+            &["serve", "--config", "node.toml", "--", "x"],
+            // 0.6's bare flags mean `serve` only after `--log-format`.
+            &["--color", "never", "--config", "node.toml"],
+            // Another file than the one --config named, which the check would read as root.
+            &["serve", "--config", &other],
+            &["serve", "--node-id", "n"],
+        ];
+        for args in crafted {
+            let running = Some(daemon(args, Some(dir.path().to_owned())));
+            assert_eq!(
+                check_command(&node, Some(&running)),
+                file_only(&node),
+                "{args:?}"
+            );
         }
         Ok(())
     }
@@ -389,7 +515,8 @@ mod tests {
                  on it:\n  fleetring 0.8.0 says:\n    fleetring: node.toml:3:1:"
             ) && installed.ends_with(&format!(
                 "edit the configuration until `fleetring serve --config {config} --check` \
-                 passes, then restart node node-1\n"
+                 passes, then restart node node-1; until then, any restart, by its supervisor, \
+                 a crash or a reboot, leaves node node-1 down\n"
             )),
             "{installed}"
         );
@@ -505,6 +632,38 @@ mod tests {
             panic!("a usage error is a refusal");
         };
         assert!(said.starts_with("nothing, and exited with"), "{said}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_the_first_64_kib_of_each_stream_is_kept() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let command = CheckCommand {
+            args: os(&["serve", "--check"]),
+            cwd: None,
+        };
+        // 1 MiB on each stream: more than a pipe holds, so a release blocked on a full pipe
+        // would never finish.
+        let chatty = script(
+            dir.path(),
+            "chatty",
+            "head -c 1048576 /dev/zero | tr '\\0' x\n\
+             head -c 1048576 /dev/zero | tr '\\0' z >&2\nexit 1",
+        )?;
+        let Answer::Refused(said) = ask_retrying(&chatty, &command, Duration::from_secs(30)).await
+        else {
+            panic!("not a refusal");
+        };
+        let kept = usize::try_from(MAX_OUTPUT_BYTES)?;
+        assert_eq!(said.matches('x').count(), kept);
+        assert_eq!(said.matches('z').count(), kept);
+        assert_eq!(
+            said.matches("… 983040 more bytes dropped").count(),
+            2,
+            "{}",
+            said.len()
+        );
         Ok(())
     }
 

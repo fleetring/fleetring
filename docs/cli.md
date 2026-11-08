@@ -41,7 +41,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | Getting started | `dev [-d] [--data-dir <dir>] [--port <n>]` | Runs a dev node on loopback (ADR-0039); `-d` runs it in the background |
 | | `dev stop \| status \| logs [-f]` | Stops, describes, or shows the log of the background dev node |
 | | `serve --config <file> [daemon flags]` | Runs a node |
-| | `serve --config <file> [daemon flags] --check [--json]` | Checks the file and the flags as a start would, and starts nothing (#95) |
+| | `serve --config <file> [daemon flags] --check [-o table\|json\|jsonl \| --json]` | Checks the file and the flags as a start would, and starts nothing (#95) |
 | | `stop (--data-dir <dir> \| --config <file>)` | Stops a node started in a terminal or script: drains, leaves, waits |
 | | `switch [<name> \| -]` | Makes a context current; with no name, a picker; `-` goes back |
 | | `context list \| show \| current \| add \| use \| remove` | Manages contexts (§4) |

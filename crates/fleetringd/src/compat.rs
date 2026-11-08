@@ -5,6 +5,10 @@ use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
+#[cfg(doc)]
+use fleetringd::upgrade::LEGACY_DAEMON_FLAGS;
+use fleetringd::upgrade::is_legacy_daemon_flag;
+
 /// The name the binary was run as, which it prints in `--version`, usage and errors (ADR-0043
 /// point 1.3). Nothing else depends on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,18 +92,6 @@ impl ProgramName {
     }
 }
 
-/// 0.6's top-level daemon flags, which mean `serve` until 1.0 (ADR-0043 point 1.4).
-pub(crate) const LEGACY_DAEMON_FLAGS: [&str; 8] = [
-    "--config",
-    "--node-id",
-    "--data-dir",
-    "--listen",
-    "--advertise",
-    "--control",
-    "--role",
-    "--insecure-plaintext",
-];
-
 /// The global flag that may come before a command, and before 0.6's daemon flags.
 const LOG_FORMAT_FLAG: &str = "--log-format";
 
@@ -108,13 +100,14 @@ const LOG_FORMAT_FLAG: &str = "--log-format";
 pub(crate) enum Invocation {
     /// As they were given.
     AsWritten,
-    /// With `serve` inserted, because they started with one of [`LEGACY_DAEMON_FLAGS`].
+    /// With `serve` inserted, because they started with one of 0.6's daemon flags
+    /// ([`LEGACY_DAEMON_FLAGS`]).
     ServeImplied,
 }
 
 /// Inserts `serve` before the first argument if, after any leading `--log-format <v>` or
-/// `--log-format=<v>`, that argument is one of [`LEGACY_DAEMON_FLAGS`] alone or as `--flag=value`.
-/// `args[0]` is the program and is never touched.
+/// `--log-format=<v>`, that argument is one of [`LEGACY_DAEMON_FLAGS`] alone or as
+/// `--flag=value`. `args[0]` is the program and is never touched.
 pub(crate) fn imply_serve(mut args: Vec<OsString>) -> (Vec<OsString>, Invocation) {
     let first = first_after_log_format(&args);
     let legacy = args
@@ -145,12 +138,6 @@ fn first_after_log_format(args: &[OsString]) -> usize {
         }
     }
     index
-}
-
-/// Whether `arg` is one of [`LEGACY_DAEMON_FLAGS`], alone or as `--flag=value`.
-fn is_legacy_daemon_flag(arg: &str) -> bool {
-    let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-    LEGACY_DAEMON_FLAGS.contains(&flag)
 }
 
 #[cfg(test)]
