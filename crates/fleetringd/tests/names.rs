@@ -412,7 +412,12 @@ fn fleet_completions_register_fleet() -> TestResult {
         assert!(output.status.success(), "{shell}: {}", stderr(&output));
         let script = stdout(&output);
         assert!(script.contains("FLEETRING_COMPLETE"), "{shell}: {script}");
-        assert!(script.contains(&fleet_path), "{shell}: {script}");
+        // bash's script doubles each backslash of a Windows path (`D:\\a\\fleet.exe`).
+        let escaped = fleet_path.replace('\\', "\\\\");
+        assert!(
+            script.contains(&fleet_path) || script.contains(&escaped),
+            "{shell}: {script}"
+        );
     }
     let bash = stdout(&run(&fleet, &["completions", "bash"])?);
     assert!(bash.contains("_clap_complete_fleet()"), "{bash}");
