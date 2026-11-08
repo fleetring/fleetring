@@ -55,7 +55,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | Security | `cert init \| node \| client` | Creates the authority and issues certificates |
 | | `token issue \| revoke` | Issues and revokes bearer tokens |
 | Agents | `mcp [--agent <id>] [--read-only]` | Serves the Model Context Protocol on stdio as one principal (ADR-0041) |
-| | `agent add \| list \| show \| renew \| remove` | Manages agent identities: a certificate and a scoped token per agent (ADR-0043, point 8) |
+| | `agent add \| list \| show \| renew \| remove` | Manages agent identities: a certificate and a token scoped `admin:agent-<id>-*` and `stream:agent-<id>-*` per agent (ADR-0043, point 8; FR-081) |
 | Recovery | `archive show \| verify \| restore` | Archives. `archive restore` is the offline restore into a directory, with no fleet |
 
 ### Nouns, verbs and top-level commands
@@ -374,7 +374,7 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | One flag, one kind of value | Yes: `--node` takes a node ID in `db list`, `status`, `lease watch`, `db exec` and `db query`; `--address` takes `host:port`; `cert node --addresses` takes the addresses a node is dialed at. | Done (FR-062) |
 | Precedence: flag, env, context, default | Flag, then environment variable, then `--as` (or `FLEETRING_AS`), then the `FLEETRING_TLS_DIR` defaults, for `--ca`, `--cert`, and `--key`; `--token` has `FLEETRING_TOKEN`; `--control`, then `--config`, then `FLEETRING_CONTROL`. No context step and no `--tls-dir` flag. | Phase B (FR-056). A flag now outranks the variables, so `--as` beats `FLEETRING_CERT` and `FLEETRING_KEY`, which 0.6 had the other way round. |
 | Contexts and `switch` | None. `fleetringd dev` writes `<dir>/env`, which sets the variables for its node (ADR-0039). | Phase B (FR-056) |
-| Agents | Six manual steps (the agent quickstart, step 2); MCP configurations carry a token. | Phase F (FR-079) |
+| Agents | Six manual steps (the agent quickstart, step 2); MCP configurations carry a token. | Phase F (FR-079). In 0.8.0 (FR-081, #126) agent identities get `stream:agent-<id>-*` beside `admin:` (or `read:` with `--read-only`), `agent renew` adds it to an identity that holds exactly 0.7's default, and `mcp` gains `changes`, a bounded read of `db watch`'s stream offered in both modes. |
 | `--json` / `-o` with stable fields | `db show` and `orphan list` only; every other command prints for people only. | Done (FR-056, phase G1): every read command, with `jsonl` for `lease watch`, from `fleetring_client::output`. |
 | Human tables by default | `db list` prints an aligned table with upper-case headers; `status` and `db locate` print key and value lines. | Done |
 | Terminals, pipes and CI | Commands print no progress or colour; logs are warnings only. No `--quiet`. | Done (phases D1 and G1): spinners, `-q`, and `--color`. |

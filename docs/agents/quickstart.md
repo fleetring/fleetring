@@ -24,7 +24,7 @@ fleetring agent add 42 --print-config json     # or cursor; `--print-config clau
 
 The configuration holds no secret, only the command: `mcp --agent` finds its own credentials. The path is absolute, because GUI MCP clients often lack your shell's `PATH`, and the context is pinned, so that a later `fleetring switch` doesn't move the agent to another fleet. `fleetring agent add 42 --install claude` runs the `claude mcp add` line for you.
 
-`agent add` mints the identity at once, and starts the dev node if none runs; with only the `claude mcp add` line, the first start does both. Add `--read-only` to `agent add` for an agent that only reads: its scope is then `read:agent-42-*`, and the server offers only `db_list`, `db_show`, and `query`.
+`agent add` mints the identity at once, and starts the dev node if none runs; with only the `claude mcp add` line, the first start does both. Add `--read-only` to `agent add` for an agent that only reads: its scopes are then `read:agent-42-*` and `stream:agent-42-*`, and the server offers only `db_list`, `db_show`, `query`, and `changes`.
 
 ## 2. What the first start does
 
@@ -33,13 +33,15 @@ When the MCP client starts `fleetring mcp --agent 42` and the `dev` context is s
 1. **It acquires a node.** If no dev node runs from `~/.fleetring`, it starts one in the background, as `fleetring dev -d` does, writes the `dev` context, and makes it current unless another context is. The node outlives the MCP server; `fleetring dev stop` stops it, and `fleetring dev logs` shows its log.
 2. **It acquires an identity.** If `~/.fleetring/agents/42/` holds none, it checks that `~/.fleetring` is a dev directory (its configuration says `dev = true` and keeps every address on loopback, and its authority is for the fleet `dev`), then mints one from the dev authority:
    - the principal `agent-42`, with a client certificate valid for a year;
-   - a token scoped `admin:agent-42-*`, valid for 30 days, which lets the agent create, use, describe, label, list, and drop databases whose names start with `agent-42-`, and nothing else;
+   - a token scoped `admin:agent-42-*` and `stream:agent-42-*`, valid for 30 days, which lets the agent create, use, describe, label, list, follow the changes of, and drop databases whose names start with `agent-42-`, and nothing else;
    - in `~/.fleetring/agents/42/`, a directory only you can read (`0700`): `ca.crt`, `client.agent-42.crt` and `client.agent-42.key`, `token`, and `identity.toml`, which holds no secret. Every file is `0600`.
 3. **It serves** MCP on stdin and stdout as `agent-42`, and says on stderr whom it serves as, on which context, and when the certificate and token expire.
 
 Later starts reuse the node and the identity and regenerate nothing. In dev mode only, a start renews the token once fewer than 7 days remain, and the certificate once fewer than 30 do, and revokes the old token. A session that outlives its token gets a tool error that says to restart the MCP server.
 
-Keep the trailing `-` in the scope: `admin:agent-42*` would also cover `agent-420-memory`, another agent's database, which is why agent IDs are lowercase letters, digits, and `_`, never `-` or `.`. `fleetring agent show 42` prints the identity, its files, and when the token must be renewed by; `fleetring agent list` lists every agent of the context.
+Keep the trailing `-` in the scope: `admin:agent-42*` would also cover `agent-420-memory`, another agent's database, which is why agent IDs are lowercase letters, digits, and `_`, never `-` or `.`. `fleetring agent show 42` prints the identity, its scopes and files, and when the token must be renewed by; `fleetring agent list` lists every agent of the context.
+
+An identity minted before 0.8 holds `admin:agent-42-*` alone, without `stream`, and a start doesn't change it: it says so on stderr, and `changes` is refused. `fleetring agent renew 42` reissues its credentials with both scopes. It widens only an identity that holds exactly the old default; scopes you chose with `--scope` stay as they are.
 
 ## 3. Try it from the shell, as the agent
 
@@ -57,6 +59,7 @@ fleetring db query agent-42-memory --agent 42 "SELECT predicate, object FROM fac
 fleetring db list --agent 42 --prefix agent-42- --label purpose=memory
 fleetring db show agent-42-memory --agent 42      # placement, description, labels, creator, expiry, schema
 fleetring db edit agent-42-scratch --agent 42 --expires-in 4h
+fleetring db watch agent-42-memory --agent 42 -o jsonl   # each write's rows as it commits, until Ctrl-C
 fleetring db create agent-43-memory --agent 42    # refused: outside the agent's scope
 fleetring db drop agent-42-scratch --agent 42 --yes
 ```
@@ -75,7 +78,16 @@ Ask the agent to do the same through the tools. The calls look like this:
 {"tool": "db_drop", "arguments": {"name": "agent-42-task-7f3a", "confirm": "agent-42-task-7f3a"}}
 ```
 
-Then give the agent the [skill](SKILL.md): load it as a skill if the client supports skills, or put it in the agent's instructions. It covers when to create a database rather than a table, naming, labels, descriptions, expiry, and SQL patterns for memory, task state, and full-text search. `--max-result-bytes <n>` after `mcp` caps each result's JSON (256 KiB by default, from 64 KiB to 4 MiB); the [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the tools, their results and errors, and how the server marks untrusted text.
+To follow what is written to a database, the agent calls `changes` once without `after`, which returns `next_after`, a position, then again and again with `after` set to the last `next_after` it got. Each call returns the transactions after that position, at most `limit` (20 by default, at most 100), as soon as it has them, and waits at most 2 seconds when there are none:
+
+```json
+{"tool": "changes", "arguments": {"database": "agent-42-memory"}}
+{"tool": "changes", "arguments": {"database": "agent-42-memory", "after": "00000000a3f19c0e5b7d21440000000000003068"}}
+```
+
+Nothing holds the agent's place between calls, so a dev node releases changes within about 64 writes once its change sink has them; an agent that falls further behind gets `out_of_range` with the oldest position held, and reads the current state with `query` before it continues.
+
+Then give the agent the [skill](SKILL.md): load it as a skill if the client supports skills, or put it in the agent's instructions. It covers when to create a database rather than a table, naming, labels, descriptions, expiry, following changes, and SQL patterns for memory, task state, and full-text search. `--max-result-bytes <n>` after `mcp` caps each result's JSON (256 KiB by default, from 64 KiB to 4 MiB); the [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the tools, their results and errors, and how the server marks untrusted text.
 
 ## Another fleet
 

@@ -289,7 +289,7 @@ enum Command {
 /// `fleetring mcp`'s flags (ADR-0041, point 9).
 #[derive(Debug, Args)]
 struct McpArgs {
-    /// Offers only the tools that read: `db_list`, `db_show`, and `query`
+    /// Offers only the tools that read: `db_list`, `db_show`, `query`, and `changes`
     ///
     /// The principal's scopes still bound what they read.
     #[arg(long)]

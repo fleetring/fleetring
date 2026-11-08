@@ -647,6 +647,18 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/docs/agents/quickstart.md"
     },
     {
+      "id": "agent-changes",
+      "component": "fleetringd",
+      "area": "access",
+      "title": "Agents follow their databases’ changes",
+      "description": "Agent identities may stream their own databases, and the MCP changes tool returns the transactions recorded after a position, with the position to continue from, in calls that wait at most two seconds.",
+      "status": "built",
+      "since": "0.8.0",
+      "ticket": "FR-081",
+      "issue": 126,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#mcp-server"
+    },
+    {
       "id": "vectors",
       "component": "fleetringd",
       "area": "access",
