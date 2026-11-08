@@ -12,6 +12,26 @@ use serde::{Deserialize, Serialize};
 use crate::data_dir::LOCK_FILE;
 use crate::upgrade::UpgradeError;
 
+/// 0.6's top-level daemon flags, which mean `serve` until 1.0 when they come first, after any
+/// `--log-format` (ADR-0043, point 1.4).
+pub const LEGACY_DAEMON_FLAGS: [&str; 8] = [
+    "--config",
+    "--node-id",
+    "--data-dir",
+    "--listen",
+    "--advertise",
+    "--control",
+    "--role",
+    "--insecure-plaintext",
+];
+
+/// Whether `arg` is one of [`LEGACY_DAEMON_FLAGS`], alone or as `--flag=value`.
+#[must_use]
+pub fn is_legacy_daemon_flag(arg: &str) -> bool {
+    let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+    LEGACY_DAEMON_FLAGS.contains(&flag)
+}
+
 /// The file a daemon writes in its data directory while it runs.
 ///
 /// Its name is kept until 1.0, as are [`RESTARTS_VAR`] and the data directory's lock file: a 0.6
@@ -236,21 +256,40 @@ impl ProcessFile {
         }
     }
 
-    /// The daemon's arguments if they run a node from a configuration file, with `serve` or with
-    /// 0.6's bare daemon flags: `None` for a dev node, and for a file a release before 0.7 wrote,
-    /// which records no arguments.
+    /// The daemon's arguments if they run a node with `serve`, after any global flags, or with
+    /// 0.6's bare daemon flags, after any `--log-format`, as the binary reads them. `None` for a
+    /// dev node, for any other command, for a file a release before 0.7 wrote, which records no
+    /// arguments, and for arguments that ask for help or the version, or hold a short flag but
+    /// `-q`, which a daemon's command line never does. An upgrade runs another binary with these,
+    /// perhaps as another user than the one that wrote the file, so it trusts only a command line
+    /// that can do nothing but check a node's configuration.
     #[must_use]
     pub fn serve_args(&self) -> Option<&[String]> {
+        let suspect = |arg: &String| {
+            matches!(arg.as_str(), "--help" | "--version" | "--")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg != "-q")
+        };
+        if self.args.iter().any(suspect) {
+            return None;
+        }
         let mut args = self.args.iter().map(String::as_str);
+        // 0.6's bare daemon flags mean `serve` only after `--log-format` alone.
+        let mut log_format_only = true;
         loop {
             match args.next()? {
-                "--log-format" | "--color" => {
+                "--log-format" => {
                     args.next();
                 }
-                "-q" | "--quiet" => {}
-                arg if arg.starts_with("--log-format=") || arg.starts_with("--color=") => {}
-                "dev" => return None,
-                _ => return Some(&self.args),
+                "--color" => {
+                    args.next();
+                    log_format_only = false;
+                }
+                "-q" | "--quiet" => log_format_only = false,
+                arg if arg.starts_with("--log-format=") => {}
+                arg if arg.starts_with("--color=") => log_format_only = false,
+                "serve" => return Some(&self.args),
+                arg if log_format_only && is_legacy_daemon_flag(arg) => return Some(&self.args),
+                _ => return None,
             }
         }
     }
@@ -472,6 +511,18 @@ mod tests {
             &["--log-format=json", "dev", "--data-dir", "d"],
             &[],
             &["--log-format", "json"],
+            // Anything that isn't a node's start: another command, help, the version, a short
+            // flag but -q, and 0.6's flags after another global flag.
+            &["upgrade", "--software"],
+            &["db", "list"],
+            &["serve", "--config", "x", "--help"],
+            &["serve", "--config", "x", "-h"],
+            &["serve", "--config", "x", "-qh"],
+            &["--config", "x", "--version"],
+            &["--config", "x", "-V"],
+            &["serve", "--", "--config", "x"],
+            &["--color", "never", "--config", "x"],
+            &["-q", "--config", "x"],
         ] {
             assert_eq!(file(args).serve_args(), None, "{args:?}");
         }

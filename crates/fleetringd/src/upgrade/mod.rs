@@ -33,7 +33,8 @@ use fleetring_control::{Liveness, Release};
 use tonic::Status;
 
 pub use process::{
-    PROCESS_FILE, ParentProcess, ProcessFile, RESTARTS_VAR, Running, StartedBy, Supervisor, running,
+    LEGACY_DAEMON_FLAGS, PROCESS_FILE, ParentProcess, ProcessFile, RESTARTS_VAR, Running,
+    StartedBy, Supervisor, is_legacy_daemon_flag, running,
 };
 
 use crate::MembershipView;
