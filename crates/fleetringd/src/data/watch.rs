@@ -20,9 +20,13 @@ use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::DatabaseName;
+use std::sync::Arc;
+
 use fleetring_proto::v1 as proto;
+use fleetring_proto::v1::change_update::Update;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
@@ -33,7 +37,7 @@ use crate::changes::Watcher;
 use crate::data::convert::{changed_transaction_to_proto, changes_opened_to_proto};
 use crate::data::node::DataNode;
 use crate::data::service::database_status;
-use crate::engine::{CaptureMode, EngineError, Position, ReadLimit};
+use crate::engine::{CaptureMode, ChangesAfter, EngineError, Position, ReadLimit};
 use crate::replication::PrimaryFeed;
 
 /// How many transactions wait for a subscriber that hasn't read them yet (ADR-0045, point 8). A
@@ -90,8 +94,13 @@ pub(crate) async fn open(
         .await
         .map_err(|error| database_status(&error))?;
     let start = match after {
-        None => end.clone(),
+        None => live_start(feed.acknowledged(), end.clone()),
         Some(after) => {
+            // A position that isn't the engine's is refused as such, before it is compared.
+            handle
+                .recorded_transactions(Some(after.clone()), after.clone(), ReadLimit::one())
+                .await
+                .map_err(|error| read_failed(name, &error))?;
             if Some(&after) > end.as_ref() {
                 return Err(Status::out_of_range(format!(
                     "position {after} is past the end of {name}'s log ({}); a failover may have \
@@ -118,12 +127,19 @@ pub(crate) async fn open(
         node: id,
         registry: node.registry().clone(),
         feed,
-        watcher,
+        watcher: Arc::new(watcher),
         start,
         capture,
         buffer: WATCH_BUFFER,
         limit: READ_LIMIT,
     }))
+}
+
+/// Where a live tail starts: the write quorum's position, so that every position the stream
+/// names, its first included, survives a failover (ADR-0018). The log's end stands in only
+/// while the primary knows no quorum position yet, as just after it starts serving.
+fn live_start(acknowledged: Option<Position>, end: Option<Position>) -> Option<Position> {
+    acknowledged.or(end)
 }
 
 /// What a feed task needs.
@@ -132,7 +148,8 @@ pub(crate) struct Feed {
     pub(crate) node: NodeId,
     pub(crate) registry: Registry,
     pub(crate) feed: PrimaryFeed,
-    pub(crate) watcher: Watcher,
+    /// The watcher; only the task keeps it, so it goes when the stream ends.
+    pub(crate) watcher: Arc<Watcher>,
     /// The position the stream starts after.
     pub(crate) start: Option<Position>,
     pub(crate) capture: CaptureMode,
@@ -142,10 +159,24 @@ pub(crate) struct Feed {
 }
 
 /// Starts the task that feeds a stream from `feed`, and returns the stream.
+///
+/// The watcher's hold on the release of row changes advances only as a transaction leaves the
+/// buffer for the connection, so it stays at what the subscriber has been handed, never at what
+/// is merely buffered. The task owns the watcher, and drops it when the stream ends.
 pub(crate) fn change_stream(feed: Feed) -> ChangeStream {
     let (updates, stream) = mpsc::channel(feed.buffer.max(1));
+    let held = Arc::downgrade(&feed.watcher);
     tokio::spawn(run(feed, updates));
-    Box::pin(ReceiverStream::new(stream))
+    Box::pin(ReceiverStream::new(stream).map(move |item| {
+        if let Ok(proto::ChangeUpdate {
+            update: Some(Update::Transaction(transaction)),
+        }) = &item
+            && let Some(watcher) = held.upgrade()
+        {
+            watcher.advance(Some(Position::from(transaction.position.clone())));
+        }
+        item
+    }))
 }
 
 /// Why a feed ended, with the status the subscriber gets, if any.
@@ -192,6 +223,8 @@ async fn run(feed: Feed, updates: mpsc::Sender<Result<proto::ChangeUpdate, Statu
                 Ok(transactions) => transactions,
                 Err(error) => break 'feed Ended::Failed(read_failed(&database, &error)),
             };
+            // Nothing recorded up to `until`: the next read starts there. The hold stays at what
+            // the subscriber was handed, so a resume after it is never refused for want of it.
             if transactions.is_empty() {
                 position = Some(until);
             }
@@ -208,7 +241,6 @@ async fn run(feed: Feed, updates: mpsc::Sender<Result<proto::ChangeUpdate, Statu
                     }
                 }
             }
-            watcher.advance(position.clone());
         }
         let moved = tokio::select! {
             () = updates.closed() => break 'feed Ended::Gone,
@@ -257,7 +289,8 @@ pub(crate) fn read_failed(database: &DatabaseName, error: &DatabaseError) -> Sta
                 None => "its primary holds none from before its log's current end".to_owned(),
             };
             Status::out_of_range(format!(
-                "the changes of {database} after {position} are no longer held: {held}"
+                "the changes of {database} {} are no longer held: {held}",
+                ChangesAfter(position)
             ))
         }
         Some(EngineError::InvalidPosition { position }) => Status::invalid_argument(format!(
@@ -274,8 +307,6 @@ mod tests {
 
     use fleetring::ReplicationFactor;
     use fleetring_control::LeaseEpoch;
-    use fleetring_proto::v1::change_update::Update;
-    use tokio_stream::StreamExt as _;
     use tonic::Code;
 
     use super::*;
@@ -363,7 +394,7 @@ mod tests {
             node: "a".parse()?,
             registry: replication.registry().clone(),
             feed,
-            watcher: streams.watch(&ledger, start.clone())?,
+            watcher: Arc::new(streams.watch(&ledger, start.clone())?),
             start,
             capture: CaptureMode::After,
             buffer,
@@ -394,15 +425,15 @@ mod tests {
         for value in 1..=3 {
             write(&replication, &format!("INSERT INTO t VALUES ({value})")).await?;
         }
-        let mut last = opened.position;
+        let mut delivered = Vec::new();
         for _ in 1..=3 {
             let Update::Transaction(transaction) = next(&mut stream).await? else {
                 panic!("then transactions");
             };
             assert_eq!(transaction.changes.len(), 1);
-            assert!(transaction.start >= last, "in order, with no overlap");
-            last = transaction.position;
+            delivered.push(transaction);
         }
+        in_order_once(&opened.position, &delivered);
         assert_eq!(streams.watchers(), 1);
         drop(stream);
         replication.stop();
@@ -416,7 +447,7 @@ mod tests {
         let replication = primary(dir.path()).await?;
         let streams = streams(&replication, dir.path());
         let mut stream = feed_from(&replication, &streams, 2).await?;
-        let Update::Opened(_) = next(&mut stream).await? else {
+        let Update::Opened(opened) = next(&mut stream).await? else {
             panic!("opened first");
         };
         // Nothing reads the stream while ten transactions commit: the buffer of two fills.
@@ -426,7 +457,7 @@ mod tests {
         let mut delivered = Vec::new();
         let ended = loop {
             match next(&mut stream).await {
-                Ok(Update::Transaction(transaction)) => delivered.push(transaction.position),
+                Ok(Update::Transaction(transaction)) => delivered.push(transaction),
                 Ok(Update::Opened(_)) => panic!("one opened message per stream"),
                 Err(status) => break status,
             }
@@ -434,10 +465,12 @@ mod tests {
         assert_eq!(ended.code(), Code::ResourceExhausted, "{ended}");
         assert!(
             delivered.len() < 10,
-            "the watcher didn't get everything: {delivered:?}"
+            "the watcher didn't get everything: {}",
+            delivered.len()
         );
+        in_order_once(&opened.position, &delivered);
         let last = delivered.last().ok_or("something was buffered")?;
-        let resumable = Position::from(last.clone());
+        let resumable = Position::from(last.position.clone());
         assert!(
             ended
                 .message()
@@ -470,6 +503,86 @@ mod tests {
         );
         replication.stop();
         Ok(())
+    }
+
+    /// Asserts that `delivered`, after a stream opened at `opened`, holds each transaction once,
+    /// in order: distinct, increasing starts, each at or past the position before it.
+    fn in_order_once(opened: &[u8], delivered: &[proto::ChangedTransaction]) {
+        let mut after = opened.to_vec();
+        let mut starts: Vec<&[u8]> = Vec::new();
+        for transaction in delivered {
+            assert!(
+                transaction.start >= after,
+                "a transaction starts at or past the position before it"
+            );
+            assert!(
+                transaction.position > transaction.start,
+                "a transaction's position is past its start"
+            );
+            if let Some(previous) = starts.last() {
+                assert!(
+                    transaction.start.as_slice() > *previous,
+                    "starts are distinct and increasing"
+                );
+            }
+            starts.push(&transaction.start);
+            after.clone_from(&transaction.position);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hold_stays_at_what_the_watcher_was_handed_not_what_is_buffered() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let replication = primary(dir.path()).await?;
+        let streams = streams(&replication, dir.path());
+        let ledger = name("ledger");
+        let mut stream = feed_from(&replication, &streams, 8).await?;
+        let Update::Opened(opened) = next(&mut stream).await? else {
+            panic!("opened first");
+        };
+        let opened = Some(Position::from(opened.position));
+        for value in 1..=3 {
+            write(&replication, &format!("INSERT INTO t VALUES ({value})")).await?;
+        }
+        // The feed buffers the three; none has been handed to the connection.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(streams.watcher_positions(&ledger), [opened]);
+        let Update::Transaction(first) = next(&mut stream).await? else {
+            panic!("a transaction");
+        };
+        assert_eq!(
+            streams.watcher_positions(&ledger),
+            [Some(Position::from(first.position))],
+            "the hold moves as a transaction leaves the buffer"
+        );
+        drop(stream);
+        replication.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn a_live_tail_starts_at_the_write_quorums_position() {
+        let acknowledged = Some(Position::new([1]));
+        let end = Some(Position::new([2]));
+        assert_eq!(
+            live_start(acknowledged.clone(), end.clone()),
+            acknowledged,
+            "never past what a failover keeps"
+        );
+        assert_eq!(live_start(None, end.clone()), end);
+    }
+
+    #[test]
+    fn a_range_from_the_logs_beginning_reads_as_such() {
+        let error = DatabaseError::Engine(EngineError::ChangesReleased {
+            position: Position::default(),
+            oldest: None,
+        });
+        assert_eq!(
+            read_failed(&name("notes"), &error).message(),
+            "the changes of notes from the log's beginning are no longer held: its primary \
+             holds none from before its log's current end"
+        );
     }
 
     #[test]

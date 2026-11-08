@@ -581,6 +581,23 @@ impl ChangeStreams {
         })
     }
 
+    /// The positions the watchers of `database` hold back the release of its row changes at, in
+    /// the order they connected.
+    ///
+    /// # Panics
+    ///
+    /// If the watchers' lock was poisoned by a panic in another thread.
+    #[must_use]
+    pub fn watcher_positions(&self, database: &DatabaseName) -> Vec<Option<Position>> {
+        self.inner
+            .lock_watchers()
+            .positions
+            .values()
+            .filter(|(watched, _)| watched == database)
+            .map(|(_, position)| position.clone())
+            .collect()
+    }
+
     /// How many watchers are connected to this node.
     ///
     /// # Panics
