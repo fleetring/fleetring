@@ -6,7 +6,7 @@ Each entry gives a definition, where the word applies, its canonical spelling in
 
 - **crate**: the `fleetring` placement crate, which says "key", never "database" (ADR-0011).
 - **daemon**: the node process (`fleetring serve`; the `fleetringd` crate) and the `fleetring-control`, `fleetring-wal` and `fleetring-proto` crates.
-- **CLI**: the `fleetring` commands (see the [CLI style guide](cli.md)).
+- **CLI**: the `fleetring` commands (see the [CLI style guide](cli.md)). The binary is also run as `fleet`, its permanent short name (ADR-0043); that `fleet` is the program, not the [fleet](#fleet) noun.
 - **UI**: the TUI and the desktop app (ADR-0033).
 
 A word marked *planned* names something decided but not yet built. Accepted ADRs and finished tickets keep the words they were written with; [renamed in 0.3.0](#renamed-in-030) and [renamed in 0.7.0](#renamed-in-070) map the old words to these.
@@ -1042,7 +1042,7 @@ A placement label for a failure domain (a room, a rack, a cloud availability zon
 
 ## Renamed in 0.7.0
 
-0.7.0 named the binary `fleetring` (ADR-0043). These are clean breaks, apart from two compatibility names kept until 1.0: `fleetringd` as a second name for the binary, and a node started with `--config <file>` and no `serve`. Each old spelling fails with a `hint:` naming the new one.
+0.7.0 named the binary `fleetring` (ADR-0043). These are clean breaks, apart from two compatibility names kept until 1.0 (`fleet`, a third name for the binary, is permanent and not one of them): `fleetringd` as a second name for the binary, and a node started with `--config <file>` and no `serve`. Each old spelling fails with a `hint:` naming the new one.
 
 | Old word | Word now |
 |---|---|

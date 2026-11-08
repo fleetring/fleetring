@@ -48,10 +48,10 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 
 The placement crate is on crates.io: `cargo add fleetring`.
 
-The `fleetring` binary runs a node (`fleetring serve`) and every command that talks to a fleet. Each release has three ways to install it. Until 1.0 it is also installed as `fleetringd`, its name before 0.7, so service units and scripts that call `fleetringd` keep working ([ADR-0043](docs/adr/0043-the-fleetring-cli.md)):
+The `fleetring` binary runs a node (`fleetring serve`) and every command that talks to a fleet. Each release has three ways to install it. Until 1.0 it is also installed as `fleetringd`, its name before 0.7, so service units and scripts that call `fleetringd` keep working, and as `fleet`, a short name that stays ([ADR-0043](docs/adr/0043-the-fleetring-cli.md)):
 
 - **Binaries** for Linux (glibc 2.36 or newer) and macOS on x86_64 and ARM64, and for Windows on x86_64. They're on the [releases page](https://github.com/fleetring/fleetring/releases) as `fleetringd-<version>-<target>.tar.gz` (`.zip` on Windows), with a `SHA256SUMS` file. The archives keep their pre-0.7 names so that 0.6's `upgrade` finds them, and hold both `fleetring` and `fleetringd`.
-- **The install script** picks the archive for your OS and CPU, verifies its checksum, and installs `fleetring` to `/usr/local/bin` as root, or to `~/.local/bin` otherwise, with `fleetringd` as a link to it:
+- **The install script** picks the archive for your OS and CPU, verifies its checksum, and installs `fleetring` to `/usr/local/bin` as root, or to `~/.local/bin` otherwise, with `fleetringd` and `fleet` as links to it. It adds `fleet` only if no other `fleet` (Rancher Fleet's, JetBrains Fleet's) is in the way, and `--no-alias` skips it:
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/install.sh | sh

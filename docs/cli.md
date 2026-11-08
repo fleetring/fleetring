@@ -21,12 +21,14 @@ fleetring token revoke --token-id 3q2-…
 fleetring switch home
 ```
 
-### The binary and its compatibility name
+### The binary and its names
 
 There is one binary, `fleetring`. `fleetringd` is the same file under a second name: a symbolic link, or a copy on Windows. It is kept until 1.0 so that service units and scripts keep working (ADR-0043, point 1). Two things depend on the name it runs as:
 
-- **The name it prints.** It prints that name in `--version`, usage lines and errors.
+- **The name it prints.** It prints that name in `--version`, usage lines and errors, and in the commands its hints name.
 - **0.6's form of running a node.** Under either name, `fleetringd --config <file> [daemon flags]`, with no verb, is read as `serve`. The daemon then logs a warning that the form goes in 1.0.
+
+`fleet` is a third name for the same file: a symbolic link that `install.sh` and the container image make, and that the Windows `.zip` doesn't hold. It is permanent, not a compatibility name, and has no behaviour of its own: `fleet --version` prints `fleet X.Y.Z`, usage, errors, hints and the completion script say `fleet`, and `fleet --config <file>` is an unknown argument, not `serve`. `install.sh` adds it only where it can't shadow or be shadowed by another `fleet` (Rancher Fleet's CLI, JetBrains Fleet's launcher); `--no-alias` skips it (ADR-0043, amendment of 2026-11-07). The noun "fleet" (a set of nodes) is a different word.
 
 Docs, examples, the site and help text use `fleetring` only. The crate and package stay `fleetringd`, so `cargo install --git … fleetringd` installs `fleetring`.
 
@@ -276,7 +278,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
   ```
 
 - **Budget:** `fleetring -h` at 100 columns is at most 50 lines, none wider than 100 columns. A snapshot test pins it.
-- **The compatibility line** closes the top-level `--help`: `fleetringd is the same program, kept until 1.0; fleetringd --config <file> runs serve.`
+- **The compatibility lines** close the top-level `--help`: `fleet is a permanent short name for fleetring.` and `fleetringd is the same program, kept until 1.0; fleetringd --config <file> runs serve.`
 - **Completions** come from `fleetring completions bash|zsh|fish|powershell`, generated with `clap_complete`'s dynamic engine. The script is a small shim: on each Tab it runs the binary with `FLEETRING_COMPLETE` set, and the binary answers from its own command tree before it parses anything, so completions follow upgrades. They include dynamic values where cheap: context names, and the selected context's agent IDs, from this machine's files; not database names, which need a network call. To install them, add the line for the shell to its startup file:
 
   ```sh

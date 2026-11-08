@@ -147,20 +147,22 @@ curl -fsSL https://raw.githubusercontent.com/fleetring/fleetring/main/scripts/in
   | sh -s -- --version $V --prefix "$PWD/prefix"
 "$PWD/prefix/bin/fleetring" --version
 "$PWD/prefix/bin/fleetringd" --version   # the link, until 1.0
+"$PWD/prefix/bin/fleet" --version        # the short name, if no other fleet is on your PATH
 MANPATH="$PWD/prefix/share/man" man -w fleetring   # the man pages, from 0.7.0
 
 # 6. The image runs on both architectures.
 docker run --rm --platform linux/amd64 ghcr.io/fleetring/fleetring:$V --version
 docker run --rm --platform linux/arm64 ghcr.io/fleetring/fleetring:$V --version
 docker run --rm --platform linux/amd64 --entrypoint /usr/local/bin/fleetringd ghcr.io/fleetring/fleetringd:$V --version
+docker run --rm --platform linux/amd64 --entrypoint /usr/local/bin/fleet ghcr.io/fleetring/fleetring:$V --version
 ```
 
 - [ ] The release lists five archives, each holding `fleetring` and `fleetringd` (`.exe` on Windows), `SHA256SUMS` with its `.sigstore.json` bundle, a `.sha256` for each file, and `install.sh`.
 - [ ] Every checksum passes.
 - [ ] `cosign verify-blob` prints `Verified OK`.
 - [ ] `gh attestation verify` succeeds for every archive, `install.sh`, and the image.
-- [ ] The installed `fleetring` prints `fleetring X.Y.Z`, and `fleetringd` prints `fleetringd X.Y.Z`; `man -w fleetring` finds the installed page.
-- [ ] The first two `docker run` commands print `fleetring X.Y.Z`, and the third `fleetringd X.Y.Z`. On a machine of one architecture, the other runs under emulation (Docker Desktop has it; on Linux, `docker run --privileged --rm tonistiigi/binfmt --install all` adds it).
+- [ ] The installed `fleetring` prints `fleetring X.Y.Z`, `fleetringd` prints `fleetringd X.Y.Z`, and `fleet` prints `fleet X.Y.Z` (from the release that adds it; skipped if another `fleet` is on your `PATH`, which `install.sh` says); `man -w fleetring` finds the installed page.
+- [ ] The first two `docker run` commands print `fleetring X.Y.Z`, the third `fleetringd X.Y.Z`, and the fourth `fleet X.Y.Z`. On a machine of one architecture, the other runs under emulation (Docker Desktop has it; on Linux, `docker run --privileged --rm tonistiigi/binfmt --install all` adds it).
 - [ ] The first time only: make the `fleetring` and `fleetringd` container packages public in the organization's GitHub package settings, and link them to this repository. 0.7.0 is the first release of `ghcr.io/fleetring/fleetring`.
 - [ ] Replace the release's notes with the [template](#5-release-notes).
 - [ ] If the release fixes a vulnerability, publish its advisory now ([`SECURITY.md`](SECURITY.md#publishing-an-advisory)).
@@ -242,3 +244,9 @@ A draft for 0.7.0's notes, under "Breaking changes" (ADR-0043, points 1 and 3). 
 - **`-q` drops every note and warning,** not only the override warnings: a command run with it prints its result and its errors alone.
 - **New database names may not start with `_fleetring`,** which is FleetRing's own namespace. A database that already has such a name stays.
 - **Keep service units on `fleetringd --config <file>`** until no node needs to roll back to 0.6. 0.6 doesn't know `serve`. A 0.7 `upgrade --rollback`, or `upgrade --version` with a release before 0.7, refuses to install it over a node started with `serve`, and without a running node to check, it asks, or needs `--yes`. But the 0.6 binary kept as `fleetringd.previous` can't check: `fleetringd.previous upgrade --rollback` installs 0.6 anyway, and a unit that runs `fleetring serve` then fails to start, and its supervisor restarts it in a loop. After switching a unit to `fleetring serve`, rolling back to 0.6 requires reverting the unit to `fleetringd --config` first.
+
+### The release that adds `fleet`
+
+A draft line for the notes of the first release with the alias (ADR-0043, amendment of 2026-11-07), under "Features":
+
+- `fleet` is a permanent short name for `fleetring`: `fleet db list`, `fleet --version`. `install.sh` and the container image link it to `fleetring`; `install.sh` skips it, and says why, if `PREFIX/bin/fleet` is something else or another `fleet` (Rancher Fleet's CLI, JetBrains Fleet's launcher) is on your `PATH`, and `--no-alias` skips it always. The archives are unchanged, and `fleetring upgrade` keeps a `fleet` link working but doesn't add one: rerun `install.sh` for that (#103).
