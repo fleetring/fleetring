@@ -197,8 +197,11 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         .output()?;
     assert!(undrained.status.success(), "{}", printed(&undrained));
 
-    // And this build's own upgrade restarts a node in place under the same writes.
+    // And this build's own upgrade restarts a node in place under the same writes. A previous
+    // release from 0.7 on added the `fleetring` name when it installed this build; otherwise
+    // this upgrade adds it.
     let node = &fleet.nodes[1];
+    let named = fs::symlink_metadata(node.bin.with_file_name("fleetring")).is_ok();
     let reinstalled = fleet
         .command(&node.bin, &path)
         .args([
@@ -215,12 +218,12 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     assert!(
         reinstalled.status.success()
             && stdout.contains("caught up")
-            && stdout.contains("added fleetring beside fleetringd"),
+            && (named || stdout.contains("added fleetring beside fleetringd")),
         "{}\n{}",
         printed(&reinstalled),
         fleet.logs()
     );
-    // The name this build added is the same file.
+    // The name is the same file.
     let printed_version = Command::new(node.bin.with_file_name("fleetring"))
         .arg("--version")
         .output()?;
