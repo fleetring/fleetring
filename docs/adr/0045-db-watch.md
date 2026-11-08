@@ -1,6 +1,6 @@
 # ADR-0045: `db watch` tails a database's recorded row changes from its primary, one transaction per line, resumable by position
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-07), with the owner's decisions on its open questions recorded under Consequences
 - **Date:** 2026-11-07
 - **Related:** ADR-0016 (engine adapters), ADR-0018 (leases and quorums), ADR-0022 (failover), ADR-0023 (durability modes), ADR-0024 (logical change capture), ADR-0025 and ADR-0026 (principals, scopes, enforcement), ADR-0028 (replicated sink positions), ADR-0031 (node calls bound to placement), ADR-0038 (version compatibility), ADR-0041 (agent kit, MCP), ADR-0043 (the CLI, point 9); tickets FR-075 (#103, item 7), FR-039, FR-041
 
@@ -76,3 +76,9 @@ The owner proposed defaults: a live tail by default and a resume from a position
 - **Change streams track connected watchers** and include them when they release row changes, and limit them per node.
 - **Docs:** `docs/cli.md` (the command tree, the JSON fields, the `db watch` line of "Where `fleetring` stands"), the lexicon (*watcher*), the daemon README, and the release notes. ADR-0043 point 9's deferral is settled by this record.
 - **Follow-ups:** capture without a sink, for databases that should be watchable without one; the MCP `changes` tool with the agents' `stream` scope (point 12); a configurable per-node watcher limit if one is needed; and a simulation workload that watches through failovers.
+- **Owner's decisions (2026-11-07), on accepting this record:**
+  - Agent identities get `stream` on their own databases in 0.8.x, together with the MCP `changes` tool of point 12 (FR-081, #126).
+  - `--from` keeps two meanings until 1.0: a database name for `db restore`, a position for `db watch` (`docs/cli.md`, section 2). It is revisited with the other names ADR-0043 defers to 1.0.
+  - The per-node watcher limit stays the constant 64; a `[changes] max_watchers` setting waits for a deployment that needs it.
+  - Capture without a sink is its own ticket (FR-082, #127).
+  - A simulation workload that follows `db watch` through crash failovers is its own ticket (#128).
