@@ -27,6 +27,8 @@ const _: () = {
     assert_debug_send_sync::<output::ArchiveReport>();
     assert_debug_send_sync::<output::ChangeReport>();
     assert_debug_send_sync::<output::ColumnsReport>();
+    assert_debug_send_sync::<output::ConfigCheckReport>();
+    assert_debug_send_sync::<output::ConfigProblem>();
     assert_debug_send_sync::<output::DatabaseList>();
     assert_debug_send_sync::<output::DatabaseLocation>();
     assert_debug_send_sync::<output::DatabaseReport>();

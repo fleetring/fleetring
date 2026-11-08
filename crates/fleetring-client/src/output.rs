@@ -292,6 +292,36 @@ pub struct VerifyReport {
     pub unchanged: Option<bool>,
 }
 
+/// `serve --check`'s result: whether a node would start with a configuration and its flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigCheckReport {
+    /// The configuration file, as the command line named it.
+    pub config: String,
+    /// Whether the node would start with it: `problems` is empty.
+    pub valid: bool,
+    /// The node's ID, with the flags applied, or `null` if the file couldn't be read or parsed.
+    pub node: Option<String>,
+    /// Its role, `both`, `data` or `control`, or `null` if the file couldn't be read or parsed.
+    pub role: Option<String>,
+    /// What stops the node from starting. The check stops at the first, as the node does.
+    pub problems: Vec<ConfigProblem>,
+}
+
+/// One thing `serve --check` found wrong with a configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigProblem {
+    /// The field at fault, dotted (`admin.listen`, `changes.sink.url`), or `null` when the fault
+    /// is in no field, as in a file that can't be read or isn't TOML.
+    pub field: Option<String>,
+    /// The line of the file it is on, from 1, or `null` when the fault is in no one place in the
+    /// file, as a rule across fields or a field missing from the top.
+    pub line: Option<u64>,
+    /// The column on that line, from 1, or `null` with `line`.
+    pub column: Option<u64>,
+    /// What is wrong, as one line.
+    pub message: String,
+}
+
 /// One replica's answer to `db verify`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplicaHash {

@@ -76,6 +76,7 @@ mod help;
 mod man;
 mod progress;
 mod resolve;
+mod serve_check;
 mod stop;
 mod watch_cmd;
 
@@ -162,6 +163,25 @@ struct DaemonArgs {
     /// Nothing on the wire is authenticated or encrypted.
     #[arg(long)]
     insecure_plaintext: bool,
+    /// Checks the configuration and these flags as `serve` would, and starts nothing
+    ///
+    /// Reads the file, applies the flags, and checks every rule the node checks before it
+    /// starts, in the same code. It reads none of the files the configuration names
+    /// (certificates, keys, tokens, credentials), no environment variable and no data directory,
+    /// and binds nothing. It exits 0 if the node would start. Otherwise it prints the first
+    /// problem, as the node would stop at it, naming the file, the field, and the line and column
+    /// where the parser gives them, and exits 1.
+    #[arg(long)]
+    check: bool,
+    /// The check's output format: `table` or `json`
+    ///
+    /// `json` is one object: `config`, `valid`, `node`, `role`, and `problems`, each `field`,
+    /// `line`, `column` and `message`. Needs `--check`.
+    #[arg(short = 'o', long, value_enum, requires = "check")]
+    output: Option<OutputFormat>,
+    /// Short for `-o json`; needs `--check`
+    #[arg(long, requires = "check", conflicts_with = "output")]
+    json: bool,
 }
 
 /// What `fleetring serve --help` says: the details, and the compatibility form (ADR-0043,
@@ -170,6 +190,7 @@ const SERVE_HELP: &str = "\
 Runs a node.
 
 Runs a node of a fleet from its configuration file; the flags override the file's settings.
+With `--check`, it checks the file and the flags as a start would, and starts nothing.
 
 Until 1.0, the flags without `serve` (`fleetring --config <file>`, or `fleetringd --config
 <file>`, as 0.6 ran a node) also run a node, and log a warning.";
@@ -1497,6 +1518,15 @@ impl Target {
 }
 
 impl DaemonArgs {
+    /// The check's output format, from `-o` and `--json`.
+    fn check_format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.output.unwrap_or(OutputFormat::Table)
+        }
+    }
+
     fn apply(self, mut config: Config) -> Config {
         if let Some(id) = self.node_id {
             config.node.id = id;
@@ -1768,6 +1798,11 @@ fn main() -> ExitCode {
         Command::Context(command) => return finish(context_cmd::run(command)),
         Command::Switch { target } => return finish(context_cmd::switch(target.as_deref())),
         Command::Completions(args) => return finish(completions::print(&args, name, arg0)),
+        // A check starts nothing, so it needs no logging and no runtime either.
+        Command::Serve(args) if args.check => {
+            let format = args.check_format();
+            return finish(serve_check::run(args, format));
+        }
         command => command,
     };
     // The daemon reads its configuration before logging starts, since it may name the format;

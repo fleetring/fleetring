@@ -4,11 +4,12 @@
 .SH NAME
 fleetring\-serve \- Runs a node
 .SH SYNOPSIS
-\fBfleetring serve\fR [\fB\-\-node\-id\fR] [\fB\-\-data\-dir\fR] [\fB\-\-listen\fR] [\fB\-\-advertise\fR] [\fB\-\-control\fR] [\fB\-\-role\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-config\fR> 
+\fBfleetring serve\fR [\fB\-\-node\-id\fR] [\fB\-\-data\-dir\fR] [\fB\-\-listen\fR] [\fB\-\-advertise\fR] [\fB\-\-control\fR] [\fB\-\-role\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-check\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-config\fR> 
 .SH DESCRIPTION
 Runs a node.
 .PP
 Runs a node of a fleet from its configuration file; the flags override the file\*(Aqs settings.
+With `\-\-check`, it checks the file and the flags as a start would, and starts nothing.
 .PP
 Until 1.0, the flags without `serve` (`fleetring \-\-config <file>`, or `fleetringd \-\-config
 <file>`, as 0.6 ran a node) also run a node, and log a warning.
@@ -39,6 +40,31 @@ Overrides `role`: `both`, `data`, or `control`
 Runs without a `[tls]` table, in plaintext, for local experiments only
 
 Nothing on the wire is authenticated or encrypted.
+.TP
+\fB\-\-check\fR
+Checks the configuration and these flags as `serve` would, and starts nothing
+
+Reads the file, applies the flags, and checks every rule the node checks before it starts, in the same code. It reads none of the files the configuration names (certificates, keys, tokens, credentials), no environment variable and no data directory, and binds nothing. It exits 0 if the node would start. Otherwise it prints the first problem, as the node would stop at it, naming the file, the field, and the line and column where the parser gives them, and exits 1.
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR
+The check\*(Aqs output format: `table` or `json`
+
+`json` is one object: `config`, `valid`, `node`, `role`, and `problems`, each `field`, `line`, `column` and `message`. Needs `\-\-check`.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+table: For people: a table, or key and value lines for one item
+.IP \(bu 2
+json: For programs: one JSON object, indented
+.IP \(bu 2
+jsonl: For programs: one JSON object per line
+.RE
+.TP
+\fB\-\-json\fR
+Short for `\-o json`; needs `\-\-check`
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`
