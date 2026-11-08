@@ -12,6 +12,7 @@ use fleetring_control::{
     Labels, LeaseEpoch, Liveness, Metadata, MetadataChange, ReplicaRole, Revocations, Revoked,
     Timestamp,
 };
+use fleetring_proto::v1::change_update::Update as ChangeUpdateKind;
 use fleetring_proto::v1::metadata_spec::Expiry as SpecExpiry;
 use fleetring_proto::v1::update_database_request::Description as DescriptionUpdate;
 use fleetring_proto::v1::update_database_request::Expiry as ExpiryUpdate;
@@ -19,13 +20,17 @@ use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as K
 use tonic::Status;
 
 use crate::changes::{MarkHome, SinkStatus};
-use crate::data::client::{LeaseUpdate, Location, NodeStatus, Orphan, ReplicaInfo, ServedDatabase};
+use crate::data::client::{
+    ChangeUpdate, ChangedTransaction, LeaseUpdate, Location, NodeStatus, Orphan, ReplicaInfo,
+    ServedDatabase,
+};
 use crate::data::metadata::{Descriptions, Expiry, ExpiryRequest, MetadataView, NewMetadata};
 use crate::data::schema::SchemaView;
 use crate::durability::ArchivedMetadata;
 use crate::engine::{
-    EngineKind, Internal, MAX_COUNT_LIMIT, ObjectKind, Position, RowCount, Rows, Schema,
-    SchemaObject, SchemaRequest, Statement, Value,
+    CaptureMode, Column, EngineKind, Internal, MAX_COUNT_LIMIT, ObjectKind, Position,
+    RecordedTransaction, RowChange, RowCount, RowOperation, Rows, Schema, SchemaObject,
+    SchemaRequest, Statement, Value,
 };
 use crate::replication::{LeaseChange, LeaseEvent};
 
@@ -811,9 +816,246 @@ pub(crate) fn lease_update_from_proto(update: proto::LeaseUpdate) -> Result<Leas
     }
 }
 
+/// A position as a reply carries it: empty for none.
+fn position_bytes(position: Option<Position>) -> Vec<u8> {
+    position.map(Position::into_bytes).unwrap_or_default()
+}
+
+/// A position a reply carries, or `None` for an empty one.
+fn reply_position(bytes: Vec<u8>) -> Option<Position> {
+    (!bytes.is_empty()).then(|| Position::from(bytes))
+}
+
+pub(crate) fn capture_mode_to_proto(mode: CaptureMode) -> proto::CaptureMode {
+    match mode {
+        CaptureMode::Id => proto::CaptureMode::Id,
+        CaptureMode::After => proto::CaptureMode::After,
+        CaptureMode::Full => proto::CaptureMode::Full,
+    }
+}
+
+/// The capture mode `mode` names, or `None` if it is unspecified or unknown.
+pub(crate) fn capture_mode_from_proto(mode: i32) -> Option<CaptureMode> {
+    match proto::CaptureMode::try_from(mode).ok()? {
+        proto::CaptureMode::Id => Some(CaptureMode::Id),
+        proto::CaptureMode::After => Some(CaptureMode::After),
+        proto::CaptureMode::Full => Some(CaptureMode::Full),
+        proto::CaptureMode::Unspecified => None,
+    }
+}
+
+fn columns_to_proto(columns: Vec<Column>) -> Vec<proto::Column> {
+    columns
+        .into_iter()
+        .map(|column| proto::Column {
+            name: column.name,
+            value: Some(value_to_proto(column.value)),
+        })
+        .collect()
+}
+
+fn columns_from_proto(columns: Vec<proto::Column>) -> Result<Vec<Column>, Status> {
+    columns
+        .into_iter()
+        .map(|column| {
+            let value = column
+                .value
+                .and_then(value_from_proto)
+                .ok_or_else(|| Status::internal("the reply has a column without a value"))?;
+            Ok(Column::new(column.name, value))
+        })
+        .collect()
+}
+
+fn row_change_to_proto(change: RowChange) -> proto::RowChange {
+    let operation = match change.operation {
+        RowOperation::Insert => proto::RowOperation::Insert,
+        RowOperation::Update => proto::RowOperation::Update,
+        RowOperation::Delete => proto::RowOperation::Delete,
+    };
+    proto::RowChange {
+        table: change.table,
+        operation: operation.into(),
+        key: columns_to_proto(change.key),
+        before: change.before.map(|columns| proto::Columns {
+            columns: columns_to_proto(columns),
+        }),
+        after: change.after.map(|columns| proto::Columns {
+            columns: columns_to_proto(columns),
+        }),
+        updated: change.updated.map(|names| proto::ColumnNames { names }),
+    }
+}
+
+fn row_change_from_proto(change: proto::RowChange) -> Result<RowChange, Status> {
+    let operation = match proto::RowOperation::try_from(change.operation) {
+        Ok(proto::RowOperation::Insert) => RowOperation::Insert,
+        Ok(proto::RowOperation::Update) => RowOperation::Update,
+        Ok(proto::RowOperation::Delete) => RowOperation::Delete,
+        Ok(proto::RowOperation::Unspecified) | Err(_) => {
+            return Err(Status::internal(format!(
+                "the reply has a row change of unknown operation {}",
+                change.operation
+            )));
+        }
+    };
+    let mut row = RowChange::new(change.table, operation, columns_from_proto(change.key)?);
+    row.before = change
+        .before
+        .map(|columns| columns_from_proto(columns.columns))
+        .transpose()?;
+    row.after = change
+        .after
+        .map(|columns| columns_from_proto(columns.columns))
+        .transpose()?;
+    row.updated = change.updated.map(|names| names.names);
+    Ok(row)
+}
+
+/// The first message of a `WatchChanges` stream.
+pub(crate) fn changes_opened_to_proto(
+    position: Option<Position>,
+    primary: &NodeId,
+    epoch: LeaseEpoch,
+    capture: CaptureMode,
+) -> proto::ChangeUpdate {
+    proto::ChangeUpdate {
+        update: Some(ChangeUpdateKind::Opened(proto::ChangesOpened {
+            position: position_bytes(position),
+            primary: primary.to_string(),
+            epoch: epoch.get(),
+            capture: capture_mode_to_proto(capture).into(),
+        })),
+    }
+}
+
+/// One transaction of a `WatchChanges` stream, served at `epoch`.
+pub(crate) fn changed_transaction_to_proto(
+    transaction: RecordedTransaction,
+    epoch: LeaseEpoch,
+) -> proto::ChangeUpdate {
+    proto::ChangeUpdate {
+        update: Some(ChangeUpdateKind::Transaction(proto::ChangedTransaction {
+            start: position_bytes(transaction.start),
+            position: transaction.position.into_bytes(),
+            epoch: epoch.get(),
+            changes: transaction
+                .changes
+                .into_iter()
+                .map(row_change_to_proto)
+                .collect(),
+        })),
+    }
+}
+
+pub(crate) fn change_update_from_proto(
+    update: proto::ChangeUpdate,
+) -> Result<ChangeUpdate, Status> {
+    match update.update {
+        Some(ChangeUpdateKind::Opened(opened)) => Ok(ChangeUpdate::Opened {
+            position: reply_position(opened.position),
+            primary: opened.primary.parse().ok(),
+            epoch: LeaseEpoch::new(opened.epoch),
+            capture: capture_mode_from_proto(opened.capture),
+        }),
+        Some(ChangeUpdateKind::Transaction(transaction)) => {
+            if transaction.position.is_empty() {
+                return Err(Status::internal(
+                    "the reply has a transaction without a position",
+                ));
+            }
+            Ok(ChangeUpdate::Transaction(ChangedTransaction {
+                start: reply_position(transaction.start),
+                position: Position::from(transaction.position),
+                epoch: LeaseEpoch::new(transaction.epoch),
+                changes: transaction
+                    .changes
+                    .into_iter()
+                    .map(row_change_from_proto)
+                    .collect::<Result<_, _>>()?,
+            }))
+        }
+        None => Err(Status::internal(
+            "the reply has a change update without a kind",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_changed_transaction_round_trips_in_every_capture_shape() -> Result<(), Status> {
+        let full = RowChange::new(
+            "note",
+            RowOperation::Update,
+            [Column::new("id", Value::Integer(1))],
+        )
+        .with_before([
+            Column::new("id", Value::Integer(1)),
+            Column::new("body", Value::Text("a".to_owned())),
+        ])
+        .with_after([
+            Column::new("id", Value::Integer(1)),
+            Column::new("body", Value::Blob(vec![0, 255])),
+        ])
+        .with_updated(["body".to_owned()]);
+        let id_only = RowChange::new(
+            "note",
+            RowOperation::Delete,
+            [Column::new("rowid", Value::Integer(7))],
+        );
+        let empty_after = RowChange::new(
+            "empty",
+            RowOperation::Insert,
+            [Column::new("rowid", Value::Integer(1))],
+        )
+        .with_after([]);
+        let transaction = RecordedTransaction {
+            start: None,
+            position: Position::new([0, 1]),
+            changes: vec![full.clone(), id_only.clone(), empty_after.clone()],
+        };
+        let decoded = change_update_from_proto(changed_transaction_to_proto(
+            transaction,
+            LeaseEpoch::new(3),
+        ))?;
+        let ChangeUpdate::Transaction(decoded) = decoded else {
+            panic!("a transaction decodes as one: {decoded:?}");
+        };
+        assert_eq!(decoded.start, None);
+        assert_eq!(decoded.position, Position::new([0, 1]));
+        assert_eq!(decoded.epoch, LeaseEpoch::new(3));
+        assert_eq!(decoded.changes, [full, id_only, empty_after]);
+        assert_eq!(
+            decoded.changes[2].after,
+            Some(Vec::new()),
+            "an empty row recorded stays apart from one not recorded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_opened_message_round_trips() -> Result<(), Status> {
+        let primary: NodeId = "data-1".parse().map_err(|_| Status::internal("id"))?;
+        let opened = change_update_from_proto(changes_opened_to_proto(
+            Some(Position::new([9])),
+            &primary,
+            LeaseEpoch::new(2),
+            CaptureMode::Full,
+        ))?;
+        assert_eq!(
+            opened,
+            ChangeUpdate::Opened {
+                position: Some(Position::new([9])),
+                primary: Some(primary),
+                epoch: LeaseEpoch::new(2),
+                capture: Some(CaptureMode::Full),
+            }
+        );
+        Ok(())
+    }
 
     fn label(key: &str, value: &str) -> proto::Label {
         proto::Label {

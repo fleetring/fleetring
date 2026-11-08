@@ -8,8 +8,8 @@ use std::path::Path;
 
 use crate::engine::{
     CaptureMode, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, LogicalSupport,
-    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Statement,
-    Transaction,
+    PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange, Rows,
+    Schema, SchemaRequest, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -393,6 +393,34 @@ pub trait LogicalChanges: fmt::Debug + Send {
     ///
     /// [`EngineError::Storage`] if the engine can't record the release.
     fn release(&mut self, before: &Position) -> Result<(), EngineError>;
+
+    /// The recorded transactions after `after` up to `until`, in commit order, each whole, with
+    /// the position it started from and the position to resume after it, for a watcher
+    /// (ADR-0045). At most `limit` of them, but always one whole transaction if there is one.
+    ///
+    /// `after` is `None` for the current log's beginning. Unlike
+    /// [`changes_between`](Self::changes_between), it never returns less than was recorded: if
+    /// the engine no longer holds every recorded transaction after `after`, it refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::ChangesReleased`] with the oldest position the engine holds changes from,
+    /// if it doesn't hold every recorded change after `after`;
+    /// [`EngineError::InvalidPosition`] if `after` isn't a position of this engine;
+    /// [`EngineError::Storage`] if the recorded changes can't be read; and
+    /// [`EngineError::Unsupported`], the default, for an engine that can't tell its recorded
+    /// transactions apart.
+    fn transactions_after(
+        &mut self,
+        after: Option<&Position>,
+        until: &Position,
+        limit: ReadLimit,
+    ) -> Result<Vec<RecordedTransaction>, EngineError> {
+        let _ = (after, until, limit);
+        Err(EngineError::Unsupported {
+            what: "watching changes",
+        })
+    }
 }
 
 /// Delivered positions of change sinks, kept inside the database so that they replicate,
@@ -499,5 +527,15 @@ pub enum EngineError {
     Unsupported {
         /// What was asked for.
         what: &'static str,
+    },
+    /// The recorded row changes after a position are no longer all held: some were released
+    /// and pruned, or were never recorded (ADR-0045, point 4).
+    #[error("the recorded changes after {position} are no longer held")]
+    ChangesReleased {
+        /// The position asked for.
+        position: Position,
+        /// The oldest position the engine holds every recorded change after, or `None` if it
+        /// holds none from before the log's current end.
+        oldest: Option<Position>,
     },
 }

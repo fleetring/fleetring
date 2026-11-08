@@ -53,7 +53,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, ffi, 
 
 pub use follower::SqliteFollower;
 
-use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX};
+use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX, Watched};
 use self::marks::Marks;
 use self::pins::Pins;
 use self::reserved::{Reserved, is_reserved};
@@ -61,8 +61,8 @@ use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
     DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
     FrameFollower, FrameSource, FrameSourceEngine, LogicalChanges, LogicalSupport, OpenMode,
-    PinnedSnapshot, Position, RowChange, Rows, Schema, SchemaRequest, SinkMarks, SnapshotFile,
-    Statement, Transaction, Value,
+    PinnedSnapshot, Position, ReadLimit, RecordedTransaction, RowChange, Rows, Schema,
+    SchemaRequest, SinkMarks, SnapshotFile, Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -334,6 +334,9 @@ impl SqliteDatabase {
 
     fn roll_back(&mut self) {
         self.reserved.forget();
+        if let Some(recorder) = &mut self.recorder {
+            recorder.rolled_back();
+        }
         if self.writer.is_autocommit() {
             return;
         }
@@ -726,6 +729,31 @@ impl LogicalChanges for SqliteDatabase {
             recorder.release(before.as_bytes());
         }
         Ok(())
+    }
+
+    fn transactions_after(
+        &mut self,
+        after: Option<&Position>,
+        until: &Position,
+        limit: ReadLimit,
+    ) -> Result<Vec<RecordedTransaction>, EngineError> {
+        if let Some(after) = after {
+            decode_position(after)?;
+        }
+        // As in `changes_between`: a reader at the log's beginning reads from the last
+        // checkpoint's end.
+        let checkpointed = self.checkpointed.map(fleetring_wal::Position::to_bytes);
+        let lower = after
+            .map(Position::as_bytes)
+            .or(checkpointed.as_ref().map(<[u8; 20]>::as_slice))
+            .unwrap_or_default();
+        match changes::transactions_after(&self.reader, lower, until.as_bytes(), limit)? {
+            Watched::Held(transactions) => Ok(transactions),
+            Watched::Released { oldest } => Err(EngineError::ChangesReleased {
+                position: Position::new(lower),
+                oldest: oldest.map(Position::from),
+            }),
+        }
     }
 }
 

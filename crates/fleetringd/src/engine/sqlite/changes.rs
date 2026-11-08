@@ -25,6 +25,19 @@
 //! Row JSON is one flat array of `name, type, value` triples, with blobs as hex. One commit
 //! record follows the rows of every transaction that recorded any.
 //!
+//! # The floor
+//!
+//! The table's first row is a *floor* whenever this release has written into it: a commit-type
+//! record whose `table_name` is [`FLOOR`] and whose `start` is a position from which every
+//! transaction is recorded and still held (ADR-0045, point 4). The first transaction that finds
+//! the table empty writes one at its own start, and every prune, which deletes the rows of the
+//! transactions that started before the released position, writes one at that position, in the
+//! id just freed in front of the first row it keeps. A watcher reads it to tell a range that
+//! recorded nothing from one that was pruned. Readers that predate it skip it as a commit record.
+//! A table an older release pruned has no floor until this one prunes it, and the start of its
+//! oldest row stands in for one, which may refuse a position that was held but never accepts one
+//! that wasn't.
+//!
 //! The table has no index: `change_id`s are contiguous (rows are only ever pruned from the
 //! front) and `start` never decreases along them, so a position bound is found by binary search
 //! over `change_id` with point lookups, and range reads and prunes are rowid ranges. That keeps
@@ -53,7 +66,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
 use super::storage;
-use crate::engine::{CaptureMode, Column, EngineError, RowChange, RowOperation, Value};
+use crate::engine::{
+    CaptureMode, Column, EngineError, Position, ReadLimit, RecordedTransaction, RowChange,
+    RowOperation, Value,
+};
 
 /// The prefix of every name the adapter reserves: its change table, its functions, and its
 /// triggers.
@@ -77,6 +93,10 @@ const ROWID: &str = "rowid";
 /// How many transactions may pass between prunes of released rows. A prune costs a range
 /// delete, so it is amortized; the table holds at most this many delivered transactions.
 const PRUNE_EVERY: u32 = 64;
+
+/// The `table_name` of a floor row: a commit-type record saying that every transaction that
+/// started at or after its `start` is recorded and still held.
+const FLOOR: &str = "_fleetring_floor";
 
 /// Turso's change types.
 const INSERT: i64 = 1;
@@ -107,6 +127,17 @@ pub(super) struct Recorder {
     released: Option<Vec<u8>>,
     /// Transactions begun since the last prune.
     since_prune: u32,
+    /// What the current transaction set up that a rollback takes back with it.
+    undone_by_rollback: Fresh,
+}
+
+/// The recorder's state that the current transaction created, and that its rollback undoes.
+#[derive(Debug, Default, Clone, Copy)]
+struct Fresh {
+    /// The transaction ran the change table's `CREATE`.
+    table: bool,
+    /// The transaction rebuilt the triggers.
+    triggers: bool,
 }
 
 impl Recorder {
@@ -137,6 +168,7 @@ impl Recorder {
             created: false,
             released: None,
             since_prune: 0,
+            undone_by_rollback: Fresh::default(),
         })
     }
 
@@ -146,13 +178,16 @@ impl Recorder {
     }
 
     /// Prepares a transaction that has just begun on `writer`: creates the change table the first
-    /// time, prunes released rows now and then, records `start`, the position the transaction
-    /// starts from (`None` for an empty log), and builds the triggers if they aren't built yet.
+    /// time, with a floor at `start` if it holds no row, prunes released rows now and then,
+    /// leaving a floor where they stopped, records `start`, the position the transaction starts
+    /// from (`None` for an empty log), and builds the triggers if they aren't built yet.
     pub(super) fn begin(
         &mut self,
         writer: &Connection,
         start: Option<fleetring_wal::Position>,
     ) -> Result<(), EngineError> {
+        self.undone_by_rollback = Fresh::default();
+        let start = start_bytes(start);
         if !self.created {
             writer
                 .execute_batch(&format!(
@@ -168,30 +203,67 @@ impl Recorder {
                         start BLOB NOT NULL);"
                 ))
                 .map_err(storage)?;
+            // An empty table holds nothing from before: from this transaction on, everything is
+            // recorded and held.
+            if oldest_start(writer)?.is_none() {
+                insert_floor(writer, 1, &start)?;
+            }
             self.created = true;
+            self.undone_by_rollback.table = true;
         }
         self.since_prune = self.since_prune.saturating_add(1);
         if self.since_prune >= PRUNE_EVERY
             && let Some(before) = self.released.take()
         {
-            if let Some(first_kept) = first_id_at_or_after(writer, &before)? {
-                writer
-                    .prepare_cached(&format!(
-                        "DELETE FROM \"{CHANGES_TABLE}\" WHERE change_id < ?1"
-                    ))
-                    .map_err(storage)?
-                    .execute(params![first_kept])
-                    .map_err(storage)?;
-            }
+            self.prune(writer, &before)?;
             self.since_prune = 0;
         }
         let next = highest_id(writer)?.saturating_add(1);
         self.txn.id.store(next, Ordering::Relaxed);
-        *self.txn.start.lock().expect("transaction lock poisoned") = start_bytes(start);
+        *self.txn.start.lock().expect("transaction lock poisoned") = start;
         if self.schema_version.is_none() {
             self.sync_triggers(writer)?;
         }
         Ok(())
+    }
+
+    /// Deletes the rows of the transactions that started before `before`, and puts a floor at
+    /// `before` in the id just in front of the first row kept, so that the ids stay contiguous
+    /// and a reader knows how far the table was pruned. A floor already at or past `before`
+    /// stays as it is.
+    fn prune(&self, writer: &Connection, before: &[u8]) -> Result<(), EngineError> {
+        let Some(first_kept) = first_id_at_or_after(writer, before)? else {
+            return Ok(());
+        };
+        let lowest: Option<i64> = writer
+            .prepare_cached(&format!("SELECT min(change_id) FROM \"{CHANGES_TABLE}\""))
+            .map_err(storage)?
+            .query_row([], |row| row.get(0))
+            .map_err(storage)?;
+        if lowest.is_none_or(|lowest| lowest >= first_kept) {
+            return Ok(());
+        }
+        writer
+            .prepare_cached(&format!(
+                "DELETE FROM \"{CHANGES_TABLE}\" WHERE change_id < ?1"
+            ))
+            .map_err(storage)?
+            .execute(params![first_kept])
+            .map_err(storage)?;
+        insert_floor(writer, first_kept - 1, before)
+    }
+
+    /// After the current transaction rolled back: forgets what it set up, the change table and
+    /// the triggers, which the rollback took with it, so that the next transaction sets them up
+    /// again.
+    pub(super) fn rolled_back(&mut self) {
+        let fresh = std::mem::take(&mut self.undone_by_rollback);
+        if fresh.table {
+            self.created = false;
+        }
+        if fresh.triggers {
+            self.schema_version = None;
+        }
     }
 
     /// Brings the triggers up to date after the statement `sql`, if it could have changed the
@@ -264,8 +336,35 @@ impl Recorder {
         }
         writer.execute_batch(&sql).map_err(storage)?;
         self.schema_version = Some(version);
+        self.undone_by_rollback.triggers = true;
         Ok(())
     }
+}
+
+/// Inserts a floor at `id`, saying that every transaction that started at or after `start` is
+/// recorded and held.
+fn insert_floor(writer: &Connection, id: i64, start: &[u8]) -> Result<(), EngineError> {
+    writer
+        .prepare_cached(&format!(
+            "INSERT INTO \"{CHANGES_TABLE}\" (change_id, change_txn_id, change_type, table_name, start)
+             VALUES (?1, ?1, {COMMIT}, '{FLOOR}', ?2)"
+        ))
+        .map_err(storage)?
+        .execute(params![id, start])
+        .map_err(storage)?;
+    Ok(())
+}
+
+/// The `start` of the change table's first row: its floor, or for a table that has none, its
+/// oldest recorded row; `None` for an empty table.
+fn oldest_start(conn: &Connection) -> Result<Option<Vec<u8>>, EngineError> {
+    conn.prepare_cached(&format!(
+        "SELECT start FROM \"{CHANGES_TABLE}\" ORDER BY change_id LIMIT 1"
+    ))
+    .map_err(storage)?
+    .query_row([], |row| row.get(0))
+    .optional()
+    .map_err(storage)
 }
 
 /// Whether `sql` starts with a keyword that only reads or writes rows, so it can't change the
@@ -579,6 +678,82 @@ struct Row {
     before: Option<String>,
     after: Option<String>,
     updates: Option<String>,
+    start: Vec<u8>,
+}
+
+impl Row {
+    /// The row's change, or `None` for a commit record or a floor.
+    fn change(self) -> Result<Option<RowChange>, EngineError> {
+        let Some(operation) = operation_from_type(self.change_type)? else {
+            return Ok(None);
+        };
+        let missing = |what: &str| {
+            storage(std::io::Error::other(format!(
+                "a {operation} record in {CHANGES_TABLE} has no {what}"
+            )))
+        };
+        let table = self.table.ok_or_else(|| missing("table name"))?;
+        let key = decode_columns(&self.id.ok_or_else(|| missing("key"))?)?;
+        let mut change = RowChange::new(table, operation, key);
+        change.before = self.before.as_deref().map(decode_columns).transpose()?;
+        change.after = self.after.as_deref().map(decode_columns).transpose()?;
+        change.updated = self
+            .updates
+            .as_deref()
+            .map(|json| serde_json::from_str::<Vec<String>>(json).map_err(storage))
+            .transpose()?;
+        Ok(Some(change))
+    }
+
+    /// Whether the row is a floor.
+    fn is_floor(&self) -> bool {
+        self.change_type == COMMIT && self.table.as_deref() == Some(FLOOR)
+    }
+}
+
+/// Whether the change table exists in the database `conn` reads.
+fn table_exists(conn: &Connection) -> Result<bool, EngineError> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1",
+            params![CHANGES_TABLE],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    Ok(exists.is_some())
+}
+
+/// Reads the change table's rows with ids from `first` up to `past`, in id order, and hands each
+/// to `each` until it returns `false`.
+fn each_row(
+    reader: &Connection,
+    first: i64,
+    past: i64,
+    mut each: impl FnMut(Row) -> Result<bool, EngineError>,
+) -> Result<(), EngineError> {
+    let mut statement = reader
+        .prepare_cached(&format!(
+            "SELECT change_type, table_name, id, before, after, updates, start
+             FROM \"{CHANGES_TABLE}\" WHERE change_id >= ?1 AND change_id < ?2 ORDER BY change_id"
+        ))
+        .map_err(storage)?;
+    let mut rows = statement.query(params![first, past]).map_err(storage)?;
+    while let Some(row) = rows.next().map_err(storage)? {
+        let row = Row {
+            change_type: row.get(0).map_err(storage)?,
+            table: row.get(1).map_err(storage)?,
+            id: row.get(2).map_err(storage)?,
+            before: row.get(3).map_err(storage)?,
+            after: row.get(4).map_err(storage)?,
+            updates: row.get(5).map_err(storage)?,
+            start: row.get(6).map_err(storage)?,
+        };
+        if !each(row)? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Reads the recorded changes of transactions that started at or after `lower` (none for the
@@ -588,15 +763,7 @@ pub(super) fn changes_between(
     lower: Option<&[u8]>,
     until: &[u8],
 ) -> Result<Vec<RowChange>, EngineError> {
-    let exists: Option<i64> = reader
-        .query_row(
-            "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1",
-            params![CHANGES_TABLE],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(storage)?;
-    if exists.is_none() {
+    if !table_exists(reader)? {
         return Ok(Vec::new());
     }
     let Some(first) = first_id_at_or_after(reader, lower.unwrap_or_default())? else {
@@ -605,48 +772,102 @@ pub(super) fn changes_between(
     let Some(past) = first_id_at_or_after(reader, until)? else {
         return Ok(Vec::new());
     };
-    let mut statement = reader
-        .prepare_cached(&format!(
-            "SELECT change_type, table_name, id, before, after, updates FROM \"{CHANGES_TABLE}\"
-             WHERE change_id >= ?1 AND change_id < ?2 ORDER BY change_id"
-        ))
-        .map_err(storage)?;
-    let rows = statement
-        .query_map(params![first, past], |row| {
-            Ok(Row {
-                change_type: row.get(0)?,
-                table: row.get(1)?,
-                id: row.get(2)?,
-                before: row.get(3)?,
-                after: row.get(4)?,
-                updates: row.get(5)?,
-            })
-        })
-        .map_err(storage)?;
     let mut changes = Vec::new();
-    for row in rows {
-        let row = row.map_err(storage)?;
-        let Some(operation) = operation_from_type(row.change_type)? else {
-            continue;
-        };
-        let missing = |what: &str| {
-            storage(std::io::Error::other(format!(
-                "a {operation} record in {CHANGES_TABLE} has no {what}"
-            )))
-        };
-        let table = row.table.ok_or_else(|| missing("table name"))?;
-        let key = decode_columns(&row.id.ok_or_else(|| missing("key"))?)?;
-        let mut change = RowChange::new(table, operation, key);
-        change.before = row.before.as_deref().map(decode_columns).transpose()?;
-        change.after = row.after.as_deref().map(decode_columns).transpose()?;
-        change.updated = row
-            .updates
-            .as_deref()
-            .map(|json| serde_json::from_str::<Vec<String>>(json).map_err(storage))
-            .transpose()?;
-        changes.push(change);
-    }
+    each_row(reader, first, past, |row| {
+        changes.extend(row.change()?);
+        Ok(true)
+    })?;
     Ok(changes)
+}
+
+/// What [`transactions_after`] found.
+#[derive(Debug)]
+pub(super) enum Watched {
+    /// The table holds every recorded transaction in the range: these.
+    Held(Vec<RecordedTransaction>),
+    /// The table no longer holds every recorded transaction after the lower bound. It holds them
+    /// from `oldest` on, or, with `None`, from no position before the range's end.
+    Released {
+        /// The table's floor, or the start of its oldest row.
+        oldest: Option<Vec<u8>>,
+    },
+}
+
+/// Reads the recorded transactions that started at or after `lower` and before `until`, whole
+/// and in commit order, each with its start and the position to resume after it, at most as
+/// many as `limit` allows. Refuses with [`Watched::Released`] unless the table holds every
+/// recorded transaction from `lower` on: unless `lower` is at or after the table's floor, or,
+/// for a table without one, the start of its oldest row.
+pub(super) fn transactions_after(
+    reader: &Connection,
+    lower: &[u8],
+    until: &[u8],
+    limit: ReadLimit,
+) -> Result<Watched, EngineError> {
+    if lower >= until {
+        return Ok(Watched::Held(Vec::new()));
+    }
+    if !table_exists(reader)? {
+        return Ok(Watched::Released { oldest: None });
+    }
+    let Some(floor) = oldest_start(reader)? else {
+        return Ok(Watched::Released { oldest: None });
+    };
+    if lower < floor.as_slice() {
+        return Ok(Watched::Released {
+            oldest: Some(floor),
+        });
+    }
+    let (Some(first), Some(past)) = (
+        first_id_at_or_after(reader, lower)?,
+        first_id_at_or_after(reader, until)?,
+    ) else {
+        return Ok(Watched::Held(Vec::new()));
+    };
+    // Each transaction's rows, then its commit record; a floor is no transaction's.
+    let mut closed: Vec<(Vec<u8>, Vec<RowChange>)> = Vec::new();
+    let mut open: Option<(Vec<u8>, Vec<RowChange>)> = None;
+    let mut rows = 0_usize;
+    let mut next_start = None;
+    each_row(reader, first, past, |row| {
+        if limit.reached(closed.len(), rows) {
+            // The first row past a full read: where the next transaction starts.
+            next_start = Some(row.start);
+            return Ok(false);
+        }
+        if row.is_floor() {
+            return Ok(true);
+        }
+        if row.change_type == COMMIT {
+            if let Some(transaction) = open.take() {
+                closed.push(transaction);
+            }
+            return Ok(true);
+        }
+        let start = row.start.clone();
+        if let Some(change) = row.change()? {
+            rows += 1;
+            open.get_or_insert_with(|| (start, Vec::new()))
+                .1
+                .push(change);
+        }
+        Ok(true)
+    })?;
+    closed.extend(open);
+    let mut transactions = Vec::with_capacity(closed.len());
+    let mut transactions_iter = closed.into_iter().peekable();
+    while let Some((start, changes)) = transactions_iter.next() {
+        let position = match transactions_iter.peek() {
+            Some((next, _)) => next.clone(),
+            None => next_start.clone().unwrap_or_else(|| until.to_vec()),
+        };
+        transactions.push(RecordedTransaction {
+            start: (!start.is_empty()).then(|| Position::from(start)),
+            position: Position::from(position),
+            changes,
+        });
+    }
+    Ok(Watched::Held(transactions))
 }
 
 /// Decodes a flat array of `name, type, value` triples.

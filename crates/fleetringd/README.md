@@ -306,6 +306,7 @@ A token is checked when a request arrives, and a stream opened with one (`WatchL
 | `Database.DescribeArchive` | read on the database, or fleet | — |
 | `Database.VerifyArchive` | admin on the database | — |
 | `Database.RemoveOrphan` | fleet | — |
+| `Database.WatchChanges` | stream on the database | — |
 
 ## Observability
 

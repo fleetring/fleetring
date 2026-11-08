@@ -23,7 +23,13 @@ use crate::observe::request_id::{CURRENT, REQUEST_ID_KEY, RequestIds};
 
 /// The methods that take or return a stream: their duration is how long the stream stays open,
 /// which says nothing about latency, so only their counts are kept.
-const STREAMING: &[&str] = &["WatchMembership", "Replicate", "Snapshot", "WatchLeases"];
+const STREAMING: &[&str] = &[
+    "WatchMembership",
+    "Replicate",
+    "Snapshot",
+    "WatchLeases",
+    "WatchChanges",
+];
 
 /// The header a response's final status code is in: the response's own headers for a
 /// trailers-only response, else its trailers.

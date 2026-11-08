@@ -121,6 +121,9 @@ const _: () = {
     assert_debug_send_sync::<data::DurabilityChange>();
     assert_debug_send_sync::<data::LeaseUpdate>();
     assert_debug_send_sync::<data::LeaseUpdates>();
+    assert_debug_send_sync::<data::ChangeUpdate>();
+    assert_debug_send_sync::<data::ChangeUpdates>();
+    assert_debug_send_sync::<data::ChangedTransaction>();
     assert_debug_send_sync::<data::Location>();
     assert_debug_send_sync::<mcp::Access>();
     assert_debug_send_sync::<mcp::McpError>();

@@ -13,8 +13,8 @@ use crate::actor::{
 };
 use crate::changes::CaptureRules;
 use crate::engine::{
-    DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Schema, SchemaRequest,
-    Statement, Transaction,
+    CaptureMode, DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Schema,
+    SchemaRequest, Statement, Transaction,
 };
 use crate::layout;
 use crate::publisher::BatchPublisher;
@@ -127,6 +127,13 @@ impl Registry {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// The mode `name` records its row changes in on this node, or `None` if no logical change
+    /// stream here reads it, so that it records nothing.
+    #[must_use]
+    pub(crate) fn capture_mode(&self, name: &DatabaseName) -> Option<CaptureMode> {
+        self.inner.recorded.mode_for(name)
     }
 
     /// Creates a database and leaves it open.

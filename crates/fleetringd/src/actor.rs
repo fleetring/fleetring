@@ -23,8 +23,8 @@ use crate::changes::MarkHome;
 use crate::engine::{
     CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot,
     EngineError, Executed, Execution, FrameBatch, FrameSource, LogicalChanges, OpenMode,
-    PinnedSnapshot, Position, ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Shape,
-    Statement, Transaction,
+    PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange, Rows,
+    Schema, SchemaRequest, Shape, Statement, Transaction,
 };
 use crate::publisher::{
     Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
@@ -42,6 +42,12 @@ pub(crate) enum Request {
     CommittedSince(Option<Position>, Reply<Option<FrameBatch>>),
     CommittedBetween(Option<Position>, Position, Reply<Option<FrameBatch>>),
     RowChanges(Option<Position>, Position, Reply<Vec<RowChange>>),
+    Transactions(
+        Option<Position>,
+        Position,
+        ReadLimit,
+        Reply<Vec<RecordedTransaction>>,
+    ),
     ReleaseChanges(Position, Reply<()>),
     SinkMarks(Reply<Option<BTreeMap<String, Position>>>),
     StageSinkMark(String, Position, Reply<MarkHome>),
@@ -75,6 +81,9 @@ impl Request {
                 let _ = reply.send(Err(error));
             }
             Self::CommittedBetween(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Transactions(_, _, _, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::RowChanges(_, _, reply) => {
@@ -119,6 +128,7 @@ impl fmt::Debug for Request {
             Self::CommittedSince(..) => "CommittedSince",
             Self::CommittedBetween(..) => "CommittedBetween",
             Self::RowChanges(..) => "RowChanges",
+            Self::Transactions(..) => "Transactions",
             Self::ReleaseChanges(..) => "ReleaseChanges",
             Self::SinkMarks(_) => "SinkMarks",
             Self::StageSinkMark(..) => "StageSinkMark",
@@ -365,6 +375,25 @@ impl DatabaseHandle {
         until: Position,
     ) -> Result<Vec<RowChange>, DatabaseError> {
         self.call(|reply| Request::RowChanges(after, until, reply))
+            .await
+    }
+
+    /// The recorded transactions after `after` up to `until`, whole and in commit order, as many
+    /// as `limit` allows, for a watcher (ADR-0045). The check that the engine still holds them
+    /// and the read run as one request, so no prune falls between them.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] unless the engine records row changes; an engine error
+    /// [`EngineError::ChangesReleased`] if it no longer holds every one after `after`; and
+    /// [`DatabaseError`] if the database is closed or the changes can't be read.
+    pub(crate) async fn recorded_transactions(
+        &self,
+        after: Option<Position>,
+        until: Position,
+        limit: ReadLimit,
+    ) -> Result<Vec<RecordedTransaction>, DatabaseError> {
+        self.call(|reply| Request::Transactions(after, until, limit, reply))
             .await
     }
 
@@ -785,6 +814,20 @@ impl Actor {
                     .call(move |database| {
                         Ok(logical_changes(database, "reading row changes")?
                             .changes_between(after.as_ref(), &until)?)
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            Request::Transactions(after, until, limit, reply) => {
+                let result = self
+                    .call(move |database| {
+                        Ok(
+                            logical_changes(database, "watching changes")?.transactions_after(
+                                after.as_ref(),
+                                &until,
+                                limit,
+                            )?,
+                        )
                     })
                     .await;
                 let _ = reply.send(result);

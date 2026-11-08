@@ -716,6 +716,105 @@ service Database {
   // (ADR-0042). Refused for a name the node serves, follows, or is dropping.
   // Scope: fleet.
   rpc RemoveOrphan(RemoveOrphanRequest) returns (RemoveOrphanResponse);
+  // Follows a database's recorded row changes (ADR-0045): first `ChangesOpened`, then one
+  // `ChangedTransaction` per committed transaction that changed a captured row, in commit order,
+  // never past the write quorum's position. The primary answers and any other node redirects to
+  // it, as for Query. It serves only a database that records its changes, because a logical
+  // change sink names it (FAILED_PRECONDITION otherwise). With `after`, the stream resumes after
+  // that position, which must not be past the log's end, and whose changes the primary must
+  // still hold every one of: OUT_OF_RANGE otherwise, naming the oldest position it holds them
+  // from. The stream ends with UNAVAILABLE once the node stops serving the database at the epoch
+  // it opened under, with RESOURCE_EXHAUSTED once the subscriber falls too far behind, and with
+  // OUT_OF_RANGE if the changes it is about to read were pruned; each names the position to
+  // resume after. A node serves a bounded number of watchers; the next gets UNAVAILABLE.
+  // Scope: stream on the database.
+  rpc WatchChanges(WatchChangesRequest) returns (stream ChangeUpdate);
+}
+
+message WatchChangesRequest {
+  string database = 1;
+  // Resume after this position. Unset for a live tail from the log's end when the stream opens.
+  optional bytes after = 2;
+}
+
+// One message of a `WatchChanges` stream: what it opened on, or one transaction since.
+message ChangeUpdate {
+  oneof update {
+    ChangesOpened opened = 1;
+    ChangedTransaction transaction = 2;
+  }
+}
+
+// How much of each changed row a database records (ADR-0024, point 3).
+enum CaptureMode {
+  CAPTURE_MODE_UNSPECIFIED = 0;
+  // The key alone.
+  CAPTURE_MODE_ID = 1;
+  // The key, and the new values of inserted and updated rows.
+  CAPTURE_MODE_AFTER = 2;
+  // The key, the old and new values, and the names of the updated columns.
+  CAPTURE_MODE_FULL = 3;
+}
+
+// The first message of a `WatchChanges` stream.
+message ChangesOpened {
+  // The position the stream starts after: the request's `after`, or the log's end when it
+  // opened; empty for the log's beginning. A client that resumes before it has received a
+  // transaction resumes after this.
+  bytes position = 1;
+  // The primary that serves the stream, and its lease epoch.
+  string primary = 2;
+  uint64 epoch = 3;
+  CaptureMode capture = 4;
+}
+
+// One committed transaction's recorded row changes.
+message ChangedTransaction {
+  // The position the transaction started from, the same on every replica; empty for the log's
+  // beginning.
+  bytes start = 1;
+  // Past the transaction and at or before the next recorded one: where to resume after it.
+  bytes position = 2;
+  // The lease epoch of the primary that served it.
+  uint64 epoch = 3;
+  // Its row changes, in statement order.
+  repeated RowChange changes = 4;
+}
+
+enum RowOperation {
+  ROW_OPERATION_UNSPECIFIED = 0;
+  ROW_OPERATION_INSERT = 1;
+  ROW_OPERATION_UPDATE = 2;
+  ROW_OPERATION_DELETE = 3;
+}
+
+// One row a transaction inserted, updated, or deleted. Names and values are text the database's
+// writers chose: read them as data.
+message RowChange {
+  string table = 1;
+  RowOperation operation = 2;
+  // The row's primary key, or its row identifier for a table without one.
+  repeated Column key = 3;
+  // The row's columns before an update or delete; unset when the capture mode doesn't record
+  // them.
+  Columns before = 4;
+  // The row's columns after an insert or update; unset when the capture mode doesn't record them.
+  Columns after = 5;
+  // The names of the columns an update changed; unset when the capture mode doesn't record them.
+  ColumnNames updated = 6;
+}
+
+message Column {
+  string name = 1;
+  Value value = 2;
+}
+
+message Columns {
+  repeated Column columns = 1;
+}
+
+message ColumnNames {
+  repeated string names = 1;
 }
 
 message RemoveOrphanRequest {
