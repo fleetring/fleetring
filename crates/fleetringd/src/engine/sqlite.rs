@@ -484,6 +484,9 @@ impl Database for SqliteDatabase {
             return Err(classify(error));
         }
         self.marks.committed();
+        if let Some(recorder) = &mut self.recorder {
+            recorder.committed();
+        }
         Ok(Executed {
             rows_affected: self
                 .writer

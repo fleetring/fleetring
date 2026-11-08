@@ -253,6 +253,12 @@ impl Recorder {
         insert_floor(writer, first_kept - 1, before)
     }
 
+    /// After the current transaction committed: what it set up stays, so no later rollback
+    /// takes it back.
+    pub(super) fn committed(&mut self) {
+        self.undone_by_rollback = Fresh::default();
+    }
+
     /// After the current transaction rolled back: forgets what it set up, the change table and
     /// the triggers, which the rollback took with it, so that the next transaction sets them up
     /// again.
@@ -824,23 +830,26 @@ pub(super) fn transactions_after(
     ) else {
         return Ok(Watched::Held(Vec::new()));
     };
-    // Each transaction's rows, then its commit record; a floor is no transaction's.
+    // Each transaction's rows, then its commit record; a floor is no transaction's. The limit is
+    // looked at only once a commit record has closed a transaction, so a read never cuts one.
     let mut closed: Vec<(Vec<u8>, Vec<RowChange>)> = Vec::new();
     let mut open: Option<(Vec<u8>, Vec<RowChange>)> = None;
     let mut rows = 0_usize;
+    let mut full = false;
     let mut next_start = None;
     each_row(reader, first, past, |row| {
-        if limit.reached(closed.len(), rows) {
+        if row.is_floor() {
+            return Ok(true);
+        }
+        if full {
             // The first row past a full read: where the next transaction starts.
             next_start = Some(row.start);
             return Ok(false);
         }
-        if row.is_floor() {
-            return Ok(true);
-        }
         if row.change_type == COMMIT {
             if let Some(transaction) = open.take() {
                 closed.push(transaction);
+                full = limit.reached(closed.len(), rows);
             }
             return Ok(true);
         }
@@ -893,4 +902,28 @@ fn decode_columns(json: &str) -> Result<Vec<Column>, EngineError> {
             column(Recorded(name, kind, triple[2].clone()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_committed_transaction_keeps_what_it_set_up_through_a_later_rollback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let writer = Connection::open_in_memory()?;
+        writer.execute_batch("CREATE TABLE t (v)")?;
+        let mut recorder = Recorder::install(&writer, CaptureMode::After)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        recorder.begin(&writer, None)?;
+        recorder.commit(&writer)?;
+        writer.execute_batch("COMMIT")?;
+        recorder.committed();
+        // A later transaction that fails before the recorder begins it rolls back nothing of
+        // the committed one's.
+        recorder.rolled_back();
+        assert!(recorder.created, "the change table stays known");
+        assert!(recorder.schema_version.is_some(), "the triggers stay built");
+        Ok(())
+    }
 }

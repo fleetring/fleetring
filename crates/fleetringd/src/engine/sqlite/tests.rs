@@ -1142,6 +1142,76 @@ fn a_watcher_reads_whole_transactions_with_positions_to_resume_after() -> TestRe
     Ok(())
 }
 
+/// A transaction inserting `values` into `t`.
+/// The log's end is read after the write, as the actor does when it captures each batch, so
+/// the next transaction records where it starts.
+fn insert_all(db: &mut SqliteDatabase, values: &[i64]) -> Result<(), EngineError> {
+    db.execute(&Transaction::new(values.iter().map(|value| {
+        Statement::new(format!("INSERT INTO t VALUES ({value})"))
+    })))?;
+    db.position()?;
+    Ok(())
+}
+
+fn row_limit(rows: usize) -> Result<ReadLimit, Box<dyn Error>> {
+    Ok(ReadLimit::new(
+        std::num::NonZeroUsize::MAX,
+        rows.try_into()?,
+    ))
+}
+
+#[test]
+fn a_row_budget_never_cuts_a_transaction() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    // A has one row, B three, C one; the budget is three rows, which B reaches inside itself.
+    insert_all(&mut db, &[10])?;
+    insert_all(&mut db, &[20, 21, 22])?;
+    insert_all(&mut db, &[30])?;
+    let read = watched(&mut db, start.as_ref(), row_limit(3)?)?;
+    assert_eq!(read.len(), 2, "A and B, B whole: {read:?}");
+    assert_eq!(inserted_values(&read[0]), [Value::Integer(10)]);
+    assert_eq!(
+        inserted_values(&read[1]),
+        [Value::Integer(20), Value::Integer(21), Value::Integer(22)]
+    );
+    let b = &read[1];
+    assert!(
+        Some(&b.position) > b.start.as_ref(),
+        "B resumes past itself: {b:?}"
+    );
+    let rest = watched(&mut db, Some(&b.position), row_limit(3)?)?;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(inserted_values(&rest[0]), [Value::Integer(30)]);
+
+    // The budget reached exactly at a transaction's last row stops after that transaction.
+    let exact = watched(&mut db, start.as_ref(), row_limit(4)?)?;
+    assert_eq!(exact.len(), 2, "{exact:?}");
+    assert_eq!(exact[1].position, rest[0].start.clone().ok_or("C's start")?);
+    Ok(())
+}
+
+#[test]
+fn a_transaction_larger_than_the_budget_is_read_whole() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    let values: Vec<i64> = (0..50).collect();
+    insert_all(&mut db, &values)?;
+    insert_all(&mut db, &[99])?;
+    let read = watched(&mut db, start.as_ref(), row_limit(10)?)?;
+    assert_eq!(read.len(), 1, "the big one alone, whole");
+    assert_eq!(read[0].changes.len(), 50);
+    assert!(Some(&read[0].position) > read[0].start.as_ref());
+    let rest = watched(&mut db, Some(&read[0].position), row_limit(10)?)?;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(inserted_values(&rest[0]), [Value::Integer(99)]);
+    Ok(())
+}
+
 #[test]
 fn a_pruned_range_is_refused_with_the_oldest_position_held() -> TestResult {
     let dir = tempfile::tempdir()?;

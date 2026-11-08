@@ -7,9 +7,9 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::engine::{
-    CaptureMode, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, LogicalSupport,
-    PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange, Rows,
-    Schema, SchemaRequest, Statement, Transaction,
+    CaptureMode, ChangesAfter, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch,
+    LogicalSupport, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition,
+    RowChange, Rows, Schema, SchemaRequest, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -530,7 +530,7 @@ pub enum EngineError {
     },
     /// The recorded row changes after a position are no longer all held: some were released
     /// and pruned, or were never recorded (ADR-0045, point 4).
-    #[error("the recorded changes after {position} are no longer held")]
+    #[error("the recorded changes {} are no longer held", ChangesAfter(position))]
     ChangesReleased {
         /// The position asked for.
         position: Position,
