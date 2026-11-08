@@ -335,6 +335,15 @@ impl DataMetrics {
             .get_or_create(&OutcomeLabels { outcome })
             .get()
     }
+
+    /// How many `Query` calls ended with `outcome`.
+    #[cfg(test)]
+    pub(crate) fn queries(&self, outcome: &'static str) -> u64 {
+        self.queries
+            .0
+            .get_or_create(&OutcomeLabels { outcome })
+            .get()
+    }
 }
 
 /// The replication families, which a node's streams, followers, and snapshots update.

@@ -125,9 +125,11 @@ const DEFAULT_STATEMENT_TIMEOUT: NonZeroU64 = NonZeroU64::new(30_000).expect("30
 /// A statement still running at its deadline is interrupted on the node: a query or a schema
 /// read fails, and a write rolls back, committing and replicating nothing. The client gets
 /// `DEADLINE_EXCEEDED`. A request whose call sets its own deadline (the gRPC `grpc-timeout`
-/// header, which `db query --timeout` and `fleetring mcp` send) stops at the earlier of that and
-/// this limit, and one whose call is cancelled stops at once. The deadline counts from when the
-/// node takes the request, so it includes any wait behind the database's other requests.
+/// header, which `db exec`, `db query`, and `fleetring mcp` send) stops at the earlier of this
+/// limit and that deadline less a tenth of it, at most 100 ms, so that the node answers before
+/// the call's deadline passes. One whose call is cancelled stops at once. The deadline counts
+/// from when the node takes the request, so it includes any wait behind the database's other
+/// requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {

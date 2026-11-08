@@ -28,6 +28,7 @@ use crate::data::node::{DataNode, restore_status};
 use crate::data::watch::{self, ChangeStream};
 use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Interruption, Position, Transaction};
+use crate::observe::DataMetrics;
 use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
@@ -135,14 +136,25 @@ impl DatabaseService {
     }
 }
 
+/// The most a statement's deadline comes before its call's own: see [`statement_deadline`].
+const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
 /// The deadline of the statement `request` carries: `limit` from now, or the call's own
-/// `grpc-timeout` if it is shorter. A malformed header is ignored, leaving the limit.
+/// `grpc-timeout` if that is shorter, less a margin. A malformed header is ignored, leaving the
+/// limit.
+///
+/// tonic enforces a call's `grpc-timeout` itself, from a timer that starts when the request
+/// arrives: once it fires it drops the handler and answers `CANCELLED`, `Timeout expired`. The
+/// node's own deadline therefore comes a tenth of the asked time earlier, at most
+/// [`DEADLINE_MARGIN`], so that the interrupt stops the statement and the handler answers
+/// `DEADLINE_EXCEEDED`, saying why, before tonic's timer does.
 fn statement_deadline<T>(request: &Request<T>, limit: Duration) -> Instant {
     let asked = request
         .metadata()
         .get(GRPC_TIMEOUT)
         .and_then(|value| value.to_str().ok())
-        .and_then(grpc_timeout);
+        .and_then(grpc_timeout)
+        .map(|asked| asked.saturating_sub((asked / 10).min(DEADLINE_MARGIN)));
     let timeout = asked.map_or(limit, |asked| asked.min(limit));
     let now = Instant::now();
     // A limit too large for the clock means no limit worth keeping: a year stands in for it.
@@ -175,7 +187,7 @@ fn grpc_timeout(text: &str) -> Option<Duration> {
 
 /// How an `Execute` that failed with `status` is counted: `redirected` to the primary,
 /// `refused` before it ran (no primary here to name, or no such database), `aborted` when it may
-/// or may not have taken effect, and `failed` otherwise.
+/// or may not have taken effect, `cancelled` when its call was, and `failed` otherwise.
 fn write_outcome(status: &Status) -> &'static str {
     if primary_hint(status).is_some() {
         return "redirected";
@@ -183,7 +195,50 @@ fn write_outcome(status: &Status) -> &'static str {
     match status.code() {
         Code::Unavailable | Code::NotFound => "refused",
         Code::Aborted => "aborted",
+        Code::Cancelled => "cancelled",
         _ => "failed",
+    }
+}
+
+/// Which call [`CountedOnDrop`] counts.
+#[derive(Debug, Clone, Copy)]
+enum Call {
+    Write,
+    Query,
+}
+
+/// Counts its call as `cancelled` when dropped before [`disarm`](Self::disarm): the caller
+/// cancelled the call, or its deadline passed, and tonic dropped the handler mid-flight.
+struct CountedOnDrop<'m> {
+    metrics: &'m DataMetrics,
+    call: Call,
+    armed: bool,
+}
+
+impl<'m> CountedOnDrop<'m> {
+    fn new(metrics: &'m DataMetrics, call: Call) -> Self {
+        Self {
+            metrics,
+            call,
+            armed: true,
+        }
+    }
+
+    /// The call ended with an outcome of its own, which its caller counts.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CountedOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.call {
+            Call::Write => self.metrics.write("cancelled", None),
+            Call::Query => self.metrics.query("cancelled", None),
+        }
     }
 }
 
@@ -289,8 +344,10 @@ impl Database for DatabaseService {
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
         let started = tokio::time::Instant::now();
-        let result = self.run_execute(request).await;
         let metrics = self.node.metrics();
+        let counted = CountedOnDrop::new(metrics, Call::Write);
+        let result = self.run_execute(request).await;
+        counted.disarm();
         match &result {
             Ok(_) => metrics.write("acknowledged", Some(started.elapsed())),
             Err(status) => metrics.write(write_outcome(status), None),
@@ -303,11 +360,14 @@ impl Database for DatabaseService {
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
         let started = tokio::time::Instant::now();
-        let result = self.run_query(request).await;
         let metrics = self.node.metrics();
+        let counted = CountedOnDrop::new(metrics, Call::Query);
+        let result = self.run_query(request).await;
+        counted.disarm();
         match &result {
             Ok(_) => metrics.query("ok", Some(started.elapsed())),
             Err(status) if primary_hint(status).is_some() => metrics.query("redirected", None),
+            Err(status) if status.code() == Code::Cancelled => metrics.query("cancelled", None),
             Err(_) => metrics.query("failed", None),
         }
         result
@@ -611,6 +671,31 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_call_is_counted_as_cancelled() {
+        let metrics = DataMetrics::default();
+        drop(CountedOnDrop::new(&metrics, Call::Write));
+        assert_eq!(metrics.writes("cancelled"), 1);
+        drop(CountedOnDrop::new(&metrics, Call::Query));
+        assert_eq!(metrics.queries("cancelled"), 1);
+        CountedOnDrop::new(&metrics, Call::Write).disarm();
+        CountedOnDrop::new(&metrics, Call::Query).disarm();
+        assert_eq!(
+            metrics.writes("cancelled"),
+            1,
+            "a call with its own outcome"
+        );
+        assert_eq!(
+            metrics.queries("cancelled"),
+            1,
+            "a call with its own outcome"
+        );
+        assert_eq!(
+            write_outcome(&Status::cancelled("Timeout expired")),
+            "cancelled"
+        );
+    }
+
+    #[test]
     fn grpc_timeouts_parse_as_the_protocol_writes_them() {
         assert_eq!(grpc_timeout("2H"), Some(Duration::from_secs(7_200)));
         assert_eq!(grpc_timeout("3M"), Some(Duration::from_secs(180)));
@@ -642,10 +727,17 @@ mod tests {
         let now = Instant::now();
         let mut request = Request::new(());
         assert_eq!(statement_deadline(&request, limit), now + limit);
+        // A tenth of the asked time earlier, so the node answers before tonic's own timer.
+        request.set_timeout(Duration::from_millis(500));
+        assert_eq!(
+            statement_deadline(&request, limit),
+            now + Duration::from_millis(450)
+        );
+        // At most 100 ms earlier.
         request.set_timeout(Duration::from_millis(1_500));
         assert_eq!(
             statement_deadline(&request, limit),
-            now + Duration::from_millis(1_500)
+            now + Duration::from_millis(1_400)
         );
         request.set_timeout(Duration::from_secs(600));
         assert_eq!(statement_deadline(&request, limit), now + limit);
