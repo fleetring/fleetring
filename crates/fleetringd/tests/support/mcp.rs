@@ -126,6 +126,44 @@ impl Session {
         .await?
     }
 
+    /// Sends a `tools/call` for each of `calls` at once, without waiting between them, as a
+    /// client that runs tools in parallel does, and returns the responses in the calls' order.
+    pub(crate) async fn call_all(
+        &mut self,
+        calls: &[(&str, Value)],
+    ) -> Result<Vec<Value>, Box<dyn Error>> {
+        let mut ids = Vec::new();
+        for (tool, arguments) in calls {
+            self.next_id += 1;
+            ids.push(self.next_id);
+            let message = json!({
+                "jsonrpc": "2.0",
+                "id": self.next_id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            });
+            self.send(&message).await?;
+        }
+        let mut answers: Vec<Option<Value>> = vec![None; ids.len()];
+        tokio::time::timeout(HANG_GUARD, async {
+            while answers.iter().any(Option::is_none) {
+                let line = self
+                    .stdout
+                    .next_line()
+                    .await?
+                    .ok_or("the server closed stdout")?;
+                self.lines.push(line.clone());
+                let message: Value = serde_json::from_str(&line)?;
+                if let Some(at) = ids.iter().position(|id| message["id"] == json!(id)) {
+                    answers[at] = Some(message);
+                }
+            }
+            Ok::<_, Box<dyn Error>>(())
+        })
+        .await??;
+        Ok(answers.into_iter().flatten().collect())
+    }
+
     pub(crate) async fn tools(&mut self) -> Result<Vec<Value>, Box<dyn Error>> {
         let listed = self.request("tools/list", json!({})).await?;
         Ok(listed["result"]["tools"]

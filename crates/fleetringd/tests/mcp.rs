@@ -1359,6 +1359,61 @@ async fn changes_stay_within_the_result_bound_and_continue_where_they_stopped() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_server_holds_at_most_two_watcher_slots() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let node = Node::start_with(dir.path(), Setup::Recording).await?;
+    let mut mcp = node.mcp(&[]).await?;
+    with_notes(&mut mcp, "agent-42-notes").await?;
+    let streams = node
+        .daemon
+        .change_streams()
+        .ok_or("the node's change streams")?;
+    // Counts the node's watchers while the calls run, and keeps the most seen.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let counter = {
+        let streams = streams.clone();
+        let done = std::sync::Arc::clone(&done);
+        tokio::spawn(async move {
+            let mut most = 0;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                most = most.max(streams.watchers());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            most
+        })
+    };
+    // Six calls at once, as a client that runs tools in parallel sends them; each would hold a
+    // watcher slot for about two seconds.
+    let calls: Vec<(&str, Value)> = (0..6)
+        .map(|_| ("changes", json!({"database": "agent-42-notes"})))
+        .collect();
+    let answers = mcp.call_all(&calls).await?;
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let most = counter.await?;
+    assert!(
+        (1..=2).contains(&most),
+        "{most} watchers at once from one server"
+    );
+    let mut ran = 0;
+    for answer in &answers {
+        let result = &answer["result"];
+        assert_eq!(result["isError"], false, "{answer}");
+        let out = &result["structuredContent"];
+        assert_eq!(out["transactions"], json!([]), "{out}");
+        if out["capture_mode"].is_null() {
+            // No turn in time: nothing collected, and more to read.
+            assert_eq!(out["more"], true, "{out}");
+        } else {
+            ran += 1;
+        }
+    }
+    assert!(ran >= 2, "{ran} of 6 calls ran");
+    mcp.close().await?;
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changes_maps_each_refusal_to_a_tool_error() -> TestResult {
     let dir = tempfile::tempdir()?;
     let node = Node::start_with(dir.path(), Setup::Recording).await?;
