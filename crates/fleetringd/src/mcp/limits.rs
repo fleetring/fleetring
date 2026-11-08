@@ -42,3 +42,21 @@ pub const DEFAULT_COUNT_LIMIT: u64 = 10_000;
 /// How long one tool call may take, from the request to the reply, before it fails with
 /// `deadline_exceeded`. A write that times out may still have taken effect.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many transactions `changes` returns unless its `limit` says otherwise.
+pub const DEFAULT_CHANGES_LIMIT: u32 = 20;
+
+/// The most transactions `changes` returns, whatever its `limit` says.
+pub const MAX_CHANGES_LIMIT: u32 = 100;
+
+/// The longest `changes` waits for transactions once its stream is open. It returns sooner
+/// once it holds `limit` of them, or once [`CHANGES_QUIET`] passes after the last one, so a call
+/// that finds nothing new returns after this long with no transactions.
+pub const CHANGES_WAIT: Duration = Duration::from_secs(2);
+
+/// How long `changes` waits for another transaction after one arrives before it returns what
+/// it holds: a backlog arrives at once, so a pause this long means it has caught up.
+pub const CHANGES_QUIET: Duration = Duration::from_millis(250);
+
+/// The longest position `changes` takes as `after`, in bytes: more than any engine's.
+pub const MAX_POSITION_BYTES: usize = 64;
