@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-upgrade \- Installs another release in place of this binary
 .SH SYNOPSIS
-\fBfleetring upgrade\fR [\fB\-\-version\fR] [\fB\-\-check\fR] [\fB\-\-no\-restart\fR] [\fB\-\-rollback\fR] [\fB\-\-base\-url\fR] [\fB\-\-releases\-url\fR] [\fB\-\-timeout\fR] [\fB\-\-software\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-token\fR] [\fB\-\-color\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBfleetring upgrade\fR [\fB\-\-version\fR] [\fB\-\-check\fR] [\fB\-\-no\-restart\fR] [\fB\-\-rollback\fR] [\fB\-\-base\-url\fR] [\fB\-\-releases\-url\fR] [\fB\-\-timeout\fR] [\fB\-\-software\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-\-token\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Installs another release in place of this binary
 .PP
@@ -102,15 +102,25 @@ Writes log lines as `text` or `json`
 
 Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
 .TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+A bearer token from `token issue`, sent with every request
+
+The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
+.TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Prints the result and errors only
 
 No progress, notes, warnings or override warnings. A command with no result then prints nothing.
 .TP
-\fB\-\-token\fR \fI<TOKEN>\fR
-A bearer token from `token issue`, sent with every request
+\fB\-\-token\-file\fR \fI<PATH>\fR
+A file that holds a bearer token, or `\-` for stdin
 
-The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
+Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
+.TP
+\fB\-\-agent\fR \fI<ID>\fR
+Acts as the agent with this ID, with the identity minted for it
+
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-color\fR \fI<COLOR>\fR [default: auto]
 When to colour log lines and the picker
@@ -128,16 +138,6 @@ always: Always, even into a pipe or a file
 .IP \(bu 2
 never: Never
 .RE
-.TP
-\fB\-\-token\-file\fR \fI<PATH>\fR
-A file that holds a bearer token, or `\-` for stdin
-
-Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
-.TP
-\fB\-\-agent\fR \fI<ID>\fR
-Acts as the agent with this ID, with the identity minted for it
-
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

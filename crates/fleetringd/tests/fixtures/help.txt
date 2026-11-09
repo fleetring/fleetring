@@ -11,6 +11,7 @@ Examples:
 Getting started:
   dev          Runs a node for development; `-d` runs it in the background
   serve        Runs a node
+  router       Runs a router, the libSQL/Hrana front door to the fleet
   stop         Stops a node started in a terminal or a script, after it drains
   switch       Makes another context current
   context      Names, lists and selects contexts, so commands need no flags

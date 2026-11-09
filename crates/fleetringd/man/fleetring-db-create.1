@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-db\-create \- Creates a SQLite database, places it with the ring, and opens it on its primary
 .SH SYNOPSIS
-\fBfleetring db create\fR [\fB\-\-replication\-factor\fR] [\fB\-\-acks\fR] [\fB\-\-min\-replicas\fR] [\fB\-\-description\fR] [\fB\-\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-log\-format\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBfleetring db create\fR [\fB\-\-replication\-factor\fR] [\fB\-\-acks\fR] [\fB\-\-min\-replicas\fR] [\fB\-\-description\fR] [\fB\-\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Creates a SQLite database, places it with the ring, and opens it on its primary
 .SH OPTIONS
@@ -90,11 +90,6 @@ A bearer token from `token issue`, sent with every request
 
 The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
 .TP
-\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
-Writes log lines as `text` or `json`
-
-Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
-.TP
 \fB\-\-token\-file\fR \fI<PATH>\fR
 A file that holds a bearer token, or `\-` for stdin
 
@@ -104,6 +99,11 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 Acts as the agent with this ID, with the identity minted for it
 
 The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Prints the result and errors only

@@ -29,6 +29,7 @@ mod publisher;
 mod registry;
 pub mod replication;
 pub mod report;
+pub mod router;
 #[cfg(feature = "simulation")]
 pub mod sim;
 pub mod software;

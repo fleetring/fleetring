@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-db\-edit \- Changes a database\*(Aqs description, labels, expiry, or durability
 .SH SYNOPSIS
-\fBfleetring db edit\fR [\fB\-\-description\fR] [\fB\-\-clear\-description\fR] [\fB\-\-label\fR] [\fB\-\-remove\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-clear\-expiry\fR] [\fB\-\-acks\fR] [\fB\-\-min\-replicas\fR] [\fB\-\-if\-version\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-log\-format\fR] [\fB\-\-key\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-as\fR] [\fB\-\-color\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBfleetring db edit\fR [\fB\-\-description\fR] [\fB\-\-clear\-description\fR] [\fB\-\-label\fR] [\fB\-\-remove\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-clear\-expiry\fR] [\fB\-\-acks\fR] [\fB\-\-min\-replicas\fR] [\fB\-\-if\-version\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-log\-format\fR] [\fB\-\-as\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Changes a database\*(Aqs description, labels, expiry, or durability
 .PP
@@ -105,25 +105,25 @@ The client certificate, PEM; overrides `\-\-as`
 
 Defaults to `FLEETRING_CERT`, the context\*(Aqs `cert`, or `client.crt` in the TLS directory.
 .TP
-\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
-Writes log lines as `text` or `json`
-
-Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
-.TP
 \fB\-\-key\fR \fI<KEY>\fR
 The client certificate\*(Aqs private key, PEM; overrides `\-\-as`
 
 Defaults to `FLEETRING_KEY`, the context\*(Aqs `key`, or `client.key` in the TLS directory.
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-Prints the result and errors only
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
 
-No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
 .TP
 \fB\-\-as\fR \fI<PRINCIPAL>\fR
 Acts as this principal, with its certificate in the TLS directory
 
 Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as `cert client <principal>` writes them. An explicit certificate or key at the same step wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults to `FLEETRING_AS`, or else the context\*(Aqs `as`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
 .TP
 \fB\-\-color\fR \fI<COLOR>\fR [default: auto]
 When to colour log lines and the picker
