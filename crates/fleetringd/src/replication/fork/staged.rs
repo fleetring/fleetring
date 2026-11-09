@@ -31,7 +31,7 @@ use fleetring_control::{DatabaseName, Incarnation};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_128;
 
-use super::super::archive::{CHECKSUM_LEN, remove_dir_if_present};
+use super::super::archive::{CHECKSUM_LEN, is_plain_name, remove_dir_if_present};
 use super::super::epochs::sync_dir;
 use crate::engine::Position;
 use crate::layout;
@@ -130,9 +130,14 @@ impl Sidecar {
         }
     }
 
+    /// The sidecar `file` describes, or `None` if it is malformed: a sidecar whose files aren't
+    /// plain names inside the copy's directory describes a damaged copy, never a path to follow.
     fn from_file(file: SidecarFile) -> Option<Self> {
         let incarnation = |text: &str| u64::from_str_radix(text, 16).ok().map(Incarnation::new);
         if file.version != 1 || file.log_epoch != 0 {
+            return None;
+        }
+        if !file.files.iter().all(|staged| is_plain_name(&staged.name)) {
             return None;
         }
         let name: DatabaseName = file.database.parse().ok()?;
@@ -607,6 +612,33 @@ mod tests {
             again.verify(&first, (&position, &ChainHash::GENESIS)),
             Err(CopyLossReason::Missing)
         );
+    }
+
+    #[test]
+    fn a_sidecar_naming_a_file_outside_its_copy_is_a_damaged_copy() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = StagedStore::new(dir.path().join("staged"));
+        let first = key(1);
+        let sidecar = stage(&store, &first, b"hello");
+        let position = Position::new([1, 2, 3]);
+        for name in ["../../escape", "/etc/passwd", "a/b", "..", ""] {
+            let mut file = sidecar.to_file();
+            file.files[0].name = name.to_owned();
+            let text = serde_json::to_string(&file).expect("json");
+            fs::write(first.dir(store.root()).join(SIDECAR), text).expect("tamper");
+            assert_eq!(
+                store.verify(&first, (&position, &ChainHash::GENESIS)),
+                Err(CopyLossReason::Damaged),
+                "{name:?}"
+            );
+            let again = StagedStore::new(dir.path().join("staged"));
+            again.scan();
+            assert_eq!(again.get(&first), None, "{name:?} isn't indexed");
+            assert!(
+                first.dir(store.root()).join(SIDECAR).is_file(),
+                "kept untouched"
+            );
+        }
     }
 
     #[test]
