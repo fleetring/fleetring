@@ -18,8 +18,10 @@ use fleetring_client::context::{ContextName, Contexts, select};
 use fleetring_client::output::{
     DatabaseList, FleetStatus, NodeStatusReport, OrphanList, ReplicaHash, VerifyReport, printable,
 };
+use fleetring_control::fork::OperationId;
 use fleetring_control::{
-    Acks, DatabaseName, Description, LabelKey, LabelValue, Labels, Liveness, parse_label,
+    Acks, DatabaseName, Description, Incarnation, LabelKey, LabelValue, Labels, Liveness,
+    parse_label,
 };
 use fleetring_control::{KeyId, Millis, ParseReleaseError, Release, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
@@ -29,7 +31,7 @@ use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
     ArchiveDescription, Client, DatabaseSpec, Expiry, LabelRequirement, LeaseUpdate, LeaseUpdates,
     ListFilter, Location, MetadataView, NewMetadata, Orphan, ReplicaInfo, Restoration,
-    RestoredExpiry, restored_metadata,
+    RestoredExpiry, StagedOrphan, restored_metadata,
 };
 use fleetringd::dev::{self, DevError, Prepared};
 use fleetringd::durability::{
@@ -604,6 +606,18 @@ enum OrphanCommand {
         /// Without it, the command asks first on a terminal, and refuses elsewhere.
         #[arg(long)]
         yes: bool,
+        /// The fork incarnation of a staged copy, 16 hex digits, as `orphan list` prints it
+        ///
+        /// A fork's staged copy is named by the database, this incarnation, `--operation-id`
+        /// and `--attempt`, all four.
+        #[arg(long, requires_all = ["operation_id", "attempt"])]
+        incarnation: Option<Incarnation>,
+        /// The fork operation ID of a staged copy, as `orphan list` prints it
+        #[arg(long, requires_all = ["incarnation", "attempt"])]
+        operation_id: Option<OperationId>,
+        /// The attempt that fetched a staged copy, as `orphan list` prints it
+        #[arg(long, requires_all = ["incarnation", "operation_id"])]
+        attempt: Option<u32>,
         #[command(flatten)]
         target: Target,
     },
@@ -2591,8 +2605,17 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             node,
             address,
             yes,
+            incarnation,
+            operation_id,
+            attempt,
             target,
         }) => {
+            let staged = match (incarnation, operation_id, attempt) {
+                (Some(incarnation), Some(operation), Some(attempt)) => {
+                    Some(StagedOrphan::new(incarnation, operation, attempt))
+                }
+                _ => None,
+            };
             let address = node_address(node.as_ref(), address, &target)
                 .await?
                 .ok_or("pass --node or --address")?;
@@ -2609,16 +2632,29 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 format!("removing the orphan copy of {}\u{2026}", shown(&name)),
                 &spinner_surroundings(MachineOutput::No),
             );
-            let epoch = client
-                .remove_orphan(&address, &name)
-                .await
-                .map_err(failed)?;
-            progress.finish_ok(format!("removed the orphan copy of {}", shown(&name)));
-            format!(
-                "removed the orphan copy of {} from epoch {} on {label}\n",
-                shown(&name),
-                epoch.get()
-            )
+            if let Some(staged) = staged {
+                client
+                    .remove_staged_orphan(&address, &name, staged)
+                    .await
+                    .map_err(failed)?;
+                progress.finish_ok(format!("removed the staged copy of {}", shown(&name)));
+                format!(
+                    "removed the staged copy of {} (attempt {}) on {label}\n",
+                    shown(&name),
+                    staged.attempt
+                )
+            } else {
+                let epoch = client
+                    .remove_orphan(&address, &name)
+                    .await
+                    .map_err(failed)?;
+                progress.finish_ok(format!("removed the orphan copy of {}", shown(&name)));
+                format!(
+                    "removed the orphan copy of {} from epoch {} on {label}\n",
+                    shown(&name),
+                    epoch.get()
+                )
+            }
         }
         Command::Lease(LeaseCommand::Watch {
             node,
@@ -3494,6 +3530,36 @@ async fn list_orphans(
 fn format_orphans(orphans: &[(String, Orphan)]) -> String {
     if orphans.is_empty() {
         return "no orphans\n".to_owned();
+    }
+    if orphans.iter().any(|(_, orphan)| orphan.staged.is_some()) {
+        let rows: Vec<[String; 7]> = orphans
+            .iter()
+            .map(|(node, orphan)| {
+                let staged = orphan.staged;
+                let or_dash = |text: Option<String>| text.unwrap_or_else(|| "-".to_owned());
+                [
+                    node.clone(),
+                    shown(&orphan.database),
+                    orphan.epoch.get().to_string(),
+                    orphan.bytes.to_string(),
+                    or_dash(staged.map(|staged| staged.incarnation.to_string())),
+                    or_dash(staged.map(|staged| staged.operation.to_string())),
+                    or_dash(staged.map(|staged| staged.attempt.to_string())),
+                ]
+            })
+            .collect();
+        return table(
+            [
+                "NODE",
+                "DATABASE",
+                "EPOCH",
+                "BYTES",
+                "INCARNATION",
+                "OPERATION",
+                "ATTEMPT",
+            ],
+            &rows,
+        );
     }
     let rows: Vec<[String; 4]> = orphans
         .iter()
@@ -4405,6 +4471,41 @@ mod tests {
         );
 
         assert_eq!(format_orphans(&[]), "no orphans\n");
+
+        // A staged copy is named by all of the incarnation, operation and attempt, or none.
+        let staged = ["--incarnation", "00000000000000ff", "--attempt", "2"];
+        let operation = OperationId::from_bytes([7; 16]).to_string();
+        let partial = [
+            &remove[..],
+            &["--node", "data-1"],
+            &staged[..],
+            &control[..],
+        ]
+        .concat();
+        assert!(Cli::try_parse_from(partial).is_err());
+        let full = [
+            &remove[..],
+            &["--node", "data-1", "--operation-id", operation.as_str()],
+            &staged[..],
+            &control[..],
+        ]
+        .concat();
+        let cli = Cli::try_parse_from(full).expect("a staged orphan remove parses");
+        let Command::Orphan(OrphanCommand::Remove {
+            incarnation,
+            operation_id,
+            attempt,
+            ..
+        }) = cli.command
+        else {
+            panic!("not orphan remove: {:?}", cli.command);
+        };
+        assert_eq!(
+            incarnation.map(|i| i.to_string()).as_deref(),
+            Some("00000000000000ff")
+        );
+        assert_eq!(operation_id.map(|id| id.to_string()), Some(operation));
+        assert_eq!(attempt, Some(2));
         assert_eq!(
             serde_json::to_value(OrphanList {
                 orphans: Vec::new()
