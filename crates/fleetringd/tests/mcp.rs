@@ -13,7 +13,7 @@ use crate::support::Tls;
 use crate::support::mcp::{HANG_GUARD, Session};
 use fleetring::ReplicationFactor;
 use fleetring_control::{DatabaseName, Labels, Millis, parse_label};
-use fleetringd::auth::{BearerToken, Grant, Scope};
+use fleetringd::auth::{BearerToken, Scope, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{Client, DatabaseSpec, NewMetadata, restored_metadata};
 use fleetringd::durability::RestoreTarget;
@@ -184,7 +184,7 @@ fn issue_token(tls: &Tls, scopes: &[&str]) -> Result<String, Box<dyn Error>> {
         .iter()
         .map(|scope| scope.parse::<Scope>())
         .collect::<Result<_, _>>()?;
-    let token = tls.authority().token_signer()?.issue(&Grant {
+    let token = tls.authority().token_signer()?.issue(&TokenSpec {
         principal: AGENT.parse()?,
         scopes,
         id: format!("agent-42-mcp-{}", now.as_millis()).parse()?,

@@ -139,7 +139,7 @@ struct Claims {
 
 /// What a token grants: who, what, and when. The issuer is the signer's fleet.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Grant {
+pub struct TokenSpec {
     /// The principal the token names.
     pub principal: Principal,
     /// What the principal may do.
@@ -165,7 +165,7 @@ pub enum IssueError {
     /// The token would last longer than [`MAX_TOKEN_LIFETIME`].
     #[error("a token lasts at most {} days", MAX_TOKEN_LIFETIME.as_secs() / (24 * 60 * 60))]
     TooLong,
-    /// The token would grant nothing.
+    /// The token would carry no scope.
     #[error("a token needs at least one scope")]
     NoScopes,
 }
@@ -218,19 +218,19 @@ impl TokenSigner {
             .expect("an Ed25519 key pair has a 32-byte public key")
     }
 
-    /// Signs a token that grants `grant`. Times are whole seconds; milliseconds are dropped.
+    /// Signs the token `spec` describes. Times are whole seconds; milliseconds are dropped.
     ///
     /// # Errors
     ///
-    /// [`IssueError::NoScopes`] for a grant without scopes, [`IssueError::Lifetime`] for one
+    /// [`IssueError::NoScopes`] for a spec without scopes, [`IssueError::Lifetime`] for one
     /// that expires before it starts, and [`IssueError::TooLong`] for one that lasts longer than
     /// [`MAX_TOKEN_LIFETIME`].
-    pub fn issue(&self, grant: &Grant) -> Result<BearerToken, IssueError> {
-        if grant.scopes.is_empty() {
+    pub fn issue(&self, spec: &TokenSpec) -> Result<BearerToken, IssueError> {
+        if spec.scopes.is_empty() {
             return Err(IssueError::NoScopes);
         }
-        let nbf = seconds(grant.not_before);
-        let exp = seconds(grant.expires_at);
+        let nbf = seconds(spec.not_before);
+        let exp = seconds(spec.expires_at);
         if exp <= nbf {
             return Err(IssueError::Lifetime);
         }
@@ -244,12 +244,12 @@ impl TokenSigner {
         };
         let claims = Claims {
             iss: self.issuer.clone(),
-            sub: grant.principal.to_string(),
-            jti: grant.id.to_string(),
+            sub: spec.principal.to_string(),
+            jti: spec.id.to_string(),
             iat: Some(nbf),
             nbf,
             exp,
-            scopes: grant
+            scopes: spec
                 .scopes
                 .as_slice()
                 .iter()
@@ -509,7 +509,7 @@ impl TokenVerifier {
             .collect::<Result<Scopes, _>>()
             .map_err(|error| refuse(TokenError::Scope(error)))?;
         Ok(Verified {
-            grant: Grant {
+            spec: TokenSpec {
                 principal,
                 scopes,
                 id,
@@ -525,7 +525,7 @@ impl TokenVerifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
     /// What the token grants.
-    pub grant: Grant,
+    pub spec: TokenSpec,
     /// The key that signed it, by which every token it signed can be revoked.
     pub key: KeyId,
 }
@@ -562,8 +562,8 @@ mod tests {
         der
     }
 
-    fn grant(scopes: &[&str]) -> Grant {
-        Grant {
+    fn spec(scopes: &[&str]) -> TokenSpec {
+        TokenSpec {
             principal: "app".parse().expect("a principal"),
             scopes: scopes
                 .iter()
@@ -584,12 +584,12 @@ mod tests {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
         let issued = signer
-            .issue(&grant(&["read:tenant:acme/*"]))
+            .issue(&spec(&["read:tenant:acme/*"]))
             .expect("issues");
         let got = verifier
             .verify(&issued, at_secs(2_000), &Revocations::new())
             .expect("verifies");
-        assert_eq!(got.grant, grant(&["read:tenant:acme/*"]));
+        assert_eq!(got.spec, spec(&["read:tenant:acme/*"]));
         assert_eq!(&got.key, signer.key_id());
 
         let header = issued.expose().split('.').next().expect("a header");
@@ -619,7 +619,7 @@ mod tests {
     fn the_validity_window_is_enforced() {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
-        let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+        let issued = signer.issue(&spec(&["read:x"])).expect("issues");
         let none = Revocations::new();
         assert_eq!(
             verifier.verify(&issued, at_secs(1_000 - NOT_BEFORE_LEEWAY_SECS - 1), &none),
@@ -645,7 +645,7 @@ mod tests {
     fn a_tampered_token_is_refused() {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
-        let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+        let issued = signer.issue(&spec(&["read:x"])).expect("issues");
         let parts: Vec<&str> = issued.expose().split('.').collect();
         let now = at_secs(2_000);
         let none = Revocations::new();
@@ -674,7 +674,7 @@ mod tests {
         );
 
         // Signed by a key nobody trusts, under the trusted key's ID.
-        let rogue = key(9, "prod").issue(&grant(&["admin:*"])).expect("issues");
+        let rogue = key(9, "prod").issue(&spec(&["admin:*"])).expect("issues");
         let rogue_parts: Vec<&str> = rogue.expose().split('.').collect();
         let spliced = format!("{}.{}.{}", parts[0], rogue_parts[1], rogue_parts[2]);
         assert_eq!(
@@ -691,7 +691,7 @@ mod tests {
     fn other_algorithms_unknown_fields_and_garbage_are_refused() {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
-        let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+        let issued = signer.issue(&spec(&["read:x"])).expect("issues");
         let parts: Vec<&str> = issued.expose().split('.').collect();
         let now = at_secs(2_000);
         let none = Revocations::new();
@@ -744,10 +744,10 @@ mod tests {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
         let max = MAX_TOKEN_LIFETIME.as_secs();
-        let mut long = grant(&["read:x"]);
+        let mut long = spec(&["read:x"]);
         long.expires_at = Timestamp::from_millis(long.not_before.as_millis() + (max + 1) * 1_000);
         assert_eq!(signer.issue(&long), Err(IssueError::TooLong));
-        let mut longest = grant(&["read:x"]);
+        let mut longest = spec(&["read:x"]);
         longest.expires_at = Timestamp::from_millis(longest.not_before.as_millis() + max * 1_000);
         assert!(signer.issue(&longest).is_ok());
 
@@ -787,12 +787,12 @@ mod tests {
         let none = Revocations::new();
         let now = at_secs(2_000);
 
-        let issued = signer.issue(&grant(&["fleet"])).expect("issues");
+        let issued = signer.issue(&spec(&["fleet"])).expect("issues");
         let claims = issued.expose().split('.').nth(1).expect("a claims part");
         let claims: Claims = decode_json(claims).expect("claims decode");
         assert_eq!(claims.scopes, ["fleet"]);
         let verified = verifier.verify(&issued, now, &none).expect("verifies");
-        assert!(verified.grant.scopes.allows(Target::Fleet));
+        assert!(verified.spec.scopes.allows(Target::Fleet));
 
         // A token minted by 0.2 carries the scope's old spelling, which 0.3 doesn't accept.
         let header = Header {
@@ -825,7 +825,7 @@ mod tests {
     fn a_token_for_another_fleet_is_refused() {
         let signer = key(7, "staging");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
-        let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+        let issued = signer.issue(&spec(&["read:x"])).expect("issues");
         assert_eq!(
             verifier.verify(&issued, at_secs(2_000), &Revocations::new()),
             Err(TokenError::Issuer)
@@ -836,9 +836,9 @@ mod tests {
     fn a_token_naming_a_reserved_dotted_agent_is_refused() {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
-        let dotted = Grant {
+        let dotted = TokenSpec {
             principal: "agent-42.c7".parse().expect("a principal"),
-            ..grant(&["read:agent-42.c7-*"])
+            ..spec(&["read:agent-42.c7-*"])
         };
         let issued = signer.issue(&dotted).expect("issues");
         assert_eq!(
@@ -846,9 +846,9 @@ mod tests {
             Err(TokenError::ReservedPrincipal)
         );
         // A dotted name that isn't an agent's keeps working, as a service.
-        let service = Grant {
+        let service = TokenSpec {
             principal: "workload.prod".parse().expect("a principal"),
-            ..grant(&["read:x"])
+            ..spec(&["read:x"])
         };
         let issued = signer.issue(&service).expect("issues");
         assert!(
@@ -862,7 +862,7 @@ mod tests {
     fn a_revoked_token_or_key_is_refused() {
         let signer = key(7, "prod");
         let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
-        let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+        let issued = signer.issue(&spec(&["read:x"])).expect("issues");
         let now = at_secs(2_000);
         let token: Revocations = [(Revoked::Token("tok-1".parse().expect("id")), Timestamp::MAX)]
             .into_iter()
@@ -890,7 +890,7 @@ mod tests {
         let new = key(8, "prod");
         let verifier = TokenVerifier::new("prod", [old.verifying_key(), new.verifying_key()]);
         for signer in [&old, &new] {
-            let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+            let issued = signer.issue(&spec(&["read:x"])).expect("issues");
             assert!(
                 verifier
                     .verify(&issued, at_secs(2_000), &Revocations::new())
@@ -902,8 +902,8 @@ mod tests {
     #[test]
     fn issuing_refuses_empty_grants_and_backwards_lifetimes() {
         let signer = key(7, "prod");
-        assert_eq!(signer.issue(&grant(&[])), Err(IssueError::NoScopes));
-        let mut backwards = grant(&["read:x"]);
+        assert_eq!(signer.issue(&spec(&[])), Err(IssueError::NoScopes));
+        let mut backwards = spec(&["read:x"]);
         backwards.expires_at = backwards.not_before;
         assert_eq!(signer.issue(&backwards), Err(IssueError::Lifetime));
         assert_eq!(
@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn debug_never_shows_the_token_or_the_key() {
         let signer = key(7, "prod");
-        let issued = signer.issue(&grant(&["read:x"])).expect("issues");
+        let issued = signer.issue(&spec(&["read:x"])).expect("issues");
         assert_eq!(format!("{issued:?}"), "BearerToken(..)");
         let shown = format!("{signer:?}");
         assert!(shown.contains(signer.key_id().as_str()), "{shown}");

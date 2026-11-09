@@ -260,7 +260,7 @@ impl Authorizer {
                 token: refusal.token().cloned(),
             })?;
         if let Some(name) = certificate
-            && *name != verified.grant.principal
+            && *name != verified.spec.principal
         {
             let forwards = self
                 .inner
@@ -272,17 +272,17 @@ impl Authorizer {
                     status: Status::permission_denied(
                         "the token names another principal than the client certificate",
                     ),
-                    token: Some(verified.grant.id),
+                    token: Some(verified.spec.id),
                 });
             }
         }
         Ok(Caller::Principal {
-            name: verified.grant.principal,
-            scopes: verified.grant.scopes,
+            name: verified.spec.principal,
+            scopes: verified.spec.scopes,
             credential: Credential::Token {
-                id: verified.grant.id,
+                id: verified.spec.id,
                 key: verified.key,
-                expires_at: verified.grant.expires_at,
+                expires_at: verified.spec.expires_at,
             },
         })
     }
@@ -690,7 +690,7 @@ mod tests {
     use fleetring_control::Revoked;
 
     use super::*;
-    use crate::auth::{Grant, Scopes, TokenSigner};
+    use crate::auth::{Scopes, TokenSigner, TokenSpec};
     use crate::clock::SimClock;
     use crate::tls::{Authority, Validity};
 
@@ -754,7 +754,7 @@ mod tests {
         expires_ms: u64,
     ) -> BearerToken {
         signer
-            .issue(&Grant {
+            .issue(&TokenSpec {
                 principal: principal.parse().expect("a principal"),
                 scopes: scopes
                     .iter()
