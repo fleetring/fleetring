@@ -125,6 +125,25 @@ fleetring db list --context home       # one command against another context
 statement_timeout_ms = 30000   # the longest a write, query, or schema read runs; at least 1
 ```
 
+**Fork limits (ADR-0046, point 7).** `[fork]` bounds what a fork may take; `db fork` itself is planned for 0.8.0, and the data side of seeding lands with it. The control node records its rows with each fork it accepts, so changing them affects new forks only; the rest bound what seeding costs a source's primary and a fork's replicas. A pin past `max_pin_ms` or `max_pin_wal_bytes` ends its stream with `ABORTED` and is released, since the source's writes always win over a fork; a request past `max_pin_ms_per_hour`, `max_pins_per_node`, `max_pins_per_database`, or `max_seeds_per_node` is refused with `RESOURCE_EXHAUSTED` and a retry-after, without failing the attempt. Every default is provisional until FR-087 measures it. The control node keeps at most 10,000 fork operations, and a data node admits a copy only with room for it and a tenth more beside the larger of 1 GiB and 5% of its volume; neither is configurable. `[fork]` is new in 0.8.0:
+
+```toml
+[fork]
+max_attempts = 5                    # control: attempts before a fork fails
+deadline_ms = 3600000               # control: how long a fork may stay seeding
+attempt_timeout_ms = 1800000        # control: how long one attempt runs; at most deadline_ms
+seeder_timeout_ms = 120000          # control: a seeder down this long is passed over; at most attempt_timeout_ms
+operation_retention_ms = 604800000  # control: how long an operation, and its ID, is kept after it ends
+transfer_retries = 3                # data: a seeder's retries of a broken transfer, per attempt
+transfer_backoff_ms = 1000          # data: the first retry's wait, doubling after each
+max_pin_ms = 600000                 # data: how long a source's primary pins one copy
+max_pin_wal_bytes = 1073741824      # data: how far the source's WAL may grow while pinned
+max_pin_ms_per_hour = 1200000       # data: pins of one source database in any hour; at least max_pin_ms
+max_pins_per_node = 2               # data: pins a source's primary holds at once
+max_pins_per_database = 1           # data: pins of one source database at once; at most max_pins_per_node
+max_seeds_per_node = 2              # data: copies a node downloads at once
+```
+
 `db list` shows every database with its engine, epoch, replication factor, primary, and replicas, and ends with how many databases each node is primary for; `--node <id>` keeps the databases one node is primary for. `node list` lists the members with their liveness, drain state and release (`-o json` for programs). `status --address <host:port>` asks one data node what it believes on its own, so its ring fingerprint can be compared with `status`; `status --node <id>` does the same, finding the node's address in the control plane's membership. `--node` always takes a node ID, and `--address` an address: `db exec` and `db query` take either, to send a statement through a particular node. `db drop` removes a database for good: every replica that is up deletes its copy within a few seconds. It asks first on a terminal; `--yes` skips the question. The control node tells each replica of the drop (`Replication.DropCopy`); the primary stops admitting writes at once, and before it deletes its copy, it flushes the database's change streams for up to 30 seconds, so an archive receives every write the database acknowledged (see Expiry and Backups and restore, below). Until the old copy is deleted, that node answers a `db create` or `db restore` of the same name with `UNAVAILABLE`, which the commands retry for up to 45 seconds. A replica that was down or unreachable when the drop happened keeps its copy as an orphan (see Orphans, below).
 
 Each database chooses its durability when it is created (ADR-0023). `--acks quorum` (the default) acknowledges a write once a majority of its replicas hold it; `--acks all` waits for every replica, so one replica down blocks writes; `--acks local` acknowledges after the primary's own fsync, which is fastest but may lose acknowledged writes when the primary fails over. `--min-replicas <n>` sets the floor: a write that arrives while fewer than `n` replicas, the primary included, are reachable is refused with `UNAVAILABLE` before anything commits, so it can be retried cleanly; it must lie between the write quorum and the replication factor, and defaults to the write quorum. `db locate` and `db list` show the settings, `db edit <db> --acks <mode> [--min-replicas <n>]` changes them from the database's next epoch on (`--min-replicas` needs `--acks`), and `[replication] acks` and `min_replicas` in the control node's configuration set the defaults for databases created without them.
