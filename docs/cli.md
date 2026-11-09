@@ -380,43 +380,52 @@ fleetring db fork <source> <target>
     [-o table|json|jsonl | --json]
 ```
 
-It makes `<target>` a new database holding `<source>`'s current contents, at a position the source's write quorum has acknowledged, and waits until the fork is **ready**. The fork is independent from then on: writes to either never reach the other.
+It makes `<target>` a new database holding `<source>`'s current contents, at a position the source's write quorum has acknowledged, and waits until the fork is **ready**. The fork is independent from then on: writes to either never reach the other. Until it is ready, its replicas are the nodes that hold its copy, whatever placement says; from then on it follows placement as any database does.
 
 - **Its place.** It belongs to the `db` noun, in the Databases group, after `db restore`. `fork` is a verb of its own (§1's table): it builds a new database and never writes over an existing one.
 - **Arguments.** Both are database names, the source first.
 - **Settings are the target's own.** `--replication-factor`, `--acks` and `--min-replicas` default as `db create`'s do, never to the source's. `--description`, `--label`, `--expires-in` and `--expires-at` are `db create`'s flags. Nothing is copied from the source's metadata: its description is another principal's text (ADR-0041, point 9).
+  - Whatever `--acks` says, the fork's copy and its fork-reset write need a majority of its replicas; `--acks` governs its writes from `ready` on (ADR-0046, point 3).
+  - Before the fork is ready, `db edit` may change its description, labels, and expiry, but not `--acks` or `--min-replicas`. An expiry that passes before it is ready cancels it.
+- **No short form.** `--detach` has no `-d`: §2 keeps `-d` for `dev`.
 - **Scopes.** `admin` on the target, and `fork` on the source. Until the `fork` action ships (FR-088), `admin` on the source stands in for it, and the refusal's hint says so: `until 0.8's fork action ships, forking needs admin on the source`.
 - **The operation ID comes first.** The command makes an operation ID (26 lowercase base32 characters) and prints it on stderr before it calls the control plane, so a crash or a lost reply never leaves the caller without it: `operation 4k7mxq…: wait for it again with --operation-id 4k7mxq…`. `-q` drops the line; a script that passes `-q` passes its own `--operation-id`.
-- **It waits for `ready`, not `seeded`.** A seeded fork isn't usable until its fork-reset write commits (ADR-0046, point 6). Progress goes to stderr as a spinner (§12) where §5's table allows it, and otherwise as one line per change of state:
-  - `seeding notes-exp from notes: attempt 1 of 5, seeder data-3, 41 MiB of 120 MiB, holders 1 of 2`, with the excluded nodes when there are any;
+- **It waits for `ready`, not `seeded`.** A seeded fork isn't usable until its fork-reset write commits (ADR-0046, point 6). Progress goes to stderr:
+  - as a spinner (§12), where §5's table allows one;
+  - otherwise, when the output is human and there's no `-q`, as one line per change of state;
+  - not at all with `-q`, `-o json`, `-o jsonl`, or `--json`.
+
+  The lines are:
+  - `seeding notes-exp from notes: attempt 1 of 5, seeder data-3, 41 MiB of 120 MiB, holders 1 of 2`, with the nodes excluded as seeders and the nodes that refused on disk, when there are any;
   - `opening notes-exp: running the fork reset`, once the fork is seeded;
-  - `✓ notes-exp is ready: forked from notes (incarnation 7) at 0000…01a8 in 12.3 s`.
+  - `✓ notes-exp is ready: forked from notes (incarnation 3f9a0c…) at 0000…01a8 in 12.3 s`.
 - **`--detach`** returns as soon as the control plane has accepted the fork, which is then `seeding`, and exits 0. Running the same command again with `--operation-id` waits for it, and exits by its final outcome.
-- **`--operation-id <id>`** resumes or retries an operation: it resends the complete original request under that ID, and then waits.
-  - The request must be the same as the first, both names and every flag. A difference is refused, naming it: `operation 4k7mxq… was requested with --replication-factor 3, not 5`.
+- **`--operation-id <id>`** resumes an operation, or submits one under an ID the caller chose:
+  - **Resuming.** The command first asks the control plane for the operation (`GetForkOperation`). If it is known, the command follows it until it is ready, failed, or cancelled, and exits by that outcome. It resends nothing and resolves nothing again: the source's incarnation, the target's incarnation, and the absolute expiry are the ones the first request settled. The flags given are checked against the operation's recorded request, and a difference is refused, naming it: `operation 4k7mxq… was requested with --replication-factor 3, not 5`. `--description -` doesn't read stdin again on a resume, and matches the recorded description.
+  - **Submitting.** If the operation is unknown, the command submits the request under that ID, as a first request does.
   - Another principal's ID is refused as if it didn't exist, revealing nothing about the operation.
-  - An ID stays valid while its fork is pending and for 7 days after its outcome; after that it is unknown, and the same command starts a new operation. `--help` says so.
-  - A request resent after the source was dropped and recreated returns the original operation's outcome, never a fork of the new source.
-- **Resends.** On `UNAVAILABLE`, or a reply that never arrives, the command resends with the same ID, up to 5 times within 60 s (ADR-0046, point 7). After that it exits 4, with the ID and the command that resumes it in the hint.
-- **`--timeout <duration>`** bounds the wait, 1 h by default, the control plane's default fork deadline. When it passes, the fork carries on: the command exits 4, with the ID and the command that resumes the wait in the hint.
+  - An ID is kept while its fork is pending and for 7 days after it is ready, failed, or cancelled. After that it is unknown, and the same command starts a new fork. `--help` says so, and so does every hint that names an ID: `resume with --operation-id 4k7mxq… (kept for 7 days after the fork finishes; after that, this command starts a new fork)`.
+- **Resends.** When the first reply is lost, or the control plane answers `UNAVAILABLE`, the command submits the same request again under the same ID, up to 5 times within 60 s (ADR-0046, point 7). The control plane compares the request as given: from the same principal and unchanged, it answers with the existing operation, so a resend never starts a second fork, even if the source was dropped and recreated meanwhile. After 5 tries the command exits 4, with the ID and the command that resumes it in the hint.
+- **`--timeout <duration>`** limits how long the command waits, 1 h by default. It doesn't limit the fork: a seeding fork has its own deadline in the control plane, and a seeded fork waits for its replicas as long as it must. When the timeout passes, the command exits 4, with the ID and the command that resumes the wait in the hint, and the fork carries on.
 - **Ctrl-C** stops the wait, not the fork. The command prints the ID, the command that resumes the wait, and `fleetring db drop <target>`, which cancels the fork, and exits 130.
+- **An older control plane** answers `UNIMPLEMENTED`, or refuses the call as one it doesn't serve (ADR-0041, amendment 4). The command exits 1 with `the control plane runs a release without forks; upgrade it first`.
 
 **Text result,** on stdout, as key and value lines:
 
 ```text
 database: notes-exp
-incarnation: 12
+incarnation: 8c41d2e07b5a9f13
 state: ready
-forked from: notes (incarnation 7)
+forked from: notes (incarnation 3f9a0c6e21d4b870)
 position: 0000…01a8
 chain hash: 9f3c…
 operation: 4k7mxq…
 elapsed: 12.3 s
 ```
 
-then the placement, as `db locate` prints it. With `--detach`, `state: seeding`, and the position and chain hash read `not yet`.
+then the placement, as `db locate` prints it. With `--detach`, `state: seeding`, and the position and chain hash read `not yet`. An incarnation prints as 16 lowercase hex digits; a database created before forks were enabled has `0000000000000000`.
 
-**JSON result:** `operation_id`; `database`; `incarnation`; `state` (`seeding`, `seeded`, `ready`, or `failed`, and `cancelled` when `--operation-id` names an operation whose fork was dropped); `source`; `source_incarnation`; `position` and `chain_hash`, `null` until the fork is seeded; `failure`, `null` or an object with `reason` and `attempts`; `elapsed_ms`; and `placement`, as `db locate` prints it, or `null` once the fork is gone. A `reason` is one of `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`, `source_too_large`, `insufficient_disk` and `engine_unsupported`; the list is open (`ForkFailure` is non-exhaustive), so a later release may add one, and a script treats an unknown reason as a failure.
+**JSON result:** `operation_id`; `database`; `incarnation`, a string of 16 hex digits; `state` (`seeding`, `seeded`, `ready`, or `failed`, and `cancelled` when `--operation-id` names an operation whose fork was dropped or expired before it was ready); `source`; `source_incarnation`; `position` and `chain_hash`, `null` until the fork is seeded; `failure`, `null` or an object with `reason`, `last_cause` (for `retries_exhausted` and `deadline_exceeded`: `seeder_down`, `attempt_timed_out`, `transfer_failed`, `pin_expired`, `holder_lost`, or `holders_left`, else `null`) and `attempts`; `elapsed_ms`; and `placement`, as `db locate` prints it, or `null` once the fork is gone. A `reason` is one of `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`, `source_too_large`, `insufficient_disk` and `engine_unsupported`; the list is open (`ForkFailure` is non-exhaustive), so a later release may add one, and a script treats an unknown reason as a failure.
 
 **Refusals and their hints:**
 
@@ -428,7 +437,8 @@ then the placement, as `db locate` prints it. With `--detach`, `state: seeding`,
 | the source doesn't exist, or isn't ready (a fork still opening) | `fleetring db show <source>` |
 | the fleet can't use `fork` yet (`FeatureUnsupported`) | names the member and its release, and says to upgrade it |
 | not enough disk on the target's replicas (`RESOURCE_EXHAUSTED`) | names the node and its free bytes |
-| the source's engine can't fork (`UNIMPLEMENTED`) | none |
+| the source's engine can't fork (`FAILED_PRECONDITION`) | none |
+| the control plane predates forks (`UNIMPLEMENTED`, or a call it doesn't serve) | the control plane runs a release without forks; upgrade it first |
 | the operation ID is known with another request | names the differing flag |
 | the fork failed (`failed`, with its reason) | `fleetring db drop <target>` removes it; then fork again |
 
@@ -439,16 +449,18 @@ then the placement, as `db locate` prints it. With `--detach`, `state: seeding`,
 A fork's record stays for its life, so `db show` reports its state and its provenance. Text adds these lines after the placement:
 
 ```text
-fork: seeding, attempt 2 of 5, seeder data-3, excluded data-1
+fork: seeding, attempt 2 of 5, seeder data-3
+fork exclusions: data-1 (not seeder: down); data-4 (disk refused)
 fork holders: data-3, 1 of 2 needed
 fork progress: 41 MiB of 120 MiB on data-3
-forked from: notes (incarnation 7)
+forked from: notes (incarnation 3f9a0c6e21d4b870)
 fork operation: 4k7mxq…, requested by agent-42 at 2026-11-08T10:15:00Z
 hint: `fleetring db drop notes-exp` cancels the fork in progress
 ```
 
-- **States:** `seeding`; `seeded`, printed as `opening: not yet usable`; `ready`, with the time it became ready; and `failed`, with its reason and the number of attempts.
-- **Once the fork is seeded,** `forked from` adds the position and the chain hash: `notes (incarnation 7) at 0000…01a8, chain hash 9f3c…`.
+- **States:** `seeding`; `seeded`, printed as `opening: not yet usable`; `ready`, with the time it became ready; and `failed`, with its reason, the cause of its last retry, and the number of attempts.
+- **Exclusions** keep their causes apart: a node excluded as seeder (it was down, or its attempt timed out) may still hold a copy; a node that refused on disk holds none. Only disk refusals can fail a fork for disk.
+- **Once the fork is seeded,** `forked from` adds the position and the chain hash: `notes (incarnation 3f9a0c6e21d4b870) at 0000…01a8, chain hash 9f3c…`, and `fork holders` lists the replicas the fork stays on until it is ready.
 - **A fork that isn't ready** carries the hint `fleetring db drop <name>` cancels or removes it: "cancels the fork in progress" while it is seeding or opening, "removes it" once it failed.
 - **A database no fork made** prints no fork lines. One restored from a fork's archive prints `forked from` as the archive's claim, with no fork state.
 
@@ -456,17 +468,18 @@ hint: `fleetring db drop notes-exp` cancels the fork in progress
 
 **JSON**, in `db locate`, in each database of `db list`, and in `db show`:
 
-- `placement.incarnation`: the database's incarnation, `0` for one created before forks were enabled.
-- `fork`: `null` for a database no fork made, and otherwise `state` (`seeding`, `seeded`, `ready`, or `failed`); `operation_id`; `source` and `source_incarnation`; `attempt` and `max_attempts`; `seeder` and `excluded`, while seeding; `holders` and `holders_needed`; `bytes` and `total_bytes`, the seeder's progress while seeding; `position` and `chain_hash`, once seeded; `failure` (`reason` and `attempts`); `requested_by` and `requested_at`; `deadline_at`; `completed_at`, `ready_at` and `failed_at`. A field that doesn't apply in the current state is `null`. `db list` always carries `fork`, whether or not the table shows the column.
+- `placement.incarnation`: the database's incarnation, a string of 16 hex digits, all zero for one created before forks were enabled.
+- `fork`: `null` for a database no fork made, and otherwise `state` (`seeding`, `seeded`, `ready`, or `failed`); `operation_id`; `source` and `source_incarnation`; `attempt` and `max_attempts`; `seeder`, `seeder_excluded` and `disk_refused`, while seeding; `holders` and `holders_needed`; `bytes` and `total_bytes`, the seeder's progress while seeding; `position` and `chain_hash`, once seeded; `failure` (`reason`, `last_cause` and `attempts`); `requested_by` and `requested_at`; `deadline_at`; `completed_at`, `ready_at` and `failed_at`. A field that doesn't apply in the current state is `null`. `db list` always carries `fork`, whether or not the table shows the column.
 - `metadata.forked_from`: `null`, or `source`, `source_incarnation`, `position`, `chain_hash` and `forked_at`. It is the provenance a ready fork keeps, and, for a restored database, the archive's claim.
 
 ### Cancelling: `db drop`
 
-There is no cancel command. `db drop <target>` on a fork that isn't ready cancels it (ADR-0046, point 3.6), and needs `admin` on the target, as every drop does.
+There is no cancel command. `db drop <target>` on a fork that is seeding or opening cancels it (ADR-0046, point 3.8), and needs `admin` on the target, as every drop does. An expiry that passes before the fork is ready cancels it the same way. A failed fork's drop only removes it: its outcome stays `failed`.
 
 - **It asks first,** as every drop does (§7), and the prompt says what it cancels: `drop database 'notes-exp' on fleet 'home' (context 'home'), cancelling the fork in progress (operation 4k7mxq…), and every replica's copy? type the name to confirm:`.
 - **Afterwards,** `db fork … --operation-id <id>` reports the operation `cancelled` and exits 1, and `db fork <source> <target>` with a new ID starts afresh.
 - `db fork --help` says how to cancel: `to cancel a fork in progress, drop its target: fleetring db drop <target>`.
+- **Copies left behind.** A node that missed the drop keeps its staged copy as an orphan (ADR-0042). `orphan list` shows it with `kind` `staged`, and its `incarnation`, `operation_id` and `attempt` (JSON fields `null` for an ordinary orphan); `orphan remove <target> --node <id> --incarnation <hex> --operation-id <id> --attempt <n>` removes exactly that one.
 
 ### Help
 
