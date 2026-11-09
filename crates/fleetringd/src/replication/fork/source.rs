@@ -192,22 +192,20 @@ impl PinLedger {
 
     /// Holds `database`'s checkpoints for a seeder whose acknowledged position is behind the
     /// log's start, for at most `max_pin_ms` and what is left of `max_pin_ms_per_hour`, and
-    /// returns how long, unless a hold is in force already, which isn't extended.
+    /// returns how long the hold in force lasts from now: a new one, or the one in force
+    /// already, which isn't extended. The caller arms it on the primary serving now, which may
+    /// not be the one that armed it first.
     ///
     /// # Errors
     ///
     /// `RESOURCE_EXHAUSTED` with a retry-after once the hour's budget is spent: a seeder asking
     /// again never re-arms a hold past it.
-    fn hold(
-        &self,
-        database: &DatabaseName,
-        config: &ForkConfig,
-    ) -> Result<Option<Duration>, Status> {
+    fn hold(&self, database: &DatabaseName, config: &ForkConfig) -> Result<Duration, Status> {
         let now = Instant::now();
         let mut state = self.lock();
         let used = state.pinned_in_hour(database, now);
-        if state.holds.contains_key(database) {
-            return Ok(None);
+        if let Some((_, until)) = state.holds.get(database) {
+            return Ok(until.saturating_duration_since(now));
         }
         let budget = config.max_pin_per_hour().saturating_sub(used);
         if budget.is_zero() {
@@ -215,7 +213,7 @@ impl PinLedger {
         }
         let held = config.max_pin().min(budget);
         state.holds.insert(database.clone(), (now, now + held));
-        Ok(Some(held))
+        Ok(held)
     }
 
     /// Ends `database`'s checkpoint hold, if it has one, once a seeder has its pin: the time it
@@ -416,14 +414,15 @@ async fn serve_source(
         {
             // The log restarted past the acknowledged position. Hold the next checkpoint, for at
             // most `max_pin_ms`, so that the position catches up inside the log. The hold counts
-            // toward the source's hour of pins, and isn't armed again past it.
-            if let Some(held) = inner.forks.pins().hold(source, &config)? {
-                let now = inner.clock.now();
-                let until = now
-                    .as_millis()
-                    .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX));
-                primary.hold_checkpoints(now, fleetring_control::Timestamp::from_millis(until));
-            }
+            // toward the source's hour of pins, and isn't armed again past it. A hold in force is
+            // armed again on the primary serving now, until it ends: a primary that replaced the
+            // one that armed it, at the same node, would otherwise checkpoint through it.
+            let held = inner.forks.pins().hold(source, &config)?;
+            let now = inner.clock.now();
+            let until = now
+                .as_millis()
+                .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX));
+            primary.hold_checkpoints(now, fleetring_control::Timestamp::from_millis(until));
             return Err(with_retry_after(
                 Status::unavailable(format!(
                     "{source} checkpointed past the position its write quorum acknowledged; \
@@ -685,15 +684,16 @@ mod tests {
         let source: DatabaseName = "src".parse().expect("a name");
         let config = config(1_000, 2_500);
         let ms = Duration::from_millis;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
-        // A seeder asking again while the hold is in force doesn't extend it.
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(1_000)));
+        // A seeder asking again while the hold is in force doesn't extend it, and learns how
+        // long it still lasts, to arm it on the primary serving now.
         time::advance(ms(400)).await;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(None));
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(600)));
         // Once it lapses, a new one gets what is left of the hour, at most `max_pin_ms`.
         time::advance(ms(600)).await;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(1_000)));
         time::advance(ms(1_000)).await;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(500))));
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(500)));
         time::advance(ms(500)).await;
         // The hour is spent: no hold is armed, and no pin is admitted either.
         let refused = ledger
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(refused.code(), Code::ResourceExhausted);
         // An hour later the budget is back.
         time::advance(HOUR).await;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(1_000)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -716,10 +716,10 @@ mod tests {
         let source: DatabaseName = "src".parse().expect("a name");
         let config = config(1_000, 1_000);
         let ms = Duration::from_millis;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(1_000)));
         time::advance(ms(300)).await;
         ledger.end_hold(&source);
         time::advance(ms(10)).await;
-        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(700))));
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(ms(700)));
     }
 }
