@@ -13,20 +13,21 @@
 //! the lattice that narrows scopes ([`Scopes::intersect`], [`Scopes::grant_step`]), which lives
 //! in a submodule of its own.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
 use fleetring_control::DatabaseName;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::changes::DatabaseMatcher;
+use crate::changes::{DatabaseMatcher, Pattern};
 
 mod lattice;
 
-pub use self::lattice::GrantStepError;
+pub use self::lattice::{GrantStepError, MAX_SCOPES, TooManyScopes};
 
 /// What a request does to a database, or, for [`Action::Grant`], what a token may delegate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Action {
     /// Reads a database: queries, its placement, its lease.
@@ -88,6 +89,20 @@ impl fmt::Display for Action {
     }
 }
 
+/// Actions order by their names, byte for byte, as [`Action::ALL`] lists them and as scopes
+/// sort.
+impl Ord for Action {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().as_bytes().cmp(other.as_str().as_bytes())
+    }
+}
+
+impl PartialOrd for Action {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl FromStr for Action {
     type Err = ParseScopeError;
 
@@ -142,12 +157,12 @@ impl fmt::Display for Target<'_> {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Scope {
     rule: Rule,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Rule {
     Databases {
         action: Action,
@@ -245,6 +260,40 @@ impl fmt::Display for Scope {
             Rule::Databases { action, pattern } => write!(f, "{action}:{pattern}"),
             Rule::Fleet => f.write_str(FLEET),
         }
+    }
+}
+
+impl Scope {
+    /// The bytes of the scope's text, as [`Display`](fmt::Display) writes it, without
+    /// allocating.
+    fn text_bytes(&self) -> impl Iterator<Item = u8> + '_ {
+        let (action, colon, body, star): (&str, &[u8], &str, &[u8]) = match &self.rule {
+            Rule::Fleet => (FLEET, b"", "", b""),
+            Rule::Databases { action, pattern } => match pattern.pattern() {
+                Pattern::Exact(name) => (action.as_str(), b":", name, b""),
+                Pattern::Prefix(prefix) => (action.as_str(), b":", prefix, b"*"),
+            },
+        };
+        action
+            .bytes()
+            .chain(colon.iter().copied())
+            .chain(body.bytes())
+            .chain(star.iter().copied())
+    }
+}
+
+/// Scopes order by their text, byte for byte, which is the canonical order the narrowing
+/// returns ([`Scopes::intersect`], [`Scopes::grant_step`]). Two scopes have the same text
+/// exactly when they are equal, so the order agrees with `==`.
+impl Ord for Scope {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.text_bytes().cmp(other.text_bytes())
+    }
+}
+
+impl PartialOrd for Scope {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 

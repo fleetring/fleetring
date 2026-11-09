@@ -21,7 +21,7 @@ use fleetring_control::{KeyId, Revocations, Timestamp, TokenId};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ParseScopeError, Scope, Scopes};
+use crate::auth::{MAX_SCOPES, ParseScopeError, Scope, Scopes};
 use crate::tls::Principal;
 
 /// The longest token accepted, in bytes. A token carries a few dozen scopes at most.
@@ -168,6 +168,13 @@ pub enum IssueError {
     /// The token would carry no scope.
     #[error("a token needs at least one scope")]
     NoScopes,
+    /// The token would carry more than [`MAX_SCOPES`] scopes, more than its holder could
+    /// narrow for a child.
+    #[error("a token carries at most {limit} scopes")]
+    TooManyScopes {
+        /// The most a token may carry, [`MAX_SCOPES`].
+        limit: usize,
+    },
 }
 
 /// The authority's signing key, which issues tokens off the nodes.
@@ -222,12 +229,16 @@ impl TokenSigner {
     ///
     /// # Errors
     ///
-    /// [`IssueError::NoScopes`] for a spec without scopes, [`IssueError::Lifetime`] for one
-    /// that expires before it starts, and [`IssueError::TooLong`] for one that lasts longer than
+    /// [`IssueError::NoScopes`] for a spec without scopes, [`IssueError::TooManyScopes`] for one
+    /// with more than [`MAX_SCOPES`], [`IssueError::Lifetime`] for one that expires before it
+    /// starts, and [`IssueError::TooLong`] for one that lasts longer than
     /// [`MAX_TOKEN_LIFETIME`].
     pub fn issue(&self, spec: &TokenSpec) -> Result<BearerToken, IssueError> {
         if spec.scopes.is_empty() {
             return Err(IssueError::NoScopes);
+        }
+        if spec.scopes.len() > MAX_SCOPES {
+            return Err(IssueError::TooManyScopes { limit: MAX_SCOPES });
         }
         let nbf = seconds(spec.not_before);
         let exp = seconds(spec.expires_at);
@@ -930,9 +941,28 @@ mod tests {
     }
 
     #[test]
-    fn issuing_refuses_empty_grants_and_backwards_lifetimes() {
+    fn issuing_refuses_empty_or_oversized_specs_and_backwards_lifetimes() {
         let signer = key(7, "prod");
         assert_eq!(signer.issue(&spec(&[])), Err(IssueError::NoScopes));
+        let many: Vec<String> = (0..=MAX_SCOPES).map(|i| format!("read:x-{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let refused = signer.issue(&spec(&many));
+        assert_eq!(
+            refused,
+            Err(IssueError::TooManyScopes { limit: MAX_SCOPES })
+        );
+        assert_eq!(
+            refused.map(|_| ()).expect_err("refused").to_string(),
+            "a token carries at most 256 scopes"
+        );
+        let most = signer
+            .issue(&spec(&many[..MAX_SCOPES]))
+            .expect("the limit issues");
+        let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
+        let verified = verifier
+            .verify(&most, at_secs(2_000), &Revocations::new())
+            .expect("verifies");
+        assert_eq!(verified.spec.scopes.len(), MAX_SCOPES);
         let mut backwards = spec(&["read:x"]);
         backwards.expires_at = backwards.not_before;
         assert_eq!(signer.issue(&backwards), Err(IssueError::Lifetime));
