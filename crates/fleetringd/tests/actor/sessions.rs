@@ -861,3 +861,40 @@ async fn a_session_write_below_the_replica_floor_is_refused_before_it_runs() -> 
     assert_eq!(outcome.rows, vec![vec![Value::Integer(0)]], "nothing ran");
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_read_only_session_never_waits_for_another_sessions_transaction() -> TestResult {
+    let (registry, _publisher, _dir) = registry(SessionLimits::default());
+    let db = name("readers");
+    create(&registry, &db).await?;
+    call(&registry, &db, 1, "BEGIN", Autocommit::On).await?;
+    call(
+        &registry,
+        &db,
+        1,
+        "INSERT INTO t VALUES (1)",
+        Autocommit::InTransaction,
+    )
+    .await?;
+    // Its write is refused at once, not queued behind the transaction.
+    let refused = tokio::time::timeout(
+        Duration::from_millis(10),
+        registry.session_call(
+            &db,
+            SessionId::new(2),
+            execute("INSERT INTO t VALUES (2)"),
+            SessionAccess::ReadOnly,
+            Autocommit::On,
+            None,
+        ),
+    )
+    .await??;
+    let CallOutcome::Statement(Err(error)) = &refused.result.outcome else {
+        panic!("refused: {refused:?}");
+    };
+    assert_eq!(error.code, PERMISSION_DENIED);
+    call(&registry, &db, 1, "COMMIT", Autocommit::InTransaction).await?;
+    let rows = registry.query(&db, Statement::new("SELECT v FROM t")).await?;
+    assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+    Ok(())
+}
