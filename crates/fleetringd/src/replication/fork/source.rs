@@ -60,14 +60,39 @@ struct PinState {
     next: u64,
     /// Each pin held now: its database, when it began, and the WAL growth it has held so far.
     open: BTreeMap<u64, (DatabaseName, Instant, u64)>,
-    /// The pins that ended in the last hour, by database: when each began and ended.
+    /// The pins and checkpoint holds that ended in the last hour, by database: when each began
+    /// and ended.
     closed: BTreeMap<DatabaseName, VecDeque<(Instant, Instant)>>,
+    /// Each database's checkpoint hold for a seeder waiting for its acknowledged position to
+    /// enter the log (ADR-0046, point 4.2): when it began and when it ends. It counts toward
+    /// `max_pin_ms_per_hour` as a pin does, since it delays the source's checkpoints as one does.
+    holds: BTreeMap<DatabaseName, (Instant, Instant)>,
 }
 
 impl PinState {
-    /// How long `database` has been pinned in the hour before `now`.
+    /// Moves `database`'s checkpoint hold among the ended ones if it ended by `now`.
+    fn expire_hold(&mut self, database: &DatabaseName, now: Instant) {
+        if let Some((start, until)) = self.holds.get(database).copied()
+            && until <= now
+        {
+            self.holds.remove(database);
+            self.closed
+                .entry(database.clone())
+                .or_default()
+                .push_back((start, until));
+        }
+    }
+
+    /// How long `database` has been pinned or had its checkpoints held in the hour before `now`.
     fn pinned_in_hour(&mut self, database: &DatabaseName, now: Instant) -> Duration {
         let since = now.checked_sub(HOUR).unwrap_or(now);
+        self.expire_hold(database, now);
+        let held = self
+            .holds
+            .get(database)
+            .map_or(Duration::ZERO, |(start, _)| {
+                now.saturating_duration_since((*start).max(since))
+            });
         let closed = self.closed.entry(database.clone()).or_default();
         while closed.front().is_some_and(|(_, end)| *end <= since) {
             closed.pop_front();
@@ -82,7 +107,26 @@ impl PinState {
             .filter(|(pinned, ..)| pinned == database)
             .map(|(_, start, _)| now.saturating_duration_since((*start).max(since)))
             .sum();
-        ended + open
+        ended + open + held
+    }
+
+    /// `RESOURCE_EXHAUSTED` for `database`, whose hour of pins is spent, with a retry-after of
+    /// when its oldest pin in the hour leaves it.
+    fn hour_spent(&self, database: &DatabaseName, now: Instant) -> Status {
+        let oldest = self
+            .closed
+            .get(database)
+            .and_then(|closed| closed.iter().map(|(start, _)| *start).min())
+            .map_or(RETRY_PINNED, |start| {
+                (start + HOUR).saturating_duration_since(now)
+            });
+        with_retry_after(
+            Status::resource_exhausted(format!(
+                "{database} has been pinned for seeding, or had its checkpoints held for it, as \
+                 long as [fork] max_pin_ms_per_hour allows in the last hour; retry later"
+            )),
+            oldest.max(RETRY_PINNED),
+        )
     }
 }
 
@@ -128,20 +172,7 @@ impl PinLedger {
         let used = state.pinned_in_hour(database, now);
         let budget = config.max_pin_per_hour().saturating_sub(used);
         if budget.is_zero() {
-            let oldest = state
-                .closed
-                .get(database)
-                .and_then(|closed| closed.front())
-                .map_or(RETRY_PINNED, |(start, _)| {
-                    (*start + HOUR).saturating_duration_since(now)
-                });
-            return Err(with_retry_after(
-                Status::resource_exhausted(format!(
-                    "{database} has been pinned for seeding as long as [fork] max_pin_ms_per_hour \
-                     allows in the last hour; retry later"
-                )),
-                oldest.max(RETRY_PINNED),
-            ));
+            return Err(state.hour_spent(database, now));
         }
         let id = state.next;
         state.next += 1;
@@ -157,6 +188,48 @@ impl PinLedger {
             open.2 = bytes;
         }
         state.open.values().map(|(.., held)| *held).sum()
+    }
+
+    /// Holds `database`'s checkpoints for a seeder whose acknowledged position is behind the
+    /// log's start, for at most `max_pin_ms` and what is left of `max_pin_ms_per_hour`, and
+    /// returns how long, unless a hold is in force already, which isn't extended.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_EXHAUSTED` with a retry-after once the hour's budget is spent: a seeder asking
+    /// again never re-arms a hold past it.
+    fn hold(
+        &self,
+        database: &DatabaseName,
+        config: &ForkConfig,
+    ) -> Result<Option<Duration>, Status> {
+        let now = Instant::now();
+        let mut state = self.lock();
+        let used = state.pinned_in_hour(database, now);
+        if state.holds.contains_key(database) {
+            return Ok(None);
+        }
+        let budget = config.max_pin_per_hour().saturating_sub(used);
+        if budget.is_zero() {
+            return Err(state.hour_spent(database, now));
+        }
+        let held = config.max_pin().min(budget);
+        state.holds.insert(database.clone(), (now, now + held));
+        Ok(Some(held))
+    }
+
+    /// Ends `database`'s checkpoint hold, if it has one, once a seeder has its pin: the time it
+    /// was in force stays counted.
+    fn end_hold(&self, database: &DatabaseName) {
+        let now = Instant::now();
+        let mut state = self.lock();
+        if let Some((start, until)) = state.holds.remove(database) {
+            state
+                .closed
+                .entry(database.clone())
+                .or_default()
+                .push_back((start, until.min(now)));
+        }
     }
 
     /// Withdraws pin `id`'s admission: the copy was never pinned, so it counts for nothing.
@@ -342,12 +415,15 @@ async fn serve_source(
             ) =>
         {
             // The log restarted past the acknowledged position. Hold the next checkpoint, for at
-            // most `max_pin_ms`, so that the position catches up inside the log.
-            let now = inner.clock.now();
-            let until = now
-                .as_millis()
-                .saturating_add(u64::try_from(config.max_pin().as_millis()).unwrap_or(u64::MAX));
-            primary.hold_checkpoints(now, fleetring_control::Timestamp::from_millis(until));
+            // most `max_pin_ms`, so that the position catches up inside the log. The hold counts
+            // toward the source's hour of pins, and isn't armed again past it.
+            if let Some(held) = inner.forks.pins().hold(source, &config)? {
+                let now = inner.clock.now();
+                let until = now
+                    .as_millis()
+                    .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX));
+                primary.hold_checkpoints(now, fleetring_control::Timestamp::from_millis(until));
+            }
             return Err(with_retry_after(
                 Status::unavailable(format!(
                     "{source} checkpointed past the position its write quorum acknowledged; \
@@ -361,6 +437,7 @@ async fn serve_source(
         }
     };
     primary.release_checkpoints();
+    inner.forks.pins().end_hold(source);
     std::mem::forget(admitted);
     let pin = SeedingPin {
         inner: Arc::clone(inner),
@@ -583,4 +660,66 @@ fn check_pin(pin: &SeedingPin, primary: &Primary) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use tonic::Code;
+
+    use super::*;
+    use crate::replication::fork::retry_after;
+
+    fn config(max_pin_ms: u64, max_pin_ms_per_hour: u64) -> ForkConfig {
+        ForkConfig {
+            max_pin_ms: NonZeroU64::new(max_pin_ms).expect("nonzero"),
+            max_pin_ms_per_hour: NonZeroU64::new(max_pin_ms_per_hour).expect("nonzero"),
+            ..ForkConfig::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_holds_spend_the_hour_of_pins_and_are_never_re_armed_past_it() {
+        let ledger = PinLedger::default();
+        let source: DatabaseName = "src".parse().expect("a name");
+        let config = config(1_000, 2_500);
+        let ms = Duration::from_millis;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+        // A seeder asking again while the hold is in force doesn't extend it.
+        time::advance(ms(400)).await;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(None));
+        // Once it lapses, a new one gets what is left of the hour, at most `max_pin_ms`.
+        time::advance(ms(600)).await;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+        time::advance(ms(1_000)).await;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(500))));
+        time::advance(ms(500)).await;
+        // The hour is spent: no hold is armed, and no pin is admitted either.
+        let refused = ledger
+            .hold(&source, &config)
+            .expect_err("the hour is spent");
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        assert!(retry_after(&refused).is_some_and(|after| after > Duration::ZERO));
+        let refused = ledger
+            .admit(&source, &config)
+            .expect_err("the hour is spent");
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        // An hour later the budget is back.
+        time::advance(HOUR).await;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_ended_early_counts_only_while_it_was_in_force() {
+        let ledger = PinLedger::default();
+        let source: DatabaseName = "src".parse().expect("a name");
+        let config = config(1_000, 1_000);
+        let ms = Duration::from_millis;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(1_000))));
+        time::advance(ms(300)).await;
+        ledger.end_hold(&source);
+        time::advance(ms(10)).await;
+        assert_eq!(ledger.hold(&source, &config).ok(), Some(Some(ms(700))));
+    }
 }
