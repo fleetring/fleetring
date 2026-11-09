@@ -39,6 +39,7 @@ use fleetringd::engine::{
     Execution, Internal, MAX_COUNT_LIMIT, Position, Rows, SchemaRequest, SqliteEngine, Statement,
     Value,
 };
+use fleetringd::fork_report;
 use fleetringd::mcp::{self, Access, McpSettings};
 use fleetringd::observe::{LogColour, log_subscriber};
 use fleetringd::replication::ChainHash;
@@ -72,6 +73,7 @@ mod context_cmd;
 mod dev_cmd;
 mod edit;
 mod exit;
+mod fork_cmd;
 mod format;
 mod help;
 #[cfg(test)]
@@ -917,6 +919,14 @@ enum DbCommand {
         #[command(flatten)]
         target: Target,
     },
+    /// Forks a database into a new one, and waits until the fork is ready
+    ///
+    /// The new database holds the source's current contents, at a position the source's write
+    /// quorum has acknowledged, and is independent of it from then on. Its settings are its own:
+    /// nothing is copied from the source's metadata. The command prints the operation ID before
+    /// it asks, and resends the request under it when a reply is lost.
+    #[command(after_long_help = fork_cmd::FORK_HELP)]
+    Fork(fork_cmd::ForkArgs),
     /// Drops a database for good
     ///
     /// Every replica that is up deletes its copy; one that is down or unreachable keeps it as an
@@ -996,7 +1006,7 @@ enum NodeCommand {
 }
 
 /// What `db create` and `db restore` record about the new database besides its placement.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct MetadataArgs {
     /// What the database holds and how it was set up; `-` reads it from stdin
     ///
@@ -1015,6 +1025,14 @@ struct MetadataArgs {
 }
 
 impl MetadataArgs {
+    /// Forgets a description that would be read from stdin, for a command that resumes work the
+    /// first run already gave it to.
+    fn drop_description_if_stdin(&mut self) {
+        if self.description.as_deref() == Some("-") {
+            self.description = None;
+        }
+    }
+
     /// The metadata the flags ask for, reading the description from `stdin` if it is `-`.
     fn read(self, stdin: impl Read) -> Result<NewMetadata, Box<dyn Error>> {
         let description = self
@@ -1031,7 +1049,7 @@ impl MetadataArgs {
 }
 
 /// When a new database is dropped, if it is: `--expires-in` or `--expires-at`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct ExpiryArgs {
     /// Drops the database this long from now: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
     ///
@@ -2243,6 +2261,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
         }
         Command::Db(DbCommand::Edit(args)) => edit::run(args).await?,
         Command::Db(DbCommand::Watch(args)) => return watch_cmd::run(args).await,
+        Command::Db(DbCommand::Fork(args)) => fork_cmd::run(args).await?,
         Command::Db(DbCommand::Exec(args)) => {
             let (client, name, statement) = args.into_parts().await?;
             let written = client.execute(&name, statement).await.map_err(failed)?;
@@ -2467,15 +2486,32 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
             report
         }
         Command::Db(DbCommand::Drop { name, yes, target }) => {
-            if !yes {
-                confirm::confirm(&confirm::drop_database(&shown(&name), &target.place()?))?;
-            }
-            let epoch = target
-                .client()?
-                .drop_database(&name)
+            let client = target.client()?;
+            // A fork that isn't ready is cancelled by its drop (ADR-0046, point 3.8): say so. A
+            // database that can't be located is left to the drop's own error.
+            let cancelling = client
+                .locate(&name)
                 .await
-                .map_err(failed)?;
-            format!("dropped {} at epoch {}\n", shown(&name), epoch.get())
+                .ok()
+                .and_then(|location| location.fork)
+                .filter(|fork| matches!(fork.state, "seeding" | "seeded"))
+                .map(|fork| fork.operation_id);
+            if !yes {
+                let place = target.place()?;
+                confirm::confirm(&match &cancelling {
+                    Some(operation) => confirm::drop_fork(&shown(&name), &place, operation),
+                    None => confirm::drop_database(&shown(&name), &place),
+                })?;
+            }
+            let epoch = client.drop_database(&name).await.map_err(failed)?;
+            let cancelled = cancelling.map_or_else(String::new, |operation| {
+                format!("; cancelled the fork in progress (operation {operation})")
+            });
+            format!(
+                "dropped {} at epoch {}{cancelled}\n",
+                shown(&name),
+                epoch.get()
+            )
         }
         Command::Node(NodeCommand::List { output, target }) => {
             let nodes = node_list(&target.client()?.status().await.map_err(failed)?);
@@ -3554,7 +3590,9 @@ fn format_location(location: &Location) -> String {
 
 /// The databases as a table sorted by name, then how many each node is primary for.
 fn format_databases(databases: &[Location]) -> String {
-    let mut rows: Vec<[String; 8]> = databases
+    // The `FORK` column is there when any listed database is a fork.
+    let forks = databases.iter().any(|location| location.fork.is_some());
+    let mut rows: Vec<Vec<String>> = databases
         .iter()
         .map(|location| {
             let replicas: Vec<String> = location
@@ -3562,7 +3600,7 @@ fn format_databases(databases: &[Location]) -> String {
                 .iter()
                 .map(|replica| replica.node.to_string())
                 .collect();
-            [
+            let mut row = vec![
                 shown(&location.database),
                 location.engine.to_string(),
                 location.epoch.get().to_string(),
@@ -3574,13 +3612,20 @@ fn format_databases(databases: &[Location]) -> String {
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), ToString::to_string),
                 replicas.join(","),
-            ]
+            ];
+            if forks {
+                row.push(fork_report::column_state(location.fork.as_ref()).to_owned());
+            }
+            row
         })
         .collect();
     rows.sort();
-    let header = [
+    let mut header = vec![
         "NAME", "ENGINE", "EPOCH", "RF", "ACKS", "MIN", "PRIMARY", "REPLICAS",
     ];
+    if forks {
+        header.push("FORK");
+    }
     let mut widths: Vec<usize> = header.iter().map(|title| title.len()).collect();
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
