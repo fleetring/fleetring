@@ -79,9 +79,9 @@ mod watch;
 pub(crate) use client::unknown_call;
 pub use client::{
     ArchiveDescription, ArchiveVerification, ArchivedSnapshot, ChangeUpdate, ChangeUpdates,
-    ChangedTransaction, Client, DatabaseSpec, DurabilityChange, LeaseUpdate, LeaseUpdates,
-    Location, NodeStatus, Orphan, ReplicaInfo, Restoration, RestoredExpiry, ServedDatabase,
-    Verification, WITHOUT_WATCH, Written,
+    ChangedTransaction, Client, DatabaseSpec, DurabilityChange, ForkSpec, LeaseUpdate,
+    LeaseUpdates, Location, NodeStatus, Orphan, ReplicaInfo, Restoration, RestoredExpiry,
+    ServedDatabase, Verification, WITHOUT_WATCH, Written,
 };
 pub(crate) use drain::DrainSettings;
 pub(crate) use lease::{DROP_FLUSH_LIMIT, LeaseKeeper, LeaseSettings};

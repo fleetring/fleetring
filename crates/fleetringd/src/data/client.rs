@@ -8,18 +8,20 @@ use std::time::Duration;
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_client::redirect::primary_hint;
+use fleetring_control::fork::OperationId;
 use fleetring_control::{
-    Acks, DatabaseName, Durability, Engine, LeaseEpoch, Liveness, MetadataChange, ReplicaRole,
-    Timestamp,
+    Acks, DatabaseName, Durability, Engine, Incarnation, LeaseEpoch, Liveness, MetadataChange,
+    ReplicaRole, Timestamp,
 };
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::restore_point::Point;
 use fleetring_proto::v1::{
     self as proto, ChangeDurabilityRequest, CreateDatabaseRequest,
     CreateDatabaseWithMetadataRequest, CreateRequest, DescribeArchiveRequest, DrainRequest,
-    DropDatabaseRequest, ExecuteRequest, LeaveRequest, ListDatabasesRequest, LocateRequest,
-    NodeStatusRequest, QueryRequest, RemoveOrphanRequest, RestoreLatest, RestoreRequest,
-    UndrainRequest, VerifyArchiveRequest, VerifyRequest, WatchChangesRequest, WatchLeasesRequest,
+    DropDatabaseRequest, ExecuteRequest, ForkDatabaseRequest, ForkOperationStatus,
+    GetForkOperationRequest, LeaveRequest, ListDatabasesRequest, LocateRequest, NodeStatusRequest,
+    QueryRequest, RemoveOrphanRequest, RestoreLatest, RestoreRequest, UndrainRequest,
+    VerifyArchiveRequest, VerifyRequest, WatchChangesRequest, WatchLeasesRequest,
     WatchMembershipRequest,
 };
 use tonic::transport::Channel;
@@ -75,6 +77,47 @@ pub struct Location {
     /// Its description, labels, and creator (ADR-0041), or `None` for a database without
     /// metadata, or from a control node that predates it.
     pub metadata: Option<MetadataView>,
+}
+
+/// A fork request (ADR-0046): its operation ID, and what the fork is created with besides its
+/// name and its source. Nothing is copied from the source: what is left unset takes the fleet's
+/// defaults, as a creation's does.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring_control::fork::OperationId;
+/// use fleetringd::data::ForkSpec;
+///
+/// let spec = ForkSpec::new(OperationId::from_bytes([7; 16]));
+/// assert_eq!(spec.expect_source_incarnation, None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForkSpec {
+    /// The operation's ID: 16 random bytes the caller chooses before it asks, so that it can
+    /// send the same request again after a lost reply and get the same operation back.
+    pub operation: OperationId,
+    /// The fork's replication factor and durability.
+    pub database: DatabaseSpec,
+    /// The fork's description, labels, and expiry.
+    pub metadata: NewMetadata,
+    /// The source incarnation the caller requires, or `None` for the source's current one.
+    pub expect_source_incarnation: Option<Incarnation>,
+}
+
+impl ForkSpec {
+    /// A fork under `operation` with the fleet's defaults, no metadata, and whatever source
+    /// incarnation is current.
+    #[must_use]
+    pub fn new(operation: OperationId) -> Self {
+        Self {
+            operation,
+            database: DatabaseSpec::default(),
+            metadata: NewMetadata::default(),
+            expect_source_incarnation: None,
+        }
+    }
 }
 
 /// What to create a database with: optionally, its replication factor and its durability
@@ -882,6 +925,60 @@ impl Client {
             snapshot: response.snapshot,
             segments: response.segments,
         })
+    }
+
+    /// Forks `source` as `target` as `spec` says (ADR-0046), and returns the operation's status:
+    /// `seeding` once the control plane accepts it. Sending the same request again under the same
+    /// operation ID, from the same principal, returns the same operation and starts nothing, so
+    /// the call is retried, and a caller may resend it after a lost reply.
+    ///
+    /// # Errors
+    ///
+    /// The status of the failed control call: `PERMISSION_DENIED` without `admin` on `target`
+    /// or `fork` on `source`, or for an operation ID another principal used; `ALREADY_EXISTS`
+    /// for an existing `target`, or an operation ID used with another request;
+    /// `INVALID_ARGUMENT` for a name under the reserved prefix; `FAILED_PRECONDITION` while a
+    /// member lacks the `fork` feature, or for a source that isn't ready or can't fork;
+    /// `RESOURCE_EXHAUSTED` when too few replicas have room; `NOT_FOUND` for an unknown source;
+    /// and `UNIMPLEMENTED` from a control node that predates forks.
+    pub async fn fork_database(
+        &self,
+        source: &DatabaseName,
+        target: &DatabaseName,
+        spec: &ForkSpec,
+    ) -> Result<ForkOperationStatus, Status> {
+        let database = spec.database.to_request(target);
+        self.control
+            .fork_database(ForkDatabaseRequest {
+                operation_id: spec.operation.to_bytes().to_vec(),
+                database: target.to_string(),
+                source: source.to_string(),
+                expect_source_incarnation: spec.expect_source_incarnation.map(Incarnation::get),
+                replication_factor: database.replication_factor,
+                acks: database.acks,
+                min_replicas: database.min_replicas,
+                metadata: (!spec.metadata.is_empty())
+                    .then(|| new_metadata_to_proto(&spec.metadata)),
+            })
+            .await
+    }
+
+    /// Reads fork operation `operation`'s status (ADR-0046, point 5.4): what was asked for, what
+    /// it resolved to, and its outcome, with the fork's placement while it exists. Retried.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` for an operation that is unknown, past its retention, or that the caller
+    /// neither requested nor administers the fork of; or the status of the last attempt.
+    pub async fn fork_operation(
+        &self,
+        operation: OperationId,
+    ) -> Result<ForkOperationStatus, Status> {
+        self.control
+            .get_fork_operation(GetForkOperationRequest {
+                operation_id: operation.to_bytes().to_vec(),
+            })
+            .await
     }
 
     /// Drops a database for good, and returns the epoch it was at. The control node tells every
