@@ -50,6 +50,10 @@ pub enum FaultPoint {
     /// here keeps counting the replica set it saw before, as one that hasn't looked again yet
     /// does.
     FollowReady,
+    /// A primary has brought its hash chain up to the log's end for a checkpoint and hasn't run
+    /// the checkpoint yet: held, writes land in between, which the restarted log no longer
+    /// holds once it runs. Held only for every database, with [`hold`](ForkFaults::hold).
+    Checkpoint,
 }
 
 /// The fault hooks a daemon's fork work passes through.
@@ -173,6 +177,16 @@ impl ForkFaults {
 impl ForkFaults {
     /// Passes `point` in the work of the fork operation `operation`, waiting while a test holds
     /// it.
+    pub(crate) async fn pass(&self, point: FaultPoint, operation: OperationId) {
+        self.pass_scoped(point, Some(operation)).await;
+    }
+
+    /// Passes `point` in work that belongs to no fork operation, waiting while a test holds it
+    /// for every operation.
+    pub(crate) async fn pass_any(&self, point: FaultPoint) {
+        self.pass_scoped(point, None).await;
+    }
+
     #[cfg_attr(
         not(feature = "fault-hooks"),
         expect(
@@ -180,7 +194,7 @@ impl ForkFaults {
             reason = "the hooks wait here only with the `fault-hooks` feature"
         )
     )]
-    pub(crate) async fn pass(&self, point: FaultPoint, operation: OperationId) {
+    async fn pass_scoped(&self, point: FaultPoint, operation: Option<OperationId>) {
         #[cfg(feature = "fault-hooks")]
         if let Some(hooks) = &self.hooks {
             *hooks
@@ -189,7 +203,7 @@ impl ForkFaults {
                 .expect("fault hooks lock poisoned")
                 .entry(point)
                 .or_default() += 1;
-            let scope = Some(operation.to_bytes());
+            let scope = operation.map(|operation| operation.to_bytes());
             let applies = |held: &BTreeSet<(FaultPoint, Scope)>| {
                 held.contains(&(point, None)) || held.contains(&(point, scope))
             };

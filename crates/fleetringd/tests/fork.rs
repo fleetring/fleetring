@@ -1083,6 +1083,17 @@ async fn dev_node_with_disk(
     extra: &str,
     disk: (u64, u64),
 ) -> Result<(Daemon, Client), Box<dyn Error>> {
+    let faults = ForkFaults::new();
+    faults.set_disk(disk.0, disk.1);
+    dev_node_with_faults(dir, extra, faults).await
+}
+
+/// A dev node as [`dev_node`] makes it, passing through `faults`.
+async fn dev_node_with_faults(
+    dir: &Path,
+    extra: &str,
+    faults: ForkFaults,
+) -> Result<(Daemon, Client), Box<dyn Error>> {
     let tls = Tls::create(dir)?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"dev\"\n\n[membership]\n\
@@ -1090,8 +1101,6 @@ async fn dev_node_with_disk(
         dir.join("dev"),
         tls.node_table("dev")?
     );
-    let faults = ForkFaults::new();
-    faults.set_disk(disk.0, disk.1);
     let daemon = Daemon::start_with(
         Config::from_toml(&text)?,
         Environment::production().with_fork_faults(faults),
@@ -1165,6 +1174,76 @@ async fn a_dev_node_forks_a_database_that_checkpointed() -> TestResult {
     assert!(status.checkpointed.is_some(), "the source checkpointed");
     let target = name("dst")?;
     let id = operation(10);
+    client
+        .fork_database(&source, &target, &spec(id, 1)?)
+        .await?;
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
+/// A lone primary, R = 1, whose checkpoint is slow while more than its retained bytes land
+/// keeps the batches its chain hasn't reached until the checkpoint ends, so its chain reaches
+/// the checkpoint and goes on: `db verify` answers, and a fork of it becomes ready, without a
+/// restart (#156).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lone_primarys_chain_survives_writes_past_its_retained_bytes_during_a_checkpoint()
+-> TestResult {
+    let dir = tempfile::tempdir()?;
+    let faults = ForkFaults::new();
+    faults.set_disk(ROOMY, 2 * ROOMY);
+    faults.hold(FaultPoint::Checkpoint);
+    let (daemon, client) = dev_node_with_faults(
+        dir.path(),
+        "\n[replication]\ncheckpoint_threshold_bytes = 16384\nretained_bytes = 4096\n",
+        faults.clone(),
+    )
+    .await?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 0).await?;
+    let replication = daemon.replication().ok_or("no replication")?;
+    let write = |n: usize| {
+        let client = &client;
+        let source = &source;
+        async move {
+            client
+                .execute(
+                    source,
+                    Statement::with_params(
+                        "INSERT INTO notes (body) VALUES (?)",
+                        [Value::from(format!("{n:0>600}"))],
+                    ),
+                )
+                .await
+        }
+    };
+    // Writes until a checkpoint starts and is held, then far more than the retained bytes
+    // while it waits.
+    let mut n = 0;
+    while faults.arrivals(FaultPoint::Checkpoint) == 0 {
+        write(n).await?;
+        n += 1;
+        assert!(n < 1_000, "no checkpoint started");
+    }
+    for _ in 0..40 {
+        write(n).await?;
+        n += 1;
+    }
+    faults.release(FaultPoint::Checkpoint);
+    wait_until("the checkpoint ends", async || {
+        replication
+            .primary_status(&source)
+            .is_some_and(|status| status.checkpointed.is_some())
+    })
+    .await?;
+    write(n).await?;
+    replication.verify(&source, None).await?;
+    let target = name("dst")?;
+    let id = operation(43);
     client
         .fork_database(&source, &target, &spec(id, 1)?)
         .await?;
