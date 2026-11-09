@@ -74,6 +74,7 @@ const _: () = {
     assert_debug_send_sync::<auth::Credential>();
     assert_debug_send_sync::<auth::Denied>();
     assert_debug_send_sync::<auth::ForNodes>();
+    assert_debug_send_sync::<auth::GrantStepError>();
     assert_debug_send_sync::<auth::Needed>();
     assert_debug_send_sync::<auth::Requirement>();
     assert_debug_send_sync::<auth::Rpc>();

@@ -45,7 +45,8 @@ const PRINCIPALS: &str = "\n[[principal]]\nname = \"reader\"\nscopes = [\"read:t
      \n[[principal]]\nname = \"app\"\n\
      \n[[principal]]\nname = \"router\"\nforward_tokens = true\n\
      \n[[principal]]\nname = \"streamer\"\nscopes = [\"stream:tenant:acme/*\"]\n\
-     \n[[principal]]\nname = \"writer\"\nscopes = [\"write:tenant:acme/*\"]\n";
+     \n[[principal]]\nname = \"writer\"\nscopes = [\"write:tenant:acme/*\"]\n\
+     \n[[principal]]\nname = \"forker\"\nscopes = [\"fork:x\"]\n";
 
 fn config(
     dir: &Path,
@@ -281,6 +282,177 @@ async fn the_schema_needs_read_on_the_database() -> TestResult {
             "{principal}"
         );
     }
+
+    data.run_until(async {}).await;
+    control.run_until(async {}).await;
+    Ok(())
+}
+
+/// `fork` reads and does nothing more, and `grant` authorizes nothing at all (ADR-0044, point 2),
+/// through a certificate and through a token, at the control node and at the data node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_only_reads_and_grant_authorizes_nothing() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let control = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "control",
+        "control",
+        None,
+    )?)?)
+    .await?;
+    let address = control.control_address().ok_or("no control address")?;
+    let data = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "data-1",
+        "data",
+        Some(address),
+    )?)?)
+    .await?;
+    let control_target = address.to_string();
+    let data_target = data.listen_address().to_string();
+
+    let admin = Client::new(control_target.clone(), network(&tls, "tester")?);
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match admin.status().await {
+                Ok(view) if view.members().len() == 1 => return Ok::<_, tonic::Status>(()),
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await??;
+    let x: DatabaseName = "x".parse()?;
+    let x1: DatabaseName = "x-1".parse()?;
+    for database in [&x, &x1] {
+        admin
+            .create_database_with(database, DatabaseSpec::new(ReplicationFactor::ONE))
+            .await?;
+        admin
+            .execute(database, Statement::new("CREATE TABLE t (v INTEGER)"))
+            .await?;
+        admin.execute(database, write_one()).await?;
+    }
+    let denied = |result: Result<(), tonic::Status>, what: &str| -> Result<String, String> {
+        let status = result.err().ok_or_else(|| format!("{what} was allowed"))?;
+        if status.code() != Code::PermissionDenied {
+            return Err(format!("{what}: {status}"));
+        }
+        Ok(status.message().to_owned())
+    };
+
+    // `fork:x` from a `[[principal]]` entry, and from a token: reads `x`, and nothing else.
+    let signer = tls.authority().token_signer()?;
+    let fork_token = token(
+        &signer,
+        "app",
+        &["fork:x"],
+        "app-fork",
+        Duration::from_secs(3600),
+    )?;
+    let forkers = [
+        ("a certificate", network(&tls, "forker")?),
+        ("a token", with_token(network(&tls, "app")?, &fork_token)?),
+    ];
+    for (how, network) in forkers {
+        for entry in [None, Some(&data_target)] {
+            let client = Client::new(control_target.clone(), network.clone());
+            let forker = match entry {
+                Some(entry) => client.with_entry(entry.clone()),
+                None => client,
+            };
+            let rows = forker.query(&x, read_one()).await?;
+            assert_eq!(
+                rows.rows.len(),
+                1,
+                "fork through {how} reads x at {entry:?}"
+            );
+            forker.locate(&x).await?;
+            let listed: Vec<String> = forker
+                .list_databases()
+                .await?
+                .iter()
+                .map(|location| location.database.to_string())
+                .collect();
+            assert_eq!(listed, ["x"], "fork through {how} lists what it reads");
+            assert_eq!(
+                denied(forker.execute(&x, write_one()).await.map(|_| ()), "a write")?,
+                "Execute needs write on 'x'",
+                "{how}"
+            );
+            assert_eq!(
+                denied(forker.drop_database(&x).await.map(|_| ()), "a drop")?,
+                "DropDatabase needs admin on 'x'",
+                "{how}"
+            );
+            denied(
+                forker
+                    .create_database_with(
+                        &"x-2".parse()?,
+                        DatabaseSpec::new(ReplicationFactor::ONE),
+                    )
+                    .await
+                    .map(|_| ()),
+                "a create",
+            )?;
+            // Through the control node, the client is refused locating the primary first.
+            let other = denied(forker.query(&x1, read_one()).await.map(|_| ()), "x-1")?;
+            assert!(
+                other.ends_with(" needs read on 'x-1'"),
+                "{how} at {entry:?}: {other}"
+            );
+        }
+    }
+
+    // `grant:x-*` alone: every call on `x-1` is refused, as is every listing.
+    let grant_token = token(
+        &signer,
+        "app",
+        &["grant:x-*"],
+        "app-grant",
+        Duration::from_secs(3600),
+    )?;
+    for entry in [None, Some(&data_target)] {
+        let client = Client::new(
+            control_target.clone(),
+            with_token(network(&tls, "app")?, &grant_token)?,
+        );
+        let granter = match entry {
+            Some(entry) => client.with_entry(entry.clone()),
+            None => client,
+        };
+        let request = SchemaRequest {
+            count_limit: 100,
+            internal: Internal::Hide,
+        };
+        let refusals = [
+            denied(granter.query(&x1, read_one()).await.map(|_| ()), "query")?,
+            denied(granter.execute(&x1, write_one()).await.map(|_| ()), "write")?,
+            denied(granter.locate(&x1).await.map(|_| ()), "locate")?,
+            denied(granter.schema(&x1, request).await.map(|_| ()), "schema")?,
+            denied(granter.drop_database(&x1).await.map(|_| ()), "drop")?,
+            denied(
+                granter
+                    .create_database_with(
+                        &"x-2".parse()?,
+                        DatabaseSpec::new(ReplicationFactor::ONE),
+                    )
+                    .await
+                    .map(|_| ()),
+                "create",
+            )?,
+            denied(granter.list_databases().await.map(|_| ()), "list")?,
+        ];
+        assert!(
+            refusals.iter().all(|message| !message.contains("grant")),
+            "a refusal names what was needed, never grant: {refusals:?}"
+        );
+    }
+    // The databases are as they were.
+    assert_eq!(admin.query(&x1, read_one()).await?.rows.len(), 1);
+    assert!(admin.locate(&"x-2".parse()?).await.is_err());
 
     data.run_until(async {}).await;
     control.run_until(async {}).await;

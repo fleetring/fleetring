@@ -104,7 +104,10 @@ impl Rpc {
 const fn rpc(path: &'static str, requirement: Requirement, binding: Binding) -> Rpc {
     let nodes = match requirement {
         Requirement::Node => ForNodes::Allowed,
-        _ => ForNodes::Refused,
+        Requirement::Fleet
+        | Requirement::Database(_)
+        | Requirement::DatabaseOrFleet(_)
+        | Requirement::Listing(_) => ForNodes::Refused,
     };
     Rpc {
         path,
@@ -647,7 +650,13 @@ mod tests {
             let service = rpc.service().trim_start_matches("fleetring.v1.");
             let binding = match rpc.binding {
                 Binding::None => "—",
-                binding => binding.as_str(),
+                binding @ (Binding::SelfNode
+                | Binding::Replica
+                | Binding::Holder
+                | Binding::Candidate
+                | Binding::HolderOrCandidate
+                | Binding::Follower
+                | Binding::Dropped) => binding.as_str(),
             };
             let row = format!(
                 "| `{service}.{}` | {} | {binding} |",
@@ -706,6 +715,59 @@ mod tests {
 
     fn database(text: &str) -> DatabaseName {
         text.parse().expect("a database name")
+    }
+
+    #[test]
+    fn grant_alone_is_refused_every_rpc() {
+        let x1 = database("x-1");
+        for scopes in [&["grant:x-*"][..], &["grant:*"], &["grant:x-1"]] {
+            let granter = principal(scopes);
+            for rpc in RPCS {
+                for database in [Some(&x1), None] {
+                    assert!(
+                        granter.authorize(rpc, database).is_err(),
+                        "{scopes:?} made {} on {database:?}",
+                        rpc.path
+                    );
+                }
+            }
+            for action in Action::ALL {
+                assert!(!granter.sees(action, &x1), "{scopes:?} sees {action}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_forker_reads_and_is_refused_writing_and_administering() {
+        let forker = principal(&["fork:x"]);
+        let x = database("x");
+        let ok = |path: &str| forker.authorize(call(path), Some(&x));
+        for read in RPCS.iter().filter(|rpc| {
+            matches!(
+                rpc.requirement,
+                Requirement::Database(Action::Read) | Requirement::DatabaseOrFleet(Action::Read)
+            )
+        }) {
+            assert_eq!(forker.authorize(read, Some(&x)), Ok(()), "{}", read.path);
+        }
+        assert_eq!(ok("/fleetring.v1.Database/Query"), Ok(()));
+        assert_eq!(ok("/fleetring.v1.Control/ListDatabases"), Ok(()));
+        let write = ok("/fleetring.v1.Database/Execute").expect_err("no write");
+        assert_eq!(write.to_string(), "Execute needs write on 'x'");
+        let drop = ok("/fleetring.v1.Control/DropDatabase").expect_err("no admin");
+        assert_eq!(drop.to_string(), "DropDatabase needs admin on 'x'");
+        for rpc in RPCS.iter().filter(|rpc| {
+            matches!(
+                rpc.requirement,
+                Requirement::Database(Action::Write | Action::Admin | Action::Stream)
+                    | Requirement::Node
+                    | Requirement::Fleet
+            )
+        }) {
+            assert!(forker.authorize(rpc, Some(&x)).is_err(), "{}", rpc.path);
+        }
+        assert!(forker.sees(Action::Read, &x));
+        assert!(!forker.sees(Action::Stream, &x));
     }
 
     #[test]
