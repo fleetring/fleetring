@@ -918,7 +918,8 @@ impl Control for ControlService {
             durability: Some(durability),
             metadata,
             // TODO(#135): draw a random incarnation from the injected RNG once this build
-            // supports forks; until then no fleet of it enables them, and none is needed.
+            // supports forks, and on `IncarnationUnavailable` draw again and resubmit; until
+            // then no fleet of it enables them, and none is needed.
             incarnation: fleetring_control::Incarnation::LEGACY,
         };
         self.create(name, replication_factor, action).await
@@ -961,7 +962,8 @@ impl Control for ControlService {
             durability: Some(durability),
             metadata: Some(spec),
             // TODO(#135): draw a random incarnation from the injected RNG once this build
-            // supports forks; until then no fleet of it enables them, and none is needed.
+            // supports forks, and on `IncarnationUnavailable` draw again and resubmit; until
+            // then no fleet of it enables them, and none is needed.
             incarnation: fleetring_control::Incarnation::LEGACY,
         };
         self.create(name, replication_factor, action).await

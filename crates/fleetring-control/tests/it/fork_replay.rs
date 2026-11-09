@@ -87,7 +87,6 @@ fn applied_kind(outcome: &Outcome) -> &'static str {
         Err(Rejection::NotEnoughHolders { .. }) => "not enough holders",
         Err(Rejection::HolderReportMismatch { .. }) => "report mismatch",
         Err(Rejection::LeaseOnUnseededFork { .. }) => "lease on unseeded",
-        Err(Rejection::FirstLeaseNotHolder { .. }) => "not a holder",
         Err(Rejection::StagedCopyNotReported { .. }) => "copy not reported",
         Err(Rejection::ResetNotReported { .. }) => "reset not reported",
         Err(Rejection::ForkNotReady { .. }) => "not ready",
@@ -344,6 +343,12 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
 /// A state and a log written before forks, by the build before them, load unchanged: every
 /// database reads as seeded and ready at the legacy incarnation, re-serializing gives the same
 /// bytes, and replaying the log gives the same state, byte for byte.
+///
+/// The fixtures were written by unmodified `main` at commit a0d51f2, from the generated logs
+/// `record_with(&fixed_ops(0x08F0, 400), SoftwareMix::Current)` and
+/// `record_with(&fixed_ops(0x08F1, 400), SoftwareMix::Mixed)` in `common`, serialized with
+/// `serde_json::to_string` as the control log and its snapshots are. They must never be
+/// regenerated: they stand for what a release before forks wrote.
 #[test]
 fn a_state_and_log_from_before_forks_load_and_reserialize_byte_for_byte() {
     for (log, snapshot) in [
@@ -464,7 +469,7 @@ fn current_attempt(state: &State, name: &str) -> u32 {
 }
 
 /// The action a step makes, aimed with the state.
-fn step_action(state: &State, step: Step) -> Vec<Action> {
+fn step_action(state: &State, step: Step, clock: u64) -> Vec<Action> {
     let a = usize::from(step.a);
     let b = usize::from(step.b);
     let node = FORK_NODES[a % FORK_NODES.len()];
@@ -519,7 +524,7 @@ fn step_action(state: &State, step: Step) -> Vec<Action> {
             };
             vec![heartbeat_of(node, vec![report], Some(1 << 40))]
         }
-        5 | 6 => fork::actions(state, state.now()),
+        5 | 6 => fork::actions(state, at(clock)),
         7 => vec![Action::AcquireLease {
             database: db(name),
             node: id(node),
@@ -551,10 +556,16 @@ fn fork_log(steps: &[Step], mut check: impl FnMut(&State, &Command, &Outcome, &S
     let mut clock = 0_u64;
     for &step in steps {
         clock += u64::from(step.dt);
-        for action in step_action(&log.state, step) {
+        // What the driver proposes, `apply` accepts: a refusal would be logged on every tick.
+        let driven = matches!(step.kind % 12, 5 | 6);
+        for action in step_action(&log.state, step, clock) {
             let before = log.state.clone();
             let command = Command::new(at(clock), action.clone());
             let outcome = log.run(clock, action);
+            assert!(
+                !driven || outcome.is_ok(),
+                "the driver proposed {command:?}, refused: {outcome:?}"
+            );
             check(&before, &command, &outcome, &log.state);
         }
         // Members keep sending heartbeats, so that liveness doesn't decide everything.
