@@ -1332,6 +1332,46 @@ fn admission_subtracts_the_seeds_already_pending() {
     assert!(matches!(created, Applied::ForkCreated { .. }));
 }
 
+/// Control-plane admission counts the floor the fork's limits carry, the proposing node's
+/// `[fork] admission_min_free_bytes`, and 1 GiB without one: a dev node's small floor admits a
+/// small copy on a nearly full disk that the default refuses (ADR-0046, point 7.3).
+#[test]
+fn admission_counts_the_floor_the_forks_limits_carry() {
+    const MIB: u64 = 1 << 20;
+    let mut state = fleet(&["n0", "n1", "n2"]);
+    run(&mut state, 10, fork_of(1, "warm", SOURCE, 1)).expect("fork");
+    for node in ["n0", "n1", "n2"] {
+        let source = replica(SOURCE).with_size_bytes(MIB);
+        run(
+            &mut state,
+            20,
+            heartbeat_of(node, vec![source], Some(512 * MIB)),
+        )
+        .expect("hb");
+    }
+    refused(
+        &mut state,
+        30,
+        fork_request(2, "a"),
+        &Rejection::InsufficientDisk {
+            database: db("a"),
+            admitting: 0,
+            need: 2,
+        },
+    );
+    let mut small = fork_request(2, "a");
+    if let Action::ForkDatabase { limits, .. } = &mut small {
+        limits.admission_min_free_bytes = Some(64 * MIB);
+    }
+    let created = run(&mut state, 40, small).expect("a small floor admits it");
+    assert!(matches!(created, Applied::ForkCreated { .. }));
+    let recorded = state
+        .database(&db("a"))
+        .and_then(|d| d.fork())
+        .map(|f| f.limits().admission_floor());
+    assert_eq!(recorded, Some(64 * MIB));
+}
+
 // ---- The driver ----
 
 /// The driver retries when the seeder is down for the seeder timeout, excluding it, and when

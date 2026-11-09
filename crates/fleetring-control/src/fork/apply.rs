@@ -172,7 +172,7 @@ pub(crate) fn fork_database(
     // Best effort: sizes and free disk are recorded only once forks are enabled, so the first
     // fork of a fleet passes unconditionally; the data node's own check decides.
     let source_bytes = reported_size(state, &intent.source);
-    let admitted = admitting(state, &replicas, source_bytes);
+    let admitted = admitting(state, &replicas, source_bytes, limits.admission_floor());
     if admitted < usize::from(need) {
         return Err(Rejection::InsufficientDisk {
             database: name,

@@ -11,10 +11,11 @@ use crate::{
     Rejection, Report, State, Timestamp,
 };
 
-/// The headroom a replica must keep beyond a fork's copy, as control-plane admission counts it:
-/// 1 GiB, the floor of ADR-0046's `max(1 GiB, 5% of the volume)`. Heartbeats carry free bytes
-/// but not the volume's size, so the control plane checks the floor and the data node, which
-/// knows its volume, checks the rest (ADR-0046, point 7).
+/// The headroom a replica must keep beyond a fork's copy, as control-plane admission counts it
+/// unless the fork's limits say otherwise: 1 GiB, the default floor of ADR-0046's
+/// `max(1 GiB, 5% of the volume)`. Heartbeats carry free bytes but not the volume's size, so the
+/// control plane checks the floor and the data node, which knows its volume, checks the rest
+/// (ADR-0046, point 7).
 pub(crate) const ADMISSION_HEADROOM: u64 = 1 << 30;
 
 /// Returns the database and the fork that `identity` names, if it is the current one: the
@@ -320,10 +321,10 @@ fn pending_seeds(state: &State, node: &NodeId) -> u128 {
 
 /// Returns how many of `replicas` have room for a copy of `bytes`, as far as their heartbeats
 /// say: free bytes, less what seeding forks have reserved there, of at least the copy's
-/// reservation plus [`ADMISSION_HEADROOM`]. A member that hasn't reported its free bytes counts
-/// as having room, and so does every member when the copy's size is unknown: the data node's
-/// own check decides (ADR-0046, point 7.3).
-pub(crate) fn admitting(state: &State, replicas: &[NodeId], bytes: u64) -> usize {
+/// reservation plus `floor`, the fork's admission floor ([`ADMISSION_HEADROOM`] by default). A
+/// member that hasn't reported its free bytes counts as having room, and so does every member
+/// when the copy's size is unknown: the data node's own check decides (ADR-0046, point 7.3).
+pub(crate) fn admitting(state: &State, replicas: &[NodeId], bytes: u64, floor: u64) -> usize {
     if bytes == 0 {
         return replicas.len();
     }
@@ -332,9 +333,7 @@ pub(crate) fn admitting(state: &State, replicas: &[NodeId], bytes: u64) -> usize
         .filter(|node| {
             state.disk_free_bytes(node).is_none_or(|free| {
                 u128::from(free)
-                    >= pending_seeds(state, node)
-                        + reservation(bytes)
-                        + u128::from(ADMISSION_HEADROOM)
+                    >= pending_seeds(state, node) + reservation(bytes) + u128::from(floor)
             })
         })
         .count()

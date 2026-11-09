@@ -1015,6 +1015,11 @@ fn config_text(dir: &Path, port: u16) -> Result<String, DevError> {
          # One node, so a database created without --replication-factor gets one replica.\n\
          replication_factor = 1\n\
          \n\
+         [fork]\n\
+         # A small disk margin beside a fork's copy: a laptop's disk is rarely 95% free.\n\
+         admission_min_free_bytes = 67108864\n\
+         admission_min_free_percent = 0\n\
+         \n\
          [tls]\n\
          ca = {ca}\n\
          cert = {cert}\n\
@@ -1488,6 +1493,9 @@ mod tests {
         assert_eq!(first.config().dev, DevMode::On);
         assert_eq!(first.config().listen.to_string(), "127.0.0.1:17400");
         assert_eq!(first.config().admin.listen.to_string(), "127.0.0.1:17401");
+        // A fork keeps a small disk margin on a dev node.
+        assert_eq!(first.config().fork.admission_min_free_bytes, 64 << 20);
+        assert_eq!(first.config().fork.admission_min_free_percent, 0);
         let second = prepare(&dir, None, NOW).expect("the same directory");
         assert!(second.created().is_empty(), "{:?}", second.created());
         assert_eq!(second.config(), first.config());

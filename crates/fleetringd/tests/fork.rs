@@ -1073,6 +1073,16 @@ async fn two_forks_never_count_the_same_free_bytes() -> TestResult {
 /// A dev node: one daemon that is its own control plane and its only data node, with `extra`
 /// appended to its configuration.
 async fn dev_node(dir: &Path, extra: &str) -> Result<(Daemon, Client), Box<dyn Error>> {
+    dev_node_with_disk(dir, extra, (ROOMY, 2 * ROOMY)).await
+}
+
+/// A dev node as [`dev_node`] makes it, whose fork admission believes its volume has `disk`'s
+/// free bytes and size.
+async fn dev_node_with_disk(
+    dir: &Path,
+    extra: &str,
+    disk: (u64, u64),
+) -> Result<(Daemon, Client), Box<dyn Error>> {
     let tls = Tls::create(dir)?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"dev\"\n\n[membership]\n\
@@ -1081,7 +1091,7 @@ async fn dev_node(dir: &Path, extra: &str) -> Result<(Daemon, Client), Box<dyn E
         tls.node_table("dev")?
     );
     let faults = ForkFaults::new();
-    faults.set_disk(ROOMY, 2 * ROOMY);
+    faults.set_disk(disk.0, disk.1);
     let daemon = Daemon::start_with(
         Config::from_toml(&text)?,
         Environment::production().with_fork_faults(faults),
@@ -1955,5 +1965,50 @@ async fn a_fork_that_isnt_ready_refuses_every_data_call_alike() -> TestResult {
         faults.release_operation(FaultPoint::Staged, failing);
     }
     fleet.stop().await;
+    Ok(())
+}
+
+/// The `[fork]` margin `fleetring dev` writes, continuing the tests' `[fork]` table.
+const DEV_MARGIN: &str = "admission_min_free_bytes = 67108864\nadmission_min_free_percent = 0\n";
+
+/// A laptop's volume: 926 GiB, of which 512 MiB are free.
+const LAPTOP: (u64, u64) = (512 << 20, 926 << 30);
+
+/// A dev node's small disk margin admits a small fork on a nearly full laptop disk, which the
+/// default margin, max(1 GiB, 5% of the volume), refuses (ADR-0046, point 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dev_nodes_margin_admits_a_small_fork_the_default_refuses() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (daemon, client) = dev_node_with_disk(dir.path(), DEV_MARGIN, LAPTOP).await?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 3).await?;
+    let id = operation(60);
+    client
+        .fork_database(&source, &name("dst")?, &spec(id, 1)?)
+        .await?;
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    daemon.run_until(async {}).await;
+
+    let dir = tempfile::tempdir()?;
+    let (daemon, client) = dev_node_with_disk(dir.path(), "", LAPTOP).await?;
+    create_source(&client, &source, 1, 3).await?;
+    let id = operation(61);
+    // The control plane may refuse it at once, if it knows the source's size, or the node
+    // refuses its copy and the fork fails.
+    match client
+        .fork_database(&source, &name("dst")?, &spec(id, 1)?)
+        .await
+    {
+        Err(status) => assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}"),
+        Ok(_) => {
+            let failed = await_state(&client, id, proto::ForkState::Failed).await?;
+            assert_eq!(
+                failed.failure.as_ref().map(proto::ForkFailure::reason),
+                Some(proto::ForkFailureReason::InsufficientDisk),
+                "{failed:?}"
+            );
+        }
+    }
+    daemon.run_until(async {}).await;
     Ok(())
 }

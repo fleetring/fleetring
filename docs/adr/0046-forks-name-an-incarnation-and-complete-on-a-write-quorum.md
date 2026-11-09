@@ -337,9 +337,12 @@ Every default marked *provisional* is a starting point. FR-087 measures it, and 
 | `[fork] max_pins_per_node` / `max_pins_per_database` | data | 2 / 1, *provisional* | `RESOURCE_EXHAUSTED` with a retry-after; not an attempt failure |
 | `[fork] max_seeds_per_node` | data | 2 concurrent staged downloads, *provisional* | the same |
 | disk admission | data | free − reserved ≥ `total_bytes` × 1.1 + max(1 GiB, 5% of the volume), *provisional* | `seed_failure { InsufficientDisk }` for this node only |
+| `[fork] admission_min_free_bytes`, `admission_min_free_percent` | data (the bytes also control) | 1 GiB and 5%: the margin of the row above | as above; the control plane's floor (point 7.3) uses the proposing node's bytes, recorded in `ForkLimits` |
 | `[fork] operation_retention` | control | 7 days after the terminal outcome | the operation record is pruned; deduplication ends |
 | `[fork] max_operations` | control | 10,000 records | `RESOURCE_EXHAUSTED` on new forks |
 | client resends | CLI and MCP | 5 within 60 s on `UNAVAILABLE` | the error, and the operation ID to resume with |
+
+*As built (2026-11-09):* the disk-admission margin is configurable, as the row above says, because max(1 GiB, 5% of the volume) refused a three-row fork on a developer's laptop with 50 GiB free of 926 GiB. The ×1.1 reservation is fixed. The configuration `fleetring dev` writes keeps 64 MiB and 0%. A fork made under the default bytes records none in `ForkLimits`, so its command encodes as before.
 
 1. **Reservations.**
    - A data node keeps an in-memory **reservation ledger.** Admitting a seed reserves `total_bytes` × 1.1 until the copy is staged (the bytes are then on disk) or abandoned. Admission compares free disk *minus* outstanding reservations, so two concurrent seeds never count the same free bytes.
