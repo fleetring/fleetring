@@ -22,7 +22,9 @@ use v1::ProtocolVersion;
 /// membership updates, and the `Undrain` call (ADR-0038). Minor 2 adds database metadata
 /// (ADR-0041): the `CreateDatabaseWithMetadata` and `UpdateDatabase` calls, `Placement.metadata`,
 /// and the filters and pages of `ListDatabases`. Minor 3 adds the `Database.Session` stream
-/// (ADR-0037).
+/// (ADR-0037), and forks (ADR-0046): the `ForkDatabase` and `GetForkOperation` calls,
+/// `Placement.incarnation` and `Placement.fork`, the fork fields of heartbeats, and the fork
+/// identity on `Snapshot` and `DropCopy`.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 /// The largest message a node sends or accepts: a replication batch or a snapshot chunk.

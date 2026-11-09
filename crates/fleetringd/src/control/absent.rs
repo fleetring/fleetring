@@ -6,12 +6,13 @@ use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
     CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
-    DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest,
-    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
-    ListDatabasesResponse, LocateRequest, LocateResponse, PromotionResponse, RecordFencedRequest,
-    RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse,
-    StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
-    UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
+    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
+    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    LocateRequest, LocateResponse, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
+    RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
+    TransferLeaseRequest, UndrainRequest, UndrainResponse, UpdateDatabaseRequest,
+    UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -81,6 +82,20 @@ impl Control for NoControl {
         &self,
         _: Request<UpdateDatabaseRequest>,
     ) -> Result<Response<UpdateDatabaseResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn fork_database(
+        &self,
+        _: Request<ForkDatabaseRequest>,
+    ) -> Result<Response<ForkOperationStatus>, Status> {
+        self.refuse()
+    }
+
+    async fn get_fork_operation(
+        &self,
+        _: Request<GetForkOperationRequest>,
+    ) -> Result<Response<ForkOperationStatus>, Status> {
         self.refuse()
     }
 

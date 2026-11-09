@@ -266,8 +266,10 @@ async fn a_control_daemon_runs_the_lease_lifecycle_through_the_client() -> TestR
                 role: ReplicaRole::Follower.into(),
                 epoch: 0,
                 position: vec![0, 0, 0, 1],
+                ..DatabaseStatus::default()
             }],
             software: None,
+            ..HeartbeatRequest::default()
         })
         .await?;
     assert_eq!(beat.membership_epoch, 3);
@@ -503,8 +505,10 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
             role: ReplicaRole::Follower.into(),
             epoch: 1,
             position: vec![0, position],
+            ..DatabaseStatus::default()
         }],
         software: None,
+        ..HeartbeatRequest::default()
     };
     let locate = || async {
         control
@@ -621,6 +625,20 @@ impl Control for Redirecting {
         &self,
         _: Request<fleetring_proto::v1::UpdateDatabaseRequest>,
     ) -> Result<Response<fleetring_proto::v1::UpdateDatabaseResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn fork_database(
+        &self,
+        _: Request<fleetring_proto::v1::ForkDatabaseRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ForkOperationStatus>, Status> {
+        self.redirect()
+    }
+
+    async fn get_fork_operation(
+        &self,
+        _: Request<fleetring_proto::v1::GetForkOperationRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ForkOperationStatus>, Status> {
         self.redirect()
     }
 
@@ -1334,6 +1352,7 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
         role: ReplicaRole::Primary.into(),
         epoch: 1,
         position: vec![0, 7],
+        ..DatabaseStatus::default()
     };
     // The known report lands, the unknown one is named, and the node stays live.
     let beat = a
@@ -1341,6 +1360,7 @@ async fn a_heartbeat_naming_an_unknown_database_still_counts() -> TestResult {
             node_id: "a".into(),
             databases: vec![status("ghost"), status("known")],
             software: None,
+            ..HeartbeatRequest::default()
         })
         .await?;
     assert_eq!(beat.unknown_databases, vec!["ghost".to_owned()]);
@@ -1678,8 +1698,10 @@ impl Bound {
                     role: ReplicaRole::Follower.into(),
                     epoch: 1,
                     position: vec![0, 1],
+                    ..DatabaseStatus::default()
                 }],
                 software: None,
+                ..HeartbeatRequest::default()
             })
             .await?;
         Ok(bound)
@@ -3548,6 +3570,7 @@ mod node_list {
                                     node_id: id.into(),
                                     databases: Vec::new(),
                                     software: None,
+                                    ..HeartbeatRequest::default()
                                 })
                                 .await;
                             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3669,6 +3692,266 @@ mod node_list {
         // `-o json` is the same output.
         assert_eq!(fleet.node_list(&["-o", "json"]).await?, printed);
         fleet.stop().await;
+        Ok(())
+    }
+}
+
+/// FR-085, stage A: forks over gRPC (ADR-0046). No build reports `fork` yet, so the members join
+/// reporting it, as a later release's would, and report their staged copies by hand.
+mod forks {
+    use std::error::Error;
+    use std::time::Duration;
+
+    use fleetring_control::Feature;
+    use fleetring_control::fork::{ForkState as ControlForkState, OperationId};
+    use fleetring_proto::v1::{
+        DatabaseStatus, ForkDatabaseRequest, ForkOperationStatus, ForkState,
+        GetForkOperationRequest, HeartbeatRequest, LocateRequest, Placement, ReplicaRole,
+        SeedProgress, Software, StagedCopy,
+    };
+    use fleetringd::control::ControlClient;
+    use fleetringd::{Config, Daemon};
+    use tonic::Code;
+
+    use super::{TestResult, create_request, join_with, node_client, reporting, secure_client};
+    use crate::support::Tls;
+
+    /// Guards against a hang only.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
+
+    /// This build's software with `fork` besides: a member of a release that seeds forks.
+    fn forking() -> Software {
+        let running = fleetringd::software::running();
+        Software {
+            features: running
+                .features()
+                .chain([Feature::Fork])
+                .map(|feature| feature.as_str().to_owned())
+                .collect(),
+            ..reporting(fleetringd::software::VERSION)
+        }
+    }
+
+    fn fork_request(operation: OperationId, replication_factor: u32) -> ForkDatabaseRequest {
+        ForkDatabaseRequest {
+            operation_id: operation.to_bytes().to_vec(),
+            database: "scratch".to_owned(),
+            source: "notes".to_owned(),
+            replication_factor,
+            ..ForkDatabaseRequest::default()
+        }
+    }
+
+    async fn locate(control: &ControlClient, database: &str) -> Result<Placement, Box<dyn Error>> {
+        Ok(control
+            .locate(LocateRequest {
+                database: database.to_owned(),
+            })
+            .await?
+            .placement
+            .ok_or("no placement")?)
+    }
+
+    /// The status without its placement, whose liveness flags move with time.
+    fn without_placement(mut status: ForkOperationStatus) -> ForkOperationStatus {
+        status.placement = None;
+        status
+    }
+
+    #[tokio::test]
+    async fn a_fork_seeds_resends_and_shows_in_its_placement() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
+        // A short lease, so the fork driver starts soon after the control node does.
+        let text = format!(
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \
+             \"control-1\"\n\n[control]\nlease_duration_ms = 500\nfailover_margin_ms = 0\n\
+             tick_interval_ms = 50\n{}",
+            dir.path().join("data"),
+            tls.node_table("control-1")?
+        );
+        let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+        let address = daemon.control_address().ok_or("no control address")?;
+        let handle = daemon.control().ok_or("no control node")?;
+        for id in ["a", "b", "c"] {
+            node_client(address, &tls, id)?
+                .join(join_with(id, Some(forking())))
+                .await?;
+        }
+        let control = secure_client(address, &tls)?;
+
+        // Before the fleet enables `fork`, a creation stores the legacy incarnation, and state
+        // is as it was.
+        let source = control
+            .create_database(create_request("notes", 3))
+            .await?
+            .placement
+            .ok_or("no placement")?;
+        assert_eq!(source.incarnation, 0);
+        assert_eq!(source.fork, None);
+        assert!(!handle.state().is_enabled(Feature::Fork));
+
+        // The fork is accepted and starts seeding, at a random incarnation.
+        let operation = OperationId::from_bytes([0x42; 16]);
+        let status = control.fork_database(fork_request(operation, 3)).await?;
+        assert!(handle.state().is_enabled(Feature::Fork));
+        assert_eq!(status.state, i32::from(ForkState::Seeding));
+        assert_eq!(status.operation_id, operation.to_bytes());
+        assert_eq!(status.database, "scratch");
+        assert_ne!(status.incarnation, 0);
+        assert_eq!(
+            (status.source.as_str(), status.source_incarnation),
+            ("notes", 0)
+        );
+        assert_eq!(status.attempt, 1);
+        assert_eq!(status.requested_by.as_deref(), Some("tester"));
+        let request = status.request.clone().ok_or("no recorded request")?;
+        assert_eq!(request.replication_factor, 3);
+        assert_eq!(
+            request.min_replicas, 2,
+            "the fleet's default floor, filled in"
+        );
+        let placement = status.placement.clone().ok_or("no placement")?;
+        assert_eq!(placement.incarnation, status.incarnation);
+        let fork = placement.fork.ok_or("no fork status")?;
+        assert_eq!(fork.state, i32::from(ForkState::Seeding));
+        assert_eq!(fork.operation_id, operation.to_bytes());
+        assert_eq!(
+            (fork.source.as_str(), fork.source_incarnation),
+            ("notes", 0)
+        );
+        assert_eq!((fork.attempt, fork.max_attempts), (1, 5));
+        assert_eq!(fork.holders_needed, 2);
+        assert!(fork.holders.is_empty());
+        assert!(fork.deadline_at_ms.is_some());
+        assert_eq!(fork.requested_by.as_deref(), Some("tester"));
+        let seeder = fork.seeder.ok_or("no seeder")?;
+
+        // A resend with the same ID and request answers with the same operation and logs
+        // nothing; another request under the ID is refused, naming what differs.
+        let logged = handle.state().fork_operations().len();
+        let again = control.fork_database(fork_request(operation, 3)).await?;
+        assert_eq!(without_placement(again), without_placement(status.clone()));
+        assert_eq!(handle.state().fork_operations().len(), logged);
+        let conflict = control
+            .fork_database(fork_request(operation, 1))
+            .await
+            .expect_err("another request under the same ID");
+        assert_eq!(conflict.code(), Code::AlreadyExists, "{conflict}");
+        assert!(
+            conflict.message().contains("replication factor"),
+            "{conflict}"
+        );
+        let read = control
+            .get_fork_operation(GetForkOperationRequest {
+                operation_id: operation.to_bytes().to_vec(),
+            })
+            .await?;
+        assert_eq!(without_placement(read), without_placement(status.clone()));
+        let short = control
+            .get_fork_operation(GetForkOperationRequest {
+                operation_id: vec![1; 15],
+            })
+            .await
+            .expect_err("a short ID");
+        assert_eq!(short.code(), Code::InvalidArgument, "{short}");
+
+        // Now that forks are enabled, every creation stores a random incarnation.
+        let after = control
+            .create_database(create_request("after", 1))
+            .await?
+            .placement
+            .ok_or("no placement")?;
+        assert_ne!(after.incarnation, 0);
+        assert_ne!(after.incarnation, status.incarnation);
+
+        // The seeder reports its staged copy, its progress, and its free disk: the placement
+        // shows the holder and the progress, and control state the free bytes.
+        let staged = |node: &str, progress: Option<SeedProgress>| HeartbeatRequest {
+            node_id: node.to_owned(),
+            databases: vec![DatabaseStatus {
+                database: "scratch".to_owned(),
+                role: ReplicaRole::Follower.into(),
+                staged: Some(StagedCopy {
+                    fork_incarnation: status.incarnation,
+                    operation: operation.to_bytes().to_vec(),
+                    attempt: 1,
+                    position: vec![0, 0, 0, 9],
+                    chain_hash: vec![7; 32],
+                    source_incarnation: 0,
+                }),
+                seed_progress: progress,
+                size_bytes: Some(4_096),
+                ..DatabaseStatus::default()
+            }],
+            disk_free_bytes: Some(1 << 40),
+            ..HeartbeatRequest::default()
+        };
+        node_client(address, &tls, &seeder)?
+            .heartbeat(staged(
+                &seeder,
+                Some(SeedProgress {
+                    fork_incarnation: status.incarnation,
+                    operation: operation.to_bytes().to_vec(),
+                    attempt: 1,
+                    bytes: 4_096,
+                    total_bytes: 4_096,
+                }),
+            ))
+            .await?;
+        let seeding = locate(&control, "scratch").await?.fork.ok_or("no fork")?;
+        assert_eq!(seeding.holders, std::slice::from_ref(&seeder));
+        assert_eq!(
+            (seeding.bytes, seeding.total_bytes),
+            (Some(4_096), Some(4_096))
+        );
+        let seeder_id = seeder.parse()?;
+        assert_eq!(handle.state().disk_free_bytes(&seeder_id), Some(1 << 40));
+
+        // A second replica holds the same copy: the driver completes the fork, and the
+        // placement shows it seeded on its holders, at the copy's position.
+        let other = ["a", "b", "c"]
+            .into_iter()
+            .find(|id| *id != seeder)
+            .ok_or("no other replica")?;
+        node_client(address, &tls, other)?
+            .heartbeat(staged(other, None))
+            .await?;
+        let seeded = tokio::time::timeout(HANG_GUARD, async {
+            loop {
+                let fork = locate(&control, "scratch").await?.fork.ok_or("no fork")?;
+                if fork.state == i32::from(ForkState::Seeded) {
+                    return Ok::<_, Box<dyn Error>>(fork);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        let mut holders = vec![seeder, other.to_owned()];
+        holders.sort();
+        assert_eq!(seeded.holders, holders);
+        assert_eq!(seeded.attempt, 1);
+        assert_eq!(seeded.position.as_deref(), Some(&[0, 0, 0, 9][..]));
+        assert_eq!(seeded.chain_hash, Some(vec![7; 32]));
+        assert!(seeded.completed_at_ms.is_some());
+        assert_eq!(seeded.seeder, None);
+        let scratch = "scratch".parse()?;
+        assert!(matches!(
+            handle
+                .state()
+                .database(&scratch)
+                .and_then(|db| db.fork())
+                .map(|fork| fork.state()),
+            Some(ControlForkState::Seeded { .. })
+        ));
+        let read = control
+            .get_fork_operation(GetForkOperationRequest {
+                operation_id: operation.to_bytes().to_vec(),
+            })
+            .await?;
+        assert_eq!(read.state, i32::from(ForkState::Seeded));
+
+        daemon.run_until(async {}).await;
         Ok(())
     }
 }

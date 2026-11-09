@@ -277,6 +277,8 @@ impl Daemon {
                     .with_default_replication_factor(config.replication.replication_factor)
                     .with_durability_defaults(config.replication.durability_defaults())
                     .with_clock(environment.clock())
+                    .with_entropy(environment.entropy())
+                    .with_fork_limits(config.fork.limits())
                     .with_dev_mode(config.dev)
                     .with_network(network.clone())
             }),

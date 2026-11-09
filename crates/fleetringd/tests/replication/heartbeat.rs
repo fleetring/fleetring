@@ -23,6 +23,7 @@ impl DatabaseStatuses for Hosted {
                 role: proto::ReplicaRole::Primary.into(),
                 epoch: 1,
                 position: vec![0, 7],
+                ..DatabaseStatus::default()
             })
             .collect()
     }

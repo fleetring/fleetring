@@ -11,12 +11,13 @@ use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
     CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
-    DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest,
-    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
-    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, PromotionResponse,
-    RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest,
-    RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest, UndrainRequest,
-    UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
+    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
+    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    LocateRequest, LocateResponse, MembershipUpdate, PromotionResponse, RecordFencedRequest,
+    RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse,
+    StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
+    UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Response, Status, Streaming};
@@ -36,8 +37,9 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 ///   [`not_leader`](fleetring_client::redirect::not_leader)) switches the client to X and repeats
 ///   the call there, so callers never see it. Later calls go straight to X.
 /// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `list_databases`,
-///   `renew_lease`, `record_fenced`, `drain`, and opening `watch_membership`) retry transient
-///   failures with [`retry`]. `create_database`, `create_database_with_metadata`,
+///   `renew_lease`, `record_fenced`, `drain`, `fork_database`, whose operation ID makes a resend
+///   return the same operation, `get_fork_operation`, and opening `watch_membership`) retry
+///   transient failures with [`retry`]. `create_database`, `create_database_with_metadata`,
 ///   `update_database`, `drop_database`, `acquire_lease`, `leave`, `start_promotion`,
 ///   `complete_promotion`, and `transfer_lease` are sent once per leader, because a lost reply
 ///   would make a retry fail as already done, or apply a patch twice.
@@ -269,6 +271,41 @@ impl ControlClient {
         self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.drop_database(request).await }
+        })
+        .await
+    }
+
+    /// Forks a database (ADR-0046). Retried: the request's operation ID makes a resend, from the
+    /// same principal with the same request, return the same operation and change nothing.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt. A control node that predates forks answers
+    /// `UNIMPLEMENTED`, or refuses the call as one it doesn't serve.
+    pub async fn fork_database(
+        &self,
+        request: ForkDatabaseRequest,
+    ) -> Result<ForkOperationStatus, Status> {
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.fork_database(request).await }
+        })
+        .await
+    }
+
+    /// Reads a fork operation's status (ADR-0046, point 5.4). Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt: `NOT_FOUND` for an operation that is unknown, past its
+    /// retention, or not the caller's to see.
+    pub async fn get_fork_operation(
+        &self,
+        request: GetForkOperationRequest,
+    ) -> Result<ForkOperationStatus, Status> {
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.get_fork_operation(request).await }
         })
         .await
     }

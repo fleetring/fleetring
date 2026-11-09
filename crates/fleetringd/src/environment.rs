@@ -1,5 +1,5 @@
-//! What a daemon takes from the world it runs in: its network, its clock, and where its blocking
-//! storage calls run (ADR-0020).
+//! What a daemon takes from the world it runs in: its network, its clock, its randomness, and
+//! where its blocking storage calls run (ADR-0020).
 //!
 //! [`Daemon::start`](crate::Daemon::start) runs in [`Environment::production`]: real TCP, the
 //! system clock, and storage on dedicated threads. The simulation harness passes
@@ -19,6 +19,7 @@ use crate::control::{ControlClient, StorageIo};
 use crate::data::DROP_FLUSH_LIMIT;
 use crate::durability::ObjectStore;
 use crate::engine::Execution;
+use crate::router::{Entropy, SystemEntropy};
 use crate::tls::{Conn, Raw, Security};
 use crate::transport::{Credentials, TransportConfig};
 
@@ -223,13 +224,15 @@ impl Default for Network {
     }
 }
 
-/// The network, clock, and storage execution a daemon runs with.
+/// The network, clock, randomness, and storage execution a daemon runs with.
 ///
-/// Cloning is cheap; clones share the clock.
+/// Cloning is cheap; clones share the clock and the randomness.
 #[derive(Debug, Clone)]
 pub struct Environment {
     network: Network,
     clock: Arc<dyn Clock>,
+    /// Where the control node draws database incarnations from (ADR-0046, point 1.1).
+    entropy: Arc<dyn Entropy>,
     execution: Execution,
     /// Object stores that replace the ones `[[archive]]` entries name, by archive name.
     object_stores: BTreeMap<String, Arc<dyn ObjectStore>>,
@@ -244,13 +247,16 @@ impl Environment {
         Self {
             network: Network::default(),
             clock: Arc::new(SystemClock),
+            entropy: Arc::new(SystemEntropy::new()),
             execution: Execution::Threads,
             object_stores: BTreeMap::new(),
             drop_flush_limit: DROP_FLUSH_LIMIT,
         }
     }
 
-    /// turmoil's network, `clock`, and every storage call inline on the host's task.
+    /// turmoil's network, `clock`, and every storage call inline on the host's task. Its
+    /// randomness is the operating system's until [`Environment::with_entropy`] replaces it, as
+    /// the simulation harness does with a seeded generator.
     ///
     /// Build it inside the turmoil host, so that a clock which follows `tokio::time` starts from
     /// the host's simulated time.
@@ -260,6 +266,7 @@ impl Environment {
         Self {
             network: Network::simulated(),
             clock: Arc::new(clock),
+            entropy: Arc::new(SystemEntropy::new()),
             execution: Execution::Inline,
             object_stores: BTreeMap::new(),
             drop_flush_limit: DROP_FLUSH_LIMIT,
@@ -277,6 +284,14 @@ impl Environment {
     #[must_use]
     pub fn with_clock(mut self, clock: impl Clock + 'static) -> Self {
         self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Draws randomness from `entropy`: a simulation's seeded generator, so that a seed replays
+    /// the same incarnations (ADR-0020).
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
+        self.entropy = entropy;
         self
     }
 
@@ -335,6 +350,12 @@ impl Environment {
     #[must_use]
     pub fn clock(&self) -> Arc<dyn Clock> {
         Arc::clone(&self.clock)
+    }
+
+    /// Returns where randomness comes from.
+    #[must_use]
+    pub fn entropy(&self) -> Arc<dyn Entropy> {
+        Arc::clone(&self.entropy)
     }
 
     /// Returns where blocking storage calls run.

@@ -707,6 +707,7 @@ impl Heartbeats {
             node_id: id.to_owned(),
             databases: self.databases.statuses(),
             software: Some(software_to_proto(&running())),
+            ..HeartbeatRequest::default()
         };
         let sent = tokio::time::Instant::now();
         let result = timeout(self.limit, self.client.heartbeat(request)).await;

@@ -232,6 +232,7 @@ async fn execute(
                 node_id: node.to_string(),
                 databases: Vec::new(),
                 software: Some(software_to_proto(&running())),
+                disk_free_bytes: None,
             })
             .await
             .map(|_| Ack::HeartbeatRecorded),
@@ -610,6 +611,7 @@ async fn impostor(network: &Network, operation: &Operation) -> Ack {
             let request = SnapshotRequest {
                 database: database.to_string(),
                 epoch: epoch.get(),
+                ..SnapshotRequest::default()
             };
             match channel(network, target) {
                 Ok(channel) => replication_client(channel)
