@@ -42,6 +42,7 @@ pub fn database_report(location: &Location, now: Timestamp) -> DatabaseReport {
             .map(|metadata| metadata_report(metadata, now)),
         schema: None,
         schema_unavailable: None,
+        fork: location.fork.clone(),
     }
 }
 
@@ -95,6 +96,7 @@ pub fn liveness_name(liveness: Liveness) -> &'static str {
 pub fn placement_report(location: &Location) -> PlacementReport {
     PlacementReport {
         engine: location.engine.to_string(),
+        incarnation: crate::fork_report::incarnation_text(location.incarnation.get()),
         lease_epoch: location.epoch.get(),
         replication_factor: location.replication_factor.get(),
         acks: location.durability.acks().to_string(),
@@ -171,6 +173,7 @@ pub fn database_location(location: &Location, now: Timestamp) -> DatabaseLocatio
             .metadata
             .as_ref()
             .map(|metadata| metadata_report(metadata, now)),
+        fork: location.fork.clone(),
     }
 }
 
@@ -438,6 +441,13 @@ pub fn render_text(
             replica.node,
             replica.position.as_deref().unwrap_or("unknown"),
             replica.liveness
+        )?;
+    }
+    if let Some(fork) = &report.fork {
+        write!(
+            out,
+            "{}",
+            crate::fork_report::section_text(&report.database, fork)
         )?;
     }
     render_metadata(report.metadata.as_ref(), reader, out)?;
@@ -979,6 +989,7 @@ mod tests {
             database: "notes".to_owned(),
             placement: PlacementReport {
                 engine: "sqlite".to_owned(),
+                incarnation: "0000000000000000".to_owned(),
                 lease_epoch: 1,
                 replication_factor: 1,
                 acks: "quorum".to_owned(),
@@ -1006,6 +1017,7 @@ mod tests {
             }),
             schema: None,
             schema_unavailable: None,
+            fork: None,
         }
     }
 
