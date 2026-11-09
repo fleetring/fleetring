@@ -47,12 +47,23 @@ const CLIENT_BACKOFF: Backoff = Backoff {
     attempts: 3,
 };
 
+/// A router a client sends its writes and reads through, with its token (ADR-0037).
+#[derive(Debug, Clone)]
+pub(super) struct Via {
+    /// The router's `host:port`.
+    pub(super) address: String,
+    /// The token the client's requests carry.
+    pub(super) token: String,
+}
+
 /// What a client needs besides its workload.
 pub(super) struct Session {
     pub(super) name: String,
     pub(super) control: String,
     /// The data node database calls go to first, if not the primary the control plane names.
     pub(super) entry: Option<String>,
+    /// The router writes and reads go through, if they go through one.
+    pub(super) via: Option<Via>,
     pub(super) timeout: Duration,
     pub(super) shared: Shared,
     /// The principal the client acts as, issued by the fleet's test authority.
@@ -72,6 +83,7 @@ pub(super) async fn run_client(
         name,
         control,
         entry,
+        via,
         timeout,
         shared,
         identity,
@@ -99,7 +111,14 @@ pub(super) async fn run_client(
                 let node = nodes.for_operation(&operation);
                 let outcome = match tokio::time::timeout(
                     timeout,
-                    execute(&client, node.as_ref(), &network, &shared, &operation),
+                    execute(
+                        &client,
+                        node.as_ref(),
+                        &network,
+                        &shared,
+                        via.as_ref(),
+                        &operation,
+                    ),
                 )
                 .await
                 {
@@ -176,8 +195,20 @@ async fn execute(
     node: Option<&ControlClient>,
     network: &Network,
     shared: &Shared,
+    via: Option<&Via>,
     operation: &Operation,
 ) -> Outcome {
+    if let Some(via) = via {
+        match operation {
+            Operation::Write { database, value } => {
+                return crate::sim::hrana::write(via, database, *value).await;
+            }
+            Operation::Read { database, value } => {
+                return crate::sim::hrana::read(via, database, *value).await;
+            }
+            _ => {}
+        }
+    }
     let client = node.unwrap_or_else(|| data.control());
     let result = match operation {
         Operation::Join { node } => client
