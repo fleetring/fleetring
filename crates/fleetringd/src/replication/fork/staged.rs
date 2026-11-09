@@ -389,6 +389,44 @@ impl StagedStore {
         Ok(sidecar)
     }
 
+    /// Moves `key`'s staged files to `location`, the database's place, which must hold nothing,
+    /// and records durably that they were moved. Should anything fail once they are moved, they
+    /// are moved back, or, if that fails too, removed from `location`: a copy is never left in the
+    /// database's place without the record that it came from here. It blocks on the file system.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::AlreadyExists`] if `location` holds something, and the I/O error of the
+    /// step that failed otherwise.
+    pub(crate) fn install(&self, key: &StagedKey, location: &Path) -> io::Result<()> {
+        if location.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} holds a copy", location.display()),
+            ));
+        }
+        let copy = self.copy_dir(key);
+        let parent = location
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        fs::create_dir_all(&parent)?;
+        fs::rename(&copy, location)?;
+        let recorded = sync_dir(&parent)
+            .and_then(|()| copy.parent().map_or(Ok(()), sync_dir))
+            .and_then(|()| self.installed(key));
+        if let Err(error) = recorded {
+            let undone = fs::rename(location, &copy)
+                .and_then(|()| sync_dir(&parent))
+                .and_then(|()| copy.parent().map_or(Ok(()), sync_dir));
+            if let Err(undo) = undone {
+                tracing::error!(location = %location.display(), %undo, "can't move a staged copy back after its install failed; removing it from the database's place");
+                remove_dir_if_present(location)?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Records that `key`'s files were moved into the database's place: they are no longer
     /// here, but the sidecar stays until a signal deletes it. It blocks on the file system.
     ///
@@ -639,6 +677,37 @@ mod tests {
                 "kept untouched"
             );
         }
+    }
+
+    #[test]
+    fn an_install_whose_record_fails_leaves_the_copy_staged() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = StagedStore::new(dir.path().join("staged"));
+        let first = key(1);
+        stage(&store, &first, b"hello");
+        let location = dir.path().join("databases").join("t");
+        // The record can't be written: a directory stands where the file goes.
+        fs::create_dir(first.dir(store.root()).join(INSTALLED)).expect("block the record");
+        assert!(store.install(&first, &location).is_err());
+        assert!(
+            !location.exists(),
+            "nothing is left in the database's place"
+        );
+        assert_eq!(
+            fs::read(store.copy_dir(&first).join("data.db")).expect("staged again"),
+            b"hello"
+        );
+        // With the record writable, the install goes through.
+        fs::remove_dir(first.dir(store.root()).join(INSTALLED)).expect("unblock");
+        store.install(&first, &location).expect("install");
+        assert_eq!(
+            fs::read(location.join("data.db")).expect("installed"),
+            b"hello"
+        );
+        assert_eq!(
+            store.get(&first).map(|staged| staged.held),
+            Some(Held::Installed)
+        );
     }
 
     #[test]

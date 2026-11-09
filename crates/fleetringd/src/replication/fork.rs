@@ -30,7 +30,7 @@ pub(crate) mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -898,24 +898,10 @@ impl super::Replication {
         super::snapshot::check_copy(inner, &copy, &inner.node).await?;
         let location = inner.registry().location(database);
         let moved = {
-            let (copy, location) = (copy.clone(), location.clone());
+            let inner = Arc::clone(inner);
+            let key = key.clone();
             super::follower::blocking(inner.execution, move || {
-                if location.try_exists()? {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("{} holds a copy", location.display()),
-                    ));
-                }
-                let parent = location
-                    .parent()
-                    .map_or_else(PathBuf::new, Path::to_path_buf);
-                std::fs::create_dir_all(&parent)?;
-                std::fs::rename(&copy, &location)?;
-                super::epochs::sync_dir(&parent)?;
-                if let Some(staged) = copy.parent() {
-                    super::epochs::sync_dir(staged)?;
-                }
-                Ok(())
+                inner.forks.store().install(&key, &location)
             })
             .await?
         };
@@ -924,15 +910,6 @@ impl super::Replication {
                 "this node holds a copy of {database} already: {error}"
             )),
             _ => Status::internal(format!("can't move the staged copy into place: {error}")),
-        })?;
-        let installed = {
-            let inner = Arc::clone(inner);
-            let key = key.clone();
-            super::follower::blocking(inner.execution, move || inner.forks.store().installed(&key))
-                .await?
-        };
-        installed.map_err(|error| {
-            Status::internal(format!("can't record the installed copy: {error}"))
         })?;
         let position = super::primary::held(sidecar.position.as_bytes().to_vec());
         let anchor = super::chain::Anchor::new(
