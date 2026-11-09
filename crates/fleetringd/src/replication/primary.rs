@@ -19,8 +19,8 @@ use tonic::metadata::MetadataValue;
 use super::chain::{Anchor, Chain, ChainHash, Links, LogRead};
 use super::follower::blocking;
 use super::{
-    FollowerProgress, Inner, PRIMARY_METADATA_KEY, PrimaryRole, PrimaryStatus, Quorum, Verified,
-    chain, failed, refused,
+    FaultPoint, FollowerProgress, Inner, PRIMARY_METADATA_KEY, PrimaryRole, PrimaryStatus, Quorum,
+    Verified, chain, failed, refused,
 };
 use crate::engine::{
     CheckpointMarker, EngineCapability, EngineError, FrameBatch, FrameSourceEngine, Position,
@@ -318,6 +318,14 @@ impl Primary {
         match &self.lock().chain {
             ChainState::Ready(chain) => Some(chain.tip().0.cloned()),
             _ => None,
+        }
+    }
+
+    /// Marks the chain lost, so that it is rebuilt from its record and the log.
+    fn lose_chain(&self) {
+        let mut state = self.lock();
+        if matches!(state.chain, ChainState::Ready(_)) {
+            state.chain = ChainState::Lost;
         }
     }
 
@@ -746,9 +754,10 @@ impl State {
     /// Drops published batches every follower has, and the oldest beyond `retained_bytes`.
     ///
     /// While a checkpoint runs, a batch the chain hasn't reached is kept even when every
-    /// follower has it, as it is when the primary has none: once the checkpoint restarts the
-    /// log, the retained batches are all the chain can reach the checkpoint's position through
-    /// (#156).
+    /// follower has it, as it is when the primary has none, and whatever `retained_bytes` says:
+    /// once the checkpoint restarts the log, the retained batches are all the chain can reach
+    /// the checkpoint's position through (#156). What one checkpoint's run lets land bounds
+    /// them.
     fn prune(&mut self, retained_bytes: usize) {
         let everyone = self
             .followers
@@ -770,7 +779,11 @@ impl State {
             let unchained = chained
                 .as_ref()
                 .is_some_and(|tip| Some(&front.batch.end) > tip.as_ref());
-            let held = !unchained && everyone.is_some_and(|everyone| front.batch.end <= *everyone);
+            // Batches are retained in order, so every one after an unchained batch is too.
+            if unchained {
+                break;
+            }
+            let held = everyone.is_some_and(|everyone| front.batch.end <= *everyone);
             if !held && self.recent_bytes <= retained_bytes {
                 break;
             }
@@ -913,8 +926,8 @@ fn frame_source(inner: &Inner) -> Option<&dyn FrameSourceEngine> {
 /// Runs a checkpoint that [`Primary::checkpoint_due`] or [`Primary::begin_checkpoint`] started,
 /// and records its marker for the streams to ship, and the chain's anchor there.
 pub(super) async fn checkpoint(
-    inner: &Inner,
-    primary: &Primary,
+    inner: &Arc<Inner>,
+    primary: &Arc<Primary>,
     excluded: Vec<NodeId>,
 ) -> Result<CheckpointMarker, ReplicationError> {
     let result = match inner.registry().open(&primary.name).await {
@@ -925,6 +938,7 @@ pub(super) async fn checkpoint(
             if !chain_to(inner, primary, &handle, committed.as_ref()).await {
                 tracing::debug!(database = %primary.name, "the chain doesn't reach the log's end; the checkpoint records no anchor");
             }
+            inner.forks.faults().pass_any(FaultPoint::Checkpoint).await;
             handle.checkpoint().await
         }
         Err(error) => Err(error),
@@ -937,7 +951,8 @@ pub(super) async fn checkpoint(
             if let Some(engine) = frame_source(inner)
                 && !primary.link_retained(engine, Some(&marker.position))
             {
-                tracing::warn!(database = %primary.name, position = %marker.position, "the chain doesn't reach the checkpoint; it holds no hash past its tip until it is rebuilt");
+                tracing::warn!(database = %primary.name, position = %marker.position, "the chain doesn't reach the checkpoint; rebuilding it from the restarted log");
+                primary.lose_chain();
             }
             if !excluded.is_empty() {
                 tracing::warn!(
@@ -949,6 +964,11 @@ pub(super) async fn checkpoint(
             primary.end_checkpoint(Ok(&marker), &excluded);
             if let Some(anchor) = primary.rebase_chain(&marker.position) {
                 record_anchor(inner, &primary.name, anchor).await;
+            }
+            // A lost chain is rebuilt from the log the checkpoint restarted, whether or not a
+            // stream runs to notice: a lone primary has none (#156).
+            if primary.take_lost() {
+                tokio::spawn(rebuild_chain(Arc::clone(inner), Arc::clone(primary)));
             }
             Ok(marker)
         }
@@ -1258,6 +1278,10 @@ pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
             }
         }
         maybe_checkpoint(&inner, &primary, &quorum);
+        // Streams rebuild a chain they find lost; a lone primary has none to (#156).
+        if primary.take_lost() {
+            tokio::spawn(rebuild_chain(Arc::clone(&inner), Arc::clone(&primary)));
+        }
         tokio::select! {
             changed = membership.changed() => if changed.is_none() {
                 time::sleep(inner.settings.retry_interval).await;
