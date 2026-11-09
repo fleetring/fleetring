@@ -152,6 +152,7 @@ fn heartbeat(node: &str, software: Option<Software>) -> Action {
         replicas: Vec::new(),
         unknown_reports: fleetring_control::UnknownReports::Skip,
         software,
+        disk_free_bytes: None,
     }
 }
 

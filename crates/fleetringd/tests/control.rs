@@ -944,6 +944,7 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
                     replicas: Vec::new(),
                     unknown_reports: fleetring_control::UnknownReports::Skip,
                     software: None,
+                    disk_free_bytes: None,
                 };
                 committed.push(handle.submit(action).await?);
             }
@@ -2270,6 +2271,7 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
             engine: Engine::Sqlite,
             durability: None,
             metadata,
+            incarnation: fleetring_control::Incarnation::LEGACY,
         })
     };
     let labelled = MetadataSpec {
@@ -2956,6 +2958,7 @@ mod metadata {
                 engine: fleetring_control::Engine::Sqlite,
                 durability: None,
                 metadata: None,
+                incarnation: fleetring_control::Incarnation::LEGACY,
             })
             .await?;
         assert!(
@@ -3205,6 +3208,7 @@ mod expiry {
                         expires_at: Some(expires_at),
                         ..MetadataSpec::default()
                     }),
+                    incarnation: fleetring_control::Incarnation::LEGACY,
                 })
                 .await?;
             assert!(created.outcome().is_ok(), "{:?}", created.outcome());

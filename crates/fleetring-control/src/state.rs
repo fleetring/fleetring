@@ -6,6 +6,8 @@ use fleetring::{BuildRingError, Epoch, Node, NodeId, ReplicationFactor, Ring};
 use serde::{Deserialize, Serialize};
 
 use crate::apply::{check_join_software, plan_promotion};
+use crate::fork::apply::{live_operation, resend};
+use crate::fork::{ForkState, OperationId, OperationRecord};
 use crate::{
     Acks, Action, ControlConfig, Database, DatabaseName, Feature, Liveness, Member, Quorums,
     Rejection, Report, Revocations, Timestamp,
@@ -47,6 +49,10 @@ pub struct State {
     /// the state rather than drop the name (ADR-0041, amendment 1).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) features: BTreeSet<Feature>,
+    /// Fork operations, by ID, until their retention has passed (ADR-0046, point 5.3). Absent
+    /// until the first fork.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) fork_operations: BTreeMap<OperationId, OperationRecord>,
 }
 
 /// A member with its liveness and its latest reports.
@@ -59,6 +65,10 @@ pub(crate) struct MemberEntry {
     /// written before members could drain.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) draining: bool,
+    /// The free bytes on the member's data volume, as its last heartbeat said once the `fork`
+    /// feature was enabled. Absent until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) disk_free_bytes: Option<u64>,
 }
 
 impl State {
@@ -73,6 +83,7 @@ impl State {
             databases: BTreeMap::new(),
             revocations: Revocations::new(),
             features: BTreeSet::new(),
+            fork_operations: BTreeMap::new(),
         }
     }
 
@@ -274,6 +285,78 @@ impl State {
         self.members.get(id)?.reports.get(database)
     }
 
+    /// Returns the free bytes on the member's data volume as its last heartbeat said, if it said
+    /// and the `fork` feature was enabled by then.
+    #[must_use]
+    pub fn disk_free_bytes(&self, id: &NodeId) -> Option<u64> {
+        self.members.get(id)?.disk_free_bytes
+    }
+
+    /// Returns the record of fork operation `operation`, unless it is unknown or past its
+    /// retention at `at`, or at [`State::now`] if `at` is earlier (ADR-0046, point 5.3).
+    #[must_use]
+    pub fn fork_operation(
+        &self,
+        operation: &OperationId,
+        at: Timestamp,
+    ) -> Option<&OperationRecord> {
+        live_operation(self, operation, at.max(self.now))
+    }
+
+    /// Returns the record of fork operation `operation` as [`State::fork_operation`] does, but
+    /// only while the database it made exists at the incarnation it made: what a principal with
+    /// `admin` on the target, rather than the requester, may read (ADR-0046, point 5.4). Once the
+    /// target is dropped and its name reused, `admin` on the new database reveals nothing about
+    /// the earlier operation.
+    #[must_use]
+    pub fn fork_operation_of_target(
+        &self,
+        operation: &OperationId,
+        at: Timestamp,
+    ) -> Option<&OperationRecord> {
+        self.fork_operation(operation, at).filter(|record| {
+            self.database(record.target())
+                .is_some_and(|database| database.incarnation() == record.target_incarnation())
+        })
+    }
+
+    /// Returns every fork operation's record, in ID order, including any past its retention
+    /// that no `Tick` has forgotten yet.
+    pub fn fork_operations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&OperationId, &OperationRecord)> {
+        self.fork_operations.iter()
+    }
+
+    /// Answers `action` without applying it if it is a resend of a known fork operation:
+    /// `None` for any other action, including a `ForkDatabase` with an operation ID that is
+    /// unknown or past its retention at `at`; otherwise the operation's record, or why the
+    /// resend is refused.
+    ///
+    /// `apply` answers a resend the same way and changes nothing else. The control node asks
+    /// first, so that a resend is never logged (ADR-0046, point 5.2).
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::OperationNotYours`] for a resend from another requester, revealing nothing
+    /// about the operation, and [`Rejection::OperationConflict`] for a different request with
+    /// a known ID.
+    #[must_use]
+    pub fn fork_resend(
+        &self,
+        action: &Action,
+        at: Timestamp,
+    ) -> Option<Result<&OperationRecord, Rejection>> {
+        let Action::ForkDatabase {
+            operation, intent, ..
+        } = action
+        else {
+            return None;
+        };
+        let record = self.fork_operation(operation, at)?;
+        Some(resend(record, *operation, intent))
+    }
+
     /// Returns every database, in name order.
     pub fn databases(&self) -> impl ExactSizeIterator<Item = &Database> {
         self.databases.values()
@@ -304,15 +387,28 @@ impl State {
     /// Liveness doesn't change the replica set; it only filters candidates for leases and
     /// promotions (ADR-0006, ADR-0018).
     ///
+    /// A seeded fork's replica set is frozen at its holders, in ID order, until it is ready:
+    /// placement changes don't move a copy that isn't ready yet (ADR-0046, point 3.10). From
+    /// then on it follows the ring like any database.
+    ///
     /// # Errors
     ///
     /// Returns [`Rejection::UnknownDatabase`] if there is no such database, and
     /// [`Rejection::NoMembers`] if the fleet is empty.
     pub fn replica_set(&self, database: &DatabaseName) -> Result<Vec<NodeId>, Rejection> {
         let db = self.database_or_reject(database)?;
+        if let Some(ForkState::Seeded { holders, .. }) = db.fork().map(|fork| fork.state()) {
+            return Ok(holders.iter().cloned().collect());
+        }
+        self.placed_replicas(db)
+    }
+
+    /// Returns where placement puts `db`: the ring's replica set over all members, ignoring a
+    /// seeded fork's frozen holders.
+    pub(crate) fn placed_replicas(&self, db: &Database) -> Result<Vec<NodeId>, Rejection> {
         let ring = self.ring().map_err(|_| Rejection::NoMembers)?;
         Ok(ring
-            .replicas_n(database.as_str(), db.replication_factor())
+            .replicas_n(db.name().as_str(), db.replication_factor())
             .to_ids())
     }
 
@@ -358,6 +454,7 @@ impl State {
     ///     engine: Engine::Sqlite,
     ///     durability: None,
     ///     metadata: None,
+    ///     incarnation: fleetring_control::Incarnation::LEGACY,
     /// })?;
     /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
     /// // "b" keeps reporting its copy; "a" goes quiet.
@@ -367,6 +464,7 @@ impl State {
     ///     replicas: vec![report],
     ///     unknown_reports: UnknownReports::Skip,
     ///     software: None,
+    ///     disk_free_bytes: None,
     /// };
     /// run(&mut state, 12_000, heartbeat)?;
     /// assert!(state.promotions_due(Timestamp::from_millis(11_000)).is_empty());
@@ -420,6 +518,7 @@ impl State {
     ///         engine: Engine::Sqlite,
     ///         durability: None,
     ///         metadata: Some(spec),
+    ///         incarnation: fleetring_control::Incarnation::LEGACY,
     ///     })?;
     /// }
     /// assert!(state.expired_databases(Timestamp::from_millis(59_999)).is_empty());

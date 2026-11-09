@@ -65,6 +65,15 @@
 //!   command that sets it, and an `ExpireDatabase` drops a database, as `DropDatabase` does,
 //!   only if its expiry is at or before the command's time; an expiry extended since wins.
 //!   [`State::expired_databases`] lists the databases due.
+//! - **Incarnations** (ADR-0046, point 1): each database has an [`Incarnation`], so a name
+//!   dropped and created again names a different database. They are assigned from a counter
+//!   that only grows, starting once the `fork` feature is enabled; until then every database
+//!   has the legacy incarnation 0 and control state is stored exactly as before.
+//! - **Forks** (ADR-0046, [`fork`]): a database may be made as a copy of another. It takes no
+//!   lease until a write quorum of its replicas holds the copy, its first lease only on one of
+//!   them, and every command that drives it is fenced by its fork identity. Each fork is made by
+//!   an operation whose ID the client chooses; a resend of the same request returns the same
+//!   operation, and the operation's record is kept for a retention after its outcome.
 //!
 //! # Examples
 //!
@@ -86,6 +95,7 @@
 //!     engine: Engine::Sqlite,
 //!     durability: None,
 //!     metadata: None,
+//!     incarnation: fleetring_control::Incarnation::LEGACY,
 //! }))?;
 //! let quorums = state.quorums(&"tenant:acme".parse()?)?;
 //! assert_eq!((quorums.write(), quorums.promotion()), (2, 2));
@@ -103,6 +113,7 @@ mod apply;
 mod command;
 mod config;
 mod database;
+pub mod fork;
 mod member;
 mod metadata;
 mod revocation;
@@ -114,8 +125,9 @@ pub use apply::{Applied, JoinKind, Outcome, Rejection, apply};
 pub use command::{Action, Command, UnknownReports};
 pub use config::ControlConfig;
 pub use database::{
-    Acks, Database, DatabaseName, Durability, DurabilityError, Engine, Lease, LeaseEpoch,
-    ParseAcksError, ParseDatabaseNameError, Position, Promotion, Quorums,
+    Acks, Database, DatabaseName, Durability, DurabilityError, Engine, Incarnation, Lease,
+    LeaseEpoch, ParseAcksError, ParseDatabaseNameError, ParseIncarnationError, Position, Promotion,
+    Quorums,
 };
 pub use member::{HostedReplica, Liveness, Member, ReplicaRole, Report};
 pub use metadata::{
@@ -147,6 +159,28 @@ const _: () = {
     assert_debug_send_sync::<ExpiryChange>();
     assert_debug_send_sync::<Feature>();
     assert_debug_send_sync::<HostedReplica>();
+    assert_debug_send_sync::<Incarnation>();
+    assert_debug_send_sync::<fork::CancelCause>();
+    assert_debug_send_sync::<fork::ChainHash>();
+    assert_debug_send_sync::<fork::CopyLossReason>();
+    assert_debug_send_sync::<fork::CopyLost>();
+    assert_debug_send_sync::<fork::Fork>();
+    assert_debug_send_sync::<fork::ForkExpiry>();
+    assert_debug_send_sync::<fork::ForkFailure>();
+    assert_debug_send_sync::<fork::ForkIdentity>();
+    assert_debug_send_sync::<fork::ForkIntent>();
+    assert_debug_send_sync::<fork::IntentField>();
+    assert_debug_send_sync::<fork::ForkLimits>();
+    assert_debug_send_sync::<fork::ForkState>();
+    assert_debug_send_sync::<fork::OperationId>();
+    assert_debug_send_sync::<fork::OperationOutcome>();
+    assert_debug_send_sync::<fork::OperationRecord>();
+    assert_debug_send_sync::<fork::ParseOperationIdError>();
+    assert_debug_send_sync::<fork::ResetReport>();
+    assert_debug_send_sync::<fork::RetryCause>();
+    assert_debug_send_sync::<fork::SeedFailure>();
+    assert_debug_send_sync::<fork::SeedFailureReason>();
+    assert_debug_send_sync::<fork::StagedCopy>();
     assert_debug_send_sync::<JoinKind>();
     assert_debug_send_sync::<KeyId>();
     assert_debug_send_sync::<LabelKey>();
@@ -166,6 +200,7 @@ const _: () = {
     assert_debug_send_sync::<ParseDatabaseNameError>();
     assert_debug_send_sync::<ParseDescriptionError>();
     assert_debug_send_sync::<ParseFeatureError>();
+    assert_debug_send_sync::<ParseIncarnationError>();
     assert_debug_send_sync::<ParseLabelError>();
     assert_debug_send_sync::<ParsePrincipalNameError>();
     assert_debug_send_sync::<ParseReleaseError>();

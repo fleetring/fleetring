@@ -3999,6 +3999,7 @@ mod expiry {
                     engine: fleetring_control::Engine::Sqlite,
                     durability: None,
                     metadata: None,
+                    incarnation: fleetring_control::Incarnation::LEGACY,
                 })
                 .await?;
             assert!(created.outcome().is_ok(), "{:?}", created.outcome());

@@ -151,6 +151,7 @@ fn the_0_5_line_decodes_joins_heartbeats_and_snapshots_of_members_with_new_featu
             replicas: Vec::new(),
             unknown_reports: fleetring_control::UnknownReports::Skip,
             software: Some(software),
+            disk_free_bytes: None,
         },
     );
     apply(&mut state, join.clone()).expect("join");

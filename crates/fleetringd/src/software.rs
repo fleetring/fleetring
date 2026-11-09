@@ -25,17 +25,23 @@ pub fn release() -> Release {
         .expect("the crate's version is a valid release")
 }
 
-/// Returns the software this build runs: its release, the control-log format it reads, and every
-/// fleet feature it knows. A release reports a feature only once it acts on every command the
-/// feature covers (ADR-0041, point 3); this one carries out all of them, `expiry` included, since
-/// its control node sweeps expired databases.
+/// Returns the software this build runs: its release, the control-log format it reads, and the
+/// fleet features it supports. A release reports a feature only once it acts on every command
+/// the feature covers (ADR-0041, point 3): this one carries out all of them, `expiry` included,
+/// since its control node sweeps expired databases, except [`Feature::Fork`]. Its control state
+/// represents and drives forks (ADR-0046), but its data nodes don't seed them yet, so no fleet
+/// of this build can enable forks.
 #[must_use]
 pub fn running() -> Software {
-    Feature::ALL.into_iter().fold(
+    SUPPORTED.into_iter().fold(
         Software::new(release(), FORMAT_VERSION),
         Software::with_feature,
     )
 }
+
+/// The fleet features this build acts on in full. `fork` joins once data nodes seed forks
+/// (#135).
+const SUPPORTED: [Feature; 3] = [Feature::Undrain, Feature::Metadata, Feature::Expiry];
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
 /// release, the protocol, the control-log format, the fleet features, and `config_check`, true
@@ -92,13 +98,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn this_build_reports_a_release_with_every_feature() {
+    fn this_build_reports_a_release_with_every_feature_but_fork() {
         let software = running();
         assert_eq!(software.release().to_string(), VERSION);
         assert!(
             Feature::ALL
                 .into_iter()
-                .all(|feature| software.supports(feature))
+                .all(|feature| software.supports(feature) == (feature != Feature::Fork))
         );
         assert_eq!(
             software_from_proto(software_to_proto(&software)).expect("valid"),

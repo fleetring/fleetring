@@ -3,6 +3,7 @@
 use fleetring::{Host, Node, NodeId, Weight, Zone};
 use serde::{Deserialize, Serialize};
 
+use crate::fork::{CopyLost, ResetReport, SeedFailure, StagedCopy};
 use crate::{DatabaseName, LeaseEpoch, Position, Software, Timestamp};
 
 /// A member's placement attributes, the ID, zone, host, and weight that the ring places by, and
@@ -202,6 +203,10 @@ pub enum ReplicaRole {
 }
 
 /// One database a member hosts, as reported in a heartbeat.
+///
+/// Besides its role and position, a replica may report its size and, for a fork, its staged
+/// copy, a failure to seed, or its reset write (ADR-0046, point 4.5). Those are recorded only
+/// once the `fork` feature is enabled, so that control state stays as it was until then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedReplica {
     database: DatabaseName,
@@ -210,6 +215,17 @@ pub struct HostedReplica {
     // Absent from logs written before replicas reported it.
     #[serde(default, skip_serializing_if = "is_zero")]
     log_epoch: LeaseEpoch,
+    // Absent from logs and states written before forks existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged: Option<StagedCopy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copy_lost: Option<CopyLost>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_failure: Option<SeedFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset: Option<ResetReport>,
 }
 
 fn is_zero(epoch: &LeaseEpoch) -> bool {
@@ -226,6 +242,11 @@ impl HostedReplica {
             role,
             position,
             log_epoch: LeaseEpoch::ZERO,
+            size_bytes: None,
+            staged: None,
+            copy_lost: None,
+            seed_failure: None,
+            reset: None,
         }
     }
 
@@ -237,6 +258,42 @@ impl HostedReplica {
     #[must_use]
     pub fn with_log_epoch(mut self, log_epoch: LeaseEpoch) -> Self {
         self.log_epoch = log_epoch;
+        self
+    }
+
+    /// Says how many bytes the replica's copy takes, for fork admission (ADR-0046, point 7.3).
+    #[must_use]
+    pub fn with_size_bytes(mut self, size_bytes: u64) -> Self {
+        self.size_bytes = Some(size_bytes);
+        self
+    }
+
+    /// Says that the replica durably holds a staged copy of a fork (ADR-0046, point 4.3).
+    #[must_use]
+    pub fn with_staged(mut self, staged: StagedCopy) -> Self {
+        self.staged = Some(staged);
+        self
+    }
+
+    /// Says that the replica's staged copy of a fork is missing or damaged (ADR-0046, point
+    /// 4.5).
+    #[must_use]
+    pub fn with_copy_lost(mut self, copy_lost: CopyLost) -> Self {
+        self.copy_lost = Some(copy_lost);
+        self
+    }
+
+    /// Says that the replica couldn't seed a fork (ADR-0046, point 4.5).
+    #[must_use]
+    pub fn with_seed_failure(mut self, seed_failure: SeedFailure) -> Self {
+        self.seed_failure = Some(seed_failure);
+        self
+    }
+
+    /// Says how the replica's reset write of a fork stands (ADR-0046, point 6).
+    #[must_use]
+    pub fn with_reset(mut self, reset: ResetReport) -> Self {
+        self.reset = Some(reset);
         self
     }
 
@@ -264,17 +321,42 @@ impl HostedReplica {
         &self.position
     }
 
-    pub(crate) fn into_report(self, at: Timestamp) -> (DatabaseName, Report) {
-        (
-            self.database,
-            Report {
-                role: self.role,
-                position: self.position,
-                at,
-                log_epoch: self.log_epoch,
+    /// Returns the report, keeping what it says about forks only if `forks` says so: before the
+    /// `fork` feature is enabled those fields are dropped, so control state stays as it was.
+    pub(crate) fn into_report(self, at: Timestamp, forks: ForkReports) -> (DatabaseName, Report) {
+        let report = Report {
+            role: self.role,
+            position: self.position,
+            at,
+            log_epoch: self.log_epoch,
+            size_bytes: self.size_bytes,
+            staged: self.staged,
+            copy_lost: self.copy_lost,
+            seed_failure: self.seed_failure,
+            reset: self.reset,
+        };
+        let report = match forks {
+            ForkReports::Record => report,
+            ForkReports::Drop => Report {
+                size_bytes: None,
+                staged: None,
+                copy_lost: None,
+                seed_failure: None,
+                reset: None,
+                ..report
             },
-        )
+        };
+        (self.database, report)
     }
+}
+
+/// Whether a heartbeat records what replicas report about forks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkReports {
+    /// The `fork` feature is enabled: record them.
+    Record,
+    /// It isn't: drop them, so control state stays as it was before forks existed.
+    Drop,
 }
 
 /// What a member last reported about one database it hosts.
@@ -286,6 +368,17 @@ pub struct Report {
     // Absent from states written before replicas reported it.
     #[serde(default, skip_serializing_if = "is_zero")]
     log_epoch: LeaseEpoch,
+    // Absent from logs and states written before forks existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged: Option<StagedCopy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copy_lost: Option<CopyLost>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_failure: Option<SeedFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset: Option<ResetReport>,
 }
 
 impl Report {
@@ -312,5 +405,35 @@ impl Report {
     #[must_use]
     pub fn log_epoch(&self) -> LeaseEpoch {
         self.log_epoch
+    }
+
+    /// Returns the bytes the member's copy takes, if it said.
+    #[must_use]
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+
+    /// Returns the staged copy of a fork the member holds, if it reported one.
+    #[must_use]
+    pub fn staged(&self) -> Option<&StagedCopy> {
+        self.staged.as_ref()
+    }
+
+    /// Returns the loss of the member's staged copy of a fork, if it reported one.
+    #[must_use]
+    pub fn copy_lost(&self) -> Option<&CopyLost> {
+        self.copy_lost.as_ref()
+    }
+
+    /// Returns the member's failure to seed a fork, if it reported one.
+    #[must_use]
+    pub fn seed_failure(&self) -> Option<&SeedFailure> {
+        self.seed_failure.as_ref()
+    }
+
+    /// Returns how the member's reset write of a fork stands, if it reported one.
+    #[must_use]
+    pub fn reset(&self) -> Option<&ResetReport> {
+        self.reset.as_ref()
     }
 }

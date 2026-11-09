@@ -312,7 +312,11 @@ impl ControlService {
 /// - `NOT_FOUND`: an unknown member or database. An unknown database also names itself in the
 ///   [`MISSING_DATABASE_KEY`] metadata, so that a caller can tell the two apart
 ///   ([`missing_database`]).
-/// - `ALREADY_EXISTS`: the database exists, or the member is already fenced.
+/// - `ALREADY_EXISTS`: the database exists, the member is already fenced, or a fork operation
+///   ID was reused with a different request.
+/// - `PERMISSION_DENIED`: a fork operation ID that another principal requested.
+/// - `RESOURCE_EXHAUSTED`: too few replicas have room for a fork, or too many fork operations
+///   are kept.
 /// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, a join that
 ///   would make an invalid ring, durability settings that don't fit the replication factor, or
 ///   an update that would leave too many labels.
@@ -332,8 +336,15 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
             }
             status
         }
-        Rejection::DatabaseExists { .. } | Rejection::AlreadyFenced { .. } => {
-            Status::already_exists(message)
+        Rejection::DatabaseExists { .. }
+        | Rejection::AlreadyFenced { .. }
+        | Rejection::OperationConflict { .. } => Status::already_exists(message),
+        // Says nothing about the operation beyond that it isn't the caller's (ADR-0046,
+        // point 5.2).
+        Rejection::OperationNotYours { .. } => Status::permission_denied(message),
+        // Room on the replicas, or for another operation record, may come later.
+        Rejection::InsufficientDisk { .. } | Rejection::TooManyOperations { .. } => {
+            Status::resource_exhausted(message)
         }
         Rejection::InvalidTopology { .. }
         | Rejection::DuplicateReport { .. }
@@ -829,6 +840,8 @@ impl Control for ControlService {
                 replicas,
                 unknown_reports: fleetring_control::UnknownReports::Skip,
                 software,
+                // TODO(#135): data nodes report their free disk once they seed forks.
+                disk_free_bytes: None,
             })
             .await?;
         let unknown_databases = match applied {
@@ -904,6 +917,9 @@ impl Control for ControlService {
             engine,
             durability: Some(durability),
             metadata,
+            // TODO(#135): draw a random incarnation from the injected RNG once this build
+            // supports forks; until then no fleet of it enables them, and none is needed.
+            incarnation: fleetring_control::Incarnation::LEGACY,
         };
         self.create(name, replication_factor, action).await
     }
@@ -944,6 +960,9 @@ impl Control for ControlService {
             engine,
             durability: Some(durability),
             metadata: Some(spec),
+            // TODO(#135): draw a random incarnation from the injected RNG once this build
+            // supports forks; until then no fleet of it enables them, and none is needed.
+            incarnation: fleetring_control::Incarnation::LEGACY,
         };
         self.create(name, replication_factor, action).await
     }
