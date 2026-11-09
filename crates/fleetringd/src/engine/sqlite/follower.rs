@@ -7,8 +7,8 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::{
     Checkpoint, DATABASE_FILE, checkpoint, cut_at, decode_position, defend, encode_position,
-    frame_batch, keep_wal_on_close, read_marker, read_wal_file, remove_if_present, shm_path,
-    storage, wal_path, write_marker,
+    frame_batch, keep_wal_on_close, page_size, read_marker, read_wal_file, remove_if_present,
+    shm_path, storage, wal_path, write_marker,
 };
 use crate::engine::{CheckpointMarker, EngineError, FrameBatch, FrameFollower, Position};
 
@@ -26,6 +26,9 @@ pub struct SqliteFollower {
     /// Where the primary's last checkpoint the copy followed ended, as `data.db-checkpoint`
     /// records it: the mirrored generation continues from there.
     checkpointed: Option<fleetring_wal::Position>,
+    /// The database file's page size, which every batch must have (#154), or `None` if the file
+    /// had no header yet when the copy was opened.
+    page_size: Option<(page_size::Source, u32)>,
 }
 
 impl SqliteFollower {
@@ -40,12 +43,15 @@ impl SqliteFollower {
         if !database.try_exists().map_err(storage)? {
             return Err(EngineError::NotFound);
         }
+        page_size::check(&database, None)?;
+        let page_size = page_size::database_file(&database)?;
         let mirror = Mirror::open(wal_path(&database)).map_err(mirror_error)?;
         let checkpointed = read_marker(&database)?;
         Ok(Self {
             database,
             mirror,
             checkpointed,
+            page_size,
         })
     }
 
@@ -79,6 +85,18 @@ impl FrameFollower for SqliteFollower {
     fn apply(&mut self, batch: &FrameBatch) -> Result<Position, EngineError> {
         let decoded = Batch::from_bytes(batch.payload.as_bytes())
             .map_err(|error| EngineError::InvalidPayload(error.into()))?;
+        // Never mirror frames, or start a generation, of another page size than the database
+        // file's (#154). A batch without a header continues the mirror's generation, whose page
+        // size the mirror checks it against.
+        let expected = self.page_size.or_else(|| {
+            self.mirror
+                .header()
+                .map(|header| (page_size::Source::Wal, header.page_size()))
+        });
+        if let Some(expected) = expected {
+            page_size::agree((page_size::Source::Batch, decoded.page_size()), expected)
+                .map_err(|mismatch| EngineError::InvalidPayload(mismatch.into()))?;
+        }
         if let Some(header) = decoded.header()
             && self.mirror.header() != Some(header)
         {

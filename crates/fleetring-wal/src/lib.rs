@@ -8,6 +8,8 @@
 //! - [`WalHeader`] and [`FrameHeader`] parse the 32-byte WAL header and the 24-byte frame
 //!   headers. Magic numbers `0x377f0682` and `0x377f0683` select little- or big-endian checksum
 //!   words ([`ChecksumOrder`]).
+//! - [`database_page_size`] reads the page size from a database file's header, to compare with
+//!   its WAL's before a copy from elsewhere is opened.
 //! - [`read_committed`] returns the complete transactions after a [`Position`] as one [`Batch`].
 //! - [`Mirror`] appends batches to a follower's WAL, starts new generations, and truncates back
 //!   to a commit boundary. [`LogEnd`] holds the same rules without I/O.
@@ -40,6 +42,7 @@
 
 mod batch;
 mod checksum;
+mod database;
 mod frame;
 mod header;
 mod log_end;
@@ -49,6 +52,7 @@ mod reader;
 
 pub use batch::{Batch, CutError, DecodeBatchError, PayloadLayout};
 pub use checksum::ChecksumOrder;
+pub use database::{DATABASE_HEADER_LEN, DatabaseHeaderError, database_page_size};
 pub use frame::{FRAME_HEADER_LEN, FrameError, FrameHeader};
 pub use header::{HeaderError, Salts, WAL_HEADER_LEN, WalHeader};
 pub use log_end::{AppendError, LogEnd};
@@ -62,6 +66,7 @@ const _: () = {
     assert_send_sync::<Batch>();
     assert_send_sync::<PayloadLayout>();
     assert_send_sync::<ChecksumOrder>();
+    assert_send_sync::<DatabaseHeaderError>();
     assert_send_sync::<DecodeBatchError>();
     assert_send_sync::<DecodePositionError>();
     assert_send_sync::<FrameError>();

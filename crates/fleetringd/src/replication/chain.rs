@@ -720,6 +720,10 @@ mod tests {
             Err(EngineError::NotFound)
         }
 
+        fn check_copy(&self, _: &Path) -> Result<(), EngineError> {
+            Err(EngineError::NotFound)
+        }
+
         fn transactions(&self, batch: &FrameBatch) -> Result<Vec<BatchTransaction>, EngineError> {
             let start = batch.start.as_bytes()[0];
             let payload = batch.payload.as_bytes();

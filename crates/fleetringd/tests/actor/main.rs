@@ -4,6 +4,7 @@ mod both;
 mod common;
 mod fork;
 mod memory;
+mod page_size;
 mod pinned;
 mod registry;
 mod sessions;

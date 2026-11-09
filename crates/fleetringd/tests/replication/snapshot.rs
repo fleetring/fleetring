@@ -14,7 +14,7 @@ use fleetring_proto::v1::{
     DropCopyRequest, DropCopyResponse, FenceRequest, FenceResponse, FetchRequest, FetchResponse,
     PromoteRequest, PromoteResponse, ReplicateMessage, SnapshotChunk, SnapshotRequest,
 };
-use fleetringd::engine::{Statement, Transaction, Value};
+use fleetringd::engine::{SqliteEngine, Statement, Transaction, Value};
 use fleetringd::replication::{PrimaryRole, ReplicationService, ReplicationSettings, SeedError};
 use fleetringd::{DatabaseError, Registry};
 use tokio::sync::{mpsc, watch};
@@ -23,8 +23,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::common::{
-    Fleet, HANG_GUARD, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put, role,
-    routes, settings, sqlite,
+    Fleet, HANG_GUARD, PAGE_SIZE, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put,
+    role, routes, settings, sqlite,
 };
 
 /// The size the CI run loads before adding a follower.
@@ -601,5 +601,50 @@ async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> Te
         before + 1,
         "not re-seeded again: {status:?}"
     );
+    Ok(())
+}
+
+/// A snapshot whose pages aren't the size the follower's engine is configured for is refused
+/// before anything opens it, naming the peer, and leaves nothing behind (#154).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_of_another_page_size_is_refused_and_nothing_is_installed() -> TestResult {
+    let fleet = Fleet::start_each(
+        &["a", "b"],
+        |node| match node {
+            "b" => SqliteEngine::new(PAGE_SIZE * 2).expect("a valid page size"),
+            _ => sqlite(),
+        },
+        settings(),
+        BTreeMap::new(),
+    )
+    .await?;
+    let db = name("pages");
+    fleet.create("a", &db, 1).await?;
+    guarded(
+        "a write",
+        fleet.node("a").registry().execute(&db, put(1, 4_000)),
+    )
+    .await??;
+    let follower = fleet.node("b");
+    let refused = guarded(
+        "the seed",
+        follower.replication.seed(&db, &id("a"), LeaseEpoch::new(1)),
+    )
+    .await?;
+    assert!(
+        matches!(
+            &refused,
+            Err(SeedError::Failed { reason, .. })
+                if reason.contains("refused the snapshot from peer a")
+                    && reason.contains("page size")
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !follower.database_dir("pages").exists(),
+        "nothing installed"
+    );
+    let databases = follower.root.join("databases");
+    assert!(staged(&databases).is_empty(), "{:?}", staged(&databases));
     Ok(())
 }

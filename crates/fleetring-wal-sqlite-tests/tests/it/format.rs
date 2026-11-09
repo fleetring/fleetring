@@ -4,7 +4,7 @@ use std::fs;
 
 use fleetring_wal::{
     AppendError, Batch, ChecksumOrder, LogEnd, Mirror, MirrorError, Position, ReadError, WalHeader,
-    read_committed, read_committed_file,
+    database_page_size, read_committed, read_committed_file,
 };
 use proptest::prelude::*;
 use rusqlite::{Connection, params};
@@ -438,5 +438,24 @@ proptest! {
         let primary = fs::read(&pair.primary_db).expect("read primary");
         let follower = fs::read(&pair.follower_db).expect("read follower");
         prop_assert!(primary == follower, "database files differ after both checkpoint");
+    }
+}
+
+#[test]
+fn the_database_header_and_the_wal_header_agree_on_the_page_size() {
+    for page_size in [512, 4096, 65_536] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("primary.db");
+        let conn = open_primary(&db, page_size);
+        insert(&conn, 3, 100, 1);
+        let database = fs::read(&db).expect("read the database file");
+        assert_eq!(
+            database_page_size(&database),
+            Ok(page_size),
+            "the database file SQLite wrote"
+        );
+        let wal = fs::read(wal_path(&db)).expect("read the wal");
+        let header = WalHeader::parse(&wal).expect("a valid wal header");
+        assert_eq!(header.page_size(), page_size, "the wal SQLite wrote");
     }
 }

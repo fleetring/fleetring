@@ -5,7 +5,11 @@
 //! against the name it was listed under; its `chain_start` must be the hash the copy is at, and
 //! the chain recomputed over its batch must give its `chain_end`, before the engine applies it.
 //! Anything that doesn't hold fails the restore as data loss, naming the object, and the staging
-//! directory is removed: nothing partial is left behind, and nothing is skipped.
+//! directory is removed: nothing partial is left behind, and nothing is skipped. The checksums
+//! detect damage but don't authenticate, so before the copy is opened at all the engine checks
+//! it as it checks any copy from elsewhere
+//! ([`FrameSourceEngine::check_copy`](crate::engine::FrameSourceEngine::check_copy)), and a copy
+//! it can't open safely is refused as data loss too (#154).
 //!
 //! The base snapshot's metadata object is the one exception (ADR-0041, point 10). It is read
 //! after the data is restored, checked against the checksum in its name, and returned; one that
@@ -199,18 +203,28 @@ async fn build(
     execution: Execution,
 ) -> Result<Restored, RestoreError> {
     unpack_snapshot(store, keys, plan, staging, execution).await?;
+    let snapshot = &plan.snapshot;
+    // The files are the archive's bytes, which its checksums don't authenticate: the engine
+    // checks them before it opens anything (#154).
     let follower = {
         let engine = Arc::clone(&engine);
         let staging = staging.to_owned();
         blocking(execution, move || match engine.capability() {
-            EngineCapability::FrameSource(frames) => frames.open_follower(&staging),
+            EngineCapability::FrameSource(frames) => frames
+                .check_copy(&staging)
+                .and_then(|()| frames.open_follower(&staging)),
             _ => Err(EngineError::NotFound),
         })
         .await
         .map_err(|reason| RestoreError::Io(io::Error::other(reason)))?
-        .map_err(RestoreError::Engine)?
+        .map_err(|error| match error {
+            EngineError::UnsafeCopy { reason } => data_loss(
+                &snapshot.key,
+                format!("the archive's snapshot is refused: {reason}"),
+            ),
+            other => RestoreError::Engine(other),
+        })?
     };
-    let snapshot = &plan.snapshot;
     // A copy pinned where the log continues from holds no log of its own yet.
     let opened_at = follower.position();
     if opened_at != snapshot.position

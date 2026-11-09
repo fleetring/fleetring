@@ -323,9 +323,21 @@ pub trait FrameSourceEngine: fmt::Debug + Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`EngineError::NotFound`] if `location` holds no copy, and [`EngineError::Storage`] if it
-    /// can't be read.
+    /// [`EngineError::NotFound`] if `location` holds no copy, [`EngineError::UnsafeCopy`] if its
+    /// files disagree as [`check_copy`](Self::check_copy) describes, and
+    /// [`EngineError::Storage`] if it can't be read.
     fn open_follower(&self, location: &Path) -> Result<Box<dyn FrameFollower>, EngineError>;
+
+    /// Checks a copy written into `location` from bytes this node didn't produce, an archive's
+    /// snapshot or a peer's, before anything opens it, and refuses one the engine can't open
+    /// safely. For SQLite, the database file's header, the WAL's header, and the engine's
+    /// configured page size must agree on the page size (#154).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnsafeCopy`] if the copy must not be opened, and [`EngineError::Storage`]
+    /// if it can't be read.
+    fn check_copy(&self, location: &Path) -> Result<(), EngineError>;
 
     /// The transactions `batch` holds, in commit order: where each ends, and which of the
     /// payload's bytes are its own. The ranges are disjoint and in order, and the last
@@ -368,8 +380,9 @@ pub trait FrameFollower: fmt::Debug + Send {
     ///
     /// # Errors
     ///
-    /// [`EngineError::InvalidPayload`] if the batch is malformed or doesn't continue the copy, and
-    /// [`EngineError::Storage`] if it can't be written.
+    /// [`EngineError::InvalidPayload`] if the batch is malformed, doesn't continue the copy, or
+    /// doesn't fit the copy's database (for SQLite, a page size other than its database file's),
+    /// and [`EngineError::Storage`] if it can't be written.
     fn apply(&mut self, batch: &FrameBatch) -> Result<Position, EngineError>;
 
     /// Checkpoints the copy at the primary's `marker`.
@@ -586,6 +599,13 @@ pub enum EngineError {
     /// A replication payload is malformed or doesn't continue the copy.
     #[error("invalid replication payload")]
     InvalidPayload(#[source] Box<dyn Error + Send + Sync>),
+    /// A copy, or the files of a database, from bytes this node didn't produce can't be opened
+    /// safely, and nothing was opened (#154).
+    #[error("the copy can't be opened safely: {reason}")]
+    UnsafeCopy {
+        /// What is wrong with it.
+        reason: String,
+    },
     /// A checkpoint couldn't complete.
     #[error("checkpoint could not complete")]
     CheckpointBlocked,

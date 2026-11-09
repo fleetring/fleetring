@@ -31,7 +31,7 @@ use super::failover;
 use super::follower::{admit, blocking, record_anchor, seeded_chain};
 use super::primary::{self, held};
 use super::{Inner, SeedError};
-use crate::engine::{EngineCapability, Execution, Position};
+use crate::engine::{EngineCapability, EngineError, Execution, Position};
 use crate::observe::ReplicationMetrics;
 use crate::transport::replication_client;
 
@@ -275,6 +275,7 @@ async fn receive(
             blocking(inner.execution, move || unpacker.finish(&checksum))
                 .await?
                 .map_err(transfer_status)?;
+            check_copy(inner, staging, from).await?;
             return Ok(Seeded {
                 position: held(position),
                 chain: chunk.chain.as_deref().and_then(ChainHash::from_bytes),
@@ -290,6 +291,28 @@ async fn receive(
         written.map_err(transfer_status)?;
     }
     Err(Status::data_loss("the snapshot ended early"))
+}
+
+/// Has the engine check the copy at `staging`, received from `from`, before anything opens it,
+/// and refuses one it can't open safely (#154). The staging directory is the caller's to remove.
+pub(super) async fn check_copy(
+    inner: &Arc<Inner>,
+    staging: &Path,
+    from: &NodeId,
+) -> Result<(), Status> {
+    let engine = Arc::clone(&inner.engine);
+    let location = staging.to_owned();
+    let checked = blocking(inner.execution, move || match engine.capability() {
+        EngineCapability::FrameSource(frames) => frames.check_copy(&location),
+        _ => Ok(()),
+    })
+    .await?;
+    checked.map_err(|error| match error {
+        EngineError::UnsafeCopy { .. } => {
+            Status::data_loss(format!("refused the snapshot from peer {from}: {error}"))
+        }
+        other => Status::internal(format!("can't check the snapshot from {from}: {other}")),
+    })
 }
 
 fn transfer_status(error: io::Error) -> Status {

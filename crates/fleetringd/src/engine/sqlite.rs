@@ -44,6 +44,7 @@ mod changes;
 mod follower;
 mod fork;
 mod marks;
+mod page_size;
 mod pins;
 mod reserved;
 mod schema;
@@ -217,6 +218,10 @@ impl FrameSourceEngine for SqliteEngine {
         Ok(Box::new(SqliteFollower::open(location)?))
     }
 
+    fn check_copy(&self, location: &Path) -> Result<(), EngineError> {
+        page_size::check(&location.join(DATABASE_FILE), Some(self.page_size))
+    }
+
     /// Each transaction is the frames up to and including a commit frame. The generation's WAL
     /// header, when the batch starts one, goes with the first; the payload's own fixed fields,
     /// which describe the batch rather than the log, belong to none.
@@ -274,8 +279,11 @@ impl SqliteDatabase {
         pins: Arc<Pins>,
     ) -> Result<Self, EngineError> {
         let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        if mode == OpenMode::Create {
-            flags |= OpenFlags::SQLITE_OPEN_CREATE;
+        match mode {
+            OpenMode::Create => flags |= OpenFlags::SQLITE_OPEN_CREATE,
+            // Never beside a WAL of another page size (#154). The configured page size is for new
+            // databases only, so an existing one may have another.
+            OpenMode::Existing => page_size::check(&path, None)?,
         }
         let mut writer = Connection::open_with_flags(&path, flags).map_err(storage)?;
         defend(&writer)?;
