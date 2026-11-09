@@ -84,6 +84,7 @@
           },
           "required": [
             "text",
+            "written_by",
             "untrusted"
           ],
           "type": "object"
@@ -145,7 +146,12 @@
             }
           },
           "required": [
+            "description",
             "labels",
+            "created_by",
+            "created_at",
+            "expires_at",
+            "expires_in_ms",
             "version"
           ],
           "type": "object"
@@ -199,6 +205,7 @@
             "replication_factor",
             "acks",
             "min_replicas",
+            "primary",
             "replicas"
           ],
           "type": "object"
@@ -231,7 +238,9 @@
           },
           "required": [
             "node",
-            "liveness"
+            "liveness",
+            "reported_role",
+            "position"
           ],
           "type": "object"
         },
@@ -276,6 +285,9 @@
           "required": [
             "kind",
             "name",
+            "table",
+            "definition",
+            "rows",
             "rows_at_least"
           ],
           "type": "object"
@@ -351,7 +363,11 @@
       },
       "required": [
         "database",
-        "placement"
+        "placement",
+        "metadata",
+        "schema",
+        "schema_unavailable",
+        "notice"
       ],
       "type": "object"
     },
@@ -431,6 +447,7 @@
           },
           "required": [
             "text",
+            "written_by",
             "untrusted"
           ],
           "type": "object"
@@ -484,7 +501,11 @@
           },
           "required": [
             "name",
-            "labels"
+            "description",
+            "labels",
+            "created_by",
+            "expires_at",
+            "primary"
           ],
           "type": "object"
         }
@@ -516,6 +537,7 @@
       },
       "required": [
         "databases",
+        "next_after",
         "truncated",
         "notice"
       ],
@@ -584,6 +606,7 @@
           },
           "required": [
             "text",
+            "written_by",
             "untrusted"
           ],
           "type": "object"
@@ -645,7 +668,12 @@
             }
           },
           "required": [
+            "description",
             "labels",
+            "created_by",
+            "created_at",
+            "expires_at",
+            "expires_in_ms",
             "version"
           ],
           "type": "object"
@@ -699,6 +727,7 @@
             "replication_factor",
             "acks",
             "min_replicas",
+            "primary",
             "replicas"
           ],
           "type": "object"
@@ -731,7 +760,9 @@
           },
           "required": [
             "node",
-            "liveness"
+            "liveness",
+            "reported_role",
+            "position"
           ],
           "type": "object"
         },
@@ -776,6 +807,9 @@
           "required": [
             "kind",
             "name",
+            "table",
+            "definition",
+            "rows",
             "rows_at_least"
           ],
           "type": "object"
@@ -851,7 +885,11 @@
       },
       "required": [
         "database",
-        "placement"
+        "placement",
+        "metadata",
+        "schema",
+        "schema_unavailable",
+        "notice"
       ],
       "type": "object"
     },
@@ -983,6 +1021,7 @@
         "columns",
         "rows",
         "truncated",
+        "hint",
         "notice"
       ],
       "type": "object"
@@ -1098,7 +1137,10 @@
           "required": [
             "table",
             "operation",
-            "key"
+            "key",
+            "before",
+            "after",
+            "updated"
           ],
           "type": "object"
         },
@@ -1135,6 +1177,7 @@
             }
           },
           "required": [
+            "start",
             "position",
             "lease_epoch",
             "changes",
@@ -1181,7 +1224,9 @@
       },
       "required": [
         "database",
+        "capture_mode",
         "transactions",
+        "next_after",
         "more",
         "notice"
       ],
@@ -1390,6 +1435,7 @@
           },
           "required": [
             "text",
+            "written_by",
             "untrusted"
           ],
           "type": "object"
@@ -1451,7 +1497,12 @@
             }
           },
           "required": [
+            "description",
             "labels",
+            "created_by",
+            "created_at",
+            "expires_at",
+            "expires_in_ms",
             "version"
           ],
           "type": "object"
@@ -1477,7 +1528,8 @@
       },
       "required": [
         "database",
-        "metadata"
+        "metadata",
+        "notice"
       ],
       "type": "object"
     },
