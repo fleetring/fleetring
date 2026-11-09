@@ -10,7 +10,7 @@ Names come from the [lexicon](lexicon.md). A command, flag, column or JSON field
 
 The CLI is one of three surfaces over one client crate (ADR-0033). The TUI and the desktop app follow the same names, the same confirmation rules and the same output fields.
 
-This guide describes the 0.7.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet. Anything marked *planned for 0.8.0* is designed here and not built yet; [§15](#15-planned-for-080-forks) designs `db fork` (ADR-0046).
+This guide describes the 0.7.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet. Anything marked *planned for 0.8.0* is designed here and not built yet; [§15](#15-forks) describes `db fork` (ADR-0046), which is built in 0.8.0 (FR-086) and reaches `ready` once the fleet's members report the `fork` feature.
 
 ## 1. Structure: `fleetring <noun> <verb>`
 
@@ -368,9 +368,9 @@ After switching a unit to `fleetring serve`, rolling back to 0.6 requires revert
 
 How renames work after 1.0 is decided with 1.0's compatibility promise, and 1.0 removes the compatibility names.
 
-## 15. Planned for 0.8.0: forks
+## 15. Forks
 
-*Planned for 0.8.0.* Nothing in this section is built yet. It designs the command before the code, as the rest of this guide does. ADR-0046 is the design it follows, and FR-086 (#136) builds it. The words are the [lexicon](lexicon.md)'s: *fork*, *incarnation*, *operation ID*, *staged copy*, and the fork states.
+*Built in 0.8.0* (FR-086, #136). ADR-0046 is the design it follows. A fork reaches `ready` only on a fleet whose members report the `fork` feature (the data path, FR-085, #135); until then `db fork` is refused with the `FeatureUnsupported` hint below. The words are the [lexicon](lexicon.md)'s: *fork*, *incarnation*, *operation ID*, *staged copy*, and the fork states.
 
 ### `db fork`
 
@@ -453,7 +453,7 @@ A fork's record stays for its life, so `db show` reports its state and its prove
 
 ```text
 fork: seeding, attempt 2 of 5, seeder data-3
-fork exclusions: data-1 (not seeder: down); data-4 (disk refused)
+fork exclusions: data-1 (not seeder); data-4 (disk refused)
 fork holders: data-3, 1 of 2 needed
 fork progress: 41 MiB of 120 MiB on data-3
 forked from: notes (incarnation 3f9a0c6e21d4b870)
@@ -462,7 +462,7 @@ hint: `fleetring db drop notes-exp` cancels the fork in progress
 ```
 
 - **States:** `seeding`; `seeded`, printed as `opening: not yet usable`; `ready`, with the time it became ready; and `failed`, with its reason, the cause of its last retry, and the number of attempts.
-- **Exclusions** keep their causes apart: a node excluded as seeder (it was down, or its attempt timed out) may still hold a copy; a node that refused on disk holds none. Only disk refusals can fail a fork for disk.
+- **Exclusions** keep their causes apart (the control plane records the nodes, not why a node was passed over, so `db show` prints `not seeder` for those, and the cause of the last retry in `failed`): a node excluded as seeder (it was down, or its attempt timed out) may still hold a copy; a node that refused on disk holds none. Only disk refusals can fail a fork for disk.
 - **Once the fork is seeded,** `forked from` adds the position and the chain hash: `notes (incarnation 3f9a0c6e21d4b870) at 0000…01a8, chain hash 9f3c…`, and `fork holders` lists the replicas the fork stays on until it is ready.
 - **A fork that isn't ready** carries the hint `fleetring db drop <name>` cancels or removes it: "cancels the fork in progress" while it is seeding or opening, "removes it" once it failed.
 - **A database no fork made** prints no fork lines. One restored from a fork's archive prints `forked from` as the archive's claim, with no fork state.
@@ -498,7 +498,7 @@ Examples:
 
 ### MCP
 
-The MCP server's `db_fork` tool, offered only with read-write access, is designed in the daemon README's MCP section.
+The MCP server's `db_fork` tool, offered only with read-write access, is described in the daemon README's MCP section.
 
 ## Where `fleetring` stands
 
@@ -530,5 +530,5 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0 and FR-076's for 0.6.0. | 0.7.0's list: phase A, in the release notes |
 | `upgrade` | Installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place (ADR-0038). | Phase A: across the rename |
 | `db watch` | None; change streams reach only configured sinks. | Done in 0.8.0 (FR-075 item 7, ADR-0045): `db watch <db> [--from <position>]`, with `jsonl`. |
-| `db fork` | None. | Planned for 0.8.0 (FR-086, ADR-0046): `db fork <source> <target>`, fork status in `db show` and `db list`, cancellation by `db drop`, and MCP `db_fork` (§15). |
+| `db fork` | None. | Done in 0.8.0 (FR-086, ADR-0046): `db fork <source> <target>`, fork status in `db show` and `db list`, cancellation by `db drop`, and MCP `db_fork` (§15). |
 | `router` | None; applications speak the gRPC `Database` service. | Done in 0.8.0 (FR-066, ADR-0037): `router --config <file>` under "Getting started". |
