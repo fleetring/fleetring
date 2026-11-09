@@ -344,6 +344,10 @@ async fn open_first(
             return Ok(());
         }
     };
+    forks
+        .faults()
+        .pass(FaultPoint::FirstLease, key.fork.operation)
+        .await;
     let lease = node
         .inner
         .control

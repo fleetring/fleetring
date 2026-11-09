@@ -27,6 +27,9 @@ pub enum FaultPoint {
     /// A node has committed a staged copy to disk and hasn't made it known yet: heartbeats
     /// don't report it, and peers can't fetch it.
     Staged,
+    /// A seeded fork's first live holder has checked its staged copy and hasn't asked for the
+    /// fork's first lease yet: held, the fork stays seeded with no primary.
+    FirstLease,
     /// A fork's primary has opened its copy and hasn't run the fork-reset write yet.
     BeforeReset,
     /// A fork's primary reports its fork-reset write running, and hasn't run it yet. The write is

@@ -732,7 +732,24 @@ impl Database for DatabaseService {
         require_database(&request, &name)?;
         let request = request.into_inner();
         let at = (!request.position.is_empty()).then(|| Position::from(request.position));
-        let verified = self.node.replication().verify(&name, at).await?;
+        let replication = self.node.replication();
+        // Through the readiness gate, as every data call: a fork control state shows seeding,
+        // seeded with no primary, or failed, a gated primary, and a copy of a fork this node sees
+        // seeded and doesn't lead, answer nothing (ADR-0046, point 6.2). A control plane out of
+        // reach leaves the answer to this node's own view.
+        if let Ok(placement) = self.node.locate(&name).await
+            && let Some(refusal) = crate::replication::fork::placement_refusal(&name, &placement)
+        {
+            return Err(refusal);
+        }
+        let leads = replication.serving(&name).is_some();
+        if replication.is_gated(&name) || (!leads && replication.forks().frozen(&name).is_some()) {
+            return Err(crate::replication::fork::fork_not_ready(
+                &name,
+                "is a fork whose fork-reset write hasn't committed yet",
+            ));
+        }
+        let verified = replication.verify(&name, at).await?;
         Ok(Response::new(VerifyResponse {
             database: name.to_string(),
             epoch: verified.epoch.get(),

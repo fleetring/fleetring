@@ -78,6 +78,9 @@ impl PlacementCache {
         let placement = located
             .placement
             .ok_or_else(|| Status::internal("the control plane sent no placement"))?;
+        if let Some(refusal) = crate::replication::fork::placement_refusal(database, &placement) {
+            return Err(refusal);
+        }
         let primary = placement.primary.as_deref().and_then(|primary| {
             placement
                 .replicas

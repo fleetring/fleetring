@@ -161,7 +161,9 @@ pub(crate) use self::failover::DropNotice;
 pub use self::failover::{Fenced, PromotionRequest};
 pub use self::follower::ReplicationService;
 pub use self::fork::faults::ForkFaults;
-pub use self::fork::{DatabaseView, FaultPoint, ForkPhase, ForkView, RETRY_AFTER_KEY};
+pub use self::fork::{
+    DatabaseView, FORK_NOT_READY, FaultPoint, ForkPhase, ForkView, RETRY_AFTER_KEY,
+};
 
 /// The metadata key on a `Replicate` stream that names the primary, so that a follower without a
 /// copy knows whom to fetch one from.
