@@ -206,12 +206,13 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo check --workspace --exclude fleetringd --exclude fleetring-client --all-features --all-targets
-      # The daemon may need a newer toolchain than the libraries (ADR-0015, point 7).
+      - run: cargo check --workspace --exclude fleetringd --exclude fleetring-client --exclude fleetring-wal-sqlite-tests --all-features --all-targets
+      # The daemon, and the WAL tests through rusqlite, may need a newer toolchain than the
+      # libraries (ADR-0015, point 7).
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.89"
-      - run: cargo +1.89 check -p fleetringd -p fleetring-client --all-features --all-targets
+      - run: cargo +1.89 check -p fleetringd -p fleetring-client -p fleetring-wal-sqlite-tests --all-features --all-targets
 
   docs:
     name: docs
@@ -241,7 +242,7 @@ jobs:
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
-      - run: cargo test -p fleetring -p fleetring-control -p fleetring-wal --all-features --target i686-unknown-linux-gnu --no-fail-fast
+      - run: cargo test -p fleetring -p fleetring-control -p fleetring-wal -p fleetring-wal-sqlite-tests --all-features --target i686-unknown-linux-gnu --no-fail-fast
 
   # Emulated targets run optimized with fewer proptest cases to stay fast; the native debug jobs
   # still catch overflow, and every property runs at full strength there.
@@ -260,7 +261,7 @@ jobs:
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cross
-      - run: cross test -p fleetring -p fleetring-control -p fleetring-wal --all-features --release --target s390x-unknown-linux-gnu --no-fail-fast
+      - run: cross test -p fleetring -p fleetring-control -p fleetring-wal -p fleetring-wal-sqlite-tests --all-features --release --target s390x-unknown-linux-gnu --no-fail-fast
       # Proves the tests above ran big-endian: a build for the host by mistake would leave
       # little-endian (LSB) binaries here, or none at all.
       - name: test binaries are big-endian

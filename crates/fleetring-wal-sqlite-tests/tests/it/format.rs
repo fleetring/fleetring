@@ -9,9 +9,7 @@ use fleetring_wal::{
 use proptest::prelude::*;
 use rusqlite::{Connection, params};
 
-use crate::common::sqlite::{
-    Checkpoint, Pair, checkpoint, integrity, open_primary, rows, wal_path,
-};
+use crate::common::{Checkpoint, Pair, checkpoint, integrity, open_primary, rows, wal_path};
 
 /// Inserts `count` rows of `len` bytes each in one transaction.
 fn insert(conn: &Connection, count: usize, len: usize, fill: u8) {
