@@ -294,6 +294,41 @@ fn session_statements_stay_confined() -> TestResult {
 }
 
 #[test]
+fn temporary_objects_are_refused_in_sessions_and_execute() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = open(dir.path())?;
+    let rw = SessionAccess::ReadWrite;
+    run(db.as_mut(), &execute("CREATE TABLE t (v)"), rw);
+    for sql in [
+        "CREATE TEMP TABLE t (v)",
+        "CREATE TEMPORARY TABLE scratch AS SELECT 1",
+        "CREATE TEMP VIEW peek AS SELECT v FROM main.t",
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN SELECT 1; END",
+    ] {
+        let refused = run(db.as_mut(), &execute(sql), rw);
+        assert_eq!(failed(&refused), "SQLITE_AUTH", "{sql}");
+        // Inside a transaction too, and the transaction goes on.
+        run(db.as_mut(), &execute("BEGIN"), rw);
+        let refused = run(db.as_mut(), &execute(sql), rw);
+        assert_eq!(failed(&refused), "SQLITE_AUTH", "{sql}");
+        run(db.as_mut(), &execute("ROLLBACK"), rw);
+        // And through `Execute`.
+        let error = db
+            .execute(&Transaction::from(Statement::new(sql)), &Interrupt::new())
+            .expect_err("a temporary object");
+        assert!(error.to_string().contains("temporary"), "{sql}: {error}");
+    }
+    // Every write still lands in the main table, on the log.
+    run(db.as_mut(), &execute("INSERT INTO t VALUES (1)"), rw);
+    assert_eq!(
+        column(db.as_mut(), "SELECT v FROM main.t"),
+        [Value::Integer(1)]
+    );
+    assert!(column(db.as_mut(), "SELECT name FROM temp.sqlite_master").is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_session_records_row_changes_as_execute_does() -> TestResult {
     let sessions_dir = TempDir::new()?;
     let execute_dir = TempDir::new()?;

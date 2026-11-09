@@ -735,16 +735,12 @@ fn renaming_a_table_into_the_reserved_namespace_is_refused() -> TestResult {
     assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
     assert_eq!(reserved_objects(&db)?, objects(&[]));
 
-    // Nor can a temporary table be renamed there, where it would shadow the adapter's tables.
-    exec(
-        &mut db,
-        "CREATE TEMP TABLE scratch (sink TEXT, position BLOB)",
-    )?;
+    // Nor can a temporary table, which could shadow the adapter's tables, be made at all.
     let message = refusal(exec(
         &mut db,
-        "ALTER TABLE temp.scratch RENAME TO _fleetring_sinks",
+        "CREATE TEMP TABLE scratch (sink TEXT, position BLOB)",
     ))?;
-    assert_eq!(message, reserved_refusal());
+    assert!(message.contains("temporary"), "{message}");
     assert_eq!(reserved_objects(&db)?, objects(&[]));
 
     // With the adapter's own tables in place, too.
@@ -803,8 +799,6 @@ fn renaming_and_altering_ordinary_tables_still_works() -> TestResult {
             Statement::new("ALTER TABLE t ADD COLUMN w"),
             Statement::new("ALTER TABLE t RENAME COLUMN w TO x"),
             Statement::new("ALTER TABLE t DROP COLUMN x"),
-            Statement::new("CREATE TEMP TABLE scratch (v)"),
-            Statement::new("ALTER TABLE temp.scratch RENAME TO scratched"),
         ]),
         &Interrupt::new(),
     )?;
@@ -1024,7 +1018,11 @@ fn a_view_reading_the_namespace_is_refused_when_created_and_when_run() -> TestRe
         "CREATE TEMP VIEW peek AS SELECT * FROM main._fleetring_cdc",
     ] {
         let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
-        assert!(message.contains("reserved"), "`{sql}`: {message}");
+        // The temporary view is refused for being temporary, or for what it reads.
+        assert!(
+            message.contains("reserved") || message.contains("temporary"),
+            "`{sql}`: {message}"
+        );
     }
     // A view that got in anyway is refused when it runs, on either connection.
     db.writer
