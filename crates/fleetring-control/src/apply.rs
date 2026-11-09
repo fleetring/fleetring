@@ -880,22 +880,25 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
-    /// A fork that isn't seeded takes no lease (ADR-0046, point 3.7).
+    /// A fork that isn't seeded takes no lease (ADR-0046, point 3.9).
     #[error("fork '{database}' is not seeded and takes no lease")]
     LeaseOnUnseededFork {
         /// The fork.
         database: DatabaseName,
     },
 
-    /// A seeded fork's first lease goes only to a replica that holds the staged copy.
+    /// A fork's replica set is smaller than its completion quorum: the fleet has too few
+    /// members for its replication factor and durability, whatever their disks hold.
     #[error(
-        "node '{id}' holds no staged copy of fork '{database}', so it can't take its first lease"
+        "fork '{database}' needs {needed} replicas to complete; the fleet places it on {available}"
     )]
-    FirstLeaseNotHolder {
-        /// The node.
-        id: NodeId,
+    TooFewReplicas {
         /// The fork.
         database: DatabaseName,
+        /// The fork's completion quorum.
+        needed: u8,
+        /// The replicas placement gives it.
+        available: usize,
     },
 
     /// Fewer members of the fork's replica set than its bootstrap quorum reported the reset
@@ -1320,7 +1323,7 @@ fn drop_database(state: &mut State, now: Timestamp, name: DatabaseName) -> Outco
 /// that no stale report outlives it; returns it, or `None` if there is no such database. Reports
 /// are replaced wholesale by each heartbeat anyway; dropping them here keeps a snapshot taken
 /// right after the drop identical to one taken after the next heartbeats. A fork dropped before
-/// it was ready has its operation cancelled for `cause` (ADR-0046, point 3.6).
+/// it was ready has its operation cancelled for `cause` (ADR-0046, point 3.8).
 fn remove_database(
     state: &mut State,
     now: Timestamp,

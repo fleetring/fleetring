@@ -157,12 +157,21 @@ pub(crate) fn fork_database(
     let replicas = ring
         .replicas_n(name.as_str(), intent.replication_factor)
         .to_ids();
+    let need = completion_quorum(intent.replication_factor, durability);
+    if replicas.len() < usize::from(need) {
+        return Err(Rejection::TooFewReplicas {
+            database: name,
+            needed: need,
+            available: replicas.len(),
+        });
+    }
     let none = BTreeSet::new();
     let Some(seeder) = next_seeder(state, &replicas, &none, &none, now) else {
         return Err(Rejection::NoCandidate { database: name });
     };
+    // Best effort: sizes and free disk are recorded only once forks are enabled, so the first
+    // fork of a fleet passes unconditionally; the data node's own check decides.
     let source_bytes = reported_size(state, &intent.source);
-    let need = completion_quorum(intent.replication_factor, durability);
     let admitted = admitting(state, &replicas, source_bytes);
     if admitted < usize::from(need) {
         return Err(Rejection::InsufficientDisk {
@@ -472,7 +481,17 @@ pub(crate) fn record_disk_refusal(
     if with_room < completion_quorum_of(db) {
         return fail(state, now, identity, attempt, ForkFailure::InsufficientDisk);
     }
-    if node == current.seeder {
+    // A seeder that refused moves on to the next attempt when another replica can seed;
+    // until one can, the refusal is recorded and the attempt runs on, bounded by its timeout
+    // and the deadline, and the driver starts the next attempt once a seeder is live.
+    let replacement = next_seeder(
+        state,
+        &replicas,
+        &current.seeder_excluded,
+        &disk_refused,
+        now,
+    );
+    if node == current.seeder && replacement.is_some() {
         return next_attempt(
             state,
             now,
@@ -634,6 +653,7 @@ pub(crate) fn mark_fork_ready(
         at,
         chain_hash,
         completed_at,
+        lease_from,
         ..
     } = fork.state()
     else {
@@ -641,7 +661,9 @@ pub(crate) fn mark_fork_ready(
             database: identity.name.clone(),
         });
     };
-    if epoch == LeaseEpoch::ZERO || epoch > db.epoch() {
+    // Only a reset written under a lease issued since this completion counts: an earlier
+    // attempt's reset marks another copy. A ready fork always has a lease.
+    if epoch <= *lease_from || epoch > db.epoch() || db.lease().is_none() {
         return Err(Rejection::StaleEpoch {
             database: identity.name.clone(),
             given: epoch,
@@ -678,14 +700,14 @@ pub(crate) fn mark_fork_ready(
 }
 
 /// Checks a lease grant on `db` to `node` against the fork rules (ADR-0046, point 3.9): no
-/// lease while seeding or failed; while seeded, only to a recorded holder, and the first lease
-/// of the seeded fork only to one whose latest report still shows the staged copy it completed
-/// with, at log epoch 0.
+/// lease while seeding or failed, and a seeded fork's lease, always its first since it was
+/// seeded, only to a holder whose latest report still shows the staged copy it completed with,
+/// at log epoch 0. The caller has checked that `node` is in the replica set, which for a seeded
+/// fork is its holders.
 ///
 /// # Errors
 ///
-/// [`Rejection::LeaseOnUnseededFork`], [`Rejection::FirstLeaseNotHolder`], or
-/// [`Rejection::StagedCopyNotReported`].
+/// [`Rejection::LeaseOnUnseededFork`] or [`Rejection::StagedCopyNotReported`].
 pub(crate) fn check_lease(state: &State, db: &Database, node: &NodeId) -> Result<(), Rejection> {
     let Some(fork) = db.fork() else {
         return Ok(());
@@ -696,28 +718,21 @@ pub(crate) fn check_lease(state: &State, db: &Database, node: &NodeId) -> Result
                 database: db.name().clone(),
             })
         }
-        ForkState::Seeded {
-            holders,
-            lease_from,
-            ..
-        } => {
-            if !holders.contains(node) {
-                return Err(Rejection::FirstLeaseNotHolder {
+        // `AcquireLease` needs no lease, and a seeded fork has none only before its first:
+        // completion records the epoch, and seeding again clears the lease.
+        ForkState::Seeded { holders, .. } => {
+            let shown = holders.contains(node)
+                && state
+                    .report(node, db.name())
+                    .is_some_and(|report| shows_seeded_copy(db, fork, report));
+            if shown {
+                Ok(())
+            } else {
+                Err(Rejection::StagedCopyNotReported {
                     id: node.clone(),
                     database: db.name().clone(),
-                });
+                })
             }
-            let first = db.epoch() == *lease_from;
-            let shown = state
-                .report(node, db.name())
-                .is_some_and(|report| shows_seeded_copy(db, fork, report));
-            if first && !shown {
-                return Err(Rejection::StagedCopyNotReported {
-                    id: node.clone(),
-                    database: db.name().clone(),
-                });
-            }
-            Ok(())
         }
         _ => Ok(()),
     }

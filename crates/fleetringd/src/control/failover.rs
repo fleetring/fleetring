@@ -24,7 +24,7 @@
 //!    leases, so it waits for no settling.
 //! 5. **Forks.** After the settling below, on every tick it submits what the fork driver
 //!    proposes ([`fork::actions`]): completions, retries, failures, readiness, and a tick when
-//!    a fork's deadline or an operation's retention has passed (ADR-0046, point 3.8).
+//!    a fork's deadline or an operation's retention has passed (ADR-0046, point 3.11).
 //!
 //! A control node that has just started gives primaries one lease duration plus the failover
 //! margin to renew before it starts any promotion: leases look expired after an outage only
@@ -306,7 +306,7 @@ async fn run(
 }
 
 /// Submits what the fork driver proposes at `now` ([`fork::actions`]), one command at a time,
-/// and logs what became of each (ADR-0046, point 3.8). The driver reads only the state, so a
+/// and logs what became of each (ADR-0046, point 3.11). The driver reads only the state, so a
 /// restarted control node proposes the same commands; `apply` checks each one again, so a
 /// proposal made stale by an earlier one is refused and changes nothing. Says whether the timer
 /// goes on: it stops only with the control node.
