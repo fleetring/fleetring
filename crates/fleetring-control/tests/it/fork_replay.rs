@@ -338,6 +338,70 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
     log.check();
 }
 
+/// A log in which a leased fork's holders leave the fleet replays identically: the holder that
+/// would leave fewer than the completion quorum is refused, and the fork stays seeded with its
+/// lease (ADR-0046, point 3.6, as built).
+#[test]
+fn a_log_where_a_leased_forks_holders_leave_replays_identically() {
+    let mut log = Log::new();
+    for node in ["n0", "n1", "n2", "n3", "n4"] {
+        let member = Member::new(id(node)).with_software(current_software());
+        log.run(0, Action::Join { member }).expect("join");
+    }
+    log.run(0, create(SOURCE, 3)).expect("source");
+    log.run(10, fork_request(1, "t")).expect("fork");
+    let fork = identity(&log.state, "t");
+    let holders: Vec<String> = log
+        .state
+        .replica_set(&db("t"))
+        .expect("replicas")
+        .iter()
+        .map(|node| node.as_str().to_owned())
+        .collect();
+    for node in &holders {
+        log.run(20, report_staged(node, &fork, 1)).expect("hb");
+    }
+    log.drive(21);
+    log.run(
+        30,
+        Action::AcquireLease {
+            database: db("t"),
+            node: id(&holders[0]),
+        },
+    )
+    .expect("first lease");
+    for node in &holders[1..] {
+        log.run(40, Action::Leave { id: id(node) }).expect("leave");
+    }
+    log.drive(50);
+    for node in &holders[1..] {
+        let _ = log.run(
+            51,
+            Action::DropForkHolder {
+                fork: fork.clone(),
+                attempt: 1,
+                holder: id(node),
+                cause: RetryCause::HoldersLeft,
+            },
+        );
+    }
+    assert!(
+        log.outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(Rejection::HolderNeededAfterLease { .. }))),
+        "{:?}",
+        log.outcomes
+    );
+    assert!(matches!(
+        log.state
+            .database(&db("t"))
+            .and_then(|d| d.fork())
+            .map(|f| f.state()),
+        Some(ForkState::Seeded { attempt: 1, .. })
+    ));
+    log.check();
+}
+
 // ---- Before forks ----
 
 /// A state and a log written before forks, by the build before them, load unchanged: every

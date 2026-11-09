@@ -389,10 +389,12 @@ pub enum Action {
 
     /// Removes a holder from a seeded fork (ADR-0046, point 3.6): one whose latest report says
     /// its staged copy is lost, before the first lease, or one that is no longer a fleet member,
-    /// at any time before the fork is ready. If fewer holders than the completion quorum remain,
-    /// the fork seeds again at the next attempt, with a fresh deadline, its lease and any
-    /// promotion cleared and its epoch kept. Accepted only for the current fork identity, seeded
-    /// at `attempt`. Proposed by the control node's fork driver only. Needs [`Feature::Fork`].
+    /// at any time before the fork is ready. If fewer holders than the completion quorum would
+    /// remain, then before any lease since completion the fork seeds again at the next attempt,
+    /// with a fresh deadline, any promotion cleared and its epoch kept; after one, the holder
+    /// stays and the command is refused, since the fork may hold acknowledged writes that seeding
+    /// again would discard. Accepted only for the current fork identity, seeded at `attempt`.
+    /// Proposed by the control node's fork driver only. Needs [`Feature::Fork`].
     DropForkHolder {
         /// The fork.
         fork: ForkIdentity,

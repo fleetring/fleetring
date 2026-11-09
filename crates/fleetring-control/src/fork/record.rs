@@ -223,7 +223,8 @@ impl Fork {
 /// How far a fork has got (ADR-0046, points 2 and 3).
 ///
 /// `Seeding` → `Seeded` → `Ready`, or `Seeding` → `Failed`; a `Seeded` fork whose holders fall
-/// below its completion quorum seeds again. A seeding fork takes no lease; a seeded one takes
+/// below its completion quorum before any lease since completion seeds again. A seeding fork
+/// takes no lease; a seeded one takes
 /// its first lease only on a holder that still reports the copy, keeps its holders as its
 /// replica set, and serves no client until it is ready.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
