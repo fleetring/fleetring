@@ -729,6 +729,195 @@ service Database {
   // resume after. A node serves a bounded number of watchers; the next gets UNAVAILABLE.
   // Scope: stream on the database.
   rpc WatchChanges(WatchChangesRequest) returns (stream ChangeUpdate);
+  // One Hrana stream's statements on the database's primary (ADR-0037): the first message opens
+  // the session, then calls run one at a time, in order, with SQLite's own transaction semantics
+  // on the primary's writer, so a transaction can span calls. A node that isn't the primary
+  // refuses the open with UNAVAILABLE and the `fleetring-primary` hint. A caller without write on
+  // the database gets a read-only session, in which every statement that may write or controls
+  // a transaction fails with PERMISSION_DENIED without running. A call that committed is
+  // answered once its write quorum holds it. A call refused before any of it ran is answered
+  // with `not_run`. The session ends with UNAVAILABLE and the hint when the node stops serving
+  // the database at the epoch it opened under, which rolls back its open transaction, and with
+  // ABORTED when a commit can't reach its write quorum or its transaction outlived the node's
+  // limit.
+  // Scope: read on the database.
+  rpc Session(stream SessionRequest) returns (stream SessionResponse);
+}
+
+// One message of a `Session` stream from its caller: `open` first, then calls.
+message SessionRequest {
+  oneof request {
+    SessionOpen open = 1;
+    SessionCall call = 2;
+  }
+}
+
+message SessionOpen {
+  string database = 1;
+}
+
+message SessionCall {
+  // Chosen by the caller, increasing; the result carries it back.
+  uint64 call_id = 1;
+  oneof call {
+    SessionStatement execute = 2;
+    SessionBatch batch = 3;
+    // Several statements in one text, run in order until the first fails.
+    string sequence = 4;
+    // One statement to describe without running it.
+    string describe = 5;
+    GetAutocommit get_autocommit = 6;
+  }
+}
+
+message SessionStatement {
+  string sql = 1;
+  repeated Value args = 2;
+  repeated NamedValue named_args = 3;
+  // Unset or true: the result carries rows.
+  optional bool want_rows = 4;
+}
+
+message NamedValue {
+  // With its prefix character, `:a`, `@a`, or `$a`; one without is tried with each.
+  string name = 1;
+  Value value = 2;
+}
+
+message SessionBatch {
+  repeated BatchStep steps = 1;
+}
+
+message BatchStep {
+  // Unset: the step always runs.
+  optional BatchCondition condition = 1;
+  SessionStatement statement = 2;
+}
+
+message BatchCondition {
+  oneof condition {
+    uint32 ok = 1;
+    uint32 error = 2;
+    BatchCondition not = 3;
+    BatchConditions and = 4;
+    BatchConditions or = 5;
+    IsAutocommit is_autocommit = 6;
+  }
+}
+
+message BatchConditions {
+  repeated BatchCondition conditions = 1;
+}
+
+message IsAutocommit {}
+
+message GetAutocommit {}
+
+// One message of a `Session` stream to its caller: `opened` first, then one result per call.
+message SessionResponse {
+  oneof response {
+    SessionOpened opened = 1;
+    SessionResult result = 2;
+  }
+}
+
+message SessionOpened {
+  // The primary's node ID and the lease epoch it serves at.
+  string primary = 1;
+  uint64 epoch = 2;
+  // Set when the caller may only read.
+  bool read_only = 3;
+}
+
+message SessionResult {
+  uint64 call_id = 1;
+  oneof result {
+    StatementResult statement = 2;
+    BatchResult batch = 3;
+    SequenceResult sequence = 4;
+    Described described = 5;
+    AutocommitResult autocommit_result = 6;
+    // The call's statement failed (execute, sequence, describe); the session goes on.
+    SessionError error = 7;
+    // The node refused the call before any of it ran.
+    NotRun not_run = 10;
+  }
+  // Whether the session is outside a transaction after the call.
+  bool autocommit = 8;
+  // Set when the call committed one or more transactions, once the last one's write quorum
+  // holds it.
+  optional Commit commit = 9;
+}
+
+message StatementResult {
+  repeated SessionColumn columns = 1;
+  repeated Row rows = 2;
+  uint64 affected_row_count = 3;
+  optional sint64 last_insert_rowid = 4;
+}
+
+message SessionColumn {
+  optional string name = 1;
+  optional string decltype = 2;
+}
+
+message BatchResult {
+  repeated BatchStepResult steps = 1;
+}
+
+message BatchStepResult {
+  oneof step {
+    StatementResult ok = 1;
+    SessionError error = 2;
+    Skipped skipped = 3;
+  }
+}
+
+message Skipped {}
+
+message SequenceResult {}
+
+message AutocommitResult {}
+
+message Described {
+  repeated DescribedParam params = 1;
+  repeated SessionColumn columns = 2;
+  bool is_explain = 3;
+  bool is_readonly = 4;
+}
+
+message DescribedParam {
+  optional string name = 1;
+}
+
+message SessionError {
+  string message = 1;
+  // SQLite's extended result code name, or PERMISSION_DENIED, FLEETRING_SAVEPOINT,
+  // FLEETRING_VALUE, FLEETRING_RESULT_TOO_LARGE, DEADLINE_EXCEEDED, CANCELLED, or
+  // FLEETRING_UNACKNOWLEDGED.
+  string code = 2;
+}
+
+// A call the node refused before any of it ran, so that the caller may send it again.
+message NotRun {
+  // UNAVAILABLE: the node no longer serves the database, and `primary` names the node that
+  // does when it is known, or the replica floor isn't met; RESOURCE_EXHAUSTED: another
+  // session's transaction holds the writer and too many writes wait for it.
+  string code = 1;
+  string message = 2;
+  // The new primary's address, when the database moved.
+  optional string primary = 3;
+  // Set when the session ends after this answer: the database moved, or the session's
+  // transaction is gone (FLEETRING_TRANSACTION_ABORTED), so that the caller opens a new one.
+  bool ends_session = 4;
+}
+
+message Commit {
+  // How many replicas hold the transaction, the primary included, and R.
+  uint32 acknowledged_by = 1;
+  uint32 replicas = 2;
+  bool under_replicated = 3;
+  uint64 epoch = 4;
 }
 
 message WatchChangesRequest {

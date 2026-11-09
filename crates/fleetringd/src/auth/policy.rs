@@ -333,6 +333,14 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Database(Action::Stream),
         Binding::None,
     ),
+    // A Hrana stream's session on the primary (ADR-0037): `read` to open one; the handler checks
+    // `write` and, without it, the session is read-only, enforced by the engine (amends ADR-0026
+    // point 4 for sessions).
+    rpc(
+        "/fleetring.v1.Database/Session",
+        Requirement::Database(Action::Read),
+        Binding::None,
+    ),
 ];
 
 /// The RPC served at `path`, or `None` for a path the table doesn't list, which is refused.
@@ -389,6 +397,19 @@ impl Caller {
             Self::Principal { scopes, .. } => {
                 scopes.allows(Target::Fleet) || scopes.allows(Target::Database(action, database))
             }
+        }
+    }
+
+    /// Whether the caller may take `action` on `database` itself, as an RPC that needs `action`
+    /// on the database would require; the `fleet` scope doesn't imply it. A node is a principal
+    /// with no scopes here (ADR-0026, point 9), and an anonymous caller, on a plaintext fleet,
+    /// may do anything.
+    #[must_use]
+    pub fn may(&self, action: Action, database: &DatabaseName) -> bool {
+        match self {
+            Self::Anonymous => true,
+            Self::Node(_) => false,
+            Self::Principal { scopes, .. } => scopes.allows(Target::Database(action, database)),
         }
     }
 

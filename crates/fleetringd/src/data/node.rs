@@ -2,6 +2,7 @@
 //! to send requests for the others.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -20,7 +21,12 @@ use crate::durability::{Archive, RestoreError, RestoreTarget, Restored, StoreErr
 use crate::engine::EngineError;
 use crate::observe::DataMetrics;
 use crate::replication::{PrimaryRole, Replication, ServePrimaryError};
-use crate::{DatabaseError, Registry};
+use crate::{DatabaseError, Registry, SessionId};
+
+/// The most SQL sessions a node holds open at once (ADR-0037). Each is a task and an HTTP/2
+/// stream, and holds the writer only while its transaction is open; the router's own
+/// `max_streams` bounds what one router opens, and this bounds what every caller together does.
+pub(crate) const MAX_SESSIONS: usize = 10_000;
 
 /// A lease this node holds, as far as it knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +137,30 @@ pub(super) struct Inner {
     retiring: Mutex<BTreeMap<DatabaseName, Fate>>,
     /// Where writes, queries, renewals, transfers, and promotions are counted.
     metrics: DataMetrics,
+    /// The last SQL session ID handed out.
+    last_session: AtomicU64,
+    /// How many SQL sessions are open.
+    open_sessions: Arc<AtomicUsize>,
+}
+
+/// One open SQL session's place on its node, given back when dropped.
+#[derive(Debug)]
+pub(crate) struct SessionTicket {
+    id: SessionId,
+    open: Arc<AtomicUsize>,
+}
+
+impl SessionTicket {
+    /// The session's ID.
+    pub(crate) fn id(&self) -> SessionId {
+        self.id
+    }
+}
+
+impl Drop for SessionTicket {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Refuses requests for one database until it is dropped.
@@ -269,8 +299,31 @@ impl DataNode {
                 creating: NameLocks::default(),
                 retiring: Mutex::new(BTreeMap::new()),
                 metrics,
+                last_session: AtomicU64::new(0),
+                open_sessions: Arc::new(AtomicUsize::new(0)),
             }),
         }
+    }
+
+    /// A place for one more SQL session, with a new ID.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_EXHAUSTED` if the node holds [`MAX_SESSIONS`] already.
+    pub(crate) fn open_session(&self) -> Result<SessionTicket, Status> {
+        let open = Arc::clone(&self.inner.open_sessions);
+        if open.fetch_add(1, Ordering::Relaxed) >= MAX_SESSIONS {
+            open.fetch_sub(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted(format!(
+                "node {} holds {MAX_SESSIONS} sessions already; retry later",
+                self.inner.id
+            )));
+        }
+        let id = self.inner.last_session.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(SessionTicket {
+            id: SessionId::new(id),
+            open,
+        })
     }
 
     /// Where the node counts writes, queries, renewals, transfers, and promotions.

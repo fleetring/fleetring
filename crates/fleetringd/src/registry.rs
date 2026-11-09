@@ -10,12 +10,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::actor::{
-    self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Published, Stored,
+    self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Published, SessionCalled,
+    SessionId, SessionLimits, SessionPublished, SessionWork, Stored,
 };
 use crate::changes::CaptureRules;
 use crate::engine::{
-    CaptureMode, DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Schema,
-    SchemaRequest, Statement, Transaction,
+    Autocommit, CaptureMode, DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows,
+    Schema, SchemaRequest, SessionAccess, SessionCall, Statement, Transaction,
 };
 use crate::layout;
 use crate::publisher::BatchPublisher;
@@ -46,6 +47,8 @@ struct Inner {
     config: EngineConfig,
     /// The databases that record row changes, and in which mode.
     recorded: CaptureRules,
+    /// How long a SQL session's transaction may hold a database's writer.
+    sessions: SessionLimits,
     state: Mutex<State>,
 }
 
@@ -105,6 +108,7 @@ impl Registry {
                 root: root.into(),
                 config,
                 recorded: CaptureRules::none(),
+                sessions: SessionLimits::default(),
                 state: Mutex::default(),
             }),
         }
@@ -125,6 +129,24 @@ impl Registry {
         let mut inner = Arc::into_inner(self.inner)
             .expect("a registry's recorded databases are set before it is shared");
         inner.recorded = recorded;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// The same registry, with SQL sessions held to `limits` (ADR-0037, point 14).
+    ///
+    /// Call it before any database opens; a registry with open databases keeps them as they
+    /// are.
+    ///
+    /// # Panics
+    ///
+    /// If the registry has been cloned, so that its settings can no longer change.
+    #[must_use]
+    pub fn with_sessions(self, limits: SessionLimits) -> Self {
+        let mut inner = Arc::into_inner(self.inner)
+            .expect("a registry's session limits are set before it is shared");
+        inner.sessions = limits;
         Self {
             inner: Arc::new(inner),
         }
@@ -223,6 +245,75 @@ impl Registry {
             if let Some(permit) = handle.reserve().await {
                 return handle.commit_reserved(permit, transaction, deadline).await;
             }
+        }
+    }
+
+    /// Runs one call of SQL session `session` on an existing database, opening it if needed, and
+    /// waits for replication to acknowledge every transaction the call committed (ADR-0037).
+    /// `holding` is whether the session thinks it is in a transaction, from its last call's
+    /// answer; the call's statements stop at `deadline`, if there is one, and when this future is
+    /// dropped (FR-078).
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::TransactionTimedOut`] or [`DatabaseError::TransactionLost`] if the session
+    /// is holding a transaction the database no longer has; [`DatabaseError::Busy`] if another
+    /// session's transaction holds the writer and too many writes wait for it;
+    /// [`DatabaseError::NoSessions`] if the engine can't run sessions; and as
+    /// [`execute`](Self::execute).
+    pub async fn session_call(
+        &self,
+        name: &DatabaseName,
+        session: SessionId,
+        call: SessionCall,
+        access: SessionAccess,
+        holding: Autocommit,
+        deadline: Option<Instant>,
+    ) -> Result<SessionCalled, DatabaseError> {
+        let work = SessionWork {
+            session,
+            call,
+            access,
+            holding,
+        };
+        self.session_publish(name, work, deadline)
+            .await?
+            .stored()
+            .await
+    }
+
+    /// As [`session_call`](Self::session_call), but returns once the transactions the call
+    /// committed are in replication's hands; [`SessionPublished::stored`] waits for their
+    /// acknowledgements.
+    pub(crate) async fn session_publish(
+        &self,
+        name: &DatabaseName,
+        work: SessionWork,
+        deadline: Option<Instant>,
+    ) -> Result<SessionPublished, DatabaseError> {
+        loop {
+            let handle = self.acquire(name, OpenMode::Existing).await?;
+            if let Some(permit) = handle.reserve().await {
+                return handle.session_call_reserved(permit, work, deadline).await;
+            }
+        }
+    }
+
+    /// Ends SQL session `session` on `name`: rolls back the transaction it holds there, if any.
+    /// A database that isn't open holds none, and isn't opened for it.
+    pub async fn session_end(&self, name: &DatabaseName, session: SessionId) {
+        let handle = {
+            let state = self.inner.lock();
+            state
+                .entries
+                .get(name)
+                .filter(|entry| matches!(entry.status, Status::Open { .. }))
+                .map(|entry| entry.handle.clone())
+        };
+        if let Some(handle) = handle
+            && let Err(error) = handle.session_end(session).await
+        {
+            tracing::debug!(database = %name, %session, %error, "ending a session found the database closed");
         }
     }
 
@@ -498,6 +589,7 @@ impl Registry {
                 Some(mode) => ChangeRecording::On(mode),
                 None => ChangeRecording::Off,
             },
+            sessions: inner.sessions,
         };
         let registry = Arc::downgrade(inner);
         let exiting = name.clone();

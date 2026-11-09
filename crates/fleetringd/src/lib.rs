@@ -36,12 +36,12 @@ pub mod tls;
 pub mod transport;
 pub mod upgrade;
 
-pub use actor::{DatabaseError, DatabaseHandle, Stored};
+pub use actor::{DatabaseError, DatabaseHandle, SessionCalled, SessionId, SessionLimits, Stored};
 pub use config::{
     AdminConfig, AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, ControlSettings,
     HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig, LogFormat,
     MembershipSettings, NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext,
-    PrincipalConfig, ReplicationConfig, TlsConfig, TokenForwarding,
+    PrincipalConfig, ReplicationConfig, SessionsConfig, TlsConfig, TokenForwarding,
 };
 pub use daemon::{Daemon, StartError, Stop};
 pub use data_dir::{DataDir, DataDirError};
@@ -182,6 +182,10 @@ const _: () = {
     assert_debug_send_sync::<upgrade::Step>();
     assert_debug_send_sync::<upgrade::Steps>();
     assert_debug_send_sync::<Stored>();
+    assert_debug_send_sync::<SessionCalled>();
+    assert_debug_send_sync::<SessionId>();
+    assert_debug_send_sync::<SessionLimits>();
+    assert_debug_send_sync::<SessionsConfig>();
     assert_debug_send_sync::<TlsConfig>();
     assert_debug_send_sync::<tls::Accepted>();
     assert_debug_send_sync::<tls::Authority>();

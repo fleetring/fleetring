@@ -9,6 +9,9 @@
 //!   statements are confined to the database they name.
 //! - [`MemoryEngine`] is a self-replicating test engine that has no WAL at all.
 //!
+//! A [`SqlSessions`] runs a Hrana stream's statements with the engine's own transaction
+//! semantics (ADR-0037); an engine that can't returns `None` from [`Database::sql_sessions`].
+//!
 //! A statement stops when its [`Interrupt`] is raised. The caller raises it, at a deadline it
 //! keeps on its own clock or when it goes away, so engines never read a clock (FR-078).
 
@@ -20,6 +23,7 @@ mod memory;
 mod pinned;
 mod position;
 mod schema;
+mod session;
 mod sqlite;
 mod statement;
 
@@ -42,6 +46,12 @@ pub use position::{
 pub use schema::{
     Internal, MAX_COUNT_LIMIT, MAX_SCHEMA_OBJECTS, ObjectKind, RowCount, Schema, SchemaObject,
     SchemaRequest,
+};
+pub use session::{
+    Autocommit, BatchCondition, BatchStep, CANCELLED, CallOutcome, CallResult, DEADLINE_EXCEEDED,
+    Description, MAX_RESULT_BYTES, PERMISSION_DENIED, RESULT_TOO_LARGE, ResultColumn,
+    SAVEPOINT_OUTSIDE_TRANSACTION, SessionAccess, SessionCall, SessionStatement, SqlSessions,
+    StatementError, StatementOutcome, StepOutcome, UNSENDABLE_VALUE, WantRows, WriteIntent, holds,
 };
 pub use sqlite::{InvalidPageSizeError, SqliteEngine, SqliteFollower};
 pub use statement::{Executed, Rows, Statement, Transaction, Value};
@@ -90,6 +100,22 @@ const _: () = {
     assert_debug_send_sync::<Statement>();
     assert_debug_send_sync::<Transaction>();
     assert_debug_send_sync::<Value>();
+    assert_debug_send_sync::<Autocommit>();
+    assert_debug_send_sync::<BatchCondition>();
+    assert_debug_send_sync::<BatchStep>();
+    assert_debug_send_sync::<CallOutcome>();
+    assert_debug_send_sync::<CallResult>();
+    assert_debug_send_sync::<Description>();
+    assert_debug_send_sync::<ResultColumn>();
+    assert_debug_send_sync::<SessionAccess>();
+    assert_debug_send_sync::<SessionCall>();
+    assert_debug_send_sync::<SessionStatement>();
+    assert_debug_send_sync::<StatementError>();
+    assert_debug_send_sync::<StatementOutcome>();
+    assert_debug_send_sync::<StepOutcome>();
+    assert_debug_send_sync::<WantRows>();
+    assert_debug_send_sync::<WriteIntent>();
+    assert_debug_send::<dyn SqlSessions>();
     assert_debug_send::<dyn Database>();
     assert_debug_send::<dyn FrameFollower>();
     assert_debug_send::<dyn LogicalChanges>();

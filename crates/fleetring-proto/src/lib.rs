@@ -21,8 +21,9 @@ use v1::ProtocolVersion;
 /// The protocol version this build speaks. Minor 1 adds `Software` to `Join`, `Heartbeat`, and
 /// membership updates, and the `Undrain` call (ADR-0038). Minor 2 adds database metadata
 /// (ADR-0041): the `CreateDatabaseWithMetadata` and `UpdateDatabase` calls, `Placement.metadata`,
-/// and the filters and pages of `ListDatabases`.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+/// and the filters and pages of `ListDatabases`. Minor 3 adds the `Database.Session` stream
+/// (ADR-0037).
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 /// The largest message a node sends or accepts: a replication batch or a snapshot chunk.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;

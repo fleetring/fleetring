@@ -58,7 +58,12 @@
 //!   primary still holds every change after (ADR-0045). It needs `stream` on the database.
 //!   [`Client::watch_changes`] opens the stream, and `fleetring db watch` prints it, resuming
 //!   on the new primary when the old one stops serving the database.
+//! - **Sessions:** `Session` carries one Hrana stream from the router to a database's primary
+//!   (ADR-0037): its calls run one at a time with SQLite's own transaction semantics, so a
+//!   transaction can span calls, and each is answered once what it committed is acknowledged.
+//!   It needs `read` on the database; without `write`, the session is read-only.
 
+pub(crate) mod calls;
 mod client;
 pub(crate) mod convert;
 mod drain;
@@ -68,6 +73,7 @@ mod metadata;
 mod node;
 mod schema;
 mod service;
+mod session;
 mod watch;
 
 pub(crate) use client::unknown_call;

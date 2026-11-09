@@ -13,10 +13,19 @@
 //! `tokio::time` and a simulation stays deterministic. Under [`Execution::Inline`] a statement
 //! blocks the task that would raise it, so there only a request whose deadline passed, or whose
 //! caller left, while it waited in the mailbox is stopped, before it starts.
+//!
+//! The actor also runs SQL sessions' calls (ADR-0037). A session that begins a transaction holds
+//! the database's writer until it commits, rolls back, or ends: meanwhile other writes, and
+//! other sessions' calls that may write, wait in the actor, up to
+//! [`SessionLimits::max_waiting_writes`] of them, and reads go on. A transaction open longer than
+//! [`SessionLimits::transaction_timeout`] is rolled back, its time kept by `tokio::time`, and a
+//! session that ends rolls back what it left open. A session that thinks it is in a transaction
+//! the database no longer holds, because it timed out or the database closed, is told so, so
+//! that its later statements never run outside the transaction they were meant for.
 
 mod executor;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,16 +38,70 @@ use tokio::time::{self, Instant};
 use self::executor::{Executor, OpenRequest};
 use crate::changes::MarkHome;
 use crate::engine::{
-    CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot,
-    EngineError, Executed, Execution, FrameBatch, FrameSource, Interrupt, Interruption,
-    LogicalChanges, OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction,
-    ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Shape, Statement, Transaction,
+    Autocommit, CallResult, CaptureMode, CheckpointMarker, Database, DatabaseCapability,
+    DatabaseEngine, DatabaseSnapshot, EngineCapability, EngineError, Executed, Execution,
+    FrameBatch, FrameSource, Interrupt, Interruption, LogicalChanges, OpenMode, PinnedSnapshot,
+    Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange, Rows, Schema,
+    SchemaRequest, SessionAccess, SessionCall, Shape, Statement, Transaction, WriteIntent,
 };
 use crate::publisher::{
     Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
 };
 
 type Reply<T> = oneshot::Sender<Result<T, DatabaseError>>;
+
+/// A SQL session's identity on one node, unique for the node's life (ADR-0037).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    /// The session numbered `id`.
+    #[must_use]
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// How long a session may hold a database's writer, and how many writes may wait for it
+/// (`[sessions]`, ADR-0037 point 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLimits {
+    /// A session's transaction open longer than this is rolled back.
+    pub transaction_timeout: Duration,
+    /// How many writes may wait, per database, for a session's transaction to end; the next is
+    /// refused with [`DatabaseError::Busy`].
+    pub max_waiting_writes: usize,
+}
+
+impl Default for SessionLimits {
+    /// 30 seconds, and 64 waiting writes.
+    fn default() -> Self {
+        Self {
+            transaction_timeout: Duration::from_secs(30),
+            max_waiting_writes: 64,
+        }
+    }
+}
+
+/// One call of a SQL session, as the actor runs it.
+#[derive(Debug)]
+pub(crate) struct SessionWork {
+    pub(crate) session: SessionId,
+    pub(crate) call: SessionCall,
+    pub(crate) access: SessionAccess,
+    /// Whether the session thinks it is in a transaction, from its last call's answer.
+    pub(crate) holding: Autocommit,
+}
+
+/// A session call that ran, with the acknowledgements of the transactions it committed, in
+/// commit order.
+type SessionRan = (CallResult, Vec<Acknowledgement>);
 
 /// A request in an actor's mailbox.
 pub(crate) enum Request {
@@ -68,9 +131,24 @@ pub(crate) enum Request {
     PinSnapshot(Reply<PinnedSnapshot>),
     PinSnapshotAt(Option<Position>, Reply<PinnedSnapshot>),
     ReplicaPositions(Reply<Vec<ReplicaPosition>>),
+    SessionCall(SessionWork, Interrupt, Reply<SessionRan>),
+    SessionEnd(SessionId, Reply<()>),
 }
 
 impl Request {
+    /// Whether the request needs the writer to itself, so that it waits while a session's
+    /// transaction holds it.
+    fn needs_writer(&self) -> bool {
+        matches!(
+            self,
+            Self::Execute(..)
+                | Self::Checkpoint(_)
+                | Self::Snapshot(..)
+                | Self::PinSnapshot(_)
+                | Self::PinSnapshotAt(..)
+        )
+    }
+
     /// Answers the request with `error` without running it.
     fn fail(self, error: DatabaseError) {
         match self {
@@ -125,6 +203,12 @@ impl Request {
             Self::ReplicaPositions(reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::SessionCall(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::SessionEnd(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
         }
     }
 }
@@ -149,6 +233,8 @@ impl fmt::Debug for Request {
             Self::PinSnapshot(_) => "PinSnapshot",
             Self::PinSnapshotAt(..) => "PinSnapshotAt",
             Self::ReplicaPositions(_) => "ReplicaPositions",
+            Self::SessionCall(..) => "SessionCall",
+            Self::SessionEnd(..) => "SessionEnd",
         })
     }
 }
@@ -209,6 +295,33 @@ pub enum DatabaseError {
         /// Why.
         source: ReplicationError,
     },
+    /// A session's transaction holds the database's writer, and as many writes as may wait for
+    /// it already do; the request never ran (ADR-0037, point 14).
+    #[error("database {name} has too many writes waiting for a transaction; retry")]
+    Busy {
+        /// The database.
+        name: DatabaseName,
+    },
+    /// The session's transaction was open longer than the session limit, and was rolled back;
+    /// the call never ran.
+    #[error("database {name} rolled back a transaction open longer than the session limit")]
+    TransactionTimedOut {
+        /// The database.
+        name: DatabaseName,
+    },
+    /// The session's transaction is gone: the database closed, which rolled it back; the call
+    /// never ran.
+    #[error("database {name} no longer holds the session's transaction; it was rolled back")]
+    TransactionLost {
+        /// The database.
+        name: DatabaseName,
+    },
+    /// The database's engine can't run SQL sessions (ADR-0037, point 16).
+    #[error("database {name}'s engine can't run sql sessions")]
+    NoSessions {
+        /// The database.
+        name: DatabaseName,
+    },
 }
 
 impl DatabaseError {
@@ -257,6 +370,56 @@ impl Published {
             rows_affected: self.executed.rows_affected,
             acknowledged,
         })
+    }
+}
+
+/// A SQL session's call that ran, and how durably replication stored what it committed.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SessionCalled {
+    /// What the call produced, and whether the session is in a transaction after it.
+    pub result: CallResult,
+    /// How replication acknowledged the last transaction the call committed, or `None` if it
+    /// committed none or the engine replicates itself.
+    pub acknowledged: Option<Acknowledged>,
+}
+
+/// A session's call that has run, whose committed transactions replication has taken.
+pub(crate) struct SessionPublished {
+    result: CallResult,
+    acknowledgements: Vec<Acknowledgement>,
+}
+
+impl SessionPublished {
+    /// What the call produced.
+    pub(crate) fn result(&self) -> &CallResult {
+        &self.result
+    }
+
+    /// Waits for replication to acknowledge every transaction the call committed.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Replication`] if replication couldn't store one; the call's transactions
+    /// committed locally.
+    pub(crate) async fn stored(self) -> Result<SessionCalled, DatabaseError> {
+        let mut acknowledged = None;
+        for acknowledgement in self.acknowledgements {
+            acknowledged = Some(acknowledgement.wait().await?);
+        }
+        Ok(SessionCalled {
+            result: self.result,
+            acknowledged,
+        })
+    }
+}
+
+impl fmt::Debug for SessionPublished {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionPublished")
+            .field("result", &self.result)
+            .field("committed", &self.acknowledgements.len())
+            .finish()
     }
 }
 
@@ -517,6 +680,32 @@ impl DatabaseHandle {
         self.call(Request::ReplicaPositions).await
     }
 
+    /// Runs one call of SQL session `session` with `access`, stopping its statements at
+    /// `deadline` or once this future is dropped (FR-078), and returns once the transactions it
+    /// committed are in replication's hands. `holding` is whether the session thinks it is in a
+    /// transaction, from its last call's answer.
+    pub(crate) async fn session_call_reserved(
+        &self,
+        permit: mpsc::Permit<'_, Request>,
+        work: SessionWork,
+        deadline: Option<Instant>,
+    ) -> Result<SessionPublished, DatabaseError> {
+        let (result, acknowledgements) = self
+            .interruptible(permit, deadline, |interrupt, reply| {
+                Request::SessionCall(work, interrupt, reply)
+            })
+            .await?;
+        Ok(SessionPublished {
+            result,
+            acknowledgements,
+        })
+    }
+
+    /// Ends SQL session `session` here: rolls back the transaction it holds, if any.
+    pub(crate) async fn session_end(&self, session: SessionId) -> Result<(), DatabaseError> {
+        self.call(|reply| Request::SessionEnd(session, reply)).await
+    }
+
     /// Waits until the database has opened.
     pub(crate) async fn ready(&self) -> Result<(), DatabaseError> {
         self.call(Request::Ready).await
@@ -687,6 +876,8 @@ pub(crate) struct ActorConfig {
     pub(crate) thread_name: String,
     /// Whether the database records row changes for logical change streams.
     pub(crate) changes: ChangeRecording,
+    /// How long a session's transaction may hold the writer, and how many writes may wait.
+    pub(crate) sessions: SessionLimits,
 }
 
 /// Whether a database records its row changes from the moment it opens, and how much of each
@@ -748,10 +939,11 @@ async fn run(
         idle_timeout,
         thread_name,
         changes,
+        sessions,
         ..
     } = config;
     let opened = Executor::open(OpenRequest {
-        engine,
+        engine: Arc::clone(&engine),
         location,
         mode,
         execution,
@@ -775,18 +967,26 @@ async fn run(
     };
     let mut actor = Actor {
         name,
+        engine,
         executor,
         publisher,
         last: None,
         failed: None,
+        limits: sessions,
+        holder: None,
+        waiting: VecDeque::new(),
+        expired: BTreeSet::new(),
     };
     actor.start(changes).await;
     actor
         .serve(&mut mailbox, close_requested, idle_timeout)
         .await;
+    // A transaction left open goes with the database; what waited for it runs first.
+    actor.end_transaction(Ending::Closing).await;
+    actor.run_waiting().await;
     mailbox.close();
     while let Some(request) = mailbox.recv().await {
-        actor.handle(request).await;
+        actor.dispatch(request).await;
     }
     let name = actor.name.clone();
     if let Err(error) = actor.executor.close().await {
@@ -803,6 +1003,35 @@ struct Actor {
     last: Option<Position>,
     /// Why the database stopped taking writes, if it has.
     failed: Option<Arc<EngineError>>,
+    /// How long a session's transaction may hold the writer, and how many writes may wait.
+    limits: SessionLimits,
+    /// The session whose transaction holds the writer, if one does.
+    holder: Option<Holder>,
+    /// The requests waiting for the holder's transaction to end, in arrival order.
+    waiting: VecDeque<Request>,
+    /// The sessions whose transactions were rolled back for running too long, until they hear.
+    expired: BTreeSet<SessionId>,
+    /// The engine, which says how a captured batch splits into transactions.
+    engine: Arc<dyn DatabaseEngine>,
+}
+
+/// Why a session's transaction ends without its commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// Its session ended, which rolls back what it left open.
+    SessionEnded,
+    /// It was open longer than [`SessionLimits::transaction_timeout`].
+    TimedOut,
+    /// The database is closing.
+    Closing,
+}
+
+/// The session whose transaction holds a database's writer.
+#[derive(Debug, Clone, Copy)]
+struct Holder {
+    session: SessionId,
+    /// When its transaction is rolled back if it is still open.
+    deadline: Instant,
 }
 
 impl Actor {
@@ -842,20 +1071,105 @@ impl Actor {
         idle_timeout: Duration,
     ) {
         loop {
+            // A database whose writer a transaction holds isn't idle, and the transaction's own
+            // limit applies instead.
+            let holding = self.holder.map(|holder| holder.deadline);
+            let idle = match holding {
+                Some(_) => None,
+                None => Some(idle_timeout),
+            };
             let request = tokio::select! {
                 biased;
                 _ = &mut close_requested => return,
-                received = time::timeout(idle_timeout, mailbox.recv()) => match received {
-                    Ok(Some(request)) => request,
-                    Ok(None) | Err(_) => return,
+                () = expiry(holding) => {
+                    self.end_transaction(Ending::TimedOut).await;
+                    self.run_waiting().await;
+                    continue;
+                }
+                received = receive(mailbox, idle) => match received {
+                    Some(request) => request,
+                    None => return,
                 },
             };
-            self.handle(request).await;
+            self.dispatch(request).await;
+        }
+    }
+
+    /// Handles `request`, then runs what waited for a transaction that has ended.
+    async fn dispatch(&mut self, request: Request) {
+        self.handle(request).await;
+        self.run_waiting().await;
+    }
+
+    /// Runs the requests that waited for a transaction, in order, while no transaction holds the
+    /// writer. One of them may begin a transaction, and the rest then wait again.
+    async fn run_waiting(&mut self) {
+        while self.holder.is_none() && !self.waiting.is_empty() {
+            let waiting = std::mem::take(&mut self.waiting);
+            for request in waiting {
+                self.handle(request).await;
+            }
+        }
+    }
+
+    /// Queues `request` until the holder's transaction ends, or refuses it if as many writes as
+    /// may wait already do.
+    fn wait(&mut self, request: Request) {
+        if self.waiting.len() < self.limits.max_waiting_writes {
+            self.waiting.push_back(request);
+        } else {
+            request.fail(DatabaseError::Busy {
+                name: self.name.clone(),
+            });
         }
     }
 
     async fn handle(&mut self, request: Request) {
+        if self.holder.is_some() && request.needs_writer() {
+            self.wait(request);
+            return;
+        }
         match request {
+            Request::SessionCall(work, interrupt, reply) => {
+                let other = self.holder.filter(|holder| holder.session != work.session);
+                if other.is_none() {
+                    let result = self.session_call(work, interrupt).await;
+                    let _ = reply.send(result);
+                    return;
+                }
+                if work.holding == Autocommit::InTransaction {
+                    let _ = reply.send(Err(self.lost(work.session)));
+                    return;
+                }
+                // Another session's transaction holds the writer: a call that only reads runs
+                // now, against the latest commit; one that may write waits.
+                let call = work.call.clone();
+                let intent = self
+                    .call(move |database| match database.sql_sessions() {
+                        Some(sessions) => Ok(sessions.intent(&call)?),
+                        None => Ok(WriteIntent::MayWrite),
+                    })
+                    .await;
+                match intent {
+                    Ok(WriteIntent::ReadOnly) => {
+                        let result = self.session_read(work, interrupt).await;
+                        let _ = reply.send(result);
+                    }
+                    Ok(WriteIntent::MayWrite) => {
+                        self.wait(Request::SessionCall(work, interrupt, reply));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Request::SessionEnd(session, reply) => {
+                if self.holder.is_some_and(|holder| holder.session == session) {
+                    self.end_transaction(Ending::SessionEnded).await;
+                }
+                self.expired.remove(&session);
+                let _ = reply.send(Ok(()));
+            }
             Request::Ready(reply) => {
                 let _ = reply.send(Ok(()));
             }
@@ -1070,6 +1384,163 @@ impl Actor {
         Ok((result?, acknowledgement))
     }
 
+    /// Why a session that thinks it is in a transaction isn't: it ran too long, or the database
+    /// closed since.
+    fn lost(&mut self, session: SessionId) -> DatabaseError {
+        let name = self.name.clone();
+        if self.expired.remove(&session) {
+            DatabaseError::TransactionTimedOut { name }
+        } else {
+            DatabaseError::TransactionLost { name }
+        }
+    }
+
+    /// Runs one call of a session that holds the writer, or of any session while none does, and
+    /// captures and publishes each transaction it committed.
+    async fn session_call(
+        &mut self,
+        work: SessionWork,
+        interrupt: Interrupt,
+    ) -> Result<SessionRan, DatabaseError> {
+        let SessionWork {
+            session,
+            call,
+            access,
+            holding,
+        } = work;
+        if let Some(source) = &self.failed {
+            return Err(DatabaseError::Failed {
+                name: self.name.clone(),
+                source: Arc::clone(source),
+            });
+        }
+        let holds = self.holder.is_some_and(|holder| holder.session == session);
+        if holding == Autocommit::InTransaction && !holds {
+            return Err(self.lost(session));
+        }
+        if access == SessionAccess::ReadWrite {
+            let checked = call.clone();
+            let intent = self
+                .call(move |database| match database.sql_sessions() {
+                    Some(sessions) => Ok(sessions.intent(&checked)?),
+                    None => Ok(WriteIntent::ReadOnly),
+                })
+                .await?;
+            // Refused here, nothing runs: below the replica floor, a call that may write never
+            // reaches the engine (ADR-0023).
+            if intent == WriteIntent::MayWrite {
+                self.publisher
+                    .admit(&self.name)
+                    .map_err(|source| DatabaseError::Refused {
+                        name: self.name.clone(),
+                        source,
+                    })?;
+            }
+        }
+        let last = self.last.clone();
+        let engine = Arc::clone(&self.engine);
+        let outcome = self
+            .executor
+            .run(move |database| {
+                let sessions = database.sql_sessions()?;
+                let result = sessions.run(&call, access, &interrupt);
+                let autocommit = sessions.autocommit();
+                // Capture runs whatever the outcome, so a commit is never missed.
+                let captured = capture_each(database, engine.as_ref(), last);
+                Some((result, autocommit, captured))
+            })
+            .await;
+        let (result, autocommit, captured) = match outcome {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                return Err(DatabaseError::NoSessions {
+                    name: self.name.clone(),
+                });
+            }
+            Err(stopped) => {
+                self.fail(EngineError::Storage(stopped.into()));
+                self.holder = None;
+                return Err(DatabaseError::Interrupted {
+                    name: self.name.clone(),
+                });
+            }
+        };
+        let acknowledgements = match captured {
+            None => Vec::new(),
+            Some(Ok(batches)) => batches
+                .into_iter()
+                .map(|batch| {
+                    self.last = Some(batch.end.clone());
+                    self.publisher.publish(CommittedBatch {
+                        database: self.name.clone(),
+                        batch,
+                    })
+                })
+                .collect(),
+            Some(Err(error)) => {
+                let source = self.fail(error);
+                return Err(DatabaseError::Failed {
+                    name: self.name.clone(),
+                    source,
+                });
+            }
+        };
+        match (autocommit, holds) {
+            (Autocommit::InTransaction, false) => {
+                self.holder = Some(Holder {
+                    session,
+                    deadline: Instant::now() + self.limits.transaction_timeout,
+                });
+            }
+            (Autocommit::On, true) => self.holder = None,
+            _ => {}
+        }
+        Ok((result?, acknowledgements))
+    }
+
+    /// Runs one call of a session that doesn't hold the writer while another session's
+    /// transaction does: a call that only reads, run as a read-only session's.
+    async fn session_read(
+        &mut self,
+        work: SessionWork,
+        interrupt: Interrupt,
+    ) -> Result<SessionRan, DatabaseError> {
+        let SessionWork { call, .. } = work;
+        let result = self
+            .call(move |database| match database.sql_sessions() {
+                Some(sessions) => Ok(sessions.run(&call, SessionAccess::ReadOnly, &interrupt)?),
+                None => Err(EngineError::Unsupported { what: "sessions" }.into()),
+            })
+            .await?;
+        Ok((result, Vec::new()))
+    }
+
+    /// Rolls back the holder's transaction, if a session holds one.
+    async fn end_transaction(&mut self, ending: Ending) {
+        let Some(holder) = self.holder.take() else {
+            return;
+        };
+        match ending {
+            Ending::SessionEnded => {}
+            Ending::TimedOut => {
+                self.expired.insert(holder.session);
+                tracing::warn!(database = %self.name, session = %holder.session, "rolled back a session's transaction open longer than the session limit");
+            }
+            Ending::Closing => {
+                tracing::info!(database = %self.name, session = %holder.session, "rolled back a session's transaction as the database closed");
+            }
+        }
+        let rolled_back = self
+            .call(|database| match database.sql_sessions() {
+                Some(sessions) => Ok(sessions.roll_back()?),
+                None => Ok(()),
+            })
+            .await;
+        if let Err(error) = rolled_back {
+            tracing::error!(database = %self.name, %error, "rolling back a session's transaction failed");
+        }
+    }
+
     async fn call<T: Send + 'static>(
         &mut self,
         call: impl FnOnce(&mut dyn Database) -> Result<T, DatabaseError> + Send + 'static,
@@ -1090,6 +1561,58 @@ impl Actor {
         let source = Arc::new(error);
         self.failed = Some(Arc::clone(&source));
         source
+    }
+}
+
+/// Every transaction committed after `last`, as one batch each, in commit order: the batches a
+/// session's call publishes, so that each transaction is replicated and acknowledged as an
+/// `Execute`'s is. `None` for an engine that replicates itself.
+fn capture_each(
+    database: &mut dyn Database,
+    engine: &dyn DatabaseEngine,
+    last: Option<Position>,
+) -> Option<Result<Vec<FrameBatch>, EngineError>> {
+    let DatabaseCapability::FrameSource(frames) = database.capability() else {
+        return None;
+    };
+    let captured = (|| {
+        let Some(batch) = frames.committed_since(last.as_ref())? else {
+            return Ok(Vec::new());
+        };
+        let EngineCapability::FrameSource(source) = engine.capability() else {
+            return Ok(vec![batch]);
+        };
+        let transactions = source.transactions(&batch)?;
+        if transactions.len() <= 1 {
+            return Ok(vec![batch]);
+        }
+        let mut batches = Vec::with_capacity(transactions.len());
+        let mut after = last;
+        for transaction in transactions {
+            if let Some(one) = frames.committed_between(after.as_ref(), &transaction.end)? {
+                batches.push(one);
+            }
+            after = Some(transaction.end);
+        }
+        Ok(batches)
+    })();
+    Some(captured)
+}
+
+/// Waits until `deadline`, or forever without one.
+async fn expiry(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next request in `mailbox`, or `None` once it closes or, with `idle`, stays empty that
+/// long.
+async fn receive(mailbox: &mut mpsc::Receiver<Request>, idle: Option<Duration>) -> Option<Request> {
+    match idle {
+        Some(idle) => time::timeout(idle, mailbox.recv()).await.ok().flatten(),
+        None => mailbox.recv().await,
     }
 }
 
