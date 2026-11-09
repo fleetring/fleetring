@@ -6,8 +6,12 @@
 //! when the registry evicts it. A database that logical change streams read also records its row
 //! changes from the moment it opens (FR-039).
 //!
-//! A write, a query, or a schema read carries an [`Interrupt`] that stops its statements on the
-//! database's thread (FR-078). The caller's side of the handle raises it: at the request's
+//! A write, a query, a schema read, or a session's call carries an [`Interrupt`] that stops its
+//! statements on the database's thread (FR-078). Before such a request starts, the actor asks its
+//! caller, who may refuse it, as a node does once it no longer serves the database at the
+//! request's lease, and who arms the statement deadline from that moment: time a write spends
+//! waiting for a session's transaction doesn't count against its statements, and a separate,
+//! later bound keeps it from waiting forever ([`StatementLimit`]). The caller's side of the handle raises it: at the request's
 //! deadline, from a `tokio::time` timer, and when the caller stops waiting for the reply, so a
 //! cancelled call frees the database too. The thread only checks the flag, so time never leaves
 //! `tokio::time` and a simulation stays deterministic. Under [`Execution::Inline`] a statement
@@ -75,28 +79,129 @@ pub struct SessionLimits {
     /// A session's transaction open longer than this is rolled back.
     pub transaction_timeout: Duration,
     /// How many writes may wait, per database, for a session's transaction to end; the next is
-    /// refused with [`DatabaseError::Busy`].
+    /// refused with [`DatabaseError::Busy`]. One principal's sessions may take at most half.
     pub max_waiting_writes: usize,
+    /// How many sessions one principal may hold open on a node.
+    pub max_sessions_per_principal: usize,
+    /// How long a session may go without a call before its node ends it.
+    pub idle_timeout: Duration,
 }
 
 impl Default for SessionLimits {
-    /// 30 seconds, and 64 waiting writes.
+    /// 30 seconds, 64 waiting writes, 256 sessions per principal, and 60 seconds idle.
     fn default() -> Self {
         Self {
             transaction_timeout: Duration::from_secs(30),
             max_waiting_writes: 64,
+            max_sessions_per_principal: 256,
+            idle_timeout: Duration::from_secs(60),
         }
     }
 }
 
 /// One call of a SQL session, as the actor runs it.
-#[derive(Debug)]
-pub(crate) struct SessionWork {
-    pub(crate) session: SessionId,
-    pub(crate) call: SessionCall,
-    pub(crate) access: SessionAccess,
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTurn {
+    session: SessionId,
+    /// Who opened the session: the principal its token or certificate names.
+    principal: String,
+    call: SessionCall,
+    access: SessionAccess,
     /// Whether the session thinks it is in a transaction, from its last call's answer.
-    pub(crate) holding: Autocommit,
+    holding: Autocommit,
+}
+
+impl SessionTurn {
+    /// Call `call` of session `session`, which `principal` opened with `access`; `holding` is
+    /// whether the session thinks it is in a transaction, from its last call's answer.
+    #[must_use]
+    pub fn new(
+        session: SessionId,
+        principal: impl Into<String>,
+        call: SessionCall,
+        access: SessionAccess,
+        holding: Autocommit,
+    ) -> Self {
+        Self {
+            session,
+            principal: principal.into(),
+            call,
+            access,
+            holding,
+        }
+    }
+}
+
+/// How long a request's statements may run (FR-078): for `budget` once the request starts, and
+/// never past `latest`, which also bounds how long it may wait to start, in the mailbox or behind
+/// a session's transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatementLimit {
+    /// How long the statements may run once the request starts.
+    pub budget: Duration,
+    /// When the statements stop, however soon the request started; a request still waiting
+    /// then never runs.
+    pub latest: Instant,
+}
+
+impl StatementLimit {
+    /// Statements stop at `deadline`, wherever the time went.
+    #[must_use]
+    pub fn until(deadline: Instant) -> Self {
+        Self {
+            budget: Duration::MAX,
+            latest: deadline,
+        }
+    }
+
+    /// When statements that start at `started` stop.
+    fn deadline(self, started: Instant) -> Instant {
+        started
+            .checked_add(self.budget)
+            .map_or(self.latest, |end| end.min(self.latest))
+    }
+}
+
+/// What admits a request when it starts, and keeps it admitted while it runs (a drain waits for
+/// it), or `None` to refuse it, which then never runs.
+pub(crate) type Admit<'a> = Box<dyn FnOnce() -> Option<Admission<'a>> + Send + 'a>;
+
+/// What keeps a started request admitted: dropped once its write is in replication's hands.
+pub(crate) type Admission<'a> = Box<dyn Send + 'a>;
+
+/// What a caller hands the actor with a request: its interrupt, and its say on starting it.
+pub(crate) struct Ticket {
+    interrupt: Interrupt,
+    /// Asked, with where to answer, right before the request starts.
+    start: Option<oneshot::Sender<oneshot::Sender<bool>>>,
+}
+
+impl fmt::Debug for Ticket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ticket")
+            .field("interrupt", &self.interrupt)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Ticket {
+    /// Asks the caller whether the request may start now, and returns its interrupt if it may,
+    /// or why not: the caller has gone or refused it, or its interrupt is raised.
+    async fn start(mut self, name: &DatabaseName) -> Result<Interrupt, DatabaseError> {
+        let refused = |interrupt: &Interrupt| match interrupt.raised() {
+            Some(why) => DatabaseError::Engine(EngineError::Interrupted(why)),
+            None => DatabaseError::NotAdmitted { name: name.clone() },
+        };
+        let Some(start) = self.start.take() else {
+            return Ok(self.interrupt);
+        };
+        let (go, decision) = oneshot::channel();
+        if start.send(go).is_err() || !decision.await.unwrap_or(false) {
+            // A caller that has gone raised the interrupt as it went.
+            return Err(refused(&self.interrupt));
+        }
+        Ok(self.interrupt)
+    }
 }
 
 /// A session call that ran, with the acknowledgements of the transactions it committed, in
@@ -108,11 +213,11 @@ pub(crate) enum Request {
     Ready(Reply<()>),
     Execute(
         Transaction,
-        Interrupt,
+        Ticket,
         Reply<(Executed, Option<Acknowledgement>)>,
     ),
-    Query(Statement, Interrupt, Reply<Rows>),
-    Schema(SchemaRequest, Interrupt, Reply<Schema>),
+    Query(Statement, Ticket, Reply<Rows>),
+    Schema(SchemaRequest, Ticket, Reply<Schema>),
     Position(Reply<Option<Position>>),
     CommittedSince(Option<Position>, Reply<Option<FrameBatch>>),
     CommittedBetween(Option<Position>, Position, Reply<Option<FrameBatch>>),
@@ -131,7 +236,7 @@ pub(crate) enum Request {
     PinSnapshot(Reply<PinnedSnapshot>),
     PinSnapshotAt(Option<Position>, Reply<PinnedSnapshot>),
     ReplicaPositions(Reply<Vec<ReplicaPosition>>),
-    SessionCall(SessionWork, Interrupt, Reply<SessionRan>),
+    SessionCall(SessionTurn, Ticket, Reply<SessionRan>),
     SessionEnd(SessionId, Reply<()>),
 }
 
@@ -308,6 +413,13 @@ pub enum DatabaseError {
     /// never ran.
     #[error("database {name} no longer holds the session's transaction; it was rolled back")]
     TransactionLost {
+        /// The database.
+        name: DatabaseName,
+    },
+    /// The caller refused the request when it was about to start, because the node no longer
+    /// serves the database at the request's lease; it never ran.
+    #[error("database {name} is no longer served here; retry")]
+    NotAdmitted {
         /// The database.
         name: DatabaseName,
     },
@@ -679,21 +791,25 @@ impl DatabaseHandle {
     /// `deadline` or once this future is dropped (FR-078), and returns once the transactions it
     /// committed are in replication's hands. `holding` is whether the session thinks it is in a
     /// transaction, from its last call's answer.
-    pub(crate) async fn session_call_reserved(
+    pub(crate) async fn session_call_reserved<'a>(
         &self,
         permit: mpsc::Permit<'_, Request>,
-        work: SessionWork,
-        deadline: Option<Instant>,
-    ) -> Result<SessionPublished, DatabaseError> {
-        let (result, acknowledgements) = self
-            .interruptible(permit, deadline, |interrupt, reply| {
-                Request::SessionCall(work, interrupt, reply)
+        work: SessionTurn,
+        limit: Option<StatementLimit>,
+        admit: Admit<'a>,
+    ) -> Result<(SessionPublished, Option<Admission<'a>>), DatabaseError> {
+        let ((result, acknowledgements), admission) = self
+            .interruptible(permit, limit, admit, |ticket, reply| {
+                Request::SessionCall(work, ticket, reply)
             })
             .await?;
-        Ok(SessionPublished {
-            result,
-            acknowledgements,
-        })
+        Ok((
+            SessionPublished {
+                result,
+                acknowledgements,
+            },
+            admission,
+        ))
     }
 
     /// Ends SQL session `session` here: rolls back the transaction it holds, if any.
@@ -715,32 +831,37 @@ impl DatabaseHandle {
         &self,
         permit: mpsc::Permit<'_, Request>,
         transaction: Transaction,
-        deadline: Option<Instant>,
+        limit: Option<StatementLimit>,
     ) -> Result<Stored, DatabaseError> {
-        self.commit_reserved(permit, transaction, deadline)
-            .await?
-            .stored()
-            .await
+        let (published, _) = self
+            .commit_reserved(permit, transaction, limit, Box::new(|| Some(Box::new(()))))
+            .await?;
+        published.stored().await
     }
 
-    /// Runs `transaction`, stopping its statements at `deadline` or once this future is
-    /// dropped, and returns once its batch, if it committed one, is in replication's hands,
-    /// without waiting for the acknowledgement.
-    pub(crate) async fn commit_reserved(
+    /// Runs `transaction`, admitted by `admit` when it starts, stopping its statements at
+    /// `limit` or once this future is dropped, and returns once its batch, if it committed one,
+    /// is in replication's hands, without waiting for the acknowledgement, with what keeps it
+    /// admitted.
+    pub(crate) async fn commit_reserved<'a>(
         &self,
         permit: mpsc::Permit<'_, Request>,
         transaction: Transaction,
-        deadline: Option<Instant>,
-    ) -> Result<Published, DatabaseError> {
-        let (executed, acknowledgement) = self
-            .interruptible(permit, deadline, |interrupt, reply| {
-                Request::Execute(transaction, interrupt, reply)
+        limit: Option<StatementLimit>,
+        admit: Admit<'a>,
+    ) -> Result<(Published, Option<Admission<'a>>), DatabaseError> {
+        let ((executed, acknowledgement), admission) = self
+            .interruptible(permit, limit, admit, |ticket, reply| {
+                Request::Execute(transaction, ticket, reply)
             })
             .await?;
-        Ok(Published {
-            executed,
-            acknowledgement,
-        })
+        Ok((
+            Published {
+                executed,
+                acknowledgement,
+            },
+            admission,
+        ))
     }
 
     /// Runs `statement`, stopping it at `deadline` or once this future is dropped.
@@ -750,10 +871,16 @@ impl DatabaseHandle {
         statement: Statement,
         deadline: Option<Instant>,
     ) -> Result<Rows, DatabaseError> {
-        self.interruptible(permit, deadline, |interrupt, reply| {
-            Request::Query(statement, interrupt, reply)
-        })
-        .await
+        let limit = deadline.map(StatementLimit::until);
+        let (rows, _) = self
+            .interruptible(
+                permit,
+                limit,
+                Box::new(|| Some(Box::new(()))),
+                |ticket, reply| Request::Query(statement, ticket, reply),
+            )
+            .await?;
+        Ok(rows)
     }
 
     /// Reads the schema, stopping at `deadline` or once this future is dropped.
@@ -763,46 +890,88 @@ impl DatabaseHandle {
         request: SchemaRequest,
         deadline: Option<Instant>,
     ) -> Result<Schema, DatabaseError> {
-        self.interruptible(permit, deadline, |interrupt, reply| {
-            Request::Schema(request, interrupt, reply)
-        })
-        .await
+        let limit = deadline.map(StatementLimit::until);
+        let (schema, _) = self
+            .interruptible(
+                permit,
+                limit,
+                Box::new(|| Some(Box::new(()))),
+                |ticket, reply| Request::Schema(request, ticket, reply),
+            )
+            .await?;
+        Ok(schema)
     }
 
     /// Sends the request `request` makes with a fresh [`Interrupt`], and waits for its reply.
     ///
-    /// The interrupt is raised with [`Interruption::Deadline`] once `deadline` passes, by a
-    /// `tokio::time` timer, and with [`Interruption::Cancelled`] if this future is dropped before
-    /// the reply arrives, because its caller stopped waiting. Either way the reply that follows
-    /// says what happened: a statement that finished first keeps its result.
-    async fn interruptible<T>(
+    /// Right before the request starts, the actor asks: `admit` then admits it, or refuses it,
+    /// and it never runs. Its statements then stop at `limit`, counted from that moment: a
+    /// `tokio::time` timer raises the interrupt with [`Interruption::Deadline`]. A request that
+    /// waits past `limit.latest` to start is refused. The interrupt is raised with
+    /// [`Interruption::Cancelled`] if this future is dropped before the reply arrives, because
+    /// its caller stopped waiting. Either way the reply that follows says what happened: a
+    /// statement that finished first keeps its result.
+    async fn interruptible<'a, T>(
         &self,
         permit: mpsc::Permit<'_, Request>,
-        deadline: Option<Instant>,
-        request: impl FnOnce(Interrupt, Reply<T>) -> Request,
-    ) -> Result<T, DatabaseError> {
+        limit: Option<StatementLimit>,
+        admit: Admit<'a>,
+        request: impl FnOnce(Ticket, Reply<T>) -> Request,
+    ) -> Result<(T, Option<Admission<'a>>), DatabaseError> {
         let interrupt = Interrupt::new();
         // A deadline already past stops the request before it starts, even where the
         // database's calls run inline, so that the timer below can't fire first.
-        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        if limit.is_some_and(|limit| limit.latest <= Instant::now()) {
             interrupt.raise(Interruption::Deadline);
         }
         let (reply, mut result) = oneshot::channel();
-        permit.send(request(interrupt.clone(), reply));
+        let (start, mut starting) = oneshot::channel();
+        let ticket = Ticket {
+            interrupt: interrupt.clone(),
+            start: Some(start),
+        };
+        permit.send(request(ticket, reply));
         // Raised if this future is dropped before the reply arrives: the caller stopped waiting.
         let cancel_on_drop = RaiseOnDrop::new(&interrupt);
-        if let Some(deadline) = deadline {
+        // Waiting to start, at most until the limit's latest moment.
+        let mut waiting_until = limit.map(|limit| limit.latest);
+        let go = loop {
             tokio::select! {
                 replied = &mut result => {
                     cancel_on_drop.disarm();
-                    return self.replied(replied);
+                    return self.replied(replied).map(|answer| (answer, None));
                 }
-                () = time::sleep_until(deadline) => interrupt.raise(Interruption::Deadline),
+                go = &mut starting => break go.ok(),
+                () = expiry(waiting_until) => {
+                    interrupt.raise(Interruption::Deadline);
+                    waiting_until = None;
+                }
+            }
+        };
+        let mut admission = None;
+        if let Some(go) = go {
+            let admitted = if interrupt.raised().is_some() {
+                None
+            } else {
+                admit()
+            };
+            let started = admitted.is_some();
+            admission = admitted;
+            let _ = go.send(started);
+            if let (true, Some(limit)) = (started, limit) {
+                let deadline = limit.deadline(Instant::now());
+                tokio::select! {
+                    replied = &mut result => {
+                        cancel_on_drop.disarm();
+                        return self.replied(replied).map(|answer| (answer, admission));
+                    }
+                    () = time::sleep_until(deadline) => interrupt.raise(Interruption::Deadline),
+                }
             }
         }
         let replied = result.await;
         cancel_on_drop.disarm();
-        self.replied(replied)
+        self.replied(replied).map(|answer| (answer, admission))
     }
 
     async fn call<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, DatabaseError> {
@@ -1109,13 +1278,31 @@ impl Actor {
 
     /// Queues `request` until the holder's transaction ends, or refuses it if as many writes as
     /// may wait already do.
+    ///
+    /// One principal's sessions may take at most half the places, so that a principal re-queuing
+    /// `BEGIN` from many sessions can't keep everyone else's writes out.
     fn wait(&mut self, request: Request) {
-        if self.waiting.len() < self.limits.max_waiting_writes {
-            self.waiting.push_back(request);
-        } else {
+        let full = self.waiting.len() >= self.limits.max_waiting_writes;
+        let over_share = match &request {
+            Request::SessionCall(turn, _, _) => {
+                let share = (self.limits.max_waiting_writes / 2).max(1);
+                let queued = self
+                    .waiting
+                    .iter()
+                    .filter(|waiting| {
+                        matches!(waiting, Request::SessionCall(other, _, _) if other.principal == turn.principal)
+                    })
+                    .count();
+                queued >= share
+            }
+            _ => false,
+        };
+        if full || over_share {
             request.fail(DatabaseError::Busy {
                 name: self.name.clone(),
             });
+        } else {
+            self.waiting.push_back(request);
         }
     }
 
@@ -1125,10 +1312,10 @@ impl Actor {
             return;
         }
         match request {
-            Request::SessionCall(work, interrupt, reply) => {
+            Request::SessionCall(work, ticket, reply) => {
                 let other = self.holder.filter(|holder| holder.session != work.session);
                 if other.is_none() {
-                    let result = self.session_call(work, interrupt).await;
+                    let result = self.session_call(work, ticket).await;
                     let _ = reply.send(result);
                     return;
                 }
@@ -1139,7 +1326,7 @@ impl Actor {
                 // A read-only session never needs the writer: it runs now, and the engine
                 // refuses whatever it may not run.
                 if work.access == SessionAccess::ReadOnly {
-                    let result = self.session_read(work, interrupt).await;
+                    let result = self.session_read(work, ticket).await;
                     let _ = reply.send(result);
                     return;
                 }
@@ -1154,11 +1341,11 @@ impl Actor {
                     .await;
                 match intent {
                     Ok(WriteIntent::ReadOnly) => {
-                        let result = self.session_read(work, interrupt).await;
+                        let result = self.session_read(work, ticket).await;
                         let _ = reply.send(result);
                     }
                     Ok(WriteIntent::MayWrite) => {
-                        self.wait(Request::SessionCall(work, interrupt, reply));
+                        self.wait(Request::SessionCall(work, ticket, reply));
                     }
                     Err(error) => {
                         let _ = reply.send(Err(error));
@@ -1175,20 +1362,28 @@ impl Actor {
             Request::Ready(reply) => {
                 let _ = reply.send(Ok(()));
             }
-            Request::Execute(transaction, interrupt, reply) => {
-                let result = self.execute(transaction, interrupt).await;
+            Request::Execute(transaction, ticket, reply) => {
+                let result = self.execute(transaction, ticket).await;
                 let _ = reply.send(result);
             }
-            Request::Query(statement, interrupt, reply) => {
-                let result = self
-                    .call(move |database| Ok(database.query(&statement, &interrupt)?))
-                    .await;
+            Request::Query(statement, ticket, reply) => {
+                let result = match ticket.start(&self.name).await {
+                    Ok(interrupt) => {
+                        self.call(move |database| Ok(database.query(&statement, &interrupt)?))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
-            Request::Schema(request, interrupt, reply) => {
-                let result = self
-                    .call(move |database| Ok(database.schema(&request, &interrupt)?))
-                    .await;
+            Request::Schema(request, ticket, reply) => {
+                let result = match ticket.start(&self.name).await {
+                    Ok(interrupt) => {
+                        self.call(move |database| Ok(database.schema(&request, &interrupt)?))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Request::Position(reply) => {
@@ -1325,7 +1520,7 @@ impl Actor {
     async fn execute(
         &mut self,
         transaction: Transaction,
-        interrupt: Interrupt,
+        ticket: Ticket,
     ) -> Result<(Executed, Option<Acknowledgement>), DatabaseError> {
         if let Some(source) = &self.failed {
             return Err(DatabaseError::Failed {
@@ -1333,6 +1528,7 @@ impl Actor {
                 source: Arc::clone(source),
             });
         }
+        let interrupt = ticket.start(&self.name).await?;
         // Refused here, nothing runs: the engine never sees the transaction.
         self.publisher
             .admit(&self.name)
@@ -1401,14 +1597,15 @@ impl Actor {
     /// captures and publishes each transaction it committed.
     async fn session_call(
         &mut self,
-        work: SessionWork,
-        interrupt: Interrupt,
+        work: SessionTurn,
+        ticket: Ticket,
     ) -> Result<SessionRan, DatabaseError> {
-        let SessionWork {
+        let SessionTurn {
             session,
             call,
             access,
             holding,
+            ..
         } = work;
         if let Some(source) = &self.failed {
             return Err(DatabaseError::Failed {
@@ -1439,6 +1636,7 @@ impl Actor {
                     })?;
             }
         }
+        let interrupt = ticket.start(&self.name).await?;
         let last = self.last.clone();
         let engine = Arc::clone(&self.engine);
         let outcome = self
@@ -1504,10 +1702,11 @@ impl Actor {
     /// transaction does: a call that only reads, run as a read-only session's.
     async fn session_read(
         &mut self,
-        work: SessionWork,
-        interrupt: Interrupt,
+        work: SessionTurn,
+        ticket: Ticket,
     ) -> Result<SessionRan, DatabaseError> {
-        let SessionWork { call, .. } = work;
+        let SessionTurn { call, .. } = work;
+        let interrupt = ticket.start(&self.name).await?;
         let result = self
             .call(move |database| match database.sql_sessions() {
                 Some(sessions) => Ok(sessions.run(&call, SessionAccess::ReadOnly, &interrupt)?),

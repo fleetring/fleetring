@@ -18,6 +18,7 @@ use fleetring_proto::v1::{
 use tokio::time::Instant;
 use tonic::{Code, Request, Response, Status};
 
+use crate::actor::{Admission, Admit};
 use crate::auth::{Action, authorized, require_database};
 use crate::changes::MarkHome;
 use crate::data::convert::{
@@ -30,7 +31,7 @@ use crate::data::watch::{self, ChangeStream};
 use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Interruption, Position, Transaction};
 use crate::observe::DataMetrics;
-use crate::{Acknowledged, DatabaseError, DatabaseStatuses};
+use crate::{Acknowledged, DatabaseError, DatabaseStatuses, StatementLimit};
 
 /// The `Database` service: runs requests for databases this node is primary for, and redirects
 /// the rest (see [`not_primary`](fleetring_client::redirect::not_primary)).
@@ -50,21 +51,37 @@ impl DatabaseService {
         statement_deadline(request, self.node.statement_timeout())
     }
 
+    /// How long the write `request` carries may run, and wait: see [`write_limit`].
+    fn write_limit<T>(&self, request: &Request<T>) -> StatementLimit {
+        write_limit(
+            request,
+            self.node.statement_timeout(),
+            self.node.registry().session_limits().transaction_timeout,
+        )
+    }
+
     async fn run_execute(
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
-        let deadline = self.deadline(&request);
+        let limit = self.write_limit(&request);
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let request = request.into_inner();
         let statement = statement(request.sql, request.params)?;
-        let admitted = self.node.route(&name).await?;
-        let lease = admitted.lease();
-        let published = self
+        let lease = self.node.route(&name).await?.lease();
+        // Admitted again as it starts, under the same lease: a write that waits behind a SQL
+        // session's transaction never holds up a drain while it waits.
+        let node = &self.node;
+        let admitting = name.clone();
+        let admit: Admit<'_> = Box::new(move || {
+            node.admit_now(&admitting, lease.epoch)
+                .map(|admitted| Box::new(admitted) as Admission<'_>)
+        });
+        let (published, admitted) = self
             .node
             .registry()
-            .commit_until(&name, Transaction::from(statement), Some(deadline))
+            .commit_until(&name, Transaction::from(statement), Some(limit), admit)
             .await
             .map_err(|error| database_status(&error))?;
         // The write is in the database's log now, so a drain may step down: it ships the tail,
@@ -161,6 +178,41 @@ fn statement_deadline<T>(request: &Request<T>, limit: Duration) -> Instant {
     // A limit too large for the clock means no limit worth keeping: a year stands in for it.
     now.checked_add(timeout)
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+/// How long the write `request` carries may run, and wait to start (FR-078, ADR-0037).
+///
+/// Without a deadline of the call's own, its statements may run for `limit`, the node's
+/// statement timeout, from when the write starts, and it may wait to start for as long as a SQL
+/// session's transaction may hold the writer, `transaction`, besides: a write queued behind a
+/// transaction of full length still gets its whole statement time. With one, the call's own
+/// deadline less its margin (see [`statement_deadline`]) bounds both.
+fn write_limit<T>(request: &Request<T>, limit: Duration, transaction: Duration) -> StatementLimit {
+    let now = Instant::now();
+    let far = |timeout: Duration| {
+        now.checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+    };
+    match asked(request) {
+        Some(asked) => StatementLimit {
+            budget: asked.min(limit),
+            latest: far(asked),
+        },
+        None => StatementLimit {
+            budget: limit,
+            latest: far(limit.saturating_add(transaction)),
+        },
+    }
+}
+
+/// The time a call's own `grpc-timeout` gives its statement, less the margin, if it set one.
+fn asked<T>(request: &Request<T>) -> Option<Duration> {
+    request
+        .metadata()
+        .get(GRPC_TIMEOUT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(grpc_timeout)
+        .map(|asked| asked.saturating_sub((asked / 10).min(DEADLINE_MARGIN)))
 }
 
 /// The header a gRPC client sends its call's timeout in.
@@ -273,6 +325,7 @@ pub(crate) fn database_status(error: &DatabaseError) -> Status {
             Status::aborted(message)
         }
         DatabaseError::NoSessions { .. } => Status::failed_precondition(message),
+        DatabaseError::NotAdmitted { .. } => Status::unavailable(message),
         DatabaseError::Interrupted { .. } | DatabaseError::Replication(_) => {
             Status::aborted(message)
         }
@@ -739,6 +792,30 @@ mod tests {
         ] {
             assert_eq!(grpc_timeout(malformed), None, "{malformed:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_may_wait_for_a_session_transaction_besides_its_statement_time() {
+        let limit = Duration::from_secs(30);
+        let transaction = Duration::from_secs(30);
+        let now = Instant::now();
+        let mut request = Request::new(());
+        assert_eq!(
+            write_limit(&request, limit, transaction),
+            StatementLimit {
+                budget: limit,
+                latest: now + limit + transaction,
+            }
+        );
+        // A call's own deadline bounds the wait and the statement both.
+        request.set_timeout(Duration::from_millis(1_500));
+        assert_eq!(
+            write_limit(&request, limit, transaction),
+            StatementLimit {
+                budget: Duration::from_millis(1_400),
+                latest: now + Duration::from_millis(1_400),
+            }
+        );
     }
 
     #[tokio::test(start_paused = true)]

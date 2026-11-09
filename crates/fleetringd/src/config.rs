@@ -167,19 +167,34 @@ const DEFAULT_TRANSACTION_TIMEOUT: NonZeroU64 = NonZeroU64::new(30_000).expect("
 /// max_waiting_writes` says otherwise.
 const DEFAULT_MAX_WAITING_WRITES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is nonzero");
 
+/// How many SQL sessions one principal may hold open on a node, unless `[sessions]
+/// max_sessions_per_principal` says otherwise.
+const DEFAULT_MAX_SESSIONS_PER_PRINCIPAL: NonZeroUsize =
+    NonZeroUsize::new(256).expect("256 is nonzero");
+
+/// How long a SQL session may go without a call, unless `[sessions] idle_timeout_ms` says
+/// otherwise: 60 seconds, longer than a transaction may stay open between calls.
+const DEFAULT_SESSION_IDLE_TIMEOUT: NonZeroU64 = NonZeroU64::new(60_000).expect("nonzero");
+
 /// The `[sessions]` table: how SQL sessions, the router's Hrana streams on a primary, may hold a
 /// database's writer (ADR-0037, point 14). New in 0.8.0.
 ///
 /// ```toml
 /// [sessions]
-/// transaction_timeout_ms = 30000   # a session transaction open longer is rolled back
-/// max_waiting_writes = 64          # writes queued behind an open transaction, per database
+/// transaction_timeout_ms = 30000      # a session transaction open longer is rolled back
+/// max_waiting_writes = 64             # writes queued behind an open transaction, per database
+/// max_sessions_per_principal = 256    # sessions one principal may hold open on this node
+/// idle_timeout_ms = 60000             # a session with no call for this long is ended
 /// ```
 ///
 /// While a session's transaction is open, other writes to its database wait, and reads go on. A
-/// write past `max_waiting_writes` is refused with `RESOURCE_EXHAUSTED`, and never runs. A
-/// transaction open longer than `transaction_timeout_ms` is rolled back, and its session's next
-/// call fails, so a client that walks away can't hold a database.
+/// write past `max_waiting_writes` is refused with `RESOURCE_EXHAUSTED`, and never runs; one
+/// principal's sessions may take at most half the places. A transaction open longer than
+/// `transaction_timeout_ms` is rolled back, and its session's next call fails, so a client that
+/// walks away can't hold a database. A write's statement time, `[limits] statement_timeout_ms`,
+/// counts from when it starts, after any wait behind a transaction, and it may wait for up to
+/// `transaction_timeout_ms` besides. A principal past `max_sessions_per_principal` open sessions
+/// gets `RESOURCE_EXHAUSTED`; a forwarded token's sessions count as its own principal's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionsConfig {
@@ -187,6 +202,10 @@ pub struct SessionsConfig {
     pub transaction_timeout_ms: NonZeroU64,
     /// How many writes may wait for a session's transaction, per database. At least 1.
     pub max_waiting_writes: NonZeroUsize,
+    /// How many sessions one principal may hold open on this node. At least 1.
+    pub max_sessions_per_principal: NonZeroUsize,
+    /// How long a session may go without a call before the node ends it, in milliseconds.
+    pub idle_timeout_ms: NonZeroU64,
 }
 
 impl SessionsConfig {
@@ -196,6 +215,8 @@ impl SessionsConfig {
         SessionLimits {
             transaction_timeout: Duration::from_millis(self.transaction_timeout_ms.get()),
             max_waiting_writes: self.max_waiting_writes.get(),
+            max_sessions_per_principal: self.max_sessions_per_principal.get(),
+            idle_timeout: Duration::from_millis(self.idle_timeout_ms.get()),
         }
     }
 }
@@ -205,6 +226,8 @@ impl Default for SessionsConfig {
         Self {
             transaction_timeout_ms: DEFAULT_TRANSACTION_TIMEOUT,
             max_waiting_writes: DEFAULT_MAX_WAITING_WRITES,
+            max_sessions_per_principal: DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
+            idle_timeout_ms: DEFAULT_SESSION_IDLE_TIMEOUT,
         }
     }
 }
@@ -1147,6 +1170,8 @@ mod tests {
             SessionLimits {
                 transaction_timeout: Duration::from_secs(30),
                 max_waiting_writes: 64,
+                max_sessions_per_principal: 256,
+                idle_timeout: Duration::from_secs(60),
             }
         );
         let set = with("\n[sessions]\ntransaction_timeout_ms = 500\nmax_waiting_writes = 2\n")
@@ -1156,6 +1181,7 @@ mod tests {
             SessionLimits {
                 transaction_timeout: Duration::from_millis(500),
                 max_waiting_writes: 2,
+                ..SessionLimits::default()
             }
         );
         let zero = with("\n[sessions]\nmax_waiting_writes = 0\n").expect_err("zero writes");

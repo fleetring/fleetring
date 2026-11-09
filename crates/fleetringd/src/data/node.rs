@@ -141,6 +141,8 @@ pub(super) struct Inner {
     last_session: AtomicU64,
     /// How many SQL sessions are open.
     open_sessions: Arc<AtomicUsize>,
+    /// How many SQL sessions each principal holds open; a principal with none has no entry.
+    principal_sessions: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 /// One open SQL session's place on its node, given back when dropped.
@@ -148,6 +150,8 @@ pub(super) struct Inner {
 pub(crate) struct SessionTicket {
     id: SessionId,
     open: Arc<AtomicUsize>,
+    principal: String,
+    by_principal: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 impl SessionTicket {
@@ -160,6 +164,16 @@ impl SessionTicket {
 impl Drop for SessionTicket {
     fn drop(&mut self) {
         self.open.fetch_sub(1, Ordering::Relaxed);
+        let mut counts = self
+            .by_principal
+            .lock()
+            .expect("session counts lock poisoned");
+        if let Some(count) = counts.get_mut(&self.principal) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.principal);
+            }
+        }
     }
 }
 
@@ -301,19 +315,49 @@ impl DataNode {
                 metrics,
                 last_session: AtomicU64::new(0),
                 open_sessions: Arc::new(AtomicUsize::new(0)),
+                principal_sessions: Arc::default(),
             }),
         }
     }
 
-    /// A place for one more SQL session, with a new ID.
+    /// A place for one more SQL session of `principal`'s, with a new ID.
     ///
     /// # Errors
     ///
-    /// `RESOURCE_EXHAUSTED` if the node holds [`MAX_SESSIONS`] already.
-    pub(crate) fn open_session(&self) -> Result<SessionTicket, Status> {
+    /// `RESOURCE_EXHAUSTED` if `principal` holds `[sessions] max_sessions_per_principal`
+    /// sessions here already, or the node holds [`MAX_SESSIONS`].
+    pub(crate) fn open_session(&self, principal: &str) -> Result<SessionTicket, Status> {
+        let cap = self.registry().session_limits().max_sessions_per_principal;
+        {
+            let mut counts = self
+                .inner
+                .principal_sessions
+                .lock()
+                .expect("session counts lock poisoned");
+            let count = counts.entry(principal.to_owned()).or_default();
+            if *count >= cap {
+                return Err(Status::resource_exhausted(format!(
+                    "{principal} holds {cap} sessions on node {} already, as many as one \
+                     principal may ([sessions] max_sessions_per_principal); close one first",
+                    self.inner.id
+                )));
+            }
+            *count += 1;
+        }
+        let by_principal = Arc::clone(&self.inner.principal_sessions);
+        let release = |by_principal: &Mutex<BTreeMap<String, usize>>| {
+            let mut counts = by_principal.lock().expect("session counts lock poisoned");
+            if let Some(count) = counts.get_mut(principal) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(principal);
+                }
+            }
+        };
         let open = Arc::clone(&self.inner.open_sessions);
         if open.fetch_add(1, Ordering::Relaxed) >= MAX_SESSIONS {
             open.fetch_sub(1, Ordering::Relaxed);
+            release(&by_principal);
             return Err(Status::resource_exhausted(format!(
                 "node {} holds {MAX_SESSIONS} sessions already; retry later",
                 self.inner.id
@@ -323,6 +367,8 @@ impl DataNode {
         Ok(SessionTicket {
             id: SessionId::new(id),
             open,
+            principal: principal.to_owned(),
+            by_principal,
         })
     }
 
@@ -615,6 +661,14 @@ impl DataNode {
             Some(primary) => Err(redirect(name, &placement, primary)),
             None => Err(no_primary(name, &placement)),
         }
+    }
+
+    /// Admits a request for `name` right as it starts, if this node still holds the lease at
+    /// `epoch` and isn't handing it over: a request that waited is admitted only then, so that it
+    /// never holds up a drain while it waits.
+    pub(crate) fn admit_now(&self, name: &DatabaseName, epoch: LeaseEpoch) -> Option<Admitted<'_>> {
+        let lease = self.held(name).filter(|lease| lease.epoch == epoch)?;
+        self.admit(name, lease).ok()
     }
 
     /// Admits a request for `name` under `lease`, unless the lease is being handed over. The
