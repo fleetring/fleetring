@@ -35,10 +35,6 @@ const MAX_RESENDS: usize = 3;
 /// The code a node gives a commit no write quorum acknowledged.
 const UNACKNOWLEDGED: &str = "FLEETRING_UNACKNOWLEDGED";
 
-/// The most bytes of rows one response carries, over all its requests: a node bounds one call's
-/// rows at half of it, and this bounds a pipeline of many.
-const MAX_RESPONSE_BYTES: usize = 2 * crate::engine::MAX_RESULT_BYTES;
-
 /// What the last call that committed reports, for the response's `fleetring-*` headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Committed {
@@ -78,6 +74,7 @@ impl From<StreamRefusal> for Refused {
             StreamRefusal::Expired | StreamRefusal::Invalid(_) => StatusCode::BAD_REQUEST,
             StreamRefusal::Forbidden(_) => StatusCode::FORBIDDEN,
             StreamRefusal::Full => StatusCode::SERVICE_UNAVAILABLE,
+            StreamRefusal::PrincipalFull(_) => StatusCode::TOO_MANY_REQUESTS,
         };
         Self {
             status,
@@ -103,7 +100,7 @@ pub(crate) async fn pipeline(
     check_size(context, statements)?;
     let mut stream = stream_for(context, request.baton.as_deref(), caller, target)?;
     let mut committed = None;
-    let mut budget = MAX_RESPONSE_BYTES;
+    let mut budget = context.config.streams.max_response_bytes.get();
     let mut results = Vec::with_capacity(request.requests.len());
     for request in request.requests {
         let ran = if stream.closed {
@@ -150,7 +147,7 @@ pub(crate) async fn cursor(
     check_size(context, request.batch.steps.len())?;
     let mut stream = stream_for(context, request.baton.as_deref(), caller, target)?;
     let mut committed = None;
-    let mut budget = MAX_RESPONSE_BYTES;
+    let mut budget = context.config.streams.max_response_bytes.get();
     let entries = if stream.closed {
         vec![CursorEntry::Error {
             error: Error::new(code::PROTOCOL_ERROR, "the stream is closed"),
@@ -452,18 +449,8 @@ impl Run<'_> {
                         return Err(self.break_with(hrana::error(failed.clone())));
                     }
                     _ => {
-                        let size = rows_size(&result);
-                        if size > *self.budget && result.commit.is_none() {
-                            // It ran, but read too much for one response to carry.
-                            return Err(Error::new(
-                                crate::engine::RESULT_TOO_LARGE,
-                                format!(
-                                    "the response's rows would exceed {MAX_RESPONSE_BYTES} \
-                                     bytes; read them in smaller pieces"
-                                ),
-                            ));
-                        }
-                        *self.budget = self.budget.saturating_sub(size);
+                        // It ran: the stream is in whatever transaction state it left, and what
+                        // it committed is committed, whether or not its rows fit the response.
                         self.stream.autocommit = if result.autocommit {
                             Autocommit::On
                         } else {
@@ -477,6 +464,20 @@ impl Run<'_> {
                                 replicas: commit.replicas,
                             });
                         }
+                        let size = rows_size(&result);
+                        if size > *self.budget && result.commit.is_none() {
+                            // It read too much for one response to carry. The stream goes on as
+                            // the call left it, so a transaction it is in stays open.
+                            let max = self.context.config.streams.max_response_bytes.get();
+                            return Err(Error::new(
+                                crate::engine::RESULT_TOO_LARGE,
+                                format!(
+                                    "the response's rows would exceed {max} bytes; read them in \
+                                     smaller pieces"
+                                ),
+                            ));
+                        }
+                        *self.budget = self.budget.saturating_sub(size);
                         return Ok(result);
                     }
                 },

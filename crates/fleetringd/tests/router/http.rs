@@ -681,3 +681,134 @@ async fn the_host_form_and_percent_encoded_names_route() -> TestResult {
     fleet.stop().await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_principal_hits_its_stream_cap_while_another_still_opens() -> TestResult {
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        router_tables: "\n[streams]\nmax_streams_per_principal = 2\n".to_owned(),
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("capped", 1).await?;
+    let path = "/db/capped/v3/pipeline";
+    let greedy = fleet.token("greedy", &["read:capped"], "t-greedy")?;
+    // A second token of the same principal shares its streams' places.
+    let greedy_again = fleet.token("greedy", &["read:capped"], "t-greedy-2")?;
+    let open = |token: String| {
+        let fleet = &fleet;
+        async move {
+            fleet
+                .post(
+                    path,
+                    Some(&token),
+                    &pipeline(None, json!([execute("SELECT 1", json!([]))])),
+                )
+                .await
+        }
+    };
+    let first = open(greedy.clone()).await?;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+    let second = open(greedy_again.clone()).await?;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+    let refused = open(greedy.clone()).await?;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        refused.text
+    );
+    assert_eq!(
+        refused.body["code"], "RESOURCE_EXHAUSTED",
+        "{}",
+        refused.text
+    );
+    let message = refused.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("max_streams_per_principal"), "{message}");
+    // Another principal still opens one.
+    let other = fleet.token("other", &["read:capped"], "t-other")?;
+    let theirs = open(other).await?;
+    assert_eq!(theirs.status, StatusCode::OK, "{}", theirs.text);
+    // A closed stream gives its place back.
+    let baton = first.baton().ok_or("a baton")?;
+    let closed = fleet
+        .post(
+            path,
+            Some(&greedy),
+            &pipeline(Some(&baton), json!([close()])),
+        )
+        .await?;
+    assert_eq!(closed.status, StatusCode::OK, "{}", closed.text);
+    let again = open(greedy).await?;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+    // Stream IDs are random: two batons share no leading stream ID.
+    let (one, two) = (
+        second.baton().ok_or("a baton")?,
+        again.baton().ok_or("a baton")?,
+    );
+    assert_ne!(one.get(..10), two.get(..10), "{one} {two}");
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_too_large_leaves_the_transaction_open() -> TestResult {
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        router_tables: "\n[streams]\nmax_response_bytes = 1000\n".to_owned(),
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("large", 1).await?;
+    let token = fleet.token("app", &["write:large"], "t-app")?;
+    let path = "/db/large/v3/pipeline";
+    // One call that begins a transaction, writes, and then reads rows that don't fit the
+    // response: it ran, and left its session in the transaction.
+    let step = |sql: &str| json!({"stmt": {"sql": sql}});
+    let batch = json!({"steps": [
+        step("BEGIN"),
+        step("INSERT INTO t (v) VALUES ('kept')"),
+        step("SELECT zeroblob(4000)"),
+    ]});
+    let began = fleet
+        .post(
+            path,
+            Some(&token),
+            &pipeline(
+                None,
+                json!([{"type": "batch", "batch": batch}, {"type": "get_autocommit"}]),
+            ),
+        )
+        .await?;
+    assert_eq!(began.status, StatusCode::OK, "{}", began.text);
+    assert_eq!(began.error_code(0), "FLEETRING_RESULT_TOO_LARGE");
+    // The stream knows it is in the transaction.
+    assert_eq!(
+        began.result(1)["response"]["is_autocommit"],
+        false,
+        "{}",
+        began.text
+    );
+    let baton = began.baton().ok_or("a baton")?;
+    // And the transaction goes on to commit what it wrote.
+    let committed = fleet
+        .post(
+            path,
+            Some(&token),
+            &pipeline(
+                Some(&baton),
+                json!([execute("COMMIT", json!([])), {"type": "get_autocommit"}]),
+            ),
+        )
+        .await?;
+    assert_eq!(committed.result(0)["type"], "ok", "{}", committed.text);
+    assert_eq!(
+        committed.result(1)["response"]["is_autocommit"],
+        true,
+        "{}",
+        committed.text
+    );
+    assert_eq!(fleet.values("large").await?, [SqlValue::from("kept")]);
+    fleet.stop().await;
+    Ok(())
+}
