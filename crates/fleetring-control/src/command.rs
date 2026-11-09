@@ -404,7 +404,7 @@ pub enum Action {
         cause: RetryCause,
     },
 
-    /// Fails a seeding fork for a permanent reason (ADR-0046, point 3.4). Accepted only for the
+    /// Fails a seeding fork for a permanent reason (ADR-0046, point 3.5). Accepted only for the
     /// current fork identity at its current attempt. Proposed by the control node's fork driver
     /// only. Needs [`Feature::Fork`].
     FailFork {

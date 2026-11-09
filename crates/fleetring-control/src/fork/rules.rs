@@ -234,18 +234,32 @@ pub(crate) fn resets_reported(
 }
 
 /// Returns how a promotion ranks `report` of `db`, or `None` if it doesn't make its member a
-/// candidate (ADR-0046, points 4.5 and 6.2). A report showing a staged copy is a candidate only
-/// if it is exactly the copy a seeded fork completed with, at log epoch 0, and then ranks at
-/// `(0, at)`: below any replica holding later writes, such as the committed reset.
+/// candidate (ADR-0046, points 4.5 and 6.2).
+///
+/// - A report showing a staged copy is a candidate only if it is exactly the copy a seeded fork
+///   completed with, at log epoch 0, and then ranks at `(0, at)`: below any replica holding
+///   later writes, such as the committed reset.
+/// - While a fork is seeded, a report without a staged copy is a candidate only if its log comes
+///   from a lease issued since the completion: a log epoch above `lease_from` and no higher
+///   than the database's epoch. A copy opened in an earlier attempt, or an undeleted copy of an
+///   earlier database of the same name, is none, so it never outranks the staged copies.
 pub(crate) fn candidate_rank<'r>(
     db: &Database,
     report: &'r Report,
 ) -> Option<(LeaseEpoch, &'r Position)> {
-    let Some(staged) = report.staged() else {
-        return Some((report.log_epoch(), report.position()));
+    let fork = db.fork();
+    if let Some(staged) = report.staged() {
+        let fork = fork?;
+        return shows_seeded_copy(db, fork, report)
+            .then_some((LeaseEpoch::ZERO, staged.position()));
+    }
+    let since_completion = |lease_from: LeaseEpoch| {
+        report.log_epoch() > lease_from && report.log_epoch() <= db.epoch()
     };
-    let fork = db.fork()?;
-    shows_seeded_copy(db, fork, report).then_some((LeaseEpoch::ZERO, staged.position()))
+    match fork.map(Fork::state) {
+        Some(ForkState::Seeded { lease_from, .. }) if !since_completion(*lease_from) => None,
+        _ => Some((report.log_epoch(), report.position())),
+    }
 }
 
 /// Returns the most bytes any member reported for `database`'s copy, or 0 if none did.

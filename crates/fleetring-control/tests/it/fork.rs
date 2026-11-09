@@ -67,7 +67,6 @@ fn strip_fork_fields(value: &mut serde_json::Value) {
                 "reset",
                 "incarnation",
                 "fork",
-                "next_incarnation",
                 "fork_operations",
             ] {
                 map.remove(key);
@@ -146,7 +145,6 @@ fn without_the_fork_feature_control_state_stays_as_it_was() {
     );
     for key in [
         "incarnation",
-        "next_incarnation",
         "fork_operations",
         "disk_free_bytes",
         "size_bytes",
@@ -1411,15 +1409,49 @@ fn the_driver_reacts_to_seed_failures_and_to_the_source() {
         report_failure(&first, &fork, 1, SeedFailureReason::TransferFailed),
     )
     .expect("hb");
+    // A seeder whose transfer failed is passed over, so a persistent cause doesn't spend every
+    // attempt on one node.
     assert_eq!(
         fork::actions(&retryable, at(20)),
         vec![Action::RetryForkSeed {
             fork: fork.clone(),
             attempt: 1,
             cause: RetryCause::TransferFailed,
-            exclude_seeder: None,
+            exclude_seeder: Some(id(&first)),
         }]
     );
+    drive(&mut retryable, 20);
+    assert_eq!(attempt(&retryable, "t"), 2);
+    assert_ne!(seeder(&retryable, "t"), first);
+    let pin = report_failure(
+        &seeder(&retryable, "t"),
+        &fork,
+        2,
+        SeedFailureReason::PinExpired,
+    );
+    run(&mut retryable, 30, pin).expect("hb");
+    let proposed = drive(&mut retryable, 30);
+    assert!(
+        matches!(
+            proposed.as_slice(),
+            [(
+                Action::RetryForkSeed {
+                    cause: RetryCause::PinExpired,
+                    exclude_seeder: Some(_),
+                    ..
+                },
+                Ok(_)
+            )]
+        ),
+        "{proposed:?}"
+    );
+    let ForkState::Seeding {
+        seeder_excluded, ..
+    } = fork_state(&retryable, "t")
+    else {
+        panic!("seeding");
+    };
+    assert_eq!(seeder_excluded.len(), 2);
 
     let mut permanent = state.clone();
     run(

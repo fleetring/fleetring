@@ -152,8 +152,12 @@ fn seeding(state: &State, now: Timestamp, db: &Database, fork: &Fork) -> Option<
                     .max(*attempt_started_at)
                     .saturating_add(fork.limits().seeder_timeout)
     });
-    let retry = if let Some(cause) = seeder_failure {
-        Some((cause, None))
+    let retry = if disk_refused.contains(seeder) {
+        Some((RetryCause::SeederDiskRefused, None))
+    } else if let Some(cause) = seeder_failure {
+        // A seeder whose transfer keeps failing is passed over, so that one node's persistent
+        // trouble doesn't spend every attempt.
+        Some((cause, Some(seeder)))
     } else if seeder_gone || seeder_timed_out {
         Some((RetryCause::SeederDown, Some(seeder)))
     } else if now >= attempt_started_at.saturating_add(fork.limits().attempt_timeout) {
@@ -247,7 +251,9 @@ fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
         return None;
     };
     let first_lease_pending = db.epoch() == *lease_from;
-    for holder in holders {
+    // Seeding again needs a fleet to place the fork on; with no members, nothing is proposed.
+    let placeable = state.ring().is_ok();
+    for holder in holders.iter().filter(|_| placeable) {
         let cause = if state.member(holder).is_none() {
             RetryCause::HoldersLeft
         } else if first_lease_pending
@@ -277,7 +283,7 @@ fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
             .filter(|reset| {
                 reset.is_committed()
                     && *reset.fork() == identity
-                    && reset.epoch() > LeaseEpoch::ZERO
+                    && reset.epoch() > *lease_from
                     && reset.epoch() <= db.epoch()
             })
         else {
@@ -285,6 +291,8 @@ fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
         };
         *resets.entry((reset.epoch(), reset.position())).or_default() += 1;
     }
+    // A ready fork always has a lease: its reset was written under one.
+    db.lease()?;
     let need = usize::from(bootstrap_quorum(db.replication_factor(), db.durability()));
     let ((epoch, position), _) = resets.into_iter().find(|(_, count)| *count >= need)?;
     Some(Action::MarkForkReady {
