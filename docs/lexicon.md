@@ -456,16 +456,16 @@ A replica that isn't the primary: it applies the primary's batches and can be pr
 
 - ***Fork identity:*** the triple (name, incarnation, operation): the fork's database name, its own incarnation, and its [operation ID](#operation-id). Every command, report, `Snapshot` request, and staging directory about a fork carries it, so nothing meant for a dropped fork can act on a fork created again under the same name.
 - ***Fork states:***
-  - **`seeding`:** being copied, in numbered *attempts*. Each attempt has one *seeder*, the replica that fetches the database snapshot from the source's primary; the fork's other replicas copy the seeder's [staged copy](#staged-copy). Never leased, never served.
-  - **`seeded`:** a write quorum of the fork's replicas durably holds the staged copy. One of those *holders* may take the first lease, but nothing is served yet. The CLI prints it as `opening: not yet usable`.
+  - **`seeding`:** being copied, in numbered *attempts*. Each attempt has one *seeder*, the replica that fetches the database snapshot from the source's primary; the fork's other replicas copy the seeder's [staged copy](#staged-copy). Never leased, never served. A node *excluded as seeder* (it was down, or its attempt timed out) isn't chosen as seeder again while another can be, and may still hold a copy; a node that *refused on disk* is neither seeder nor holder. Only disk refusals can fail a fork for disk.
+  - **`seeded`:** the fork's *completion quorum*, a majority of its replicas and at least its write quorum, durably holds the staged copy. Those *holders* are the fork's replica set until it is ready, whatever placement says, and only a holder whose copy is still verified may take the first lease. Nothing is served yet. The CLI prints it as `opening: not yet usable`; JSON and MCP say `seeded`.
   - **`ready`:** the fork-reset write has committed. Clients, `db watch`, and sinks are served, and it is an ordinary database from then on.
   - **`failed`:** it stopped, with a reason, and stays until `db drop` removes it.
 
   A database no fork made has no fork state, and counts as seeded and ready. `ready` is a fork's state, not a node's [readiness](#readiness).
-- ***Fork reset*** and ***reset marker:*** the fork-reset write is one conditional transaction, run by the fork's first primary, that clears the change record and the sink positions the fork inherited from its source, and inserts the reset marker, a row in the reserved `_fleetring_fork` table naming the fork identity. It runs only when the marker is absent, so it happens exactly once in the database's surviving history.
-- **Cancelling** a fork is dropping it before it is ready; there is no cancel command.
+- ***Fork reset*** and ***reset marker:*** the fork-reset write is one conditional transaction, run by the fork's primary before it serves anything, that clears the change record and the sink positions the fork inherited from its source, and makes the reset marker the only row of the reserved `_fleetring_fork` table: a row naming the fork identity (a fork of a fork drops the row it inherited). It runs only when the marker for this identity is absent, and counts as committed only once a majority of the fork's replicas, and at least its write quorum, holds it, `acks = local` included, so it happens exactly once in the database's surviving history.
+- **Cancelling** a fork is dropping it while it is seeding or seeded, or letting its expiry pass then; there is no cancel command. An operation's terminal outcomes are exactly `ready`, `failed`, and `cancelled`.
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet (*planned:* `ForkDatabase`, `CompleteFork`, `RetryForkSeed`, `FailFork`, `MarkForkReady`, `Fork`, `ForkState`, `ForkFailure`, `Feature::Fork`, `FrameSourceEngine::fork_reset`, `Metadata::forked_from`). **CLI:** none yet (*planned:* `db fork <source> <target>`, the fork lines of `db show`, the `FORK` column of `db list`, and `fork` and `forked_from` in their JSON; MCP `db_fork`).
+- **Code:** none yet (*planned:* `ForkDatabase`, `CompleteFork`, `RetryForkSeed`, `RecordForkDiskRefusal`, `FailFork`, `DropForkHolder`, `MarkForkReady`, `Fork`, `ForkState`, `ForkFailure`, `RetryCause`, `Feature::Fork`, `FrameSourceEngine::fork_reset`, `Metadata::forked_from`). **CLI:** none yet (*planned:* `db fork <source> <target>`, the fork lines of `db show`, the `FORK` column of `db list`, and `fork` and `forked_from` in their JSON; MCP `db_fork`).
 - **Not:** branch, clone (kept for the file-system mechanism, which is deferred), copy (a fork is a database; a *copy* is a node's files of one), snapshot; for the states, not *unseeded*, *pending*, *done*, or *live* (a member's [liveness](#liveness)).
 
 ### Group
@@ -526,10 +526,10 @@ A placement label for the machine a node runs on, when several nodes share one; 
 
 ### Incarnation
 
-*Planned* (ADR-0046). One life of a database name: `(name, incarnation)` identifies one database for the fleet's whole life. Control state assigns each new database, a [fork](#fork) included, the next value of a counter that never decreases, so a name dropped and created again always has a different incarnation, even where its [lease epochs](#epoch) start again. A database created before the `fork` [fleet feature](#fleet-feature) was enabled has incarnation 0. A fork records its source's incarnation, so it never copies a database created again under the source's name.
+*Planned* (ADR-0046). One life of a database name: `(name, incarnation)` identifies one database. Each new database, a [fork](#fork) included, gets 64 random bits, never 0, drawn by the control node that proposes its creation and carried in the command, as time is; so a name dropped and created again has a different incarnation, even where its [lease epochs](#epoch) start again, and even if `control.db` was replaced. No rule rests on a counter. A database created before the `fork` [fleet feature](#fleet-feature) was enabled has incarnation 0. A fork records its source's incarnation, so it never copies a database created again under the source's name. Printed as 16 lowercase hex digits, and a string of them in JSON.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet (*planned:* `Incarnation`, `Database::incarnation`, `State::next_incarnation`, protocol `Placement.incarnation`). **CLI:** none yet (*planned:* `incarnation` in `db show`, `db locate` and `db fork`; `<name> (incarnation N)`).
+- **Code:** none yet (*planned:* `Incarnation`, `Database::incarnation`, the `incarnation` of `CreateDatabase` and `ForkDatabase`, protocol `Placement.incarnation`). **CLI:** none yet (*planned:* `incarnation` in `db show`, `db locate` and `db fork`; `<name> (incarnation 3f9a0c6e21d4b870)`).
 - **Not:** generation (SQLite's, below the adapter), epoch (a lease epoch counts leases within one incarnation), version (metadata's), instance, ID.
 
 ### Issuer
@@ -654,10 +654,14 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 
 ### Operation ID
 
-*Planned* (ADR-0046). The identifier of one *operation*: one fork request, from its first call until it is `ready`, `failed`, or `cancelled`, across every retry. It is 16 random bytes the client chooses, printed as 26 lowercase base32 characters, and the CLI prints it before it calls. Resending the same request under the same ID, from the same principal, returns the operation's status and never starts a second fork; the same ID with another request is refused. Control state keeps the operation's record, and with it the ID, while the fork is pending and for 7 days after its outcome; after that the ID is unknown.
+*Planned* (ADR-0046). The identifier of one *operation*: one fork request, from its first call until it is `ready`, `failed`, or `cancelled`, across every retry. It is 16 random bytes the client chooses, printed as 26 lowercase base32 characters, and the CLI prints it before it calls.
 
+- ***Caller intent*** is the request as given, a relative expiry included; the ***resolved state*** is what the first request settled: the source's incarnation, the fork's incarnation, the absolute expiry. Neither is decided twice.
+- ***Resuming*** reads the operation by its ID and follows it; nothing is sent or resolved again.
+- ***Resubmitting*** sends the request again under a known ID, and compares the caller intent only: from the same principal and unchanged, it returns the existing operation; from another principal, it is refused without revealing the operation; changed, it is refused, naming the field.
+- **Retention.** Control state keeps the operation's record, and with it the ID, while the fork is pending and for 7 days after its terminal outcome; after that the ID is unknown, and the same request starts a new fork.
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet (*planned:* `OperationId`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation`). **CLI:** none yet (*planned:* `--operation-id` on `db fork`; `operation_id` in JSON; MCP `operation_id`).
+- **Code:** none yet (*planned:* `OperationId`, `ForkIntent`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation`, `Rejection::OperationConflict`, `Rejection::OperationNotYours`). **CLI:** none yet (*planned:* `--operation-id` on `db fork` and on `orphan remove` for a staged copy; `operation_id` in JSON; MCP `operation_id`).
 - **Not:** [request ID](#request-id) (one call, for tracing), job ID, task ID, idempotency key, transaction ID.
 
 ### Organization
@@ -670,7 +674,7 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 
 ### Orphan
 
-A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused. *Planned* (ADR-0046): a [staged copy](#staged-copy) whose fork the node can't see is kept as an orphan too.
+A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused. *Planned* (ADR-0046): a [staged copy](#staged-copy) whose fork the node can't confirm is kept as an orphan too, including when a placement shows the name with another [incarnation](#incarnation); it is listed and removed by its name, incarnation, operation ID, and attempt.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Replication::orphan`, `data::Orphan`, protocol `OrphanStatus` and `Database.RemoveOrphan`. **CLI:** `fleetring orphan list`, `fleetring orphan remove <database> --node <id>`.
@@ -968,10 +972,10 @@ The placement spec: the normative description of placement that every implementa
 
 ### Staged copy
 
-*Planned* (ADR-0046). A [fork](#fork)'s database snapshot as one of its replicas holds it before the fork is ready: written to a temporary file under `<data_dir>/staged/`, in a directory named by the fork identity and the attempt, checked against its checksum and chain hash, fsynced and renamed into place, with a sidecar naming the fork identity, the attempt, the position, the chain hash, and the source's [incarnation](#incarnation). A node reports it only once it is in place. It is never served, and becomes a database's files only when a holder takes the fork's first lease. A node deletes one only on a positive signal, and keeps one whose fork it can't see as an [orphan](#orphan).
+*Planned* (ADR-0046). A [fork](#fork)'s database snapshot as one of its replicas holds it before the fork is ready: written to a temporary file under `<data_dir>/staged/`, in a directory named by the fork identity and the attempt, checked against its checksum, fsynced and renamed into place, with a sidecar naming the fork identity, the attempt, the position, the source primary's chain hash at it, the source's [incarnation](#incarnation), the file's size and checksum, and [log epoch](#epoch) 0. A node reports it only once it is in place. It is never served. It becomes a database's files only when its holder, after checking it again against the fork's recorded position and chain hash, takes the fork's first lease, is promoted, or installs it as a follower on its first stream; a copy that fails that check is reported lost. Promotion ranks it at log epoch 0. A node deletes one only on a positive signal for its own fork identity (a drop notice naming it, or that identity failed, completed without this node, or moved to a later attempt), and keeps any other as an [orphan](#orphan).
 
 - **Applies to:** daemon, CLI.
-- **Code:** none yet (*planned:* the `staged` report in heartbeats, `SnapshotRequest.staged`). **CLI:** none yet (*planned:* `holders` in `db show`).
+- **Code:** none yet (*planned:* the `staged` and `copy_lost` reports in heartbeats, `SnapshotRequest.staged`, `DropCopy`'s incarnation and operation). **CLI:** none yet (*planned:* `holders` in `db show`; `kind` `staged` in `orphan list`).
 - **Not:** partial copy (a staged copy is whole, or not reported), temporary copy, snapshot (alone), fork (the fork is the database).
 
 ### Statement deadline
