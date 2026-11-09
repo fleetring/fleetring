@@ -129,8 +129,10 @@ pub(crate) struct AgentAddArgs {
     id: AgentId,
     /// A scope the token carries instead of the defaults
     ///
-    /// The defaults are `admin:agent-<id>-*` and `stream:agent-<id>-*`. Repeat it for more;
-    /// `agent renew` never widens scopes chosen with it.
+    /// `<action>:<pattern>`, with the action `read`, `write`, `fork`, `admin`, `stream`, or
+    /// `grant`. The defaults are `admin:agent-<id>-*` and `stream:agent-<id>-*`. Repeat it for
+    /// more; `agent renew` never widens scopes chosen with it. Nodes before 0.8 refuse a token
+    /// that carries `fork` or `grant`.
     #[arg(long = "scope", value_name = "SCOPE")]
     scopes: Vec<Scope>,
     /// Records the identity as read-only, with default scopes that read and stream
@@ -473,6 +475,7 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
     for warning in args.scopes.iter().filter_map(Scope::separator_warning) {
         note(format!("warning: {warning}"));
     }
+    let pre_0_8 = agent::pre_0_8_note(&args.scopes);
     let access = if args.read_only {
         Access::ReadOnly
     } else {
@@ -542,6 +545,9 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
             .into());
         }
     };
+    if let Some(pre_0_8) = pre_0_8 {
+        note(pre_0_8);
+    }
     let context = situation.pinned();
     let invocation = Invocation::of(&args.id, &context)?;
     let summary = describe(&dir, &record, &context, &invocation, Detail::Summary);

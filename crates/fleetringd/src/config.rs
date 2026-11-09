@@ -14,7 +14,7 @@ use fleetring::{Host, NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
-use crate::auth::Scopes;
+use crate::auth::{Action, Scopes};
 use crate::changes::ChangesConfig;
 use crate::control::DurabilityDefaults;
 use crate::dev::{self, DevMode};
@@ -358,9 +358,10 @@ impl From<bool> for AdminPlaintext {
 /// forward_tokens = true   # may carry its callers' tokens, and then acts as them
 /// ```
 ///
-/// Each scope is `<action>:<pattern>` with the action `read`, `write`, `admin`, or `stream`,
-/// and the pattern an exact database name or a prefix ending in `*`; or the word `fleet`, for
-/// control operations that name no database. `write` implies `read`, and `admin` implies both.
+/// Each scope is `<action>:<pattern>` with the action `read`, `write`, `fork`, `admin`, or
+/// `stream`, and the pattern an exact database name or a prefix ending in `*`; or the word
+/// `fleet`, for control operations that name no database. `write` and `fork` each imply `read`,
+/// and `admin` implies all three. `grant` is refused here: only an agent's token delegates.
 /// A request with a bearer token acts with the token's scopes instead.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -900,6 +901,15 @@ impl Config {
                     reason: reserved_reason(&principal.name),
                 });
             }
+            // Only an agent's token delegates (ADR-0044, point 2; ADR-0047), so `grant` in a
+            // certificate's scopes would mean nothing; refusing it keeps anyone from thinking
+            // it does.
+            if principal.scopes.names(Action::Grant) {
+                return Err(ConfigError::Invalid {
+                    field: "principal",
+                    reason: format!("'{}': {GRANT_IN_PRINCIPAL}", principal.name),
+                });
+            }
         }
         if self.replication.retry_interval_ms == 0 {
             return Err(ConfigError::Invalid {
@@ -965,6 +975,10 @@ impl Config {
         Ok(())
     }
 }
+
+/// Why a `[[principal]]` entry may not hold a `grant` scope (ADR-0044, point 2).
+const GRANT_IN_PRINCIPAL: &str =
+    "grant has no effect in a certificate's scopes; it is carried by an agent's token";
 
 /// Why a configuration may not name `name`: a reserved dotted agent name (ADR-0044, point 1.8).
 fn reserved_reason(name: &Principal) -> String {
@@ -1067,6 +1081,37 @@ mod tests {
             let config = with(&format!("\n[[principal]]\nname = \"{kept}\"\n"));
             assert!(config.is_ok(), "{kept}: {config:?}");
         }
+    }
+
+    #[test]
+    fn grant_in_a_principal_entry_is_refused_and_fork_is_kept() {
+        for scopes in [
+            r#"["grant:agent-42.*"]"#,
+            r#"["read:*", "grant:*"]"#,
+            r#"["admin:x-*", "grant:x-*"]"#,
+        ] {
+            let refused = with(&format!(
+                "\n[[principal]]\nname = \"ops\"\nscopes = {scopes}\n"
+            ))
+            .expect_err("grant in a certificate's scopes");
+            let ConfigError::Invalid { field, reason } = &refused else {
+                panic!("{scopes}: {refused}");
+            };
+            assert_eq!(*field, "principal");
+            assert_eq!(
+                reason,
+                "'ops': grant has no effect in a certificate's scopes; it is carried by an \
+                 agent's token"
+            );
+        }
+        let kept = with("\n[[principal]]\nname = \"forker\"\nscopes = [\"fork:src-*\"]\n")
+            .expect("fork in a certificate's scopes");
+        assert_eq!(
+            kept.principals[0].scopes.as_slice()[0].to_string(),
+            "fork:src-*"
+        );
+        // `grant` in a pattern is just a name.
+        assert!(with("\n[[principal]]\nname = \"ops\"\nscopes = [\"read:grant-*\"]\n").is_ok());
     }
 
     #[test]

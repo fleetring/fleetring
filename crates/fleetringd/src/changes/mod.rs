@@ -98,6 +98,7 @@ use crate::replication::{ChainHash, Replication};
 
 pub use self::config::{ChangesConfig, Format, SinkConfig, SinkKind};
 pub use self::file::{FileSink, database_file};
+pub(crate) use self::matcher::Pattern;
 pub use self::matcher::{CaptureRules, DatabaseMatcher, DatabaseMatchers, ParseMatcherError};
 pub use self::memory::MemorySink;
 pub use self::record::{ChangeRecord, NotHex, ParseRecordError, RecordContent, hex, unhex};

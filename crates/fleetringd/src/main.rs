@@ -604,8 +604,9 @@ enum TokenCommand {
         principal: Principal,
         /// A scope the token carries: `<action>:<pattern>`, or `fleet`
         ///
-        /// The action is `read`, `write`, `admin`, or `stream`, and the pattern a database name or
-        /// a prefix ending in `*`. Repeat it for more.
+        /// The action is `read`, `write`, `fork`, `admin`, `stream`, or `grant`, and the pattern a
+        /// database name or a prefix ending in `*`. Repeat it for more. Nodes before 0.8 refuse a
+        /// token that carries `fork` or `grant`.
         #[arg(long = "scope", required = true)]
         scopes: Vec<Scope>,
         /// How long the token lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
@@ -3022,6 +3023,9 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                 signer.key_id(),
                 ttl.as_secs()
             ));
+            if let Some(pre_0_8) = agent::pre_0_8_note(spec.scopes.as_slice()) {
+                note(pre_0_8);
+            }
             Ok(format!("{}\n", token.expose()))
         }
         TokenCommand::Revoke {

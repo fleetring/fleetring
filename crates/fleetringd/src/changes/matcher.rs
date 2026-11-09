@@ -52,6 +52,24 @@ impl DatabaseMatcher {
             Rule::Prefix(prefix) => Some(prefix),
         }
     }
+
+    /// The rule as an exact name or a prefix, for comparing rules byte for byte.
+    pub(crate) fn pattern(&self) -> Pattern<'_> {
+        match &self.rule {
+            Rule::Exact(exact) => Pattern::Exact(exact),
+            Rule::Prefix(prefix) => Pattern::Prefix(prefix),
+        }
+    }
+}
+
+/// A rule's shape: the name it matches exactly, or the bytes every name it matches starts with
+/// (`*` alone is `Prefix("")`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pattern<'a> {
+    /// Matches exactly this name.
+    Exact(&'a str),
+    /// Matches every name whose bytes start with these.
+    Prefix(&'a str),
 }
 
 /// The error returned for a rule that names nothing.

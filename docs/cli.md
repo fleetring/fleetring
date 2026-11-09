@@ -55,7 +55,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `upgrade [--check \| --rollback \| --version <v>]` | Installs another release in place, once the release's `serve --check` accepts the node's configuration (ADR-0038) |
 | | `lease watch` | Follows the leases a data node holds |
 | Security | `cert init \| node \| client` | Creates the authority and issues certificates |
-| | `token issue \| revoke` | Issues and revokes bearer tokens |
+| | `token issue \| revoke` | Issues and revokes bearer tokens. `--scope <action>:<pattern>` (repeated) or `fleet`, with six actions: `read`, `write`, `fork`, `admin`, `stream`, `grant` (ADR-0044, point 2; FR-088). A token carrying `fork` or `grant` is refused by nodes before 0.8, and `token issue` notes so |
 | Agents | `mcp [--agent <id>] [--read-only]` | Serves the Model Context Protocol on stdio as one principal (ADR-0041) |
 | | `agent add \| list \| show \| renew \| remove` | Manages agent identities: a certificate and a token scoped `admin:agent-<id>-*` and `stream:agent-<id>-*` per agent (ADR-0043, point 8; FR-081) |
 | Recovery | `archive show \| verify \| restore` | Archives. `archive restore` is the offline restore into a directory, with no fleet |
