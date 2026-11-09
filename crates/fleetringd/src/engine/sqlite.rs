@@ -219,7 +219,7 @@ impl FrameSourceEngine for SqliteEngine {
     }
 
     fn check_copy(&self, location: &Path) -> Result<(), EngineError> {
-        page_size::check(&location.join(DATABASE_FILE), Some(self.page_size))
+        page_size::check(&location.join(DATABASE_FILE))
     }
 
     /// Each transaction is the frames up to and including a commit frame. The generation's WAL
@@ -283,7 +283,7 @@ impl SqliteDatabase {
             OpenMode::Create => flags |= OpenFlags::SQLITE_OPEN_CREATE,
             // Never beside a WAL of another page size (#154). The configured page size is for new
             // databases only, so an existing one may have another.
-            OpenMode::Existing => page_size::check(&path, None)?,
+            OpenMode::Existing => page_size::check(&path)?,
         }
         let mut writer = Connection::open_with_flags(&path, flags).map_err(storage)?;
         defend(&writer)?;

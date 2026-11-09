@@ -330,8 +330,9 @@ pub trait FrameSourceEngine: fmt::Debug + Send + Sync {
 
     /// Checks a copy written into `location` from bytes this node didn't produce, an archive's
     /// snapshot or a peer's, before anything opens it, and refuses one the engine can't open
-    /// safely. For SQLite, the database file's header, the WAL's header, and the engine's
-    /// configured page size must agree on the page size (#154).
+    /// safely. For SQLite, the database file's header and the WAL's header must agree on
+    /// the page size (#154); the engine's configured page size, which is for new databases, isn't
+    /// compared.
     ///
     /// # Errors
     ///

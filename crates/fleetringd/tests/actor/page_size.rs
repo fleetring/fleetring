@@ -1,5 +1,5 @@
 //! #154 in the SQLite adapter: a copy or batch whose page size disagrees with its database
-//! file's, or a copy with the configured one's, is refused before anything opens it.
+//! file's is refused before anything opens it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -88,24 +88,14 @@ fn a_copy_whose_wal_has_another_page_size_is_refused_and_never_opened() -> TestR
 }
 
 #[test]
-fn a_copy_of_another_page_size_than_configured_is_refused_but_a_local_database_opens() -> TestResult
-{
+fn an_engine_configured_for_another_page_size_accepts_a_consistent_copy() -> TestResult {
     let dir = tempfile::tempdir()?;
     let source = dir.path().join("source");
     primary(&source, PAGE_SIZE)?;
+    // The configured page size is for new databases: changing it must not strand older ones.
     let other = engine(PAGE_SIZE * 2);
-    let reason = unsafe_reason(frames(&other).check_copy(&source))?;
-    assert_eq!(
-        reason,
-        format!(
-            "the configured [engine] page_size is {} bytes, but the database file's page size \
-             is {PAGE_SIZE}",
-            PAGE_SIZE * 2
-        )
-    );
-    // The engine that made it takes it as a copy.
-    frames(&engine(PAGE_SIZE)).check_copy(&source)?;
-    // The configured page size is for new databases: an existing one opens whatever it says.
+    frames(&other).check_copy(&source)?;
+    frames(&other).open_follower(&source)?;
     other.open(&source, OpenMode::Existing)?.close()?;
     Ok(())
 }
