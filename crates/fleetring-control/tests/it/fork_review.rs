@@ -10,7 +10,7 @@ use fleetring_control::{
 
 use crate::common::fork::{
     copy_hash, drive, first_lease, fleet, fork_request, fork_state, heartbeat_of, identity,
-    replica, report_failure, report_reset, report_staged, seeded, seeder, with_intent,
+    replica, report_failure, report_reset, seeded, seeder, with_intent,
 };
 use crate::common::{at, current_software, db, factor, id, run};
 
@@ -72,12 +72,14 @@ fn join(state: &mut State, millis: u64, node: &str) {
 
 // ---- Resets from an earlier attempt ----
 
-/// A fork that seeds again keeps its epoch, so resets that attempt 1's primary committed are
-/// still at an epoch the database has issued. They mark attempt 1's copy, not attempt 2's:
-/// `MarkForkReady` needs a reset under a lease issued since the completion, the driver proposes
-/// none, and the fork becomes ready only under its next lease.
+/// A leased fork whose holders leave below the completion quorum keeps the holders it needs and
+/// its lease, rather than seeding again: its primary may have acknowledged writes once the reset
+/// committed, and the resets its holders committed under the lease still mark it ready
+/// (ADR-0046, point 3.6, as built). A fork seeds again only before any lease since completion,
+/// so its epoch is still the completion's, and a reset from an earlier attempt, written under an
+/// epoch at or below that, never counts.
 #[test]
-fn a_reset_from_an_earlier_attempt_never_marks_a_reseeded_fork_ready() {
+fn a_leased_fork_whose_holders_leave_becomes_ready_on_its_resets() {
     let mut state = fleet(&["n0", "n1", "n2", "n3", "n4", "n5", "n6"]);
     // R = 5 with min_replicas = 4: the completion quorum is 4, the bootstrap quorum 3.
     let request = with_intent(fork_request(1, "t"), |intent| {
@@ -94,8 +96,8 @@ fn a_reset_from_an_earlier_attempt_never_marks_a_reseeded_fork_ready() {
     }
     run(&mut state, 20, complete_at(&fork, 1, &[1, 0], &first)).expect("complete");
     first_lease(&mut state, 30, &first[0]).expect("lease at epoch 1");
-    // Attempt 1's primary commits the reset at the bootstrap quorum, but before readiness is
-    // recorded two holders leave, below the completion quorum.
+    // The primary commits the reset at the bootstrap quorum, but before readiness is recorded
+    // two holders leave, below the completion quorum.
     for node in &first[..3] {
         run(
             &mut state,
@@ -107,76 +109,29 @@ fn a_reset_from_an_earlier_attempt_never_marks_a_reseeded_fork_ready() {
     for node in &first[3..] {
         run(&mut state, 50, Action::Leave { id: id(node) }).expect("leave");
     }
-    for millis in [60, 61] {
-        drive(&mut state, millis);
-    }
+    let dropped = drive(&mut state, 60);
     assert!(
         matches!(
-            fork_state(&state, "t"),
-            ForkState::Seeding { attempt: 2, .. }
+            dropped.as_slice(),
+            [(
+                Action::DropForkHolder { .. },
+                Ok(Applied::ForkHolderDropped { .. })
+            )]
         ),
+        "{dropped:?}"
+    );
+    let ready = drive(&mut state, 61);
+    assert!(
+        matches!(ready.as_slice(), [(Action::MarkForkReady { epoch, .. }, Ok(_))] if *epoch == LeaseEpoch::new(1)),
+        "{ready:?}"
+    );
+    assert!(
+        matches!(fork_state(&state, "t"), ForkState::Ready { .. }),
         "{:?}",
         fork_state(&state, "t")
     );
     let database = state.database(&db("t")).expect("t");
-    assert!(database.lease().is_none());
-    assert_eq!(database.epoch(), LeaseEpoch::new(1));
-
-    // Attempt 2 seeds at another position and completes.
-    let second = replicas(&state, "t");
-    for node in &second {
-        run(&mut state, 70, staged_at(node, &fork, 2, &[2, 0])).expect("hb");
-    }
-    run(&mut state, 70, complete_at(&fork, 2, &[2, 0], &second)).expect("complete");
-
-    // Attempt 1's resets are reported again by a bootstrap quorum of the new holders.
-    for node in &second[..3] {
-        run(
-            &mut state,
-            80,
-            report_reset(node, &fork, LeaseEpoch::new(1), &[3]),
-        )
-        .expect("hb");
-    }
-    assert!(fork::actions(&state, at(90)).is_empty());
-    refused(
-        &mut state,
-        90,
-        Action::MarkForkReady {
-            fork: fork.clone(),
-            epoch: LeaseEpoch::new(1),
-            reset_position: Position::new([3]),
-        },
-        &Rejection::StaleEpoch {
-            database: db("t"),
-            given: LeaseEpoch::new(1),
-            current: LeaseEpoch::new(1),
-        },
-    );
-    // No lease goes to a replica without the copy; a holder still reporting it takes the next.
-    assert!(matches!(
-        first_lease(&mut state, 95, &second[0]),
-        Err(Rejection::StagedCopyNotReported { .. })
-    ));
-    let granted = first_lease(&mut state, 95, &second[4]).expect("a holder with the copy");
-    assert!(
-        matches!(&granted, Applied::LeaseGranted { lease, .. } if lease.epoch() == LeaseEpoch::new(2)),
-        "{granted:?}"
-    );
-    // The reset under the new lease marks it ready.
-    for node in &second[2..] {
-        run(
-            &mut state,
-            100,
-            report_reset(node, &fork, LeaseEpoch::new(2), &[4]),
-        )
-        .expect("hb");
-    }
-    let proposed = drive(&mut state, 110);
-    assert!(
-        matches!(proposed.as_slice(), [(Action::MarkForkReady { epoch, .. }, Ok(_))] if *epoch == LeaseEpoch::new(2)),
-        "{proposed:?}"
-    );
+    assert!(database.lease().is_some());
 }
 
 // ---- Proposals the driver mustn't repeat ----
@@ -247,9 +202,8 @@ fn the_driver_proposes_nothing_for_a_fork_in_an_empty_fleet() {
 // ---- Stale copies in promotions ----
 
 /// While a fork is seeded, a copy that isn't staged is a promotion candidate only if its log
-/// comes from a lease issued since the completion. A holder still reporting the copy it opened
-/// in an earlier attempt, or an undeleted copy of an earlier database of the same name, never
-/// outranks the staged copies.
+/// comes from a lease issued since the completion: an undeleted copy of an earlier database of
+/// the same name never outranks the staged copies.
 #[test]
 fn a_stale_copy_never_outranks_the_staged_copies() {
     let start = |state: &mut State, millis| match run(
@@ -260,40 +214,6 @@ fn a_stale_copy_never_outranks_the_staged_copies() {
         Ok(Applied::PromotionStarted { candidate, .. }) => candidate.as_str().to_owned(),
         other => panic!("{other:?}"),
     };
-
-    // An earlier attempt's opened copy: attempt 1 is leased at epoch 1, its holders leave, and
-    // attempt 2 completes with `lease_from` 1.
-    let mut state = fleet(&["n0", "n1", "n2", "n3", "n4"]);
-    run(&mut state, 10, fork_request(1, "t")).expect("fork");
-    let fork = identity(&state, "t");
-    let first = replicas(&state, "t");
-    for node in &first {
-        run(&mut state, 20, report_staged(node, &fork, 1)).expect("hb");
-    }
-    run(&mut state, 20, complete_at(&fork, 1, &[1, 0], &first)).expect("complete");
-    first_lease(&mut state, 30, &first[0]).expect("lease at epoch 1");
-    let leaving: Vec<String> = first[1..].to_vec();
-    for node in &leaving {
-        run(&mut state, 40, Action::Leave { id: id(node) }).expect("leave");
-    }
-    for millis in [50, 51] {
-        drive(&mut state, millis);
-    }
-    let second = replicas(&state, "t");
-    assert!(second.contains(&first[0]), "{second:?}");
-    for node in &second {
-        run(&mut state, 60, staged_at(node, &fork, 2, &[2, 0])).expect("hb");
-    }
-    run(&mut state, 60, complete_at(&fork, 2, &[2, 0], &second)).expect("complete");
-    let lessee = second
-        .iter()
-        .find(|node| **node != first[0])
-        .expect("another holder");
-    first_lease(&mut state, 70, lessee).expect("lease at epoch 2");
-    // The old primary reports attempt 1's opened copy, at a far position.
-    run(&mut state, 1_500, opened(&first[0], "t", 1, &[9, 9])).expect("hb");
-    let candidate = start(&mut state, 1_500);
-    assert_ne!(candidate, first[0]);
 
     // An undeleted copy of an earlier database of the same name, at a higher epoch.
     let mut state = seeded();

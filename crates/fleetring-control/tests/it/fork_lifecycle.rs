@@ -455,11 +455,11 @@ fn a_lost_copy_after_the_first_lease_keeps_the_holder() {
     );
 }
 
-/// A seeded fork whose holders leave the fleet drops them one by one, and once fewer than the
-/// completion quorum remain it seeds again, even after a lease: the lease is cleared, the epoch
-/// kept, and the next first lease takes a higher epoch.
+/// A seeded fork whose holders leave the fleet before any lease drops them one by one, and once
+/// fewer than the completion quorum remain it seeds again from the members left: nothing was
+/// served, so nothing is lost.
 #[test]
-fn a_seeded_fork_whose_holders_all_left_seeds_again() {
+fn a_seeded_fork_whose_holders_all_left_before_a_lease_seeds_again() {
     let mut state = fleet(&["n0", "n1", "n2", "n3", "n4"]);
     run(&mut state, 10, fork_request(1, "t")).expect("fork");
     let fork = identity(&state, "t");
@@ -469,7 +469,6 @@ fn a_seeded_fork_whose_holders_all_left_seeds_again() {
     }
     let named: Vec<&str> = holders.iter().map(String::as_str).collect();
     run(&mut state, 20, complete(&fork, 1, &named)).expect("complete");
-    first_lease(&mut state, 30, &holders[0]).expect("lease");
     for node in &holders {
         run(&mut state, 40, Action::Leave { id: id(node) }).expect("leave");
     }
@@ -504,9 +503,8 @@ fn a_seeded_fork_whose_holders_all_left_seeds_again() {
     assert_eq!(attempt(&state, "t"), 2);
     let database = state.database(&db("t")).expect("t");
     assert!(database.lease().is_none());
-    assert_eq!(database.epoch(), LeaseEpoch::new(1));
 
-    // The members left seed it and take the next first lease at a higher epoch.
+    // The members left seed it and take its first lease.
     let rest = replicas(&state, "t");
     for node in &rest {
         run(&mut state, 60, report_staged(node, &fork, 2)).expect("hb");
@@ -518,9 +516,77 @@ fn a_seeded_fork_whose_holders_all_left_seeds_again() {
     );
     let granted = first_lease(&mut state, 70, &rest[0]).expect("lease");
     assert!(
-        matches!(&granted, Applied::LeaseGranted { lease, .. } if lease.epoch() == LeaseEpoch::new(2)),
+        matches!(&granted, Applied::LeaseGranted { lease, .. } if lease.epoch() == LeaseEpoch::new(1)),
         "{granted:?}"
     );
+}
+
+/// Once a lease was issued since completion, the fork may hold acknowledged writes: holders
+/// that leave the fleet are dropped only while the completion quorum remains, and then the fork
+/// stays seeded on the holders it has, its lease kept, rather than seeding again from the
+/// source and discarding what it served (ADR-0046, point 3.6, as built).
+#[test]
+fn a_leased_fork_never_seeds_again_when_its_holders_leave() {
+    let mut state = fleet(&["n0", "n1", "n2", "n3", "n4"]);
+    run(&mut state, 10, fork_request(1, "t")).expect("fork");
+    let fork = identity(&state, "t");
+    let holders = replicas(&state, "t");
+    for node in &holders {
+        run(&mut state, 20, report_staged(node, &fork, 1)).expect("hb");
+    }
+    let named: Vec<&str> = holders.iter().map(String::as_str).collect();
+    run(&mut state, 20, complete(&fork, 1, &named)).expect("complete");
+    first_lease(&mut state, 30, &holders[0]).expect("lease");
+    for node in &holders[1..] {
+        run(&mut state, 40, Action::Leave { id: id(node) }).expect("leave");
+    }
+    // Three holders, a completion quorum of two: one that left is dropped.
+    let first = drive(&mut state, 50);
+    assert!(
+        matches!(
+            first.as_slice(),
+            [(
+                Action::DropForkHolder {
+                    cause: RetryCause::HoldersLeft,
+                    ..
+                },
+                Ok(Applied::ForkHolderDropped { .. })
+            )]
+        ),
+        "{first:?}"
+    );
+    // The other stays: dropping it would leave one.
+    assert!(fork::actions(&state, at(51)).is_empty());
+    let ForkState::Seeded { holders: kept, .. } = fork_state(&state, "t") else {
+        panic!("still seeded");
+    };
+    let left = kept
+        .iter()
+        .find(|node| node.as_str() != holders[0])
+        .expect("a holder that left")
+        .clone();
+    refused(
+        &mut state,
+        52,
+        Action::DropForkHolder {
+            fork,
+            attempt: 1,
+            holder: left.clone(),
+            cause: RetryCause::HoldersLeft,
+        },
+        &Rejection::HolderNeededAfterLease {
+            id: left,
+            database: db("t"),
+            needed: 2,
+        },
+    );
+    assert!(matches!(
+        fork_state(&state, "t"),
+        ForkState::Seeded { attempt: 1, .. }
+    ));
+    let database = state.database(&db("t")).expect("t");
+    assert!(database.lease().is_some(), "the lease is kept");
+    assert_eq!(kept.len(), 2);
 }
 
 // ---- Staged copies in promotions ----
