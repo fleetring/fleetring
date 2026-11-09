@@ -4,7 +4,7 @@
 - **Date:** 2026-11-02
 - **Related:** ADR-0017 (control state machine), ADR-0018 (epochs), ADR-0022 (failover), ADR-0025 (principals and scopes), ADR-0026 (scope enforcement, proposed with FR-047); tickets FR-046, FR-047, FR-050
 
-*Note (2026-11-08):* [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed) proposes one more binding, **`seeding`**: under it, the source's primary serves a fork's seeder, and the seeder serves the fork's other replicas, on `Replication.Snapshot`, each checked against the fork's full identity (ADR-0046, points 4.1 and 4.4). It is proposed, not part of this decision, until ADR-0046 is accepted. The text below is unchanged.
+*Note (2026-11-08):* [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed) proposes one more binding, **`seeding`**: under it, the source's primary serves a fork's seeder, and the seeder serves the fork's other replicas, on `Replication.Snapshot`, each checked against the fork's full identity (ADR-0046, points 4.1 and 4.4). It also proposes that, from a fork's completion until it is ready, `replicas_of` (point 4) returns the fork's recorded holders rather than its ring's replica set (ADR-0046, point 3.10). Both are proposed, not part of this decision, until ADR-0046 is accepted. The text below is unchanged.
 
 ## Context
 
