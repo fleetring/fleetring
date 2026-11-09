@@ -11,7 +11,7 @@
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create or drop a database,
 //!   change its durability or its metadata, expire it, acquire or renew a lease, start a
 //!   promotion, record a fenced member, complete a promotion, tick, drain or undrain a member,
-//!   transfer a lease, or revoke a bearer token.
+//!   transfer a lease, revoke a bearer token, or create and drive a fork.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -66,14 +66,16 @@
 //!   only if its expiry is at or before the command's time; an expiry extended since wins.
 //!   [`State::expired_databases`] lists the databases due.
 //! - **Incarnations** (ADR-0046, point 1): each database has an [`Incarnation`], so a name
-//!   dropped and created again names a different database. They are assigned from a counter
-//!   that only grows, starting once the `fork` feature is enabled; until then every database
-//!   has the legacy incarnation 0 and control state is stored exactly as before.
+//!   dropped and created again names another life of it. The control node draws each one at
+//!   random and carries it in the creating command; `apply` stores it only once the `fork`
+//!   feature is enabled, so until then every database has the legacy incarnation 0 and control
+//!   state is stored exactly as before.
 //! - **Forks** (ADR-0046, [`fork`]): a database may be made as a copy of another. It takes no
-//!   lease until a write quorum of its replicas holds the copy, its first lease only on one of
-//!   them, and every command that drives it is fenced by its fork identity. Each fork is made by
-//!   an operation whose ID the client chooses; a resend of the same request returns the same
-//!   operation, and the operation's record is kept for a retention after its outcome.
+//!   lease until a completion quorum of its replicas holds the copy, keeps those holders as its
+//!   replica set until it is ready, takes its first lease only on one that still reports the
+//!   copy, and every command that drives it is fenced by its fork identity. Each fork is made by
+//!   an operation whose ID the client chooses; a resubmission of the same intent returns the
+//!   same operation, and the operation's record is kept for a retention after its outcome.
 //!
 //! # Examples
 //!

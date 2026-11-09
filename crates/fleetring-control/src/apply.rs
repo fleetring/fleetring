@@ -403,7 +403,7 @@ pub enum Applied {
         outcome: OperationOutcome,
     },
 
-    /// A fork's write quorum holds its copy: it is seeded.
+    /// A fork's completion quorum holds its copy: it is seeded.
     ForkSeeded {
         /// The fork.
         database: DatabaseName,
@@ -833,7 +833,7 @@ pub enum Rejection {
         current: Option<Incarnation>,
     },
 
-    /// Fewer replicas of a new fork than its write quorum have room for the copy, as far as
+    /// Fewer replicas of a new fork than its completion quorum have room for the copy, as far as
     /// their heartbeats say (ADR-0046, point 7.3).
     #[error("fork '{database}' needs room for its copy on {need} replicas; {admitting} have it")]
     InsufficientDisk {
@@ -841,7 +841,7 @@ pub enum Rejection {
         database: DatabaseName,
         /// How many replicas have room.
         admitting: usize,
-        /// The fork's write quorum.
+        /// The fork's completion quorum.
         need: u8,
     },
 
@@ -862,12 +862,12 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
-    /// A fork's completion names fewer holders than the fork's write quorum.
+    /// A fork's completion names fewer holders than its completion quorum.
     #[error("a fork needs {need} replicas holding its staged copy; {have} were named")]
     NotEnoughHolders {
         /// How many holders the command named.
         have: usize,
-        /// The fork's write quorum.
+        /// The fork's completion quorum.
         need: u8,
     },
 

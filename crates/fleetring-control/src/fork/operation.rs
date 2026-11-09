@@ -230,7 +230,7 @@ pub enum OperationOutcome {
         /// The current attempt.
         attempt: u32,
     },
-    /// A write quorum holds the copy; the fork's reset hasn't been recorded yet.
+    /// A completion quorum holds the copy; the fork's reset hasn't been recorded yet.
     Seeded,
     /// The fork is ready.
     Ready {
