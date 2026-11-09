@@ -142,14 +142,19 @@ pub struct Config {
 /// max_pins_per_node = 2               # pins a source's primary holds at once
 /// max_pins_per_database = 1           # pins of one source database at once
 /// max_seeds_per_node = 2              # staged copies a node downloads at once
+/// admission_min_free_bytes = 1073741824  # free bytes a copy must leave, at least
+/// admission_min_free_percent = 5      # free share of the volume a copy must leave, at least
 /// ```
 ///
 /// A pin past `max_pin_ms` or `max_pin_wal_bytes` ends its stream with `ABORTED` and is released:
 /// the source's writes always win over a fork. A request past `max_pin_ms_per_hour`,
 /// `max_pins_per_node`, `max_pins_per_database`, or `max_seeds_per_node` is refused with
-/// `RESOURCE_EXHAUSTED` and a retry-after, which doesn't fail the attempt. The control node's
-/// cap on fork operations it keeps, 10,000, and a data node's disk admission, room for the copy
-/// and a tenth more beside the larger of 1 GiB and 5% of the volume, are fixed.
+/// `RESOURCE_EXHAUSTED` and a retry-after, which doesn't fail the attempt. A data node admits a
+/// copy only with room for it and a tenth more beside the larger of `admission_min_free_bytes`
+/// and `admission_min_free_percent` of its volume; the control node's best-effort check counts
+/// its own `admission_min_free_bytes`, which it records with each fork. `fleetring dev` writes a
+/// small margin, since a laptop's disk is rarely 95% free. The control node's cap on fork
+/// operations it keeps, 10,000, is fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForkConfig {
@@ -187,6 +192,13 @@ pub struct ForkConfig {
     pub max_pins_per_database: NonZeroUsize,
     /// How many staged copies a node downloads at once.
     pub max_seeds_per_node: NonZeroUsize,
+    /// The fewest free bytes a data node keeps beside a fork's copy and a tenth more, whatever
+    /// its volume's size. The control node records its own with each fork it accepts, for its
+    /// best-effort check.
+    pub admission_min_free_bytes: u64,
+    /// The smallest share of its volume, in percent, a data node keeps free beside a fork's copy
+    /// and a tenth more. At most 100.
+    pub admission_min_free_percent: u8,
 }
 
 /// The `[fork]` defaults of ADR-0046, point 7, all provisional.
@@ -205,6 +217,8 @@ const DEFAULT_FORK_MAX_PIN_PER_HOUR: NonZeroU64 =
 const DEFAULT_FORK_MAX_PINS_PER_NODE: NonZeroUsize = NonZeroUsize::new(2).expect("nonzero");
 const DEFAULT_FORK_MAX_PINS_PER_DATABASE: NonZeroUsize = NonZeroUsize::new(1).expect("nonzero");
 const DEFAULT_FORK_MAX_SEEDS_PER_NODE: NonZeroUsize = NonZeroUsize::new(2).expect("nonzero");
+const DEFAULT_FORK_ADMISSION_MIN_FREE_BYTES: u64 = 1 << 30;
+const DEFAULT_FORK_ADMISSION_MIN_FREE_PERCENT: u8 = 5;
 
 impl ForkConfig {
     /// The limits the control node records with each fork it accepts (ADR-0046, point 3.1).
@@ -216,6 +230,10 @@ impl ForkConfig {
             attempt_timeout: Millis::new(self.attempt_timeout_ms.get()),
             seeder_timeout: Millis::new(self.seeder_timeout_ms.get()),
             operation_retention: Millis::new(self.operation_retention_ms.get()),
+            // The default isn't recorded, so that a fork made under it encodes as before.
+            admission_min_free_bytes: (self.admission_min_free_bytes
+                != DEFAULT_FORK_ADMISSION_MIN_FREE_BYTES)
+                .then_some(self.admission_min_free_bytes),
         }
     }
 
@@ -242,8 +260,9 @@ impl ForkConfig {
     /// # Errors
     ///
     /// [`ConfigError::Invalid`] if `seeder_timeout_ms` is above `attempt_timeout_ms`,
-    /// `attempt_timeout_ms` above `deadline_ms`, `max_pin_ms` above `max_pin_ms_per_hour`, or
-    /// `max_pins_per_database` above `max_pins_per_node`.
+    /// `attempt_timeout_ms` above `deadline_ms`, `max_pin_ms` above `max_pin_ms_per_hour`,
+    /// `max_pins_per_database` above `max_pins_per_node`, or `admission_min_free_percent` above
+    /// 100.
     fn validate(&self) -> Result<(), ConfigError> {
         let above = |field: &'static str, value: u64, other: &str, limit: u64| {
             Err(ConfigError::Invalid {
@@ -283,6 +302,15 @@ impl ForkConfig {
                 u64::try_from(self.max_pins_per_node.get()).unwrap_or(u64::MAX),
             );
         }
+        if self.admission_min_free_percent > 100 {
+            return Err(ConfigError::Invalid {
+                field: "fork.admission_min_free_percent",
+                reason: format!(
+                    "{} is above 100, the whole volume",
+                    self.admission_min_free_percent
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -303,6 +331,8 @@ impl Default for ForkConfig {
             max_pins_per_node: DEFAULT_FORK_MAX_PINS_PER_NODE,
             max_pins_per_database: DEFAULT_FORK_MAX_PINS_PER_DATABASE,
             max_seeds_per_node: DEFAULT_FORK_MAX_SEEDS_PER_NODE,
+            admission_min_free_bytes: DEFAULT_FORK_ADMISSION_MIN_FREE_BYTES,
+            admission_min_free_percent: DEFAULT_FORK_ADMISSION_MIN_FREE_PERCENT,
         }
     }
 }
@@ -1473,13 +1503,28 @@ mod tests {
                 attempt_timeout: Millis::new(3_000),
                 seeder_timeout: Millis::new(1_000),
                 operation_retention: Millis::new(60_000),
+                admission_min_free_bytes: None,
             }
+        );
+        let small =
+            with("\n[fork]\nadmission_min_free_bytes = 67108864\nadmission_min_free_percent = 0\n")
+                .expect("a small margin");
+        assert_eq!(small.fork.admission_min_free_bytes, 64 << 20);
+        assert_eq!(small.fork.admission_min_free_percent, 0);
+        assert_eq!(
+            small.fork.limits().admission_min_free_bytes,
+            Some(64 << 20),
+            "recorded with each fork"
         );
         for (table, field) in [
             ("seeder_timeout_ms = 3600000", "fork.seeder_timeout_ms"),
             ("attempt_timeout_ms = 7200000", "fork.attempt_timeout_ms"),
             ("max_pin_ms = 3600000", "fork.max_pin_ms"),
             ("max_pins_per_database = 3", "fork.max_pins_per_database"),
+            (
+                "admission_min_free_percent = 101",
+                "fork.admission_min_free_percent",
+            ),
         ] {
             let refused = with(&format!("\n[fork]\n{table}\n")).expect_err(table);
             let ConfigError::Invalid { field: named, .. } = &refused else {

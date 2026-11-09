@@ -58,10 +58,6 @@ pub use self::view::{DatabaseView, ForkPhase, ForkView};
 /// a call refused with `UNAVAILABLE` or `RESOURCE_EXHAUSTED` (ADR-0046, points 4.2, 6.2, and 7).
 pub const RETRY_AFTER_KEY: &str = "fleetring-retry-after-ms";
 
-/// The least a fork's admission leaves free beside the copy: the larger of this and 5% of the
-/// volume (ADR-0046, point 7).
-const HEADROOM_FLOOR: u64 = 1 << 30;
-
 /// What every refusal of a data call against a fork that isn't ready says, whichever node and
 /// whichever path refuses it (ADR-0046, point 6.2).
 pub const FORK_NOT_READY: &str = "fork not ready";
@@ -179,10 +175,12 @@ impl DiskSpace {
 }
 
 /// What a copy of `total_bytes` needs free on a volume of `volume` bytes, beyond what other
-/// copies reserved (ADR-0046, point 7): the copy and a tenth more, beside the larger of 1 GiB
-/// and 5% of the volume.
-pub(crate) fn admission_need(total_bytes: u64, volume: u64) -> u128 {
-    reservation(total_bytes) + u128::from(HEADROOM_FLOOR.max(volume / 20))
+/// copies reserved (ADR-0046, point 7): the copy and a tenth more, beside the larger of
+/// `[fork] admission_min_free_bytes` and `admission_min_free_percent` of the volume (1 GiB and
+/// 5% by default).
+pub(crate) fn admission_need(total_bytes: u64, volume: u64, config: &ForkConfig) -> u128 {
+    let share = u128::from(volume) * u128::from(config.admission_min_free_percent) / 100;
+    reservation(total_bytes) + share.max(u128::from(config.admission_min_free_bytes))
 }
 
 /// What admitting a copy of `total_bytes` reserves until it is staged: the copy and a tenth.
@@ -367,6 +365,7 @@ impl Forks {
         total_bytes: u64,
     ) -> Result<Reservation, Refused> {
         let space = self.disk_space();
+        let config = self.config();
         {
             let mut ledger = self.lock_ledger();
             if let Some(space) = space {
@@ -377,7 +376,7 @@ impl Forks {
                     .map(|(_, bytes)| *bytes)
                     .sum();
                 let available = u128::from(space.free).saturating_sub(reserved);
-                if available < admission_need(total_bytes, space.volume) {
+                if available < admission_need(total_bytes, space.volume, &config) {
                     return Err(Refused::Disk);
                 }
             }
@@ -1006,8 +1005,19 @@ mod tests {
     #[test]
     fn admission_leaves_room_beside_the_copy() {
         // A tenth more than the copy, beside 1 GiB on a small volume and 5% on a large one.
-        assert_eq!(admission_need(1_000, 1 << 20), 1_100 + (1 << 30));
-        assert_eq!(admission_need(1_000, 100 << 30), 1_100 + (5 << 30));
+        let defaults = ForkConfig::default();
+        assert_eq!(admission_need(1_000, 1 << 20, &defaults), 1_100 + (1 << 30));
+        assert_eq!(
+            admission_need(1_000, 100 << 30, &defaults),
+            1_100 + (5 << 30)
+        );
+        // A dev node's small margin: 64 MiB, whatever the volume.
+        let dev = ForkConfig {
+            admission_min_free_bytes: 64 << 20,
+            admission_min_free_percent: 0,
+            ..ForkConfig::default()
+        };
+        assert_eq!(admission_need(1_000, 926 << 30, &dev), 1_100 + (64 << 20));
     }
 
     #[test]

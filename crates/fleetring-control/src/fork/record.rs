@@ -56,6 +56,12 @@ pub struct ForkLimits {
     pub seeder_timeout: Millis,
     /// How long the operation's record, and so its deduplication, outlives its final outcome.
     pub operation_retention: Millis,
+    /// The free bytes a replica must keep beyond the fork's copy for the control plane's
+    /// best-effort disk admission to count it (ADR-0046, point 7.3), or `None` for the default,
+    /// 1 GiB. The proposing node's `[fork] admission_min_free_bytes`, so that a dev node, which
+    /// keeps a small margin, admits as its data side does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_min_free_bytes: Option<u64>,
 }
 
 impl ForkLimits {
@@ -69,7 +75,17 @@ impl ForkLimits {
             attempt_timeout: DEFAULT_ATTEMPT_TIMEOUT,
             seeder_timeout: DEFAULT_SEEDER_TIMEOUT,
             operation_retention: DEFAULT_OPERATION_RETENTION,
+            admission_min_free_bytes: None,
         }
+    }
+
+    /// The free bytes a replica must keep beyond the fork's copy for the control plane's disk
+    /// admission to count it: [`admission_min_free_bytes`](Self::admission_min_free_bytes), or
+    /// 1 GiB by default.
+    #[must_use]
+    pub fn admission_floor(&self) -> u64 {
+        self.admission_min_free_bytes
+            .unwrap_or(super::rules::ADMISSION_HEADROOM)
     }
 }
 
