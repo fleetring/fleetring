@@ -1279,9 +1279,10 @@ fn cert_client_and_token_issue_refuse_reserved_dotted_agents() -> TestResult {
 }
 
 /// `fork` and `grant` are actions since 0.8 (ADR-0044, point 2), so `token issue` and
-/// `agent add` mint them, with a note that nodes before 0.8 refuse such a token.
+/// `agent add` mint them, and `agent renew` re-mints them, with a note that nodes before 0.8
+/// refuse such a token.
 #[test]
-fn token_issue_and_agent_add_mint_fork_and_grant_with_a_note() -> TestResult {
+fn token_issue_agent_add_and_renew_mint_fork_and_grant_with_a_note() -> TestResult {
     const NOTE: &str = "note: nodes before 0.8 refuse this token, since it carries fork or grant";
     let machine = Machine::new()?;
     let tls = machine.home().join("prod-tls");
@@ -1348,6 +1349,23 @@ fn token_issue_and_agent_add_mint_fork_and_grant_with_a_note() -> TestResult {
     let defaults = machine.run(&["agent", "add", "43"])?;
     assert!(defaults.status.success(), "{}", printed(&defaults));
     assert!(!stderr(&defaults).contains(NOTE), "{}", printed(&defaults));
+
+    // A renewal re-mints the recorded scopes, and notes them the same way.
+    let renewed = machine.run(&["agent", "renew", "42"])?;
+    assert!(renewed.status.success(), "{}", printed(&renewed));
+    assert_eq!(
+        stderr(&renewed).matches(NOTE).count(),
+        1,
+        "{}",
+        printed(&renewed)
+    );
+    assert_eq!(
+        token_scopes(&machine.token("42")?)?,
+        ["admin:agent-42-*", "grant:agent-42.*"]
+    );
+    let plain = machine.run(&["agent", "renew", "43"])?;
+    assert!(plain.status.success(), "{}", printed(&plain));
+    assert!(!stderr(&plain).contains(NOTE), "{}", printed(&plain));
     Ok(())
 }
 
