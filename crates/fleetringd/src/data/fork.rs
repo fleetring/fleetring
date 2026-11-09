@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::fork::{CopyLost, ForkIdentity, ResetReport};
+use fleetring_control::fork::{CopyLost, ForkIdentity, PlacementCaughtUp, ResetReport};
 use fleetring_control::{Acks, DatabaseName, LeaseEpoch, Quorums};
 use fleetring_proto::v1::{AcquireLeaseRequest, Placement};
 use tokio::task::JoinHandle;
@@ -116,8 +116,19 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
         Err(status) => return Err(status),
     };
     let view = view_from_placement(&placement)?;
+    if let Some(fork) = view
+        .fork
+        .as_ref()
+        .filter(|fork| matches!(fork.phase, ForkPhase::Ready { .. }))
+    {
+        forks
+            .faults()
+            .pass(FaultPoint::FollowReady, fork.identity.operation)
+            .await;
+    }
     // A seeded fork's replica set is its recorded holders until this node sees it ready, its
-    // gate open or not (ADR-0046, point 3.10).
+    // gate open or not, and a ready fork's until control state releases them (ADR-0046, point
+    // 3.10).
     forks.follow_view(name, view.fork.as_ref());
     let Some(fork) = view.fork else {
         forks.observe(name, None);
@@ -125,8 +136,10 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
         mark_orphans(node, name, None);
         return Ok(());
     };
-    // A fork that is ready or failed needs no more reports from this node.
-    forks.observe(name, fork.is_pending().then_some(&fork.identity));
+    // A fork that is ready, its holders released, or failed needs no more reports from this
+    // node.
+    let reporting = fork.is_pending() || fork.keeps_holders();
+    forks.observe(name, reporting.then_some(&fork.identity));
     signals(node, &fork).await;
     match &fork.phase {
         ForkPhase::Seeding {
@@ -173,9 +186,33 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
                 _ => {}
             }
         }
+        ForkPhase::Ready { holders: Some(_) } => {
+            forks.abandon_seeds(name, None);
+            report_placement_caught_up(node, &fork.identity);
+        }
         _ => forks.abandon_seeds(name, None),
     }
     Ok(())
+}
+
+/// Reports that placement caught up with this node's primary of the ready fork `fork`, once it
+/// does: while the fork keeps its recorded holders, the primary counts both their write quorum
+/// and placement's toward every write, and once placement's holds everything the primary has
+/// committed, every write it acknowledged reaches a quorum of either (ADR-0046, point 3.10, as
+/// built). The fork's view was followed before this, so every write committed after the check
+/// counted both.
+fn report_placement_caught_up(node: &DataNode, fork: &ForkIdentity) {
+    let replication = node.replication();
+    let caught_up = replication
+        .placement_caught_up(&fork.name)
+        .map(|epoch| PlacementCaughtUp::new(fork.clone(), epoch));
+    let forks = replication.forks();
+    if let Some(caught_up) = &caught_up
+        && forks.placement_caught_up(&fork.name).as_ref() != Some(caught_up)
+    {
+        tracing::info!(target: "fleetringd::audit", %fork, epoch = caught_up.epoch().get(), "placement's write quorum holds the ready fork's log; its holders may be released");
+    }
+    forks.report_placement_caught_up(&fork.name, caught_up);
 }
 
 /// The first holder the placement shows live, in its order: the one that takes a seeded fork's
@@ -205,7 +242,7 @@ async fn signals(node: &DataNode, fork: &ForkView) {
         store.confirm(&key);
         let signal = match &fork.phase {
             ForkPhase::Failed => Some("the fork failed"),
-            ForkPhase::Ready => Some("the fork is ready"),
+            ForkPhase::Ready { .. } => Some("the fork is ready"),
             ForkPhase::Seeding { attempt, .. } if key.attempt < *attempt => Some("a later attempt"),
             ForkPhase::Seeded { attempt, .. } if key.attempt < *attempt => Some("a later attempt"),
             ForkPhase::Seeded {
@@ -471,7 +508,11 @@ async fn try_open(
         Status::unavailable(format!("can't read the fork marker of {name}: {error}"))
     };
     match &fork.phase {
-        ForkPhase::Ready => {
+        ForkPhase::Ready { .. } => {
+            // A primary that may serve clients counts every replica set a promotion may fence
+            // for their writes: the holders a ready fork keeps, with placement, until they are
+            // released (ADR-0046, point 3.10, as built).
+            node.replication().forks().follow_view(name, Some(&fork));
             let held = handle.fork_marker().await.map_err(marker_status)?;
             let ours = held.is_some_and(|marker| {
                 marker.fork_incarnation == fork.identity.incarnation.get()

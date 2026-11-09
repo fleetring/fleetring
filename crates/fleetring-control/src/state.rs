@@ -388,8 +388,9 @@ impl State {
     /// promotions (ADR-0006, ADR-0018).
     ///
     /// A seeded fork's replica set is frozen at its holders, in ID order, until it is ready:
-    /// placement changes don't move a copy that isn't ready yet (ADR-0046, point 3.10). From
-    /// then on it follows the ring like any database.
+    /// placement changes don't move a copy that isn't ready yet (ADR-0046, point 3.10). A ready
+    /// fork keeps them until they are released, once its primary reports that placement's write
+    /// quorum holds its log, and from then on it follows the ring like any database.
     ///
     /// # Errors
     ///
@@ -397,10 +398,16 @@ impl State {
     /// [`Rejection::NoMembers`] if the fleet is empty.
     pub fn replica_set(&self, database: &DatabaseName) -> Result<Vec<NodeId>, Rejection> {
         let db = self.database_or_reject(database)?;
-        if let Some(ForkState::Seeded { holders, .. }) = db.fork().map(|fork| fork.state()) {
-            return Ok(holders.iter().cloned().collect());
+        match db.fork().map(|fork| fork.state()) {
+            Some(
+                ForkState::Seeded { holders, .. }
+                | ForkState::Ready {
+                    holders: Some(holders),
+                    ..
+                },
+            ) => Ok(holders.iter().cloned().collect()),
+            _ => self.placed_replicas(db),
         }
-        self.placed_replicas(db)
     }
 
     /// Returns where placement puts `db`: the ring's replica set over all members, ignoring a

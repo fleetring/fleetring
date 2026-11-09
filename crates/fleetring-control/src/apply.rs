@@ -217,6 +217,9 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             epoch,
             reset_position,
         } => forks::mark_fork_ready(state, now, &fork, epoch, reset_position),
+        Action::ReleaseForkHolders { fork, epoch } => {
+            forks::release_fork_holders(state, &fork, epoch)
+        }
     }?;
     state.features.extend(features.iter().copied());
     state.now = now;
@@ -458,6 +461,14 @@ pub enum Applied {
         epoch: LeaseEpoch,
         /// The reset write's position.
         reset_position: Position,
+    },
+
+    /// A ready fork's recorded holders are released: its replica set follows placement.
+    ForkHoldersReleased {
+        /// The fork.
+        database: DatabaseName,
+        /// The epoch of the primary that reported placement caught up.
+        epoch: LeaseEpoch,
     },
 }
 
@@ -969,6 +980,17 @@ pub enum Rejection {
         database: DatabaseName,
         /// The completion quorum.
         needed: usize,
+    },
+
+    /// A ready fork's holders are released only while it keeps them, and only once its lease
+    /// holder reports, at the lease's epoch, that placement's write quorum holds its log.
+    #[error(
+        "fork '{database}' keeps no holders to release, or its primary hasn't reported that \
+         placement holds its log"
+    )]
+    HoldersNotReleasable {
+        /// The fork.
+        database: DatabaseName,
     },
 
     /// A fork's durability can't change until it is ready: its completion counted holders

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use fleetring::NodeId;
 use fleetring_control::fork::{
     CancelCause, ChainHash, CopyLossReason, CopyLost, Fork, ForkExpiry, ForkFailure, ForkIdentity,
-    ForkIntent, ForkState, OperationId, OperationOutcome, OperationRecord, ResetReport, RetryCause,
-    SeedFailure, SeedFailureReason, StagedCopy, completion_quorum,
+    ForkIntent, ForkState, OperationId, OperationOutcome, OperationRecord, PlacementCaughtUp,
+    ResetReport, RetryCause, SeedFailure, SeedFailureReason, StagedCopy, completion_quorum,
 };
 use fleetring_control::{
     Database, DatabaseName, HostedReplica, Incarnation, LeaseEpoch, Position, ReplicaRole, Report,
@@ -165,6 +165,13 @@ pub(crate) fn replica_from_proto(
             ResetReport::running(fork, epoch, position)
         });
     }
+    if let Some(caught_up) = status.placement_caught_up {
+        let fork = identity(caught_up.fork_incarnation, &caught_up.operation)?;
+        replica = replica.with_placement_caught_up(PlacementCaughtUp::new(
+            fork,
+            LeaseEpoch::new(caught_up.epoch),
+        ));
+    }
     let progress = status
         .seed_progress
         .map(|progress| {
@@ -260,6 +267,13 @@ pub(crate) fn replica_to_proto(
             total_bytes: progress.total_bytes,
         }),
         size_bytes: replica.size_bytes(),
+        placement_caught_up: replica.placement_caught_up().map(|caught_up| {
+            proto::PlacementCaughtUp {
+                fork_incarnation: incarnation(caught_up.fork()),
+                operation: operation(caught_up.fork()),
+                epoch: caught_up.epoch().get(),
+            }
+        }),
     }
 }
 
@@ -451,7 +465,11 @@ pub(crate) fn fork_status(
             reset_epoch,
             reset_position,
             ready_at,
+            holders,
         } => {
+            // Holders kept past readiness stay the replica set until they are released
+            // (ADR-0046, point 3.10, as built); none once they are.
+            status.holders = holders.as_ref().map(names).unwrap_or_default();
             status.position = Some(at.as_bytes().to_vec());
             status.chain_hash = Some(chain_hash.as_bytes().to_vec());
             status.completed_at_ms = Some(completed_at.as_millis());

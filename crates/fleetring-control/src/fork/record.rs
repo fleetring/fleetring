@@ -275,7 +275,7 @@ pub enum ForkState {
     },
     /// The fork's primary committed the fork-reset write at the bootstrap quorum. Clients,
     /// `db watch`, and sinks are served; from here on it is an ordinary database, and its
-    /// replica set follows placement.
+    /// replica set follows placement once its recorded holders are released.
     Ready {
         /// The source position the copy holds.
         at: Position,
@@ -289,6 +289,13 @@ pub enum ForkState {
         reset_position: Position,
         /// When the fork was recorded as ready.
         ready_at: Timestamp,
+        /// The recorded holders, which stay the fork's replica set until its primary reports
+        /// that placement's write quorum holds its log and `ReleaseForkHolders` releases them,
+        /// so that a promotion fences a quorum of every set the primary may have counted
+        /// (ADR-0046, point 3.10, as built). `None` once released, and in a state written
+        /// before holders were kept past readiness.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holders: Option<BTreeSet<NodeId>>,
     },
     /// The fork failed for good: it is never leased or served, and only `db drop` removes it.
     Failed {

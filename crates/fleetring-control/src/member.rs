@@ -3,7 +3,7 @@
 use fleetring::{Host, Node, NodeId, Weight, Zone};
 use serde::{Deserialize, Serialize};
 
-use crate::fork::{CopyLost, ResetReport, SeedFailure, StagedCopy};
+use crate::fork::{CopyLost, PlacementCaughtUp, ResetReport, SeedFailure, StagedCopy};
 use crate::{DatabaseName, LeaseEpoch, Position, Software, Timestamp};
 
 /// A member's placement attributes, the ID, zone, host, and weight that the ring places by, and
@@ -226,6 +226,9 @@ pub struct HostedReplica {
     seed_failure: Option<SeedFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reset: Option<ResetReport>,
+    // Absent from logs and states written before ready forks released their holders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement_caught_up: Option<PlacementCaughtUp>,
 }
 
 fn is_zero(epoch: &LeaseEpoch) -> bool {
@@ -247,6 +250,7 @@ impl HostedReplica {
             copy_lost: None,
             seed_failure: None,
             reset: None,
+            placement_caught_up: None,
         }
     }
 
@@ -294,6 +298,14 @@ impl HostedReplica {
     #[must_use]
     pub fn with_reset(mut self, reset: ResetReport) -> Self {
         self.reset = Some(reset);
+        self
+    }
+
+    /// Says that the replica, a ready fork's primary, has placement's write quorum holding its
+    /// log (ADR-0046, point 3.10, as built).
+    #[must_use]
+    pub fn with_placement_caught_up(mut self, caught_up: PlacementCaughtUp) -> Self {
+        self.placement_caught_up = Some(caught_up);
         self
     }
 
@@ -351,6 +363,13 @@ impl HostedReplica {
         self.reset.as_ref()
     }
 
+    /// Returns whether placement's write quorum holds the log of the ready fork the replica
+    /// leads, if it reported it.
+    #[must_use]
+    pub fn placement_caught_up(&self) -> Option<&PlacementCaughtUp> {
+        self.placement_caught_up.as_ref()
+    }
+
     /// Returns the report, keeping what it says about forks only if `forks` says so: before the
     /// `fork` feature is enabled those fields are dropped, so control state stays as it was.
     pub(crate) fn into_report(self, at: Timestamp, forks: ForkReports) -> (DatabaseName, Report) {
@@ -364,6 +383,7 @@ impl HostedReplica {
             copy_lost: self.copy_lost,
             seed_failure: self.seed_failure,
             reset: self.reset,
+            placement_caught_up: self.placement_caught_up,
         };
         let report = match forks {
             ForkReports::Record => report,
@@ -373,6 +393,7 @@ impl HostedReplica {
                 copy_lost: None,
                 seed_failure: None,
                 reset: None,
+                placement_caught_up: None,
                 ..report
             },
         };
@@ -409,6 +430,9 @@ pub struct Report {
     seed_failure: Option<SeedFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reset: Option<ResetReport>,
+    // Absent from logs and states written before ready forks released their holders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement_caught_up: Option<PlacementCaughtUp>,
 }
 
 impl Report {
@@ -465,5 +489,12 @@ impl Report {
     #[must_use]
     pub fn reset(&self) -> Option<&ResetReport> {
         self.reset.as_ref()
+    }
+
+    /// Returns whether placement's write quorum holds the log of the ready fork the member
+    /// leads, if it reported it.
+    #[must_use]
+    pub fn placement_caught_up(&self) -> Option<&PlacementCaughtUp> {
+        self.placement_caught_up.as_ref()
     }
 }

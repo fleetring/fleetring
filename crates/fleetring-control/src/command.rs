@@ -419,8 +419,9 @@ pub enum Action {
     },
 
     /// Records that a seeded fork's primary committed the fork-reset write (ADR-0046, point
-    /// 3.7): the fork becomes ready, and its replica set follows placement again. It mirrors the
-    /// marker in the database, which decides.
+    /// 3.7): the fork becomes ready. Its replica set stays its recorded holders until
+    /// [`Action::ReleaseForkHolders`], and follows placement from then on. It mirrors the marker
+    /// in the database, which decides.
     ///
     /// Accepted only for the current fork identity, while seeded, for an epoch the database
     /// has issued, when at least the bootstrap quorum W_boot = max(⌊R/2⌋ + 1, W) of its replica
@@ -433,6 +434,23 @@ pub enum Action {
         epoch: LeaseEpoch,
         /// The reset write's position.
         reset_position: Position,
+    },
+
+    /// Moves a ready fork's replica set from its recorded holders to placement (ADR-0046, point
+    /// 3.10, as built), once its primary reports that placement's write quorum holds its log and
+    /// that it counts both its holders' and placement's write quorums toward every write. Until
+    /// then a promotion fences a quorum of the holders, which every write the primary
+    /// acknowledged reached; from then on one of placement, which every write did too.
+    ///
+    /// Accepted only for the current fork identity, while ready with its holders kept, at the
+    /// epoch of the database's lease when no promotion is in progress, and only when the lease
+    /// holder's latest report says placement caught up at that epoch. Proposed by the control
+    /// node's fork driver only. Needs [`Feature::Fork`].
+    ReleaseForkHolders {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The epoch of the primary that reported placement caught up.
+        epoch: LeaseEpoch,
     },
 }
 
@@ -494,7 +512,8 @@ impl Action {
             | Self::RecordForkDiskRefusal { .. }
             | Self::FailFork { .. }
             | Self::DropForkHolder { .. }
-            | Self::MarkForkReady { .. } => FORK,
+            | Self::MarkForkReady { .. }
+            | Self::ReleaseForkHolders { .. } => FORK,
             _ => &[],
         }
     }
@@ -509,7 +528,8 @@ impl Action {
             | Self::RecordForkDiskRefusal { fork, .. }
             | Self::FailFork { fork, .. }
             | Self::DropForkHolder { fork, .. }
-            | Self::MarkForkReady { fork, .. } => Some(fork),
+            | Self::MarkForkReady { fork, .. }
+            | Self::ReleaseForkHolders { fork, .. } => Some(fork),
             _ => None,
         }
     }

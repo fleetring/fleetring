@@ -178,6 +178,7 @@ const _: () = {
     assert_debug_send_sync::<fork::OperationOutcome>();
     assert_debug_send_sync::<fork::OperationRecord>();
     assert_debug_send_sync::<fork::ParseOperationIdError>();
+    assert_debug_send_sync::<fork::PlacementCaughtUp>();
     assert_debug_send_sync::<fork::ResetReport>();
     assert_debug_send_sync::<fork::RetryCause>();
     assert_debug_send_sync::<fork::SeedFailure>();

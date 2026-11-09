@@ -335,3 +335,45 @@ impl ResetReport {
         self.progress == ResetProgress::Committed
     }
 }
+
+/// A ready fork's primary reports that placement's write quorum holds its whole log, and that
+/// it counts both its recorded holders' and placement's write quorums toward every write from
+/// now on (ADR-0046, point 3.10, as built). `ReleaseForkHolders` needs this report from the
+/// lease holder at the current epoch before the fork's replica set leaves its holders.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring_control::{Incarnation, LeaseEpoch};
+/// use fleetring_control::fork::{ForkIdentity, OperationId, PlacementCaughtUp};
+///
+/// let fork = ForkIdentity::new("t".parse()?, Incarnation::new(3), OperationId::from_bytes([1; 16]));
+/// let caught_up = PlacementCaughtUp::new(fork, LeaseEpoch::new(2));
+/// assert_eq!(caught_up.epoch(), LeaseEpoch::new(2));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementCaughtUp {
+    fork: ForkIdentity,
+    epoch: LeaseEpoch,
+}
+
+impl PlacementCaughtUp {
+    /// The primary of `fork` at `epoch` has placement's write quorum holding its log.
+    #[must_use]
+    pub fn new(fork: ForkIdentity, epoch: LeaseEpoch) -> Self {
+        Self { fork, epoch }
+    }
+
+    /// Returns the fork the report is about.
+    #[must_use]
+    pub fn fork(&self) -> &ForkIdentity {
+        &self.fork
+    }
+
+    /// Returns the lease epoch of the primary that reports it.
+    #[must_use]
+    pub fn epoch(&self) -> LeaseEpoch {
+        self.epoch
+    }
+}
