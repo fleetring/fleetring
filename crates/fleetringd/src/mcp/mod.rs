@@ -1,8 +1,8 @@
 //! `fleetringd mcp`: an MCP server over stdio, acting as one principal (ADR-0041, point 9).
 //!
 //! The server speaks the Model Context Protocol as newline-delimited JSON-RPC on stdin and
-//! stdout, so stdout carries the protocol and nothing else; logs go to stderr. It offers eight
-//! tools (`db_create`, `db_list`, `db_show`, `query`, `changes`, `exec`, `db_update`, and
+//! stdout, so stdout carries the protocol and nothing else; logs go to stderr. It offers nine
+//! tools (`db_create`, `db_fork`, `db_list`, `db_show`, `query`, `changes`, `exec`, `db_update`, and
 //! `db_drop`), or the four that read with [`Access::ReadOnly`].
 //!
 //! - **One principal.** Every tool call goes through a [`Client`], as every command's calls

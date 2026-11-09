@@ -34,11 +34,13 @@ use tokio::time::Instant;
 use crate::clock::{Clock as _, SystemClock};
 use crate::data::{
     ChangeUpdate, ChangeUpdates, Client, DatabaseSpec, Descriptions, Expiry, ExpiryRequest,
-    LabelRequirement, ListFilter, NewMetadata,
+    ForkSpec, LabelRequirement, ListFilter, NewMetadata,
 };
 use crate::engine::{
     CaptureMode, Internal, MAX_COUNT_LIMIT, Position, SchemaRequest, Statement, Value,
 };
+use crate::fork_flow::{self, Followed, ResendPolicy, SubmitError};
+use crate::fork_report::fork_report;
 use crate::mcp::limits::{
     CALL_TIMEOUT, CHANGES_QUIET, CHANGES_WAIT, DEFAULT_CHANGES_LIMIT, DEFAULT_COUNT_LIMIT,
     DEFAULT_LIST_LIMIT, DEFAULT_MAX_ROWS, MAX_CHANGES_LIMIT, MAX_CHANGES_ROWS,
@@ -46,16 +48,17 @@ use crate::mcp::limits::{
     MAX_SQL_BYTES, STATEMENT_TIMEOUT,
 };
 use crate::mcp::render::{
-    Budget, NOTICE, PAGE_HINT, database_out, fit, fit_changes, fit_listing, list_out, metadata_out,
-    query_out, text, text_len, transaction_out,
+    Budget, NOTICE, PAGE_HINT, database_out, fit, fit_changes, fit_listing, fork_result_out,
+    list_out, metadata_out, query_out, text, text_len, transaction_out,
 };
 use crate::mcp::tools::{
-    ChangesInput, ChangesOut, DatabaseOut, DbCreateInput, DbDropInput, DbListInput, DbShowInput,
-    DbUpdateInput, DropOut, ErrorBody, ErrorOut, ExecInput, ExecOut, ListOut, QueryInput, QueryOut,
-    SqlValue, TransactionOut, UntrustedText, UpdateOut,
+    ChangesInput, ChangesOut, DatabaseOut, DbCreateInput, DbDropInput, DbForkInput, DbListInput,
+    DbShowInput, DbUpdateInput, DropOut, ErrorBody, ErrorOut, ExecInput, ExecOut, ForkResultOut,
+    ListOut, QueryInput, QueryOut, SqlValue, TransactionOut, UntrustedText, UpdateOut,
 };
 use crate::mcp::{Access, McpSettings};
 use crate::report::{database_report, schema_report, schema_unavailable};
+use fleetring_control::fork::OperationId;
 
 /// What the server tells a client about itself when the session starts. Fixed text: it says
 /// what every result's notice says, and where the conventions are (ADR-0041, point 9).
@@ -86,6 +89,7 @@ const SCHEMA_KEY_SLACK: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ToolName {
     DbCreate,
+    DbFork,
     DbList,
     DbShow,
     Query,
@@ -97,8 +101,9 @@ pub(crate) enum ToolName {
 
 impl ToolName {
     /// Every tool, in the order `tools/list` lists them.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::DbCreate,
+        Self::DbFork,
         Self::DbList,
         Self::DbShow,
         Self::Query,
@@ -111,6 +116,7 @@ impl ToolName {
     fn name(self) -> &'static str {
         match self {
             Self::DbCreate => "db_create",
+            Self::DbFork => "db_fork",
             Self::DbList => "db_list",
             Self::DbShow => "db_show",
             Self::Query => "query",
@@ -130,6 +136,16 @@ impl ToolName {
                  scope, such as agent-42-notes. An expiry drops the database, every copy, once \
                  it passes: give scratch and task databases a generous one and extend it with \
                  db_update while working."
+            }
+            Self::DbFork => {
+                "Forks a database: makes a new database holding the source's current contents, \
+                 independent of it from then on, and waits up to a minute for it to be ready. \
+                 Only the status ready means the new database can be used; seeding or seeded \
+                 means it cannot yet: check db_show later, or call db_fork again with the \
+                 returned operation_id and the same arguments to wait for it. Nothing is copied \
+                 from the source's description or labels. This principal needs admin on the \
+                 source and on the new name. Dropping the new database cancels a fork in \
+                 progress."
             }
             Self::DbList => {
                 "Lists the databases this principal may read, in name order, with each one's \
@@ -206,7 +222,7 @@ impl ToolName {
             .read_only(self.reads_only())
             .open_world(false);
         match self {
-            Self::DbCreate => annotations.destructive(false),
+            Self::DbCreate | Self::DbFork => annotations.destructive(false),
             Self::DbUpdate => annotations.idempotent(true),
             Self::DbDrop => annotations.destructive(true),
             Self::DbList | Self::DbShow | Self::Query | Self::Changes | Self::Exec => annotations,
@@ -216,6 +232,7 @@ impl ToolName {
     fn definition(self) -> Tool {
         let (input, output) = match self {
             Self::DbCreate => (input::<DbCreateInput>(), output::<DatabaseOut>()),
+            Self::DbFork => (input::<DbForkInput>(), output::<ForkResultOut>()),
             Self::DbList => (input::<DbListInput>(), output::<ListOut>()),
             Self::DbShow => (input::<DbShowInput>(), output::<DatabaseOut>()),
             Self::Query => (input::<QueryInput>(), output::<QueryOut>()),
@@ -299,6 +316,20 @@ fn unwrapped(schema: &JsonObject) -> Arc<JsonObject> {
     }
 }
 
+/// How long `db_fork` may spend sending its request again after a lost reply.
+const FORK_RESEND_WINDOW: Duration = Duration::from_secs(10);
+
+/// What `db_fork` leaves of its call's time for building the result.
+const FORK_MARGIN: Duration = Duration::from_secs(5);
+
+/// A new operation ID from the operating system's randomness.
+fn new_operation_id() -> Result<OperationId, Failed> {
+    let mut bytes = [0_u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes)
+        .map_err(|_| Failed::Status(Status::internal("no randomness for the operation ID")))?;
+    Ok(OperationId::from_bytes(bytes))
+}
+
 /// The MCP server: one fleet, one principal.
 #[derive(Debug)]
 pub(crate) struct FleetringMcp {
@@ -332,6 +363,7 @@ impl FleetringMcp {
     ) -> Result<serde_json::Value, Failed> {
         match tool {
             ToolName::DbCreate => json(&self.db_create(parse(arguments)?).await?),
+            ToolName::DbFork => json(&self.db_fork(parse(arguments)?).await?),
             ToolName::DbList => json(&self.db_list(parse(arguments)?).await?),
             ToolName::DbShow => json(&self.db_show(parse(arguments)?).await?),
             ToolName::Query => json(&self.query(parse(arguments)?).await?),
@@ -388,6 +420,109 @@ impl FleetringMcp {
             self.me(),
             now,
         ))
+    }
+
+    async fn db_fork(&self, input: DbForkInput) -> Result<ForkResultOut, Failed> {
+        let started = tokio::time::Instant::now();
+        let source = database_name(&input.source)?;
+        let name = database_name(&input.name)?;
+        let operation = match input.operation_id.as_deref() {
+            Some(text) => text
+                .parse::<OperationId>()
+                .map_err(|error| Failed::Input(format!("invalid operation_id: {error}")))?,
+            None => new_operation_id()?,
+        };
+        let description = input
+            .description
+            .map(|text| text.parse::<Description>())
+            .transpose()
+            .map_err(|error| Failed::Input(format!("invalid description: {error}")))?;
+        let labels = labels(input.labels.unwrap_or_default())?;
+        let expiry = match expiry(input.expires_in.as_deref(), input.expires_at.as_deref())? {
+            ExpiryRequest::Keep => None,
+            ExpiryRequest::In(duration) => Some(Expiry::In(duration)),
+            ExpiryRequest::At(at) => Some(Expiry::At(at)),
+            ExpiryRequest::Clear => {
+                return Err(Failed::Input(
+                    "a new database has no expiry to remove: leave expires_in out".to_owned(),
+                ));
+            }
+        };
+        let mut spec = ForkSpec::new(operation);
+        spec.database = match input.replication_factor {
+            None => DatabaseSpec::default(),
+            Some(factor) => DatabaseSpec::new(ReplicationFactor::new(factor).ok_or_else(|| {
+                Failed::Input("replication_factor must be at least 1".to_owned())
+            })?),
+        };
+        spec.metadata = NewMetadata {
+            description,
+            labels,
+            expiry,
+        };
+        // A resumed operation the control plane knows is followed, and resends nothing.
+        let known = if input.operation_id.is_some() {
+            match self.client.fork_operation(operation).await {
+                Ok(status) => {
+                    if let Some(found) = status.request.as_ref().and_then(|request| {
+                        fork_flow::difference(request, source.as_str(), name.as_str(), &spec)
+                    }) {
+                        return Err(Failed::Input(format!(
+                            "operation {operation} was requested with {found}"
+                        )));
+                    }
+                    Some(status)
+                }
+                Err(status) if status.code() == tonic::Code::NotFound => None,
+                Err(status) => return Err(Failed::status(status)),
+            }
+        } else {
+            None
+        };
+        let first = match known {
+            Some(status) => status,
+            None => {
+                let policy = ResendPolicy::new(
+                    fork_flow::MAX_RESENDS,
+                    FORK_RESEND_WINDOW,
+                    Duration::from_millis(250),
+                );
+                fork_flow::submit(policy, || self.client.fork_database(&source, &name, &spec))
+                    .await
+                    .map_err(|error| match error {
+                        SubmitError::Refused(status)
+                        | SubmitError::Unavailable { last: status, .. } => Failed::status(status),
+                    })?
+            }
+        };
+        let wait = CALL_TIMEOUT
+            .saturating_sub(FORK_RESEND_WINDOW)
+            .saturating_sub(FORK_MARGIN);
+        let status = match fork_flow::follow(
+            first,
+            || self.client.fork_operation(operation),
+            fork_flow::POLL_INTERVAL,
+            wait,
+            |_| {},
+        )
+        .await
+        .map_err(Failed::status)?
+        {
+            Followed::Finished(status) | Followed::TimedOut(status) => status,
+        };
+        let mut out = fork_result_out(&fork_report(&status, started.elapsed()));
+        if out.ready
+            && let Ok(location) = self.client.locate(&name).await
+        {
+            let now = SystemClock.now();
+            out.database = Some(database_out(
+                database_report(&location, now),
+                location.metadata.as_ref(),
+                self.me(),
+                now,
+            ));
+        }
+        Ok(out)
     }
 
     async fn db_list(&self, input: DbListInput) -> Result<ListOut, Failed> {
