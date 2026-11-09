@@ -23,7 +23,7 @@ use crate::layout;
 use crate::replication::{Replication, ReplicationSettings};
 use crate::sim::SimRng;
 use crate::sim::check::{self, ControlLog, ReplicaChains, ReplicaRows, Violation};
-use crate::sim::client::{Session, WatcherSession, run_client, run_lease_watcher};
+use crate::sim::client::{Session, Via, WatcherSession, run_client, run_lease_watcher};
 use crate::sim::fault::{Fault, LossRate};
 use crate::sim::history::{self, Guarantee, Replicated};
 use crate::sim::host::{Shared, WorkloadState, run_host};
@@ -35,6 +35,13 @@ use crate::{
     Config, ControlSettings, Membership, MembershipSettings, NodeConfig, NodeRole,
     ReplicationConfig,
 };
+
+/// The port a simulated router serves Hrana on ([`FleetBuilder::router`]).
+pub const ROUTER_PORT: u16 = 8080;
+
+/// The principal a simulated router's certificate names. Every data host lists it with
+/// `forward_tokens = true` and no scopes, as ADR-0037 deploys a router.
+const ROUTER_PRINCIPAL: &str = "router";
 
 /// The port every simulated daemon listens on.
 pub const PORT: u16 = 7400;
@@ -179,6 +186,8 @@ pub struct FleetBuilder {
     impostors: BTreeMap<String, NodeId>,
     /// The archives every data host writes.
     archives: Vec<ArchiveSetup>,
+    /// The router host, if the fleet has one.
+    router: Option<String>,
 }
 
 impl fmt::Debug for FleetBuilder {
@@ -297,6 +306,15 @@ impl FleetBuilder {
         self
     }
 
+    /// Adds a router host named `name`, serving Hrana on [`ROUTER_PORT`] in plaintext, with a
+    /// client certificate for the principal `router` that every data host lets forward its
+    /// callers' tokens (ADR-0037). Clients reach it with [`Fleet::client_via_router`].
+    #[must_use]
+    pub fn router(mut self, name: &str) -> Self {
+        self.router = Some(name.to_owned());
+        self
+    }
+
     /// Changes the configuration of host `name` with `configure`, after the harness fills it in.
     #[must_use]
     pub fn configure(mut self, name: &str, configure: impl Fn(&mut Config) + 'static) -> Self {
@@ -339,6 +357,7 @@ impl FleetBuilder {
             watchers: Vec::new(),
             partitions: BTreeSet::new(),
             impostors: self.impostors,
+            router: None,
             root,
         };
         for (name, role) in &self.hosts {
@@ -351,6 +370,9 @@ impl FleetBuilder {
             }
             if let Some(settings) = &self.replication {
                 config.replication = ReplicationConfig::from(settings);
+            }
+            if self.router.is_some() {
+                config.principals.push(router_principal());
             }
             if role.hosts_data() {
                 for (archive, _, configure) in &self.archives {
@@ -390,6 +412,9 @@ impl FleetBuilder {
         for name in data_hosts {
             fleet.add_lease_watcher(&name);
         }
+        if let Some(router) = &self.router {
+            fleet.add_router(router, control_address)?;
+        }
         Ok(fleet)
     }
 
@@ -428,6 +453,17 @@ pub(super) fn certificate_validity() -> Validity {
 /// principal may: administer, write, read, and stream every database, and run fleet
 /// operations (ADR-0025).
 pub(super) const WORKLOAD_PRINCIPAL: &str = "workload";
+
+/// The router's `[[principal]]` entry: no scopes of its own, and its callers' tokens forwarded.
+fn router_principal() -> crate::PrincipalConfig {
+    crate::PrincipalConfig {
+        name: ROUTER_PRINCIPAL
+            .parse()
+            .unwrap_or_else(|error| panic!("'{ROUTER_PRINCIPAL}' is not a principal: {error}")),
+        scopes: crate::auth::Scopes::none(),
+        forward_tokens: crate::TokenForwarding::Allowed,
+    }
+}
 
 fn workload_principal() -> crate::PrincipalConfig {
     crate::PrincipalConfig {
@@ -539,6 +575,8 @@ pub struct Fleet {
     partitions: BTreeSet<(String, String)>,
     /// Client hosts that act as a node with that node's certificate.
     impostors: BTreeMap<String, NodeId>,
+    /// The router host, if the fleet has one.
+    router: Option<String>,
     root: TempDir,
 }
 
@@ -569,6 +607,7 @@ impl Fleet {
             replication: None,
             impostors: BTreeMap::new(),
             archives: Vec::new(),
+            router: None,
         }
     }
 
@@ -599,6 +638,40 @@ impl Fleet {
             data_dir,
             config,
         });
+    }
+
+    /// Adds the router host `name`, which asks the control node at `control` where databases
+    /// live.
+    fn add_router(&mut self, name: &str, control: SocketAddr) -> Result<(), SimError> {
+        let principal: crate::tls::Principal = ROUTER_PRINCIPAL
+            .parse()
+            .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?;
+        let issued = self
+            .authority
+            .issue_client(&principal, certificate_validity())?;
+        let identity = Identity::from_issued(self.authority.certificate_pem(), &issued)?;
+        // Plaintext on every address: the simulated network has no eavesdropper.
+        let config = crate::router::RouterConfig::from_toml(&format!(
+            "listen = \"0.0.0.0:{ROUTER_PORT}\"\n[http]\nallow_plaintext = true\n\
+             [control]\naddress = \"{control}\"\n"
+        ))
+        .map_err(|error| SimError::Invalid(error.to_string()))?;
+        let seed = self.rng.next_u64();
+        let (stop, _) = watch::channel(0_u64);
+        self.shared.lock().stops.insert(name.to_owned(), stop);
+        let shared = self.shared.clone();
+        let host = name.to_owned();
+        self.sim.host(name, move || {
+            crate::sim::host::run_router(
+                host.clone(),
+                config.clone(),
+                identity.clone(),
+                seed,
+                shared.clone(),
+            )
+        });
+        self.router = Some(name.to_owned());
+        Ok(())
     }
 
     /// Adds the lease watcher that follows data host `node`'s `WatchLeases` stream for the
@@ -774,6 +847,58 @@ impl Fleet {
         self.add_client(name, Some(format!("{entry}:{PORT}")), workload);
     }
 
+    /// Adds a client named `name` that runs `workload`, sending its writes and reads through the
+    /// fleet's router as Hrana pipelines, with a token for the principal it acts as (ADR-0037).
+    /// Every other operation, a database's creation included, goes to the fleet directly, since
+    /// Hrana can't create databases.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Invalid`] if the fleet has no router; an error if the authority can't sign
+    /// the token.
+    pub fn client_via_router(
+        &mut self,
+        name: &str,
+        workload: impl Workload,
+    ) -> Result<(), SimError> {
+        let router = self
+            .router
+            .clone()
+            .ok_or_else(|| SimError::Invalid("the fleet has no router".into()))?;
+        let signer = self
+            .authority
+            .token_signer()
+            .map_err(|error| SimError::Invalid(error.to_string()))?;
+        let scopes = ["admin:*"]
+            .into_iter()
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map_err(|error: crate::auth::ParseScopeError| SimError::Invalid(error.to_string()))?;
+        // Tokens are judged by the hosts' simulated clocks, which start near the epoch.
+        let token = signer
+            .issue(&crate::auth::Grant {
+                principal: WORKLOAD_PRINCIPAL
+                    .parse()
+                    .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?,
+                scopes,
+                id: format!("sim-{name}").parse().map_err(
+                    |error: fleetring_control::ParseCredentialIdError| {
+                        SimError::Invalid(error.to_string())
+                    },
+                )?,
+                not_before: Timestamp::ZERO,
+                expires_at: Timestamp::ZERO
+                    .saturating_add(fleetring_control::Millis::new(29 * 24 * 60 * 60 * 1000)),
+            })
+            .map_err(|error| SimError::Invalid(error.to_string()))?;
+        let via = Via {
+            address: format!("{router}:{ROUTER_PORT}"),
+            token: token.expose().to_owned(),
+        };
+        self.add_client_with(name, None, Some(via), workload);
+        Ok(())
+    }
+
     /// Issues the client `name` a certificate for the principal [`WORKLOAD_PRINCIPAL`] from the
     /// fleet's authority.
     ///
@@ -814,6 +939,17 @@ impl Fleet {
     ///
     /// If `name` isn't a valid principal name, or the authority can't issue for it.
     fn add_client(&mut self, name: &str, entry: Option<String>, workload: impl Workload) {
+        self.add_client_with(name, entry, None, workload);
+    }
+
+    /// As [`add_client`](Self::add_client), with its writes and reads `via` a router if given.
+    fn add_client_with(
+        &mut self,
+        name: &str,
+        entry: Option<String>,
+        via: Option<Via>,
+        workload: impl Workload,
+    ) {
         let identity = self.client_identity(name);
         let rng = self.rng.fork();
         let shared = self.shared.clone();
@@ -830,6 +966,7 @@ impl Fleet {
             name: client,
             control,
             entry,
+            via,
             timeout: self.operation_timeout,
             shared,
             identity,
@@ -1285,7 +1422,9 @@ impl Fleet {
     pub fn inject(&mut self, fault: Fault) -> Result<(), SimError> {
         let (names, clients_too) = fault_hosts(&fault);
         for name in names {
-            let is_client = self.clients.iter().any(|client| client == name);
+            // The router is a client of the fleet: its links can fail, as clients' can.
+            let is_client = self.clients.iter().any(|client| client == name)
+                || self.router.as_deref() == Some(name);
             if self.host(name).is_none() && !(clients_too && is_client) {
                 return Err(SimError::Invalid(format!(
                     "no host named '{name}' for {fault}"

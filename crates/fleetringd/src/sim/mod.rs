@@ -68,6 +68,7 @@ mod fault;
 mod fleet;
 pub mod history;
 mod host;
+mod hrana;
 mod rng;
 pub mod seeds;
 mod trace;
@@ -76,7 +77,8 @@ mod workload;
 pub use check::{ControlLog, Invariant, ReplicaChains, ReplicaRows, Violation};
 pub use fault::{Fault, LossRate};
 pub use fleet::{
-    Fleet, FleetBuilder, PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher, written_values,
+    Fleet, FleetBuilder, PORT, ROUTER_PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher,
+    written_values,
 };
 pub use history::{DurabilityMode, Guarantee, Replicated};
 pub use rng::SimRng;
