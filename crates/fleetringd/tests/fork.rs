@@ -876,6 +876,19 @@ async fn an_expired_pin_aborts_its_stream_and_is_released() -> TestResult {
     .into_inner();
     let first = stream.message().await?.ok_or("an empty stream")?;
     assert!(first.total_bytes.is_some());
+    // While the pin holds, the source can't checkpoint.
+    let replication = fleet
+        .daemon(&source_primary)?
+        .replication()
+        .ok_or("no replication")?;
+    let blocked = replication
+        .checkpoint(&source)
+        .await
+        .expect_err("a checkpoint while the source is pinned");
+    assert!(
+        blocked.to_string().contains("could not complete"),
+        "the pin blocks the checkpoint: {blocked}"
+    );
     // The seeder stops reading; the pin expires.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let ended = loop {
@@ -888,10 +901,6 @@ async fn an_expired_pin_aborts_its_stream_and_is_released() -> TestResult {
     let ended = ended.ok_or("the stream ended without a status")?;
     assert_eq!(ended.code(), Code::Aborted, "{ended:?}");
     // The pin is released: the source checkpoints.
-    let replication = fleet
-        .daemon(&source_primary)?
-        .replication()
-        .ok_or("no replication")?;
     wait_until("the source checkpoints", async || {
         replication.checkpoint(&source).await.is_ok()
     })
