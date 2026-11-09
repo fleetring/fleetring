@@ -9,8 +9,8 @@ use fleetring_control::fork::{
     StagedCopy,
 };
 use fleetring_control::{
-    Acks, Action, Applied, Durability, HostedReplica, Incarnation, LeaseEpoch, Member, Millis,
-    Position, Rejection, ReplicaRole, State, fork, membership_ring,
+    Acks, Action, Applied, DescriptionChange, Durability, HostedReplica, Incarnation, LeaseEpoch,
+    Member, MetadataChange, Millis, Position, Rejection, ReplicaRole, State, fork, membership_ring,
 };
 
 use crate::common::fork::{
@@ -290,6 +290,10 @@ fn a_seeded_forks_replica_set_is_frozen_until_ready() {
     assert_ne!(placed(&state, "t", 3), frozen);
     assert_eq!(replicas(&state, "t"), frozen);
     assert_eq!(state.quorums(&db("t")).map(|q| q.replicas()), Ok(2));
+    // A leave of the replica that isn't a holder, and a drain of a holder, don't move it either.
+    run(&mut state, 26, Action::Leave { id: id(&order[2]) }).expect("leave");
+    run(&mut state, 26, Action::Drain { id: id(holders[1]) }).expect("drain");
+    assert_eq!(replicas(&state, "t"), frozen);
 
     first_lease(&mut state, 30, holders[0]).expect("a holder takes the first lease");
     for node in holders {
@@ -657,6 +661,17 @@ fn a_forks_durability_changes_only_once_it_is_ready() {
     refused(&mut seeding, 20, change.clone(), &not_ready);
     let mut seeded = seeded();
     refused(&mut seeded, 25, change.clone(), &not_ready);
+    // Metadata may change before it is ready: it touches control state only.
+    let label = Action::UpdateDatabase {
+        name: db("t"),
+        change: MetadataChange {
+            description: DescriptionChange::Set("Scratch copy.".parse().expect("valid")),
+            ..MetadataChange::default()
+        },
+        by: None,
+        if_version: None,
+    };
+    run(&mut seeded, 26, label).expect("an update before ready");
     let mut ready = ready();
     run(&mut ready, 50, change).expect("a ready fork is an ordinary database");
 }
