@@ -808,3 +808,10 @@ The open questions this plan raised were decided as recommended:
   - The cursor sends its entries once the batch has run, not as rows arrive.
   - `TransactionWrite` and the `TransactionsAtomic` invariant of step 12 wait for a follow-up; the scenarios write and read through the router, one statement per stream.
   - The libsql conformance crate lives outside the workspace, as step 11 says: `libsql`'s hyper 0.14 brings h2 0.3, which carries RUSTSEC-2026-0258 (fixed only in h2 0.4), and `cargo deny` would refuse it in the workspace graph.
+- **2026-11-08, security review fixed.** An independent review found four medium and four low findings; each is fixed with a test, and ADR-0037's amendment of 2026-11-08 records the refinements and limits:
+  - Per-principal caps on node sessions (`[sessions] max_sessions_per_principal`) and router streams (`[streams] max_streams_per_principal`), and a per-principal half share of a database's waiting writes.
+  - Router connections: an idle and preface timeout (`[http] idle_timeout_ms`), HTTP/2 keep-alive, and a per-address cap (`[http] max_connections_per_ip`); keep-alive on the router's channels to nodes.
+  - `CREATE TEMP` objects refused in sessions and `Execute`.
+  - A write's statement deadline counts from when it starts, with a separate bound on its wait, and it is admitted under its lease when it starts, so a waiting write doesn't hold up a drain.
+  - `RESULT_TOO_LARGE` keeps the stream's transaction state (`[streams] max_response_bytes`); random stream IDs; a primary without sessions is `UNAVAILABLE`.
+  - Follow-ups proposed, not yet ticketed: a history-checked interactive-transaction simulation scenario, router metrics and `/readyz`, WebSocket and protobuf Hrana, streaming cursors, several control addresses after FR-064, and follower reads.
