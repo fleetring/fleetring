@@ -137,16 +137,11 @@ pub(crate) enum Request {
 
 impl Request {
     /// Whether the request needs the writer to itself, so that it waits while a session's
-    /// transaction holds it.
+    /// transaction holds it: a write, or a checkpoint, which rewrites the database file.
+    /// Snapshots read only the committed log, which an open transaction never changes, so a
+    /// follower's catch-up never waits for one.
     fn needs_writer(&self) -> bool {
-        matches!(
-            self,
-            Self::Execute(..)
-                | Self::Checkpoint(_)
-                | Self::Snapshot(..)
-                | Self::PinSnapshot(_)
-                | Self::PinSnapshotAt(..)
-        )
+        matches!(self, Self::Execute(..) | Self::Checkpoint(_))
     }
 
     /// Answers the request with `error` without running it.

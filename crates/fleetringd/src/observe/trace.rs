@@ -29,6 +29,7 @@ const STREAMING: &[&str] = &[
     "Snapshot",
     "WatchLeases",
     "WatchChanges",
+    "Session",
 ];
 
 /// The header a response's final status code is in: the response's own headers for a

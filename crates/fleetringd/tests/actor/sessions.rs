@@ -894,7 +894,9 @@ async fn a_read_only_session_never_waits_for_another_sessions_transaction() -> T
     };
     assert_eq!(error.code, PERMISSION_DENIED);
     call(&registry, &db, 1, "COMMIT", Autocommit::InTransaction).await?;
-    let rows = registry.query(&db, Statement::new("SELECT v FROM t")).await?;
+    let rows = registry
+        .query(&db, Statement::new("SELECT v FROM t"))
+        .await?;
     assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
     Ok(())
 }
