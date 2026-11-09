@@ -809,7 +809,7 @@ impl Database {
         self.fork.as_mut()
     }
 
-    /// Returns whether a write quorum of the database's replicas holds its data: always for an
+    /// Returns whether a quorum of the database's replicas holds its data: always for an
     /// ordinary database, and for a fork once it is
     /// [`Seeded`](crate::fork::ForkState::Seeded) or [`Ready`](crate::fork::ForkState::Ready).
     /// Only a seeded database may take a lease (ADR-0046, point 3.7).

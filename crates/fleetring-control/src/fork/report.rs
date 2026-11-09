@@ -254,18 +254,19 @@ impl CopyLost {
     }
 }
 
-/// Whether a fork's reset write has committed at its primary's write quorum.
+/// Whether a fork's reset write has committed at the fork's bootstrap quorum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ResetProgress {
     /// The primary is running the reset.
     Running,
-    /// The reset and its marker are committed at the primary's write quorum.
+    /// The reset and its marker are committed at the fork's bootstrap quorum.
     Committed,
 }
 
 /// A fork's primary reports its fork-reset write (ADR-0046, point 6): running, or committed at
-/// its write quorum with the marker for this identity.
+/// the bootstrap quorum with the marker for this identity. Every replica that holds the
+/// committed marker reports it, and `MarkForkReady` needs the bootstrap quorum of reports.
 ///
 /// # Examples
 ///
@@ -299,7 +300,7 @@ impl ResetReport {
     }
 
     /// The primary of `fork` at `epoch` holds the reset marker for the identity, committed at
-    /// its write quorum at `position`.
+    /// the fork's bootstrap quorum at `position`.
     #[must_use]
     pub fn committed(fork: ForkIdentity, epoch: LeaseEpoch, position: Position) -> Self {
         Self {
@@ -328,7 +329,7 @@ impl ResetReport {
         &self.position
     }
 
-    /// Returns whether the reset is committed at the primary's write quorum.
+    /// Returns whether the reset is committed at the fork's bootstrap quorum.
     #[must_use]
     pub fn is_committed(&self) -> bool {
         self.progress == ResetProgress::Committed
