@@ -3,8 +3,13 @@
 //! A request comes from a node or from a principal. Nodes make the node-to-node calls, each
 //! bound to placement: a node acts only on databases placed on it, in the role control state
 //! gives it there ([`Binding`], ADR-0031). A principal's [`Scopes`] say which databases it may
-//! read, write, administer, or stream, and whether it may run the control operations that name
-//! no database (`fleet`); everything else is denied.
+//! read, write, fork, administer, or stream, and whether it may run the control operations that
+//! name no database (`fleet`); everything else is denied. A `grant` scope authorizes no request:
+//! it bounds what an agent's token may delegate ([`Scopes::grant_step`]).
+//!
+//! Every `match` over an enum here lists its variants, so that a new action, caller, or peer
+//! can't fall through a wildcard arm to a permissive one (ADR-0044, point 3.6).
+#![deny(clippy::wildcard_enum_match_arm)]
 
 mod binding;
 mod boundary;
@@ -21,7 +26,7 @@ pub use boundary::{
 };
 pub use denylist::Denylist;
 pub use policy::{Caller, Credential, Denied, ForNodes, Needed, RPCS, Requirement, Rpc, rpc_at};
-pub use scope::{Action, ParseScopeError, Scope, Scopes, Target};
+pub use scope::{Action, GrantStepError, ParseScopeError, Scope, Scopes, Target};
 pub use token::{
     BearerToken, DEFAULT_TOKEN_LIFETIME, IssueError, MAX_TOKEN_LEN, MAX_TOKEN_LIFETIME,
     NOT_BEFORE_LEEWAY_SECS, TokenError, TokenSigner, TokenSpec, TokenVerifier, Verified,

@@ -25,8 +25,8 @@ use fleetring_client::context::{Context, ContextName};
 use fleetring_client::dirs::{self, DirsError};
 use fleetring_control::{Millis, Timestamp, TokenId};
 use fleetringd::auth::{
-    BearerToken, IssueError, MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS, ParseScopeError, Scope,
-    TokenSpec,
+    Action, BearerToken, IssueError, MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS, ParseScopeError,
+    Scope, TokenSpec,
 };
 use fleetringd::dev::{self, DevChecked, DevError};
 use fleetringd::mcp::Access;
@@ -934,6 +934,15 @@ pub(crate) fn new_token_id() -> Result<TokenId, AgentError> {
         .encode(random)
         .parse()
         .map_err(|_| AgentError::Random)
+}
+
+/// The note printed when a token is minted with `fork` or `grant`, which nodes before 0.8
+/// refuse as words reserved for delegation (ADR-0043, point 8.11), or `None`.
+pub(crate) fn pre_0_8_note(scopes: &[Scope]) -> Option<&'static str> {
+    scopes
+        .iter()
+        .any(|scope| matches!(scope.action(), Some(Action::Fork | Action::Grant)))
+        .then_some("note: nodes before 0.8 refuse this token, since it carries fork or grant")
 }
 
 /// Loads the authority in `dir`, and names the recovery when `ca.key` is there without

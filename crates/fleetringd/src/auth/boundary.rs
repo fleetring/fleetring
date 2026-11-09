@@ -232,7 +232,7 @@ impl Authorizer {
                         .unwrap_or_default(),
                     credential: Credential::Certificate,
                 },
-                _ => Caller::Anonymous,
+                Peer::Plaintext => Caller::Anonymous,
             });
         };
         let certificate = match peer {
@@ -243,7 +243,7 @@ impl Authorizer {
                 .into());
             }
             Peer::Principal(name) => Some(name),
-            _ => None,
+            Peer::Plaintext => None,
         };
         let Some(identity) = &self.inner.identity else {
             return Err(Status::unauthenticated(
@@ -329,7 +329,7 @@ impl Authorizer {
                 let principal = match &peer {
                     Peer::Node(id) => format!("node:{id}"),
                     Peer::Principal(name) => name.to_string(),
-                    _ => "anonymous".to_owned(),
+                    Peer::Plaintext => "anonymous".to_owned(),
                 };
                 // The ID is there whenever the token verified far enough to have one.
                 let credential =
@@ -356,7 +356,7 @@ impl Authorizer {
             Caller::Principal { name, .. } => {
                 span.record("principal", name.as_str());
             }
-            _ => {}
+            Caller::Anonymous => {}
         }
         let authorized = Authorized {
             caller,
@@ -366,7 +366,7 @@ impl Authorizer {
         match rpc.requirement {
             // The database is in the body; the handler checks it.
             Requirement::Database(_) | Requirement::DatabaseOrFleet(_) => Ok(authorized),
-            _ => {
+            Requirement::Node | Requirement::Fleet | Requirement::Listing(_) => {
                 authorized.check(None)?;
                 Ok(authorized)
             }
@@ -806,7 +806,9 @@ mod tests {
             Caller::Principal { scopes, .. } => {
                 scopes.as_slice().iter().map(ToString::to_string).collect()
             }
-            other => panic!("expected a principal, got {other:?}"),
+            other @ (Caller::Node(_) | Caller::Anonymous) => {
+                panic!("expected a principal, got {other:?}")
+            }
         }
     }
 

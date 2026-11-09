@@ -1,12 +1,17 @@
-//! Scopes: what a principal may do, as prefix rules on database names (ADR-0025).
+//! Scopes: what a principal may do, as prefix rules on database names (ADR-0025, ADR-0044).
 //!
-//! A scope is `<action>:<pattern>`, where the action is `read`, `write`, `admin`, or `stream` and
-//! the pattern is an exact database name or a prefix ending in `*`, the matcher the change sinks
-//! use. The word `fleet` alone is the scope for control operations that name no database.
-//! `write` implies `read`, `admin` implies both, and `stream` implies nothing and is implied by
-//! nothing, so a change consumer can't read tables. Everything not allowed is denied.
+//! A scope is `<action>:<pattern>`, where the action is `read`, `write`, `fork`, `admin`,
+//! `stream`, or `grant` and the pattern is an exact database name or a prefix ending in `*`, the
+//! matcher the change sinks use. The word `fleet` alone is the scope for control operations that
+//! name no database. `write` and `fork` each imply `read`; `admin` implies `write`, `fork`, and
+//! `read`; `stream` and `grant` imply nothing and are implied by nothing, so a change consumer
+//! can't read tables, and administering a prefix never hands out credentials for it. `grant`
+//! authorizes no request: it only bounds what an agent's token may delegate (ADR-0044,
+//! point 2). Everything not allowed is denied.
 //!
-//! The policy is pure: [`Scopes::allows`] decides from the scopes and the request alone.
+//! The policy is pure: [`Scopes::allows`] decides from the scopes and the request alone. So is
+//! the lattice that narrows scopes ([`Scopes::intersect`], [`Scopes::grant_step`]), which lives
+//! in a submodule of its own.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,7 +21,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::changes::DatabaseMatcher;
 
-/// What a request does to a database.
+mod lattice;
+
+pub use self::lattice::GrantStepError;
+
+/// What a request does to a database, or, for [`Action::Grant`], what a token may delegate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Action {
@@ -24,29 +33,38 @@ pub enum Action {
     Read,
     /// Changes a database's contents. Implies [`Action::Read`].
     Write,
-    /// Creates, drops, or reconfigures a database, or moves its lease. Implies
-    /// [`Action::Write`] and [`Action::Read`].
+    /// Creates a fork *from* a database. Implies [`Action::Read`], which doesn't imply it.
+    Fork,
+    /// Creates, drops, or reconfigures a database, moves its lease, or creates a fork *into* its
+    /// name. Implies [`Action::Write`], [`Action::Fork`], and [`Action::Read`].
     Admin,
     /// Follows a database's changes. Neither implies nor is implied by any other action.
     Stream,
+    /// Names a new holder for the token's other scopes, narrowed to the pattern
+    /// ([`Scopes::grant_step`]). Neither implies nor is implied by any other action, and
+    /// authorizes no request.
+    Grant,
 }
 
 impl Action {
     /// Every action, in the order of their names.
-    pub const ALL: [Self; 4] = [Self::Admin, Self::Read, Self::Stream, Self::Write];
+    pub const ALL: [Self; 6] = [
+        Self::Admin,
+        Self::Fork,
+        Self::Grant,
+        Self::Read,
+        Self::Stream,
+        Self::Write,
+    ];
 
-    /// Whether a scope for `self` also covers `wanted`.
-    #[must_use]
-    pub fn covers(self, wanted: Self) -> bool {
-        match (self, wanted) {
-            (Self::Admin, Self::Admin | Self::Write | Self::Read)
-            | (Self::Write, Self::Write | Self::Read)
-            | (Self::Read, Self::Read)
-            | (Self::Stream, Self::Stream) => true,
-            (Self::Admin | Self::Write | Self::Read, Self::Stream)
-            | (Self::Write | Self::Read | Self::Stream, Self::Admin)
-            | (Self::Read | Self::Stream, Self::Write)
-            | (Self::Stream, Self::Read) => false,
+    /// Whether a scope for `self` lets a request take `wanted`: what
+    /// [`covers`](Self::covers) says, except that `grant` lets no request take anything.
+    fn authorizes(self, wanted: Self) -> bool {
+        match self {
+            Self::Grant => false,
+            Self::Read | Self::Write | Self::Fork | Self::Admin | Self::Stream => {
+                self.covers(wanted)
+            }
         }
     }
 
@@ -56,8 +74,10 @@ impl Action {
         match self {
             Self::Read => "read",
             Self::Write => "write",
+            Self::Fork => "fork",
             Self::Admin => "admin",
             Self::Stream => "stream",
+            Self::Grant => "grant",
         }
     }
 }
@@ -75,8 +95,10 @@ impl FromStr for Action {
         match text {
             "read" => Ok(Self::Read),
             "write" => Ok(Self::Write),
+            "fork" => Ok(Self::Fork),
             "admin" => Ok(Self::Admin),
             "stream" => Ok(Self::Stream),
+            "grant" => Ok(Self::Grant),
             _ => Err(ParseScopeError::UnknownAction {
                 action: text.to_owned(),
             }),
@@ -113,6 +135,7 @@ impl fmt::Display for Target<'_> {
 /// let database = "tenant:acme/orders".parse()?;
 /// assert!(scope.allows(Target::Database(Action::Read, &database)));
 /// assert!(scope.allows(Target::Database(Action::Write, &database)));
+/// assert!(!scope.allows(Target::Database(Action::Fork, &database)));
 /// assert!(!scope.allows(Target::Database(Action::Admin, &database)));
 /// assert!(!scope.allows(Target::Fleet));
 /// assert_eq!(scope.to_string(), "write:tenant:acme/*");
@@ -151,23 +174,32 @@ impl Scope {
         Self { rule: Rule::Fleet }
     }
 
-    /// Whether this scope alone allows `target`.
+    /// The scope's action, or `None` for `fleet`.
+    #[must_use]
+    pub fn action(&self) -> Option<Action> {
+        match &self.rule {
+            Rule::Databases { action, .. } => Some(*action),
+            Rule::Fleet => None,
+        }
+    }
+
+    /// Whether this scope alone allows `target`. A `grant` scope allows nothing.
     #[must_use]
     pub fn allows(&self, target: Target<'_>) -> bool {
         match (&self.rule, target) {
             (Rule::Databases { action, pattern }, Target::Database(wanted, database)) => {
-                action.covers(wanted) && pattern.matches(database)
+                action.authorizes(wanted) && pattern.matches(database)
             }
             (Rule::Fleet, Target::Fleet) => true,
             (Rule::Databases { .. }, Target::Fleet) | (Rule::Fleet, Target::Database(..)) => false,
         }
     }
 
-    /// Whether this scope covers `wanted` on at least one database.
+    /// Whether this scope lets a request take `wanted` on at least one database.
     #[must_use]
     pub fn covers_some(&self, wanted: Action) -> bool {
         match &self.rule {
-            Rule::Databases { action, .. } => action.covers(wanted),
+            Rule::Databases { action, .. } => action.authorizes(wanted),
             Rule::Fleet => false,
         }
     }
@@ -226,8 +258,8 @@ pub enum ParseScopeError {
         /// The text.
         scope: String,
     },
-    /// The action isn't one of `read`, `write`, `admin`, or `stream`.
-    #[error("unknown scope action '{action}'; expected read, write, admin, or stream")]
+    /// The action isn't one of `read`, `write`, `fork`, `admin`, `stream`, or `grant`.
+    #[error("unknown scope action '{action}'; expected read, write, fork, admin, stream, or grant")]
     UnknownAction {
         /// The action as given.
         action: String,
@@ -238,17 +270,7 @@ pub enum ParseScopeError {
         /// The text.
         scope: String,
     },
-    /// The scope is `fork` or `grant`, alone or as an action, which delegation will use
-    /// (ADR-0043, point 8.11).
-    #[error("'{word}' is reserved for delegation, which this release doesn't support")]
-    Reserved {
-        /// The reserved word.
-        word: &'static str,
-    },
 }
-
-/// The words reserved for delegation, as a bare scope and as an action (ADR-0043, point 8.11).
-const RESERVED: [&str; 2] = ["fork", "grant"];
 
 impl FromStr for Scope {
     type Err = ParseScopeError;
@@ -256,10 +278,6 @@ impl FromStr for Scope {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         if text == FLEET {
             return Ok(Self::fleet());
-        }
-        let word = text.split_once(':').map_or(text, |(action, _)| action);
-        if let Some(word) = RESERVED.into_iter().find(|reserved| *reserved == word) {
-            return Err(ParseScopeError::Reserved { word });
         }
         let Some((action, pattern)) = text.split_once(':') else {
             return Err(ParseScopeError::Shape {
@@ -326,14 +344,14 @@ impl Scopes {
         }
     }
 
-    /// Whether any scope allows `target`.
+    /// Whether any scope allows `target`. `grant` scopes allow nothing.
     #[must_use]
     pub fn allows(&self, target: Target<'_>) -> bool {
         self.scopes.iter().any(|scope| scope.allows(target))
     }
 
-    /// Whether any scope covers `action` on at least one database, so that a listing filtered by
-    /// `action` may show the caller something.
+    /// Whether any scope lets a request take `action` on at least one database, so that a
+    /// listing filtered by `action` may show the caller something.
     #[must_use]
     pub fn covers_some(&self, action: Action) -> bool {
         self.scopes.iter().any(|scope| scope.covers_some(action))
@@ -360,6 +378,15 @@ impl Scopes {
     /// Each scope's [`Scope::separator_warning`], in order.
     pub fn separator_warnings(&self) -> impl Iterator<Item = String> + '_ {
         self.scopes.iter().filter_map(Scope::separator_warning)
+    }
+
+    /// Whether any scope's action is `action`, such as `grant` in a certificate's scopes, or
+    /// `fork` or `grant` in a token that nodes before 0.8 refuse.
+    #[must_use]
+    pub fn names(&self, action: Action) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope.action() == Some(action))
     }
 }
 
@@ -393,28 +420,83 @@ mod tests {
     }
 
     #[test]
-    fn reserved_scope_words_are_refused() {
-        for (text, word) in [
-            ("fork", "fork"),
-            ("grant", "grant"),
-            ("fork:agent-42-*", "fork"),
-            ("grant:agent-42.*", "grant"),
-            ("grant:", "grant"),
+    fn fork_and_grant_parse_as_actions_and_print_back() {
+        for text in [
+            "fork:agent-42-*",
+            "fork:x",
+            "grant:agent-42.*",
+            "grant:*",
+            "fork:*",
         ] {
-            let error = text.parse::<Scope>().expect_err(text);
-            assert_eq!(error, ParseScopeError::Reserved { word }, "{text}");
+            assert_eq!(scope(text).to_string(), text);
+        }
+        assert_eq!(scope("fork:x").action(), Some(Action::Fork));
+        assert_eq!(scope("grant:x").action(), Some(Action::Grant));
+        assert_eq!(scope("fleet").action(), None);
+        // A bare word is a shape error, as `read` alone is; an empty pattern is refused.
+        for bare in ["fork", "grant"] {
             assert_eq!(
-                error.to_string(),
-                format!("'{word}' is reserved for delegation, which this release doesn't support")
+                bare.parse::<Scope>(),
+                Err(ParseScopeError::Shape {
+                    scope: bare.to_owned()
+                })
             );
         }
-        // A pattern may still hold the words; only the action is reserved.
-        for text in ["read:fork", "admin:grant-*", "forks:x"] {
+        assert_eq!(
+            "grant:".parse::<Scope>(),
+            Err(ParseScopeError::EmptyPattern {
+                scope: "grant:".to_owned()
+            })
+        );
+        // The words are case-sensitive, like every other action.
+        for wrong in ["Fork:x", "GRANT:x", "forks:x", "granted:x"] {
             assert!(
-                !matches!(text.parse::<Scope>(), Err(ParseScopeError::Reserved { .. })),
-                "{text}"
+                matches!(
+                    wrong.parse::<Scope>(),
+                    Err(ParseScopeError::UnknownAction { .. })
+                ),
+                "{wrong}"
             );
         }
+        // A pattern may hold the words.
+        for text in ["read:fork", "admin:grant-*"] {
+            assert_eq!(scope(text).to_string(), text);
+        }
+        let unknown = "delete:x".parse::<Scope>().expect_err("not an action");
+        assert_eq!(
+            unknown.to_string(),
+            "unknown scope action 'delete'; expected read, write, fork, admin, stream, or grant"
+        );
+    }
+
+    #[test]
+    fn grant_authorizes_no_request_on_any_database() {
+        let granter = scopes(&["grant:*", "grant:x-*", "grant:x-1"]);
+        let x1 = database("x-1");
+        for action in Action::ALL {
+            assert!(
+                !granter.allows(Target::Database(action, &x1)),
+                "grant allowed {action}"
+            );
+            assert!(!granter.covers_some(action), "grant covers some {action}");
+        }
+        assert!(!granter.allows(Target::Fleet));
+        // Nothing else lets a request take `grant` either, should any requirement ever name it.
+        let everything = scopes(&[
+            "admin:*", "write:*", "fork:*", "read:*", "stream:*", "fleet",
+        ]);
+        assert!(!everything.allows(Target::Database(Action::Grant, &x1)));
+        assert!(!everything.covers_some(Action::Grant));
+    }
+
+    #[test]
+    fn names_finds_an_action() {
+        let held = scopes(&["read:a", "fork:b-*", "fleet"]);
+        assert!(held.names(Action::Fork));
+        assert!(held.names(Action::Read));
+        assert!(!held.names(Action::Grant));
+        assert!(!held.names(Action::Admin));
+        assert!(!Scopes::none().names(Action::Fork));
     }
 
     #[test]
@@ -427,12 +509,15 @@ mod tests {
             )
         );
         assert!(scope("read:Tenant*").separator_warning().is_some());
+        assert!(scope("grant:agent-42*").separator_warning().is_some());
+        assert!(scope("fork:agent-42*").separator_warning().is_some());
         for quiet in [
             "admin:agent-42-*",
             "write:tenant:acme/*",
             "read:*",
             "admin:agent-42",
             "fleet",
+            "grant:agent-42.*",
         ] {
             assert_eq!(scope(quiet).separator_warning(), None, "{quiet}");
         }
@@ -443,35 +528,39 @@ mod tests {
     }
 
     #[test]
-    fn write_implies_read_admin_implies_both_and_stream_is_separate() {
-        use Action::{Admin, Read, Stream, Write};
-        let implied = [
-            (Admin, vec![Admin, Read, Write]),
-            (Read, vec![Read]),
-            (Stream, vec![Stream]),
-            (Write, vec![Read, Write]),
-        ];
-        for (held, covered) in implied {
-            for wanted in Action::ALL {
-                assert_eq!(
-                    held.covers(wanted),
-                    covered.contains(&wanted),
-                    "{held} covers {wanted}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn a_read_scope_on_a_prefix_reads_inside_it_and_nothing_else() {
         let reader = scopes(&["read:tenant:*"]);
         let acme = database("tenant:acme");
         assert!(reader.allows(Target::Database(Action::Read, &acme)));
         assert!(!reader.allows(Target::Database(Action::Write, &acme)));
+        assert!(!reader.allows(Target::Database(Action::Fork, &acme)));
         assert!(!reader.allows(Target::Database(Action::Admin, &acme)));
         assert!(!reader.allows(Target::Database(Action::Stream, &acme)));
+        assert!(!reader.allows(Target::Database(Action::Grant, &acme)));
         assert!(!reader.allows(Target::Database(Action::Read, &database("ledger"))));
         assert!(!reader.allows(Target::Fleet));
+    }
+
+    #[test]
+    fn a_fork_scope_reads_and_forks_and_nothing_else() {
+        let forker = scopes(&["fork:x"]);
+        let x = database("x");
+        assert!(forker.allows(Target::Database(Action::Fork, &x)));
+        assert!(forker.allows(Target::Database(Action::Read, &x)));
+        for refused in [Action::Write, Action::Admin, Action::Stream, Action::Grant] {
+            assert!(!forker.allows(Target::Database(refused, &x)), "{refused}");
+        }
+        assert!(!forker.allows(Target::Database(Action::Fork, &database("x-1"))));
+        assert!(forker.covers_some(Action::Read));
+        assert!(!forker.covers_some(Action::Stream));
+        // `admin` forks; `read` and `write` don't.
+        assert!(scopes(&["admin:x"]).allows(Target::Database(Action::Fork, &x)));
+        for weaker in ["read:x", "write:x"] {
+            assert!(
+                !scopes(&[weaker]).allows(Target::Database(Action::Fork, &x)),
+                "{weaker}"
+            );
+        }
     }
 
     #[test]
@@ -493,13 +582,14 @@ mod tests {
     }
 
     #[test]
-    fn admin_on_everything_still_lacks_stream_and_fleet() {
+    fn admin_on_everything_still_lacks_stream_grant_and_fleet() {
         let admin = scopes(&["admin:*"]);
         let any = database("anything");
-        for action in [Action::Admin, Action::Write, Action::Read] {
+        for action in [Action::Admin, Action::Write, Action::Fork, Action::Read] {
             assert!(admin.allows(Target::Database(action, &any)), "{action}");
         }
         assert!(!admin.allows(Target::Database(Action::Stream, &any)));
+        assert!(!admin.allows(Target::Database(Action::Grant, &any)));
         assert!(!admin.allows(Target::Fleet));
     }
 
@@ -529,8 +619,21 @@ mod tests {
         let writer = scopes(&["write:tenant:*"]);
         assert!(writer.covers_some(Action::Read));
         assert!(writer.covers_some(Action::Write));
+        assert!(!writer.covers_some(Action::Fork));
         assert!(!writer.covers_some(Action::Stream));
         assert!(!writer.covers_some(Action::Admin));
+    }
+
+    #[test]
+    fn the_actions_are_listed_once_in_name_order() {
+        let names: Vec<&str> = Action::ALL.iter().map(|action| action.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted);
+        for action in Action::ALL {
+            assert_eq!(action.as_str().parse::<Action>(), Ok(action));
+        }
     }
 
     #[test]
@@ -581,9 +684,12 @@ mod tests {
 
     #[test]
     fn scopes_round_trip_through_json_as_strings() {
-        let set = scopes(&["read:tenant:*", "fleet"]);
+        let set = scopes(&["read:tenant:*", "fleet", "fork:a-*", "grant:agent-42.*"]);
         let json = serde_json::to_string(&set).expect("scopes serialize");
-        assert_eq!(json, r#"["read:tenant:*","fleet"]"#);
+        assert_eq!(
+            json,
+            r#"["read:tenant:*","fleet","fork:a-*","grant:agent-42.*"]"#
+        );
         let back: Scopes = serde_json::from_str(&json).expect("scopes deserialize");
         assert_eq!(back, set);
         assert!(serde_json::from_str::<Scopes>(r#"["nope"]"#).is_err());

@@ -779,6 +779,36 @@ mod tests {
     }
 
     #[test]
+    fn fork_and_grant_travel_in_a_token_and_grant_authorizes_nothing() {
+        use crate::auth::{Action, Target};
+
+        let signer = key(7, "prod");
+        let verifier = TokenVerifier::new("prod", [signer.verifying_key()]);
+        let none = Revocations::new();
+        let issued = signer
+            .issue(&spec(&["fork:src-*", "grant:agent-42.*"]))
+            .expect("issues");
+        let claims = issued.expose().split('.').nth(1).expect("a claims part");
+        let claims: Claims = decode_json(claims).expect("claims decode");
+        assert_eq!(claims.scopes, ["fork:src-*", "grant:agent-42.*"]);
+        let verified = verifier
+            .verify(&issued, at_secs(2_000), &none)
+            .expect("verifies");
+        let scopes = &verified.spec.scopes;
+        let source = "src-1".parse().expect("a name");
+        assert!(scopes.allows(Target::Database(Action::Fork, &source)));
+        assert!(scopes.allows(Target::Database(Action::Read, &source)));
+        assert!(!scopes.allows(Target::Database(Action::Write, &source)));
+        let child = "agent-42.c7-notes".parse().expect("a name");
+        for action in Action::ALL {
+            assert!(
+                !scopes.allows(Target::Database(action, &child)),
+                "grant allowed {action}"
+            );
+        }
+    }
+
+    #[test]
     fn the_fleet_scope_is_written_and_read_as_fleet_and_cluster_is_refused() {
         use crate::auth::Target;
 

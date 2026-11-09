@@ -85,7 +85,7 @@ How many replicas must store a write before it is acknowledged: `quorum` (a majo
 
 ### Action
 
-The verb half of a [scope](#scope): `read`, `write`, `admin`, or `stream`. `write` implies `read`, `admin` implies both, and `stream` stands alone (ADR-0025). *Planned* (ADR-0044): `fork`, which implies `read` and which `admin` implies, and `grant`, which lets a holder delegate its other scopes narrowed to its pattern, and implies and is implied by nothing.
+The verb half of a [scope](#scope): `read`, `write`, `fork`, `admin`, `stream`, or `grant` (ADR-0025, ADR-0044 point 2). `write` and `fork` each imply `read`; `admin` implies `write`, `fork`, and `read`; `stream` and `grant` stand alone, implying nothing and implied by nothing. `read` doesn't imply `fork`. `fork` lets a principal fork *from* a database; forking *into* a name needs `admin`. `grant` authorizes no request: it bounds the scopes an agent's token may hand a child, narrowed to its pattern, and a `[[principal]]` entry refuses it. Since 0.8.0; nodes before 0.8 refuse a token carrying `fork` or `grant`.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::Action`. **CLI:** the part before `:` in `--scope read:notes`.
@@ -450,7 +450,7 @@ A replica that isn't the primary: it applies the primary's batches and can be pr
 
 ### Fork
 
-*Planned* (ADR-0044). A new database seeded from a source database's snapshot at a position, independent afterwards, that records its source in `forked_from` (the source, the position, its chain hash, and a signed head or a package manifest when there is one). Needs `fork` on the source and `admin` on the target. Also the action `fork`, which implies `read`.
+*Planned* (ADR-0044). A new database seeded from a source database's snapshot at a position, independent afterwards, that records its source in `forked_from` (the source, the position, its chain hash, and a signed head or a package manifest when there is one). Needs `fork` on the source and `admin` on the target. Also the [action](#action) `fork`, which implies `read` and which scopes accept since 0.8.0.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** none yet (`ForkDatabase`, `Feature::Fork`, `Metadata::forked_from` when built). **CLI:** none yet (`db fork`).
@@ -871,8 +871,8 @@ A database's tables, views, indexes, triggers, and virtual tables with their def
 `<action>:<pattern>`, where the pattern is an exact database name or a prefix ending in `*`, or the [fleet scope](#fleet-scope). Default deny (ADR-0025). What an RPC needs is stated in the same words: `admin on the database`, `read per database listed, or fleet`.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `auth::Scope`, `Scopes`. **CLI:** `--scope`, `scopes = […]` in `[[principal]]`.
-- **Not:** permission, grant (a `Grant` is a token's content), role, policy, ACL.
+- **Code:** `auth::Scope`, `Scopes`; narrowing is `Scopes::intersect` and `Scopes::grant_step` (`grant_step_strict` refuses rather than narrow). **CLI:** `--scope`, `scopes = […]` in `[[principal]]`.
+- **Not:** permission, role, policy, ACL. A token's contents are its *token spec* (`auth::TokenSpec`), not a "grant"; `grant` is the [action](#action).
 
 ### Scraper
 
@@ -975,7 +975,7 @@ Not a FleetRing object. A tenant is a naming convention for keys, `tenant:<name>
 A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`. *Planned* (ADR-0044): a token may also be a biscuit in FleetRing's fixed vocabulary, which a holder can narrow and [delegate](#delegation) without the authority.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `auth::BearerToken`, `TokenId`, `KeyId`. **CLI:** `fleetring token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
+- **Code:** `auth::BearerToken`, `TokenSpec` (what a token says: principal, scopes, ID, lifetime), `TokenId`, `KeyId`. **CLI:** `fleetring token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
 - **Not:** API key, password, secret, session, JWT (fine where the format matters).
 
 ### Transfer

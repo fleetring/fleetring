@@ -19,7 +19,7 @@ A client sending it must connect with a certificate for the same principal, unle
 \fB\-\-scope\fR \fI<SCOPES>\fR
 A scope the token carries: `<action>:<pattern>`, or `fleet`
 
-The action is `read`, `write`, `admin`, or `stream`, and the pattern a database name or a prefix ending in `*`. Repeat it for more.
+The action is `read`, `write`, `fork`, `admin`, `stream`, or `grant`, and the pattern a database name or a prefix ending in `*`. Repeat it for more. Nodes before 0.8 refuse a token that carries `fork` or `grant`.
 .TP
 \fB\-\-ttl\fR \fI<TTL>\fR
 How long the token lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`

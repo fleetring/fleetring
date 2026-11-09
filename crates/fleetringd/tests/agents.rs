@@ -1278,43 +1278,76 @@ fn cert_client_and_token_issue_refuse_reserved_dotted_agents() -> TestResult {
     Ok(())
 }
 
+/// `fork` and `grant` are actions since 0.8 (ADR-0044, point 2), so `token issue` and
+/// `agent add` mint them, with a note that nodes before 0.8 refuse such a token.
 #[test]
-fn token_issue_refuses_fork_and_grant() -> TestResult {
+fn token_issue_and_agent_add_mint_fork_and_grant_with_a_note() -> TestResult {
+    const NOTE: &str = "note: nodes before 0.8 refuse this token, since it carries fork or grant";
     let machine = Machine::new()?;
     let tls = machine.home().join("prod-tls");
     let dir = tls.to_str().ok_or("not UTF-8")?;
     machine.ok(&["cert", "init", "--fleet", "prod", "--dir", dir])?;
-    for (scope, word) in [
-        ("fork", "fork"),
-        ("grant:agent-42-*", "grant"),
-        ("fork:x", "fork"),
+    let issue = |scopes: &[&str]| -> TestResult<Output> {
+        let mut args = vec!["token", "issue", "--principal", "agent-42", "--dir", dir];
+        for scope in scopes {
+            args.extend(["--scope", scope]);
+        }
+        machine.run(&args)
+    };
+    for scopes in [
+        &["fork:x"][..],
+        &["grant:agent-42.*"],
+        &["admin:agent-42-*", "fork:src-*", "grant:agent-42.*"],
     ] {
-        let output = machine.run(&[
-            "token",
-            "issue",
-            "--principal",
-            "agent-42",
-            "--scope",
-            scope,
-            "--dir",
-            dir,
-        ])?;
+        let output = issue(scopes)?;
+        assert!(output.status.success(), "{scopes:?}: {}", printed(&output));
+        assert_eq!(token_scopes(stdout(&output).trim())?, scopes);
+        assert_eq!(
+            stderr(&output).matches(NOTE).count(),
+            1,
+            "{scopes:?}: {}",
+            printed(&output)
+        );
+    }
+    let plain = issue(&["admin:agent-42-*", "stream:agent-42-*"])?;
+    assert!(plain.status.success(), "{}", printed(&plain));
+    assert!(!stderr(&plain).contains(NOTE), "{}", printed(&plain));
+    // The bare words are no scope, as `read` alone isn't.
+    for bare in ["fork", "grant"] {
+        let output = issue(&[bare])?;
         assert_eq!(
             output.status.code(),
             Some(2),
-            "{scope}: {}",
+            "{bare}: {}",
             printed(&output)
         );
         assert!(
             stderr(&output).contains(&format!(
-                "'{word}' is reserved for delegation, which this release doesn't support"
+                "a scope is `<action>:<pattern>` or `fleet`, not '{bare}'"
             )),
-            "{scope}: {}",
+            "{bare}: {}",
             printed(&output)
         );
     }
-    let refused = machine.run(&["agent", "add", "42", "--scope", "grant:agent-42.*"])?;
-    assert_eq!(refused.status.code(), Some(2), "{}", printed(&refused));
+
+    let added = machine.run(&[
+        "agent",
+        "add",
+        "42",
+        "--scope",
+        "admin:agent-42-*",
+        "--scope",
+        "grant:agent-42.*",
+    ])?;
+    assert!(added.status.success(), "{}", printed(&added));
+    assert!(stderr(&added).contains(NOTE), "{}", printed(&added));
+    assert_eq!(
+        token_scopes(&machine.token("42")?)?,
+        ["admin:agent-42-*", "grant:agent-42.*"]
+    );
+    let defaults = machine.run(&["agent", "add", "43"])?;
+    assert!(defaults.status.success(), "{}", printed(&defaults));
+    assert!(!stderr(&defaults).contains(NOTE), "{}", printed(&defaults));
     Ok(())
 }
 

@@ -14,7 +14,7 @@ A certificate for `agent\-<id>` and a token scoped `admin:agent\-<id>\-*` and `s
 \fB\-\-scope\fR \fI<SCOPE>\fR
 A scope the token carries instead of the defaults
 
-The defaults are `admin:agent\-<id>\-*` and `stream:agent\-<id>\-*`. Repeat it for more; `agent renew` never widens scopes chosen with it.
+`<action>:<pattern>`, with the action `read`, `write`, `fork`, `admin`, `stream`, or `grant`. The defaults are `admin:agent\-<id>\-*` and `stream:agent\-<id>\-*`. Repeat it for more; `agent renew` never widens scopes chosen with it. Nodes before 0.8 refuse a token that carries `fork` or `grant`.
 .TP
 \fB\-\-read\-only\fR
 Records the identity as read\-only, with default scopes that read and stream
