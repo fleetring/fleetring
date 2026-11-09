@@ -1526,7 +1526,7 @@ fn the_schema_reads_own_statements_stop_once_its_interrupt_is_raised() -> TestRe
     let interrupt = Interrupt::new();
     interrupt.raise(Interruption::Deadline);
     let read = {
-        let _interruptible = Interruptible::watch(&db.reader, &interrupt);
+        let _interruptible = Interruptible::watch(&db.reading, &interrupt);
         schema::read(&db.reader, &request(100_000, Internal::Hide))
             .map_err(|error| stopped_by(&interrupt, error))
     };
@@ -1534,7 +1534,7 @@ fn the_schema_reads_own_statements_stop_once_its_interrupt_is_raised() -> TestRe
         matches!(read, Err(EngineError::Interrupted(Interruption::Deadline))),
         "{read:?}"
     );
-    // The handler is gone with the guard: the next read counts every row.
+    // The interrupt is gone with the guard: the next read counts every row.
     let schema = db.schema(&request(100_000, Internal::Hide), &Interrupt::new())?;
     assert_eq!(schema.objects[0].rows, Some(RowCount::Exact(50_001)));
     Ok(())
