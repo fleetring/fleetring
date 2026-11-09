@@ -17,8 +17,9 @@ use crate::data::{ChangedTransaction, Listing, MetadataView, is_invisible};
 use crate::engine::{Column, Rows, Value};
 use crate::mcp::limits::MAX_VALUE_BYTES;
 use crate::mcp::tools::{
-    ChangesOut, ColumnOut, DatabaseOut, DescriptionOut, ListOut, ListedOut, MetadataOut,
-    PlacementOut, QueryOut, ReplicaOut, RowChangeOut, SchemaObjectOut, SchemaOut, TransactionOut,
+    ChangesOut, ColumnOut, DatabaseOut, DescriptionOut, ForkFailureOut, ForkOut, ForkResultOut,
+    ForkedFromOut, ListOut, ListedOut, MetadataOut, PlacementOut, QueryOut, ReplicaOut,
+    RowChangeOut, SchemaObjectOut, SchemaOut, TransactionOut,
 };
 use fleetring_client::output::DatabaseReport;
 
@@ -106,6 +107,7 @@ pub(crate) fn database_out(
         database: report.database,
         placement: PlacementOut {
             engine: placement.engine,
+            incarnation: placement.incarnation,
             lease_epoch: placement.lease_epoch,
             replication_factor: placement.replication_factor,
             acks: placement.acks,
@@ -126,6 +128,7 @@ pub(crate) fn database_out(
         schema,
         schema_unavailable: report.schema_unavailable,
         notice: (untrusted || definitions).then(|| NOTICE.to_owned()),
+        fork: report.fork.as_ref().map(fork_out),
     }
 }
 
@@ -161,12 +164,65 @@ pub(crate) fn list_out(listing: &Listing, me: Option<&PrincipalName>) -> ListOut
                     created_by: metadata.and_then(|view| view.created_by.clone()),
                     expires_at: metadata.and_then(|view| view.expires_at).map(rfc3339),
                     primary: location.primary.as_ref().map(ToString::to_string),
+                    fork: location.fork.as_ref().map(fork_out),
                 }
             })
             .collect(),
         next_after: listing.next_after.as_ref().map(ToString::to_string),
         truncated: false,
         notice: NOTICE.to_owned(),
+    }
+}
+
+fn failure_out(failure: &fleetring_client::output::ForkFailureReport) -> ForkFailureOut {
+    ForkFailureOut {
+        reason: failure.reason.clone(),
+        last_cause: failure.last_cause.clone(),
+        attempts: failure.attempts,
+    }
+}
+
+/// The fork record `fork` as a result carries it.
+pub(crate) fn fork_out(fork: &fleetring_client::output::ForkStatusReport) -> ForkOut {
+    ForkOut {
+        status: fork.state.to_owned(),
+        operation_id: fork.operation_id.clone(),
+        forked_from: ForkedFromOut {
+            source: fork.source.clone(),
+            source_incarnation: fork.source_incarnation.clone(),
+            position: fork.position.clone(),
+            chain_hash: fork.chain_hash.clone(),
+        },
+        failure: fork.failure.as_ref().map(failure_out),
+    }
+}
+
+/// `db_fork`'s result for `report`.
+pub(crate) fn fork_result_out(report: &fleetring_client::output::ForkReport) -> ForkResultOut {
+    let status = report.state.to_owned();
+    let hint = match report.state {
+        "ready" => "the database is ready: use it",
+        "failed" => "the fork failed: drop the new database with db_drop, then fork again",
+        "cancelled" => "the fork was cancelled before it was ready: fork again for a new one",
+        _ => {
+            "the fork is not ready and the database can't be used yet: check db_show later, or              call db_fork again with this operation_id and the same arguments to wait for it"
+        }
+    };
+    ForkResultOut {
+        operation_id: report.operation_id.clone(),
+        name: report.database.clone(),
+        incarnation: report.incarnation.clone(),
+        ready: report.state == "ready",
+        status,
+        forked_from: ForkedFromOut {
+            source: report.source.clone(),
+            source_incarnation: report.source_incarnation.clone(),
+            position: report.position.clone(),
+            chain_hash: report.chain_hash.clone(),
+        },
+        failure: report.failure.as_ref().map(failure_out),
+        hint: hint.to_owned(),
+        database: None,
     }
 }
 
@@ -568,6 +624,7 @@ mod tests {
                     created_by: Some("agent-42".to_owned()),
                     expires_at: None,
                     primary: Some("dev".to_owned()),
+                    fork: None,
                 })
                 .collect(),
             next_after: None,
@@ -629,6 +686,7 @@ mod tests {
             database: "agent-42-notes".to_owned(),
             placement: PlacementReport {
                 engine: "sqlite".to_owned(),
+                incarnation: "0000000000000000".to_owned(),
                 lease_epoch: 1,
                 replication_factor: 1,
                 acks: "quorum".to_owned(),
@@ -647,6 +705,7 @@ mod tests {
             metadata: None,
             schema,
             schema_unavailable: None,
+            fork: None,
         }
     }
 

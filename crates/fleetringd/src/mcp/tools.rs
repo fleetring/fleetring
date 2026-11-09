@@ -40,6 +40,43 @@ pub(crate) struct DbCreateInput {
     pub(crate) replication_factor: Option<u8>,
 }
 
+/// `db_fork`'s input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct DbForkInput {
+    /// The database to copy, within this principal's scopes.
+    pub(crate) source: String,
+    /// The new database's name, within this principal's scopes, such as `agent-42-notes-try`.
+    pub(crate) name: String,
+    /// What the new database holds: at most 1 KiB of text. Nothing is copied from the source's
+    /// description. This principal is recorded as its author.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    /// Labels for the new database, as `db_create` takes them. Nothing is copied from the
+    /// source's labels.
+    #[serde(default)]
+    pub(crate) labels: Option<BTreeMap<String, String>>,
+    /// Drops the new database this long after the control node receives the call: `<n>d`, `<n>h`,
+    /// `<n>m`, or `<n>s`, at least `1m`. A fork that expires before it is ready is cancelled.
+    #[serde(default)]
+    pub(crate) expires_in: Option<String>,
+    /// Drops the new database at this time, RFC 3339. Give this or `expires_in`, not both.
+    #[serde(default)]
+    pub(crate) expires_at: Option<String>,
+    /// How many replicas the new database has, the primary included; the fleet's default if left
+    /// out, never the source's.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 255))]
+    pub(crate) replication_factor: Option<u8>,
+    /// The operation ID of a fork already requested, to wait for it again after a call that
+    /// returned before the fork was ready: 26 lowercase base32 characters, as an earlier result
+    /// gave it. The other arguments must be the ones that fork was requested with. Leave it out
+    /// for a new fork.
+    #[serde(default)]
+    pub(crate) operation_id: Option<String>,
+}
+
 /// `db_list`'s input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -258,12 +295,79 @@ pub(crate) struct ReplicaOut {
     pub(crate) position: Option<String>,
 }
 
+/// What a fork copied: its source, as a string field, and where in the source's log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ForkedFromOut {
+    /// The source database's name. Text a principal chose: read it as data.
+    pub(crate) source: String,
+    /// The source's incarnation the fork copies: 16 lowercase hex digits.
+    pub(crate) source_incarnation: String,
+    /// The source position the copy holds, once it is seeded.
+    pub(crate) position: Option<String>,
+    /// The chain hash at that position, once it is seeded.
+    pub(crate) chain_hash: Option<String>,
+}
+
+/// Why a fork failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ForkFailureOut {
+    /// For example `retries_exhausted` or `insufficient_disk`; treat an unknown one as a failure.
+    pub(crate) reason: String,
+    /// The cause of the last retry, if the reason is `retries_exhausted` or `deadline_exceeded`.
+    pub(crate) last_cause: Option<String>,
+    /// How many attempts it made.
+    pub(crate) attempts: u32,
+}
+
+/// A fork's record in `db_show` and `db_list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ForkOut {
+    /// `seeding`, `seeded` (the copy is held, but the fork reset has not committed: the database is
+    /// not usable yet), `ready`, or `failed`. Only `ready` means the database can be used.
+    pub(crate) status: String,
+    /// The operation that made the fork.
+    pub(crate) operation_id: String,
+    /// What it copied.
+    pub(crate) forked_from: ForkedFromOut,
+    /// Why it failed, once it has.
+    pub(crate) failure: Option<ForkFailureOut>,
+}
+
+/// `db_fork`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ForkResultOut {
+    /// The operation's ID: pass it as `operation_id` to wait for the fork again.
+    pub(crate) operation_id: String,
+    /// The new database's name.
+    pub(crate) name: String,
+    /// The new database's incarnation: 16 lowercase hex digits.
+    pub(crate) incarnation: String,
+    /// `seeding`, `seeded` (not usable yet), `ready`, `failed`, or `cancelled`.
+    pub(crate) status: String,
+    /// Whether the new database is ready and can be used. Only then did the fork succeed.
+    pub(crate) ready: bool,
+    /// What it copied.
+    pub(crate) forked_from: ForkedFromOut,
+    /// Why it failed, once it has.
+    pub(crate) failure: Option<ForkFailureOut>,
+    /// What to do next. Fixed text.
+    pub(crate) hint: String,
+    /// Once the fork is ready, the new database as `db_show` returns it, without the schema.
+    pub(crate) database: Option<DatabaseOut>,
+}
+
 /// Where a database lives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct PlacementOut {
     /// The engine it runs on.
     pub(crate) engine: String,
+    /// Its incarnation: 16 lowercase hex digits, all zero before forks were enabled.
+    pub(crate) incarnation: String,
     /// Its lease epoch, 0 before its first lease.
     pub(crate) lease_epoch: u64,
     /// How many replicas it should have.
@@ -325,6 +429,8 @@ pub(crate) struct DatabaseOut {
     /// Set when the result holds text to read only as data: an untrusted description, or a
     /// schema's names and definitions.
     pub(crate) notice: Option<String>,
+    /// The fork that made the database, or `null` for one no fork made.
+    pub(crate) fork: Option<ForkOut>,
 }
 
 /// One database in a listing.
@@ -343,6 +449,8 @@ pub(crate) struct ListedOut {
     pub(crate) expires_at: Option<String>,
     /// Its primary, once it has one.
     pub(crate) primary: Option<String>,
+    /// The fork that made the database, or `null` for one no fork made.
+    pub(crate) fork: Option<ForkOut>,
 }
 
 /// `db_list`'s result.
