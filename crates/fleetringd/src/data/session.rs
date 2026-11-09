@@ -33,8 +33,8 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Status, Streaming};
 
-use crate::actor::{SessionId, SessionWork};
-use crate::auth::{Action, Authorized, BoxStream, authorized};
+use crate::actor::{Admission, Admit, SessionId, SessionTurn};
+use crate::auth::{Action, Authorized, BoxStream, Caller, authorized};
 use crate::data::calls::{
     NotRun, Then, call_from_proto, commit_to_proto, error_result, not_run_result, refused_a_write,
     result_to_proto,
@@ -43,7 +43,7 @@ use crate::data::convert::parse;
 use crate::data::node::{DataNode, SessionTicket};
 use crate::data::service::database_status;
 use crate::engine::{Autocommit, SessionAccess, SessionCall};
-use crate::{DatabaseError, ReplicationError};
+use crate::{DatabaseError, ReplicationError, StatementLimit};
 
 /// The stream `Session` returns.
 pub(crate) type SessionStream = BoxStream<proto::SessionResponse>;
@@ -54,11 +54,6 @@ const RESPONSE_BUFFER: usize = 2;
 
 /// How long a session's caller has to send the message that opens it.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a session may go without a call before the node ends it, so that callers who leave
-/// sessions open can't hold the node's places for sessions. Longer than a transaction may stay
-/// open, and than a router keeps an idle Hrana stream.
-pub(crate) const SESSION_IDLE: Duration = Duration::from_secs(120);
 
 /// The code of a commit no write quorum acknowledged (ADR-0037, point 13).
 pub(crate) const UNACKNOWLEDGED: &str = "FLEETRING_UNACKNOWLEDGED";
@@ -97,7 +92,8 @@ pub(crate) async fn open(
     let admitted = node.route(&name).await?;
     let epoch = admitted.lease().epoch;
     drop(admitted);
-    let ticket = node.open_session()?;
+    let principal = principal_of(&caller);
+    let ticket = node.open_session(&principal)?;
     let (responses, stream) = mpsc::channel(RESPONSE_BUFFER);
     let opened = proto::SessionResponse {
         response: Some(session_response::Response::Opened(proto::SessionOpened {
@@ -117,10 +113,21 @@ pub(crate) async fn open(
         access,
         epoch,
         caller: caller.clone(),
+        principal: principal.clone(),
         holding: Autocommit::On,
     };
     tokio::spawn(session.serve(request.into_inner(), responses));
     Ok(caller.guard(Box::pin(ReceiverStream::new(stream))))
+}
+
+/// The principal `caller` acts as, by which sessions are counted and waiting writes shared: a
+/// forwarded token's own principal, not the router's.
+fn principal_of(caller: &Authorized) -> String {
+    match caller.caller() {
+        Caller::Principal { name, .. } => name.to_string(),
+        Caller::Node(id) => format!("node:{id}"),
+        _ => "anonymous".to_owned(),
+    }
 }
 
 fn opens_first() -> Status {
@@ -136,6 +143,8 @@ struct Session {
     /// The epoch of the lease the session opened under, the only one it runs calls under.
     epoch: LeaseEpoch,
     caller: Authorized,
+    /// The principal the session acts as: its token's, for a forwarded token.
+    principal: String,
     /// Whether the session is in a transaction, as its last call left it.
     holding: Autocommit,
 }
@@ -159,6 +168,8 @@ impl Session {
 
     async fn serve(mut self, mut incoming: Streaming<proto::SessionRequest>, responses: Responses) {
         let mut served = self.node.replication().served();
+        // So that callers who leave sessions open can't hold the node's places for them.
+        let idle = self.node.registry().session_limits().idle_timeout;
         let ended = loop {
             if !self.is_current(&served) {
                 break Some(self.moved().await);
@@ -171,10 +182,10 @@ impl Session {
                     }
                     continue;
                 }
-                () = tokio::time::sleep(SESSION_IDLE) => {
+                () = tokio::time::sleep(idle) => {
                     break Some(Status::deadline_exceeded(format!(
-                        "the session had no call for {} s",
-                        SESSION_IDLE.as_secs()
+                        "the session had no call for {} ms ([sessions] idle_timeout_ms)",
+                        idle.as_millis()
                     )));
                 }
                 message = incoming.message() => message,
@@ -250,8 +261,10 @@ impl Session {
     /// Runs call `id`.
     async fn run(&mut self, id: u64, call: SessionCall) -> Answered {
         let autocommit = self.holding == Autocommit::On;
-        let admitted = match self.node.route(&self.name).await {
-            Ok(admitted) if admitted.lease().epoch == self.epoch => admitted,
+        match self.node.route(&self.name).await {
+            // Let go at once: the call is admitted again as it starts, so that one that waits
+            // behind another session's transaction never holds up a drain.
+            Ok(admitted) if admitted.lease().epoch == self.epoch => drop(admitted),
             Ok(_) => {
                 let status = Status::unavailable(format!(
                     "database {} moved to a new lease epoch; open a new session",
@@ -275,25 +288,39 @@ impl Session {
                 return Answered::Last(not_run_result(id, not_run, autocommit), status);
             }
         };
-        let deadline = Instant::now() + self.node.statement_timeout();
-        let work = SessionWork {
-            session: self.id(),
-            call,
-            access: self.access,
-            holding: self.holding,
+        // The statement time counts from when the call starts; it may wait for another session's
+        // transaction besides, as long as one may last.
+        let statement = self.node.statement_timeout();
+        let waiting = self.node.registry().session_limits().transaction_timeout;
+        let limit = StatementLimit {
+            budget: statement,
+            latest: Instant::now() + statement.saturating_add(waiting),
         };
+        let work = SessionTurn::new(
+            self.id(),
+            self.principal.clone(),
+            call,
+            self.access,
+            self.holding,
+        );
+        let node = &self.node;
+        let (name, epoch) = (self.name.clone(), self.epoch);
+        let admit: Admit<'_> = Box::new(move || {
+            node.admit_now(&name, epoch)
+                .map(|admitted| Box::new(admitted) as Admission<'_>)
+        });
         let published = self
             .node
             .registry()
-            .session_publish(&self.name, work, Some(deadline))
+            .session_publish(&self.name, work, Some(limit), admit)
             .await;
-        // The call's commits are in the database's log now, so a drain may step down: it ships
-        // the tail, these commits included, before it does.
-        drop(admitted);
-        let published = match published {
+        let (published, admitted) = match published {
             Ok(published) => published,
             Err(error) => return self.refused(id, &error, autocommit),
         };
+        // The call's commits are in the database's log now, so a drain may step down: it ships
+        // the tail, these commits included, before it does.
+        drop(admitted);
         if refused_a_write(published.result()) {
             self.caller.audit_refused(Action::Write, &self.name);
         }
@@ -331,6 +358,20 @@ impl Session {
             }
             // The transaction is gone, rolled back: the call never ran, and the session ends,
             // so that nothing its caller sends later runs outside the transaction it meant.
+            // The node no longer served the database at the session's lease when the call
+            // would have started: it never ran, and the session ends.
+            DatabaseError::NotAdmitted { .. } => {
+                let not_run = NotRun {
+                    code: "UNAVAILABLE",
+                    message: message.clone(),
+                    primary: None,
+                    then: Then::Ends,
+                };
+                Answered::Last(
+                    not_run_result(id, not_run, autocommit),
+                    Status::unavailable(message),
+                )
+            }
             DatabaseError::TransactionTimedOut { .. } | DatabaseError::TransactionLost { .. } => {
                 let not_run = NotRun {
                     code: TRANSACTION_ABORTED,

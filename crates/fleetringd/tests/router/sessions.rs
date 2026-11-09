@@ -292,3 +292,120 @@ async fn losing_the_lease_ends_the_session_and_rolls_back() -> TestResult {
     fleet.stop().await;
     Ok(())
 }
+
+/// The address of `database`'s primary.
+async fn primary_address(fleet: &Fleet, database: &str) -> Result<String, Box<dyn Error>> {
+    let location = fleet.admin.locate(&database.parse()?).await?;
+    let primary = location.primary.ok_or("no primary")?;
+    Ok(location
+        .replicas
+        .iter()
+        .find(|replica| replica.node == primary)
+        .and_then(|replica| replica.address.clone())
+        .ok_or("no primary address")?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_principal_hits_its_session_cap_while_another_still_opens() -> TestResult {
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        sessions: "max_sessions_per_principal = 2".to_owned(),
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("busy", 1).await?;
+    let address = primary_address(&fleet, "busy").await?;
+    let greedy = fleet.token("app", &["read:busy"], "t-greedy")?;
+    let first = Session::open(&fleet, &address, "router", Some(&greedy), "busy").await?;
+    let _second = Session::open(&fleet, &address, "router", Some(&greedy), "busy").await?;
+    let refused = Session::open(&fleet, &address, "router", Some(&greedy), "busy")
+        .await
+        .err()
+        .ok_or("a third session past the cap")?;
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused}");
+    assert!(
+        refused.message().contains("max_sessions_per_principal"),
+        "{refused}"
+    );
+    // Sessions count by the token's principal, not the router's: another caller through the
+    // same router, and a principal with a certificate of its own, still open.
+    let other = fleet.token("other", &["read:busy"], "t-other")?;
+    Session::open(&fleet, &address, "router", Some(&other), "busy").await?;
+    Session::open(&fleet, &address, "reader", None, "busy").await?;
+    // A closed session gives its place back.
+    drop(first);
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            if Session::open(&fleet, &address, "router", Some(&greedy), "busy")
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_doesnt_wait_for_a_write_queued_behind_a_transaction() -> TestResult {
+    // A drain would wait up to the acknowledgement window, 20 s here, for writes it admitted.
+    let fleet = Fleet::start(Options {
+        node_tables: "\n[replication]\nack_timeout_ms = 20000\n".to_owned(),
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("queued", 3).await?;
+    let address = primary_address(&fleet, "queued").await?;
+    let old = fleet.primary("queued").await?;
+    let mut session = Session::open(&fleet, &address, "tester", None, "queued").await?;
+    session.execute("BEGIN").await?;
+    session
+        .execute("INSERT INTO t (v) VALUES ('uncommitted')")
+        .await?;
+    // A write that waits behind the transaction.
+    let admin = fleet.admin.clone();
+    let waiting = tokio::spawn(async move {
+        admin
+            .execute(
+                &"queued".parse().expect("a name"),
+                fleetringd::engine::Statement::new("INSERT INTO t (v) VALUES ('waited')"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiting.is_finished(),
+        "the write waits for the transaction"
+    );
+    let started = tokio::time::Instant::now();
+    fleet.admin.drain_node(&old.parse()?).await?;
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match fleet.primary("queued").await {
+                Ok(primary) if primary != old => return,
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await?;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "the drain waited {took:?} for a write that hadn't started"
+    );
+    // The queued write never ran on the old primary: it either ran on the new one, through the
+    // client's retry, or failed as never run.
+    match tokio::time::timeout(HANG_GUARD, waiting).await?? {
+        Ok(_) => assert_eq!(fleet.values("queued").await?, [SqlValue::from("waited")]),
+        Err(status) => {
+            assert_eq!(status.code(), Code::Unavailable, "{status}");
+            assert!(fleet.values("queued").await?.is_empty());
+        }
+    }
+    fleet.stop().await;
+    Ok(())
+}

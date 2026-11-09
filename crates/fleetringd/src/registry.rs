@@ -10,13 +10,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::actor::{
-    self, ActorConfig, ChangeRecording, DatabaseError, DatabaseHandle, Published, SessionCalled,
-    SessionId, SessionLimits, SessionPublished, SessionWork, Stored,
+    self, ActorConfig, Admission, Admit, ChangeRecording, DatabaseError, DatabaseHandle, Published,
+    SessionCalled, SessionId, SessionLimits, SessionPublished, SessionTurn, StatementLimit, Stored,
 };
 use crate::changes::CaptureRules;
 use crate::engine::{
-    Autocommit, CaptureMode, DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows,
-    Schema, SchemaRequest, SessionAccess, SessionCall, Statement, Transaction,
+    CaptureMode, DatabaseEngine, EngineConfig, EngineError, Execution, OpenMode, Rows, Schema,
+    SchemaRequest, Statement, Transaction,
 };
 use crate::layout;
 use crate::publisher::BatchPublisher;
@@ -209,50 +209,57 @@ impl Registry {
         name: &DatabaseName,
         transaction: Transaction,
     ) -> Result<Published, DatabaseError> {
-        self.commit_until(name, transaction, None).await
+        let admit: Admit<'_> = Box::new(|| Some(Box::new(())));
+        Ok(self.commit_until(name, transaction, None, admit).await?.0)
     }
 
-    /// As [`execute`](Self::execute), but the transaction's statements stop at `deadline`,
-    /// waiting in the database's mailbox included, and the transaction then rolls back
-    /// (FR-078).
+    /// As [`execute`](Self::execute), but the transaction's statements stop at `limit`: they run
+    /// for `limit.budget` from when the transaction starts, and never past `limit.latest`, which
+    /// also bounds how long it may wait to start, in the mailbox or behind a SQL session's
+    /// transaction. Stopped, the transaction rolls back (FR-078).
     ///
     /// # Errors
     ///
     /// As [`execute`](Self::execute); a [`DatabaseError::Engine`] with
-    /// [`EngineError::Interrupted`] if the deadline stopped it, when nothing committed.
+    /// [`EngineError::Interrupted`] if the limit stopped it, when nothing committed.
     pub async fn execute_until(
         &self,
         name: &DatabaseName,
         transaction: Transaction,
-        deadline: Instant,
+        limit: StatementLimit,
     ) -> Result<Stored, DatabaseError> {
-        self.commit_until(name, transaction, Some(deadline))
+        let admit: Admit<'_> = Box::new(|| Some(Box::new(())));
+        self.commit_until(name, transaction, Some(limit), admit)
             .await?
+            .0
             .stored()
             .await
     }
 
-    /// As [`commit`](Self::commit), with the transaction's statements stopped at `deadline` if
-    /// there is one.
-    pub(crate) async fn commit_until(
+    /// As [`commit`](Self::commit), with the transaction's statements stopped at `limit` if
+    /// there is one, and `admit` asked right before it starts: refused, the transaction never
+    /// runs; admitted, it returns with what keeps it admitted.
+    pub(crate) async fn commit_until<'a>(
         &self,
         name: &DatabaseName,
         transaction: Transaction,
-        deadline: Option<Instant>,
-    ) -> Result<Published, DatabaseError> {
+        limit: Option<StatementLimit>,
+        admit: Admit<'a>,
+    ) -> Result<(Published, Option<Admission<'a>>), DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
-                return handle.commit_reserved(permit, transaction, deadline).await;
+                return handle
+                    .commit_reserved(permit, transaction, limit, admit)
+                    .await;
             }
         }
     }
 
-    /// Runs one call of SQL session `session` on an existing database, opening it if needed, and
-    /// waits for replication to acknowledge every transaction the call committed (ADR-0037).
-    /// `holding` is whether the session thinks it is in a transaction, from its last call's
-    /// answer; the call's statements stop at `deadline`, if there is one, and when this future is
-    /// dropped (FR-078).
+    /// Runs one session's call, `turn`, on an existing database, opening it if needed, and waits
+    /// for replication to acknowledge every transaction the call committed (ADR-0037). The
+    /// call's statements stop at `limit`, if there is one, counted from when the call starts, and
+    /// when this future is dropped (FR-078).
     ///
     /// # Errors
     ///
@@ -264,39 +271,41 @@ impl Registry {
     pub async fn session_call(
         &self,
         name: &DatabaseName,
-        session: SessionId,
-        call: SessionCall,
-        access: SessionAccess,
-        holding: Autocommit,
-        deadline: Option<Instant>,
+        turn: SessionTurn,
+        limit: Option<StatementLimit>,
     ) -> Result<SessionCalled, DatabaseError> {
-        let work = SessionWork {
-            session,
-            call,
-            access,
-            holding,
-        };
-        self.session_publish(name, work, deadline)
+        let admit: Admit<'_> = Box::new(|| Some(Box::new(())));
+        self.session_publish(name, turn, limit, admit)
             .await?
+            .0
             .stored()
             .await
     }
 
-    /// As [`session_call`](Self::session_call), but returns once the transactions the call
-    /// committed are in replication's hands; [`SessionPublished::stored`] waits for their
-    /// acknowledgements.
-    pub(crate) async fn session_publish(
+    /// As [`session_call`](Self::session_call), but asks `admit` right before the call starts
+    /// (refused, it never runs), and returns once the transactions the call committed are in
+    /// replication's hands, with what keeps it admitted; [`SessionPublished::stored`] waits for
+    /// their acknowledgements.
+    pub(crate) async fn session_publish<'a>(
         &self,
         name: &DatabaseName,
-        work: SessionWork,
-        deadline: Option<Instant>,
-    ) -> Result<SessionPublished, DatabaseError> {
+        work: SessionTurn,
+        limit: Option<StatementLimit>,
+        admit: Admit<'a>,
+    ) -> Result<(SessionPublished, Option<Admission<'a>>), DatabaseError> {
         loop {
             let handle = self.acquire(name, OpenMode::Existing).await?;
             if let Some(permit) = handle.reserve().await {
-                return handle.session_call_reserved(permit, work, deadline).await;
+                return handle
+                    .session_call_reserved(permit, work, limit, admit)
+                    .await;
             }
         }
+    }
+
+    /// How SQL sessions are held to their limits here.
+    pub(crate) fn session_limits(&self) -> SessionLimits {
+        self.inner.sessions
     }
 
     /// Ends SQL session `session` on `name`: rolls back the transaction it holds there, if any.
