@@ -39,6 +39,10 @@ pub enum FaultPoint {
     /// A fork's fork-reset write committed at its bootstrap quorum, and its primary hasn't
     /// reported it or served a client yet.
     AfterQuorumCommit,
+    /// A follower of a fork's primary is about to look for the fork-reset write the primary
+    /// reported committed in its durable log, and to report it there: held, the follower
+    /// reports nothing, so the fork stays seeded while its primary serves.
+    FollowerReset,
 }
 
 /// The fault hooks a daemon's fork work passes through.

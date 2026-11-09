@@ -9,7 +9,8 @@
 //!
 //! Membership changes publish the new ring on each node at a different moment. A stream's
 //! receiver counts as a replica under its current ring, the ring before it ([`replicas_of`]), or
-//! the replica set control state names now. A snapshot goes only to a follower on the primary's
+//! the replica set control state names now; a seeded fork's receiver only under the last, its
+//! recorded holders (ADR-0046, point 3.10). A snapshot goes only to a follower on the primary's
 //! current ring or in control state's replica set: the ring before lingers until the next
 //! change, and must not keep a node a follower that long (ADR-0031, amendment).
 
@@ -181,7 +182,7 @@ fn superseded(database: &DatabaseName, epoch: u64, current: LeaseEpoch) -> Statu
 
 /// Checks a `Replicate` stream that `caller` opens for `database` at `epoch` against its binding,
 /// before anything is recorded: `caller` holds the epoch or is promoting to it, and this node is
-/// a replica of the database.
+/// a replica of the database: one of a seeded fork's recorded holders, whatever the rings say.
 ///
 /// The epoch record decides when it names a holder at `epoch`; control state decides otherwise,
 /// once, and the stream then records the caller as the epoch's holder. An epoch below the
@@ -220,20 +221,35 @@ pub(super) async fn check_stream(
             None => {}
         }
     }
-    let holders = inner.authority.holders(database).await?;
+    let DatabaseView {
+        holders,
+        fork: placed,
+        ..
+    } = inner.authority.view(database).await?;
     if holders.epoch > lease_epoch {
         return Err(superseded(database, epoch, holders.epoch));
     }
     if !holders.leads(caller, lease_epoch) {
         return Err(refuse(inner, Some(database), not_holder()));
     }
-    let view = inner.membership.view();
-    let mut replicas = replicas_of(
-        &view,
-        view.previous_ring().map(|ring| &**ring),
-        database,
-        holders.replication_factor,
+    // A seeded fork's replica set is its recorded holders, which control state places it on,
+    // whatever either ring says (ADR-0046, point 3.10): a node the ring names, and not control
+    // state, never takes the stream, so it never counts toward a write the holders must keep.
+    let seeded = matches!(
+        placed.as_ref().map(|fork| &fork.phase),
+        Some(ForkPhase::Seeded { .. })
     );
+    let mut replicas: BTreeSet<NodeId> = if seeded {
+        BTreeSet::new()
+    } else {
+        let view = inner.membership.view();
+        replicas_of(
+            &view,
+            view.previous_ring().map(|ring| &**ring),
+            database,
+            holders.replication_factor,
+        )
+    };
     replicas.extend(holders.replicas);
     if !replicas.contains(&inner.node) {
         let denied = BindingDenied::new(

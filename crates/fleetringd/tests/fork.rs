@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::DatabaseName;
 use fleetring_control::fork::OperationId;
+use fleetring_control::{DatabaseName, Member, membership_ring};
 use fleetring_proto::v1::{self as proto, ForkOperationStatus, SnapshotRequest};
 use fleetringd::auth::refused_binding;
 use fleetringd::data::{Client, DatabaseSpec, ForkSpec};
@@ -1405,6 +1405,218 @@ async fn a_dropped_forks_seeder_never_touches_its_replacement() -> TestResult {
             "a kept staged copy of the old fork is an orphan"
         );
     }
+    fleet.stop().await;
+    Ok(())
+}
+
+impl Fleet {
+    /// Starts data daemon `id`, a new member, and waits until every data daemon publishes the
+    /// ring with it.
+    async fn join(&mut self, dir: &Path, id: &str, settings: &Settings) -> TestResult {
+        let address = self.control.control_address().ok_or("no control address")?;
+        let text = config(dir, &self.tls, id, "data", Some(address), settings)?;
+        self.restart(Config::from_toml(&text)?).await
+    }
+
+    /// A name for a fork of three replicas that the ring places on `joiner` and not on
+    /// `excluded` once `joiner` joins the fleet with the attributes of its first member.
+    fn name_moved_on_join(
+        &self,
+        joiner: &NodeId,
+        excluded: &NodeId,
+    ) -> Result<DatabaseName, Box<dyn Error>> {
+        let handle = self.control.control().ok_or("no control handle")?;
+        let state = handle.watch().borrow().clone();
+        let template = state.members().next().ok_or("no member")?.clone();
+        let mut joined = Member::new(joiner.clone()).with_weight(template.weight());
+        if let Some(zone) = template.zone() {
+            joined = joined.with_zone(zone.clone());
+        }
+        if let Some(host) = template.host() {
+            joined = joined.with_host(host.clone());
+        }
+        let mut members: Vec<Member> = state.members().cloned().collect();
+        members.push(joined);
+        let ring = membership_ring(&members, state.membership_epoch())?;
+        for n in 0..1_000 {
+            let candidate = format!("moved-{n}");
+            let replicas = ring.replicas_n(&candidate, factor(3)?).to_ids();
+            if replicas.contains(joiner) && !replicas.contains(excluded) {
+                return Ok(candidate.parse()?);
+            }
+        }
+        Err("no name the joined ring moves".into())
+    }
+}
+
+/// Writes a row to `database` once its primary serves clients, and returns the primary.
+async fn write_once_served(
+    client: &Client,
+    database: &DatabaseName,
+    body: &str,
+) -> Result<NodeId, Box<dyn Error>> {
+    let written = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match client
+                .execute(
+                    database,
+                    Statement::with_params(
+                        "INSERT INTO notes (body) VALUES (?)",
+                        [Value::from(body.to_owned())],
+                    ),
+                )
+                .await
+            {
+                Ok(written) => return Ok(written),
+                Err(status) if matches!(status.code(), Code::Unavailable | Code::Aborted) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+    })
+    .await??;
+    Ok(written.primary.ok_or("no primary named")?)
+}
+
+/// The followers `database`'s primary on data daemon `id` streams to.
+fn followers_of(
+    fleet: &Fleet,
+    id: &NodeId,
+    database: &DatabaseName,
+) -> Result<BTreeSet<NodeId>, Box<dyn Error>> {
+    let status = fleet
+        .daemon(id)?
+        .replication()
+        .ok_or("no replication")?
+        .primary_status(database)
+        .ok_or("not the primary")?;
+    Ok(status
+        .followers
+        .into_iter()
+        .map(|progress| progress.node)
+        .collect())
+}
+
+/// A fork of three replicas seeded on the first three data daemons, whose primary serves
+/// clients while its followers' reset reports are held, so it stays seeded; then a fourth data
+/// daemon joins, and the ring moves the fork onto it and off the second.
+struct Moved {
+    fleet: Fleet,
+    client: Client,
+    target: DatabaseName,
+    id: OperationId,
+    primary: NodeId,
+    holders: BTreeSet<NodeId>,
+    joiner: NodeId,
+}
+
+const JOINER: &str = "data-4";
+
+async fn seeded_then_moved(
+    dir: &Path,
+    settings: fn() -> Settings,
+    seed: u8,
+) -> Result<Moved, Box<dyn Error>> {
+    let mut fleet = Fleet::start(dir, settings()).await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 5).await?;
+    let joiner: NodeId = JOINER.parse()?;
+    let excluded: NodeId = DATA[1].parse()?;
+    let target = fleet.name_moved_on_join(&joiner, &excluded)?;
+    let id = operation(seed);
+    for faults in &fleet.faults {
+        faults.hold_operation(FaultPoint::FollowerReset, id);
+    }
+    client
+        .fork_database(&source, &target, &spec(id, 3)?)
+        .await?;
+    await_state(&client, id, proto::ForkState::Seeded).await?;
+    let primary = write_once_served(&client, &target, "served while seeded").await?;
+    assert_eq!(primary.as_str(), DATA[0], "the first live holder leads");
+    let seeded = client.fork_operation(id).await?;
+    assert_eq!(
+        seeded.state(),
+        proto::ForkState::Seeded,
+        "the reports are held"
+    );
+    let holders: BTreeSet<NodeId> = DATA
+        .iter()
+        .map(|id| id.parse::<NodeId>())
+        .collect::<Result<_, _>>()?;
+    fleet.join(dir, JOINER, &settings()).await?;
+    let ring: BTreeSet<NodeId> = fleet
+        .ring_replicas(target.as_str(), 3)?
+        .into_iter()
+        .collect();
+    assert!(
+        ring.contains(&joiner) && !ring.contains(&excluded),
+        "the ring moved the fork: {ring:?}"
+    );
+    Ok(Moved {
+        fleet,
+        client,
+        target,
+        id,
+        primary,
+        holders,
+        joiner,
+    })
+}
+
+/// From the reset's commit to `Ready`, a seeded fork's primary streams to its recorded holders
+/// alone and counts only them toward a write's quorum, though it serves clients and the ring
+/// has moved the fork; once ready, it follows the ring (ADR-0046, point 3.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeded_fork_streams_only_to_its_holders_until_it_is_ready() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let Moved {
+        fleet,
+        client,
+        target,
+        id,
+        primary,
+        holders,
+        joiner,
+        ..
+    } = seeded_then_moved(dir.path(), Settings::default, 40).await?;
+    // A write after the ring moved is acknowledged by the holders alone.
+    write_once_served(&client, &target, "after the move").await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let expected: BTreeSet<NodeId> = holders
+        .iter()
+        .filter(|node| **node != primary)
+        .cloned()
+        .collect();
+    assert_eq!(followers_of(&fleet, &primary, &target)?, expected);
+    let joined = fleet
+        .daemon(&joiner)?
+        .replication()
+        .ok_or("no replication")?;
+    assert!(
+        joined.follower_status(&target).is_none(),
+        "the joined node never took the seeded fork's stream"
+    );
+    assert_eq!(
+        client.fork_operation(id).await?.state(),
+        proto::ForkState::Seeded
+    );
+
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::FollowerReset, id);
+    }
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    // Ready, the fork follows the ring: the joined node becomes a follower.
+    wait_until(
+        "the ready fork's primary streams to the joined node",
+        async || {
+            followers_of(&fleet, &primary, &target)
+                .is_ok_and(|followers| followers.contains(&joiner))
+        },
+    )
+    .await?;
+    assert_eq!(notes(&client, &target).await?.len(), 7);
     fleet.stop().await;
     Ok(())
 }
