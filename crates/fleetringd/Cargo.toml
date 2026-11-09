@@ -74,7 +74,7 @@ rustix = { version = "1.1", default-features = false, features = ["std", "proces
 # clock (ADR-0020).
 simulation = ["dep:turmoil"]
 # Fault hooks for the fork tests (FR-085): points where a test holds a node's fork work, and a
-# stand-in for its free disk. Never enable in release builds.
+# stand-in for its free disk. A build without debug assertions, such as `--release`, refuses it.
 fault-hooks = []
 
 [lints]
