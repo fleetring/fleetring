@@ -1,0 +1,36 @@
+# The router's conformance with the `libsql` crate's remote client (FR-066, ADR-0037): unchanged
+# client code through the router, against a three-node fleet.
+#
+# A workspace of its own, with its own lock file, so that `libsql`'s dependency tree never
+# enters the main workspace, its MSRV checks, its cross-target jobs, or its `cargo deny` graph.
+# `libsql` 0.10 (MIT) with only the `remote` feature builds no SQLite: its one C build step is
+# `libsql-sqlite3-parser`'s, which compiles the lemon parser generator, a build-time tool that
+# writes its SQL parser in Rust. It speaks Hrana 3 over HTTP with
+# hyper 0.14, whose h2 0.3 carries RUSTSEC-2026-0258 (unbounded empty DATA frames, fixed only in
+# h2 0.4): acceptable for a test client on loopback, and the reason this crate stays apart.
+#
+# cargo test --manifest-path tests/router-conformance/Cargo.toml --locked
+
+[package]
+name = "router-conformance"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dev-dependencies]
+fleetring = { path = "../../crates/fleetring" }
+fleetring-control = { path = "../../crates/fleetring-control" }
+fleetringd = { path = "../../crates/fleetringd" }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+# The `libsql` client's HTTP stack is hyper 0.14; the test hands it a plain connector.
+hyper-014 = { package = "hyper", version = "0.14", default-features = false, features = ["client", "http1", "tcp"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libsql = { version = "=0.10.0", default-features = false, features = ["remote"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tonic = "0.14"

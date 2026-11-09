@@ -1,0 +1,12 @@
+{
+  "name": "fleetring-router-conformance",
+  "private": true,
+  "description": "Runs @libsql/client unchanged against the FleetRing router (FR-066).",
+  "type": "module",
+  "scripts": {
+    "conformance": "node conformance.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "0.18.0"
+  }
+}
