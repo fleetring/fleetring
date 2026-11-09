@@ -758,6 +758,15 @@ async fn renew(
         old,
         scopes,
     } = renewed;
+    // The renewed token carries the record's scopes, which the renewal has just parsed.
+    let reminted: Vec<Scope> = record
+        .scopes
+        .iter()
+        .filter_map(|scope| scope.parse().ok())
+        .collect();
+    if let Some(pre_0_8) = agent::pre_0_8_note(&reminted) {
+        note(pre_0_8);
+    }
     match client {
         Some(client) => revoke_old(&client, &old).await,
         None => note(format!(
