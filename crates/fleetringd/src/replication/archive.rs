@@ -357,7 +357,7 @@ fn fill(bytes: &mut Vec<u8>, want: usize, data: &mut &[u8]) {
 }
 
 /// Whether `name` names a file directly inside a directory, and nothing else.
-fn is_plain_name(name: &str) -> bool {
+pub(super) fn is_plain_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0', ':'])
 }
 
