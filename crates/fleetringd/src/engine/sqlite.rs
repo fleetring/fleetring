@@ -55,6 +55,7 @@ use std::ffi::{OsString, c_int};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write as _};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,14 +64,16 @@ use fleetring_wal::{Batch, ReadError, ReadFileError, read_committed_file};
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use rusqlite::types::{ToSqlOutput, ValueRef};
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, ffi, params};
+use rusqlite::{
+    CachedStatement, Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, ffi, params,
+};
 
 pub use follower::SqliteFollower;
 
 use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX, Watched};
 use self::marks::Marks;
 use self::pins::Pins;
-use self::reserved::{Reserved, is_reserved};
+use self::reserved::{Reserved, is_reserved, mentions_reserved};
 use self::session::{Control, OpenTransaction};
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
@@ -548,10 +551,7 @@ impl Database for SqliteDatabase {
         let classify = |error: rusqlite::Error| {
             interrupted(&error, interrupt).unwrap_or_else(|| self.reading.classify(error))
         };
-        let mut prepared = self
-            .reader
-            .prepare_cached(statement.sql())
-            .map_err(classify)?;
+        let mut prepared = prepare_user(&self.reader, statement.sql()).map_err(classify)?;
         let columns: Vec<String> = prepared.column_names().map(str::to_owned).collect();
         let width = columns.len();
         let mut rows = prepared
@@ -1268,7 +1268,7 @@ fn run(
     let classify = |error: rusqlite::Error| {
         interrupted(&error, interrupt).unwrap_or_else(|| confinement.classify(error))
     };
-    let mut prepared = conn.prepare_cached(statement.sql()).map_err(classify)?;
+    let mut prepared = prepare_user(conn, statement.sql()).map_err(classify)?;
     let mut rows = prepared
         .query(rusqlite::params_from_iter(
             statement.params().iter().map(Param),
@@ -1276,6 +1276,54 @@ fn run(
         .map_err(classify)?;
     while rows.next().map_err(classify)?.is_some() {}
     Ok(())
+}
+
+/// A user statement, prepared by [`prepare_user`].
+enum UserPrepared<'conn> {
+    /// Taken from, or added to, the connection's statement cache.
+    Cached(CachedStatement<'conn>),
+    /// Prepared afresh, and finalized when dropped.
+    Fresh(rusqlite::Statement<'conn>),
+}
+
+impl<'conn> Deref for UserPrepared<'conn> {
+    type Target = rusqlite::Statement<'conn>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Cached(statement) => statement,
+            Self::Fresh(statement) => statement,
+        }
+    }
+}
+
+impl DerefMut for UserPrepared<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Cached(statement) => statement,
+            Self::Fresh(statement) => statement,
+        }
+    }
+}
+
+/// Prepares a user statement on `conn`, with the confinement already entered.
+///
+/// SQLite authorizes a statement when it is prepared, not when it runs, and the adapter keeps its
+/// own statements in the connection's statement cache, prepared with the confinement clear. A
+/// user statement of exactly the same text taken from the cache would run the adapter's
+/// statement, unauthorized: a write could then forge sink marks with the adapter's own upsert,
+/// or a query read the change record. So a user statement that mentions the reserved prefix anywhere,
+/// which every such statement of the adapter's does, is prepared afresh, and refused; the rest
+/// share the cache.
+fn prepare_user<'conn>(
+    conn: &'conn Connection,
+    sql: &str,
+) -> rusqlite::Result<UserPrepared<'conn>> {
+    if mentions_reserved(sql) {
+        conn.prepare(sql).map(UserPrepared::Fresh)
+    } else {
+        conn.prepare_cached(sql).map(UserPrepared::Cached)
+    }
 }
 
 /// A parameter bound by reference.
