@@ -516,31 +516,69 @@ async fn a_missing_snapshot_chunk_is_refused_as_data_loss() -> TestResult {
     Ok(())
 }
 
-/// An archive whose pages aren't the size the restoring engine is configured for is refused
-/// before anything opens the copy, and nothing is left behind (#154).
+/// Sets the page size in the packed snapshot's `data.db` header to twice what it was, leaving
+/// the WAL's alone. The stream is each file as a big-endian `u16` name length, the name, a
+/// big-endian `u64` content length, and the content.
+fn double_database_page_size(stream: &mut [u8]) -> Option<()> {
+    let mut at = 0;
+    while at < stream.len() {
+        let name_len = usize::from(u16::from_be_bytes(stream.get(at..at + 2)?.try_into().ok()?));
+        let is_database = stream.get(at + 2..at + 2 + name_len)? == b"data.db";
+        at += 2 + name_len;
+        let len =
+            usize::try_from(u64::from_be_bytes(stream.get(at..at + 8)?.try_into().ok()?)).ok()?;
+        at += 8;
+        if is_database {
+            let field = stream.get_mut(at + 16..at + 18)?;
+            let size = u16::from_be_bytes([field[0], field[1]]);
+            field.copy_from_slice(&size.checked_mul(2)?.to_be_bytes());
+            return Some(());
+        }
+        at += len;
+    }
+    None
+}
+
+/// Rewrites the archived snapshot so its database file's header names twice the page size its
+/// WAL does, with every checksum recomputed: the damage checksums can't see, as whoever can write
+/// the bucket would leave it. Returns the snapshot's key.
+async fn forge_page_size_mismatch(
+    store: &MemoryStore,
+    ledger: &DatabaseName,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let keys = ArchiveKeys::new("fleetring", ledger);
+    let listing = Listing::read(store, &keys, ledger, EngineKind::Sqlite).await?;
+    let snapshot = listing.snapshots.first().ok_or("a snapshot")?;
+    let mut chunks = Vec::new();
+    for key in &snapshot.chunks {
+        chunks.push(store.get(key).await?.ok_or("a chunk")?);
+    }
+    let mut stream = chunks.concat();
+    double_database_page_size(&mut stream).ok_or("a database file in the snapshot")?;
+    let mut descriptor = snapshot.descriptor.clone();
+    descriptor.checksum = checksum_hex(&stream);
+    let mut rest = stream.as_slice();
+    for (index, (key, old)) in snapshot.chunks.iter().zip(&chunks).enumerate() {
+        let (chunk, tail) = rest.split_at(old.len());
+        rest = tail;
+        descriptor.chunk_checksums[index] = checksum_hex(chunk);
+        store.put(key, chunk.to_vec()).await?;
+    }
+    store
+        .put(&snapshot.key, encode_descriptor(&descriptor))
+        .await?;
+    Ok(snapshot.key.clone())
+}
+
+/// An archive whose snapshot holds a database file of one page size beside a WAL of another is
+/// refused before anything opens the copy, and nothing is left behind (#154).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_snapshot_of_another_page_size_is_refused_before_anything_opens_it() -> TestResult {
+async fn a_snapshot_whose_wal_and_database_disagree_is_refused_before_anything_opens_it()
+-> TestResult {
     let (dir, store, ledger) = archived().await?;
-    let listing = Listing::read(
-        &store,
-        &ArchiveKeys::new("fleetring", &ledger),
-        &ledger,
-        EngineKind::Sqlite,
-    )
-    .await?;
-    let snapshot = listing.snapshots.first().ok_or("a snapshot")?.key.clone();
+    let snapshot = forge_page_size_mismatch(&store, &ledger).await?;
     let staging = dir.path().join("restored");
-    let engine = SqliteEngine::new(PAGE_SIZE * 2)?;
-    let refused = restore_into(
-        &store,
-        &ArchiveKeys::new("fleetring", &ledger),
-        &ledger,
-        Arc::new(engine),
-        &RestoreTarget::Latest,
-        &staging,
-        Execution::Threads,
-    )
-    .await;
+    let refused = restore_from(&store, &ledger, &staging).await;
     assert!(
         matches!(
             &refused,
@@ -551,8 +589,28 @@ async fn a_snapshot_of_another_page_size_is_refused_before_anything_opens_it() -
         "{refused:?}"
     );
     assert!(!staging.exists(), "nothing is left behind");
-    // The engine it was archived with restores it.
-    restore_from(&store, &ledger, &staging).await?;
+    Ok(())
+}
+
+/// The configured `[engine] page_size` is for new databases: an engine configured for another
+/// page size than the archive's still restores it (#154).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_configured_for_another_page_size_still_restores_an_archive() -> TestResult {
+    let (dir, store, ledger) = archived().await?;
+    let staging = dir.path().join("restored");
+    restore_into(
+        &store,
+        &ArchiveKeys::new("fleetring", &ledger),
+        &ledger,
+        Arc::new(SqliteEngine::new(PAGE_SIZE * 2)?),
+        &RestoreTarget::Latest,
+        &staging,
+        Execution::Threads,
+    )
+    .await?;
+    let (values, integrity) = rows(&staging)?;
+    assert_eq!(values, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(integrity, "ok");
     Ok(())
 }
 

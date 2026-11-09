@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use twox_hash::XxHash3_128;
 
 use crate::common::{
     Fleet, HANG_GUARD, PAGE_SIZE, TestResult, Wrap, checkpoint, eventually, guarded, id, name, put,
@@ -218,6 +219,8 @@ enum Fault {
     Corrupt,
     /// Waits for the test's release before passing anything.
     Hold,
+    /// Doubles the page size in the database file's header and re-seals the stream's checksum.
+    PageSize,
 }
 
 /// A primary's `Replication` service that tampers with its snapshot transfers.
@@ -302,6 +305,34 @@ impl ReplicationRpc for Tamper {
             if fault == Fault::Hold && release.wait_for(|on| *on).await.is_err() {
                 return;
             }
+            if fault == Fault::PageSize {
+                let mut stream = Vec::new();
+                let mut last = None;
+                while let Some(chunk) = chunks.next().await {
+                    match chunk {
+                        Ok(chunk) if !chunk.data.is_empty() => stream.extend(&chunk.data),
+                        Ok(chunk) => last = Some(chunk),
+                        Err(status) => {
+                            let _ = sender.send(Err(status)).await;
+                            return;
+                        }
+                    }
+                }
+                let Some(mut last) = last else { return };
+                assert!(
+                    double_database_page_size(&mut stream).is_some(),
+                    "the stream holds a database file"
+                );
+                last.checksum = Some(XxHash3_128::oneshot(&stream).to_be_bytes().to_vec());
+                let data = SnapshotChunk {
+                    data: stream,
+                    ..SnapshotChunk::default()
+                };
+                if sender.send(Ok(data)).await.is_ok() {
+                    let _ = sender.send(Ok(last)).await;
+                }
+                return;
+            }
             let mut tampered = false;
             while let Some(mut chunk) = chunks.next().await {
                 if let Ok(data) = &mut chunk
@@ -321,7 +352,7 @@ impl ReplicationRpc for Tamper {
                                 *last ^= 1;
                             }
                         }
-                        Fault::Hold => {}
+                        Fault::Hold | Fault::PageSize => {}
                     }
                 }
                 if sender.send(chunk).await.is_err() {
@@ -604,20 +635,20 @@ async fn a_follower_that_diverges_behind_its_last_checkpoint_is_reseeded() -> Te
     Ok(())
 }
 
-/// A snapshot whose pages aren't the size the follower's engine is configured for is refused
-/// before anything opens it, naming the peer, and leaves nothing behind (#154).
+/// A snapshot whose database file's header names another page size than its WAL's is refused
+/// before anything opens it, naming the peer, and leaves nothing behind (#154). The proxy
+/// rewrites the page size in the streamed database header and re-seals the stream's checksum, as
+/// a faulty peer would.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_snapshot_of_another_page_size_is_refused_and_nothing_is_installed() -> TestResult {
-    let fleet = Fleet::start_each(
-        &["a", "b"],
-        |node| match node {
-            "b" => SqliteEngine::new(PAGE_SIZE * 2).expect("a valid page size"),
-            _ => sqlite(),
-        },
-        settings(),
-        BTreeMap::new(),
-    )
-    .await?;
+async fn a_snapshot_whose_wal_and_database_disagree_is_refused_and_nothing_is_installed()
+-> TestResult {
+    let faults = Arc::new(Mutex::new(VecDeque::from([Fault::PageSize])));
+    let (_release, released) = watch::channel(false);
+    let wraps = BTreeMap::from([(
+        "a".to_owned(),
+        Tamper::wrap(faults, Arc::new(AtomicUsize::new(0)), released),
+    )]);
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), wraps).await?;
     let db = name("pages");
     fleet.create("a", &db, 1).await?;
     guarded(
@@ -647,4 +678,61 @@ async fn a_snapshot_of_another_page_size_is_refused_and_nothing_is_installed() -
     let databases = follower.root.join("databases");
     assert!(staged(&databases).is_empty(), "{:?}", staged(&databases));
     Ok(())
+}
+
+/// The configured `[engine] page_size` is for new databases: a node configured for another page
+/// size than the peer's still takes the peer's consistent snapshot (#154).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_configured_for_another_page_size_still_seeds_from_a_peer() -> TestResult {
+    let fleet = Fleet::start_each(
+        &["a", "b"],
+        |node| match node {
+            "b" => SqliteEngine::new(PAGE_SIZE * 2).expect("a valid page size"),
+            _ => sqlite(),
+        },
+        settings(),
+        BTreeMap::new(),
+    )
+    .await?;
+    let db = name("pages");
+    fleet.create("a", &db, 1).await?;
+    guarded(
+        "a write",
+        fleet.node("a").registry().execute(&db, put(1, 4_000)),
+    )
+    .await??;
+    let follower = fleet.node("b");
+    guarded(
+        "the seed",
+        follower.replication.seed(&db, &id("a"), LeaseEpoch::new(1)),
+    )
+    .await??;
+    assert!(follower.database_dir("pages").exists(), "installed");
+    let databases = follower.root.join("databases");
+    assert!(staged(&databases).is_empty(), "{:?}", staged(&databases));
+    Ok(())
+}
+
+/// Sets the page size in the packed stream's `data.db` header to twice what it was, leaving the
+/// WAL's alone. The stream is each file as a big-endian `u16` name length, the name, a big-endian
+/// `u64` content length, and the content.
+fn double_database_page_size(stream: &mut [u8]) -> Option<()> {
+    let mut at = 0;
+    while at < stream.len() {
+        let name_len = usize::from(u16::from_be_bytes(stream.get(at..at + 2)?.try_into().ok()?));
+        let name = stream.get(at + 2..at + 2 + name_len)?;
+        let is_database = name == b"data.db";
+        at += 2 + name_len;
+        let len =
+            usize::try_from(u64::from_be_bytes(stream.get(at..at + 8)?.try_into().ok()?)).ok()?;
+        at += 8;
+        if is_database {
+            let field = stream.get_mut(at + 16..at + 18)?;
+            let size = u16::from_be_bytes([field[0], field[1]]);
+            field.copy_from_slice(&size.checked_mul(2)?.to_be_bytes());
+            return Some(());
+        }
+        at += len;
+    }
+    None
 }

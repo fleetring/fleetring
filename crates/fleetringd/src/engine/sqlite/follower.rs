@@ -43,7 +43,7 @@ impl SqliteFollower {
         if !database.try_exists().map_err(storage)? {
             return Err(EngineError::NotFound);
         }
-        page_size::check(&database, None)?;
+        page_size::check(&database)?;
         let page_size = page_size::database_file(&database)?;
         let mirror = Mirror::open(wal_path(&database)).map_err(mirror_error)?;
         let checkpointed = read_marker(&database)?;

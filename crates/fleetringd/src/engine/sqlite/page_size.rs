@@ -6,7 +6,8 @@
 //! can't set the page size, but an archive's snapshot and a peer's snapshot or batches are bytes
 //! from elsewhere: whoever can write the bucket, or a faulty peer, chooses them. So before a copy
 //! is opened, and before a batch is mirrored, their page sizes are compared, and a copy or batch
-//! that disagrees is refused without anything being opened.
+//! that disagrees is refused without anything being opened. The configured `[engine] page_size` is
+//! not compared: it is for new databases, and changing it must not strand older ones.
 //!
 //! A database file with no header yet (an empty file) and a WAL that is absent, shorter than its
 //! header, or whose header SQLite would ignore as invalid, carry no page size, and agree with
@@ -31,8 +32,6 @@ pub(super) enum Source {
     Wal,
     /// A replicated batch of WAL frames.
     Batch,
-    /// `[engine] page_size`.
-    Configured,
 }
 
 impl fmt::Display for Source {
@@ -41,7 +40,6 @@ impl fmt::Display for Source {
             Self::Database => "the database file's page size",
             Self::Wal => "the WAL's page size",
             Self::Batch => "the WAL batch's page size",
-            Self::Configured => "the configured [engine] page_size",
         })
     }
 }
@@ -56,26 +54,17 @@ pub(super) struct Mismatch {
     pub(super) expected_size: u32,
 }
 
-/// Checks that the database file at `database`, its WAL, and `configured` if given agree on the
-/// page size.
+/// Checks that the database file at `database` and its WAL agree on the page size.
 ///
 /// # Errors
 ///
-/// [`EngineError::UnsafeCopy`] if any two disagree, or the database file's header isn't a SQLite
+/// [`EngineError::UnsafeCopy`] if they disagree, or the database file's header isn't a SQLite
 /// database's, and [`EngineError::Storage`] if the files can't be read.
-pub(super) fn check(database: &Path, configured: Option<u32>) -> Result<(), EngineError> {
-    let configured = configured.map(|size| (Source::Configured, size));
-    let mut sizes = [
-        database_file(database)?,
-        wal(&wal_path(database))?,
-        configured,
-    ]
-    .into_iter()
-    .flatten();
-    let Some(first) = sizes.next() else {
-        return Ok(());
-    };
-    sizes.try_for_each(|size| agree(size, first).map_err(unsafe_copy))
+pub(super) fn check(database: &Path) -> Result<(), EngineError> {
+    match (database_file(database)?, wal(&wal_path(database))?) {
+        (Some(database), Some(wal)) => agree(wal, database).map_err(unsafe_copy),
+        _ => Ok(()),
+    }
 }
 
 /// The database file's page size, or `None` if the file is empty or absent.
