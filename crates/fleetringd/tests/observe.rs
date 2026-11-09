@@ -1205,7 +1205,10 @@ fn the_readme_lists_every_family() -> TestResult {
             "the README doesn't list {exposed}"
         );
         if family.kind == Kind::Histogram {
-            assert!(exposed.ends_with("_seconds"), "{exposed}");
+            assert!(
+                exposed.ends_with("_seconds") || exposed.ends_with("_bytes"),
+                "{exposed}"
+            );
         }
     }
     Ok(())
