@@ -81,9 +81,9 @@ pub(crate) fn authenticate(
         Refusal::Unauthenticated(format!("the token can't be forwarded: {error}"))
     })?;
     Ok(Caller {
-        principal: verified.grant.principal,
-        token_id: verified.grant.id,
-        scopes: verified.grant.scopes,
+        principal: verified.spec.principal,
+        token_id: verified.spec.id,
+        scopes: verified.spec.scopes,
         credentials,
     })
 }
@@ -121,7 +121,7 @@ mod tests {
     use fleetring_control::Millis;
 
     use super::*;
-    use crate::auth::{Grant, Scope, TokenSigner};
+    use crate::auth::{Scope, TokenSigner, TokenSpec};
     use crate::tls::{Authority, Identity, Validity};
 
     fn signer_and_verifier() -> (TokenSigner, TokenVerifier) {
@@ -148,7 +148,7 @@ mod tests {
         let (signer, verifier) = signer_and_verifier();
         let now = Timestamp::from_millis(1_000_000);
         let token = signer
-            .issue(&Grant {
+            .issue(&TokenSpec {
                 principal: "app".parse().expect("principal"),
                 scopes: ["read:notes".parse::<Scope>().expect("a scope")]
                     .into_iter()

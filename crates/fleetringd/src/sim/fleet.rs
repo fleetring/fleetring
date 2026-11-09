@@ -876,7 +876,7 @@ impl Fleet {
             .map_err(|error: crate::auth::ParseScopeError| SimError::Invalid(error.to_string()))?;
         // Tokens are judged by the hosts' simulated clocks, which start near the epoch.
         let token = signer
-            .issue(&crate::auth::Grant {
+            .issue(&crate::auth::TokenSpec {
                 principal: WORKLOAD_PRINCIPAL
                     .parse()
                     .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?,
