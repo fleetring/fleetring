@@ -1305,10 +1305,12 @@ async fn a_crash_after_the_resets_quorum_commit_leaves_exactly_one() -> TestResu
 }
 
 /// Target fencing on real daemons: a fork's seeder pauses after it stages attempt 1; the fork
-/// is dropped and made again under its name, and reaches attempt 1 on the same nodes; the old
-/// seeder then resumes. The new fork never counts the old copy, the old identity's requests are
-/// refused by the seeding binding, and the old staging directory is deleted on the drop or kept
-/// as an orphan, never opened (ADR-0046, points 4 and 12; #135).
+/// is dropped and made again under its name, and its seeder stages attempt 1 on the same nodes
+/// and holds there; the old seeder then resumes. The new fork, still seeding attempt 1, never
+/// counts the old copy; the old identity's requests, a peer's to the new seeder and the old
+/// seeder's to the source, are refused by the seeding binding; the new fork then becomes ready;
+/// and the old staging directory is deleted on the drop or kept as an orphan, never opened
+/// (ADR-0046, points 4 and 12; #135).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_forks_seeder_never_touches_its_replacement() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -1341,26 +1343,56 @@ async fn a_dropped_forks_seeder_never_touches_its_replacement() -> TestResult {
 
     client.drop_database(&target).await?;
     await_state(&client, old_id, proto::ForkState::Cancelled).await?;
+    // The new fork stages attempt 1 on the same nodes and reports nothing yet, so it stays
+    // seeding attempt 1 while the old seeder resumes.
+    for faults in &fleet.faults {
+        faults.hold_operation(FaultPoint::Staged, new_id);
+    }
     client
         .fork_database(&source, &target, &spec(new_id, 2)?)
         .await?;
-    let new = await_state(&client, new_id, proto::ForkState::Ready).await?;
+    wait_until("the new fork's seeder stages attempt 1", async || {
+        fleet
+            .faults(&seeder)
+            .is_ok_and(|faults| faults.arrivals(FaultPoint::Staged) >= 2)
+    })
+    .await?;
+    let new = client.fork_operation(new_id).await?;
     assert_ne!(new.incarnation, old.incarnation);
-    // The old seeder resumes.
+    let seeding = |status: &ForkOperationStatus| {
+        status.state() == proto::ForkState::Seeding && status.attempt == 1
+    };
+    assert!(seeding(&new), "{new:?}");
+    let new_seeder: NodeId = new
+        .placement
+        .as_ref()
+        .and_then(|placement| placement.fork.as_ref())
+        .and_then(|fork| fork.seeder.as_deref())
+        .ok_or("no seeder")?
+        .parse()?;
+    assert_eq!(new_seeder, seeder, "the same nodes seed the new fork");
+
+    // The old seeder resumes: its old copy, if the drop left it, is never counted.
     for faults in &fleet.faults {
         faults.release_operation(FaultPoint::Staged, old_id);
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let again = client.fork_operation(new_id).await?;
-    assert_eq!(again.state(), proto::ForkState::Ready);
-    assert_eq!(again.incarnation, new.incarnation);
-    assert_eq!(
-        notes(&client, &target).await?,
-        notes(&client, &source).await?
-    );
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let status = client.fork_operation(new_id).await?;
+        let holders = status
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.fork.as_ref())
+            .map_or(0, |fork| fork.holders.len());
+        assert!(
+            seeding(&status) && holders == 0,
+            "the new fork counted nothing: {status:?}"
+        );
+    }
 
-    // The old identity's requests: a peer's to the seeder, and the seeder's to the source.
-    let seeder_address = fleet.daemon(&seeder)?.listen_address().to_string();
+    // The old identity's requests: a peer's to the new seeder, and the old seeder's to the
+    // source.
+    let seeder_address = fleet.daemon(&new_seeder)?.listen_address().to_string();
     let source_address = fleet.daemon(&source_primary)?.listen_address().to_string();
     let as_peer = fleet.tls.node_network(peer.as_str())?;
     let as_seeder = fleet.tls.node_network(seeder.as_str())?;
@@ -1380,6 +1412,17 @@ async fn a_dropped_forks_seeder_never_touches_its_replacement() -> TestResult {
     assert!(
         refused_seeding(&answer),
         "an old source request: {answer:?}"
+    );
+
+    // Released, the new fork becomes ready from its own copy.
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::Staged, new_id);
+    }
+    let ready = await_state(&client, new_id, proto::ForkState::Ready).await?;
+    assert_eq!(ready.incarnation, new.incarnation);
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
     );
 
     // The old staging directory went with the drop, or stays as an orphan; it was never opened.
