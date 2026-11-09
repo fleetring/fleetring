@@ -16,6 +16,8 @@ This is a design record. It decides the model: who acts, what they may do, how a
 | **S3, federation:** sites, fleets that trust each other, fleet-qualified identities, signed heads across fleets | 6.5, 6.6 | Proposed; accepted separately |
 | **S4, packages:** publishers, manifests, freshness, overlays | 8 | Proposed; accepted separately |
 
+*Note (2026-11-08):* S2 (§7) is superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed), which keeps §2.1 and §7.6. The umbrella and its text are unchanged.
+
 The umbrella fixes what the specifications must achieve (a child never holds more than its parent, stolen bytes are inert, revoking a parent ends its descendants, a fork records its source, "verified" means identity); each specification decides how, and may be accepted, revised, or replaced by a follow-up ADR without reopening the umbrella. Point 4 shows the delegation model with S1's mechanism, as an example. Open questions are grouped the same way.
 
 ## Context
@@ -260,6 +262,8 @@ In 0.8, `agent add` gives a root agent `admin:agent-<id>-*`, `admin:agent-<id>.*
 ### 7. Forking
 
 *Specification S2: Proposed; accepted separately.*
+
+*Superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed, 2026-11-08).* Points 1, 2, and 3 survive there with incarnations added; points 4 and 5 are replaced by its seeding, completion, readiness, and operation design; point 6 stands.
 
 1. **A fork is a new database** seeded from a source database's snapshot at a position, and independent from then on: its own name, placement, replicas, log, epochs, expiry, and archive. Nothing flows from the source to the fork, or back, after the fork is made. A fork's engine is its source's.
 2. **A fork records where it came from**, in a new metadata field, `forked_from`, set only by the fork command:

@@ -4,6 +4,8 @@
 - **Date:** 2026-11-04
 - **Related:** ADR-0016 (engine adapters), ADR-0017 (control state machine), ADR-0020 (simulation), ADR-0021 (engines), ADR-0025 and ADR-0026 (principals, scopes, tokens), ADR-0029 (archives), ADR-0033 (surfaces), ADR-0038 (versions and fleet features), ADR-0039 (dev mode), ADR-0040 (Raft amendments); tickets FR-070 (#76), FR-066 (router), FR-064 (Raft), FR-069 (vectors), FR-056 (contexts and `-o json`), #95 (upgrade configuration check)
 
+*Note (2026-11-08):* [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed) proposes one more metadata field, **`forked_from`**: a fork's source, the source's incarnation, the position, the chain hash, and the time, set only by the fork command, granting nothing, and archived with the rest of the metadata as the archive's claim (ADR-0046, point 10). It is proposed, not part of this decision, until ADR-0046 is accepted. The text below is unchanged.
+
 ## Context
 
 Agents fit FleetRing's model well: one database per user, task, or agent, holding memory, working state, or a sandbox the agent can drop. FR-070 asks for what an agent needs to use that model without a person in the loop:
