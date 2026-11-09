@@ -256,30 +256,20 @@ impl Primary {
             {
                 return Some(hash);
             }
-            let State { chain, recent, .. } = &mut *state;
-            let ChainState::Ready(chain) = chain else {
+            let ChainState::Ready(chain) = &state.chain else {
                 return None;
             };
             if chain.hash_at(from).is_none() {
-                let reached = from.is_some_and(|from| {
-                    let tip = chain.tip().0.cloned();
-                    let index = recent
-                        .iter()
-                        .position(|shipped| Some(&shipped.batch.end) == tip.as_ref())
-                        .map_or(0, |index| index + 1);
-                    let recent: Vec<&FrameBatch> = recent
-                        .iter()
-                        .skip(index)
-                        .map(|shipped| &shipped.batch)
-                        .collect();
-                    fill_gap(chain, engine, &recent, from)
-                });
+                let reached = from.is_some_and(|from| state.fill_chain(engine, from));
                 if !reached {
                     tracing::warn!(database = %self.name, from = ?from, "the chain doesn't reach a published batch; rebuilding it");
                     state.chain = ChainState::Lost;
                     return None;
                 }
             }
+            let ChainState::Ready(chain) = &state.chain else {
+                return None;
+            };
             chain.hash_at(from)?
         };
         let links = match Links::compute(engine, from_hash, from, batch) {
@@ -314,27 +304,13 @@ impl Primary {
     /// chain holds `target` afterwards.
     fn link_retained(&self, engine: &dyn FrameSourceEngine, target: Option<&Position>) -> bool {
         let mut state = self.lock();
-        let State { chain, recent, .. } = &mut *state;
-        let ChainState::Ready(chain) = chain else {
+        let ChainState::Ready(chain) = &state.chain else {
             return false;
         };
         if chain.hash_at(target).is_some() {
             return true;
         }
-        let Some(target) = target else {
-            return false;
-        };
-        let tip = chain.tip().0.cloned();
-        let index = recent
-            .iter()
-            .position(|shipped| Some(&shipped.batch.end) == tip.as_ref())
-            .map_or(0, |index| index + 1);
-        let retained: Vec<&FrameBatch> = recent
-            .iter()
-            .skip(index)
-            .map(|shipped| &shipped.batch)
-            .collect();
-        fill_gap(chain, engine, &retained, target)
+        target.is_some_and(|target| state.fill_chain(engine, target))
     }
 
     /// The position the chain ends at, if it is built.
@@ -668,6 +644,30 @@ impl Primary {
 }
 
 impl State {
+    /// Extends the chain through the retained batches that continue from its tip until it
+    /// reaches `target`. Returns whether it did. A tip the retained batches don't continue from
+    /// reaches nothing through them: hashing a batch onto a position it doesn't follow would
+    /// give a wrong chain.
+    fn fill_chain(&mut self, engine: &dyn FrameSourceEngine, target: &Position) -> bool {
+        let ChainState::Ready(chain) = &self.chain else {
+            return false;
+        };
+        let tip = chain.tip().0.cloned();
+        let Some(index) = self.following(tip.as_ref()) else {
+            return false;
+        };
+        let Self { chain, recent, .. } = self;
+        let ChainState::Ready(chain) = chain else {
+            return false;
+        };
+        let retained: Vec<&FrameBatch> = recent
+            .iter()
+            .skip(index)
+            .map(|shipped| &shipped.batch)
+            .collect();
+        fill_gap(chain, engine, &retained, target)
+    }
+
     /// Whether `chain` reaches `position` through the retained batches, which hold what was
     /// published while the chain was being rebuilt.
     fn chain_can_reach(&self, chain: &Chain, position: Option<&Position>) -> bool {
@@ -735,6 +735,11 @@ impl State {
     }
 
     /// Drops published batches every follower has, and the oldest beyond `retained_bytes`.
+    ///
+    /// While a checkpoint runs, a batch the chain hasn't reached is kept even when every
+    /// follower has it, as it is when the primary has none: once the checkpoint restarts the
+    /// log, the retained batches are all the chain can reach the checkpoint's position through
+    /// (#156).
     fn prune(&mut self, retained_bytes: usize) {
         let everyone = self
             .followers
@@ -748,8 +753,15 @@ impl State {
             })
             .min()
             .unwrap_or(self.committed.as_ref());
+        let chained = match &self.chain {
+            ChainState::Ready(chain) if self.checkpoints % 2 == 1 => Some(chain.tip().0.cloned()),
+            _ => None,
+        };
         while let Some(front) = self.recent.front() {
-            let held = everyone.is_some_and(|everyone| front.batch.end <= *everyone);
+            let unchained = chained
+                .as_ref()
+                .is_some_and(|tip| Some(&front.batch.end) > tip.as_ref());
+            let held = !unchained && everyone.is_some_and(|everyone| front.batch.end <= *everyone);
             if !held && self.recent_bytes <= retained_bytes {
                 break;
             }
@@ -903,6 +915,14 @@ pub(super) async fn checkpoint(
     };
     match result {
         Ok(marker) => {
+            // Writes that landed between bringing the chain up and the checkpoint are no longer
+            // in the log, which restarted: the chain reaches the marker through the batches
+            // retained meanwhile, or never (#156).
+            if let Some(engine) = frame_source(inner)
+                && !primary.link_retained(engine, Some(&marker.position))
+            {
+                tracing::warn!(database = %primary.name, position = %marker.position, "the chain doesn't reach the checkpoint; it holds no hash past its tip until it is rebuilt");
+            }
             if !excluded.is_empty() {
                 tracing::warn!(
                     database = %primary.name,

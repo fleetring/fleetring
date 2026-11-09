@@ -820,9 +820,6 @@ async fn an_expired_pin_aborts_its_stream_and_is_released() -> TestResult {
         dir.path(),
         Settings {
             data: "max_pin_ms = 1500\n".to_owned(),
-            // No checkpoint while the source is written: a primary without followers keeps its
-            // hash chain current only up to its last checkpoint's.
-            replication: "checkpoint_threshold_bytes = 1000000000\n",
             ..Settings::default()
         },
     )
@@ -1064,16 +1061,14 @@ async fn two_forks_never_count_the_same_free_bytes() -> TestResult {
     Ok(())
 }
 
-/// A dev node, R = 1 and W = 1, forks and its fork becomes ready through the same path
-/// (#135).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dev_node_forks() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let tls = Tls::create(dir.path())?;
+/// A dev node: one daemon that is its own control plane and its only data node, with `extra`
+/// appended to its configuration.
+async fn dev_node(dir: &Path, extra: &str) -> Result<(Daemon, Client), Box<dyn Error>> {
+    let tls = Tls::create(dir)?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"dev\"\n\n[membership]\n\
-         heartbeat_interval_ms = 100\n{}{FORK}",
-        dir.path().join("dev"),
+         heartbeat_interval_ms = 100\n{}{FORK}{extra}",
+        dir.join("dev"),
         tls.node_table("dev")?
     );
     let faults = ForkFaults::new();
@@ -1092,6 +1087,15 @@ async fn a_dev_node_forks() -> TestResult {
     .await?
     .ok_or("membership stopped")?;
     let client = Client::new(address.to_string(), client_network(&tls)?);
+    Ok((daemon, client))
+}
+
+/// A dev node, R = 1 and W = 1, forks and its fork becomes ready through the same path
+/// (#135).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dev_node_forks() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (daemon, client) = dev_node(dir.path(), "").await?;
     let source = name("src")?;
     create_source(&client, &source, 1, 3).await?;
     let target = name("dst")?;
@@ -1106,6 +1110,50 @@ async fn a_dev_node_forks() -> TestResult {
     );
     let held = reserved(dir.path(), &"dev".parse()?, &target)?;
     assert_eq!(held.markers.len(), 1);
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
+/// A lone primary, R = 1, that checkpointed while it was written serves a chain hash at the
+/// position it pins, so a dev node forks a database that has checkpointed (#156).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dev_node_forks_a_database_that_checkpointed() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (daemon, client) = dev_node(
+        dir.path(),
+        "\n[replication]\ncheckpoint_threshold_bytes = 4096\n",
+    )
+    .await?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 0).await?;
+    let replication = daemon.replication().ok_or("no replication")?;
+    // Writes go on while the checkpoints they set off run, so that some land between where the
+    // chain was brought up to and where the checkpoint restarts the log.
+    for n in 0..200 {
+        client
+            .execute(
+                &source,
+                Statement::with_params(
+                    "INSERT INTO notes (body) VALUES (?)",
+                    [Value::from(format!("{n:0>600}"))],
+                ),
+            )
+            .await?;
+    }
+    let status = replication
+        .primary_status(&source)
+        .ok_or("the dev node leads the source")?;
+    assert!(status.checkpointed.is_some(), "the source checkpointed");
+    let target = name("dst")?;
+    let id = operation(10);
+    client
+        .fork_database(&source, &target, &spec(id, 1)?)
+        .await?;
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
     daemon.run_until(async {}).await;
     Ok(())
 }
