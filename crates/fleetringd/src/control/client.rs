@@ -455,6 +455,25 @@ impl ControlClient {
         .await
     }
 
+    /// Finds where a database lives, as [`locate`](Self::locate) does, but with `credentials`
+    /// instead of the client's own: a router locates with each caller's token, so the control
+    /// plane answers only what the caller may read (ADR-0037). Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt.
+    pub async fn locate_as(
+        &self,
+        request: LocateRequest,
+        credentials: &Credentials,
+    ) -> Result<LocateResponse, Status> {
+        let call = |mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.locate(request).await }
+        };
+        retry(self.backoff, || self.following_as(credentials, &call)).await
+    }
+
     async fn retrying<T, F, Fut>(&self, call: F) -> Result<T, Status>
     where
         F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
@@ -469,9 +488,22 @@ impl ControlClient {
         F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
+        self.following_as(&self.shared.credentials, call).await
+    }
+
+    /// As [`following`](Self::following), with `credentials` on each call.
+    async fn following_as<T, F, Fut>(
+        &self,
+        credentials: &Credentials,
+        call: &F,
+    ) -> Result<T, Status>
+    where
+        F: Fn(GrpcControlClient<CredentialedChannel>) -> Fut,
+        Fut: Future<Output = Result<Response<T>, Status>>,
+    {
         let mut redirects = 0;
         loop {
-            match call(self.current()?).await {
+            match call(self.current(credentials)?).await {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) => match leader_hint(&status) {
                     Some(leader) if redirects < MAX_REDIRECTS => {
@@ -485,7 +517,10 @@ impl ControlClient {
         }
     }
 
-    fn current(&self) -> Result<GrpcControlClient<CredentialedChannel>, Status> {
+    fn current(
+        &self,
+        credentials: &Credentials,
+    ) -> Result<GrpcControlClient<CredentialedChannel>, Status> {
         let leader = self.leader();
         let mut channels = self
             .shared
@@ -493,16 +528,13 @@ impl ControlClient {
             .lock()
             .expect("control client lock poisoned");
         if let Some(channel) = channels.get(&leader) {
-            return Ok(control_client_with(
-                channel.clone(),
-                &self.shared.credentials,
-            ));
+            return Ok(control_client_with(channel.clone(), credentials));
         }
         let channel = (self.shared.connect)(&leader).map_err(|error| {
             Status::unavailable(format!("can't reach control node {leader}: {error}"))
         })?;
         channels.insert(leader, channel.clone());
-        Ok(control_client_with(channel, &self.shared.credentials))
+        Ok(control_client_with(channel, credentials))
     }
 
     fn set_leader(&self, leader: String) {
