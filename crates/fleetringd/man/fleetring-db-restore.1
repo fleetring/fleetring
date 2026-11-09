@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-db\-restore \- Creates a new database from an archived one
 .SH SYNOPSIS
-\fBfleetring db restore\fR [\fB\-\-at\-position\fR] [\fB\-\-at\-time\fR] [\fB\-\-replication\-factor\fR] [\fB\-\-acks\fR] [\fB\-\-description\fR] [\fB\-\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-log\-format\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-archive\fR> <\fB\-\-from\fR> <\fINAME\fR> 
+\fBfleetring db restore\fR [\fB\-\-at\-position\fR] [\fB\-\-at\-time\fR] [\fB\-\-replication\-factor\fR] [\fB\-\-acks\fR] [\fB\-\-description\fR] [\fB\-\-label\fR] [\fB\-\-expires\-in\fR] [\fB\-\-expires\-at\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-token\fR] [\fB\-\-color\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-archive\fR> <\fB\-\-from\fR> <\fINAME\fR> 
 .SH DESCRIPTION
 Creates a new database from an archived one
 .PP
@@ -93,18 +93,23 @@ Acts as this principal, with its certificate in the TLS directory
 
 Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as `cert client <principal>` writes them. An explicit certificate or key at the same step wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults to `FLEETRING_AS`, or else the context\*(Aqs `as`.
 .TP
+\fB\-\-insecure\-plaintext\fR
+Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
+.TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`
 
 Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
 .TP
-\fB\-\-insecure\-plaintext\fR
-Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
-.TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Prints the result and errors only
 
 No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+A bearer token from `token issue`, sent with every request
+
+The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
 .TP
 \fB\-\-color\fR \fI<COLOR>\fR [default: auto]
 When to colour log lines and the picker
@@ -122,11 +127,6 @@ always: Always, even into a pipe or a file
 .IP \(bu 2
 never: Never
 .RE
-.TP
-\fB\-\-token\fR \fI<TOKEN>\fR
-A bearer token from `token issue`, sent with every request
-
-The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
 .TP
 \fB\-\-token\-file\fR \fI<PATH>\fR
 A file that holds a bearer token, or `\-` for stdin

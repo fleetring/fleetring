@@ -30,8 +30,8 @@ fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 http-body = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server", "server-auto", "tokio"] }
 # Spinners on stderr for slow commands (ADR-0043, point 6).
 indicatif = { version = "0.18", default-features = false, features = ["unicode-width"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
@@ -102,5 +102,5 @@ divan.workspace = true
 hyper = { version = "1", features = ["server", "http1"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "test-util"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 

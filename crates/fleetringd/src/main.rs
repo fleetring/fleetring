@@ -47,6 +47,7 @@ use fleetringd::report::{
     liveness_name, metadata_report, node_list, node_list_text, node_status, orphan_report,
     query_result, render_archived_metadata, render_text, schema_report, schema_unavailable, table,
 };
+use fleetringd::router::{Router, RouterConfig};
 use fleetringd::tls::{
     AUTHORITY_CERT_FILE, Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
     DEFAULT_NODE_LIFETIME, FleetName, Identity, Peer, Principal, Security, Validity,
@@ -198,6 +199,24 @@ With `--check`, it checks the file and the flags as a start would, and starts no
 Until 1.0, the flags without `serve` (`fleetring --config <file>`, or `fleetringd --config
 <file>`, as 0.6 ran a node) also run a node, and log a warning.";
 
+/// What `fleetring router --help` says (ADR-0037).
+const ROUTER_HELP: &str = "\
+Runs a router, the libSQL/Hrana front door to the fleet.
+
+Serves Hrana over HTTP (`/db/<database>/v3/pipeline`), so that unchanged libSQL and Turso
+clients reach each database's primary. Every request carries a FleetRing token as its
+`authToken`; the router verifies it, checks read on the database, and forwards it to the node.
+The router connects to the fleet with its own client certificate, for a principal every node
+lists with `forward_tokens = true`.";
+
+/// `fleetring router`'s flags.
+#[derive(Debug, Args)]
+struct RouterArgs {
+    /// The router's TOML configuration file
+    #[arg(long)]
+    config: PathBuf,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Runs a node
@@ -211,6 +230,9 @@ enum Command {
     /// current unless another context is, so the other commands need no flags. `dev stop`, `dev
     /// status` and `dev logs` act on the node `-d` started. Not for production.
     Dev(DevArgs),
+    /// Runs a router, the libSQL/Hrana front door to the fleet
+    #[command(long_about = ROUTER_HELP)]
+    Router(RouterArgs),
     /// Stops a node started in a terminal or a script, after it drains
     ///
     /// Sends the node SIGTERM through its process file, which drains it, and waits until it has
@@ -1754,6 +1776,8 @@ enum Run {
         /// Set in dev mode: the prepared directory, for the banner.
         dev: Option<Box<Prepared>>,
     },
+    /// The router, from its configuration file (ADR-0037).
+    Router(Box<RouterConfig>),
 }
 
 /// Parses `raw`, the process's arguments with the program first, as the binary named `name`:
@@ -1848,10 +1872,18 @@ fn main() -> ExitCode {
             }
         },
         Command::Dev(args) => Run::Dev(Box::new(args)),
+        Command::Router(args) => match RouterConfig::load(&args.config) {
+            Ok(config) => Run::Router(Box::new(config)),
+            Err(error) => {
+                report(&error);
+                return ExitCode::FAILURE;
+            }
+        },
         command => Run::Command(Box::new(command)),
     };
     let config = match &run {
-        Run::Daemon { config, .. } => Some(config.as_ref()),
+        Run::Daemon { config, .. } => Some(config.log.format),
+        Run::Router(config) => Some(config.log.format),
         Run::Command(_) | Run::Dev(_) => None,
     };
     let variable = std::env::var(LOG_FORMAT_VAR).ok();
@@ -1868,7 +1900,7 @@ fn main() -> ExitCode {
     // The daemon logs at info; a command prints its result and logs only warnings.
     let default_filter = match run {
         Run::Command(_) | Run::Dev(_) => "warn",
-        Run::Daemon { .. } => "info",
+        Run::Daemon { .. } | Run::Router(_) => "info",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
     // A detached node's log, a journal, or a pipe gets no escape sequences unless `--color
@@ -1906,6 +1938,7 @@ fn main() -> ExitCode {
         Run::Daemon { config, dev } => {
             runtime.block_on(run_daemon(*config, dev.map(|prepared| *prepared)))
         }
+        Run::Router(config) => runtime.block_on(run_router(*config)),
     };
     // Every task, connection, and database is closed by now; the runtime's threads go too,
     // before a restart executes the binary again.
@@ -1931,8 +1964,8 @@ fn failure(error: &(dyn Error + 'static)) -> ExitCode {
     ExitCode::from(exit::code_of(error))
 }
 
-/// The log format: `--log-format`, else `FLEETRING_LOG_FORMAT`, else the daemon's `[log]
-/// format`, else text.
+/// The log format: `--log-format`, else `FLEETRING_LOG_FORMAT`, else the daemon's or the
+/// router's `[log] format`, else text.
 ///
 /// # Errors
 ///
@@ -1940,7 +1973,7 @@ fn failure(error: &(dyn Error + 'static)) -> ExitCode {
 fn log_format(
     flag: Option<LogFormat>,
     variable: Option<&str>,
-    config: Option<&Config>,
+    configured: Option<LogFormat>,
 ) -> Result<LogFormat, String> {
     if let Some(format) = flag {
         return Ok(format);
@@ -1948,7 +1981,7 @@ fn log_format(
     if let Some(value) = variable {
         return value.parse().map_err(|_| value.to_owned());
     }
-    Ok(config.map_or(LogFormat::Text, |config| config.log.format))
+    Ok(configured.unwrap_or(LogFormat::Text))
 }
 
 fn parse_log_format(text: &str) -> Result<LogFormat, String> {
@@ -2053,11 +2086,25 @@ async fn run_daemon(config: Config, dev: Option<Prepared>) -> Result<Stopped, Bo
     })
 }
 
+/// Runs the router until a stop signal (ADR-0037). It holds no state of its own: a stop ends
+/// every Hrana stream, and the nodes roll back what the streams left open.
+async fn run_router(config: RouterConfig) -> Result<Stopped, Box<dyn Error>> {
+    let signals = StopSignals::listen();
+    let router = Router::start(config).await?;
+    router
+        .run_until(async {
+            signals.next().await;
+        })
+        .await;
+    Ok(Stopped::Exit)
+}
+
 async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
     let output = match command {
         Command::Serve(_) | Command::Dev(_) => {
             return Err("serve and dev run a node, not a command".into());
         }
+        Command::Router(_) => return Err("router runs a process, not a command".into()),
         Command::Context(_) | Command::Switch { .. } | Command::Completions(_) => {
             return Err("context, switch and completions don't talk to a fleet".into());
         }
@@ -4545,9 +4592,12 @@ mod tests {
         )
         .expect("a config");
         assert_eq!(log_format(None, None, None), Ok(LogFormat::Text));
-        assert_eq!(log_format(None, None, Some(&config)), Ok(LogFormat::Json));
         assert_eq!(
-            log_format(None, Some("text"), Some(&config)),
+            log_format(None, None, Some(config.log.format)),
+            Ok(LogFormat::Json)
+        );
+        assert_eq!(
+            log_format(None, Some("text"), Some(config.log.format)),
             Ok(LogFormat::Text)
         );
         assert_eq!(
