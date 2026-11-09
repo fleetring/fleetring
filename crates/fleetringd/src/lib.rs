@@ -7,6 +7,14 @@
 //! The library exposes the daemon's building blocks so that tests, including the simulation
 //! harness (ADR-0020), run the same code as the binary.
 
+// The fork tests' fault hooks hold a node's fork work and fake its free disk: never in an
+// optimized build, which is what ships. CI's release test step leaves the feature out.
+#[cfg(all(feature = "fault-hooks", not(debug_assertions)))]
+compile_error!(
+    "the `fault-hooks` feature is for the fork tests only and can't be built without debug \
+     assertions: drop `--features fleetringd/fault-hooks` (or `--all-features`) from a release build"
+);
+
 mod actor;
 pub mod auth;
 pub mod changes;

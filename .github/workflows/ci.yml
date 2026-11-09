@@ -101,9 +101,13 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --workspace --all-features --no-fail-fast
       # The simulation tests are deterministic and OS-independent, and Linux already runs them in
-      # three jobs, so macOS and Windows run every feature except `simulation` (ADR-0014).
+      # three jobs, so macOS and Windows run every feature except `simulation` (ADR-0014). macOS
+      # also enables the fork tests' fault hooks, so that `tests/fork.rs` runs there too.
       - name: all features except simulation
-        if: runner.os != 'Linux'
+        if: runner.os == 'macOS'
+        run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/fault-hooks --no-fail-fast
+      - name: all features except simulation and the fault hooks
+        if: runner.os == 'Windows'
         run: cargo test --workspace --features fleetring/serde,fleetring/test-util --no-fail-fast
       # Feature combinations and the release profile don't depend on the OS, so only Linux runs
       # them; macOS and Windows run the suite once (ADR-0014).
@@ -115,9 +119,11 @@ jobs:
       - name: no default features
         if: runner.os == 'Linux'
         run: cargo test -p fleetring --no-default-features --no-fail-fast
-      - name: all features, release
+      # Every feature but `fleetringd/fault-hooks`, which a build without debug assertions
+      # refuses: the fork tests it enables run in the debug steps above.
+      - name: all features but the fault hooks, release
         if: runner.os == 'Linux'
-        run: cargo test --workspace --all-features --release --no-fail-fast
+        run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-fail-fast
       # Runs every example, so a new one can't be left out. `cargo test` already builds them
       # on every OS, so running them on one is enough.
       - name: examples
@@ -362,4 +368,4 @@ jobs:
       - run: cargo test --workspace --all-features --no-run
       - run: cargo test --workspace --no-run
       - run: cargo test --workspace --no-default-features --no-run
-      - run: cargo test --workspace --all-features --release --no-run
+      - run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-run
