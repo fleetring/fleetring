@@ -83,6 +83,7 @@ const _: () = {
     assert_debug_send_sync::<auth::Scope>();
     assert_debug_send_sync::<auth::Scopes>();
     assert_debug_send_sync::<auth::Target<'static>>();
+    assert_debug_send_sync::<auth::TooManyScopes>();
     assert_debug_send_sync::<auth::TokenError>();
     assert_debug_send_sync::<auth::TokenSigner>();
     assert_debug_send_sync::<auth::TokenSpec>();

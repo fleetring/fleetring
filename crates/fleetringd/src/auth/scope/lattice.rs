@@ -1,5 +1,5 @@
 //! The scope lattice: which scope covers which, and the two exact operations that narrow scopes,
-//! the intersection and the grant step (ADR-0044, point 2.4).
+//! the intersection and the grant step (ADR-0044 §2.4).
 //!
 //! Everything here is a pure function of its arguments: no I/O, clock, randomness, or runtime.
 //! Patterns, prefixes, and separators are compared byte for byte, so nothing widens through a
@@ -8,16 +8,33 @@
 //! matching every name whose bytes start with `p` (`*` alone is `Prefix("")`). A `*` anywhere
 //! but last is an ordinary byte of the name.
 //!
-//! The results are canonical: [`Scopes::normalized`] drops every scope another one covers and
-//! sorts the rest by their text, byte for byte, so equal sets of scopes compare equal.
+//! The results are canonical: every scope another one covers is dropped, and the rest are in
+//! [`Scope`]'s order, their text byte for byte, so equal sets of scopes compare equal.
+//!
+//! The operations refuse a side of more than [`MAX_SCOPES`] scopes, so their work is bounded
+//! whatever a caller passes. Each normalizes both sides first, and the meet of two patterns is
+//! always one of them, so the product of two sides of `n` and `m` scopes holds at most
+//! `6 × (n + m) + 1` distinct scopes, which is all a result is ever built from.
+//!
+//! Until `docs/spec/tokens-v1.md` exists, this module's tests are the golden vectors: ADR-0044
+//! §2.4's table, row by row, and the covering table `TRICKY`.
+
+use std::collections::BTreeSet;
 
 use crate::changes::{DatabaseMatcher, Pattern};
 
 use super::{Action, Rule, Scope, Scopes};
 
+/// The most scopes either side of [`Scopes::intersect`] or the grant step may hold, and the most
+/// a token may carry when it is issued.
+///
+/// An agent's default scopes are two, so 256 is far beyond what a principal needs, and it keeps
+/// the narrowing's work small: at most 65,536 meets of two normalized sides.
+pub const MAX_SCOPES: usize = 256;
+
 impl Action {
-    /// The actions a scope for `self` covers, itself included, strongest first (ADR-0044,
-    /// point 2's table).
+    /// The actions a scope for `self` covers, itself included, strongest first (ADR-0044 §2's
+    /// table).
     fn implied(self) -> &'static [Self] {
         match self {
             Self::Admin => &[Self::Admin, Self::Write, Self::Fork, Self::Read],
@@ -68,6 +85,12 @@ fn pattern_covers(held: &DatabaseMatcher, wanted: &DatabaseMatcher) -> bool {
 
 /// The pattern matching exactly the names both `a` and `b` match, or `None` if no name matches
 /// both. It is always one of the two: the exact name under the prefix, or the longer prefix.
+///
+/// Names starting with `_fleetring` compare as bytes here, like any other, which is sound only
+/// while [`DatabaseMatcher::matches`] matches them as bytes too. When ADR-0044 §2.5's "no pattern
+/// matches a reserved name" ships, that exclusion belongs in `DatabaseMatcher::matches`, for
+/// exact patterns as well as prefixes, and this function must return `None` whenever the meet
+/// would be an exact reserved name, so that no grant step can hand one to a child.
 fn pattern_meet<'a>(a: &'a DatabaseMatcher, b: &'a DatabaseMatcher) -> Option<&'a DatabaseMatcher> {
     if pattern_covers(a, b) {
         Some(b)
@@ -131,43 +154,47 @@ impl Scope {
     }
 }
 
-/// The canonical set of `scopes`: every scope another one covers dropped, duplicates included,
-/// and the rest sorted by their text.
+/// The canonical set of `scopes`: the scopes no other one covers, in [`Scope`]'s order.
+///
+/// The work is `n log n` to sort and deduplicate `n` scopes, then a covering check of each
+/// distinct scope against the antichain kept so far.
 fn normalized(scopes: impl IntoIterator<Item = Scope>) -> Scopes {
-    let mut scopes: Vec<(String, Scope)> = scopes
-        .into_iter()
-        .map(|scope| (scope.to_string(), scope))
-        .collect();
-    scopes.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
-    scopes.dedup_by(|(_, a), (_, b)| a == b);
-    // Distinct scopes never cover each other both ways, so this keeps one of every equal pair
-    // and drops only what something else still covers.
-    let kept: Vec<Scope> = scopes
-        .iter()
-        .filter(|(_, scope)| {
-            !scopes
-                .iter()
-                .any(|(_, other)| other != scope && other.covers(scope))
-        })
-        .map(|(_, scope)| scope.clone())
-        .collect();
+    let sorted: BTreeSet<Scope> = scopes.into_iter().collect();
+    let mut kept: Vec<Scope> = Vec::new();
+    for scope in sorted {
+        if kept.iter().any(|held| held.covers(&scope)) {
+            continue;
+        }
+        // Distinct scopes never cover each other both ways, and `kept` only loses scopes and
+        // gains them at its end, so it stays in order.
+        kept.retain(|held| !scope.covers(held));
+        kept.push(scope);
+    }
     Scopes::new(kept)
+}
+
+/// Refuses a side of more than [`MAX_SCOPES`] scopes.
+fn bounded(scopes: &Scopes) -> Result<(), TooManyScopes> {
+    if scopes.len() > MAX_SCOPES {
+        return Err(TooManyScopes { limit: MAX_SCOPES });
+    }
+    Ok(())
 }
 
 impl Scopes {
     /// The same scopes in canonical form: any scope another one covers dropped, and the rest
-    /// sorted by their text. It allows exactly what `self` allows.
+    /// in [`Scope`]'s order. It allows exactly what `self` allows.
+    ///
+    /// Its work grows with the square of the number of scopes, so it is for sets the caller has
+    /// already bounded.
     #[must_use]
-    pub fn normalized(&self) -> Self {
+    pub(crate) fn normalized(&self) -> Self {
         normalized(self.scopes.iter().cloned())
     }
 
     /// The scopes allowing exactly what both `self` and `other` allow: every non-empty
     /// pairwise [`Scope::meet`], normalized. It is commutative and idempotent, and never wider
-    /// than either side (ADR-0044, point 2.4).
-    ///
-    /// The work is the product of the two sets' sizes, then the square of the result's, so
-    /// callers bound what they pass (a token is at most 8 KiB).
+    /// than either side (ADR-0044 §2.4).
     ///
     /// ```
     /// use fleetringd::auth::Scopes;
@@ -175,37 +202,54 @@ impl Scopes {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let held: Scopes = ["write:agent-42-*"].iter().map(|s| s.parse()).collect::<Result<_, _>>()?;
     /// let asked: Scopes = ["fork:agent-42-*"].iter().map(|s| s.parse()).collect::<Result<_, _>>()?;
-    /// assert_eq!(held.intersect(&asked).as_slice(), ["read:agent-42-*".parse()?]);
+    /// assert_eq!(held.intersect(&asked)?.as_slice(), ["read:agent-42-*".parse()?]);
     /// # Ok(())
     /// # }
     /// ```
-    #[must_use]
-    pub fn intersect(&self, other: &Self) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TooManyScopes`] if either side holds more than [`MAX_SCOPES`] scopes.
+    pub fn intersect(&self, other: &Self) -> Result<Self, TooManyScopes> {
+        bounded(self)?;
+        bounded(other)?;
+        Ok(self.intersect_bounded(other))
+    }
+
+    /// [`intersect`](Self::intersect), for sides already bounded: both normalized first, and
+    /// the product collected into a set, never a list of every pair.
+    fn intersect_bounded(&self, other: &Self) -> Self {
+        let (a, b) = (self.normalized(), other.normalized());
         normalized(
-            self.scopes
+            a.scopes
                 .iter()
-                .flat_map(|a| other.scopes.iter().filter_map(move |b| a.meet(b))),
+                .flat_map(|x| b.scopes.iter().filter_map(move |y| x.meet(y))),
         )
     }
 
-    /// The patterns of the `grant` scopes.
+    /// The distinct patterns of the `grant` scopes.
     fn grant_patterns(&self) -> Vec<&DatabaseMatcher> {
-        self.scopes
-            .iter()
-            .filter_map(|scope| match &scope.rule {
+        let mut patterns: Vec<&DatabaseMatcher> = Vec::new();
+        for scope in &self.scopes {
+            match &scope.rule {
                 Rule::Databases {
                     action: Action::Grant,
                     pattern,
-                } => Some(pattern),
-                Rule::Databases { .. } | Rule::Fleet => None,
-            })
-            .collect()
+                } => {
+                    if !patterns.contains(&pattern) {
+                        patterns.push(pattern);
+                    }
+                }
+                Rule::Databases { .. } | Rule::Fleet => {}
+            }
+        }
+        patterns
     }
 
-    /// The grant step without its refusals: the intersection, each pattern met with each
-    /// `grant` pattern, and `fleet` dropped.
+    /// The grant step without its refusals, for sides already bounded: the intersection, each
+    /// pattern met with each `grant` pattern, and `fleet` dropped.
     fn narrowed(&self, requested: &Self, grants: &[&DatabaseMatcher]) -> Self {
-        let intersection = self.intersect(requested);
+        let intersection = self.intersect_bounded(requested);
         normalized(intersection.scopes.iter().flat_map(|scope| {
             let held = match &scope.rule {
                 Rule::Databases { action, pattern } => Some((*action, pattern)),
@@ -220,18 +264,21 @@ impl Scopes {
     }
 
     /// What a holder with these effective scopes may hand a new holder that asks for
-    /// `requested`, narrowed silently (ADR-0044, point 2.4): the intersection with
-    /// `requested`, then each pattern met with each pattern the `grant` scopes hold, keeping
-    /// what isn't empty and dropping `fleet`, normalized.
+    /// `requested`, narrowed silently (ADR-0044 §2.4): the intersection with `requested`, then
+    /// each pattern met with each pattern the `grant` scopes hold, keeping what isn't empty and
+    /// dropping `fleet`, normalized.
     ///
     /// The result is covered both by `self` and by the `grant` patterns. It may be narrower than
     /// `requested`; [`grant_step_strict`](Self::grant_step_strict) refuses instead.
     ///
     /// # Errors
     ///
+    /// [`GrantStepError::TooMany`] if either side holds more than [`MAX_SCOPES`] scopes,
     /// [`GrantStepError::NoGrant`] if `self` holds no `grant` scope, and
     /// [`GrantStepError::Empty`] if nothing remains.
     pub fn grant_step(&self, requested: &Self) -> Result<Self, GrantStepError> {
+        bounded(self)?;
+        bounded(requested)?;
         let grants = self.grant_patterns();
         if grants.is_empty() {
             return Err(GrantStepError::NoGrant);
@@ -243,9 +290,9 @@ impl Scopes {
         Ok(narrowed)
     }
 
-    /// The grant step that never narrows: exactly `requested`, normalized, if the grant step
-    /// keeps every requested scope whole, and a refusal naming the first scope it would narrow
-    /// or drop otherwise. `fleet` is never kept, so asking for it is refused.
+    /// The grant step that never narrows: exactly `requested`, in canonical form, if the grant
+    /// step keeps every requested scope whole, and a refusal naming the first scope it would
+    /// narrow or drop otherwise. `fleet` is never kept, so asking for it is refused.
     ///
     /// ```
     /// use fleetringd::auth::{GrantStepError, Scopes};
@@ -266,11 +313,14 @@ impl Scopes {
     ///
     /// # Errors
     ///
+    /// [`GrantStepError::TooMany`] if either side holds more than [`MAX_SCOPES`] scopes,
     /// [`GrantStepError::NoGrant`] if `self` holds no `grant` scope,
     /// [`GrantStepError::Empty`] if `requested` is empty, and [`GrantStepError::NotCovered`]
     /// naming the first requested scope, in canonical order, that the grant step would narrow
     /// or drop.
     pub fn grant_step_strict(&self, requested: &Self) -> Result<Self, GrantStepError> {
+        bounded(self)?;
+        bounded(requested)?;
         let grants = self.grant_patterns();
         if grants.is_empty() {
             return Err(GrantStepError::NoGrant);
@@ -279,7 +329,7 @@ impl Scopes {
         if wanted.is_empty() {
             return Err(GrantStepError::Empty);
         }
-        let narrowed = self.narrowed(requested, &grants);
+        let narrowed = self.narrowed(&wanted, &grants);
         if let Some(scope) = wanted
             .scopes
             .iter()
@@ -293,10 +343,25 @@ impl Scopes {
     }
 }
 
+/// A set of scopes too large to narrow: more than [`MAX_SCOPES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a set of scopes to narrow holds at most {limit}")]
+#[non_exhaustive]
+pub struct TooManyScopes {
+    /// The most a side may hold, [`MAX_SCOPES`].
+    pub limit: usize,
+}
+
 /// Why the grant step refuses.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum GrantStepError {
+    /// The effective scopes or the requested ones hold more than [`MAX_SCOPES`].
+    #[error("a set of scopes to narrow holds at most {limit}")]
+    TooMany {
+        /// The most a side may hold, [`MAX_SCOPES`].
+        limit: usize,
+    },
     /// The effective scopes hold no `grant` scope, so they can name no new holder.
     #[error("the scopes hold no grant, so they can't name a new holder")]
     NoGrant,
@@ -309,6 +374,14 @@ pub enum GrantStepError {
         /// The requested scope, as normalized.
         scope: Scope,
     },
+}
+
+impl From<TooManyScopes> for GrantStepError {
+    fn from(too_many: TooManyScopes) -> Self {
+        Self::TooMany {
+            limit: too_many.limit,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +532,17 @@ mod tests {
         ("admin:_fleetring/identity", "admin:_fleetring/*", false),
         ("admin:_fleetring/*", "admin:_fleetring/identity", true),
         ("admin:_fleetring/*", "admin:_fleetringx", false),
+        // Today an exact reserved name is bytes too, so `*` covers it and a grant step can keep
+        // it. When ADR-0044 §2.5's exclusion ships, `pattern_meet` returns `None` for it and
+        // these rows change (see `pattern_meet`).
+        ("read:*", "read:_fleetring", true),
+        ("read:_fleetring/identity", "read:_fleetring/identity", true),
+        (
+            "read:_fleetring/identity",
+            "read:_fleetring/identity2",
+            false,
+        ),
+        ("grant:*", "grant:_fleetring/identity", true),
         // Actions: nothing widens through an implication.
         ("admin:x", "fork:x", true),
         ("admin:x", "write:x", true),
@@ -528,9 +612,136 @@ mod tests {
             ("read:x", "stream:x", None),
             ("fleet", "fleet", Some("fleet")),
             ("fleet", "admin:*", None),
+            // Today's byte-wise meet keeps an exact reserved name (see `pattern_meet`).
+            (
+                "read:_fleetring*",
+                "read:_fleetring/identity",
+                Some("read:_fleetring/identity"),
+            ),
+            (
+                "admin:*",
+                "read:_fleetring/identity",
+                Some("read:_fleetring/identity"),
+            ),
         ] {
             assert_eq!(scope(a).meet(&scope(b)), meet.map(scope), "{a} ∧ {b}");
         }
+    }
+
+    /// A list of `count` distinct scopes no one of which covers another, over `action`.
+    fn distinct(action: &str, tag: &str, count: usize) -> Scopes {
+        (0..count)
+            .map(|i| scope(&format!("{action}:{tag}-{i}-*")))
+            .collect()
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a cost test measures wall time; the lattice it measures reads no clock"
+    )]
+    fn an_oversized_side_is_refused_before_any_work() {
+        let holder = {
+            let mut held = distinct("admin", "a", MAX_SCOPES - 1);
+            held.extend([scope("grant:*")]);
+            held
+        };
+        let too_many = distinct("read", "a", MAX_SCOPES + 1);
+        let fine = distinct("read", "a", MAX_SCOPES);
+        let refused = GrantStepError::TooMany { limit: MAX_SCOPES };
+        // A side far over the limit is refused as fast as one just over it: the length is
+        // checked before anything is compared.
+        let huge = distinct("read", "a", 20_000);
+        let started = std::time::Instant::now();
+        for asked in [&too_many, &huge] {
+            assert_eq!(holder.grant_step(asked), Err(refused.clone()));
+            assert_eq!(holder.grant_step_strict(asked), Err(refused.clone()));
+            assert_eq!(asked.grant_step(&fine), Err(refused.clone()));
+            assert_eq!(
+                holder.intersect(asked),
+                Err(TooManyScopes { limit: MAX_SCOPES })
+            );
+            assert_eq!(
+                asked.intersect(&holder),
+                Err(TooManyScopes { limit: MAX_SCOPES })
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "refusing took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            refused.to_string(),
+            "a set of scopes to narrow holds at most 256"
+        );
+        // Exactly the limit is accepted, on either side.
+        assert_eq!(
+            scopes(&["admin:*", "grant:*"]).grant_step_strict(&fine),
+            Ok(fine.normalized())
+        );
+        assert_eq!(holder.len(), MAX_SCOPES);
+        assert_eq!(
+            fine.intersect(&holder).map(|both| both.len()),
+            Ok(MAX_SCOPES - 1)
+        );
+    }
+
+    /// The narrowing's worst sides at the limit finish well within a generous bound, even in a
+    /// debug build: 256 effective scopes, half of them `grant`, against 256 requested ones whose
+    /// meets with them are all distinct.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a cost test measures wall time; the lattice it measures reads no clock"
+    )]
+    fn narrowing_at_the_limit_stays_cheap() {
+        let half = MAX_SCOPES / 2;
+        let mut effective = distinct("admin", "p", half);
+        effective.extend(distinct("grant", "p", half).as_slice().iter().cloned());
+        let mut requested: Scopes = (0..MAX_SCOPES)
+            .map(|i| scope(&format!("fork:p-{}-x{i}", i % half)))
+            .collect();
+        let started = std::time::Instant::now();
+        let both = effective.intersect(&requested).expect("within the limit");
+        assert_eq!(both.len(), MAX_SCOPES);
+        let narrowed = effective.grant_step(&requested).expect("a grant step");
+        assert_eq!(narrowed, requested.normalized());
+        assert_eq!(effective.grant_step_strict(&requested), Ok(narrowed));
+        // And the pathological shape: every pair of sides meets in a scope of its own.
+        requested = distinct("read", "q", MAX_SCOPES);
+        let wide: Scopes = (0..MAX_SCOPES)
+            .map(|i| scope(&format!("admin:q-{i}*")))
+            .collect();
+        let both = wide.intersect(&requested).expect("within the limit");
+        assert!(both.len() <= MAX_SCOPES);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "narrowing at the limit took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn scopes_order_by_their_text() {
+        let mut generator = Generator(0x5eed_0004);
+        for _ in 0..CASES {
+            let (a, b) = (generator.scope(), generator.scope());
+            assert_eq!(
+                a.cmp(&b),
+                a.to_string().as_bytes().cmp(b.to_string().as_bytes()),
+                "{a} and {b}"
+            );
+            assert_eq!(
+                a.cmp(&b) == std::cmp::Ordering::Equal,
+                a == b,
+                "{a} and {b}"
+            );
+        }
+        let names: Vec<&str> = Action::ALL.iter().map(|action| action.as_str()).collect();
+        let mut sorted = Action::ALL;
+        sorted.sort();
+        assert_eq!(sorted, Action::ALL, "{names:?}");
     }
 
     /// A grant step's row: the effective scopes, the requested ones, and the result.
@@ -540,7 +751,7 @@ mod tests {
         Result<&'static [&'static str], GrantStepError>,
     );
 
-    /// ADR-0044 point 2.4's golden vectors, each row as the ADR states it.
+    /// ADR-0044 §2.4's golden vectors, each row as the ADR states it.
     #[test]
     fn the_golden_vectors_of_point_two_four_hold() {
         let intersections: &[(&[&str], &[&str], &[&str])] = &[
@@ -575,7 +786,9 @@ mod tests {
             (&["fleet", "read:a-*"], &["fleet"], &["fleet"]),
         ];
         for (effective, block, result) in intersections {
-            let got = scopes(effective).intersect(&scopes(block));
+            let got = scopes(effective)
+                .intersect(&scopes(block))
+                .expect("within the limit");
             assert_eq!(texts(&got), *result, "{effective:?} ∩ {block:?}");
         }
 
@@ -848,11 +1061,23 @@ mod tests {
         for _ in 0..CASES {
             let a = generator.scopes(4);
             let b = generator.scopes(4);
-            let both = a.intersect(&b);
+            let both = a.intersect(&b).expect("within the limit");
             assert_canonical(&both);
-            assert_eq!(both, b.intersect(&a), "{a:?} ∩ {b:?} commutes");
-            assert_eq!(a.intersect(&a), a.normalized(), "{a:?} ∩ itself");
-            assert_eq!(both.intersect(&b), both, "{a:?} ∩ {b:?} twice");
+            assert_eq!(
+                both,
+                b.intersect(&a).expect("within the limit"),
+                "{a:?} ∩ {b:?} commutes"
+            );
+            assert_eq!(
+                a.intersect(&a).expect("within the limit"),
+                a.normalized(),
+                "{a:?} ∩ itself"
+            );
+            assert_eq!(
+                both.intersect(&b).expect("within the limit"),
+                both,
+                "{a:?} ∩ {b:?} twice"
+            );
             for scope in both.as_slice() {
                 assert!(
                     a.as_slice().iter().any(|held| held.covers(scope)),
@@ -914,7 +1139,11 @@ mod tests {
                 Err(GrantStepError::Empty) => {
                     assert!(!grants.is_empty());
                 }
-                Err(error) => panic!("the narrowing step refused with {error}"),
+                Err(
+                    error @ (GrantStepError::NotCovered { .. } | GrantStepError::TooMany { .. }),
+                ) => {
+                    panic!("the narrowing step refused with {error}")
+                }
                 Ok(result) => {
                     kept += 1;
                     assert_canonical(result);
@@ -975,6 +1204,9 @@ mod tests {
                 }
                 Err(GrantStepError::NoGrant) => assert!(grants.is_empty()),
                 Err(GrantStepError::Empty) => assert!(requested.normalized().is_empty()),
+                Err(error @ GrantStepError::TooMany { .. }) => {
+                    panic!("the strict step refused {requested:?} with {error}")
+                }
             }
         }
         // The generator reaches every outcome often enough to mean something.
