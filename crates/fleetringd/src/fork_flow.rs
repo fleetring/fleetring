@@ -371,9 +371,9 @@ pub fn refusal_hint(
 #[must_use]
 pub fn resume_hint(operation: &str, source: &str, target: &str) -> String {
     format!(
-        "resume with `fleetring db fork {source} {target} --operation-id {operation}` (kept for \
-         {RETENTION_DAYS} days after the fork finishes; after that, this command starts a new \
-         fork)"
+        "resume with `fleetring db fork {source} {target} --operation-id {operation}`. The \
+         operation ID is kept for {RETENTION_DAYS} days after the fork finishes; after that, \
+         this command starts a new fork."
     )
 }
 

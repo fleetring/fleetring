@@ -263,10 +263,13 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
     match report.state {
         "failed" | "cancelled" => {
             emit(&rendered)?;
-            eprintln!(
-                "{}",
-                outcome_hint(&report, &shown(&target_name), &resume(&id))
-            );
+            let refused = status
+                .placement
+                .as_ref()
+                .and_then(|placement| placement.fork.as_ref())
+                .map(|fork| fork.disk_refused.clone())
+                .unwrap_or_default();
+            eprintln!("{}", outcome_hint(&report, &shown(&target_name), &refused));
             Err(exit::Silent(exit::FAILURE).into())
         }
         _ => Ok(rendered),
@@ -279,16 +282,77 @@ fn exit_failure(status: &Status, hint: &str) -> Box<dyn Error> {
 }
 
 /// What to do about a fork that ended badly.
-fn outcome_hint(report: &ForkReport, target: &str, resume: &str) -> String {
+fn outcome_hint(report: &ForkReport, target: &str, disk_refused: &[String]) -> String {
     match report.state {
         "cancelled" => format!(
             "operation {} was cancelled before the fork was ready (dropped or expired); run \
              `fleetring db fork {} {target}` for a new fork",
             report.operation_id, report.source
         ),
-        _ => format!(
-            "hint: `fleetring db drop {target}` removes the failed fork; then fork again ({resume})"
-        ),
+        _ => {
+            let mut hint = format!(
+                "hint: `fleetring db drop {target}` removes the failed fork; then run \
+                 `fleetring db fork {} {target}` again.",
+                report.source
+            );
+            let out_of_disk = report
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.reason == "insufficient_disk");
+            if out_of_disk {
+                if !disk_refused.is_empty() {
+                    hint.push_str(&format!(" Free disk on {}", disk_refused.join(", ")));
+                    hint.push_str(", or fork with a smaller --replication-factor.");
+                } else {
+                    hint.push_str(" Free disk on the replicas' nodes, or fork with a smaller --replication-factor.");
+                }
+            }
+            hint
+        }
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn failed(reason: &str) -> ForkReport {
+        ForkReport {
+            operation_id: "op".to_owned(),
+            database: "notes-try".to_owned(),
+            incarnation: "0".repeat(16),
+            state: "failed",
+            source: "notes".to_owned(),
+            source_incarnation: "0".repeat(16),
+            position: None,
+            chain_hash: None,
+            failure: Some(fleetring_client::output::ForkFailureReport {
+                reason: reason.to_owned(),
+                last_cause: None,
+                attempts: 1,
+            }),
+            elapsed_ms: 0,
+            placement: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_fork_says_to_drop_it_and_fork_again_with_no_nesting() {
+        let hint = outcome_hint(&failed("retries_exhausted"), "notes-try", &[]);
+        assert_eq!(
+            hint,
+            "hint: `fleetring db drop notes-try` removes the failed fork; then run `fleetring db \
+             fork notes notes-try` again."
+        );
+        let disk = outcome_hint(
+            &failed("insufficient_disk"),
+            "notes-try",
+            &["data-2".to_owned()],
+        );
+        assert!(
+            disk.contains("Free disk on data-2, or fork with a smaller"),
+            "{disk}"
+        );
     }
 }
 
