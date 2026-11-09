@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use fleetring::ReplicationFactor;
 use fleetring_control::{DatabaseName, Millis};
-use fleetringd::auth::{BearerToken, Grant, Scope, TokenSigner};
+use fleetringd::auth::{BearerToken, Scope, TokenSigner, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{Client, DatabaseSpec};
 use fleetringd::engine::{Statement, Value as SqlValue};
@@ -307,7 +307,7 @@ pub(crate) fn issue(
     id: &str,
 ) -> Result<String, Box<dyn Error>> {
     let now = SystemClock.now();
-    let token: BearerToken = signer.issue(&Grant {
+    let token: BearerToken = signer.issue(&TokenSpec {
         principal: principal.parse()?,
         scopes: scopes
             .iter()

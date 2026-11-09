@@ -16,7 +16,7 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::*;
-use crate::auth::{BoxStream, Grant, Scope};
+use crate::auth::{BoxStream, Scope, TokenSpec};
 use crate::clock::SimClock;
 use crate::router::hrana::{PipelineRequest, StreamResult};
 use crate::router::naming::{Endpoint, Hrana, Target};
@@ -167,7 +167,7 @@ async fn a_lost_reply_is_an_error_and_never_resent() {
     let token = authority
         .token_signer()
         .expect("a signer")
-        .issue(&Grant {
+        .issue(&TokenSpec {
             principal: "app".parse().expect("a principal"),
             scopes: ["write:notes".parse::<Scope>().expect("a scope")]
                 .into_iter()
