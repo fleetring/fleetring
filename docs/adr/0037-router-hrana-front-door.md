@@ -1,6 +1,6 @@
 # ADR-0037: The router is a Hrana-over-HTTP front door that authenticates each request and runs it in a session on its database's primary
 
-- **Status:** Accepted (2026-11-03)
+- **Status:** Accepted (2026-11-03); points 8, 10, 12, 14, 15, 19, 21, and 23 refined by the [amendment](#amendment-2026-11-08-fr-066) below
 - **Date:** 2026-11-03
 - **Related:** ADR-0016 (engine adapters), ADR-0018 (leases, epochs, quorums), ADR-0019 (gRPC; the `Database` service is v0.1-only), ADR-0023 (durability), ADR-0025 (principals and scopes), ADR-0026 (amends point 4), ADR-0031 (node calls bound to placement), ADR-0033 (surfaces); tickets FR-061, FR-066
 
@@ -88,3 +88,22 @@ Four facts of FleetRing shape the design:
 - A request whose reply is lost fails at the client rather than being retried for it, which is the same contract `Execute` has. Clients that retry blindly on network errors can double a write; that is their existing behaviour against any Hrana server.
 - A router holds tokens in memory for the streams it serves, and never writes or logs them. `SECURITY.md` gains the router as an actor: what a compromised router can do is what its callers' unexpired tokens allow, until they expire or are revoked.
 - Follow-ups: WebSocket Hrana and the protobuf encoding; follower reads; the router's use of `fleetring-client` (FR-056); a `WatchLeases`-driven placement cache instead of TTLs at large scale (E4).
+
+## Amendment (2026-11-08, FR-066)
+
+Building the router, and the independent security review of it, found places where the decision was silent or too loose. Each refinement keeps the decision's intent, and most are the more conservative reading; the text above stands.
+
+1. **A call the node never ran says so (points 15 and 21).** A node answers a call it refused before running any of it, because the lease moved, the replica floor isn't met, too many writes wait, the transaction it belonged to is gone, or the node no longer serves the database when the call's turn comes, with `SessionResult.not_run`, which says whether the session ends and may name the primary. The router sends such a call again, to the new primary, up to three times, and only from a stream outside a transaction: this is point 21's "provably never ran" case, made explicit in the protocol rather than inferred from a status.
+2. **A baton is bound to the token that opened its stream (point 19),** not only to its principal: a request with another token of the same principal's is `403` too. A client that rotates its token mid-stream opens a new stream. Stream IDs are random 64-bit numbers from the same generator as the batons' secrets, so a baton says nothing of how many streams came before it.
+3. **`NOT_FOUND` is per request (point 21).** A session opens at a stream's first call, not when the HTTP request arrives, so a database that doesn't exist, or stops existing between requests, fails that request with the Hrana error `NOT_FOUND` naming it, inside a `200` pipeline response, as sqld reports per-statement errors. A path that names no endpoint is still `404` (point 8).
+4. **`base_url` repeats the database's path (point 10):** `<advertise_url>/db/<percent-encoded name>/`, since clients resolve the next endpoint against it. A request in the host form gets no `base_url`, so behind a load balancer its streams need sticky sessions to reach the router instance that holds them.
+5. **Statements may not create temporary objects (point 12).** `CREATE TEMP` tables, indexes, triggers, and views are refused in sessions and through `Execute` alike: a temporary object would live on a connection every caller of the database shares, outside the replicated log, where one session could read or shadow what another wrote.
+6. **The bounds of points 14 and 23 gain limits, and per-principal shares,** so that one caller can't take every place:
+   - A data node holds at most 10,000 sessions, at most `[sessions] max_sessions_per_principal` (256) of one principal's, counted by a forwarded token's own principal; gives a session 10 s to open; and ends one idle for `[sessions] idle_timeout_ms` (60 s).
+   - One principal's sessions may take at most half of a database's `max_waiting_writes` places.
+   - A write's statement deadline counts from when it starts, after any wait behind a transaction, and it may wait up to `transaction_timeout_ms` besides, or until its own call deadline; it is admitted under its lease when it starts, not when it arrives, so a waiting write never holds up a drain and never runs after one.
+   - The router holds at most `[streams] max_streams_per_principal` (256) streams of one principal's (`429` beyond); at most `[streams] max_statements` (1,000) statements per request; and at most `[streams] max_response_bytes` (64 MiB) of rows per response, a node bounding one call at 32 MiB. A call whose rows don't fit fails with `RESULT_TOO_LARGE`, and the stream keeps the transaction state the call left.
+   - `[routing] call_timeout_ms` (60 s) bounds the wait for a call's answer, after which its outcome is unknown.
+   - The router closes a connection with no request in flight for `[http] idle_timeout_ms` (30 s), one that never sends a request included, and one client address holds at most `[http] max_connections_per_ip` (1,024) of its 16,384 connections. HTTP/2 connections, from clients and to nodes, are pinged every 30 s and closed if a ping goes 20 s unanswered.
+
+What remains exposed, by design: a principal with `write` on a database can hold its writer for `transaction_timeout_ms` at a time, and take turns at it with other principals; `Execute` writes aren't counted per principal; and behind a load balancer that doesn't pass client addresses on, the per-address connection cap counts the balancer's addresses.
