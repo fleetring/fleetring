@@ -452,6 +452,35 @@ impl Authorized {
         self.caller.sees(action, database)
     }
 
+    /// Whether the caller may take `action` on `database` itself, for a handler that narrows
+    /// what an already authorized request may do: a `Session` caller without `write` gets a
+    /// read-only session (ADR-0037, point 17). Nothing is logged; the handler logs a refusal.
+    #[must_use]
+    pub fn may(&self, action: Action, database: &DatabaseName) -> bool {
+        self.caller.may(action, database)
+    }
+
+    /// Logs, on the audit target, that the caller was refused `action` on `database` by a
+    /// handler that narrowed what its request may do, as a read-only session's refused write.
+    pub fn audit_refused(&self, action: Action, database: &DatabaseName) {
+        let denied = Denied {
+            method: self.rpc.method(),
+            needed: crate::auth::Needed::Database(action, database.clone()),
+        };
+        audit_denied(&self.caller, self.rpc, &denied);
+    }
+
+    /// Checks the request against its RPC's requirement, with `database` the one it names, and
+    /// logs the decision, for a streaming handler that learns the database from the stream's
+    /// first message.
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED` naming the action and the database, never the caller's scopes.
+    pub fn require(&self, database: &DatabaseName) -> Result<(), Status> {
+        self.check(Some(database))
+    }
+
     /// Ends `stream` with `UNAUTHENTICATED` once the token the request carried expires or is
     /// revoked, and with `UNAVAILABLE` if this node's denylist goes stale meanwhile. The token
     /// is checked before each item and every [`STREAM_RECHECK`] between items. A stream opened

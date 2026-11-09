@@ -25,6 +25,7 @@ use crate::data::convert::{
 };
 use crate::data::leases::{LeaseStream, STREAM_BUFFER, lease_stream};
 use crate::data::node::{DataNode, restore_status};
+use crate::data::session::{self, SessionStream};
 use crate::data::watch::{self, ChangeStream};
 use crate::durability::{Listing, RestoreTarget, restore_into};
 use crate::engine::{EngineError, Interruption, Position, Transaction};
@@ -256,6 +257,8 @@ impl Drop for CountedOnDrop<'_> {
 ///   it, or the write committed on the primary but replication couldn't store it on a write
 ///   quorum, because too few replicas are reachable (under-replicated) or they didn't acknowledge
 ///   it in time. Such a write may still reach the followers later.
+/// - `RESOURCE_EXHAUSTED`: a SQL session's transaction holds the writer, and too many writes
+///   wait for it already; the request never ran (ADR-0037).
 /// - `NOT_FOUND`: the database has no copy here.
 /// - `UNIMPLEMENTED`: the engine can't run this kind of request.
 /// - `INTERNAL`: storage failed.
@@ -265,6 +268,11 @@ pub(crate) fn database_status(error: &DatabaseError) -> Status {
         DatabaseError::Closed { .. } | DatabaseError::Refused { .. } => {
             Status::unavailable(message)
         }
+        DatabaseError::Busy { .. } => Status::resource_exhausted(message),
+        DatabaseError::TransactionTimedOut { .. } | DatabaseError::TransactionLost { .. } => {
+            Status::aborted(message)
+        }
+        DatabaseError::NoSessions { .. } => Status::failed_precondition(message),
         DatabaseError::Interrupted { .. } | DatabaseError::Replication(_) => {
             Status::aborted(message)
         }
@@ -316,6 +324,18 @@ fn restore_target(point: Option<RestorePoint>) -> Result<RestoreTarget, Status> 
 impl Database for DatabaseService {
     type WatchLeasesStream = LeaseStream;
     type WatchChangesStream = ChangeStream;
+    type SessionStream = SessionStream;
+
+    /// Opens a SQL session on the database's primary for one Hrana stream (ADR-0037). The
+    /// request boundary has found the caller; this checks `read` on the database the first
+    /// message names, and `write` to decide whether the session may write.
+    async fn session(
+        &self,
+        request: Request<tonic::Streaming<fleetring_proto::v1::SessionRequest>>,
+    ) -> Result<Response<Self::SessionStream>, Status> {
+        let stream = session::open(&self.node, request).await?;
+        Ok(Response::new(stream))
+    }
 
     /// Streams the database's recorded row changes from its primary (ADR-0045). The request
     /// boundary has found the caller; this checks `stream` on the database the request names.

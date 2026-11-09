@@ -14,6 +14,7 @@ use fleetring::{Host, NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
+use crate::actor::SessionLimits;
 use crate::auth::{Action, Scopes};
 use crate::changes::ChangesConfig;
 use crate::control::DurabilityDefaults;
@@ -109,6 +110,10 @@ pub struct Config {
     /// What one request may take on a data node (FR-078).
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// How long a SQL session's transaction may hold a database's writer, and how many writes
+    /// may wait for it (ADR-0037).
+    #[serde(default)]
+    pub sessions: SessionsConfig,
 }
 
 /// How long a statement may run on a data node unless `[limits] statement_timeout_ms` says
@@ -150,6 +155,56 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT,
+        }
+    }
+}
+
+/// How long a SQL session's transaction may hold a database's writer unless `[sessions]
+/// transaction_timeout_ms` says otherwise: 30 seconds.
+const DEFAULT_TRANSACTION_TIMEOUT: NonZeroU64 = NonZeroU64::new(30_000).expect("30000 is nonzero");
+
+/// How many writes may wait for a SQL session's transaction, per database, unless `[sessions]
+/// max_waiting_writes` says otherwise.
+const DEFAULT_MAX_WAITING_WRITES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is nonzero");
+
+/// The `[sessions]` table: how SQL sessions, the router's Hrana streams on a primary, may hold a
+/// database's writer (ADR-0037, point 14). New in 0.8.0.
+///
+/// ```toml
+/// [sessions]
+/// transaction_timeout_ms = 30000   # a session transaction open longer is rolled back
+/// max_waiting_writes = 64          # writes queued behind an open transaction, per database
+/// ```
+///
+/// While a session's transaction is open, other writes to its database wait, and reads go on. A
+/// write past `max_waiting_writes` is refused with `RESOURCE_EXHAUSTED`, and never runs. A
+/// transaction open longer than `transaction_timeout_ms` is rolled back, and its session's next
+/// call fails, so a client that walks away can't hold a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionsConfig {
+    /// The longest a session's transaction may stay open, in milliseconds. At least 1.
+    pub transaction_timeout_ms: NonZeroU64,
+    /// How many writes may wait for a session's transaction, per database. At least 1.
+    pub max_waiting_writes: NonZeroUsize,
+}
+
+impl SessionsConfig {
+    /// The limits the registry holds sessions to.
+    #[must_use]
+    pub fn limits(&self) -> SessionLimits {
+        SessionLimits {
+            transaction_timeout: Duration::from_millis(self.transaction_timeout_ms.get()),
+            max_waiting_writes: self.max_waiting_writes.get(),
+        }
+    }
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            transaction_timeout_ms: DEFAULT_TRANSACTION_TIMEOUT,
+            max_waiting_writes: DEFAULT_MAX_WAITING_WRITES,
         }
     }
 }
@@ -1127,6 +1182,29 @@ mod tests {
         assert!(message.contains("nonzero replication factor"), "{message}");
         let large = with("\n[replication]\nreplication_factor = 256\n");
         assert!(large.is_err(), "a factor above 255: {large:?}");
+    }
+
+    #[test]
+    fn sessions_default_to_thirty_seconds_and_sixty_four_waiting_writes() {
+        let defaults = with("").expect("defaults");
+        assert_eq!(
+            defaults.sessions.limits(),
+            SessionLimits {
+                transaction_timeout: Duration::from_secs(30),
+                max_waiting_writes: 64,
+            }
+        );
+        let set = with("\n[sessions]\ntransaction_timeout_ms = 500\nmax_waiting_writes = 2\n")
+            .expect("set limits");
+        assert_eq!(
+            set.sessions.limits(),
+            SessionLimits {
+                transaction_timeout: Duration::from_millis(500),
+                max_waiting_writes: 2,
+            }
+        );
+        let zero = with("\n[sessions]\nmax_waiting_writes = 0\n").expect_err("zero writes");
+        assert!(zero.to_string().contains("max_waiting_writes"), "{zero}");
     }
 
     #[test]

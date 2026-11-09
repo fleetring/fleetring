@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::engine::{
     CaptureMode, ChangesAfter, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, Interrupt,
     Interruption, LogicalSupport, PinnedSnapshot, Position, ReadLimit, RecordedTransaction,
-    ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, Statement, Transaction,
+    ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, SqlSessions, Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -111,6 +111,12 @@ pub trait Database: fmt::Debug + Send {
     /// The database's row-change recorder, if its engine supports logical change streams
     /// ([`DatabaseEngine::logical_support`]). The default is `None`.
     fn logical_changes(&mut self) -> Option<&mut dyn LogicalChanges> {
+        None
+    }
+
+    /// The database's SQL sessions, if its engine runs them (ADR-0037). The default is `None`,
+    /// and a `Database.Session` call on such a database is refused with `FAILED_PRECONDITION`.
+    fn sql_sessions(&mut self) -> Option<&mut dyn SqlSessions> {
         None
     }
 

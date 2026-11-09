@@ -40,7 +40,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 ring = "0.17"
 # Kept behind `fleetringd::mcp` alone (ADR-0041 point 9).
 rmcp.workspace = true
-rusqlite = { workspace = true, features = ["functions", "hooks"] }
+rusqlite = { workspace = true, features = ["column_decltype", "functions", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }

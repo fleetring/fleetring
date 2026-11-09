@@ -691,6 +691,7 @@ fn start_data(
     let databases = data_dir.path().join(DATABASES_DIR);
     let engine_config = config.engine.clone();
     let recorded = config.changes.capture_rules();
+    let sessions = config.sessions.limits();
     let replication = Replication::start(
         ReplicationParts {
             node: config.node.id.clone(),
@@ -708,6 +709,7 @@ fn start_data(
         move |publisher| {
             Registry::new(engine, publisher, databases, engine_config)
                 .with_recorded_changes(recorded)
+                .with_sessions(sessions)
         },
     );
     statuses.set(replication.clone());
