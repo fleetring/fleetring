@@ -190,6 +190,7 @@ async fn a_node_certificate_for_another_id_cannot_join_heartbeat_leave_or_drain(
             node_id: "b".into(),
             databases: Vec::new(),
             software: None,
+            ..HeartbeatRequest::default()
         })
         .await
         .expect_err("wrong id");
@@ -219,6 +220,7 @@ async fn a_node_certificate_for_another_id_cannot_join_heartbeat_leave_or_drain(
             node_id: "other".into(),
             databases: Vec::new(),
             software: None,
+            ..HeartbeatRequest::default()
         })
         .await?;
     other

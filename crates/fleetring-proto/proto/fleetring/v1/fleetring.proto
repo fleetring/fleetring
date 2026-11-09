@@ -69,7 +69,8 @@ enum ReplicaRole {
 // Every RPC states, in a `Scope:` line, what its caller needs (ADR-0025): `node` (a node
 // certificate; principals are refused), `fleet` (a node, or a principal with the `fleet`
 // scope), an action on the database the request names, or, for a listing, the action on each
-// database it shows. A node call also states, in a `Binding:` line, what the calling node must
+// database it shows; a fork also needs `fork` on its source, and a fork operation's status goes
+// only to its requester or to `admin` on its target (ADR-0046). A node call also states, in a `Binding:` line, what the calling node must
 // be for the database or node the request names (ADR-0031): `self` (the request names the
 // caller), `replica` (in the database's replica set), `holder` (it holds the database's lease),
 // `candidate` (the candidate of the promotion to the request's epoch), `holder or candidate`
@@ -159,6 +160,18 @@ service Control {
   // caller as the description's author when the description changes.
   // Scope: admin on the database.
   rpc UpdateDatabase(UpdateDatabaseRequest) returns (UpdateDatabaseResponse);
+  // Creates `database` as a copy of `source` (ADR-0046): the control plane records the fork,
+  // which starts `seeding`, and answers at once with its operation's status. The operation ID the
+  // client chose makes a resend safe: the same requester sending the same request again gets the
+  // same operation back, and nothing changes. Needs the `fork` fleet feature, and `metadata`,
+  // and `expiry` for an expiry. A control node that predates forks answers UNIMPLEMENTED.
+  // Scope: admin on the database, and fork on `source`.
+  rpc ForkDatabase(ForkDatabaseRequest) returns (ForkOperationStatus);
+  // A fork operation's status, while the operation is pending and for its retention after it
+  // ends (ADR-0046, point 5.4). An operation the caller may not see answers NOT_FOUND, exactly as
+  // an unknown one does.
+  // Scope: the requesting principal, or admin on the target.
+  rpc GetForkOperation(GetForkOperationRequest) returns (ForkOperationStatus);
 }
 
 message JoinRequest {
@@ -186,6 +199,106 @@ message DatabaseStatus {
   // own epoch on a primary. Promotions rank logs by it before their positions.
   uint64 epoch = 3;
   bytes position = 4;
+  // What the replica says about a fork of this name (ADR-0046, point 4.5). Each names the fork
+  // identity it is about, `(database, fork_incarnation, operation)`, and the control plane
+  // ignores one for another identity. Unset by nodes that predate forks, and recorded only once
+  // the fleet has enabled `fork`.
+  //
+  // The replica durably holds a staged copy of the fork, at log epoch 0.
+  StagedCopy staged = 5;
+  // The replica's staged copy is missing or damaged.
+  CopyLost copy_lost = 6;
+  // The replica couldn't seed the fork in an attempt.
+  SeedFailure seed_failure = 7;
+  // How the fork-reset write stands on this replica.
+  ForkReset reset = 8;
+  // How far the replica has streamed a copy, for status only: nothing is decided by it.
+  SeedProgress seed_progress = 9;
+  // The bytes the replica's copy of the database takes on disk, for fork admission (ADR-0046,
+  // point 7.3). Unset if the node doesn't say.
+  optional uint64 size_bytes = 10;
+}
+
+// A replica durably holds a staged copy of a fork: written, verified, synced, and renamed into
+// place (ADR-0046, point 4.3).
+message StagedCopy {
+  // The fork's incarnation: 64 bits, printed as 16 lowercase hex digits.
+  fixed64 fork_incarnation = 1;
+  // The fork's operation ID: 16 bytes, printed as 26 lowercase base32 characters.
+  bytes operation = 2;
+  // The attempt that fetched the copy, from 1.
+  uint32 attempt = 3;
+  // The source position the copy holds, and its chain hash there.
+  bytes position = 4;
+  bytes chain_hash = 5;
+  // The source incarnation the source's primary stamped on the stream.
+  fixed64 source_incarnation = 6;
+}
+
+// Why a staged copy is lost.
+enum CopyLossReason {
+  COPY_LOSS_REASON_UNSPECIFIED = 0;
+  // The staged file or its sidecar is missing.
+  COPY_LOSS_REASON_MISSING = 1;
+  // The staged file fails its size, position, or checksum check.
+  COPY_LOSS_REASON_DAMAGED = 2;
+}
+
+// A holder found its staged copy of a fork missing or damaged (ADR-0046, points 4.5 and 6.2).
+message CopyLost {
+  fixed64 fork_incarnation = 1;
+  bytes operation = 2;
+  uint32 attempt = 3;
+  CopyLossReason reason = 4;
+}
+
+// Why a replica couldn't seed a fork.
+enum SeedFailureReason {
+  SEED_FAILURE_REASON_UNSPECIFIED = 0;
+  // The replica hasn't room for the copy (ADR-0046, point 7.2).
+  SEED_FAILURE_REASON_INSUFFICIENT_DISK = 1;
+  // The source can't be copied within its pin limits.
+  SEED_FAILURE_REASON_SOURCE_TOO_LARGE = 2;
+  // The source's primary can't seed the source's engine.
+  SEED_FAILURE_REASON_ENGINE_UNSUPPORTED = 3;
+  // The transfer broke after the replica's own retries.
+  SEED_FAILURE_REASON_TRANSFER_FAILED = 4;
+  // The source's pin expired before the transfer finished.
+  SEED_FAILURE_REASON_PIN_EXPIRED = 5;
+}
+
+// A replica couldn't seed a fork in one attempt.
+message SeedFailure {
+  fixed64 fork_incarnation = 1;
+  bytes operation = 2;
+  uint32 attempt = 3;
+  SeedFailureReason reason = 4;
+  // Whether another attempt may succeed. A control node judges a reason it knows by the reason
+  // itself; it reads this only for a reason it doesn't know.
+  bool retryable = 5;
+}
+
+// A fork's reset write on a replica (ADR-0046, point 6): on the primary, `committed` means its
+// commit index at the bootstrap quorum covers the marker; on a follower, that the marker is in
+// its durable log. Unset `committed` means the primary is running it.
+message ForkReset {
+  fixed64 fork_incarnation = 1;
+  bytes operation = 2;
+  // The lease epoch of the primary that wrote the reset.
+  uint64 epoch = 3;
+  // The reset write's position in the fork's own log.
+  bytes position = 4;
+  bool committed = 5;
+}
+
+// How far a replica has streamed a copy of a fork.
+message SeedProgress {
+  fixed64 fork_incarnation = 1;
+  bytes operation = 2;
+  uint32 attempt = 3;
+  uint64 bytes = 4;
+  // The copy's size, from the stream's first chunk; 0 until it is known.
+  uint64 total_bytes = 5;
 }
 
 message HeartbeatRequest {
@@ -194,6 +307,10 @@ message HeartbeatRequest {
   // Unset by nodes older than this field. Corrects the control plane's record of the node's
   // software, as after the control node was upgraded; never a reason to refuse the heartbeat.
   Software software = 3;
+  // The free bytes on the node's data volume, for the control plane's best-effort fork
+  // admission (ADR-0046, point 7.3). Unset by nodes that predate forks; recorded only once the
+  // fleet has enabled `fork`.
+  optional uint64 disk_free_bytes = 4;
 }
 
 message HeartbeatResponse {
@@ -347,6 +464,186 @@ message Placement {
   // The database's metadata (ADR-0041). Unset for a database without any, and from a control
   // node that predates the field.
   DatabaseMetadata metadata = 11;
+  // The database's incarnation (ADR-0046, point 1): 64 random bits naming this life of its name,
+  // printed as 16 lowercase hex digits. 0 for a database created before the fleet enabled
+  // `fork`, and from a control node that predates the field.
+  fixed64 incarnation = 12;
+  // The fork that made the database, its state and provenance. Unset for a database no fork
+  // made, and from a control node that predates forks.
+  ForkStatus fork = 13;
+}
+
+// How far a fork has got (ADR-0046, point 2). `cancelled` appears only in an operation's
+// status: a fork dropped or expired before it was ready.
+enum ForkState {
+  FORK_STATE_UNSPECIFIED = 0;
+  // An attempt is copying the source.
+  FORK_STATE_SEEDING = 1;
+  // A completion quorum holds the copy; the fork-reset write hasn't been recorded yet, so the
+  // fork serves no client.
+  FORK_STATE_SEEDED = 2;
+  // The fork-reset write is committed: the fork is an ordinary database.
+  FORK_STATE_READY = 3;
+  // The fork failed for good; `db drop` removes it.
+  FORK_STATE_FAILED = 4;
+  // The fork was dropped, or expired, before it was ready.
+  FORK_STATE_CANCELLED = 5;
+}
+
+// Why a fork failed. A later release may add a reason: a client treats an unknown one as a
+// failure.
+enum ForkFailureReason {
+  FORK_FAILURE_REASON_UNSPECIFIED = 0;
+  FORK_FAILURE_REASON_SOURCE_GONE = 1;
+  FORK_FAILURE_REASON_SOURCE_RECREATED = 2;
+  FORK_FAILURE_REASON_RETRIES_EXHAUSTED = 3;
+  FORK_FAILURE_REASON_DEADLINE_EXCEEDED = 4;
+  FORK_FAILURE_REASON_SOURCE_TOO_LARGE = 5;
+  FORK_FAILURE_REASON_INSUFFICIENT_DISK = 6;
+  FORK_FAILURE_REASON_ENGINE_UNSUPPORTED = 7;
+}
+
+// Why a fork's attempt ended and another began.
+enum RetryCause {
+  RETRY_CAUSE_UNSPECIFIED = 0;
+  RETRY_CAUSE_SEEDER_DOWN = 1;
+  RETRY_CAUSE_ATTEMPT_TIMED_OUT = 2;
+  RETRY_CAUSE_TRANSFER_FAILED = 3;
+  RETRY_CAUSE_PIN_EXPIRED = 4;
+  RETRY_CAUSE_HOLDER_LOST = 5;
+  RETRY_CAUSE_HOLDERS_LEFT = 6;
+  RETRY_CAUSE_SEEDER_DISK_REFUSED = 7;
+}
+
+// Why a fork that wasn't ready was removed.
+enum ForkCancelCause {
+  FORK_CANCEL_CAUSE_UNSPECIFIED = 0;
+  // `db drop`.
+  FORK_CANCEL_CAUSE_DROPPED = 1;
+  // Its expiry passed.
+  FORK_CANCEL_CAUSE_EXPIRED = 2;
+}
+
+// Why a fork failed, the cause of its last retry, and how many attempts it made.
+message ForkFailure {
+  ForkFailureReason reason = 1;
+  // For `retries_exhausted` and `deadline_exceeded`; unspecified otherwise.
+  RetryCause last_cause = 2;
+  // 0 when the control plane no longer knows it, as after the fork was dropped.
+  uint32 attempts = 3;
+}
+
+// A fork's record in a placement (ADR-0046, point 2). A field that doesn't apply in the state
+// is unset, or empty.
+message ForkStatus {
+  ForkState state = 1;
+  // The operation that made the fork: 16 bytes, printed as 26 lowercase base32 characters.
+  bytes operation_id = 2;
+  string source = 3;
+  // The source's incarnation the fork copies.
+  fixed64 source_incarnation = 4;
+  // The current attempt while seeding, the attempt that fetched the copy once seeded or ready,
+  // and the attempts made once failed.
+  uint32 attempt = 5;
+  // The most attempts the fork makes.
+  uint32 max_attempts = 6;
+  // While seeding: the attempt's seeder, the replicas passed over as seeders, and those that
+  // refused the copy for want of disk.
+  optional string seeder = 7;
+  repeated string seeder_excluded = 8;
+  repeated string disk_refused = 9;
+  // While seeding, the replicas that reported the attempt's staged copy; once seeded, the
+  // recorded holders, which are the fork's replica set until it is ready.
+  repeated string holders = 10;
+  // The fork's completion quorum: how many holders seeding needs.
+  uint32 holders_needed = 11;
+  // While seeding, the seeder's progress as it last reported it.
+  optional uint64 bytes = 12;
+  optional uint64 total_bytes = 13;
+  // Once seeded: the source position the copy holds, and its chain hash there.
+  optional bytes position = 14;
+  optional bytes chain_hash = 15;
+  // Once failed.
+  ForkFailure failure = 16;
+  // The principal that asked for the fork, if it had a name. It grants nothing.
+  optional string requested_by = 17;
+  uint64 requested_at_ms = 18;
+  // While seeding: when the fork fails if it is still seeding.
+  optional uint64 deadline_at_ms = 19;
+  optional uint64 completed_at_ms = 20;
+  optional uint64 ready_at_ms = 21;
+  optional uint64 failed_at_ms = 22;
+  // Once ready: the epoch of the primary that committed the fork-reset write, and its position.
+  optional uint64 reset_epoch = 23;
+  optional bytes reset_position = 24;
+  // While seeding, why the previous attempt ended; unspecified for the first.
+  RetryCause last_cause = 25;
+}
+
+// A fork request (ADR-0046, point 5.2): the caller's intent, exactly as given, and the operation
+// ID it chose. A resend compares everything here but the ID.
+message ForkDatabaseRequest {
+  // 16 random bytes the client chooses before it asks, printed as 26 lowercase base32
+  // characters.
+  bytes operation_id = 1;
+  // The fork's name: the database to create.
+  string database = 2;
+  // The database to copy.
+  string source = 3;
+  // The source incarnation the caller requires; unset for the source's current one.
+  optional fixed64 expect_source_incarnation = 4;
+  // As in CreateDatabaseRequest: 0, unspecified, and 0 take the fleet's defaults, which the
+  // control node fills in before it logs the fork. Nothing is copied from the source.
+  uint32 replication_factor = 5;
+  Acks acks = 6;
+  uint32 min_replicas = 7;
+  // The fork's description, labels, and expiry, as CreateDatabaseWithMetadata takes them. A
+  // duration is part of the request, and is resolved to a time only when the fork is first
+  // recorded, so a resend of the same duration matches it.
+  MetadataSpec metadata = 8;
+}
+
+message GetForkOperationRequest {
+  bytes operation_id = 1;
+}
+
+// A fork operation's record (ADR-0046, point 5.3): what the caller asked for, what it resolved
+// to when it was first recorded, and its outcome.
+message ForkOperationStatus {
+  bytes operation_id = 1;
+  // The fork's name, and the incarnation the operation made it with.
+  string database = 2;
+  fixed64 incarnation = 3;
+  // `seeding` or `seeded` while pending; `ready`, `failed`, or `cancelled` once it ended, which
+  // never changes.
+  ForkState state = 4;
+  string source = 5;
+  // The source incarnation the operation resolved to when it was first recorded.
+  fixed64 source_incarnation = 6;
+  // While seeding, the current attempt.
+  uint32 attempt = 7;
+  // Once ready: the source position the fork holds, and its chain hash there.
+  optional bytes position = 8;
+  optional bytes chain_hash = 9;
+  // Once failed.
+  ForkFailure failure = 10;
+  // Once cancelled.
+  ForkCancelCause cancel_cause = 11;
+  // When the outcome last changed, when it ended, and when the record, and the deduplication of
+  // its ID, is forgotten.
+  uint64 updated_at_ms = 12;
+  optional uint64 finished_at_ms = 13;
+  optional uint64 forgotten_at_ms = 14;
+  // The request as first recorded, with the replication factor and durability the control node
+  // filled in. `operation_id` is the operation's.
+  ForkDatabaseRequest request = 15;
+  // The principal that asked, if it had a name.
+  optional string requested_by = 16;
+  // The expiry the operation resolved to, if any.
+  optional uint64 expires_at_ms = 17;
+  // The fork's placement while its name holds the operation's incarnation; unset once the fork
+  // is gone.
+  Placement placement = 18;
 }
 
 // A database label (ADR-0041 point 1): Kubernetes key and value rules.
@@ -638,6 +935,11 @@ message DropCopyRequest {
   string database = 1;
   // The epoch the database was at when it was dropped.
   uint64 epoch = 2;
+  // The dropped database's incarnation and, for a fork, its operation ID: a seeding fork's epoch
+  // is 0, so the epoch alone can't name it (ADR-0046, point 4.6). A staged copy is deleted only
+  // on a notice naming its own identity. Unset by control nodes that predate forks.
+  optional fixed64 incarnation = 3;
+  optional bytes operation = 4;
 }
 
 message DropCopyResponse {}
@@ -645,6 +947,18 @@ message DropCopyResponse {}
 message SnapshotRequest {
   string database = 1;
   uint64 epoch = 2;
+  // Set when the snapshot seeds a fork (ADR-0046, points 4.1 and 4.4), under the `seeding`
+  // binding: the fork's name, its incarnation and operation ID (its fork identity), and the
+  // attempt. `database` then names the source, whose incarnation the caller expects in
+  // `source_incarnation`, when the seeder fetches from the source's primary; with `staged`,
+  // `database` names the fork, and a replica copies the seeder's staged copy. Unset by nodes that
+  // predate forks.
+  optional string fork = 3;
+  fixed64 fork_incarnation = 4;
+  bytes operation = 5;
+  uint32 fork_attempt = 6;
+  fixed64 source_incarnation = 7;
+  bool staged = 8;
 }
 
 message SnapshotChunk {
@@ -658,6 +972,13 @@ message SnapshotChunk {
   // On the last chunk: the primary's hash chain at `position` (FR-044), which the follower's
   // chain continues from. Unset by a primary that predates the field.
   optional bytes chain = 5;
+  // On the first chunk of a stream that seeds a fork: the snapshot's size, for disk admission
+  // and progress (ADR-0046, point 4.2).
+  optional uint64 total_bytes = 6;
+  // On the last chunk of a stream that seeds a fork: the incarnation recorded beside the copy
+  // the primary held open, which the seeder compares with what it asked for (ADR-0046, point
+  // 4.1).
+  optional fixed64 source_incarnation = 7;
 }
 
 // ---- Database (v0.1 only; the router replaces it) ---------------------------------------------

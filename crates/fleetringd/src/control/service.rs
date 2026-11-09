@@ -6,23 +6,24 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
+use fleetring_control::fork::{ForkExpiry, ForkIntent, ForkLimits, OperationId, OperationRecord};
 use fleetring_control::{
-    Acks, Action, Applied, DatabaseName, Durability, Engine, ExpiryChange, Feature, HostedReplica,
+    Acks, Action, Applied, DatabaseName, Durability, Engine, ExpiryChange, Feature, Incarnation,
     Lease, LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName, Rejection,
-    ReplicaRole, Revoked, Software, State, Timestamp,
+    Revoked, Software, State, Timestamp,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     self as proto, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
     CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
-    DropDatabaseRequest, DropDatabaseResponse, HeartbeatRequest, HeartbeatResponse, JoinRequest,
-    JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest,
-    ListDatabasesResponse, LocateRequest, LocateResponse, MembershipUpdate, Placement,
-    PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
-    RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
-    UndrainRequest, UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse,
-    WatchMembershipRequest,
+    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
+    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    LocateRequest, LocateResponse, MembershipUpdate, Placement, PromotionResponse,
+    RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest,
+    RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest, UndrainRequest,
+    UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -35,6 +36,10 @@ use crate::auth::{
 };
 use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
+use crate::control::fork::{
+    SeedProgressBoard, fork_status, operation_from_proto, operation_status, replica_from_proto,
+    role_to_proto,
+};
 use crate::control::node::{ControlHandle, SubmitError};
 use crate::control::notices::DropNotices;
 use crate::data::convert::{
@@ -44,6 +49,7 @@ use crate::data::convert::{
 use crate::data::{Descriptions, Expiry, ExpiryRequest, LabelRequirement, is_invisible};
 use crate::dev::DevMode;
 use crate::environment::Network;
+use crate::router::{Entropy, SystemEntropy};
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
 
@@ -92,6 +98,12 @@ impl DurabilityDefaults {
 /// point 4): an expiry that passes before the creating client's next call is a mistake.
 pub const MIN_EXPIRY: Millis = Millis::new(60_000);
 
+/// How many incarnations a creation or a fork draws before it gives up: `apply` refuses one that
+/// is 0 once forks are enabled, or that a database or a retained operation already uses, and
+/// the service draws again (ADR-0046, point 1.1). Drawing more than twice means the generator is
+/// broken.
+const INCARNATION_DRAWS: usize = 4;
+
 /// The `Control` service: every mutation goes through the control node's single writer, and
 /// reads come from its published state.
 #[derive(Debug, Clone)]
@@ -102,6 +114,12 @@ pub struct ControlService {
     clock: Arc<dyn Clock>,
     dev: DevMode,
     notices: Option<DropNotices>,
+    /// Where incarnations come from (ADR-0020, ADR-0046 point 1.1).
+    entropy: Arc<dyn Entropy>,
+    /// The limits each fork this service proposes records (ADR-0046, point 7).
+    fork_limits: ForkLimits,
+    /// The progress of the copies replicas stream, for forks' status.
+    progress: SeedProgressBoard,
 }
 
 impl ControlService {
@@ -116,7 +134,34 @@ impl ControlService {
             clock: Arc::new(SystemClock),
             dev: DevMode::Off,
             notices: None,
+            entropy: Arc::new(SystemEntropy::new()),
+            fork_limits: ForkLimits::new(),
+            progress: SeedProgressBoard::default(),
         }
+    }
+
+    /// Draws incarnations from `entropy`, the operating system's randomness by default, and a
+    /// simulation's seeded generator under simulation (ADR-0020).
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
+        self.entropy = entropy;
+        self
+    }
+
+    /// Records `limits` with each fork this service proposes: the control node's `[fork]`
+    /// configuration (ADR-0046, point 7). A fork keeps the limits it was made under.
+    #[must_use]
+    pub fn with_fork_limits(mut self, limits: ForkLimits) -> Self {
+        self.fork_limits = limits;
+        self
+    }
+
+    /// Draws a database's incarnation: 64 bits from the injected generator. `apply` refuses 0
+    /// where it would store it, and the caller draws again.
+    fn draw_incarnation(&self) -> Incarnation {
+        let mut bytes = [0_u8; 8];
+        self.entropy.fill(&mut bytes);
+        Incarnation::new(u64::from_le_bytes(bytes))
     }
 
     /// Tells the replicas of each database it drops over `network`, so that they delete their
@@ -274,9 +319,9 @@ impl ControlService {
         replication_factor: ReplicationFactor,
         action: Action,
     ) -> Result<Response<CreateDatabaseResponse>, Status> {
-        match self.submit(action).await? {
+        match self.submit_drawing(action).await? {
             (Applied::DatabaseCreated { .. }, state) => {
-                let placement = placement(&state, &name, Descriptions::Include)?;
+                let placement = placement(&state, &name, Descriptions::Include, &self.progress)?;
                 let replicas = placement.replicas.len();
                 if replicas < usize::from(replication_factor.get()) {
                     // Accepted all the same: the fleet may still be growing, and placement
@@ -305,6 +350,64 @@ impl ControlService {
             Err(rejection) => Err(rejection_status(&rejection)),
         }
     }
+
+    /// Operation `operation`'s status from its `record` in `state`, with the fork's placement
+    /// while its name holds the operation's incarnation.
+    fn status_of_operation(
+        &self,
+        state: &State,
+        operation: OperationId,
+        record: &OperationRecord,
+    ) -> Result<ForkOperationStatus, Status> {
+        let placement = state
+            .database(record.target())
+            .filter(|database| database.incarnation() == record.target_incarnation())
+            .map(|database| {
+                placement(
+                    state,
+                    database.name(),
+                    Descriptions::Include,
+                    &self.progress,
+                )
+            })
+            .transpose()?;
+        Ok(operation_status(state, operation, record, placement))
+    }
+
+    /// Submits `action`, a command that brings a database name into existence, with an
+    /// incarnation drawn from the injected generator, and draws again and resubmits while
+    /// `apply` refuses the incarnation as unavailable (ADR-0046, point 1.1). Every creation draws
+    /// one, before forks are enabled too: `apply` stores 0 until then, so a creation screened
+    /// before the feature was enabled and applied after it still stores a random value.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlService::submit`], and `UNAVAILABLE` if every draw was refused.
+    async fn submit_drawing(&self, mut action: Action) -> Result<(Applied, Arc<State>), Status> {
+        for _ in 0..INCARNATION_DRAWS {
+            let drawn = self.draw_incarnation();
+            match &mut action {
+                Action::CreateDatabase { incarnation, .. }
+                | Action::ForkDatabase { incarnation, .. } => *incarnation = drawn,
+                _ => {}
+            }
+            let committed = self
+                .node
+                .submit(action.clone())
+                .await
+                .map_err(submit_status)?;
+            match committed.into_parts() {
+                (Ok(applied), state) => return Ok((applied, state)),
+                (Err(Rejection::IncarnationUnavailable { incarnation }), _) => {
+                    tracing::warn!(%incarnation, "the incarnation drawn is unavailable; drawing again");
+                }
+                (Err(rejection), _) => return Err(rejection_status(&rejection)),
+            }
+        }
+        Err(Status::unavailable(
+            "every incarnation drawn for the database was unavailable; retry",
+        ))
+    }
 }
 
 /// Maps a rejection to the gRPC status a caller receives, with the rejection's message.
@@ -317,6 +420,7 @@ impl ControlService {
 /// - `PERMISSION_DENIED`: a fork operation ID that another principal requested.
 /// - `RESOURCE_EXHAUSTED`: too few replicas have room for a fork, or too many fork operations
 ///   are kept.
+/// - `UNAVAILABLE`: an incarnation that turned out to be in use, which a retry draws again.
 /// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, a join that
 ///   would make an invalid ring, durability settings that don't fit the replication factor, or
 ///   an update that would leave too many labels.
@@ -357,6 +461,8 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
         Rejection::ExpiryPassed { .. } => {
             Status::unavailable("the control plane's time moved past the requested expiry; retry")
         }
+        // The service draws again before it answers; a caller who still sees it retries.
+        Rejection::IncarnationUnavailable { .. } => Status::unavailable(message),
         _ => Status::failed_precondition(message),
     }
 }
@@ -424,38 +530,11 @@ pub(crate) fn node_to_proto(member: &Member) -> proto::Node {
     }
 }
 
-fn replica_from(status: proto::DatabaseStatus) -> Result<HostedReplica, Status> {
-    let role = match proto::ReplicaRole::try_from(status.role) {
-        Ok(proto::ReplicaRole::Primary) => ReplicaRole::Primary,
-        Ok(proto::ReplicaRole::Follower) => ReplicaRole::Follower,
-        _ => {
-            return Err(Status::invalid_argument(format!(
-                "database '{}' has no valid role",
-                status.database
-            )));
-        }
-    };
-    Ok(HostedReplica::new(
-        parse("database name", &status.database)?,
-        role,
-        Position::new(status.position),
-    )
-    .with_log_epoch(LeaseEpoch::new(status.epoch)))
-}
-
 fn engine_from(engine: i32) -> Result<Engine, Status> {
     match proto::Engine::try_from(engine) {
         // Proto3 sends an unset engine as unspecified; SQLite is the only engine so far.
         Ok(proto::Engine::Unspecified | proto::Engine::Sqlite) => Ok(Engine::Sqlite),
         Err(_) => Err(Status::invalid_argument(format!("unknown engine {engine}"))),
-    }
-}
-
-fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
-    match role {
-        ReplicaRole::Primary => proto::ReplicaRole::Primary,
-        ReplicaRole::Follower => proto::ReplicaRole::Follower,
-        _ => proto::ReplicaRole::Unspecified,
     }
 }
 
@@ -483,11 +562,13 @@ fn lease_response(database: &DatabaseName, lease: &Lease) -> LeaseResponse {
 /// (ADR-0031).
 ///
 /// The placement carries the database's metadata, if it has any, with its description text as
-/// `descriptions` says.
+/// `descriptions` says, its incarnation, and, for a fork, the fork's state, with the seeder's
+/// progress from `progress`.
 fn placement(
     state: &State,
     name: &DatabaseName,
     descriptions: Descriptions,
+    progress: &SeedProgressBoard,
 ) -> Result<Placement, Status> {
     let database = state.database(name).ok_or_else(|| {
         rejection_status(&Rejection::UnknownDatabase {
@@ -546,6 +627,10 @@ fn placement(
         metadata: database
             .metadata()
             .map(|metadata| metadata_to_proto(metadata, descriptions)),
+        incarnation: database.incarnation().get(),
+        fork: database
+            .fork()
+            .map(|fork| fork_status(state, database, fork, progress)),
     })
 }
 
@@ -818,13 +903,15 @@ impl Control for ControlService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let peer = Peer::of(&request);
         let request = request.into_inner();
-        let id = parse("node id", &request.node_id)?;
+        let id: NodeId = parse("node id", &request.node_id)?;
         peer.check_node(&id, "Heartbeat")?;
-        let replicas = request
-            .databases
-            .into_iter()
-            .map(replica_from)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut replicas = Vec::with_capacity(request.databases.len());
+        let mut progress = Vec::new();
+        for status in request.databases {
+            let (replica, streaming) = replica_from_proto(status)?;
+            replicas.push(replica);
+            progress.extend(streaming);
+        }
         // The software goes into the log only when it corrects the record, as after the control
         // node was upgraded beside members that joined it earlier: not once per heartbeat.
         let software = request
@@ -836,14 +923,14 @@ impl Control for ControlService {
             });
         let (applied, state) = self
             .submit(Action::Heartbeat {
-                id,
+                id: id.clone(),
                 replicas,
                 unknown_reports: fleetring_control::UnknownReports::Skip,
                 software,
-                // TODO(#135): data nodes report their free disk once they seed forks.
-                disk_free_bytes: None,
+                disk_free_bytes: request.disk_free_bytes,
             })
             .await?;
+        self.progress.record(&state, &id, progress);
         let unknown_databases = match applied {
             Applied::HeartbeatRecorded { unknown, .. } => unknown
                 .into_iter()
@@ -917,10 +1004,8 @@ impl Control for ControlService {
             engine,
             durability: Some(durability),
             metadata,
-            // TODO(#135): draw a random incarnation from the injected RNG once this build
-            // supports forks, and on `IncarnationUnavailable` draw again and resubmit; until
-            // then no fleet of it enables them, and none is needed.
-            incarnation: fleetring_control::Incarnation::LEGACY,
+            // Drawn when it is submitted.
+            incarnation: Incarnation::LEGACY,
         };
         self.create(name, replication_factor, action).await
     }
@@ -961,10 +1046,8 @@ impl Control for ControlService {
             engine,
             durability: Some(durability),
             metadata: Some(spec),
-            // TODO(#135): draw a random incarnation from the injected RNG once this build
-            // supports forks, and on `IncarnationUnavailable` draw again and resubmit; until
-            // then no fleet of it enables them, and none is needed.
-            incarnation: fleetring_control::Incarnation::LEGACY,
+            // Drawn when it is submitted.
+            incarnation: Incarnation::LEGACY,
         };
         self.create(name, replication_factor, action).await
     }
@@ -998,6 +1081,112 @@ impl Control for ControlService {
             }
             (other, _) => Err(unexpected(&other)),
         }
+    }
+
+    /// Creates a fork (ADR-0046): it needs `admin` on the target, `fork` on the source, and a new
+    /// name for the target. The request is resolved before it is logged: the fleet's defaults
+    /// for what it leaves unset, the caller as its requester, a relative expiry's time, this
+    /// control node's `[fork]` limits, and an incarnation from the injected generator. A resend
+    /// of a known operation is answered from control state and never logged (ADR-0046, point
+    /// 5.2).
+    async fn fork_database(
+        &self,
+        request: Request<ForkDatabaseRequest>,
+    ) -> Result<Response<ForkOperationStatus>, Status> {
+        let target: DatabaseName = parse("database name", &request.get_ref().database)?;
+        require_database(&request, &target)?;
+        let source: DatabaseName = parse("source", &request.get_ref().source)?;
+        authorized(&request)?.require_also(AuthAction::Fork, &source)?;
+        check_new_name(&target)?;
+        let requested_by = creator(&request)?;
+        let request = request.into_inner();
+        let operation = operation_from_proto(&request.operation_id)?;
+        let replication_factor = self.replication_factor(request.replication_factor)?;
+        let durability = self.durability(request.acks, request.min_replicas, replication_factor)?;
+        let metadata = request.metadata.unwrap_or_default();
+        let expiry = spec_expiry_from_proto(&metadata);
+        let mut intent = ForkIntent::new(target, source, replication_factor);
+        intent.expect_source_incarnation = request.expect_source_incarnation.map(Incarnation::new);
+        intent.durability = Some(durability);
+        intent.description = description_from_proto(&metadata.description)?;
+        intent.labels = labels_from_proto(&metadata.labels)?;
+        intent.expiry = match expiry {
+            None => ForkExpiry::Never,
+            Some(Expiry::At(at)) => ForkExpiry::At(at),
+            Some(Expiry::In(span)) => ForkExpiry::After(Millis::new(
+                u64::try_from(span.as_millis()).unwrap_or(u64::MAX),
+            )),
+        };
+        intent.requested_by = requested_by;
+        let state = self.node.state();
+        let now = self.clock.now().max(state.now());
+        // A resend resolves nothing again, so its expiry isn't held to the minimum again.
+        let resolved_expiry = match expiry {
+            Some(expiry) if state.fork_operation(&operation, now).is_none() => {
+                let at = self.resolve_expiry(expiry)?;
+                matches!(expiry, Expiry::In(_)).then_some(at)
+            }
+            _ => None,
+        };
+        let action = Action::ForkDatabase {
+            operation,
+            intent,
+            // Drawn when it is submitted.
+            incarnation: Incarnation::LEGACY,
+            resolved_expiry,
+            limits: self.fork_limits,
+        };
+        if let Some(resent) = state.fork_resend(&action, now) {
+            let record = resent.map_err(|rejection| rejection_status(&rejection))?;
+            return Ok(Response::new(
+                self.status_of_operation(&state, operation, record)?,
+            ));
+        }
+        let (_, state) = self.submit_drawing(action).await?;
+        let record = state
+            .fork_operation(&operation, state.now())
+            .ok_or_else(|| Status::internal("the fork left no operation record"))?;
+        Ok(Response::new(
+            self.status_of_operation(&state, operation, record)?,
+        ))
+    }
+
+    /// A fork operation's status, to the principal that requested it, or to one with `admin` on
+    /// its target while the target's name holds the operation's incarnation (ADR-0046, point
+    /// 5.4). To anyone else, the operation is unknown: the answer is the `NOT_FOUND` an unknown
+    /// operation gets, and the refusal is audited.
+    async fn get_fork_operation(
+        &self,
+        request: Request<GetForkOperationRequest>,
+    ) -> Result<Response<ForkOperationStatus>, Status> {
+        let authorized = authorized(&request)?;
+        let requester = creator(&request)?;
+        let operation = operation_from_proto(&request.get_ref().operation_id)?;
+        let state = self.node.state();
+        let now = self.clock.now().max(state.now());
+        let known = state.fork_operation(&operation, now);
+        let visible = match authorized.caller() {
+            Caller::Anonymous => known,
+            Caller::Principal { .. } => known
+                .filter(|record| requester.is_some() && record.intent().requested_by == requester)
+                .or_else(|| {
+                    state
+                        .fork_operation_of_target(&operation, now)
+                        .filter(|record| authorized.may(AuthAction::Admin, record.target()))
+                }),
+            Caller::Node(_) => None,
+        };
+        let Some(record) = visible else {
+            if let Some(record) = known {
+                authorized.audit_refused(AuthAction::Admin, record.target());
+            }
+            return Err(Status::not_found(format!(
+                "fork operation {operation} is unknown"
+            )));
+        };
+        Ok(Response::new(
+            self.status_of_operation(&state, operation, record)?,
+        ))
     }
 
     async fn drop_database(
@@ -1081,7 +1270,12 @@ impl Control for ControlService {
         require_database(&request, &name)?;
         let state = self.node.state();
         Ok(Response::new(LocateResponse {
-            placement: Some(placement(&state, &name, Descriptions::Include)?),
+            placement: Some(placement(
+                &state,
+                &name,
+                Descriptions::Include,
+                &self.progress,
+            )?),
         }))
     }
 
@@ -1127,7 +1321,7 @@ impl Control for ControlService {
         let databases = admitted
             .by_ref()
             .take(limit)
-            .map(|database| placement(&state, database.name(), descriptions))
+            .map(|database| placement(&state, database.name(), descriptions, &self.progress))
             .collect::<Result<Vec<_>, _>>()?;
         let next_after = match (admitted.next(), databases.last()) {
             (Some(_), Some(last)) => last.database.clone(),

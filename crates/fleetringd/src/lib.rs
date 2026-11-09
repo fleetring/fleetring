@@ -43,9 +43,9 @@ pub use actor::{
 };
 pub use config::{
     AdminConfig, AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, ControlSettings,
-    ForkConfig, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig, LogFormat,
-    MembershipSettings, NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext,
-    PrincipalConfig, ReplicationConfig, SessionsConfig, TlsConfig, TokenForwarding,
+    ForkConfig, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig,
+    LogFormat, MembershipSettings, NodeConfig, NodeRole, OnShutdown, ParseLogFormatError,
+    Plaintext, PrincipalConfig, ReplicationConfig, SessionsConfig, TlsConfig, TokenForwarding,
 };
 pub use daemon::{Daemon, StartError, Stop};
 pub use data_dir::{DataDir, DataDirError};
@@ -108,6 +108,7 @@ const _: () = {
     assert_debug_send_sync::<control::LogError>();
     assert_debug_send_sync::<control::NoControl>();
     assert_debug_send_sync::<control::OpenError>();
+    assert_debug_send_sync::<control::SeedProgress>();
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
     assert_debug_send_sync::<Daemon>();

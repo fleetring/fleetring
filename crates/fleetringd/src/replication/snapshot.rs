@@ -140,6 +140,7 @@ async fn send_chunks(
                 position: None,
                 checksum: None,
                 chain: None,
+                ..SnapshotChunk::default()
             },
             Ok(None) => match packer.finish() {
                 Ok(checksum) => SnapshotChunk {
@@ -153,6 +154,7 @@ async fn send_chunks(
                     ),
                     checksum: Some(checksum.to_vec()),
                     chain: chain.map(|hash| hash.as_bytes().to_vec()),
+                    ..SnapshotChunk::default()
                 },
                 Err(error) => {
                     let status = Status::aborted(format!("the snapshot changed: {error}"));
@@ -245,6 +247,7 @@ async fn receive(
         .snapshot(SnapshotRequest {
             database: database.to_string(),
             epoch,
+            ..SnapshotRequest::default()
         })
         .await?
         .into_inner();

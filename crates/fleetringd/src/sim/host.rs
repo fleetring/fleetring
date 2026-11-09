@@ -115,11 +115,14 @@ pub(super) async fn run_router(
 }
 
 /// One incarnation of a host: starts the daemon with `identity`, publishes its handles, and
-/// serves until the test stops it or turmoil crashes it.
+/// serves until the test stops it or turmoil crashes it. Each incarnation draws its randomness,
+/// a control node's incarnations of databases among it, from `seed` and the time it starts, so
+/// that a seed replays the same values and a restarted host never repeats them.
 pub(super) async fn run_host(
     name: String,
     config: Config,
     identity: Identity,
+    seed: u64,
     shared: Shared,
 ) -> turmoil::Result {
     let mut stop = shared
@@ -128,7 +131,8 @@ pub(super) async fn run_host(
     let elapsed = turmoil::sim_elapsed().unwrap_or_default();
     let clock = SimClock::new(Timestamp::from_millis(millis(elapsed)));
     let mut environment = Environment::simulated(clock)
-        .with_network(Network::simulated().with_security(Security::Tls(identity)));
+        .with_network(Network::simulated().with_security(Security::Tls(identity)))
+        .with_entropy(Arc::new(SimEntropy::new(seed ^ millis(elapsed))));
     let stores = shared.lock().object_stores.clone();
     for (archive, store) in stores {
         environment = environment.with_object_store(archive, store);

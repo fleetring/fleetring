@@ -58,10 +58,22 @@ pub(crate) fn bootstrap_quorum(
 /// Returns the completion quorum of a fork with `replication_factor` replicas and
 /// `durability`: C = max(⌊R/2⌋ + 1, W, `min_replicas`), the holders its completion needs
 /// (ADR-0046, point 3).
-pub(crate) fn completion_quorum(
-    replication_factor: ReplicationFactor,
-    durability: Durability,
-) -> u8 {
+///
+/// # Examples
+///
+/// ```
+/// use fleetring::ReplicationFactor;
+/// use fleetring_control::{Acks, Durability};
+/// use fleetring_control::fork::completion_quorum;
+///
+/// let three = ReplicationFactor::new(3).ok_or("3 is a factor")?;
+/// // Under `local`, W is 1, but a fork's copy still needs a majority.
+/// assert_eq!(completion_quorum(three, Durability::new(Acks::Local, three)), 2);
+/// assert_eq!(completion_quorum(three, Durability::new(Acks::All, three)), 3);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
+pub fn completion_quorum(replication_factor: ReplicationFactor, durability: Durability) -> u8 {
     bootstrap_quorum(replication_factor, durability).max(durability.min_replicas())
 }
 

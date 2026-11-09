@@ -365,8 +365,13 @@ impl Authorizer {
         };
         match rpc.requirement {
             // The database is in the body; the handler checks it.
-            Requirement::Database(_) | Requirement::DatabaseOrFleet(_) => Ok(authorized),
-            Requirement::Node | Requirement::Fleet | Requirement::Listing(_) => {
+            Requirement::Database(_) | Requirement::DatabaseOrFleet(_) | Requirement::Fork => {
+                Ok(authorized)
+            }
+            Requirement::Node
+            | Requirement::Fleet
+            | Requirement::Listing(_)
+            | Requirement::Requester => {
                 authorized.check(None)?;
                 Ok(authorized)
             }
@@ -470,6 +475,26 @@ impl Authorized {
         audit_denied(&self.caller, self.rpc, &denied);
     }
 
+    /// Checks that the caller may take `action` on `database`, a second database the request
+    /// names besides the one its RPC's requirement covers, and logs the decision: a fork's
+    /// source, which needs `fork` (ADR-0046, point 11).
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED` naming the action and the database, never the caller's scopes.
+    pub fn require_also(&self, action: Action, database: &DatabaseName) -> Result<(), Status> {
+        match self.caller.authorize_also(self.rpc, action, database) {
+            Ok(()) => {
+                audit_allowed(&self.caller, self.rpc, Some(database));
+                Ok(())
+            }
+            Err(denied) => {
+                audit_denied_action(&self.caller, self.rpc, action.as_str(), &denied);
+                Err(denied.to_status())
+            }
+        }
+    }
+
     /// Checks the request against its RPC's requirement, with `database` the one it names, and
     /// logs the decision, for a streaming handler that learns the database from the stream's
     /// first message.
@@ -565,16 +590,23 @@ fn action_of(rpc: &Rpc) -> String {
             .map(|action| action.as_str())
             .collect::<Vec<_>>()
             .join("|"),
+        // The target's; the source's `fork` is logged with its own check.
+        Requirement::Fork => Action::Admin.as_str().to_owned(),
+        Requirement::Requester => "requester".to_owned(),
     }
 }
 
 fn audit_denied(caller: &Caller, rpc: &Rpc, denied: &Denied) {
+    audit_denied_action(caller, rpc, &action_of(rpc), denied);
+}
+
+fn audit_denied_action(caller: &Caller, rpc: &Rpc, action: &str, denied: &Denied) {
     let (principal, credential) = who(caller);
     tracing::warn!(
         target: AUDIT,
         principal,
         credential,
-        action = action_of(rpc),
+        action,
         database = denied.database().map(DatabaseName::as_str),
         rpc = rpc.method(),
         "denied",

@@ -89,6 +89,20 @@ impl Control for StubControl {
         Err(Status::unimplemented("stub"))
     }
 
+    async fn fork_database(
+        &self,
+        _request: Request<fleetring_proto::v1::ForkDatabaseRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ForkOperationStatus>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn get_fork_operation(
+        &self,
+        _request: Request<fleetring_proto::v1::GetForkOperationRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ForkOperationStatus>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
     async fn drop_database(
         &self,
         _request: Request<DropDatabaseRequest>,
@@ -296,6 +310,7 @@ async fn join_and_heartbeat_over_tcp() -> TestResult {
             node_id: "node-1".into(),
             databases: Vec::new(),
             software: None,
+            ..HeartbeatRequest::default()
         })
         .await?;
     assert_eq!(beat.get_ref().membership_epoch, MEMBERSHIP_EPOCH);
@@ -426,6 +441,7 @@ mod simulated {
                     node_id: "node-1".into(),
                     databases: Vec::new(),
                     software: None,
+                    ..HeartbeatRequest::default()
                 })
                 .await?;
             assert_eq!(beat.get_ref().membership_epoch, MEMBERSHIP_EPOCH);

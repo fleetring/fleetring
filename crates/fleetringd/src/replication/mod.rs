@@ -1004,6 +1004,7 @@ impl DatabaseStatuses for Replication {
                     role: ReplicaRole::Follower.into(),
                     epoch: self.inner.epochs.record(name).log_epoch(),
                     position: position.into_bytes(),
+                    ..DatabaseStatus::default()
                 },
             );
         }
@@ -1019,6 +1020,7 @@ impl DatabaseStatuses for Replication {
                         .committed()
                         .map(Position::into_bytes)
                         .unwrap_or_default(),
+                    ..DatabaseStatus::default()
                 },
             );
         }

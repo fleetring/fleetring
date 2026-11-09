@@ -32,6 +32,14 @@ pub enum Requirement {
     /// A principal that may take none of the actions on any database, and lacks `fleet`, is
     /// refused.
     Listing(&'static [Action]),
+    /// A fork (ADR-0046, point 11): `admin` on the database the request names, the fork's
+    /// target, and `fork` on its source, which the handler checks once it has read the request.
+    Fork,
+    /// A fork operation's status (ADR-0046, point 5.4): the principal that requested it, or one
+    /// with `admin` on its target while the target holds the operation's incarnation, which the
+    /// handler checks against the record. The boundary admits a principal that may administer
+    /// some database, since no other could have requested a fork or administer its target.
+    Requester,
 }
 
 /// The actions, as a requirement names them: `read`, or `read or stream`.
@@ -53,6 +61,8 @@ impl fmt::Display for Requirement {
             Self::Listing(actions) => {
                 write!(f, "{} per database listed, or fleet", either(actions))
             }
+            Self::Fork => f.write_str("admin on the database, and fork on `source`"),
+            Self::Requester => f.write_str("the requesting principal, or admin on the target"),
         }
     }
 }
@@ -107,7 +117,9 @@ const fn rpc(path: &'static str, requirement: Requirement, binding: Binding) -> 
         Requirement::Fleet
         | Requirement::Database(_)
         | Requirement::DatabaseOrFleet(_)
-        | Requirement::Listing(_) => ForNodes::Refused,
+        | Requirement::Listing(_)
+        | Requirement::Fork
+        | Requirement::Requester => ForNodes::Refused,
     };
     Rpc {
         path,
@@ -238,6 +250,18 @@ pub const RPCS: &[Rpc] = &[
     rpc(
         "/fleetring.v1.Control/UpdateDatabase",
         Requirement::Database(Action::Admin),
+        Binding::None,
+    ),
+    // Forks (ADR-0046): `admin` on the target and `fork` on the source; an operation's status
+    // to its requester, or to `admin` on its target.
+    rpc(
+        "/fleetring.v1.Control/ForkDatabase",
+        Requirement::Fork,
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Control/GetForkOperation",
+        Requirement::Requester,
         Binding::None,
     ),
     // Replication: nodes only.
@@ -454,7 +478,42 @@ impl Caller {
                 Ok(())
             }
             Requirement::Listing(actions) => Err(denied(Needed::Some(actions))),
+            // The source's `fork` is the handler's to check, once it has read the request.
+            Requirement::Fork => match database {
+                Some(database) if scopes.allows(Target::Database(Action::Admin, database)) => {
+                    Ok(())
+                }
+                Some(database) => Err(denied(Needed::Database(Action::Admin, database.clone()))),
+                None => Err(denied(Needed::Fleet)),
+            },
+            // Who requested the operation, and whether its target still holds it, is the
+            // handler's to check against the record.
+            Requirement::Requester if scopes.covers_some(Action::Admin) => Ok(()),
+            Requirement::Requester => Err(denied(Needed::Requester)),
         }
+    }
+
+    /// Checks that the caller may take `action` on `database`, a second database a request
+    /// names besides the one its RPC's requirement covers: a fork's source (ADR-0046, point 11).
+    /// A node is a principal with no scopes here, and an anonymous caller, on a plaintext fleet,
+    /// may do anything.
+    ///
+    /// # Errors
+    ///
+    /// A [`Denied`] naming the action and the database, never the caller's scopes.
+    pub fn authorize_also(
+        &self,
+        rpc: &Rpc,
+        action: Action,
+        database: &DatabaseName,
+    ) -> Result<(), Denied> {
+        if self.may(action, database) {
+            return Ok(());
+        }
+        Err(Denied {
+            method: rpc.method(),
+            needed: Needed::Database(action, database.clone()),
+        })
     }
 }
 
@@ -470,6 +529,8 @@ pub enum Needed {
     Database(Action, DatabaseName),
     /// The action on at least one database, or `fleet`.
     Some(&'static [Action]),
+    /// The principal that requested a fork operation, or `admin` on its target.
+    Requester,
 }
 
 /// A refused request: the method and what it needed, never what the caller has.
@@ -490,6 +551,9 @@ fn needed_text(needed: &Needed) -> String {
         Needed::Some(actions) => {
             format!("{} on some database, or the fleet scope", either(actions))
         }
+        Needed::Requester => {
+            "the principal that requested the operation, or admin on its target".to_owned()
+        }
     }
 }
 
@@ -499,7 +563,7 @@ impl Denied {
     pub fn database(&self) -> Option<&DatabaseName> {
         match &self.needed {
             Needed::Database(_, database) => Some(database),
-            Needed::Node | Needed::Fleet | Needed::Some(_) => None,
+            Needed::Node | Needed::Fleet | Needed::Some(_) | Needed::Requester => None,
         }
     }
 
@@ -789,6 +853,54 @@ mod tests {
         }
         assert!(forker.sees(Action::Read, &x));
         assert!(!forker.sees(Action::Stream, &x));
+    }
+
+    #[test]
+    fn a_fork_needs_admin_on_its_target_and_fork_on_its_source() {
+        let fork = call("/fleetring.v1.Control/ForkDatabase");
+        let (src, dst) = (database("src"), database("dst"));
+        let both = principal(&["admin:dst", "fork:src"]);
+        assert_eq!(both.authorize(fork, Some(&dst)), Ok(()));
+        assert_eq!(both.authorize_also(fork, Action::Fork, &src), Ok(()));
+        let target_only = principal(&["admin:dst"]);
+        assert_eq!(target_only.authorize(fork, Some(&dst)), Ok(()));
+        let refused = target_only
+            .authorize_also(fork, Action::Fork, &src)
+            .expect_err("no fork on the source");
+        assert_eq!(refused.to_string(), "ForkDatabase needs fork on 'src'");
+        assert_eq!(refused.database(), Some(&src));
+        for scopes in [&["fork:src"][..], &["admin:src"]] {
+            let refused = principal(scopes)
+                .authorize(fork, Some(&dst))
+                .expect_err("no admin on the target");
+            assert_eq!(refused.to_string(), "ForkDatabase needs admin on 'dst'");
+        }
+        // `admin` on the source implies `fork` there.
+        assert_eq!(
+            principal(&["admin:*"]).authorize_also(fork, Action::Fork, &src),
+            Ok(())
+        );
+        assert!(
+            Caller::Node("a".parse().expect("a node id"))
+                .authorize(fork, Some(&dst))
+                .is_err()
+        );
+
+        // An operation's status: any principal that may administer some database gets past the
+        // boundary, which leaves the record to the handler; anyone else is refused.
+        let status = call("/fleetring.v1.Control/GetForkOperation");
+        assert_eq!(principal(&["admin:x-*"]).authorize(status, None), Ok(()));
+        for scopes in [&["fork:src"][..], &["read:*"], &["fleet"], &[]] {
+            let refused = principal(scopes)
+                .authorize(status, None)
+                .expect_err("no admin anywhere");
+            assert_eq!(
+                refused.to_string(),
+                "GetForkOperation needs the principal that requested the operation, or admin \
+                 on its target",
+                "{scopes:?}"
+            );
+        }
     }
 
     #[test]

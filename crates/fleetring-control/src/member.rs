@@ -321,6 +321,36 @@ impl HostedReplica {
         &self.position
     }
 
+    /// Returns the bytes the replica's copy takes, if it said.
+    #[must_use]
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+
+    /// Returns the staged copy of a fork the replica holds, if it reported one.
+    #[must_use]
+    pub fn staged(&self) -> Option<&StagedCopy> {
+        self.staged.as_ref()
+    }
+
+    /// Returns the loss of the replica's staged copy of a fork, if it reported one.
+    #[must_use]
+    pub fn copy_lost(&self) -> Option<&CopyLost> {
+        self.copy_lost.as_ref()
+    }
+
+    /// Returns the replica's failure to seed a fork, if it reported one.
+    #[must_use]
+    pub fn seed_failure(&self) -> Option<&SeedFailure> {
+        self.seed_failure.as_ref()
+    }
+
+    /// Returns how the replica's reset write of a fork stands, if it reported one.
+    #[must_use]
+    pub fn reset(&self) -> Option<&ResetReport> {
+        self.reset.as_ref()
+    }
+
     /// Returns the report, keeping what it says about forks only if `forks` says so: before the
     /// `fork` feature is enabled those fields are dropped, so control state stays as it was.
     pub(crate) fn into_report(self, at: Timestamp, forks: ForkReports) -> (DatabaseName, Report) {

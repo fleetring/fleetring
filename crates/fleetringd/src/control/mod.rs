@@ -6,7 +6,9 @@
 //! - [`ControlNode`] runs the single writer: it stamps each command with a
 //!   [`Clock`](crate::clock::Clock), logs it, applies it with `fleetring_control::apply`, and
 //!   publishes the new state. [`ControlHandle`] submits commands and reads the published state.
-//! - [`ControlService`] serves the `Control` gRPC service over a handle.
+//! - [`ControlService`] serves the `Control` gRPC service over a handle, forks included
+//!   (ADR-0046): what replicas report about forks, a fork's status in a placement, and a fork
+//!   operation's status cross the protocol in `fork`.
 //! - [`ControlClient`] calls the service, retrying and following leader redirects
 //!   ([`not_leader`](fleetring_client::redirect::not_leader)).
 //! - [`Failover`] ticks the state machine on a timer, starts promotions for expired leases, and
@@ -20,6 +22,7 @@
 mod absent;
 mod client;
 mod failover;
+pub(crate) mod fork;
 mod log;
 mod node;
 mod notices;
@@ -28,6 +31,7 @@ mod service;
 pub use absent::NoControl;
 pub use client::ControlClient;
 pub use failover::{Failover, FailoverSettings};
+pub use fork::SeedProgress;
 pub(crate) use log::FORMAT_VERSION;
 pub use log::{CommandLog, LogError, LogIndex, Recovered};
 pub use node::{

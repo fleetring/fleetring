@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{DatabaseName, LeaseEpoch, State};
+use fleetring_control::fork::OperationId;
+use fleetring_control::{Database, DatabaseName, Incarnation, LeaseEpoch, State};
 use fleetring_proto::v1::DropCopyRequest;
 use tonic::Code;
 
@@ -45,6 +46,16 @@ pub(crate) struct Recipient {
     address: String,
 }
 
+/// Who to tell of a drop, and what the notice names besides the database and its epoch: the
+/// dropped database's incarnation and, for a fork, its operation, since a seeding fork's epoch
+/// is 0 and the epoch alone can't name it (ADR-0046, point 4.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Recipients {
+    nodes: Vec<Recipient>,
+    incarnation: Option<Incarnation>,
+    operation: Option<OperationId>,
+}
+
 impl DropNotices {
     /// Notices that reach data nodes over `network`.
     pub(crate) fn new(network: Network) -> Self {
@@ -54,8 +65,20 @@ impl DropNotices {
     }
 
     /// The members of `state`, the state before the drop, that may hold a copy of `database`:
-    /// its replica set, and every other member that reported a copy, each with its address.
-    pub(crate) fn recipients(state: &State, database: &DatabaseName) -> Vec<Recipient> {
+    /// its replica set, and every other member that reported a copy, each with its address; and
+    /// the database's incarnation and fork operation as `state` holds them.
+    pub(crate) fn recipients(state: &State, database: &DatabaseName) -> Recipients {
+        let dropped = state.database(database);
+        Recipients {
+            nodes: Self::nodes(state, database),
+            incarnation: dropped.map(Database::incarnation),
+            operation: dropped
+                .and_then(Database::fork)
+                .map(fleetring_control::fork::Fork::operation),
+        }
+    }
+
+    fn nodes(state: &State, database: &DatabaseName) -> Vec<Recipient> {
         let replicas = state.replica_set(database).unwrap_or_default();
         state
             .members()
@@ -73,17 +96,19 @@ impl DropNotices {
 
     /// Tells each of `recipients` that `database` was dropped at `epoch`, each in a task of its
     /// own, retrying a node that can't be reached a few times.
-    pub(crate) fn send(
-        &self,
-        recipients: Vec<Recipient>,
-        database: &DatabaseName,
-        epoch: LeaseEpoch,
-    ) {
-        for recipient in recipients {
+    pub(crate) fn send(&self, recipients: Recipients, database: &DatabaseName, epoch: LeaseEpoch) {
+        let Recipients {
+            nodes,
+            incarnation,
+            operation,
+        } = recipients;
+        for recipient in nodes {
             let peers = Arc::clone(&self.peers);
             let request = DropCopyRequest {
                 database: database.to_string(),
                 epoch: epoch.get(),
+                incarnation: incarnation.map(Incarnation::get),
+                operation: operation.map(|operation| operation.to_bytes().to_vec()),
             };
             tokio::spawn(async move {
                 tell(&peers, &recipient, request).await;

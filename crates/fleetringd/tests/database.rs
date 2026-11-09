@@ -4580,6 +4580,7 @@ mod orphans {
                     .drop_copy(DropCopyRequest {
                         database: database.to_owned(),
                         epoch: *epoch,
+                        ..DropCopyRequest::default()
                     })
                     .await
                     .expect_err("not a drop of this copy");

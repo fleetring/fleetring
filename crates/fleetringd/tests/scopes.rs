@@ -2293,3 +2293,232 @@ mod archives {
         Ok(())
     }
 }
+
+/// Forks (ADR-0046, point 11): `admin` on the target and `fork` on the source, a new name for
+/// the target, and an operation's status only to its requester or to `admin` on its target
+/// (point 5.4). No build reports `fork` yet, so the fleet's members join reporting it, as a
+/// later release's would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_needs_admin_on_its_target_and_fork_on_its_source() -> TestResult {
+    use fleetring_control::Feature;
+    use fleetring_control::fork::OperationId;
+    use fleetring_proto::v1::{
+        CreateDatabaseRequest, Engine, ForkDatabaseRequest, ForkState, GetForkOperationRequest,
+        JoinRequest, Node, Software,
+    };
+    use fleetringd::control::ControlClient;
+
+    let dir = tempfile::tempdir()?;
+    let tls = Tls::create(dir.path())?;
+    let control = Daemon::start(Config::from_toml(&config(
+        dir.path(),
+        &tls,
+        "control",
+        "control",
+        None,
+    )?)?)
+    .await?;
+    let address = control
+        .control_address()
+        .ok_or("no control address")?
+        .to_string();
+    let running = fleetringd::software::running();
+    let forking = Software {
+        version: fleetringd::software::VERSION.to_owned(),
+        protocol: Some(fleetring_proto::PROTOCOL_VERSION),
+        control_format: running.control_format(),
+        features: running
+            .features()
+            .chain([Feature::Fork])
+            .map(|feature| feature.as_str().to_owned())
+            .collect(),
+    };
+    for id in ["a", "b", "c"] {
+        tls.node_network(id)?
+            .control_client(address.clone())
+            .join(JoinRequest {
+                protocol: Some(fleetring_proto::PROTOCOL_VERSION),
+                node: Some(Node {
+                    id: id.to_owned(),
+                    weight: 1,
+                    ..Node::default()
+                }),
+                software: Some(forking.clone()),
+            })
+            .await?;
+    }
+    let as_principal =
+        |principal: &str, scopes: &[&str]| -> Result<ControlClient, Box<dyn Error>> {
+            let signer = tls.authority().token_signer()?;
+            let token = token(
+                &signer,
+                principal,
+                scopes,
+                &format!("{principal}-{}", scopes.join("-").replace([':', '*'], "")),
+                Duration::from_secs(3600),
+            )?;
+            Ok(with_token(network(&tls, principal)?, &token)?.control_client(address.clone()))
+        };
+    let admin = network(&tls, "tester")?.control_client(address.clone());
+    for database in ["src", "other"] {
+        admin
+            .create_database(CreateDatabaseRequest {
+                database: database.to_owned(),
+                replication_factor: 3,
+                engine: Engine::Sqlite.into(),
+                ..CreateDatabaseRequest::default()
+            })
+            .await?;
+    }
+    let operation = OperationId::from_bytes([0x5A; 16]);
+    let fork = |target: &str| ForkDatabaseRequest {
+        operation_id: operation.to_bytes().to_vec(),
+        database: target.to_owned(),
+        source: "src".to_owned(),
+        replication_factor: 3,
+        ..ForkDatabaseRequest::default()
+    };
+    let refused = |result: Result<_, tonic::Status>, code: Code, what: &str| -> String {
+        let status = result.err().unwrap_or_else(|| panic!("{what} was allowed"));
+        assert_eq!(status.code(), code, "{what}: {status}");
+        status.message().to_owned()
+    };
+
+    // `admin` on the target alone: refused, naming the source and `fork`.
+    let message = refused(
+        as_principal("app", &["admin:dst"])?
+            .fork_database(fork("dst"))
+            .await,
+        Code::PermissionDenied,
+        "admin on the target alone",
+    );
+    assert_eq!(message, "ForkDatabase needs fork on 'src'");
+    // `fork`, or `admin`, on the source alone: refused, naming the target.
+    for scopes in [&["fork:src"][..], &["admin:src"]] {
+        let message = refused(
+            as_principal("app", scopes)?
+                .fork_database(fork("dst"))
+                .await,
+            Code::PermissionDenied,
+            "the source alone",
+        );
+        assert_eq!(message, "ForkDatabase needs admin on 'dst'", "{scopes:?}");
+    }
+    // A target under the reserved prefix: refused as an invalid name, whoever asks.
+    let message = refused(
+        admin.fork_database(fork("_fleetring-x")).await,
+        Code::InvalidArgument,
+        "a reserved target",
+    );
+    assert!(message.contains("reserved"), "{message}");
+    // A node certificate is a principal with no scopes here.
+    refused(
+        tls.node_network("a")?
+            .control_client(address.clone())
+            .fork_database(fork("dst"))
+            .await,
+        Code::PermissionDenied,
+        "a node",
+    );
+
+    // Both: accepted, and the fork starts seeding.
+    let requester = as_principal("app", &["admin:dst", "fork:src"])?;
+    let status = requester.fork_database(fork("dst")).await?;
+    assert_eq!(status.state, i32::from(ForkState::Seeding));
+    assert_eq!(status.requested_by.as_deref(), Some("app"));
+    let read = GetForkOperationRequest {
+        operation_id: operation.to_bytes().to_vec(),
+    };
+
+    // The requester reads its operation, and so does another principal with `admin` on the
+    // target.
+    for (who, client) in [
+        ("the requester", requester.clone()),
+        (
+            "admin on the target",
+            as_principal("writer", &["admin:dst"])?,
+        ),
+    ] {
+        let seen = client.get_fork_operation(read.clone()).await?;
+        assert_eq!(seen.incarnation, status.incarnation, "{who}");
+        assert_eq!(seen.database, "dst", "{who}");
+    }
+    // Another principal that administers something else learns nothing: the answer is the one
+    // an unknown operation gets.
+    let unknown = OperationId::from_bytes([0x11; 16]);
+    let elsewhere = as_principal("writer", &["admin:other", "fork:src"])?;
+    let hidden = refused(
+        elsewhere.get_fork_operation(read.clone()).await,
+        Code::NotFound,
+        "admin elsewhere",
+    );
+    assert_eq!(hidden, format!("fork operation {operation} is unknown"));
+    let missing = refused(
+        elsewhere
+            .get_fork_operation(GetForkOperationRequest {
+                operation_id: unknown.to_bytes().to_vec(),
+            })
+            .await,
+        Code::NotFound,
+        "an unknown operation",
+    );
+    assert_eq!(missing, format!("fork operation {unknown} is unknown"));
+    // A principal that may administer nothing, and a node, are refused at the boundary, for any
+    // operation alike.
+    for (who, client) in [
+        (
+            "a reader",
+            network(&tls, "reader")?.control_client(address.clone()),
+        ),
+        ("a forker", as_principal("app", &["fork:src"])?),
+        (
+            "a node",
+            tls.node_network("a")?.control_client(address.clone()),
+        ),
+    ] {
+        let message = refused(
+            client.get_fork_operation(read.clone()).await,
+            Code::PermissionDenied,
+            who,
+        );
+        assert!(!message.contains("dst"), "{who}: {message}");
+    }
+    // A resend from another principal with the same rights is refused, revealing nothing.
+    let message = refused(
+        as_principal("writer", &["admin:dst", "fork:src"])?
+            .fork_database(fork("dst"))
+            .await,
+        Code::PermissionDenied,
+        "another principal's operation",
+    );
+    assert!(!message.contains("dst"), "{message}");
+
+    // Once the target is dropped and its name reused, `admin` on the new database doesn't reveal
+    // the old operation; its requester still sees it, cancelled.
+    admin
+        .drop_database(fleetring_proto::v1::DropDatabaseRequest {
+            database: "dst".to_owned(),
+        })
+        .await?;
+    admin
+        .create_database(CreateDatabaseRequest {
+            database: "dst".to_owned(),
+            replication_factor: 3,
+            engine: Engine::Sqlite.into(),
+            ..CreateDatabaseRequest::default()
+        })
+        .await?;
+    refused(
+        as_principal("writer", &["admin:dst"])?
+            .get_fork_operation(read.clone())
+            .await,
+        Code::NotFound,
+        "admin on a recreated target",
+    );
+    let cancelled = requester.get_fork_operation(read).await?;
+    assert_eq!(cancelled.state, i32::from(ForkState::Cancelled));
+    assert_eq!(cancelled.placement, None);
+
+    control.run_until(async {}).await;
+    Ok(())
+}

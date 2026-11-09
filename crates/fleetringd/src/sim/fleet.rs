@@ -62,6 +62,18 @@ const STOP_LIMIT: Duration = Duration::from_secs(30);
 /// Mixed into the seed for the workload generator, so it doesn't mirror turmoil's.
 const WORKLOAD_SALT: u64 = 0x5EED_F1EE_7219_0024;
 
+/// Mixed into a host's seed for its randomness, with its name.
+const HOST_SALT: u64 = 0x7A11_C0DE_0046_0001;
+
+/// The seed a host draws its randomness from: the fleet's seed mixed with the host's name
+/// (FNV-1a), so that two hosts never share a sequence and a seed replays each.
+fn host_seed(seed: u64, name: &str) -> u64 {
+    let hashed = name.bytes().fold(0xCBF2_9CE4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+    });
+    seed ^ HOST_SALT ^ hashed
+}
+
 /// The fleet name the test authority issues for.
 const FLEET: &str = "sim";
 
@@ -625,11 +637,15 @@ impl Fleet {
         let shared = self.shared.clone();
         let host = name.to_owned();
         let started = config.clone();
+        // From the fleet's seed and the host's name, without drawing from the workloads'
+        // generator, so that adding a host's randomness moves no workload.
+        let seed = host_seed(self.seed, name);
         self.sim.host(name, move || {
             run_host(
                 host.clone(),
                 started.clone(),
                 identity.clone(),
+                seed,
                 shared.clone(),
             )
         });

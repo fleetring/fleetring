@@ -398,6 +398,7 @@ impl Bound {
             .snapshot(SnapshotRequest {
                 database: DATABASE.to_owned(),
                 epoch,
+                ..SnapshotRequest::default()
             })
             .await
             .map(|_| ())

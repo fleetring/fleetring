@@ -44,3 +44,4 @@ pub use record::{Fork, ForkFailure, ForkLimits, ForkState, RetryCause};
 pub use report::{
     CopyLossReason, CopyLost, ResetReport, SeedFailure, SeedFailureReason, StagedCopy,
 };
+pub use rules::completion_quorum;
