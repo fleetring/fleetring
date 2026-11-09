@@ -217,6 +217,18 @@ message DatabaseStatus {
   // The bytes the replica's copy of the database takes on disk, for fork admission (ADR-0046,
   // point 7.3). Unset if the node doesn't say.
   optional uint64 size_bytes = 10;
+  // On a ready fork's primary whose recorded holders are still its replica set: placement's
+  // write quorum holds its whole log, and it counts both write quorums toward every write from
+  // now on (ADR-0046, point 3.10, as built). The control plane then releases the holders.
+  PlacementCaughtUp placement_caught_up = 11;
+}
+
+// A ready fork's primary at `epoch` has placement's write quorum holding its log.
+message PlacementCaughtUp {
+  fixed64 fork_incarnation = 1;
+  bytes operation = 2;
+  // The lease epoch of the primary that reports it.
+  uint64 epoch = 3;
 }
 
 // A replica durably holds a staged copy of a fork: written, verified, synced, and renamed into
@@ -556,7 +568,9 @@ message ForkStatus {
   repeated string seeder_excluded = 8;
   repeated string disk_refused = 9;
   // While seeding, the replicas that reported the attempt's staged copy; once seeded, the
-  // recorded holders, which are the fork's replica set until it is ready.
+  // recorded holders, which are the fork's replica set until it is ready; once ready, the
+  // holders it keeps as its replica set until they are released, or none (ADR-0046, point
+  // 3.10, as built).
   repeated string holders = 10;
   // The fork's completion quorum: how many holders seeding needs.
   uint32 holders_needed = 11;

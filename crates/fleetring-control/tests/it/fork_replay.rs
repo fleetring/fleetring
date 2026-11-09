@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fleetring_control::fork::{
     ChainHash, CopyLossReason, CopyLost, ForkFailure, ForkIdentity, ForkState, OperationId,
-    OperationOutcome, ResetReport, RetryCause, SeedFailure, SeedFailureReason, StagedCopy,
+    OperationOutcome, PlacementCaughtUp, ResetReport, RetryCause, SeedFailure, SeedFailureReason,
+    StagedCopy,
 };
 use fleetring_control::{
     Action, Applied, Command, Durability, HostedReplica, Incarnation, LeaseEpoch, Member, Outcome,
@@ -73,6 +74,7 @@ fn applied_kind(outcome: &Outcome) -> &'static str {
         Ok(Applied::ForkHolderDropped { .. }) => "holder dropped",
         Ok(Applied::ForkFailed { .. }) => "failed",
         Ok(Applied::ForkReady { .. }) => "ready",
+        Ok(Applied::ForkHoldersReleased { .. }) => "holders released",
         Ok(Applied::LeaseGranted { .. }) => "leased",
         Ok(Applied::DatabaseDropped { .. }) => "dropped",
         Ok(Applied::Ticked { .. }) => "ticked",
@@ -92,6 +94,7 @@ fn applied_kind(outcome: &Outcome) -> &'static str {
         Err(Rejection::ForkNotReady { .. }) => "not ready",
         Err(Rejection::IncarnationUnavailable { .. }) => "incarnation unavailable",
         Err(Rejection::HolderNotDroppable { .. }) => "not droppable",
+        Err(Rejection::HoldersNotReleasable { .. }) => "not releasable",
         Err(Rejection::DatabaseExists { .. }) => "exists",
         Err(_) => "rejected",
     }
@@ -279,6 +282,19 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
         },
     )
     .expect_err("ready already");
+    // Ready, it keeps its holders until its primary reports placement caught up.
+    let release = Action::ReleaseForkHolders {
+        fork: second.clone(),
+        epoch: LeaseEpoch::new(1),
+    };
+    log.run(79, release.clone()).expect_err("not reported");
+    let caught_up = HostedReplica::new(db("t"), ReplicaRole::Primary, Position::new([4]))
+        .with_log_epoch(LeaseEpoch::new(1))
+        .with_placement_caught_up(PlacementCaughtUp::new(second.clone(), LeaseEpoch::new(1)));
+    log.run(79, heartbeat_of(&order[0], vec![caught_up], None))
+        .expect("hb");
+    log.drive(79);
+    log.run(79, release).expect_err("released already");
 
     // A fork that fails, and a tick past every retention.
     log.run(80, fork_of(4, "u", SOURCE, 3)).expect("fork");
@@ -315,6 +331,8 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
         "holder dropped",
         "failed",
         "ready",
+        "holders released",
+        "not releasable",
         "leased",
         "dropped",
         "ticked",

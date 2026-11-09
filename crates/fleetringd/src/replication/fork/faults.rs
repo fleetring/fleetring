@@ -46,6 +46,10 @@ pub enum FaultPoint {
     /// reported committed in its durable log, and to report it there: held, the follower
     /// reports nothing, so the fork stays seeded while its primary serves.
     FollowerReset,
+    /// A node is about to follow control state's view of a fork that is ready: held, a primary
+    /// here keeps counting the replica set it saw before, as one that hasn't looked again yet
+    /// does.
+    FollowReady,
 }
 
 /// The fault hooks a daemon's fork work passes through.

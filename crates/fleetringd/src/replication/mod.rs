@@ -140,6 +140,7 @@ use tonic::Status;
 use self::chain::Chains;
 use self::epochs::Epochs;
 use self::follower::FollowerSlot;
+use self::fork::FrozenSet;
 use self::primary::Primary;
 use crate::clock::Clock;
 use crate::engine::{
@@ -776,6 +777,29 @@ impl Replication {
         .await
     }
 
+    /// The epoch of this node's primary of `database` once placement's write quorum holds
+    /// everything it has committed, while the database is a ready fork whose recorded holders
+    /// are still its replica set: the primary then counts both write quorums toward every write
+    /// (ADR-0046, point 3.10, as built). `None` otherwise.
+    ///
+    /// The caller follows the fork's view first: every write committed after the check counted
+    /// placement's write quorum, and every write before it is in the log placement now holds.
+    pub(crate) fn placement_caught_up(&self, database: &DatabaseName) -> Option<LeaseEpoch> {
+        let inner = &self.inner;
+        let primary = inner.primary(database)?;
+        if !matches!(
+            inner.forks.frozen_set(database),
+            Some(FrozenSet::Handover(_))
+        ) {
+            return None;
+        }
+        let committed = primary.committed();
+        let placed = inner.write_quorum(&primary, inner.placed(&primary));
+        let floor = usize::from(primary.role().durability.min_replicas());
+        let held = primary.quorum_held(&Quorum::over(vec![placed], floor));
+        (committed.is_none() || held >= committed).then_some(primary.role().epoch)
+    }
+
     /// Whether `database`'s primary has enough followers connected, live, and reporting for a
     /// write to be admitted and reach its quorum now.
     pub(crate) fn is_writable(&self, database: &DatabaseName) -> bool {
@@ -1275,27 +1299,73 @@ impl BatchPublisher for ReplicatingPublisher {
     }
 }
 
-/// The replica set's followers as this node sees them, how many must acknowledge a write, and
-/// how many must be reachable for one to run.
+/// The replica set's followers as this node sees them, the write quorums a write needs, and
+/// how many replicas must be reachable for one to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Quorum {
-    /// Every member of the replica set but this node.
+    /// Every node the primary streams to: every member of the replica set but this node, and,
+    /// while a ready fork hands its holders over, every member of either set.
     followers: Vec<NodeId>,
-    /// W, the replicas a write needs, the primary included.
-    required: usize,
-    /// How many of `followers` must acknowledge a write.
-    needed: usize,
-    /// How many replicas this node counts for: 1 when it is in the replica set, else 0.
+    /// The write quorums a write needs, each over its own set: one, or, while a ready fork
+    /// hands its holders over, the holders' and placement's (ADR-0046, point 3.10, as built).
+    groups: Vec<WriteQuorum>,
+    /// How many replicas this node counts for: 1 when it is in a replica set, else 0.
     own: usize,
     /// The database's `min_replicas`: how many replicas, this node included, must be reachable
     /// for a write to be admitted (ADR-0023).
     floor: usize,
 }
 
+/// One replica set's write quorum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteQuorum {
+    /// Every member of the set but this node.
+    followers: Vec<NodeId>,
+    /// W, the replicas a write needs, the primary included.
+    required: usize,
+    /// How many of `followers` must acknowledge a write.
+    needed: usize,
+    /// How many replicas this node counts for in the set: 1 when it is a member, else 0.
+    own: usize,
+}
+
 impl Quorum {
+    /// The quorum over the sets `groups`, the first being the one the floor is judged by.
+    fn over(groups: Vec<WriteQuorum>, floor: usize) -> Self {
+        let mut followers: Vec<NodeId> = Vec::new();
+        for group in &groups {
+            for node in &group.followers {
+                if !followers.contains(node) {
+                    followers.push(node.clone());
+                }
+            }
+        }
+        let own = groups.iter().map(|group| group.own).max().unwrap_or(0);
+        Self {
+            followers,
+            groups,
+            own,
+            floor,
+        }
+    }
+
     /// Whether a write may run with `reachable` followers connected and live.
     fn admits(&self, reachable: usize) -> bool {
         reachable + self.own >= self.floor
+    }
+
+    /// Whether the primary alone makes every write quorum.
+    fn alone(&self) -> bool {
+        self.groups.iter().all(|group| group.needed == 0)
+    }
+
+    /// The first write quorum that the followers `count` counts in each fall short of, with
+    /// how many it counted there.
+    fn short_of(&self, count: impl Fn(&[NodeId]) -> usize) -> Option<(&WriteQuorum, usize)> {
+        self.groups
+            .iter()
+            .map(|group| (group, count(&group.followers)))
+            .find(|(group, counted)| *counted < group.needed)
     }
 }
 
@@ -1378,32 +1448,47 @@ impl Inner {
 
     /// The replica set of `primary`'s database in the current membership view: a seeded fork's
     /// recorded holders until this node sees it ready, whatever the ring says (ADR-0046, point
-    /// 3.10), so that no write counts a node the control plane wouldn't fence for it.
+    /// 3.10), so that no write counts a node the control plane wouldn't fence for it. While a
+    /// ready fork keeps its holders, a write needs both their write quorum and placement's: the
+    /// control plane fences the holders until it releases them, and placement from then on.
     fn followers_of(&self, primary: &Primary) -> Quorum {
+        let floor = usize::from(primary.role().durability.min_replicas());
+        let groups = match self.forks.frozen_set(primary.name()) {
+            Some(FrozenSet::Seeded(holders)) => vec![self.write_quorum(primary, holders)],
+            Some(FrozenSet::Handover(holders)) => vec![
+                self.write_quorum(primary, holders),
+                self.write_quorum(primary, self.placed(primary)),
+            ],
+            None => vec![self.write_quorum(primary, self.placed(primary))],
+        };
+        Quorum::over(groups, floor)
+    }
+
+    /// The replica set the ring in the current membership view places `primary`'s database on.
+    fn placed(&self, primary: &Primary) -> Vec<NodeId> {
+        let factor = primary.role().replication_factor;
+        self.membership.view().ring().map_or_else(Vec::new, |ring| {
+            ring.replicas_n(primary.name().as_str(), factor).to_ids()
+        })
+    }
+
+    /// The write quorum of `primary`'s database over the replica set `members`.
+    fn write_quorum(&self, primary: &Primary, members: Vec<NodeId>) -> WriteQuorum {
         let role = primary.role();
-        let factor = role.replication_factor;
-        let view = self.membership.view();
-        let members: Vec<NodeId> = self.forks.frozen(primary.name()).unwrap_or_else(|| {
-            view.ring().map_or_else(Vec::new, |ring| {
-                ring.replicas_n(primary.name().as_str(), factor).to_ids()
-            })
-        });
         let includes_self = members.is_empty() || members.contains(&self.node);
         let size = u8::try_from(members.len())
             .ok()
             .and_then(ReplicationFactor::new)
-            .unwrap_or(factor);
+            .unwrap_or(role.replication_factor);
         let required = usize::from(role.durability.quorums(size).write());
         let followers: Vec<NodeId> = members.into_iter().filter(|id| *id != self.node).collect();
         // Without a ring, the node can't know its followers, so a write needs them all.
         let own = usize::from(includes_self);
-        let needed = required - own;
-        Quorum {
+        WriteQuorum {
             followers,
             required,
-            needed,
+            needed: required - own,
             own,
-            floor: usize::from(role.durability.min_replicas()),
         }
     }
 

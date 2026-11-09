@@ -666,6 +666,7 @@ pub(crate) fn mark_fork_ready(
         chain_hash,
         completed_at,
         lease_from,
+        holders,
         ..
     } = fork.state()
     else {
@@ -695,6 +696,9 @@ pub(crate) fn mark_fork_ready(
         reset_epoch: epoch,
         reset_position: reset_position.clone(),
         ready_at: now,
+        // The primary counts the holders until it sees the fork ready: they stay the replica
+        // set, which promotions fence, until it reports placement caught up.
+        holders: Some(holders.clone()),
     };
     let outcome = OperationOutcome::Ready {
         at: at.clone(),
@@ -708,6 +712,69 @@ pub(crate) fn mark_fork_ready(
         database: identity.name.clone(),
         epoch,
         reset_position,
+    })
+}
+
+/// Applies `ReleaseForkHolders` (ADR-0046, point 3.10, as built).
+pub(crate) fn release_fork_holders(
+    state: &mut State,
+    identity: &ForkIdentity,
+    epoch: LeaseEpoch,
+) -> Outcome {
+    let (db, fork) = current_fork(state, identity)?;
+    let not_releasable = || Rejection::HoldersNotReleasable {
+        database: identity.name.clone(),
+    };
+    let ForkState::Ready {
+        holders: Some(_), ..
+    } = fork.state()
+    else {
+        return Err(not_releasable());
+    };
+    // The report must come from the primary serving now: a promotion in progress, or a lease
+    // at another epoch, may have a primary that still counts the holders alone.
+    let Some(lease) = db
+        .lease()
+        .filter(|lease| lease.epoch() == epoch && db.epoch() == epoch && db.promotion().is_none())
+    else {
+        return Err(Rejection::StaleEpoch {
+            database: identity.name.clone(),
+            given: epoch,
+            current: db.epoch(),
+        });
+    };
+    let reported = state
+        .report(lease.holder(), &identity.name)
+        .and_then(crate::Report::placement_caught_up)
+        .is_some_and(|caught_up| *caught_up.fork() == *identity && caught_up.epoch() == epoch);
+    if !reported {
+        return Err(not_releasable());
+    }
+    let ready = match fork.state().clone() {
+        ForkState::Ready {
+            at,
+            chain_hash,
+            completed_at,
+            reset_epoch,
+            reset_position,
+            ready_at,
+            holders: _,
+        } => ForkState::Ready {
+            at,
+            chain_hash,
+            completed_at,
+            reset_epoch,
+            reset_position,
+            ready_at,
+            holders: None,
+        },
+        _ => return Err(not_releasable()),
+    };
+
+    set_fork_state(state, identity, ready)?;
+    Ok(Applied::ForkHoldersReleased {
+        database: identity.name.clone(),
+        epoch,
     })
 }
 

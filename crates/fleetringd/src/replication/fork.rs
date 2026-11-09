@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleetring_control::fork::{
-    CopyLossReason, CopyLost, ForkIdentity, ResetReport, SeedFailure, StagedCopy,
+    CopyLossReason, CopyLost, ForkIdentity, PlacementCaughtUp, ResetReport, SeedFailure, StagedCopy,
 };
 use fleetring_control::{DatabaseName, HostedReplica, LeaseEpoch, ReplicaRole};
 use fleetring_proto::v1::DatabaseStatus;
@@ -188,12 +188,41 @@ pub(crate) fn reservation(total_bytes: u64) -> u128 {
     u128::from(total_bytes) + u128::from(total_bytes / 10)
 }
 
+/// How a fork's replica set is frozen on this node, by name, and the fork identities whose
+/// holders this node saw released.
+#[derive(Debug, Default)]
+struct Frozen {
+    sets: BTreeMap<DatabaseName, (ForkIdentity, FrozenSet)>,
+    released: BTreeMap<DatabaseName, ForkIdentity>,
+}
+
+/// A fork's recorded holders, and what a primary counts toward a write while they are its
+/// replica set (ADR-0046, point 3.10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FrozenSet {
+    /// Seeded: the holders alone are the replica set and the write quorum.
+    Seeded(Vec<fleetring::NodeId>),
+    /// Ready, holders kept: they are still the replica set a promotion fences, and a write
+    /// needs both their write quorum and placement's until control state releases them.
+    Handover(Vec<fleetring::NodeId>),
+}
+
+impl FrozenSet {
+    /// The recorded holders.
+    pub(crate) fn holders(&self) -> &[fleetring::NodeId] {
+        match self {
+            Self::Seeded(holders) | Self::Handover(holders) => holders,
+        }
+    }
+}
+
 /// What a node says about one fork name in its heartbeats, beside its copy.
 #[derive(Debug, Clone, Default)]
 struct NameReports {
     seed_failure: Option<SeedFailure>,
     copy_lost: Option<CopyLost>,
     reset: Option<ResetReport>,
+    placement_caught_up: Option<PlacementCaughtUp>,
     progress: Option<SeedProgress>,
     /// The fork identity the node last saw in control state for the name.
     current: Option<ForkIdentity>,
@@ -252,12 +281,13 @@ pub(crate) struct Forks {
     gated: Mutex<BTreeSet<DatabaseName>>,
     /// The epoch each fork's gate was last opened at on this node, and the task opening one.
     opening: Mutex<BTreeMap<DatabaseName, Opening>>,
-    /// The replica set of each fork this node last saw seeded, as control state froze it: its
-    /// recorded holders, whatever the ring says (ADR-0046, point 3.10). A primary here streams
-    /// to them alone, counts only them toward a write quorum, and a promotion fences only them,
-    /// until this node sees the fork ready, gate open or not; a follower accepts a stream only
-    /// as one of them.
-    frozen: Mutex<BTreeMap<DatabaseName, Vec<fleetring::NodeId>>>,
+    /// The replica set of each fork this node last saw seeded, or ready with its holders kept,
+    /// as control state froze it: its recorded holders, whatever the ring says (ADR-0046, point
+    /// 3.10). A promotion fences only them. While the fork is seeded, a primary here streams to
+    /// them alone and counts only them toward a write quorum; once it is ready, the primary
+    /// streams to them and to placement and counts both write quorums, until control state
+    /// releases them. A fork this node saw released never freezes again.
+    frozen: Mutex<Frozen>,
     /// The free space and volume the test hooks last said, with the data directory's size
     /// then, which what it grows by since comes off the free space.
     disk_baseline: Mutex<Option<((u64, u64), u64)>>,
@@ -486,6 +516,25 @@ impl Forks {
         self.lock_reports().entry(name).or_default().reset = Some(reset);
     }
 
+    /// Reports, for `name`, that placement caught up with its primary here, or nothing.
+    pub(crate) fn report_placement_caught_up(
+        &self,
+        name: &DatabaseName,
+        caught_up: Option<PlacementCaughtUp>,
+    ) {
+        self.lock_reports()
+            .entry(name.clone())
+            .or_default()
+            .placement_caught_up = caught_up;
+    }
+
+    /// What this node reports for `name` about placement catching up, if anything.
+    pub(crate) fn placement_caught_up(&self, name: &DatabaseName) -> Option<PlacementCaughtUp> {
+        self.lock_reports()
+            .get(name)
+            .and_then(|reports| reports.placement_caught_up.clone())
+    }
+
     /// The reset this node reports for `name`, if it reports one.
     pub(crate) fn reset(&self, name: &DatabaseName) -> Option<ResetReport> {
         self.lock_reports()
@@ -517,48 +566,72 @@ impl Forks {
         self.lock_gated().contains(name)
     }
 
-    /// Freezes `name`'s replica set at `holders`, or, with `None`, lets it follow the ring again.
-    pub(crate) fn freeze(&self, name: &DatabaseName, holders: Option<Vec<fleetring::NodeId>>) {
-        let mut frozen = self.frozen.lock().expect("fork replica set lock poisoned");
-        match holders {
-            Some(holders) => {
-                frozen.insert(name.clone(), holders);
-            }
-            None => {
-                frozen.remove(name);
-            }
-        }
+    fn lock_frozen(&self) -> MutexGuard<'_, Frozen> {
+        self.frozen.lock().expect("fork replica set lock poisoned")
     }
 
-    /// `name`'s frozen replica set, if it has one.
+    /// `name`'s frozen replica set, if it has one: its recorded holders.
     pub(crate) fn frozen(&self, name: &DatabaseName) -> Option<Vec<fleetring::NodeId>> {
-        self.frozen
-            .lock()
-            .expect("fork replica set lock poisoned")
+        self.frozen_set(name).map(|set| set.holders().to_vec())
+    }
+
+    /// How `name`'s replica set is frozen, if it is.
+    pub(crate) fn frozen_set(&self, name: &DatabaseName) -> Option<FrozenSet> {
+        self.lock_frozen()
+            .sets
             .get(name)
-            .cloned()
+            .map(|(_, set)| set.clone())
     }
 
     /// The names with a frozen replica set.
     pub(crate) fn frozen_names(&self) -> BTreeSet<DatabaseName> {
-        self.frozen
-            .lock()
-            .expect("fork replica set lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        self.lock_frozen().sets.keys().cloned().collect()
     }
 
-    /// Freezes `name`'s replica set at the recorded holders while `fork` is seeded, and lets it
-    /// follow the ring again once it is anything else: seeding, ready, failed, or no fork at
-    /// all. A state this build doesn't know changes nothing.
+    /// Follows what control state shows of `name`'s fork: its replica set is frozen at the
+    /// recorded holders while it is seeded, handed over while it is ready with its holders kept,
+    /// and follows the ring once they are released, and for anything else: seeding, failed, or
+    /// no fork at all. A state this build doesn't know changes nothing.
+    ///
+    /// A view never moves the fork back: one that shows it seeded once this node saw it ready,
+    /// or its holders kept once it saw them released, is an older view and changes nothing, so
+    /// a primary here never goes back to counting the holders alone.
     pub(crate) fn follow_view(&self, name: &DatabaseName, fork: Option<&ForkView>) {
-        match fork.map(|fork| &fork.phase) {
-            Some(ForkPhase::Seeded { holders, .. }) => {
-                self.freeze(name, Some(holders.iter().cloned().collect()));
+        let mut frozen = self.lock_frozen();
+        let Some(fork) = fork else {
+            frozen.sets.remove(name);
+            frozen.released.remove(name);
+            return;
+        };
+        let identity = &fork.identity;
+        let released = frozen.released.get(name) == Some(identity);
+        let handed_over = matches!(
+            frozen.sets.get(name),
+            Some((seen, FrozenSet::Handover(_))) if seen == identity
+        );
+        match &fork.phase {
+            ForkPhase::Seeded { holders, .. } => {
+                if !released && !handed_over {
+                    let set = FrozenSet::Seeded(holders.iter().cloned().collect());
+                    frozen.sets.insert(name.clone(), (identity.clone(), set));
+                }
             }
-            Some(ForkPhase::Unknown) => {}
-            _ => self.freeze(name, None),
+            ForkPhase::Ready {
+                holders: Some(holders),
+            } => {
+                if !released {
+                    let set = FrozenSet::Handover(holders.iter().cloned().collect());
+                    frozen.sets.insert(name.clone(), (identity.clone(), set));
+                }
+            }
+            ForkPhase::Ready { holders: None } => {
+                frozen.sets.remove(name);
+                frozen.released.insert(name.clone(), identity.clone());
+            }
+            ForkPhase::Unknown => {}
+            _ => {
+                frozen.sets.remove(name);
+            }
         }
     }
 
@@ -648,6 +721,7 @@ impl Forks {
                 && report.seed_failure.is_none()
                 && report.copy_lost.is_none()
                 && report.reset.is_none()
+                && report.placement_caught_up.is_none()
                 && report.progress.is_none();
             if nothing {
                 continue;
@@ -694,6 +768,9 @@ impl Forks {
             }
             if let Some(reset) = report.reset {
                 replica = replica.with_reset(reset);
+            }
+            if let Some(caught_up) = report.placement_caught_up {
+                replica = replica.with_placement_caught_up(caught_up);
             }
             statuses.insert(name, replica_to_proto(&replica, report.progress.as_ref()));
         }

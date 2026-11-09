@@ -36,6 +36,8 @@ use crate::{Action, Database, LeaseEpoch, Position, Report, State, Timestamp};
 ///   before the first lease, that reports its staged copy lost;
 /// - [`Action::MarkForkReady`] when the bootstrap quorum of a seeded fork's replica set reports
 ///   its reset committed;
+/// - [`Action::ReleaseForkHolders`] when a ready fork that keeps its holders has a lease holder
+///   that reports, at the lease's epoch, that placement's write quorum holds its log;
 ///
 /// and a [`Action::Tick`] when a seeding fork is past its deadline, which the tick fails, or an
 /// operation's record is past its retention, which the tick forgets.
@@ -58,6 +60,9 @@ pub fn actions(state: &State, now: Timestamp) -> Vec<Action> {
             match fork.state() {
                 ForkState::Seeding { .. } => seeding(state, now, db, fork),
                 ForkState::Seeded { .. } => seeded(state, db, fork),
+                ForkState::Ready {
+                    holders: Some(_), ..
+                } => release(state, db, fork),
                 _ => None,
             }
         })
@@ -303,5 +308,23 @@ fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
         fork: identity,
         epoch,
         reset_position: position.clone(),
+    })
+}
+
+/// A `ReleaseForkHolders` for a ready fork that keeps its holders, once the primary serving it
+/// now reports that placement's write quorum holds its log (ADR-0046, point 3.10, as built).
+fn release(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
+    let identity = identity_of(db, fork);
+    let lease = db
+        .lease()
+        .filter(|lease| lease.epoch() == db.epoch() && db.promotion().is_none())?;
+    let epoch = lease.epoch();
+    state
+        .report(lease.holder(), db.name())
+        .and_then(Report::placement_caught_up)
+        .filter(|caught_up| *caught_up.fork() == identity && caught_up.epoch() == epoch)?;
+    Some(Action::ReleaseForkHolders {
+        fork: identity,
+        epoch,
     })
 }

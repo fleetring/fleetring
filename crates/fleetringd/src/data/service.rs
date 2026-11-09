@@ -743,7 +743,11 @@ impl Database for DatabaseService {
             return Err(refusal);
         }
         let leads = replication.serving(&name).is_some();
-        if replication.is_gated(&name) || (!leads && replication.forks().frozen(&name).is_some()) {
+        let seeded = matches!(
+            replication.forks().frozen_set(&name),
+            Some(crate::replication::fork::FrozenSet::Seeded(_))
+        );
+        if replication.is_gated(&name) || (!leads && seeded) {
             return Err(crate::replication::fork::fork_not_ready(
                 &name,
                 "is a fork whose fork-reset write hasn't committed yet",

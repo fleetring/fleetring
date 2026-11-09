@@ -1766,6 +1766,94 @@ async fn a_holder_promotes_a_seeded_fork_over_its_holders_after_placement_moved(
     Ok(())
 }
 
+/// A ready fork's primary that hasn't seen it ready yet still counts its recorded holders
+/// alone, so a write it acknowledges then may sit only on a holder the ring moved the fork off.
+/// The holders stay the replica set a promotion fences until the primary reports placement
+/// caught up, so that write survives the primary's crash; the promoted holder then hands the
+/// fork over to placement (ADR-0046, point 3.10, as built).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_on_the_holders_survives_a_promotion_after_readiness() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut fleet = Fleet::start(dir.path(), fast_failover()).await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 5).await?;
+    let joiner: NodeId = JOINER.parse()?;
+    let moved_off: NodeId = DATA[1].parse()?;
+    let unseeded: NodeId = DATA[2].parse()?;
+    let target = fleet.name_moved_on_join(&joiner, &moved_off)?;
+    let id = operation(42);
+    for faults in &fleet.faults {
+        faults.hold_operation(FaultPoint::FollowerReset, id);
+    }
+    // The third replica never reports its copy: the fork completes on the other two.
+    fleet
+        .faults(&unseeded)?
+        .hold_operation(FaultPoint::Staged, id);
+    client
+        .fork_database(&source, &target, &spec(id, 3)?)
+        .await?;
+    await_state(&client, id, proto::ForkState::Seeded).await?;
+    let primary = write_once_served(&client, &target, "served while seeded").await?;
+    assert_eq!(primary.as_str(), DATA[0], "the first live holder leads");
+    fleet.join(dir.path(), JOINER, &fast_failover()).await?;
+    let ring: BTreeSet<NodeId> = fleet
+        .ring_replicas(target.as_str(), 3)?
+        .into_iter()
+        .collect();
+    assert!(
+        ring.contains(&joiner) && !ring.contains(&moved_off),
+        "the ring moved the fork: {ring:?}"
+    );
+
+    // The primary doesn't look at the fork again once it is ready.
+    fleet
+        .faults(&primary)?
+        .hold_operation(FaultPoint::FollowReady, id);
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::FollowerReset, id);
+    }
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    // A write is acknowledged by the primary and the holder the ring moved the fork off, and
+    // nowhere else: no node the ring now places the fork on has it.
+    write_once_served(&client, &target, "on the holders").await?;
+    assert_eq!(
+        followers_of(&fleet, &primary, &target)?,
+        BTreeSet::from([moved_off.clone()])
+    );
+    fleet.crash(&primary).await?;
+
+    let written = Value::from("on the holders".to_owned());
+    wait_until(
+        "a promoted primary serves the acknowledged write",
+        async || {
+            notes(&client, &target)
+                .await
+                .is_ok_and(|rows| rows.iter().any(|row| row.get(1) == Some(&written)))
+        },
+    )
+    .await?;
+    let promoted = client.locate(&target).await?.primary.ok_or("no primary")?;
+    assert_eq!(promoted, moved_off, "the holder that has the write leads");
+    // The promoted holder hands the fork over: the ring's nodes follow it.
+    let handle = fleet.control.control().ok_or("no control handle")?;
+    wait_until("the fork's holders are released", async || {
+        handle.watch().borrow().database(&target).is_some_and(|db| {
+            matches!(
+                db.fork().map(|fork| fork.state()),
+                Some(fleetring_control::fork::ForkState::Ready { holders: None, .. })
+            )
+        })
+    })
+    .await?;
+    wait_until("the joined node follows the fork", async || {
+        followers_of(&fleet, &promoted, &target).is_ok_and(|followers| followers.contains(&joiner))
+    })
+    .await?;
+    fleet.stop().await;
+    Ok(())
+}
+
 /// Every data call against `database` that the data daemon at `address` answers, each with the
 /// status it was refused with, by call; an error if one was served.
 async fn refusals(

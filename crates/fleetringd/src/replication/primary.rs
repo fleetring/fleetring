@@ -345,25 +345,34 @@ impl Primary {
     /// acknowledged, or would be if its writer were still waiting (ADR-0018). `None` while no
     /// batch is.
     ///
-    /// With `quorum.needed` followers required, that is the `needed`-th highest position the
-    /// followers have reported, capped at the log's end; the primary alone decides when
-    /// `needed` is 0.
+    /// For each write quorum with `needed` followers required, that is the `needed`-th highest
+    /// position its followers have reported, capped at the log's end, and the primary alone
+    /// decides one whose `needed` is 0; with two write quorums, the lower of the two.
     pub(super) fn quorum_held(&self, quorum: &Quorum) -> Option<Position> {
         let state = self.lock();
         let committed = state.committed.as_ref()?;
-        if quorum.needed == 0 {
-            return Some(committed.clone());
+        let mut held: Option<Position> = None;
+        for group in &quorum.groups {
+            let group_held = if group.needed == 0 {
+                committed.clone()
+            } else {
+                let mut acked: Vec<&Position> = group
+                    .followers
+                    .iter()
+                    .filter_map(|node| state.followers.get(node))
+                    .filter(|progress| progress.reported)
+                    .filter_map(|progress| progress.acked.as_ref())
+                    .collect();
+                acked.sort_unstable_by(|a, b| b.cmp(a));
+                let at = acked.get(group.needed - 1)?;
+                (*at).min(committed).clone()
+            };
+            held = Some(match held {
+                Some(so_far) => so_far.min(group_held),
+                None => group_held,
+            });
         }
-        let mut acked: Vec<&Position> = quorum
-            .followers
-            .iter()
-            .filter_map(|node| state.followers.get(node))
-            .filter(|progress| progress.reported)
-            .filter_map(|progress| progress.acked.as_ref())
-            .collect();
-        acked.sort_unstable_by(|a, b| b.cmp(a));
-        let held = acked.get(quorum.needed - 1)?;
-        Some((*held).min(committed).clone())
+        held
     }
 
     /// A subscription to this primary's changes, for a change stream's pump.
@@ -793,15 +802,17 @@ pub(super) fn publish(
         reachable: count(reachable + quorum.own),
         replicas: u32::from(primary.role().replication_factor.get()),
     };
-    if quorum.needed == 0 {
+    if quorum.alone() {
         // The primary alone is the write quorum: R = 1, or `local` acknowledgements.
         let acknowledged_by = count(1 + primary.acknowledged_by(&quorum.followers, &end));
         return Acknowledgement::new(std::future::ready(Ok(counts.acknowledged(acknowledged_by))));
     }
-    if reachable < quorum.needed {
+    if let Some((short, reachable)) =
+        quorum.short_of(|followers| primary.reachable(inner, followers))
+    {
         return refused(ReplicationError::UnderReplicated {
-            required: quorum.required,
-            reachable: reachable + quorum.own,
+            required: short.required,
+            reachable: reachable + short.own,
         });
     }
     Acknowledgement::new(wait_for_quorum(
@@ -830,8 +841,8 @@ fn count(replicas: usize) -> u32 {
     u32::try_from(replicas).unwrap_or(u32::MAX)
 }
 
-/// Completes once `quorum.needed` followers have acknowledged `end`, with how many replicas,
-/// the primary included, hold it by then.
+/// Completes once every write quorum's `needed` followers have acknowledged `end`, with how
+/// many replicas, the primary included, hold it by then.
 async fn wait_for_quorum(
     primary: Arc<Primary>,
     end: Position,
@@ -841,7 +852,9 @@ async fn wait_for_quorum(
 ) -> Result<Acknowledged, ReplicationError> {
     let mut changes = primary.changed.subscribe();
     let waited = time::timeout(limit, async {
-        while primary.acknowledged_by(&quorum.followers, &end) < quorum.needed
+        while quorum
+            .short_of(|followers| primary.acknowledged_by(followers, &end))
+            .is_some()
             && !primary.is_retired()
         {
             if changes.changed().await.is_err() {
@@ -851,19 +864,22 @@ async fn wait_for_quorum(
     })
     .await;
     let holders = primary.acknowledged_by(&quorum.followers, &end);
-    if waited.is_ok() && holders >= quorum.needed {
-        Ok(counts.acknowledged(count(holders + quorum.own)))
-    } else if holders < quorum.needed && primary.is_retired() {
-        Err(failed(
+    let short = quorum
+        .short_of(|followers| primary.acknowledged_by(followers, &end))
+        .map(|(group, acknowledged)| (group.needed, acknowledged));
+    match short {
+        None if waited.is_ok() => Ok(counts.acknowledged(count(holders + quorum.own))),
+        Some(_) if primary.is_retired() => Err(failed(
             "this node stopped being the database's primary before a quorum acknowledged the write"
                 .to_owned(),
-        ))
-    } else {
-        Err(failed(format!(
-            "{} of the {} followers a write needs did not acknowledge it within {limit:?}",
-            quorum.needed - holders.min(quorum.needed),
-            quorum.needed,
-        )))
+        )),
+        Some((needed, acknowledged)) => Err(failed(format!(
+            "{} of the {needed} followers a write needs did not acknowledge it within {limit:?}",
+            needed - acknowledged.min(needed),
+        ))),
+        None => Err(failed(format!(
+            "the followers a write needs did not acknowledge it within {limit:?}"
+        ))),
     }
 }
 

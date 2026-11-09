@@ -66,7 +66,13 @@ pub enum ForkPhase {
         reset: Option<(LeaseEpoch, Position)>,
     },
     /// The reset is committed: the fork is an ordinary database.
-    Ready,
+    Ready {
+        /// The recorded holders it keeps as its replica set until control state releases them,
+        /// once its primary reports that placement's write quorum holds its log; `None` once
+        /// released, and from a control node that predates keeping them (ADR-0046, point 3.10,
+        /// as built).
+        holders: Option<BTreeSet<NodeId>>,
+    },
     /// The fork failed for good.
     Failed,
     /// A state this build doesn't know.
@@ -92,6 +98,12 @@ impl ForkView {
             self.phase,
             ForkPhase::Seeding { .. } | ForkPhase::Seeded { .. }
         )
+    }
+
+    /// Whether the fork is ready but keeps its recorded holders as its replica set.
+    #[must_use]
+    pub fn keeps_holders(&self) -> bool {
+        matches!(self.phase, ForkPhase::Ready { holders: Some(_) })
     }
 }
 
@@ -142,7 +154,11 @@ pub(crate) fn fork_from_proto(
                 .zip(status.reset_position.clone())
                 .map(|(epoch, position)| (LeaseEpoch::new(epoch), Position::from(position))),
         },
-        Ok(proto::ForkState::Ready) => ForkPhase::Ready,
+        Ok(proto::ForkState::Ready) => ForkPhase::Ready {
+            holders: (!status.holders.is_empty())
+                .then(|| nodes(&status.holders))
+                .transpose()?,
+        },
         Ok(proto::ForkState::Failed) => ForkPhase::Failed,
         _ => ForkPhase::Unknown,
     };

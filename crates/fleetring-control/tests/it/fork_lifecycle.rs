@@ -5,8 +5,8 @@
 use std::collections::BTreeSet;
 
 use fleetring_control::fork::{
-    CancelCause, ChainHash, ForkExpiry, ForkFailure, ForkState, OperationOutcome, RetryCause,
-    StagedCopy,
+    CancelCause, ChainHash, ForkExpiry, ForkFailure, ForkState, OperationOutcome,
+    PlacementCaughtUp, RetryCause, StagedCopy,
 };
 use fleetring_control::{
     Acks, Action, Applied, DescriptionChange, Durability, HostedReplica, Incarnation, LeaseEpoch,
@@ -309,7 +309,219 @@ fn a_seeded_forks_replica_set_is_frozen_until_ready() {
         matches!(proposed.as_slice(), [(Action::MarkForkReady { .. }, Ok(_))]),
         "{proposed:?}"
     );
+    // Ready, it keeps its holders until its primary reports placement caught up.
+    assert_eq!(replicas(&state, "t"), frozen);
+    run(
+        &mut state,
+        45,
+        heartbeat_of(holders[0], vec![caught_up(&fork, 1)], None),
+    )
+    .expect("hb");
+    let released = drive(&mut state, 46);
+    assert!(
+        matches!(
+            released.as_slice(),
+            [(
+                Action::ReleaseForkHolders { .. },
+                Ok(Applied::ForkHoldersReleased { .. })
+            )]
+        ),
+        "{released:?}"
+    );
     assert_eq!(replicas(&state, "t"), placed(&state, "t", 3));
+}
+
+/// A report from a ready fork's primary that placement's write quorum holds its log.
+fn caught_up(fork: &fork::ForkIdentity, epoch: u64) -> HostedReplica {
+    HostedReplica::new(fork.name.clone(), ReplicaRole::Primary, Position::new([4]))
+        .with_log_epoch(LeaseEpoch::new(epoch))
+        .with_placement_caught_up(PlacementCaughtUp::new(fork.clone(), LeaseEpoch::new(epoch)))
+}
+
+/// A ready fork's primary counts its recorded holders until it sees the fork ready, however far
+/// the ring has moved: a write it acknowledged then may sit on holders placement no longer
+/// names. So the holders stay the replica set a promotion fences, after readiness too, until
+/// the primary serving now reports that placement's write quorum holds its log; only then does
+/// the replica set follow placement (ADR-0046, point 3.10, as built).
+#[test]
+fn a_promotion_after_readiness_fences_the_holders_until_they_are_released() {
+    let mut state = fleet(&["n0", "n1", "n2", "n3"]);
+    run(&mut state, 10, fork_request(1, "t")).expect("fork");
+    let fork = identity(&state, "t");
+    let holders = replicas(&state, "t");
+    for node in &holders {
+        run(&mut state, 20, report_staged(node, &fork, 1)).expect("hb");
+    }
+    let named: Vec<&str> = holders.iter().map(String::as_str).collect();
+    run(&mut state, 20, complete(&fork, 1, &named)).expect("complete");
+    let mut frozen = holders.clone();
+    frozen.sort();
+    // The ring moves the fork off a holder.
+    for node in ["n4", "n5", "n6", "n7", "n8", "n9"] {
+        let member = Member::new(id(node)).with_software(current_software());
+        run(&mut state, 25, Action::Join { member }).expect("join");
+    }
+    let mut moved = placed(&state, "t", 3);
+    moved.sort();
+    assert_ne!(moved, frozen, "the ring moved the fork");
+    let outside = moved
+        .iter()
+        .find(|node| !frozen.contains(node))
+        .expect("a placed node that isn't a holder")
+        .clone();
+
+    first_lease(&mut state, 30, &holders[0]).expect("first lease");
+    for node in &holders[..2] {
+        run(
+            &mut state,
+            35,
+            report_reset(node, &fork, LeaseEpoch::new(1), &[3]),
+        )
+        .expect("hb");
+    }
+    let proposed = drive(&mut state, 40);
+    assert!(
+        matches!(proposed.as_slice(), [(Action::MarkForkReady { .. }, Ok(_))]),
+        "{proposed:?}"
+    );
+    assert_eq!(replicas(&state, "t"), frozen, "ready, it keeps its holders");
+
+    // The primary goes quiet; a promotion fences a quorum of the holders, never placement.
+    for node in &holders[1..] {
+        let follower = HostedReplica::new(db("t"), ReplicaRole::Follower, Position::new([4]))
+            .with_log_epoch(LeaseEpoch::new(1));
+        run(&mut state, 1_900, heartbeat_of(node, vec![follower], None)).expect("hb");
+    }
+    run(&mut state, 1_900, heartbeat_of(&outside, Vec::new(), None)).expect("hb");
+    let started = run(
+        &mut state,
+        2_000,
+        Action::StartPromotion { database: db("t") },
+    );
+    let Ok(Applied::PromotionStarted {
+        candidate, epoch, ..
+    }) = started
+    else {
+        panic!("{started:?}");
+    };
+    assert!(
+        frozen.contains(&candidate.as_str().to_owned()),
+        "{candidate}"
+    );
+    let fence = |node: &str| Action::RecordFenced {
+        database: db("t"),
+        node: id(node),
+        epoch,
+        position: Position::new([4]),
+    };
+    refused(
+        &mut state,
+        2_010,
+        fence(&outside),
+        &Rejection::NotInReplicaSet {
+            id: id(&outside),
+            database: db("t"),
+        },
+    );
+    run(&mut state, 2_010, fence(candidate.as_str())).expect("the candidate fences");
+    assert!(matches!(
+        run(
+            &mut state,
+            2_020,
+            Action::CompletePromotion {
+                database: db("t"),
+                epoch,
+            }
+        ),
+        Err(Rejection::QuorumNotReached { needed: 2, .. })
+    ));
+    let other = holders[1..]
+        .iter()
+        .find(|node| **node != candidate.as_str())
+        .expect("another live holder");
+    run(&mut state, 2_020, fence(other)).expect("a holder fences");
+    run(
+        &mut state,
+        2_030,
+        Action::CompletePromotion {
+            database: db("t"),
+            epoch,
+        },
+    )
+    .expect("a quorum of the holders is fenced");
+    assert_eq!(replicas(&state, "t"), frozen);
+
+    // Only the primary serving now, at its own epoch, releases the holders.
+    let release = Action::ReleaseForkHolders {
+        fork: fork.clone(),
+        epoch,
+    };
+    refused(
+        &mut state,
+        2_040,
+        release.clone(),
+        &Rejection::HoldersNotReleasable { database: db("t") },
+    );
+    run(
+        &mut state,
+        2_050,
+        heartbeat_of(&holders[0], vec![caught_up(&fork, epoch.get())], None),
+    )
+    .expect("hb");
+    run(
+        &mut state,
+        2_050,
+        heartbeat_of(candidate.as_str(), vec![caught_up(&fork, 1)], None),
+    )
+    .expect("hb");
+    assert!(fork::actions(&state, at(2_060)).is_empty());
+    refused(
+        &mut state,
+        2_060,
+        release.clone(),
+        &Rejection::HoldersNotReleasable { database: db("t") },
+    );
+    refused(
+        &mut state,
+        2_060,
+        Action::ReleaseForkHolders {
+            fork: fork.clone(),
+            epoch: LeaseEpoch::new(1),
+        },
+        &Rejection::StaleEpoch {
+            database: db("t"),
+            given: LeaseEpoch::new(1),
+            current: epoch,
+        },
+    );
+    run(
+        &mut state,
+        2_070,
+        heartbeat_of(
+            candidate.as_str(),
+            vec![caught_up(&fork, epoch.get())],
+            None,
+        ),
+    )
+    .expect("hb");
+    let released = drive(&mut state, 2_080);
+    assert_eq!(
+        released,
+        vec![(
+            release.clone(),
+            Ok(Applied::ForkHoldersReleased {
+                database: db("t"),
+                epoch,
+            })
+        )]
+    );
+    assert_eq!(replicas(&state, "t"), placed(&state, "t", 3));
+    refused(
+        &mut state,
+        2_090,
+        release,
+        &Rejection::HoldersNotReleasable { database: db("t") },
+    );
 }
 
 // ---- Holders that lose their copy ----
