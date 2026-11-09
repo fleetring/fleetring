@@ -266,7 +266,8 @@ pub(super) async fn check_stream(
 
 /// Checks a `Fence` that `caller` sends for `database` at `epoch`, naming `candidate`: the
 /// request names the caller, and control state names the caller the candidate of the promotion
-/// to `epoch` (or, once that promotion completed, the holder at it). A fence the record already
+/// to `epoch` (or, once that promotion completed, the holder at it), and, for a fork whose
+/// replica set is its recorded holders, this node one of them. A fence the record already
 /// took from the caller at `epoch` needs no second look, and an epoch below the record's is left
 /// to the record, which refuses it.
 ///
@@ -312,12 +313,32 @@ pub(super) async fn check_fence(
     {
         return Ok(());
     }
-    let holders = inner.authority.holders(database).await?;
+    let DatabaseView {
+        holders,
+        fork: placed,
+        ..
+    } = inner.authority.view(database).await?;
     if holders.epoch > lease_epoch {
         return Err(superseded(database, epoch, holders.epoch));
     }
     if !holders.leads(caller, lease_epoch) {
         return Err(refuse(inner, Some(database), not_candidate()));
+    }
+    // A fork whose replica set is its recorded holders, seeded or ready with them kept, is
+    // fenced only on them: a node the ring names and control state doesn't never records the
+    // candidate, so it never takes the candidate's stream (ADR-0046, point 3.10).
+    let frozen = placed
+        .as_ref()
+        .is_some_and(|fork| fork.is_pending() || fork.keeps_holders());
+    if frozen && !holders.replicas.contains(&inner.node) {
+        let denied = BindingDenied::new(
+            "Fence",
+            caller.clone(),
+            Unbound::NotReplica {
+                database: database.clone(),
+            },
+        );
+        return Err(refuse(inner, Some(database), denied));
     }
     Ok(())
 }

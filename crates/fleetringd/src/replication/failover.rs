@@ -509,16 +509,28 @@ impl Replication {
             })
     }
 
-    /// Learns from control state whether `database` is a seeded fork, whose replica set is its
-    /// recorded holders, as [`replica_set`](Self::replica_set) answers from then on. A control
-    /// state it can't reach leaves what this node saw last.
-    pub(crate) async fn learn_fork_replicas(&self, database: &DatabaseName) {
-        match self.inner.authority.view(database).await {
-            Ok(view) => self.inner.forks.follow_view(database, view.fork.as_ref()),
-            Err(status) => {
-                tracing::debug!(database = %database, %status, "can't learn whether the database is a seeded fork; keeping its replica set as last seen");
-            }
-        }
+    /// Learns from control state whether `database` is a fork whose replica set is its
+    /// recorded holders, seeded or ready with them kept, as [`replica_set`](Self::replica_set)
+    /// answers from then on.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when control state can't be reached: a promotion that doesn't know which
+    /// replica set control state fences mustn't guess the ring, so it stops and is tried again.
+    pub(crate) async fn learn_fork_replicas(&self, database: &DatabaseName) -> Result<(), Status> {
+        let view = self
+            .inner
+            .authority
+            .view(database)
+            .await
+            .map_err(|status| {
+                Status::unavailable(format!(
+                    "can't learn the replica set of {database} from control state: {}",
+                    status.message()
+                ))
+            })?;
+        self.inner.forks.follow_view(database, view.fork.as_ref());
+        Ok(())
     }
 
     /// The promotion quorum Q for a replica set of `members` members.
