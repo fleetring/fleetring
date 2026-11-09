@@ -635,6 +635,24 @@ impl Forks {
         }
     }
 
+    /// Whether this node holds any fork state for `name`: a staged copy, a frozen replica set,
+    /// a readiness gate or its opening, or a fork identity it reports about. A name with none
+    /// is an ordinary database here, or a fork this node saw ready.
+    pub(crate) fn tracks(&self, name: &DatabaseName) -> bool {
+        !self.store.of_name(name).is_empty()
+            || self.lock_frozen().sets.contains_key(name)
+            || self.lock_gated().contains(name)
+            || self
+                .opening
+                .lock()
+                .expect("fork opening lock poisoned")
+                .contains_key(name)
+            || self
+                .lock_reports()
+                .get(name)
+                .is_some_and(|reports| reports.current.is_some())
+    }
+
     /// Whether `name`'s gate was opened at `epoch` on this node.
     pub(crate) fn opened_at(&self, name: &DatabaseName, epoch: LeaseEpoch) -> bool {
         matches!(

@@ -735,9 +735,17 @@ impl Database for DatabaseService {
         let replication = self.node.replication();
         // Through the readiness gate, as every data call: a fork control state shows seeding,
         // seeded with no primary, or failed, a gated primary, and a copy of a fork this node sees
-        // seeded and doesn't lead, answer nothing (ADR-0046, point 6.2). A control plane out of
-        // reach leaves the answer to this node's own view.
-        if let Ok(placement) = self.node.locate(&name).await
+        // seeded and doesn't lead, answer nothing (ADR-0046, point 6.2). A copy this node serves
+        // or follows with no fork state for its name, and that no heartbeat reply names as a
+        // fork that isn't ready, is an ordinary database's, or a ready fork's: control state
+        // isn't asked about it. A control plane out of reach leaves the answer to this node's
+        // own view.
+        let ordinary = (replication.serving(&name).is_some()
+            || replication.follower_status(&name).is_some())
+            && !replication.forks().tracks(&name)
+            && !replication.membership().pending_forks().contains(&name);
+        if !ordinary
+            && let Ok(placement) = self.node.locate(&name).await
             && let Some(refusal) = crate::replication::fork::placement_refusal(&name, &placement)
         {
             return Err(refusal);
