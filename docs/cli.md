@@ -10,7 +10,7 @@ Names come from the [lexicon](lexicon.md). A command, flag, column or JSON field
 
 The CLI is one of three surfaces over one client crate (ADR-0033). The TUI and the desktop app follow the same names, the same confirmation rules and the same output fields.
 
-This guide describes the 0.7.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet.
+This guide describes the 0.7.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet. Anything marked *planned for 0.8.0* is designed here and not built yet; [§15](#15-planned-for-080-forks) designs `db fork` (ADR-0046).
 
 ## 1. Structure: `fleetring <noun> <verb>`
 
@@ -48,6 +48,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `completions bash\|zsh\|fish\|powershell` | Prints a shell completion script |
 | Databases | `db create \| list \| show \| edit \| locate \| exec \| query \| verify \| restore \| drop` | Databases. `db restore` is the online restore into the fleet |
 | | `db watch <db> [--from <position>]` | Follows a database's row changes, one transaction per line (ADR-0045) |
+| | `db fork <source> <target> [--operation-id <id>] [--detach]` | *Planned for 0.8.0.* Makes a new database from another's current contents, and waits until it is ready (ADR-0046, §15) |
 | Fleet | `status [--node <id> \| --address <host:port>]` | Gives the fleet overview, or one data node's view |
 | | `node list \| drain \| undrain \| remove` | Members, with liveness, release, and drain state |
 | | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042) |
@@ -75,6 +76,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
   | `watch` | follow a stream until interrupted | no |
   | `verify` | check, and report only | no |
   | `restore` | build a new item from an archive, never over an existing one | no |
+  | `fork` | *planned for 0.8.0:* build a new database from another's current contents, never over an existing one (`db fork`) | no |
   | `drain` | move work off, keeping data | asks |
   | `undrain` | clear a drain mark, so the node takes work again | no |
   | `stop` | end a running process cleanly (`stop`, `dev stop`) | no |
@@ -87,7 +89,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
   - **`upgrade`**, which replaces this binary.
   - **`mcp`, a long-running process on stdio** (ADR-0041, point 8). It acts on many nouns, so it belongs under none.
   - **`completions`** and **`ui`** (*planned*, FR-057).
-- **Arguments** are for the thing the command acts on (`db drop <database>`, `archive restore <database>`, `agent add <id>`). Everything else is a flag. A command takes at most one positional kind, plus SQL and its parameters for `db exec` and `db query`.
+- **Arguments** are for the thing the command acts on (`db drop <database>`, `archive restore <database>`, `agent add <id>`). Everything else is a flag. A command takes at most one positional kind, plus SQL and its parameters for `db exec` and `db query`. `db fork <source> <target>` (*planned for 0.8.0*) takes two of that one kind, source first, as `cp` does.
 - **No aliases.** A command or flag has one spelling; a rename replaces it outright ([renames](#14-renames)). The exceptions are the compatibility names above, which are documented in `--help` and go in 1.0, and `switch`.
 
 ## 2. Flags
@@ -195,6 +197,8 @@ PS1='$(fleetring context current) $ '
   | `db verify` | `database`, `position`, `replicas` (each `node`, `chain_hash` and `error`), `chain_hash`, `agree`, `expected` and `unchanged` |
   | `lease watch` | one object per line: `event` (`held`, `gained` or `lost`), `node`, `database` and `lease_epoch` |
   | `db watch` | one object per transaction, per line: `database`; `start`, the position the transaction started from (`null` for the log's beginning); `position`, where `--from` resumes after it; `lease_epoch`, the serving primary's; and `changes`, each `table`, `operation` (`insert`, `update` or `delete`), `key`, `before`, `after` and `updated`. `key`, `before` and `after` are objects from column name to value in the table's column order, values as `db query` prints them; `before`, `after` and `updated` are `null` when the database's capture mode doesn't record them. Delivery across reconnections is at least once: drop a transaction whose `start` is before the last `position` kept |
+  | `db fork` (*planned for 0.8.0*) | `operation_id`, `database`, `incarnation`, `state`, `source`, `source_incarnation`, `position`, `chain_hash`, `failure`, `elapsed_ms`, and `placement`, as `db locate` prints it (§15) |
+  | `db locate`, `db list`, `db show`: fork fields (*planned for 0.8.0*) | `placement` gains `incarnation`; each database gains `fork`, `null` for a database no fork made; `metadata` gains `forked_from` (§15) |
   | `orphan list` | `orphans`, each `node`, `database`, `epoch` and `bytes` |
   | `archive show` | `database`, `archive`, `latest`, `latest_archived_at`, `segments`, `segment_bytes`, `snapshots` (each `id`, `position`, `lease_epoch`, `taken_at`, `bytes` and `has_metadata`), `incomplete` and `unusable` |
   | `context list`, `context show` | `contexts`, each `name`, `current`, `fleet`, `control`, `tls_dir`, `ca`, `cert`, `key`, `as` and `token_file`; `show` prints one context alone |
@@ -244,7 +248,7 @@ fleetring: database 'notes' doesn't exist on fleet 'home'
 
 ## 7. Confirmation and `--yes`
 
-- **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost, and where: `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` name the fleet and the context, or the fleet and the control address when no context is in use. Irreversible actions ask for the name typed, not `y`.
+- **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost, and where: `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` name the fleet and the context, or the fleet and the control address when no context is in use. Irreversible actions ask for the name typed, not `y`. *Planned for 0.8.0:* dropping a fork that isn't ready also says that it cancels the fork in progress, and names the operation (§15).
 - **`--yes` skips the question.** Without a terminal and without `--yes`, the command refuses with exit code 2 and says to pass `--yes`.
 - **`--dry-run`** shows what would change, where the command can know: a drain lists the databases it would hand over.
 - **Drain asks too** when the node holds a database's only replica, since that database is then unavailable until the node returns. A drain can be undone with `undrain`, so it asks for `y`.
@@ -257,7 +261,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
 | Code | Meaning |
 |---|---|
 | 0 | Success. `dev -d` when the dev node already runs, `dev status` either way. |
-| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, an `upgrade` whose release refuses the node's configuration, or an agent with no identity outside dev mode. |
+| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, an `upgrade` whose release refuses the node's configuration, or an agent with no identity outside dev mode. *Planned for 0.8.0:* a fork that failed, was cancelled, or was refused (§15). |
 | 2 | Usage: a bad flag or argument, a confirmation needed without a terminal, or `switch` with no name and no terminal. |
 | 3 | Authentication or authorization: `UNAUTHENTICATED` or `PERMISSION_DENIED`. |
 | 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, `DEADLINE_EXCEEDED`, no leader yet. |
@@ -312,7 +316,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
 
 ## 12. Long-running commands and background processes
 
-- **Progress** is a spinner on stderr, shown after 150 ms and only where §5's table allows. Long-running commands are dev startup, `dev -d`, `dev stop`, `stop`, `db create`, `db restore`, `db verify`, `archive verify`, `archive restore`, `upgrade`, `node drain`, `orphan remove` and `agent add`. On success the spinner becomes `✓ <what happened>`; on failure it is cleared, and the error prints. A command whose steps differ (`upgrade`) changes the spinner's message per step. Log lines printed meanwhile don't tear the spinner's line.
+- **Progress** is a spinner on stderr, shown after 150 ms and only where §5's table allows. Long-running commands are dev startup, `dev -d`, `dev stop`, `stop`, `db create`, `db restore`, `db verify`, `archive verify`, `archive restore`, `upgrade`, `node drain`, `orphan remove` and `agent add`, and `db fork` once it ships in 0.8.0 (§15). On success the spinner becomes `✓ <what happened>`; on failure it is cleared, and the error prints. A command whose steps differ (`upgrade`) changes the spinner's message per step. Log lines printed meanwhile don't tear the spinner's line.
 - **Ctrl-C** stops cleanly. A drain stops after the database it is handing over, and says what it moved and what it left.
 - **Timeouts** have a flag (`--timeout 30s`) and a stated default: 60s for `dev -d` to be ready, 2m for `stop` to drain, 5m for each `upgrade` step, and 30s for `db exec` and `db query`, whose primary also stops the statement at its own `[limits] statement_timeout_ms` if that comes first. The primary interrupts a statement just before its timeout, an interrupted write rolling back, and the command exits 4 with `DEADLINE_EXCEEDED` and a hint to make the statement cheaper or give it longer (FR-078). An `exec` whose replicas' acknowledgement outran the timeout has committed. Exit codes are unchanged.
 - **A background process is a `docker run -d`:**
@@ -362,6 +366,124 @@ After switching a unit to `fleetring serve`, rolling back to 0.6 requires revert
 
 How renames work after 1.0 is decided with 1.0's compatibility promise, and 1.0 removes the compatibility names.
 
+## 15. Planned for 0.8.0: forks
+
+*Planned for 0.8.0.* Nothing in this section is built yet. It designs the command before the code, as the rest of this guide does. ADR-0046 is the design it follows, and FR-086 (#136) builds it. The words are the [lexicon](lexicon.md)'s: *fork*, *incarnation*, *operation ID*, *staged copy*, and the fork states.
+
+### `db fork`
+
+```text
+fleetring db fork <source> <target>
+    [--replication-factor <n>] [--acks quorum|all|local] [--min-replicas <n>]
+    [--description <text|->] [--label <key=value>]… [--expires-in <duration> | --expires-at <time>]
+    [--operation-id <id>] [--detach] [--timeout <duration>]
+    [-o table|json|jsonl | --json]
+```
+
+It makes `<target>` a new database holding `<source>`'s current contents, at a position the source's write quorum has acknowledged, and waits until the fork is **ready**. The fork is independent from then on: writes to either never reach the other.
+
+- **Its place.** It belongs to the `db` noun, in the Databases group, after `db restore`. `fork` is a verb of its own (§1's table): it builds a new database and never writes over an existing one.
+- **Arguments.** Both are database names, the source first.
+- **Settings are the target's own.** `--replication-factor`, `--acks` and `--min-replicas` default as `db create`'s do, never to the source's. `--description`, `--label`, `--expires-in` and `--expires-at` are `db create`'s flags. Nothing is copied from the source's metadata: its description is another principal's text (ADR-0041, point 9).
+- **Scopes.** `admin` on the target, and `fork` on the source. Until the `fork` action ships (FR-088), `admin` on the source stands in for it, and the refusal's hint says so: `until 0.8's fork action ships, forking needs admin on the source`.
+- **The operation ID comes first.** The command makes an operation ID (26 lowercase base32 characters) and prints it on stderr before it calls the control plane, so a crash or a lost reply never leaves the caller without it: `operation 4k7mxq…: wait for it again with --operation-id 4k7mxq…`. `-q` drops the line; a script that passes `-q` passes its own `--operation-id`.
+- **It waits for `ready`, not `seeded`.** A seeded fork isn't usable until its fork-reset write commits (ADR-0046, point 6). Progress goes to stderr as a spinner (§12) where §5's table allows it, and otherwise as one line per change of state:
+  - `seeding notes-exp from notes: attempt 1 of 5, seeder data-3, 41 MiB of 120 MiB, holders 1 of 2`, with the excluded nodes when there are any;
+  - `opening notes-exp: running the fork reset`, once the fork is seeded;
+  - `✓ notes-exp is ready: forked from notes (incarnation 7) at 0000…01a8 in 12.3 s`.
+- **`--detach`** returns as soon as the control plane has accepted the fork, which is then `seeding`, and exits 0. Running the same command again with `--operation-id` waits for it, and exits by its final outcome.
+- **`--operation-id <id>`** resumes or retries an operation: it resends the complete original request under that ID, and then waits.
+  - The request must be the same as the first, both names and every flag. A difference is refused, naming it: `operation 4k7mxq… was requested with --replication-factor 3, not 5`.
+  - Another principal's ID is refused as if it didn't exist, revealing nothing about the operation.
+  - An ID stays valid while its fork is pending and for 7 days after its outcome; after that it is unknown, and the same command starts a new operation. `--help` says so.
+  - A request resent after the source was dropped and recreated returns the original operation's outcome, never a fork of the new source.
+- **Resends.** On `UNAVAILABLE`, or a reply that never arrives, the command resends with the same ID, up to 5 times within 60 s (ADR-0046, point 7). After that it exits 4, with the ID and the command that resumes it in the hint.
+- **`--timeout <duration>`** bounds the wait, 1 h by default, the control plane's default fork deadline. When it passes, the fork carries on: the command exits 4, with the ID and the command that resumes the wait in the hint.
+- **Ctrl-C** stops the wait, not the fork. The command prints the ID, the command that resumes the wait, and `fleetring db drop <target>`, which cancels the fork, and exits 130.
+
+**Text result,** on stdout, as key and value lines:
+
+```text
+database: notes-exp
+incarnation: 12
+state: ready
+forked from: notes (incarnation 7)
+position: 0000…01a8
+chain hash: 9f3c…
+operation: 4k7mxq…
+elapsed: 12.3 s
+```
+
+then the placement, as `db locate` prints it. With `--detach`, `state: seeding`, and the position and chain hash read `not yet`.
+
+**JSON result:** `operation_id`; `database`; `incarnation`; `state` (`seeding`, `seeded`, `ready`, or `failed`, and `cancelled` when `--operation-id` names an operation whose fork was dropped); `source`; `source_incarnation`; `position` and `chain_hash`, `null` until the fork is seeded; `failure`, `null` or an object with `reason` and `attempts`; `elapsed_ms`; and `placement`, as `db locate` prints it, or `null` once the fork is gone. A `reason` is one of `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`, `source_too_large`, `insufficient_disk` and `engine_unsupported`; the list is open (`ForkFailure` is non-exhaustive), so a later release may add one, and a script treats an unknown reason as a failure.
+
+**Refusals and their hints:**
+
+| Refusal | Hint |
+|---|---|
+| no `admin` on the source (`fork` once FR-088 ships) | until 0.8's fork action ships, forking needs admin on the source |
+| no `admin` on the target | names the target and the action, as every refusal does (§6) |
+| the target exists | `fleetring db show <target>`, or another name |
+| the source doesn't exist, or isn't ready (a fork still opening) | `fleetring db show <source>` |
+| the fleet can't use `fork` yet (`FeatureUnsupported`) | names the member and its release, and says to upgrade it |
+| not enough disk on the target's replicas (`RESOURCE_EXHAUSTED`) | names the node and its free bytes |
+| the source's engine can't fork (`UNIMPLEMENTED`) | none |
+| the operation ID is known with another request | names the differing flag |
+| the fork failed (`failed`, with its reason) | `fleetring db drop <target>` removes it; then fork again |
+
+**Exit codes** (§8): 0 when the fork is ready, or accepted with `--detach`; 1 when it failed, was cancelled, or was refused for any reason but scope; 2 for usage; 3 for a refused scope; 4 when the control plane stays unavailable after the resends, or `--timeout` passes; 130 on Ctrl-C.
+
+### Fork status in `db show`, `db locate` and `db list`
+
+A fork's record stays for its life, so `db show` reports its state and its provenance. Text adds these lines after the placement:
+
+```text
+fork: seeding, attempt 2 of 5, seeder data-3, excluded data-1
+fork holders: data-3, 1 of 2 needed
+fork progress: 41 MiB of 120 MiB on data-3
+forked from: notes (incarnation 7)
+fork operation: 4k7mxq…, requested by agent-42 at 2026-11-08T10:15:00Z
+hint: `fleetring db drop notes-exp` cancels the fork in progress
+```
+
+- **States:** `seeding`; `seeded`, printed as `opening: not yet usable`; `ready`, with the time it became ready; and `failed`, with its reason and the number of attempts.
+- **Once the fork is seeded,** `forked from` adds the position and the chain hash: `notes (incarnation 7) at 0000…01a8, chain hash 9f3c…`.
+- **A fork that isn't ready** carries the hint `fleetring db drop <name>` cancels or removes it: "cancels the fork in progress" while it is seeding or opening, "removes it" once it failed.
+- **A database no fork made** prints no fork lines. One restored from a fork's archive prints `forked from` as the archive's claim, with no fork state.
+
+**`db list`** gains a `FORK` column, shown when any listed database is a fork: `seeding`, `opening`, `ready`, `failed`, or `-`.
+
+**JSON**, in `db locate`, in each database of `db list`, and in `db show`:
+
+- `placement.incarnation`: the database's incarnation, `0` for one created before forks were enabled.
+- `fork`: `null` for a database no fork made, and otherwise `state` (`seeding`, `seeded`, `ready`, or `failed`); `operation_id`; `source` and `source_incarnation`; `attempt` and `max_attempts`; `seeder` and `excluded`, while seeding; `holders` and `holders_needed`; `bytes` and `total_bytes`, the seeder's progress while seeding; `position` and `chain_hash`, once seeded; `failure` (`reason` and `attempts`); `requested_by` and `requested_at`; `deadline_at`; `completed_at`, `ready_at` and `failed_at`. A field that doesn't apply in the current state is `null`. `db list` always carries `fork`, whether or not the table shows the column.
+- `metadata.forked_from`: `null`, or `source`, `source_incarnation`, `position`, `chain_hash` and `forked_at`. It is the provenance a ready fork keeps, and, for a restored database, the archive's claim.
+
+### Cancelling: `db drop`
+
+There is no cancel command. `db drop <target>` on a fork that isn't ready cancels it (ADR-0046, point 3.6), and needs `admin` on the target, as every drop does.
+
+- **It asks first,** as every drop does (§7), and the prompt says what it cancels: `drop database 'notes-exp' on fleet 'home' (context 'home'), cancelling the fork in progress (operation 4k7mxq…), and every replica's copy? type the name to confirm:`.
+- **Afterwards,** `db fork … --operation-id <id>` reports the operation `cancelled` and exits 1, and `db fork <source> <target>` with a new ID starts afresh.
+- `db fork --help` says how to cancel: `to cancel a fork in progress, drop its target: fleetring db drop <target>`.
+
+### Help
+
+`db fork` is in the Databases group of `fleetring -h`, after `db restore`, inside the 50-line budget (§9). Its `--help` opens with examples:
+
+```text
+Examples:
+  fleetring db fork notes notes-exp                         fork notes, and wait until the fork is ready
+  fleetring db fork notes notes-exp --detach                start the fork, and return
+  fleetring db fork notes notes-exp --operation-id 4k7mxq…  wait for the same fork again, or retry it
+  fleetring db drop notes-exp                               cancel the fork, or remove it
+```
+
+### MCP
+
+The MCP server's `db_fork` tool, offered only with read-write access, is designed in the daemon README's MCP section.
+
 ## Where `fleetring` stands
 
 As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](plans/0.7.0-cli.md); FR-056 is #59, FR-075 is #103, and FR-079 is #114.
@@ -392,3 +514,4 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0 and FR-076's for 0.6.0. | 0.7.0's list: phase A, in the release notes |
 | `upgrade` | Installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place (ADR-0038). | Phase A: across the rename |
 | `db watch` | None; change streams reach only configured sinks. | Done in 0.8.0 (FR-075 item 7, ADR-0045): `db watch <db> [--from <position>]`, with `jsonl`. |
+| `db fork` | None. | Planned for 0.8.0 (FR-086, ADR-0046): `db fork <source> <target>`, fork status in `db show` and `db list`, cancellation by `db drop`, and MCP `db_fork` (§15). |
