@@ -175,8 +175,10 @@ Where a database's actor hands each committed batch to be replicated, right afte
 
 What a node making a node-to-node call must be for the database or node the request names: `self`, `replica`, `holder`, `candidate`, `holder or candidate`, `follower`, or `dropped` (ADR-0031, ADR-0042). A call that fails its binding is refused before it touches state.
 
+- ***Seeding binding*** (*planned*, ADR-0046): `seeding`, under which a [fork](#fork)'s seeder fetches the source's database snapshot from the source's primary, and the fork's other replicas fetch the [staged copy](#staged-copy) from the seeder, on `Replication.Snapshot`. Each side checks the caller against the full fork identity, the attempt, and the source's [incarnation](#incarnation) in its own view of control state.
+
 - **Applies to:** daemon.
-- **Code:** `replication::binding`, metadata `fleetring-binding`, the `Binding:` lines in the protocol. **CLI:** none.
+- **Code:** `replication::binding`, metadata `fleetring-binding`, the `Binding:` lines in the protocol; *planned:* `Binding::Seeding`. **CLI:** none.
 - **Not:** check, guard, constraint, policy.
 
 ### Candidate
@@ -418,7 +420,7 @@ The set of nodes that one control plane and one certificate authority govern, un
 
 ### Fleet feature
 
-A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (a command that sets or changes an expiry, and the one that expires a database), ADR-0041.
+A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (a command that sets or changes an expiry, and the one that expires a database), ADR-0041. *Planned* (ADR-0046): `fork`, for the fork commands; enabling it also starts assigning [incarnations](#incarnation).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetring_control::Feature`, `Action::features`, `State::features`, `State::check_features`, `State::check_admission`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
@@ -450,11 +452,21 @@ A replica that isn't the primary: it applies the primary's batches and can be pr
 
 ### Fork
 
-*Planned* (ADR-0044). A new database seeded from a source database's snapshot at a position, independent afterwards, that records its source in `forked_from` (the source, the position, its chain hash, and a signed head or a package manifest when there is one). Needs `fork` on the source and `admin` on the target. Also the action `fork`, which implies `read`.
+*Planned* (ADR-0044, ADR-0046). A new database seeded from a source database's snapshot at a position its source's write quorum acknowledged, independent afterwards, that records its source in `forked_from`: the source, the source's [incarnation](#incarnation), the position, its chain hash, and the time (a signed head or a package manifest, later). Needs `fork` on the source and `admin` on the target. Also the action `fork`, which implies `read`.
 
+- ***Fork identity:*** the triple (name, incarnation, operation): the fork's database name, its own incarnation, and its [operation ID](#operation-id). Every command, report, `Snapshot` request, and staging directory about a fork carries it, so nothing meant for a dropped fork can act on a fork created again under the same name.
+- ***Fork states:***
+  - **`seeding`:** being copied, in numbered *attempts*. Each attempt has one *seeder*, the replica that fetches the database snapshot from the source's primary; the fork's other replicas copy the seeder's [staged copy](#staged-copy). Never leased, never served.
+  - **`seeded`:** a write quorum of the fork's replicas durably holds the staged copy. One of those *holders* may take the first lease, but nothing is served yet. The CLI prints it as `opening: not yet usable`.
+  - **`ready`:** the fork-reset write has committed. Clients, `db watch`, and sinks are served, and it is an ordinary database from then on.
+  - **`failed`:** it stopped, with a reason, and stays until `db drop` removes it.
+
+  A database no fork made has no fork state, and counts as seeded and ready. `ready` is a fork's state, not a node's [readiness](#readiness).
+- ***Fork reset*** and ***reset marker:*** the fork-reset write is one conditional transaction, run by the fork's first primary, that clears the change record and the sink positions the fork inherited from its source, and inserts the reset marker, a row in the reserved `_fleetring_fork` table naming the fork identity. It runs only when the marker is absent, so it happens exactly once in the database's surviving history.
+- **Cancelling** a fork is dropping it before it is ready; there is no cancel command.
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet (`ForkDatabase`, `Feature::Fork`, `Metadata::forked_from` when built). **CLI:** none yet (`db fork`).
-- **Not:** branch, clone (fine for the file-system mechanism), copy, snapshot.
+- **Code:** none yet (*planned:* `ForkDatabase`, `CompleteFork`, `RetryForkSeed`, `FailFork`, `MarkForkReady`, `Fork`, `ForkState`, `ForkFailure`, `Feature::Fork`, `FrameSourceEngine::fork_reset`, `Metadata::forked_from`). **CLI:** none yet (*planned:* `db fork <source> <target>`, the fork lines of `db show`, the `FORK` column of `db list`, and `fork` and `forked_from` in their JSON; MCP `db_fork`).
+- **Not:** branch, clone (kept for the file-system mechanism, which is deferred), copy (a fork is a database; a *copy* is a node's files of one), snapshot; for the states, not *unseeded*, *pending*, *done*, or *live* (a member's [liveness](#liveness)).
 
 ### Group
 
@@ -511,6 +523,14 @@ A placement label for the machine a node runs on, when several nodes share one; 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** none yet. **CLI:** none yet.
 - **Not:** user store, directory (a [directory](#directory) maps prefixes to cells), IAM.
+
+### Incarnation
+
+*Planned* (ADR-0046). One life of a database name: `(name, incarnation)` identifies one database for the fleet's whole life. Control state assigns each new database, a [fork](#fork) included, the next value of a counter that never decreases, so a name dropped and created again always has a different incarnation, even where its [lease epochs](#epoch) start again. A database created before the `fork` [fleet feature](#fleet-feature) was enabled has incarnation 0. A fork records its source's incarnation, so it never copies a database created again under the source's name.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet (*planned:* `Incarnation`, `Database::incarnation`, `State::next_incarnation`, protocol `Placement.incarnation`). **CLI:** none yet (*planned:* `incarnation` in `db show`, `db locate` and `db fork`; `<name> (incarnation N)`).
+- **Not:** generation (SQLite's, below the adapter), epoch (a lease epoch counts leases within one incarnation), version (metadata's), instance, ID.
 
 ### Issuer
 
@@ -610,7 +630,7 @@ A node as the fleet's membership records it: its ID, placement attributes, addre
 
 ### Metadata
 
-Database metadata: a database's [description](#description), [labels](#label), [creator](#creator), creation time, and [expiry](#expiry), kept in control state with a version that grows with every update (ADR-0041). Updates are patches applied in log order; `--if-version` makes one conditional. A creation or update with metadata is a [fleet feature](#fleet-feature), `metadata`.
+Database metadata: a database's [description](#description), [labels](#label), [creator](#creator), creation time, and [expiry](#expiry), kept in control state with a version that grows with every update (ADR-0041). Updates are patches applied in log order; `--if-version` makes one conditional. A creation or update with metadata is a [fleet feature](#fleet-feature), `metadata`. *Planned* (ADR-0046): `forked_from`, a [fork](#fork)'s provenance, set only by the fork command and granting nothing.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetring_control::Metadata`, `MetadataSpec`, `MetadataChange`, `Feature::Metadata`; protocol `DatabaseMetadata`, `CreateDatabaseWithMetadata`, `UpdateDatabase`. **CLI:** `db show`, `db edit`; `metadata` in `db show --json`.
@@ -632,6 +652,14 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 - **Code:** `fleetringd::NodeRole`, `role` in config. **CLI:** `--role data|control|both`.
 - **Not:** role alone (say whose), mode, type, kind, function.
 
+### Operation ID
+
+*Planned* (ADR-0046). The identifier of one *operation*: one fork request, from its first call until it is `ready`, `failed`, or `cancelled`, across every retry. It is 16 random bytes the client chooses, printed as 26 lowercase base32 characters, and the CLI prints it before it calls. Resending the same request under the same ID, from the same principal, returns the operation's status and never starts a second fork; the same ID with another request is refused. Control state keeps the operation's record, and with it the ID, while the fork is pending and for 7 days after its outcome; after that the ID is unknown.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** none yet (*planned:* `OperationId`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation`). **CLI:** none yet (*planned:* `--operation-id` on `db fork`; `operation_id` in JSON; MCP `operation_id`).
+- **Not:** [request ID](#request-id) (one call, for tracing), job ID, task ID, idempotency key, transaction ID.
+
 ### Organization
 
 *Planned* (ADR-0044). A namespace of principals and databases in a fleet that serves several: its databases are under `<org>/`, its principals are named `<org>_<name>` (never with `.`, which is reserved for lineage), and its administrators edit its groups and access roles. A fleet that serves one organization needs none. `org-` in a database name is the organization-wide tier.
@@ -642,7 +670,7 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 
 ### Orphan
 
-A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused.
+A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused. *Planned* (ADR-0046): a [staged copy](#staged-copy) whose fork the node can't see is kept as an orphan too.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Replication::orphan`, `data::Orphan`, protocol `OrphanStatus` and `Database.RemoveOrphan`. **CLI:** `fleetring orphan list`, `fleetring orphan remove <database> --node <id>`.
@@ -814,7 +842,7 @@ The identifier of one request, kept from `x-request-id` or made as `<node-id>-<c
 
 - **Applies to:** daemon.
 - **Code:** `observe::RequestId`, `x-request-id`. **CLI:** none.
-- **Not:** trace ID (until traces are exported), correlation ID.
+- **Not:** trace ID (until traces are exported), correlation ID, [operation ID](#operation-id) (one fork request across many calls).
 
 ### Restore
 
@@ -937,6 +965,14 @@ The placement spec: the normative description of placement that every implementa
 - **Applies to:** crate.
 - **Code:** `RingSpec`, `CellsSpec`, `NodeSpec`. **CLI:** none.
 - **Not:** schema, config, manifest.
+
+### Staged copy
+
+*Planned* (ADR-0046). A [fork](#fork)'s database snapshot as one of its replicas holds it before the fork is ready: written to a temporary file under `<data_dir>/staged/`, in a directory named by the fork identity and the attempt, checked against its checksum and chain hash, fsynced and renamed into place, with a sidecar naming the fork identity, the attempt, the position, the chain hash, and the source's [incarnation](#incarnation). A node reports it only once it is in place. It is never served, and becomes a database's files only when a holder takes the fork's first lease. A node deletes one only on a positive signal, and keeps one whose fork it can't see as an [orphan](#orphan).
+
+- **Applies to:** daemon, CLI.
+- **Code:** none yet (*planned:* the `staged` report in heartbeats, `SnapshotRequest.staged`). **CLI:** none yet (*planned:* `holders` in `db show`).
+- **Not:** partial copy (a staged copy is whole, or not reported), temporary copy, snapshot (alone), fork (the fork is the database).
 
 ### Statement deadline
 
