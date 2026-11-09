@@ -51,7 +51,7 @@ What the code has today (checked against `main` on 2026-11-08):
 
 ### 1. A database has an incarnation
 
-1. **`Database::incarnation: Incarnation(u64)`** names one life of a database name. It is **64 random bits**, never 0, drawn by the control node that proposes the command from its injected generator (ADR-0020), and carried in the command, as time is. `apply` stays pure: it stores what the command carries, and refuses 0 where it would store it.
+1. **`Database::incarnation: Incarnation(u64)`** names one life of a database name. It is **64 random bits**, never 0, drawn by the control node that proposes the command from its injected generator (ADR-0020), and carried in the command, as time is. `apply` stays pure: it stores what the command carries, and refuses 0 where it would store it. It also refuses an incarnation that a database in control state, or an operation record still retained, already uses (`Rejection::IncarnationUnavailable`); the proposer then draws again and resubmits. That check guards against a collision; nothing else relies on it.
    - The commands that bring a database name into existence carry one: `CreateDatabase` (which a restore also issues, before `Database.Restore` fills the copy) and `ForkDatabase`.
    - **No rule rests on a counter, or on a value never repeating.** Fencing compares the whole fork identity (point 2), whose operation ID is another 128 random bits; two lives of one name share an incarnation with probability 2⁻⁶⁴. A replaced, recreated, or rolled-back `control.db` therefore can't hand out a value it handed out before in any way a rule depends on.
 2. **Absent means 0, the legacy incarnation.**
@@ -68,21 +68,25 @@ A database gains an optional `fork: Option<Fork>`. **A database without the fiel
 
 ```text
 Fork {
-  operation:          OperationId,     // 128 bits, chosen by the client (point 5)
+  operation:          OperationId,           // 128 bits, chosen by the client (point 5)
   source:             DatabaseName,
-  source_incarnation: Incarnation,     // resolved at first apply
-  requested_by:       PrincipalName,   // grants nothing, like created_by
+  source_incarnation: Incarnation,           // resolved at first apply
+  requested_by:       Option<PrincipalName>, // grants nothing, like created_by
   requested_at:       Timestamp,
-  intent:             ForkIntent,      // the caller's request, as given (point 5.2)
+  source_bytes:       u64,                   // the source's reported size at the request, or 0
+  limits:             ForkLimits,            // the limits the fork was made under (point 3.1)
   state:              ForkState,
 }
 // The fork's own incarnation is Database::incarnation. Every message about this fork carries
-// the triple (name, incarnation, operation): its *fork identity*.
+// the triple (name, incarnation, operation): its *fork identity*. The caller's whole request,
+// ForkIntent, lives in the operation record (point 5.3), not here.
+
+ForkLimits { max_attempts, deadline, attempt_timeout, seeder_timeout, operation_retention }
 
 ForkState =
   | Seeding { attempt: u32, seeder: NodeId,
               seeder_excluded: BTreeSet<NodeId>, disk_refused: BTreeSet<NodeId>,
-              attempt_started_at, deadline }
+              attempt_started_at, deadline, last_cause: Option<RetryCause> }
   | Seeded  { attempt, at: Position, chain_hash: ChainHash, holders: BTreeSet<NodeId>,
               lease_from: LeaseEpoch, completed_at }
   | Ready   { at, chain_hash, completed_at, reset_epoch: LeaseEpoch, reset_position: Position, ready_at }
@@ -93,8 +97,8 @@ ForkState =
 - **`Ready` means "the fork-reset write is committed".** It mirrors the in-database marker of point 6, for status and for clients deciding when to call. The database's own marker is authoritative: the control state never decides whether the reset runs. From `Ready` on, the fork is an ordinary database, and its replica set follows placement.
 - **`Seeded` and `Ready` keep the provenance** that `forked_from` shows: the source, its incarnation, the position, the chain hash, and the time. It stays for the database's life, and ADR-0041's metadata archive carries it (point 10).
 - **`Failed` is permanent until `db drop`.** A failed fork is never served and never leased, and it holds no copy anyone may open.
-- **`ForkFailure`** is `#[non_exhaustive]`: `SourceGone`, `SourceRecreated`, `RetriesExhausted { last: RetryCause }`, `DeadlineExceeded { last: RetryCause }`, `SourceTooLarge`, `InsufficientDisk`, `EngineUnsupported`. `RetryCause` keeps the real cause of the last retry: `SeederDown`, `AttemptTimedOut`, `TransferFailed`, `PinExpired`, `HolderLost`, or `HoldersLeft`. A fork never fails as `InsufficientDisk` because its seeders timed out.
-- **Terminal outcomes are exactly `Ready`, `Failed`, and `Cancelled`.** `Seeding` and `Seeded` are pending.
+- **`ForkFailure`** is `#[non_exhaustive]`: `SourceGone`, `SourceRecreated`, `RetriesExhausted { last: RetryCause }`, `DeadlineExceeded { last: RetryCause }`, `SourceTooLarge`, `InsufficientDisk`, `EngineUnsupported`. `RetryCause` keeps the real cause of the last retry: `SeederDown`, `AttemptTimedOut`, `TransferFailed`, `PinExpired`, `HolderLost`, `HoldersLeft`, or `SeederDiskRefused`. `Seeding::last_cause` holds it between attempts, so a failure at the deadline keeps it too (`AttemptTimedOut` if the first attempt was still running). A fork never fails as `InsufficientDisk` because its seeders timed out.
+- **Terminal outcomes are exactly `Ready`, `Failed`, and `Cancelled { cause }`,** where `cause` is `Dropped` or `Expired`. `Seeding` and `Seeded` are pending.
 
 ### 3. States and transitions
 
@@ -133,8 +137,12 @@ Under `quorum` and `all` they are W and its floor, as for any write. Under `loca
 
 **Fencing.** Every fork command after creation carries the fork identity `(name, target_incarnation, operation)`. `apply` checks it before anything else, and refuses a command whose identity doesn't equal the current database's with `Rejection::StaleForkIdentity`. A command meant for a dropped fork therefore can't touch its replacement, even with the same name and attempt number: it is refused and changes nothing.
 
-1. **`ForkDatabase { operation, incarnation, name, source, intent, resolved_expiry, requested_by }`.**
-   - `incarnation` is drawn by the proposer (point 1.1); `intent` is the caller's request as given (point 5.2); `resolved_expiry` is the absolute expiry the control service resolved from a relative one, as ADR-0041 resolves `--expires-in`.
+1. **`ForkDatabase { operation, intent, incarnation, resolved_expiry, limits }`.**
+   - `intent` is the caller's request as given, the target and source names and the requester included (point 5.2).
+   - `incarnation` is drawn by the proposer (point 1.1).
+   - `resolved_expiry` is optional: the absolute expiry the control service resolved from a relative one, as ADR-0041 resolves `--expires-in`. When it is absent, `apply` resolves a relative expiry as the command's own time plus the span. Either way it is resolved once, at first apply.
+   - `limits` is the proposing node's `[fork]` configuration (point 7): `max_attempts`, `deadline`, `attempt_timeout`, `seeder_timeout`, and `operation_retention`. The fork records them, so the driver and `apply` use the fork's own limits, and a replay applies the same ones whatever the configuration is by then.
+   - It refuses a target replica set smaller than the completion quorum with `Rejection::TooFewReplicas { needed, available }`: a fleet too small for the fork is not a disk problem.
    - It resolves `source` to its current incarnation, and refuses if:
      - the source doesn't exist;
      - the source isn't ready (a source that is itself a fork must be `Ready`);
@@ -156,42 +164,50 @@ Under `quorum` and `all` they are W and its floor, as for any write. Under `loca
 3. **`RetryForkSeed { identity, attempt, cause, exclude_seeder: Option<NodeId> }`.** Accepted only with a matching identity at the current attempt, while `Seeding`.
    - If `attempt < max_attempts` and `now < deadline`, the state becomes `Seeding { attempt + 1, seeder: next }`, with `exclude_seeder` added to `seeder_excluded`.
    - **`seeder_excluded` is a preference, not a ban.** `next` is the first live member of the replica set, in preference order, that is in neither set; when every live member that isn't disk-refused has been excluded as a seeder, `next` is the first of those in preference order again, and the budget and the deadline bound the loop.
+   - **Who is passed over.** A seeder that was down for `seeder_timeout` or left, or that reported a retryable `TransferFailed` or `PinExpired` for the attempt, goes into `seeder_excluded`, so one node's persistent trouble doesn't spend every attempt. An attempt that only timed out excludes nobody.
+   - The driver proposes the retry only when a next seeder is live, or when the budget is spent and the retry will fail the fork.
    - Otherwise the state becomes `Failed { RetriesExhausted { last: cause } }` or `Failed { DeadlineExceeded { last: cause } }`.
 4. **`RecordForkDiskRefusal { identity, attempt, node }`.** A disk-admission refusal (point 7.2), and nothing else, adds `node` to `disk_refused`. A disk-refused node is never seeder or holder for this fork.
-   - If it was the seeder, the same command moves to the next attempt, as `RetryForkSeed` does, within the budget.
    - If the members of the replica set that aren't disk-refused are fewer than C, the state becomes `Failed { InsufficientDisk }`. Seeder exclusions never count here.
+   - If it was the seeder and another replica can seed, the same command moves to the next attempt with `RetryCause::SeederDiskRefused`, as `RetryForkSeed` does, within the budget.
+   - If it was the seeder and no other replica can seed now, the refusal is recorded and the attempt keeps running, bounded by `attempt_timeout` and the deadline; the driver starts the next attempt, with that cause, once a seeder is live.
+   - A refusal from a node that isn't the seeder is recorded whatever the attempt, since it is about the node.
 5. **`FailFork { identity, attempt, reason }`.** For permanent reasons: the source gone or recreated, an engine that can't fork, or `SourceTooLarge`. Accepted only while `Seeding`, with a matching identity.
 6. **`DropForkHolder { identity, attempt, holder, cause }`.** Accepted only while `Seeded` at `attempt`, with a matching identity, and only for:
    - **a holder whose latest report says its staged copy is lost** (`copy_lost`, point 4.5), and only while no lease has been issued for this `Seeded` (the database's epoch still equals `lease_from`). After a lease, a holder that lost its copy is re-seeded from the fork's primary as any follower is;
    - **a holder that is no longer a fleet member** (it left or was removed), at any time while `Seeded`. A holder that is merely down stays.
 
-   The holder leaves `holders`. If fewer than C holders remain, the fork goes back to `Seeding { attempt + 1 }` within the budget, with a fresh `deadline` (time spent seeded isn't spent seeding), the lease and any promotion cleared, and the epoch kept, so the next first lease is at a higher epoch and fences any primary of the earlier attempt. No client was served before `Ready`, so starting again from the source loses nothing. Past the budget, the fork fails with `RetriesExhausted { last: HolderLost or HoldersLeft }`.
+   The holder leaves `holders`. If fewer than C holders remain, the fork goes back to `Seeding { attempt + 1 }` within the budget:
+   - with a fresh `deadline`, since time spent seeded isn't spent seeding;
+   - with `disk_refused` and `seeder_excluded` cleared, since disk may have been freed and seeders may have recovered meanwhile;
+   - with its replica set following placement again;
+   - with the lease and any promotion cleared, and the epoch kept, so the next first lease is at a higher epoch and fences any primary of the earlier attempt.
+
+   No client was served before `Ready`, so starting again from the source loses nothing. Past the budget, the fork fails with `RetriesExhausted { last: HolderLost or HoldersLeft }`.
 7. **`MarkForkReady { identity, epoch, reset_position }`.** Accepted only when all of these hold:
    - the identity matches;
    - the state is `Seeded`;
-   - `epoch` is a lease epoch the database has issued;
-   - the reporting primary's report shows the reset marker for this identity committed at `reset_position` under the bootstrap quorum W_boot.
+   - `lease_from < epoch <= ` the database's epoch, and the database holds a lease now. A reset written under a lease issued before this completion, in an earlier attempt, never counts after a reseed, and a ready fork always has a lease;
+   - at least W_boot members of the fork's replica set (its holders) report `reset { identity, epoch, position: reset_position, committed }` (point 4.5).
 
    The state becomes `Ready`. A second `MarkForkReady` for a ready fork is refused and changes nothing.
-8. **`DropDatabase` and `ExpireDatabase`** on a fork in any state remove it as any drop does (ADR-0042). On a fork that is `Seeding` or `Seeded`, the operation's outcome becomes `Cancelled`; a `Failed` or `Ready` outcome stays as it was. This is the cancellation path; there is no separate cancel command.
+8. **`DropDatabase` and `ExpireDatabase`** on a fork in any state remove it as any drop does (ADR-0042). On a fork that is `Seeding` or `Seeded`, the operation's outcome becomes `Cancelled { Dropped }` or `Cancelled { Expired }`; a `Failed` or `Ready` outcome stays as it was. This is the cancellation path; there is no separate cancel command.
 9. **Other commands before `Ready`.**
    - `AcquireLease`:
-     - is refused while `Seeding` or `Failed`;
-     - while `Seeded`, is accepted only from a recorded holder;
-     - for the first lease of this `Seeded` (epoch equals `lease_from`), is accepted only when the requester's latest report still shows the staged copy `{identity, attempt, at, chain_hash}` with log epoch 0 that `Seeded` recorded (`Rejection::StagedCopyNotReported` otherwise);
-     - otherwise follows ADR-0018 and ADR-0022 among the holders, including after a lease that ended before readiness.
+     - is refused while `Seeding` or `Failed` (`Rejection::LeaseOnUnseededFork`);
+     - while `Seeded`, is always the fork's first lease since completion: completion records the epoch, a lease once issued changes hands only by promotion (ADR-0022), and seeding again clears it. It is accepted only from a member of the replica set, which is the recorded holders, whose latest report still shows the staged copy `{identity, attempt, at, chain_hash}` with log epoch 0 that `Seeded` recorded. Anything else is `Rejection::StagedCopyNotReported`; there is no separate "not a holder" refusal.
 
-     The new primary then follows point 6 to decide whether the reset still has to run.
+     After the first lease, promotions among the holders follow ADR-0018 and ADR-0022, including after a lease that ended before readiness, and the new primary follows point 6 to decide whether the reset still has to run.
    - `UpdateDatabase` (description, labels, expiry) is allowed, since it touches control state only. An expiry that passes before `Ready` cancels the fork (point 3.8).
    - `ChangeDurability` is refused until `Ready` (`Rejection::ForkNotReady`): the quorums above are fixed by the durability the fork was created with.
-10. **The replica set is frozen from completion until `Ready`.** While `Seeded`, `replicas_of` (ADR-0031, point 4) returns the recorded holders, whatever the ring says: a join, a leave, a drain, or a weight change doesn't move a fork that isn't ready, and the first lease goes only to a recorded holder. From `Ready` on, the fork's replica set follows placement as any database's does. While `Seeding`, it follows placement: reports from non-members don't count, and new members copy from the seeder. A protocol that hands a holder's place to another node before `Ready` is deferred.
+10. **The replica set is frozen from completion until `Ready`.** While `Seeded`, `replicas_of` (ADR-0031, point 4) returns the recorded holders in node-ID order, whatever the ring says, and a promotion among holders that rank equal breaks the tie by node ID: a join, a leave, a drain, or a weight change doesn't move a fork that isn't ready, and the first lease goes only to a recorded holder. From `Ready` on, the fork's replica set follows placement as any database's does. While `Seeding`, it follows placement: reports from non-members don't count, and new members copy from the seeder. A protocol that hands a holder's place to another node before `Ready` is deferred.
 11. **The fork driver** runs on the control node (the Raft leader under ADR-0035). It is a pure function, `fork_actions(&State, now, rng) -> Vec<Action>`, so a control restart loses nothing: the next leader recomputes the same proposals, and draws only what a new command carries. It proposes:
     - `CompleteFork` as soon as reports satisfy point 3.2;
     - `RetryForkSeed` when the seeder has been down for `seeder_timeout`, when the attempt has run for `attempt_timeout`, or when the seeder reports a retryable failure for the current identity and attempt, with that cause;
     - `RecordForkDiskRefusal` when a node reports `seed_failure { InsufficientDisk }` for the current identity;
     - `FailFork` when the source is gone or recreated, or when a report gives a permanent reason;
     - `DropForkHolder` for a holder that reports `copy_lost`, or that is no longer a member;
-    - `MarkForkReady` when the primary's report shows the reset marker committed;
+    - `MarkForkReady` when W_boot members of the replica set report the reset committed at one epoch and position, under a lease issued since completion (point 3.7);
     - the deadline's `Failed`, through `Tick`.
 
     Every proposal is checked again by `apply`, so a stale or duplicated one is refused and changes nothing.
@@ -231,10 +247,10 @@ Under `quorum` and `all` they are W and its floor, as for any write. Under `loca
 
    Otherwise it answers `UNAVAILABLE` with a retry-after, or `PERMISSION_DENIED` on an identity mismatch. Peers stage exactly as in point 4.3, with the seeder's sidecar values.
 5. **Reports.** `DatabaseStatus` in `HeartbeatRequest` gains optional fields, which `Report` stores and which decode as absent when missing:
-   - `staged { fork_incarnation, operation, attempt, position, chain_hash, source_incarnation }`, always at log epoch 0: promotion ranks a staged copy at `(0, at)`;
+   - `staged { fork_incarnation, operation, attempt, position, chain_hash, source_incarnation }`, always at log epoch 0: promotion ranks a staged copy at `(0, at)`. A follower that installed its copy from a staged copy (point 6.2) keeps reporting `staged` until its log holds a frame of the fork's own epoch, so it stays a candidate meanwhile;
    - `copy_lost { fork_incarnation, operation, attempt, reason }`, when a holder finds its staged copy missing or damaged (point 6.2);
    - `seed_failure { fork_incarnation, operation, attempt, reason, retryable }`;
-   - `reset { fork_incarnation, operation, epoch, position, committed }`;
+   - `reset { fork_incarnation, operation, epoch, position, committed }`. On the primary, `committed` means its commit index at W_boot covers the marker; on a follower, that the marker is in its durable log. `MarkForkReady` counts these reports across the replica set (point 3.7);
    - `seed_progress { fork_incarnation, operation, attempt, bytes, total_bytes }`, while a node streams a copy, for status only: neither `apply` nor the driver reads it.
 
    The control plane compares every field with the current fork identity, and ignores a report for another identity.
@@ -261,7 +277,7 @@ Under `quorum` and `all` they are W and its floor, as for any write. Under `loca
    - A new ID for a target name that exists is refused (`DatabaseExists`).
 3. **Status persists in control state.** `State::fork_operations: BTreeMap<OperationId, OperationRecord { target, target_incarnation, source, source_incarnation, intent, requested_by, outcome, updated_at, finished_at }>`.
    - `outcome` is pending, `Pending { attempt }` or `Seeded`, or terminal, `Ready { at, chain_hash }`, `Failed { reason }`, or `Cancelled`.
-   - `finished_at` is set at the terminal outcome, and retention counts from it. `Tick` prunes records past `operation_retention`. Pending records are never pruned. Records are capped at `max_operations` (10,000); a new fork past the cap is refused with `RESOURCE_EXHAUSTED`.
+   - `finished_at` is set at the terminal outcome, and retention counts from it. `Tick` prunes records past the `operation_retention` of the fork's own limits, and a record past it counts as unknown even before a `Tick` prunes it. Pending records are never pruned. Records are capped at `max_operations` (10,000); a new fork past the cap is refused with `RESOURCE_EXHAUSTED`.
 4. **`Control.GetForkOperation(operation_id)`** returns the record to the requesting principal, or to a principal with `admin` on the target **while the target's name holds the record's target incarnation**. After a drop and a recreate, `admin` on the new database doesn't reveal the old operation; its requester still sees it. `db show <target>` shows the current fork's record.
 5. **Cancellation is `db drop`** on a fork that isn't ready, which needs `admin` on the target, or an expiry that passes before `Ready` (point 3.8). The source's pin is released when its stream ends: the seeding binding refuses the dropped identity, and the pin is bounded by `max_pin_ms`.
 
@@ -278,10 +294,10 @@ The fork inherits the source's logical change record (`_fleetring_cdc`, ADR-0024
      - **Locality.** The primary decides from its own copy, with no round trip.
 2. **Opening.** Whichever holder becomes the primary of a fork that isn't `Ready` in its view, by the first lease or by a promotion:
    - **opens only a verified copy and never creates files.** Before it asks for the first lease, it re-reads its sidecar and checks the staged file's size, position, and checksum against `Seeded { attempt, at, chain_hash }`. If the check fails, it reports `copy_lost` and never asks. A promoted holder opens the copy it followed, or, if it never followed one, its verified staged copy. If a check fails after it holds the lease, it serves nothing, reports `copy_lost`, and stops renewing, so the lease expires and another holder takes over. `Database.Create` and `Database.Restore` refuse, with `FAILED_PRECONDITION`, a database whose placement carries a fork that isn't ready, so no path makes an empty database in its place;
-   - **offers only the matching staged copy for promotion.** A staged copy ranks at log epoch 0, position `at`, and only one whose `(identity, attempt, at, chain_hash)` equals `Seeded`'s is offered or opened;
+   - **offers only the matching staged copy for promotion.** A staged copy ranks at log epoch 0, position `at`, and only one whose `(identity, attempt, at, chain_hash)` equals `Seeded`'s is offered or opened. While the fork is `Seeded`, a report without a staged copy is a promotion candidate only if its log epoch is above `lease_from` and no higher than the database's epoch: a copy opened in an earlier attempt, or an undeleted copy of an earlier database of the name, never outranks the staged copies;
    - checks for the marker for the current fork identity;
    - if it is absent, runs `fork_reset` and waits for it to commit at W_boot;
-   - then reports `reset { committed: true, epoch, position }`.
+   - then reports `reset { committed: true, epoch, position }`, as each follower does once the marker is in its durable log; `MarkForkReady` needs W_boot such reports (point 3.7).
 
    **Other holders become followers from their staged copies.** On the first stream at epoch *e*, a holder whose matching staged copy is at `at` installs it as its copy, with `epoch_start = at` and log epoch 0, and follows from there, instead of taking a full database snapshot. A replica that isn't a holder, which exists only from `Ready` on, takes a database snapshot as today.
 
@@ -306,7 +322,7 @@ The fork inherits the source's logical change record (`_fleetring_cdc`, ADR-0024
 
 ### 7. Limits, budgets, and admission
 
-Every default marked *provisional* is a starting point. FR-087 measures it, and this record is amended with the measured numbers, and the reasoning, before it is accepted.
+Every default marked *provisional* is a starting point. FR-087 measures it, and this record is amended with the measured numbers, and the reasoning, before it is accepted. The control rows `max_attempts`, `deadline`, `attempt_timeout`, `seeder_timeout`, and `operation_retention` travel in `ForkDatabase` as `ForkLimits` and are recorded with the fork (point 3.1): changing the configuration affects new forks only.
 
 | Setting | Where | Default | What happens at the limit |
 |---|---|---|---|
@@ -331,7 +347,10 @@ Every default marked *provisional* is a starting point. FR-087 measures it, and 
    - The control plane's best-effort check (point 7.3) also subtracts each node's pending seeds, using the source sizes of forks it is a replica of that are still `Seeding`.
 2. **Disk refusals and seeder exclusions are different things.** A node that refuses on disk reports `seed_failure { InsufficientDisk, retryable: false }` for the identity, and the driver proposes `RecordForkDiskRefusal` (point 3.4): the node is never seeder or holder for this fork. A seeder that times out or fails is only excluded from seeder selection (point 3.3), and may still hold a copy that a later seeder serves it. The fork fails with `InsufficientDisk` only when the members that aren't disk-refused are fewer than C.
    - While `Seeding`, placement fixes the replica set, so "choosing replicas that admit" means choosing the seeder and the holders among them. It never means placing the fork elsewhere.
-3. **Control-plane admission, best effort.** Heartbeats gain an optional `disk_free_bytes` per node and `size_bytes` per replica. `ForkDatabase` is refused early (`RESOURCE_EXHAUSTED`) when fewer than C members of the target's replica set pass the formula after reservations. The data node's own check is authoritative.
+3. **Control-plane admission, best effort.** Heartbeats gain an optional `disk_free_bytes` per node and `size_bytes` per replica. `ForkDatabase` is refused early (`Rejection::InsufficientDisk`, `RESOURCE_EXHAUSTED`) when fewer than C members of the target's replica set pass the check after reservations. The data node's own check is authoritative.
+   - **The control plane checks only the floor:** free bytes, less pending seeds, at least `total_bytes` × 1.1 + 1 GiB. Heartbeats carry free bytes but not the volume's size, so the 5% term is the data node's to check.
+   - **Unknown means admitted.** A member that hasn't reported its free bytes counts as having room, and so does every member when the source's size is unknown. Sizes are reported only once `fork` is enabled, so the first fork of a fleet passes this check unconditionally.
+   - **Too few replicas isn't a disk refusal:** a replica set smaller than C is refused with `TooFewReplicas` before this check (point 3.1).
 4. **The source's exposure.** Each attempt holds at most one pin on the source, for at most `max_pin_ms` and `max_pin_wal_bytes`, and the pins of all forks of one source are bounded by `max_pin_ms_per_hour`. A principal with `fork` on a busy source can therefore delay its checkpoints by at most that much an hour, which the docs state.
 
 ### 8. The `fork` fleet feature
@@ -391,6 +410,8 @@ Every default marked *provisional* is a starting point. FR-087 measures it, and 
 | Seeding, after the seeder staged | The seeder crashes, then restarts | none | peers get `UNAVAILABLE` and retry; the seeder reports its staged copy from disk | continues |
 | Seeding, after the seeder staged | The seeder is lost permanently | C matching reports exist already, or C members that aren't disk-refused remain for a new attempt | `CompleteFork` if C matching reports exist (a dead node's durable copy counts toward C, as an acknowledged write does; it must report it again before it may take the first lease); otherwise `RetryForkSeed` | completion, or the next attempt |
 | Seeding | A peer refuses on disk | at least C members remain that aren't disk-refused | `RecordForkDiskRefusal`; the others continue | completion, or `Failed { InsufficientDisk }` if fewer than C can admit |
+| Seeding | **The seeder refuses on disk, and no other replica can seed now** (the others are down or passed over) | a member that isn't disk-refused comes back live before the attempt timeout or the deadline | the refusal is recorded and the attempt keeps running; once a seeder is live, the driver starts the next attempt with `SeederDiskRefused` | the next attempt, or `Failed { DeadlineExceeded { SeederDiskRefused } }`, or `RetriesExhausted`; `InsufficientDisk` only if fewer than C can admit |
+| creation | The fleet has fewer members than the completion quorum | none | `ForkDatabase` is refused with `TooFewReplicas { needed, available }` | nothing is created |
 | Seeding | Membership changes the replica set | eventually C members of the new set reachable | reports from non-members don't count; new members copy from the seeder | continues, or retries |
 | Seeding | The source is dropped or recreated | none | the binding refuses the new incarnation; the primary's open-copy check refuses a mismatch; the driver sees the change and proposes `FailFork` | `Failed { SourceGone }` or `Failed { SourceRecreated }` |
 | Seeding or Seeded | The user drops the fork, or its expiry passes | none | gone; `Cancelled`; old messages are fenced as above | cancelled |
@@ -407,6 +428,7 @@ Every default marked *provisional* is a starting point. FR-087 measures it, and 
 | Seeded, leased, opening, `acks = local` | **The reset under `local`** | W_boot = ⌊R/2⌋ + 1 reachable | the reset counts as committed, and `MarkForkReady` is accepted, only at a majority; a promotion fencing a majority sees it | ready, reset exactly once |
 | Seeded, leased, opening | The primary's staged copy fails its check after it took the lease | another holder | it serves nothing, reports `copy_lost`, and lets the lease expire; another holder is promoted | continues |
 | Seeded, leased, opening | The write quorum is unreachable | — | the reset can't commit; clients keep getting `UNAVAILABLE` | ready when W_boot returns |
+| Seeded, after a reseed | **Replicas report again a committed reset from an earlier attempt** (a delayed heartbeat, or a node whose old copy held the marker) | none | `MarkForkReady` counts only resets at an epoch above this completion's `lease_from` and at most the database's epoch, under a current lease; the old reports don't count, and an old copy isn't a promotion candidate (point 6.2) | the new attempt's reset decides; ready only from it |
 | Ready | anything | ADR-0018 and ADR-0022 | an ordinary database | as any database |
 
 **Invariants** (asserted in the simulation, FR-087):

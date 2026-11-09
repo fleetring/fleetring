@@ -425,7 +425,7 @@ elapsed: 12.3 s
 
 then the placement, as `db locate` prints it. With `--detach`, `state: seeding`, and the position and chain hash read `not yet`. An incarnation prints as 16 lowercase hex digits; a database created before forks were enabled has `0000000000000000`.
 
-**JSON result:** `operation_id`; `database`; `incarnation`, a string of 16 hex digits; `state` (`seeding`, `seeded`, `ready`, or `failed`, and `cancelled` when `--operation-id` names an operation whose fork was dropped or expired before it was ready); `source`; `source_incarnation`; `position` and `chain_hash`, `null` until the fork is seeded; `failure`, `null` or an object with `reason`, `last_cause` (for `retries_exhausted` and `deadline_exceeded`: `seeder_down`, `attempt_timed_out`, `transfer_failed`, `pin_expired`, `holder_lost`, or `holders_left`, else `null`) and `attempts`; `elapsed_ms`; and `placement`, as `db locate` prints it, or `null` once the fork is gone. A `reason` is one of `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`, `source_too_large`, `insufficient_disk` and `engine_unsupported`; the list is open (`ForkFailure` is non-exhaustive), so a later release may add one, and a script treats an unknown reason as a failure.
+**JSON result:** `operation_id`; `database`; `incarnation`, a string of 16 hex digits; `state` (`seeding`, `seeded`, `ready`, or `failed`, and `cancelled` when `--operation-id` names an operation whose fork was dropped or expired before it was ready); `source`; `source_incarnation`; `position` and `chain_hash`, `null` until the fork is seeded; `failure`, `null` or an object with `reason`, `last_cause` (for `retries_exhausted` and `deadline_exceeded`: `seeder_down`, `attempt_timed_out`, `transfer_failed`, `pin_expired`, `holder_lost`, `holders_left`, or `seeder_disk_refused`, else `null`) and `attempts`; `elapsed_ms`; and `placement`, as `db locate` prints it, or `null` once the fork is gone. A `reason` is one of `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`, `source_too_large`, `insufficient_disk` and `engine_unsupported`; the list is open (`ForkFailure` is non-exhaustive), so a later release may add one, and a script treats an unknown reason as a failure.
 
 **Refusals and their hints:**
 
@@ -436,6 +436,7 @@ then the placement, as `db locate` prints it. With `--detach`, `state: seeding`,
 | the target exists | `fleetring db show <target>`, or another name |
 | the source doesn't exist, or isn't ready (a fork still opening) | `fleetring db show <source>` |
 | the fleet can't use `fork` yet (`FeatureUnsupported`) | names the member and its release, and says to upgrade it |
+| the fleet has fewer members than the fork's completion quorum (`TooFewReplicas`) | names how many replicas it needs and how many there are |
 | not enough disk on the target's replicas (`RESOURCE_EXHAUSTED`) | names the node and its free bytes |
 | the source's engine can't fork (`FAILED_PRECONDITION`) | none |
 | the control plane predates forks (`UNIMPLEMENTED`, or a call it doesn't serve) | the control plane runs a release without forks; upgrade it first |
