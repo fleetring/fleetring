@@ -24,7 +24,9 @@
 //! User statements are confined to the database they name. One that attaches or detaches a
 //! database, loads an extension, or runs a pragma other than read-only introspection is refused
 //! as a statement error, so it can't reach another database's files or change how this one is
-//! journaled and checkpointed. The connections also run in SQLite's defensive mode.
+//! journaled and checkpointed, nor create a temporary table, index, trigger, or view: temporary
+//! objects live on one connection, which every SQL session and `Execute` share, and outside the
+//! replicated log. The connections also run in SQLite's defensive mode.
 //!
 //! A user statement, and a schema read, stop once their call's [`Interrupt`] is raised (FR-078):
 //! while one runs, SQLite's progress handler checks the interrupt every
@@ -909,6 +911,8 @@ enum Refusal {
     Pragma(String),
     /// It asks for an action the adapter doesn't recognize, by SQLite's action code.
     Unrecognized(i32),
+    /// It creates a temporary table, index, trigger, or view.
+    Temporary,
 }
 
 impl fmt::Display for Refusal {
@@ -929,6 +933,11 @@ impl fmt::Display for Refusal {
             Self::Unrecognized(code) => {
                 write!(f, "statements can't perform SQLite action {code}")
             }
+            Self::Temporary => f.write_str(
+                "statements can't create temporary tables, indexes, triggers, or views: they \
+                 would live on a connection the database's every caller shares, and outside its \
+                 replicated log",
+            ),
         }
     }
 }
@@ -1019,6 +1028,13 @@ fn refusal(action: &AuthAction<'_>) -> Option<Refusal> {
             Some(Refusal::Pragma(pragma_name.to_ascii_lowercase()))
         }
         _ if names_reserved(action) => Some(Refusal::Reserved),
+        // A temporary object lives on one connection, which every session and `Execute` share:
+        // a temporary table would shadow a main one for everyone, diverting their writes off
+        // the log, unreplicated, and a session's own would be missing on the read connection.
+        AuthAction::CreateTempTable { .. }
+        | AuthAction::CreateTempIndex { .. }
+        | AuthAction::CreateTempTrigger { .. }
+        | AuthAction::CreateTempView { .. } => Some(Refusal::Temporary),
         _ => None,
     }
 }
