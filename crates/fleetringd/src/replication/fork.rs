@@ -62,6 +62,50 @@ pub const RETRY_AFTER_KEY: &str = "fleetring-retry-after-ms";
 /// volume (ADR-0046, point 7).
 const HEADROOM_FLOOR: u64 = 1 << 30;
 
+/// What every refusal of a data call against a fork that isn't ready says, whichever node and
+/// whichever path refuses it (ADR-0046, point 6.2).
+pub const FORK_NOT_READY: &str = "fork not ready";
+
+/// How long a client should wait before it retries a data call to a fork that isn't ready.
+const FORK_NOT_READY_RETRY: Duration = Duration::from_millis(500);
+
+/// `UNAVAILABLE` "fork not ready", with a retry-after, for a data call against `name`, a fork
+/// that isn't ready, `why` saying where it stands.
+pub(crate) fn fork_not_ready(name: &DatabaseName, why: &str) -> Status {
+    with_retry_after(
+        Status::unavailable(format!("{FORK_NOT_READY}: database {name} {why}; retry")),
+        FORK_NOT_READY_RETRY,
+    )
+}
+
+/// The refusal of a data call against `name` that `placement` calls for before any node serves
+/// it: `UNAVAILABLE` "fork not ready" for a fork seeding, or seeded with no primary yet, and
+/// `FAILED_PRECONDITION` for a failed fork, which no node ever serves. `None` for anything else:
+/// a database that isn't a fork, a ready fork, and a seeded fork with a primary, which decides
+/// by its own readiness gate.
+pub(crate) fn placement_refusal(
+    name: &DatabaseName,
+    placement: &fleetring_proto::v1::Placement,
+) -> Option<Status> {
+    use fleetring_proto::v1::ForkState;
+    let fork = placement.fork.as_ref()?;
+    match ForkState::try_from(fork.state) {
+        Ok(ForkState::Seeding) => Some(fork_not_ready(
+            name,
+            &format!("is a fork still being seeded from {}", fork.source),
+        )),
+        Ok(ForkState::Seeded) if placement.primary.is_none() => Some(fork_not_ready(
+            name,
+            "is a fork that is seeded and waiting for its first primary",
+        )),
+        Ok(ForkState::Failed) => Some(Status::failed_precondition(format!(
+            "database {name} is a fork that failed and is never served; `fleetring db drop \
+             {name}` removes it"
+        ))),
+        _ => None,
+    }
+}
+
 /// `status` with a retry-after of `after`.
 pub(crate) fn with_retry_after(mut status: Status, after: Duration) -> Status {
     let millis = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);

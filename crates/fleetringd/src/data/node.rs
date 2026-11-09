@@ -20,6 +20,7 @@ use crate::data::service::database_status;
 use crate::durability::{Archive, RestoreError, RestoreTarget, Restored, StoreError, restore_into};
 use crate::engine::EngineError;
 use crate::observe::DataMetrics;
+use crate::replication::fork::{fork_not_ready, placement_refusal};
 use crate::replication::{PrimaryRole, Replication, ServePrimaryError};
 use crate::{DatabaseError, Registry, SessionId};
 
@@ -264,9 +265,6 @@ impl Drop for Counted<'_> {
         });
     }
 }
-
-/// How long a client should wait before it retries a call to a fork that isn't ready.
-const FORK_NOT_READY_RETRY: Duration = Duration::from_millis(500);
 
 /// What a node answers a creation or restore of a name whose dropped database it is still
 /// flushing or deleting; a client retries it ([`DataNode::check_not_dropping`]).
@@ -717,13 +715,18 @@ impl DataNode {
             return Ok(admitted);
         }
         let placement = self.locate(name).await?;
+        // A fork that is seeding, seeded with no primary, or failed is refused alike on every
+        // node, whatever its role (ADR-0046, point 6.2).
+        if let Some(refusal) = placement_refusal(name, &placement) {
+            return Err(refusal);
+        }
         match placement.primary.as_deref() {
             Some(primary) if primary == self.inner.id.as_str() => {
                 // A primary that restarted learns its lease again here. Its database must exist.
                 self.registry()
                     .open(name)
                     .await
-                    .map_err(|error| missing_file(name, &error))?;
+                    .map_err(|error| missing_file(name, &placement, &error))?;
                 let lease = self.serve(name, &placement).await?;
                 self.admit(name, lease)
             }
@@ -745,12 +748,9 @@ impl DataNode {
     /// requests afterwards sees every request admitted before it.
     fn admit(&self, name: &DatabaseName, lease: HeldLease) -> Result<Admitted<'_>, Status> {
         if self.inner.replication.is_gated(name) {
-            return Err(crate::replication::fork::with_retry_after(
-                Status::unavailable(format!(
-                    "database {name} is a fork that isn't ready: its fork-reset write hasn't \
-                     committed yet; retry"
-                )),
-                FORK_NOT_READY_RETRY,
+            return Err(fork_not_ready(
+                name,
+                "is a fork whose fork-reset write hasn't committed yet",
             ));
         }
         let refusing = self.refusing();
@@ -1181,8 +1181,18 @@ pub(crate) fn restore_status(source: &DatabaseName, archive: &str, error: &Resto
     }
 }
 
-fn missing_file(name: &DatabaseName, error: &DatabaseError) -> Status {
-    if matches!(error.engine_error(), Some(EngineError::NotFound)) {
+/// The status for a primary here that can't open its copy of `name`: a fork's first primary
+/// that hasn't moved its staged copy into place yet isn't ready, and anything else lacking its
+/// copy needs its creation finished.
+fn missing_file(name: &DatabaseName, placement: &Placement, error: &DatabaseError) -> Status {
+    let missing = matches!(error.engine_error(), Some(EngineError::NotFound));
+    let pending = placement
+        .fork
+        .as_ref()
+        .is_some_and(|fork| fork.state != fleetring_proto::v1::ForkState::Ready as i32);
+    if missing && pending {
+        fork_not_ready(name, "is a fork whose primary hasn't opened its copy yet")
+    } else if missing {
         Status::failed_precondition(format!(
             "this node holds the lease on {name} but has no copy of it; finish creating it"
         ))

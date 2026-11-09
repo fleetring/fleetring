@@ -1828,6 +1828,11 @@ fn placement_of(placement: Option<proto::Placement>) -> Result<proto::Placement,
 
 /// The address of the database's primary.
 fn primary_address(name: &DatabaseName, placement: &proto::Placement) -> Result<String, Status> {
+    // A fork that is seeding, seeded with no primary, or failed is refused here as every node
+    // refuses it (ADR-0046, point 6.2).
+    if let Some(refusal) = crate::replication::fork::placement_refusal(name, placement) {
+        return Err(refusal);
+    }
     let primary = placement.primary.as_deref().ok_or_else(|| {
         if placement.epoch > 0 {
             Status::unavailable(format!(

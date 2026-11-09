@@ -16,7 +16,7 @@ use fleetring_proto::v1::{self as proto, ForkOperationStatus, SnapshotRequest};
 use fleetringd::auth::refused_binding;
 use fleetringd::data::{Client, DatabaseSpec, ForkSpec};
 use fleetringd::engine::{Statement, Value};
-use fleetringd::replication::{FaultPoint, ForkFaults};
+use fleetringd::replication::{FORK_NOT_READY, FaultPoint, ForkFaults};
 use fleetringd::transport::{database_client, replication_client};
 use fleetringd::{Config, Daemon, Environment, Network};
 use tonic::Code;
@@ -551,7 +551,7 @@ fn not_ready(status: &tonic::Status) -> bool {
             .metadata()
             .get(fleetringd::replication::RETRY_AFTER_KEY)
             .is_some()
-        && status.message().contains("isn't ready")
+        && status.message().contains(FORK_NOT_READY)
 }
 
 /// Between `CompleteFork` and the reset's commit, which a fault hook holds, every data call,
@@ -1700,6 +1700,208 @@ async fn a_holder_promotes_a_seeded_fork_over_its_holders_after_placement_moved(
         faults.release_operation(FaultPoint::FollowerReset, id);
     }
     await_state(&client, id, proto::ForkState::Ready).await?;
+    fleet.stop().await;
+    Ok(())
+}
+
+/// Every data call against `database` that the data daemon at `address` answers, each with the
+/// status it was refused with, by call; an error if one was served.
+async fn refusals(
+    network: &Network,
+    address: &str,
+    database: &DatabaseName,
+) -> Result<Vec<(&'static str, tonic::Status)>, Box<dyn Error>> {
+    let mut raw = database_client(network.channel(address)?);
+    let database = database.to_string();
+    let served = |call: &str| format!("{call} was served");
+    let mut refused = Vec::new();
+    let execute = raw
+        .execute(proto::ExecuteRequest {
+            database: database.clone(),
+            sql: "INSERT INTO notes (body) VALUES ('early')".to_owned(),
+            params: Vec::new(),
+        })
+        .await;
+    refused.push(("Execute", execute.err().ok_or_else(|| served("Execute"))?));
+    let query = raw
+        .query(proto::QueryRequest {
+            database: database.clone(),
+            sql: "SELECT count(*) FROM notes".to_owned(),
+            ..proto::QueryRequest::default()
+        })
+        .await;
+    refused.push(("Query", query.err().ok_or_else(|| served("Query"))?));
+    let schema = raw
+        .schema(proto::SchemaRequest {
+            database: database.clone(),
+            ..proto::SchemaRequest::default()
+        })
+        .await;
+    refused.push(("Schema", schema.err().ok_or_else(|| served("Schema"))?));
+    let verify = raw
+        .verify(proto::VerifyRequest {
+            database: database.clone(),
+            ..proto::VerifyRequest::default()
+        })
+        .await;
+    refused.push(("Verify", verify.err().ok_or_else(|| served("Verify"))?));
+    let watched = match raw
+        .watch_changes(proto::WatchChangesRequest {
+            database: database.clone(),
+            after: None,
+        })
+        .await
+    {
+        Err(status) => status,
+        Ok(stream) => stream
+            .into_inner()
+            .message()
+            .await
+            .err()
+            .ok_or_else(|| served("WatchChanges"))?,
+    };
+    refused.push(("WatchChanges", watched));
+    let open = proto::SessionRequest {
+        request: Some(proto::session_request::Request::Open(proto::SessionOpen {
+            database,
+        })),
+    };
+    let session = match raw.session(tokio_stream::iter([open])).await {
+        Err(status) => status,
+        Ok(stream) => stream
+            .into_inner()
+            .message()
+            .await
+            .err()
+            .ok_or_else(|| served("Session"))?,
+    };
+    refused.push(("Session", session));
+    Ok(refused)
+}
+
+/// Asserts that every data call against `database`, from the data daemon at each of `addresses`
+/// and through the client, is refused as `not_ready` at `stage`, or, for a failed fork, as
+/// failed.
+async fn assert_refused(
+    fleet: &Fleet,
+    client: &Client,
+    addresses: &[String],
+    database: &DatabaseName,
+    stage: &str,
+) -> TestResult {
+    let failed = stage == "failed";
+    let expected = |status: &tonic::Status| {
+        if failed {
+            status.code() == Code::FailedPrecondition
+                && status.message().contains("failed")
+                && status
+                    .message()
+                    .contains(&format!("fleetring db drop {database}"))
+        } else {
+            not_ready(status)
+        }
+    };
+    let network = client_network(&fleet.tls)?;
+    for address in addresses {
+        for (call, status) in refusals(&network, address, database).await? {
+            assert!(
+                expected(&status),
+                "{stage}: {call} at {address}: {status:?}"
+            );
+        }
+    }
+    let queried = client
+        .query(database, Statement::new("SELECT count(*) FROM notes"))
+        .await
+        .expect_err("the client's query is refused");
+    assert!(
+        expected(&queried),
+        "{stage}: the client's query: {queried:?}"
+    );
+    Ok(())
+}
+
+/// Every data call against a fork that isn't ready is refused alike, on every node and through
+/// the client, while it seeds, once it is seeded with no primary, and while its primary holds
+/// the reset: `UNAVAILABLE` "fork not ready" with a retry-after; and a failed fork's calls say
+/// it failed and how to remove it (ADR-0046, point 6.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_that_isnt_ready_refuses_every_data_call_alike() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(dir.path(), Settings::default()).await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    let source_primary = create_source(&client, &source, 1, 5).await?;
+    let target = fleet.name_apart("dst", 2, &source_primary)?;
+    let every: Vec<String> = fleet
+        .data
+        .iter()
+        .map(|daemon| daemon.listen_address().to_string())
+        .collect();
+    let id = operation(50);
+    for faults in &fleet.faults {
+        for point in [
+            FaultPoint::Staged,
+            FaultPoint::FirstLease,
+            FaultPoint::BeforeReset,
+        ] {
+            faults.hold_operation(point, id);
+        }
+    }
+    client
+        .fork_database(&source, &target, &spec(id, 2)?)
+        .await?;
+    await_held(&fleet, FaultPoint::Staged).await?;
+    assert_eq!(
+        client.fork_operation(id).await?.state(),
+        proto::ForkState::Seeding
+    );
+    assert_refused(&fleet, &client, &every, &target, "seeding").await?;
+
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::Staged, id);
+    }
+    await_state(&client, id, proto::ForkState::Seeded).await?;
+    await_held(&fleet, FaultPoint::FirstLease).await?;
+    assert_eq!(client.locate(&target).await?.primary, None);
+    assert_refused(&fleet, &client, &every, &target, "seeded before its lease").await?;
+
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::FirstLease, id);
+    }
+    let primary = await_held(&fleet, FaultPoint::BeforeReset).await?;
+    let at_primary = [fleet.daemon(&primary)?.listen_address().to_string()];
+    assert_refused(
+        &fleet,
+        &client,
+        &at_primary,
+        &target,
+        "leased with its reset held",
+    )
+    .await?;
+
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::BeforeReset, id);
+    }
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    assert_eq!(notes(&client, &target).await?.len(), 5);
+
+    // A fork whose source is dropped while it seeds fails, and says so.
+    let doomed = name("doomed")?;
+    let failing = operation(51);
+    for faults in &fleet.faults {
+        faults.hold_operation(FaultPoint::Staged, failing);
+    }
+    client
+        .fork_database(&source, &doomed, &spec(failing, 2)?)
+        .await?;
+    await_held(&fleet, FaultPoint::Staged).await?;
+    client.drop_database(&source).await?;
+    await_state(&client, failing, proto::ForkState::Failed).await?;
+    assert_refused(&fleet, &client, &every, &doomed, "failed").await?;
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::Staged, failing);
+    }
     fleet.stop().await;
     Ok(())
 }
