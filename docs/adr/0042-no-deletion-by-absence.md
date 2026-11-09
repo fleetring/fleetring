@@ -4,7 +4,7 @@
 - **Date:** 2026-11-05
 - **Related:** ADR-0017 (control state machine), ADR-0018 (leases, epochs, quorums), ADR-0022 (failover), ADR-0025 and ADR-0026 (principals and scopes), ADR-0031 (node calls bound to placement), ADR-0038 (versions and fleet features), ADR-0040 (Raft amendments), ADR-0041 (expiry; amendment 7); tickets FR-077 (#105, part 1), FR-070 (#76)
 
-*Note (2026-11-08):* under [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed), a fork's *staged copies* follow this record's rule: a node deletes one only on a positive signal for the fork's identity, and keeps every other as an orphan (ADR-0046, point 4.6). Since a seeding fork's epoch is 0, ADR-0046 proposes that `DropCopy` also name the database's incarnation and the fork's operation. The text below is unchanged.
+*Note (2026-11-08):* under [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed), a fork's *staged copies* follow this record's rule: a node deletes one only on a positive signal for the fork's own identity, and keeps every other as an orphan (ADR-0046, point 4.6). Since a seeding fork's epoch is 0, ADR-0046 proposes that `DropCopy` also name the database's incarnation and the fork's operation, judged under the name's lock as point 2 judges a notice. A placement that shows the name with another incarnation is a view, not a drop: it marks a staged copy an orphan and deletes nothing. Staged orphans are listed and removed by name, incarnation, operation, and attempt. The text below is unchanged.
 
 ## Context
 
