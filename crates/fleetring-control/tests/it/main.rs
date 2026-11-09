@@ -5,6 +5,7 @@ mod common;
 mod durability;
 mod fork;
 mod fork_lifecycle;
+mod fork_replay;
 mod metadata;
 mod properties;
 mod replay;
