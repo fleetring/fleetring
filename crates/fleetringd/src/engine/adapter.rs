@@ -7,9 +7,10 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::engine::{
-    CaptureMode, ChangesAfter, CheckpointMarker, DatabaseSnapshot, Executed, FrameBatch, Interrupt,
-    Interruption, LogicalSupport, PinnedSnapshot, Position, ReadLimit, RecordedTransaction,
-    ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, SqlSessions, Statement, Transaction,
+    CaptureMode, ChangesAfter, CheckpointMarker, DatabaseSnapshot, Executed, ForkMarker, ForkReset,
+    FrameBatch, Interrupt, Interruption, LogicalSupport, PinnedSnapshot, Position, ReadLimit,
+    RecordedTransaction, ReplicaPosition, RowChange, Rows, Schema, SchemaRequest, SqlSessions,
+    Statement, Transaction,
 };
 
 /// A storage engine that opens databases (ADR-0015, ADR-0016).
@@ -125,6 +126,44 @@ pub trait Database: fmt::Debug + Send {
     /// on this node only.
     fn sink_marks(&mut self) -> Option<&mut dyn SinkMarks> {
         None
+    }
+
+    /// Runs a fork's reset (ADR-0046, point 6.1): one write transaction, conditional on the
+    /// marker it leaves.
+    ///
+    /// If the database already holds a marker for `marker`'s fork (the same fork incarnation and
+    /// operation, [`ForkMarker::same_fork`]), it writes nothing and answers
+    /// [`ForkReset::AlreadyDone`]. Otherwise, in one transaction, it clears the change record
+    /// (ADR-0024) and the sink positions (ADR-0028), both inherited from the source, replaces
+    /// whatever marker the database holds with exactly `marker`, and answers
+    /// [`ForkReset::Written`] with the position just past the transaction. A fork of a fork
+    /// inherits its source's marker, which names another fork, so its reset runs. Change capture
+    /// doesn't record the transaction, and a crash before it commits leaves neither the marker
+    /// nor any part of the reset.
+    ///
+    /// The transaction replicates as any other write does. Engines that can't fork keep the
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Unsupported`], the default, for an engine that can't fork;
+    /// [`EngineError::Statement`] if a SQL session's transaction holds the database's writer or
+    /// the engine's reserved namespace holds an object it didn't create; and
+    /// [`EngineError::Storage`] if storage fails. On any error nothing is written.
+    fn fork_reset(&mut self, marker: &ForkMarker) -> Result<ForkReset, EngineError> {
+        let _ = marker;
+        Err(EngineError::Unsupported { what: "forks" })
+    }
+
+    /// The marker of the last fork reset the database committed, or `None` if it holds none.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Unsupported`], the default, for an engine that can't fork;
+    /// [`EngineError::Statement`] if the engine's reserved namespace holds an object it didn't
+    /// create; and [`EngineError::Storage`] if the marker can't be read.
+    fn fork_marker(&mut self) -> Result<Option<ForkMarker>, EngineError> {
+        Err(EngineError::Unsupported { what: "forks" })
     }
 
     /// Closes the database. It doesn't checkpoint: the log stays as it is for the next open.

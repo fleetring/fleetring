@@ -11,15 +11,16 @@
 //! Row changes for logical change streams are recorded by the `changes` module, in a change
 //! table inside the database (FR-039, ADR-0024), and the positions that change sinks have been
 //! delivered up to by the `marks` module, in a second table, so that they replicate with the data
-//! (FR-041, ADR-0028). Names beginning with `_fleetring_`, in any ASCII case, are reserved for
-//! them, and `_fleetring_cdc` and `_fleetring_sinks` are the tables: a user statement that reads,
-//! writes, calls, creates, alters, or drops anything so named is refused as a statement error, on
-//! both connections, so that neither the table nor the recorder's triggers can be read, forged,
-//! or broken from outside. Nor can a user statement create, rename into, or put a trigger on
-//! anything in the reserved namespace: one that changes the namespace in any way is refused and
-//! its transaction rolled back. The adapter, in turn, never adopts an object there that it didn't
-//! create: it refuses to record changes or sink marks in a database that holds one (the
-//! `reserved` module).
+//! (FR-041, ADR-0028). A fork's reset clears both and records its marker in a third, by the `fork`
+//! module (ADR-0046, point 6). Names beginning with `_fleetring_`, in any ASCII case, are reserved
+//! for them, and `_fleetring_cdc`, `_fleetring_sinks`, and `_fleetring_fork` are the tables: a
+//! user statement that reads, writes, calls, creates, alters, or drops anything so named is refused
+//! as a statement error, on both connections, so that neither the tables nor the recorder's
+//! triggers can be read, forged, or broken from outside. Nor can a user statement create, rename
+//! into, or put a trigger on anything in the reserved namespace: one that changes the namespace in
+//! any way is refused and its transaction rolled back. The adapter, in turn, never adopts an
+//! object there that it didn't create: it refuses to record changes or sink marks, or to read or
+//! write a fork's marker, in a database that holds one (the `reserved` module).
 //!
 //! User statements are confined to the database they name. One that attaches or detaches a
 //! database, loads an extension, or runs a pragma other than read-only introspection is refused
@@ -41,6 +42,7 @@
 
 mod changes;
 mod follower;
+mod fork;
 mod marks;
 mod pins;
 mod reserved;
@@ -71,16 +73,18 @@ use rusqlite::{
 pub use follower::SqliteFollower;
 
 use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX, Watched};
+use self::fork::Outcome;
 use self::marks::Marks;
 use self::pins::Pins;
 use self::reserved::{Reserved, is_reserved, mentions_reserved};
 use self::session::{Control, OpenTransaction};
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
-    DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
-    FrameFollower, FrameSource, FrameSourceEngine, Interrupt, LogicalChanges, LogicalSupport,
-    OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, RowChange, Rows, Schema,
-    SchemaRequest, SinkMarks, SnapshotFile, SqlSessions, Statement, Transaction, Value,
+    DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, ForkMarker, ForkReset,
+    FrameBatch, FrameFollower, FrameSource, FrameSourceEngine, Interrupt, LogicalChanges,
+    LogicalSupport, OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, RowChange,
+    Rows, Schema, SchemaRequest, SinkMarks, SnapshotFile, SqlSessions, Statement, Transaction,
+    Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -634,6 +638,51 @@ impl Database for SqliteDatabase {
 
     fn sql_sessions(&mut self) -> Option<&mut dyn SqlSessions> {
         Some(self)
+    }
+
+    fn fork_reset(&mut self, marker: &ForkMarker) -> Result<ForkReset, EngineError> {
+        if !self.writer.is_autocommit() {
+            return Err(EngineError::Statement {
+                message: "a session's transaction holds the database's writer".to_owned(),
+            });
+        }
+        // The reset starts where the log ends now, and the change record's floor goes there.
+        let start = self.read_wal(None)?.map(|batch| batch.end());
+        self.writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(classify)?;
+        // The adapter's own tables only, and none subverted by an object it didn't create.
+        let outcome = self
+            .refuse_foreign_objects()
+            .and_then(|()| fork::reset(&self.writer, marker, start));
+        match outcome {
+            Ok(Outcome::Written) => {}
+            Ok(Outcome::Held) => {
+                self.roll_back();
+                return Ok(ForkReset::AlreadyDone);
+            }
+            Err(error) => {
+                self.roll_back();
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.writer.execute_batch("COMMIT") {
+            self.roll_back();
+            return Err(classify(error));
+        }
+        self.marks.discard_staged();
+        let position = self
+            .read_wal(None)?
+            .map(|batch| encode_position(batch.end()));
+        position
+            .map(|position| ForkReset::Written { position })
+            .ok_or_else(|| storage(io::Error::other("the fork reset committed to an empty log")))
+    }
+
+    fn fork_marker(&mut self) -> Result<Option<ForkMarker>, EngineError> {
+        self.refuse_foreign_objects()?;
+        // The read connection sees only committed transactions.
+        fork::read(&self.reader)
     }
 
     fn close(self: Box<Self>) -> Result<(), EngineError> {

@@ -2,6 +2,7 @@
 
 mod both;
 mod common;
+mod fork;
 mod memory;
 mod pinned;
 mod registry;

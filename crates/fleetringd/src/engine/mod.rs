@@ -18,6 +18,7 @@
 mod adapter;
 mod changes;
 mod config;
+mod fork;
 mod interrupt;
 mod memory;
 mod pinned;
@@ -37,6 +38,7 @@ pub use changes::{
     RecordedTransaction, RowChange, RowOperation,
 };
 pub use config::{EngineConfig, Execution};
+pub use fork::{ForkMarker, ForkReset};
 pub use interrupt::{Interrupt, Interruption};
 pub use memory::MemoryEngine;
 pub use pinned::{PinnedSnapshot, SnapshotFile, SnapshotGuard};
@@ -74,6 +76,8 @@ const _: () = {
     assert_debug_send_sync::<EngineKind>();
     assert_debug_send_sync::<Executed>();
     assert_debug_send_sync::<Execution>();
+    assert_debug_send_sync::<ForkMarker>();
+    assert_debug_send_sync::<ForkReset>();
     assert_debug_send_sync::<FrameBatch>();
     assert_debug_send_sync::<InvalidPageSizeError>();
     assert_debug_send_sync::<Internal>();

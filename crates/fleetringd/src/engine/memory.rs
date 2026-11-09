@@ -10,8 +10,8 @@ use fleetring::NodeId;
 
 use crate::engine::{
     Database, DatabaseCapability, DatabaseEngine, DatabaseSnapshot, EngineCapability, EngineError,
-    EngineKind, Executed, Interrupt, OpenMode, Position, ReplicaPosition, Rows, SelfReplicating,
-    Statement, Transaction, Value,
+    EngineKind, Executed, ForkMarker, ForkReset, Interrupt, OpenMode, Position, ReplicaPosition,
+    Rows, SelfReplicating, Statement, Transaction, Value,
 };
 
 /// An in-memory key-value engine that replicates itself.
@@ -32,6 +32,9 @@ use crate::engine::{
 /// - `fail` always fails.
 ///
 /// Positions are the count of committed write transactions, as 8 big-endian bytes.
+///
+/// A fork's reset marker is kept with the database's rows, and a reset is one more committed
+/// transaction; there is no change record or sink position to clear.
 ///
 /// # Examples
 ///
@@ -106,6 +109,8 @@ impl DatabaseEngine for MemoryEngine {
 struct Stored {
     rows: BTreeMap<String, Value>,
     version: u64,
+    /// The marker of the last fork reset, if one committed.
+    fork: Option<ForkMarker>,
 }
 
 impl Stored {
@@ -169,6 +174,27 @@ impl Database for MemoryDatabase {
 
     fn capability(&mut self) -> DatabaseCapability<'_> {
         DatabaseCapability::SelfReplicating(self)
+    }
+
+    fn fork_reset(&mut self, marker: &ForkMarker) -> Result<ForkReset, EngineError> {
+        let mut store = lock(&self.store);
+        let stored = store.get_mut(&self.location).ok_or(EngineError::NotFound)?;
+        if stored
+            .fork
+            .as_ref()
+            .is_some_and(|held| held.same_fork(marker))
+        {
+            return Ok(ForkReset::AlreadyDone);
+        }
+        stored.fork = Some(marker.clone());
+        stored.version += 1;
+        Ok(ForkReset::Written {
+            position: Position::new(stored.version.to_be_bytes()),
+        })
+    }
+
+    fn fork_marker(&mut self) -> Result<Option<ForkMarker>, EngineError> {
+        Ok(self.stored()?.fork)
     }
 
     fn close(self: Box<Self>) -> Result<(), EngineError> {
