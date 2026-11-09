@@ -34,7 +34,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Accepted |
 | [0024](0024-logical-change-capture.md) | Logical change capture through a replicated, Turso-shaped change table inside the database | Accepted |
 | [0025](0025-principals-and-scopes.md) | Principals and scopes: mutual TLS between nodes and prefix-scoped credentials for clients | Accepted |
-| [0026](0026-scope-enforcement-details.md) | How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire (amends 0025) | Accepted |
+| [0026](0026-scope-enforcement-details.md) | How scopes and tokens are enforced: forwarding, node-only calls, and tokens on the wire (amends 0025; point 4 amended by 0037 for sessions) | Accepted |
 | [0027](0027-keyed-leases.md) | Keyed leases: a fenced, renewable lease on any key, requested by a named holder and kept in control state | Accepted |
 | [0028](0028-replicated-sink-positions.md) | Replicated sink positions live in the database, written with the next write after a delivery | Accepted |
 | [0029](0029-s3-durability-sink.md) | Durability sinks: verifiable archives of snapshots and log segments in object storage, with point-in-time restore | Accepted |

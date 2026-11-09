@@ -258,6 +258,15 @@ id = "node-1"
 # call stops its statement at once.
 # statement_timeout_ms = 30000
 
+# [sessions]
+# How the router's Hrana streams may hold a database's writer on its primary (ADR-0037). A
+# stream's transaction holds the writer from its first write to its COMMIT or ROLLBACK: other
+# writes wait, reads go on. A transaction open longer than `transaction_timeout_ms` is rolled
+# back, so a client that walks away can't hold a database; a write past `max_waiting_writes`
+# behind one is refused with RESOURCE_EXHAUSTED and never runs.
+# transaction_timeout_ms = 30000
+# max_waiting_writes = 64          # per database
+
 # [log]
 # How log lines are written to stderr: "text" (the default) or "json", one object per line with
 # the current span; every request's lines carry its `rpc` span and `request_id`. `--log-format`
@@ -286,8 +295,8 @@ id = "node-1"
 name = "admin"
 scopes = ["admin:*", "stream:*", "fleet"]
 
-# A router that relays its callers' tokens: its own certificate grants nothing, and a request
-# carrying a caller's token acts as that caller.
+# The router (`fleetring router`, deploy/router.toml) relays its callers' tokens: its own
+# certificate grants nothing, and a request carrying a caller's token acts as that caller.
 # [[principal]]
 # name = "router"
 # scopes = []

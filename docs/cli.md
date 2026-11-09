@@ -42,6 +42,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `dev stop \| status \| logs [-f]` | Stops, describes, or shows the log of the background dev node |
 | | `serve --config <file> [daemon flags]` | Runs a node |
 | | `serve --config <file> [daemon flags] --check [-o table\|json\|jsonl \| --json]` | Checks the file and the flags as a start would, and starts nothing (#95) |
+| | `router --config <file>` | Runs a router, the libSQL/Hrana front door to the fleet (ADR-0037) |
 | | `stop (--data-dir <dir> \| --config <file>)` | Stops a node started in a terminal or script: drains, leaves, waits |
 | | `switch [<name> \| -]` | Makes a context current; with no name, a picker; `-` goes back |
 | | `context list \| show \| current \| add \| use \| remove` | Manages contexts (§4) |
@@ -83,6 +84,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 - **Top-level commands are few.** A new one needs a reason in its pull request. Today's, besides the nouns:
   - **`status`**, the fleet overview.
   - **`dev`, `serve` and `stop`, which run or stop a node.** Each acts on a process, not on a fleet noun.
+  - **`router`, which runs a router:** a long-running process with an identity of its own, like the daemon itself (ADR-0037). It serves Hrana over HTTP to applications, not commands to a person, so it belongs under no noun.
   - **`switch`.** It is the one documented shortcut: `switch <name>` is `context use <name>`, plus a picker and `-`. No other command has a second spelling.
   - **`upgrade`**, which replaces this binary.
   - **`mcp`, a long-running process on stdio** (ADR-0041, point 8). It acts on many nouns, so it belongs under none.
@@ -392,3 +394,4 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | Renames | Clean breaks, listed in FR-062's breaking changes for 0.3.0 and FR-076's for 0.6.0. | 0.7.0's list: phase A, in the release notes |
 | `upgrade` | Installs a release verified with cosign and by checksum, keeps `fleetringd.previous` for `--rollback`, and restarts the node `--config` names in place (ADR-0038). | Phase A: across the rename |
 | `db watch` | None; change streams reach only configured sinks. | Done in 0.8.0 (FR-075 item 7, ADR-0045): `db watch <db> [--from <position>]`, with `jsonl`. |
+| `router` | None; applications speak the gRPC `Database` service. | Done in 0.8.0 (FR-066, ADR-0037): `router --config <file>` under "Getting started". |

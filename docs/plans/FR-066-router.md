@@ -1,7 +1,7 @@
 ---
 id: FR-066
 title: The router: a libSQL/Hrana front door that routes each request to its database's primary
-status: todo
+status: in-progress
 priority: P1
 size: L
 milestone: M8 Access and integration
@@ -792,4 +792,19 @@ The open questions this plan raised were decided as recommended:
 
 ## Progress
 
-- Not started.
+- **2026-11-08, built** on one branch, steps 1 to 12 and 14; step 13 (metrics) waits, as this plan allows.
+  - Steps 2 to 6: `engine::SqlSessions` and its SQLite implementation, the actor's transaction holder and waiting writes, `[sessions]`, and `Database.Session` (protocol 1.3), with the tests in `tests/actor/sessions.rs` and `tests/router/sessions.rs`.
+  - Step 7: `ControlClient::locate_as`.
+  - Steps 8 to 10: `fleetringd::router` and `fleetring router --config <file>`, under "Getting started" in `fleetring -h`; the tests in `tests/router/http.rs` and the lost-reply test in `src/router/tests.rs`.
+  - Step 11: the `libsql` crate (0.10.0) in `tests/router-conformance/`, run by CI's `router conformance (libsql)` job; `@libsql/client` 0.18.0 from `tests/router/node/`, run nightly by `router-conformance.yml`. Both pass.
+  - Step 12: `FleetBuilder::router` and `Fleet::client_via_router`, and `tests/sim/router.rs` with both scenarios.
+- **Where the build differs from this plan:**
+  - A node answers a call it refused before running any of it (the lease moved, the replica floor, too many waiting writes, a transaction that is gone) with `SessionResult.not_run`, which says whether the session ends. The router sends such a call again, to the new primary, only from outside a transaction: this is the "provably never ran" case of point 21, made explicit in the protocol.
+  - `SessionCall` carries no flag for the session's transaction; the actor learns it from the session's last answer (`holding`), and a session that thinks it holds a transaction the database no longer has (it ran past its limit, or the database closed) gets `FLEETRING_TRANSACTION_ABORTED`, never an autocommit in its place.
+  - A baton is bound to the token that opened its stream, not only to its principal: the same principal with another token is `403` too.
+  - The router's `[control]` takes `address` alone: `ControlClient` takes one address until FR-064.
+  - The router's configuration adds `[routing] call_timeout_ms` (60 s) and `[streams] max_statements` (1,000), and one response carries at most 64 MiB of rows (a call at most 32 MiB); nodes hold at most 10,000 sessions.
+  - `base_url` repeats the database's path (`<advertise_url>/db/<name>/`), since clients append the endpoint to it; a host-form request gets none.
+  - The cursor sends its entries once the batch has run, not as rows arrive.
+  - `TransactionWrite` and the `TransactionsAtomic` invariant of step 12 wait for a follow-up; the scenarios write and read through the router, one statement per stream.
+  - The libsql conformance crate lives outside the workspace, as step 11 says: `libsql`'s hyper 0.14 brings h2 0.3, which carries RUSTSEC-2026-0258 (fixed only in h2 0.4), and `cargo deny` would refuse it in the workspace graph.
