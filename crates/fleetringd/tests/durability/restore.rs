@@ -13,11 +13,11 @@ use fleetringd::durability::{
     RestoreError, RestoreTarget, Restored, StoreError, StoreFuture, checksum_hex, decode_segment,
     encode_descriptor, encode_segment, finish_offline, restore_into,
 };
-use fleetringd::engine::{EngineKind, Execution, Position};
+use fleetringd::engine::{EngineKind, Execution, Position, SqliteEngine};
 use tokio::sync::watch;
 
 use crate::common::{
-    Node, TestMetadata, TestResult, archived_metadata, insert, name, settings, sqlite,
+    Node, PAGE_SIZE, TestMetadata, TestResult, archived_metadata, insert, name, settings, sqlite,
 };
 
 /// The values of `t` in the copy at `dir`, read from a scratch copy of its files so that SQLite's
@@ -513,6 +513,46 @@ async fn a_missing_snapshot_chunk_is_refused_as_data_loss() -> TestResult {
         "{refused:?}"
     );
     assert!(!staging.exists());
+    Ok(())
+}
+
+/// An archive whose pages aren't the size the restoring engine is configured for is refused
+/// before anything opens the copy, and nothing is left behind (#154).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_of_another_page_size_is_refused_before_anything_opens_it() -> TestResult {
+    let (dir, store, ledger) = archived().await?;
+    let listing = Listing::read(
+        &store,
+        &ArchiveKeys::new("fleetring", &ledger),
+        &ledger,
+        EngineKind::Sqlite,
+    )
+    .await?;
+    let snapshot = listing.snapshots.first().ok_or("a snapshot")?.key.clone();
+    let staging = dir.path().join("restored");
+    let engine = SqliteEngine::new(PAGE_SIZE * 2)?;
+    let refused = restore_into(
+        &store,
+        &ArchiveKeys::new("fleetring", &ledger),
+        &ledger,
+        Arc::new(engine),
+        &RestoreTarget::Latest,
+        &staging,
+        Execution::Threads,
+    )
+    .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(RestoreError::DataLoss { object, reason })
+                if *object == snapshot && reason.contains("the archive's snapshot is refused")
+                    && reason.contains("page size")
+        ),
+        "{refused:?}"
+    );
+    assert!(!staging.exists(), "nothing is left behind");
+    // The engine it was archived with restores it.
+    restore_from(&store, &ledger, &staging).await?;
     Ok(())
 }
 

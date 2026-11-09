@@ -161,6 +161,17 @@ impl Fleet {
         ids: &[&str],
         engine: impl DatabaseEngine + Clone,
         settings: ReplicationSettings,
+        wraps: BTreeMap<String, Wrap>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::start_each(ids, |_| engine.clone(), settings, wraps).await
+    }
+
+    /// Starts `ids.len()` data nodes, each running the engine `engine` makes for its name, and
+    /// wrapped by `wraps` if it names it.
+    pub(crate) async fn start_each<E: DatabaseEngine + Clone>(
+        ids: &[&str],
+        engine: impl Fn(&str) -> E,
+        settings: ReplicationSettings,
         mut wraps: BTreeMap<String, Wrap>,
     ) -> Result<Self, Box<dyn Error>> {
         let _ = tracing_subscriber::fmt()
@@ -204,7 +215,7 @@ impl Fleet {
             let replication = start_node(
                 id(name),
                 &root,
-                engine.clone(),
+                engine(name),
                 membership.clone(),
                 Arc::clone(&addresses),
                 Arc::new(BTreeMap::<DatabaseName, EpochHolders>::new()),
