@@ -31,11 +31,12 @@
 //! A user statement, and a schema read, stop once their call's [`Interrupt`] is raised (FR-078):
 //! while one runs, SQLite's progress handler checks the interrupt every
 //! [`INTERRUPT_CHECK_OPS`] virtual-machine instructions, and fails the statement with
-//! `SQLITE_INTERRUPT` once it is raised. The write transaction the statement ran in then rolls
+//! `SQLITE_INTERRUPT` once it is raised. The handler is installed once per connection and checks
+//! only the interrupt watched at the time. The write transaction the statement ran in then rolls
 //! back, change records and all, as after any failed statement: nothing commits, so no batch
 //! ships, though pages a large transaction spilled may sit in the WAL past its committed end until
 //! the next commit overwrites them. The adapter's own statements around a write, its change
-//! records and sink marks and its `COMMIT`, run with no handler, so a transaction whose
+//! records and sink marks and its `COMMIT`, run with no interrupt watched, so a transaction whose
 //! statements finished always commits.
 
 mod changes;
@@ -269,7 +270,7 @@ impl SqliteDatabase {
         if mode == OpenMode::Create {
             flags |= OpenFlags::SQLITE_OPEN_CREATE;
         }
-        let writer = Connection::open_with_flags(&path, flags).map_err(storage)?;
+        let mut writer = Connection::open_with_flags(&path, flags).map_err(storage)?;
         defend(&writer)?;
         keep_wal_on_close(&writer)?;
         if mode == OpenMode::Create {
@@ -297,8 +298,8 @@ impl SqliteDatabase {
                  PRAGMA recursive_triggers = ON;",
             )
             .map_err(storage)?;
-        let writing = confine(&writer);
-        let reader = Connection::open_with_flags(
+        let writing = confine(&mut writer)?;
+        let mut reader = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -308,7 +309,7 @@ impl SqliteDatabase {
         reader
             .execute_batch("PRAGMA query_only = 1; PRAGMA wal_autocheckpoint = 0;")
             .map_err(storage)?;
-        let reading = confine(&reader);
+        let reading = confine(&mut reader)?;
         let checkpointed = read_marker(&path)?;
         Ok(Self {
             path,
@@ -339,7 +340,7 @@ impl SqliteDatabase {
         for statement in transaction.statements() {
             {
                 let _user = UserStatement::enter(&self.writing);
-                let _interruptible = Interruptible::watch(&self.writer, interrupt);
+                let _interruptible = Interruptible::watch(&self.writing, interrupt);
                 run(&self.writer, statement, &self.writing, interrupt)?;
             }
             // The authorizer sees a renamed table's old name only, so a rename into the reserved
@@ -543,7 +544,7 @@ impl Database for SqliteDatabase {
         // Confined while it steps too: SQLite prepares statements of its own while stepping some,
         // such as a pragma table-valued function's pragma, and reprepares after a schema change.
         let _user = UserStatement::enter(&self.reading);
-        let _interruptible = Interruptible::watch(&self.reader, interrupt);
+        let _interruptible = Interruptible::watch(&self.reading, interrupt);
         let classify = |error: rusqlite::Error| {
             interrupted(&error, interrupt).unwrap_or_else(|| self.reading.classify(error))
         };
@@ -551,11 +552,7 @@ impl Database for SqliteDatabase {
             .reader
             .prepare_cached(statement.sql())
             .map_err(classify)?;
-        let columns: Vec<String> = prepared
-            .column_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let columns: Vec<String> = prepared.column_names().map(str::to_owned).collect();
         let width = columns.len();
         let mut rows = prepared
             .query(rusqlite::params_from_iter(
@@ -594,7 +591,7 @@ impl Database for SqliteDatabase {
         interrupt.check()?;
         // The adapter's own statements, on the read connection, with the user confinement off.
         // The scan budget bounds the counting; the interrupt bounds it in time as well.
-        let _interruptible = Interruptible::watch(&self.reader, interrupt);
+        let _interruptible = Interruptible::watch(&self.reading, interrupt);
         schema::read(&self.reader, request).map_err(|error| stopped_by(interrupt, error))
     }
 
@@ -873,6 +870,8 @@ struct Confinement {
     /// What the user statement being prepared does to a transaction, for a SQL session to read
     /// (ADR-0037, point 12). Never refused here: `Execute` refuses transaction control itself.
     control: Mutex<Option<Control>>,
+    /// The interrupt the connection's statements stop on, while an [`Interruptible`] watches it.
+    interrupt: Mutex<Option<Interrupt>>,
 }
 
 impl Confinement {
@@ -950,8 +949,28 @@ impl fmt::Display for Refusal {
 ///
 /// SQLite authorizes a statement when it is prepared, so the confinement applies only around
 /// user statements; the adapter's own statements prepare with it clear.
-fn confine(conn: &Connection) -> Arc<Confinement> {
+///
+/// It also installs the progress handler that stops statements once the interrupt an
+/// [`Interruptible`] put in the confinement is raised.
+///
+/// # Errors
+///
+/// [`EngineError::Storage`] if SQLite can't install the authorizer or the progress handler.
+fn confine(conn: &mut Connection) -> Result<Arc<Confinement>, EngineError> {
     let confinement = Arc::new(Confinement::default());
+    let watched = Arc::clone(&confinement);
+    conn.progress_handler(
+        INTERRUPT_CHECK_OPS,
+        Some(move || {
+            watched
+                .interrupt
+                .lock()
+                .expect("interrupt lock poisoned")
+                .as_ref()
+                .is_some_and(|interrupt| interrupt.raised().is_some())
+        }),
+    )
+    .map_err(storage)?;
     let seen = Arc::clone(&confinement);
     conn.authorizer(Some(move |context: AuthContext<'_>| {
         if !seen.user.load(Ordering::Relaxed) {
@@ -982,8 +1001,9 @@ fn confine(conn: &Connection) -> Arc<Confinement> {
             }
             None => Authorization::Allow,
         }
-    }));
-    confinement
+    }))
+    .map_err(storage)?;
+    Ok(confinement)
 }
 
 /// What `action` does to a transaction, if it is a transaction's or a savepoint's control. The
@@ -1193,23 +1213,28 @@ fn keep_wal_on_close(conn: &Connection) -> Result<(), EngineError> {
 }
 
 /// Stops the statements a connection runs once an [`Interrupt`] is raised, while it lives: it
-/// installs SQLite's progress handler, and removes it when dropped.
-struct Interruptible<'c>(&'c Connection);
+/// installs the interrupt in its connection's [`Confinement`], which the progress handler that
+/// [`confine`] installed checks, and takes it out again when dropped. With none installed, the
+/// handler lets every statement run on.
+///
+/// The handler stays installed for the connection's life because installing one needs the
+/// connection exclusively, which a statement prepared on it, and stepped while watched, holds
+/// shared.
+struct Interruptible<'c>(&'c Confinement);
 
 impl<'c> Interruptible<'c> {
-    fn watch(conn: &'c Connection, interrupt: &Interrupt) -> Self {
-        let interrupt = interrupt.clone();
-        conn.progress_handler(
-            INTERRUPT_CHECK_OPS,
-            Some(move || interrupt.raised().is_some()),
-        );
-        Self(conn)
+    fn watch(confinement: &'c Confinement, interrupt: &Interrupt) -> Self {
+        *confinement
+            .interrupt
+            .lock()
+            .expect("interrupt lock poisoned") = Some(interrupt.clone());
+        Self(confinement)
     }
 }
 
 impl Drop for Interruptible<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        *self.0.interrupt.lock().expect("interrupt lock poisoned") = None;
     }
 }
 

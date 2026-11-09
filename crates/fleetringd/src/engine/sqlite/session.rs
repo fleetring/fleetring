@@ -511,7 +511,7 @@ fn step(
         // Confined while it steps too: SQLite prepares statements of its own while stepping some,
         // and reprepares after a schema change.
         let _user = UserStatement::enter(confinement);
-        let _interruptible = Interruptible::watch(conn, interrupt);
+        let _interruptible = Interruptible::watch(confinement, interrupt);
         let mut stepping = prepared.raw_query();
         loop {
             let row = match stepping.next() {
@@ -568,7 +568,6 @@ fn sendable(value: ValueRef<'_>) -> Result<Value, StatementError> {
 fn columns(prepared: &Statement<'_>) -> Vec<ResultColumn> {
     prepared
         .columns()
-        .into_iter()
         .map(|column| ResultColumn {
             name: Some(column.name().to_owned()),
             decltype: column.decl_type().map(str::to_owned),
