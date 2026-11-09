@@ -1557,3 +1557,56 @@ fn a_write_whose_statements_finished_commits_whatever_its_interrupt_says_after()
     assert_eq!(values(&mut db)?, [[Value::Integer(1)], [Value::Integer(2)]]);
     Ok(())
 }
+
+#[test]
+fn a_user_statement_with_the_text_of_an_adapter_statement_is_still_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    let mark = Position::new([1; 20]);
+    db.stage("audit", &mark);
+    // The write records the mark, so the adapter's upsert is in the writer's statement cache.
+    exec(&mut db, "INSERT INTO t VALUES (2)")?;
+
+    // The adapter's upsert of a sink mark, word for word, with the user's own parameters.
+    let forged = db.execute(
+        &Transaction::from(Statement::with_params(
+            "INSERT INTO _fleetring_sinks (sink, position) VALUES (?1, ?2) \
+             ON CONFLICT (sink) DO UPDATE SET position = excluded.position",
+            [Value::from("audit"), Value::Blob(vec![0xff; 20])],
+        )),
+        &Interrupt::new(),
+    );
+    assert_eq!(refusal(forged)?, reserved_refusal());
+    assert_eq!(
+        db.marks()?,
+        BTreeMap::from([("audit".to_owned(), mark)]),
+        "the mark is the adapter's"
+    );
+    // The adapter's read of the change table's bounds, now in the reader's statement cache.
+    db.start_recording(CaptureMode::After)?;
+    let start = db.position()?;
+    exec(&mut db, "INSERT INTO t VALUES (3)")?;
+    let end = db.position()?.ok_or("a position")?;
+    db.changes_between(start.as_ref(), &end)?;
+    let read = query(
+        &mut db,
+        &format!(
+            "SELECT min(change_id), max(change_id) FROM \"{}\"",
+            changes::CHANGES_TABLE
+        ),
+    );
+    assert_eq!(refusal(read)?, reserved_refusal());
+    // Its check of a reserved table's shape names the table only as a parameter.
+    let shape = db.query(
+        &Statement::with_params(
+            "SELECT type, wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+            [Value::from(changes::CHANGES_TABLE)],
+        ),
+        &Interrupt::new(),
+    );
+    assert!(
+        refusal(shape)?.contains("table_list"),
+        "refused as the pragma it is"
+    );
+    Ok(())
+}

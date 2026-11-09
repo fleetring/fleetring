@@ -36,6 +36,14 @@ pub(super) fn is_reserved(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_PREFIX.as_bytes()))
 }
 
+/// Whether `sql` mentions the reserved prefix anywhere, in any ASCII case: in a name, a string, or
+/// a comment alike.
+pub(super) fn mentions_reserved(sql: &str) -> bool {
+    sql.as_bytes()
+        .windows(RESERVED_PREFIX.len())
+        .any(|window| window.eq_ignore_ascii_case(RESERVED_PREFIX.as_bytes()))
+}
+
 /// The schema versions of `main` and `temp`. Every schema change in either moves its version.
 type Versions = (i64, i64);
 
@@ -266,9 +274,13 @@ fn find_foreign(conn: &Connection) -> Result<Option<Foreign>, EngineError> {
 }
 
 /// What differs between `main`'s table named `own.name` and the table the adapter creates.
+///
+/// Its statements take the reserved name as a parameter, so their text doesn't mention the
+/// reserved prefix; they are prepared afresh, never cached, so that no user statement of the same
+/// text can take them from the cache and run them on a reserved table (see `prepare_user`).
 fn shape_mismatch(conn: &Connection, own: &OwnTable) -> Result<Option<&'static str>, EngineError> {
     let (kind, without_rowid, strict): (String, bool, bool) = conn
-        .prepare_cached(
+        .prepare(
             "SELECT type, wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
         )
         .map_err(storage)?
@@ -280,7 +292,7 @@ fn shape_mismatch(conn: &Connection, own: &OwnTable) -> Result<Option<&'static s
         return Ok(Some("a table of another kind"));
     }
     let mut statement = conn
-        .prepare_cached(
+        .prepare(
             "SELECT name, type, \"notnull\", pk, dflt_value IS NULL AND hidden = 0
                FROM pragma_table_xinfo(?1, 'main') ORDER BY cid",
         )
