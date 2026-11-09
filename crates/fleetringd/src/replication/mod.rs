@@ -793,11 +793,18 @@ impl Replication {
         limit: Duration,
         ready: impl Fn(&Inner, &Primary, &Quorum) -> bool,
     ) -> bool {
-        let Some(primary) = self.inner.primary(database) else {
+        if self.inner.primary(database).is_none() {
             return false;
-        };
+        }
         let poll = self.inner.settings.retry_interval;
-        let holds = || ready(&self.inner, &primary, &self.inner.followers_of(&primary));
+        // The primary serving now, not the one serving when the wait began: serving again at
+        // the same epoch from a known position, as a fork's first primary does once it has
+        // opened its copy, replaces it, and the replaced one's streams never connect.
+        let holds = || {
+            self.inner.primary(database).is_some_and(|primary| {
+                ready(&self.inner, &primary, &self.inner.followers_of(&primary))
+            })
+        };
         tokio::time::timeout(limit, async {
             while !holds() {
                 tokio::time::sleep(poll).await;
