@@ -10,7 +10,11 @@ use crate::common::{SoftwareMix, config, fixed_ops, record, record_with};
 const LOG_LEN: usize = 4_000;
 
 /// Replays `log` from scratch and checks it reaches `final_state` with the same `outcomes`.
-fn check_replay_from_scratch(log: &[Command], outcomes: &[Outcome], final_state: &State) {
+pub(crate) fn check_replay_from_scratch(
+    log: &[Command],
+    outcomes: &[Outcome],
+    final_state: &State,
+) {
     let mut replayed = State::new(config());
     let replayed_outcomes: Vec<_> = log
         .iter()
@@ -23,7 +27,11 @@ fn check_replay_from_scratch(log: &[Command], outcomes: &[Outcome], final_state:
 
 /// Snapshots the state at several points of `log`, restores each snapshot, and replays the rest
 /// of the log from it.
-fn check_replay_from_snapshots(log: &[Command], outcomes: &[Outcome], final_state: &State) {
+pub(crate) fn check_replay_from_snapshots(
+    log: &[Command],
+    outcomes: &[Outcome],
+    final_state: &State,
+) {
     for split in [1, log.len() / 3, log.len() / 2, log.len() - 1] {
         let mut state = State::new(config());
         for command in &log[..split] {
@@ -54,7 +62,11 @@ fn check_replay_from_snapshots(log: &[Command], outcomes: &[Outcome], final_stat
 }
 
 /// Serializes `log` and its `outcomes`, decodes them, and replays the decoded log.
-fn check_replay_through_serialization(log: &[Command], outcomes: &[Outcome], final_state: &State) {
+pub(crate) fn check_replay_through_serialization(
+    log: &[Command],
+    outcomes: &[Outcome],
+    final_state: &State,
+) {
     let encoded = serde_json::to_string(log).expect("log serializes");
     let decoded: Vec<Command> = serde_json::from_str(&encoded).expect("log deserializes");
     assert_eq!(decoded, log);

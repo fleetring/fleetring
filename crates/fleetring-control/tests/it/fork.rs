@@ -368,10 +368,21 @@ fn every_fork_command_with_another_identity_is_refused_first() {
                 cause: RetryCause::TransferFailed,
                 exclude_seeder: None,
             },
+            Action::RecordForkDiskRefusal {
+                fork: fork.clone(),
+                attempt: 1,
+                node: id("n0"),
+            },
             Action::FailFork {
                 fork: fork.clone(),
                 attempt: 1,
                 reason: ForkFailure::SourceGone,
+            },
+            Action::DropForkHolder {
+                fork: fork.clone(),
+                attempt: 1,
+                holder: id("n0"),
+                cause: RetryCause::HoldersLeft,
             },
             Action::MarkForkReady {
                 fork: fork.clone(),
