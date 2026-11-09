@@ -1,0 +1,22 @@
+[package]
+name = "fleetring-wal-sqlite-tests"
+description = "Checks fleetring-wal's WAL format against WAL files written by real SQLite."
+version = "0.0.0"
+publish = false
+edition.workspace = true
+# rusqlite needs 1.89, the daemon's toolchain (ADR-0015, point 7). `fleetring-wal` itself stays
+# on the libraries' 1.88, which is why these tests live here and not in its own tests.
+rust-version = "1.89"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+fleetring-wal = { path = "../fleetring-wal" }
+proptest.workspace = true
+rusqlite.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

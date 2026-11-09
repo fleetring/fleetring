@@ -1,8 +1,5 @@
 //! Hand-built WAL bytes, written independently of the crate's own encoder.
 
-#[cfg(not(target_family = "wasm"))]
-pub(crate) mod sqlite;
-
 use fleetring_wal::ChecksumOrder;
 
 /// Both checksum byte orders, for tests that must pass in each.

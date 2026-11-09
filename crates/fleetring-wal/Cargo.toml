@@ -16,10 +16,8 @@ thiserror.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 
-# Real SQLite checks the format end to end. It needs a C toolchain and files, so it stays off wasm.
-[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-rusqlite = { version = "0.37", features = ["bundled"] }
-tempfile = "3"
+# Real SQLite checks the format end to end in `fleetring-wal-sqlite-tests`, which needs the newer
+# toolchain rusqlite does.
 
 [lints]
 workspace = true

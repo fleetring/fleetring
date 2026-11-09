@@ -772,9 +772,17 @@ name = "fleetring-wal"
 version = "0.0.0"
 dependencies = [
  "proptest",
+ "thiserror",
+]
+
+[[package]]
+name = "fleetring-wal-sqlite-tests"
+version = "0.0.0"
+dependencies = [
+ "fleetring-wal",
+ "proptest",
  "rusqlite",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]
