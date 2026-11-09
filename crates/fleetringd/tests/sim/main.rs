@@ -13,6 +13,7 @@ mod durability;
 mod expiry;
 mod failover;
 mod fleet;
+mod fork;
 mod history;
 mod membership;
 mod observe;

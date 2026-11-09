@@ -375,7 +375,7 @@ pub fn acknowledged_control_survives(state: &State, history: &History) -> Result
         .collect();
     for (operation, ack) in history.acknowledged() {
         match (operation, ack) {
-            (Operation::Join { node }, Ack::Joined { .. }) => {
+            (Operation::Join { node } | Operation::JoinWith { node, .. }, Ack::Joined { .. }) => {
                 if state.member(node).is_none() && !leaving.contains(&node) {
                     return Err(violation(format!("acknowledged member {node} is lost")));
                 }
