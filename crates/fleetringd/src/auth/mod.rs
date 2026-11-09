@@ -8,7 +8,9 @@
 //! it bounds what an agent's token may delegate ([`Scopes::grant_step`]).
 //!
 //! Every `match` over an enum here lists its variants, so that a new action, caller, or peer
-//! can't fall through a wildcard arm to a permissive one (ADR-0044, point 3.6).
+//! can't fall through a wildcard arm to a permissive one. ADR-0044 §3.6 names the example: the
+//! `_ =>` arm of `resolve_identified` mapped any peer that is neither a node nor a principal to
+//! `Caller::Anonymous`, which `Caller::authorize` lets make every call.
 #![deny(clippy::wildcard_enum_match_arm)]
 
 mod binding;
@@ -26,7 +28,9 @@ pub use boundary::{
 };
 pub use denylist::Denylist;
 pub use policy::{Caller, Credential, Denied, ForNodes, Needed, RPCS, Requirement, Rpc, rpc_at};
-pub use scope::{Action, GrantStepError, ParseScopeError, Scope, Scopes, Target};
+pub use scope::{
+    Action, GrantStepError, MAX_SCOPES, ParseScopeError, Scope, Scopes, Target, TooManyScopes,
+};
 pub use token::{
     BearerToken, DEFAULT_TOKEN_LIFETIME, IssueError, MAX_TOKEN_LEN, MAX_TOKEN_LIFETIME,
     NOT_BEFORE_LEEWAY_SECS, TokenError, TokenSigner, TokenSpec, TokenVerifier, Verified,
