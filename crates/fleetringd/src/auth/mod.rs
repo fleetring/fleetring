@@ -20,7 +20,7 @@ mod policy;
 mod scope;
 mod token;
 
-pub use binding::{BINDING_KEY, Binding, BindingDenied, Unbound, refused_binding};
+pub use binding::{BINDING_KEY, Binding, BindingDenied, SeedingMismatch, Unbound, refused_binding};
 pub(crate) use boundary::Refusal;
 pub use boundary::{
     AUTHORIZATION, AuthLayer, AuthService, Authorized, Authorizer, BoxStream, STREAM_RECHECK,

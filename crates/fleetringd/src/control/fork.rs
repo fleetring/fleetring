@@ -72,6 +72,14 @@ pub(super) fn role_from_proto(role: i32, database: &str) -> Result<ReplicaRole, 
     }
 }
 
+/// The role a data node's own status names: primary, or else follower.
+pub(crate) fn role_from_status(role: i32) -> ReplicaRole {
+    match proto::ReplicaRole::try_from(role) {
+        Ok(proto::ReplicaRole::Primary) => ReplicaRole::Primary,
+        _ => ReplicaRole::Follower,
+    }
+}
+
 /// The protocol form of a replica's role.
 pub(super) fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
     match role {
@@ -188,13 +196,6 @@ fn seed_failure_reason(reason: i32, retryable: bool) -> Option<SeedFailureReason
     }
 }
 
-#[cfg_attr(
-    not(any(test, feature = "simulation")),
-    expect(
-        dead_code,
-        reason = "the simulation's reports use it until data nodes report forks (FR-085, stage C)"
-    )
-)]
 fn seed_failure_reason_to_proto(reason: SeedFailureReason) -> proto::SeedFailureReason {
     match reason {
         SeedFailureReason::InsufficientDisk => proto::SeedFailureReason::InsufficientDisk,
@@ -208,13 +209,6 @@ fn seed_failure_reason_to_proto(reason: SeedFailureReason) -> proto::SeedFailure
 
 /// The status a heartbeat carries for `replica`, with `progress` if it streams a copy: what a
 /// data node sends, and what [`replica_from_proto`] reads back.
-#[cfg_attr(
-    not(any(test, feature = "simulation")),
-    expect(
-        dead_code,
-        reason = "the simulation's reports use it until data nodes report forks (FR-085, stage C)"
-    )
-)]
 pub(crate) fn replica_to_proto(
     replica: &HostedReplica,
     progress: Option<&SeedProgress>,
@@ -428,13 +422,27 @@ pub(crate) fn fork_status(
             chain_hash,
             holders,
             completed_at,
-            ..
+            lease_from,
         } => {
             status.attempt = *attempt;
             status.holders = names(holders);
             status.position = Some(at.as_bytes().to_vec());
             status.chain_hash = Some(chain_hash.as_bytes().to_vec());
             status.completed_at_ms = Some(completed_at.as_millis());
+            // The reset the current primary reports committed, which its followers report in
+            // turn once their logs hold it (ADR-0046, point 6.2).
+            let primary_reset = db
+                .lease()
+                .filter(|lease| lease.epoch() == db.epoch() && db.epoch() > *lease_from)
+                .and_then(|lease| state.report(lease.holder(), db.name()))
+                .and_then(Report::reset)
+                .filter(|reset| {
+                    reset.is_committed() && *reset.fork() == identity && reset.epoch() == db.epoch()
+                });
+            if let Some(reset) = primary_reset {
+                status.reset_epoch = Some(reset.epoch().get());
+                status.reset_position = Some(reset.position().as_bytes().to_vec());
+            }
         }
         ForkState::Ready {
             at,

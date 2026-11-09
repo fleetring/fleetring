@@ -207,6 +207,11 @@ async fn run(node: DataNode, settings: LeaseSettings) {
                     let node = node.clone();
                     let dropped_found = dropped_found.clone();
                     checking.spawn(async move {
+                        if let (Some(incarnation), Some(operation)) =
+                            (notice.incarnation, notice.operation)
+                        {
+                            drop_staged(&node, &database, incarnation, operation).await;
+                        }
                         drop_seen(&node, &database, notice.epoch, &dropped_found).await;
                     });
                 }
@@ -595,6 +600,35 @@ async fn drop_seen(
     discard(node, database).await;
 }
 
+/// Acts on a drop notice that names a fork identity (ADR-0046, point 4.6): deletes this node's
+/// staged copies of `database` at `incarnation` made by `operation`, of every attempt, if control
+/// state agrees, judged again under the name's lock, that it no longer holds that fork: it holds
+/// no database of the name, or one of another incarnation. Its fetches stop too.
+async fn drop_staged(
+    node: &DataNode,
+    database: &DatabaseName,
+    incarnation: fleetring_control::Incarnation,
+    operation: fleetring_control::fork::OperationId,
+) {
+    let _name = node.lock_name(database).await;
+    let fork = fleetring_control::fork::ForkIdentity::new(database.clone(), incarnation, operation);
+    let gone = match node.locate(database).await {
+        Ok(placement) => placement.incarnation != incarnation.get(),
+        Err(status) if missing_database(&status).is_some() => true,
+        Err(status) => {
+            tracing::info!(%fork, %status, "can't confirm a fork's drop notice with the control plane; kept its staged copies");
+            return;
+        }
+    };
+    if !gone {
+        tracing::info!(%fork, "the control plane still holds the fork a drop notice names; kept its staged copies");
+        return;
+    }
+    node.replication()
+        .delete_fork_copies(&fork, "a drop notice naming its identity")
+        .await;
+}
+
 /// Whether this node's copy of `database` comes from a database that was dropped and created
 /// again under the name: the control plane never issues an epoch below one a replica has seen, so
 /// a placement below the recorded epoch belongs to a new database.
@@ -670,6 +704,9 @@ async fn carry_out(
             "{database} has moved past epoch {epoch}"
         )));
     }
+    // A holder of a fork that isn't ready, which never followed its first primary, fences and
+    // ranks with its verified staged copy (ADR-0046, point 6.2).
+    replication.install_holder_copy(database).await?;
     let me = node.id().clone();
     let replicas = replication.replica_set(database, request.replication_factor);
     if !replicas.contains(&me) {

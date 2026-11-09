@@ -346,20 +346,85 @@ impl DataMetrics {
     }
 }
 
-/// The replication families, which a node's streams, followers, and snapshots update.
+/// A histogram over long durations, as a fork's pin or readiness takes: from 0.1 s, doubling,
+/// up to about an hour.
+fn long_duration_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.1, 2.0, 16))
+}
+
+/// A histogram over sizes, from 64 KiB, each bucket four times the last, up to about 256 GiB.
+fn bytes_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(65_536.0, 4.0, 12))
+}
+
+/// The replication families, which a node's streams, followers, and snapshots update, with
+/// the data side of forks (ADR-0046, point 11).
 ///
 /// A `Default` handle counts without being registered anywhere; the daemon passes the one its
 /// [`Metrics`] registered.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReplicationMetrics {
     batches_sent: Counter,
     sent_bytes: Counter,
     batches_applied: Counter,
     snapshots_sent: Counter,
     reseeds: Counter,
+    fork_attempts: Outcomes,
+    fork_seed_bytes: Histogram,
+    fork_pin_duration: Histogram,
+    fork_pinned_wal: Gauge,
+    fork_reserved: Gauge,
+}
+
+impl Default for ReplicationMetrics {
+    fn default() -> Self {
+        Self {
+            batches_sent: Counter::default(),
+            sent_bytes: Counter::default(),
+            batches_applied: Counter::default(),
+            snapshots_sent: Counter::default(),
+            reseeds: Counter::default(),
+            fork_attempts: Outcomes::with(names::OUTCOMES_FORK_ATTEMPT),
+            fork_seed_bytes: bytes_histogram(),
+            fork_pin_duration: long_duration_histogram(),
+            fork_pinned_wal: Gauge::default(),
+            fork_reserved: Gauge::default(),
+        }
+    }
 }
 
 impl ReplicationMetrics {
+    /// A fetch of a fork's copy that ended with `outcome`, one of
+    /// [`OUTCOMES_FORK_ATTEMPT`](names::OUTCOMES_FORK_ATTEMPT).
+    pub(crate) fn fork_attempt(&self, outcome: &'static str) {
+        self.fork_attempts.inc(outcome);
+    }
+
+    /// A copy of `bytes` staged.
+    pub(crate) fn fork_seed_bytes(&self, bytes: u64) {
+        self.fork_attempts.inc("staged");
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a histogram observation; precision past 2^53 bytes is moot"
+        )]
+        self.fork_seed_bytes.observe(bytes as f64);
+    }
+
+    /// A seeding pin held for `held`.
+    pub(crate) fn fork_pin(&self, held: Duration) {
+        self.fork_pin_duration.observe(held.as_secs_f64());
+    }
+
+    /// The WAL bytes the seeding pins hold now.
+    pub(crate) fn fork_pinned_wal_bytes(&self, bytes: u64) {
+        self.fork_pinned_wal.set(gauge_value_u64(bytes));
+    }
+
+    /// The disk reserved for copies being fetched now.
+    pub(crate) fn fork_reserved_bytes(&self, bytes: u64) {
+        self.fork_reserved.set(gauge_value_u64(bytes));
+    }
+
     /// A batch of `bytes` payload bytes sent to a follower.
     pub(crate) fn batch_sent(&self, bytes: usize) {
         self.batches_sent.inc();
@@ -389,6 +454,8 @@ pub struct ControlMetrics {
     log_index: Gauge,
     log_write_duration: Histogram,
     snapshot_index: Gauge,
+    forks: Outcomes,
+    fork_ready_duration: Histogram,
 }
 
 impl Default for ControlMetrics {
@@ -398,6 +465,8 @@ impl Default for ControlMetrics {
             log_index: Gauge::default(),
             log_write_duration: duration_histogram(),
             snapshot_index: Gauge::default(),
+            forks: Outcomes::with(names::OUTCOMES_FORK),
+            fork_ready_duration: long_duration_histogram(),
         }
     }
 }
@@ -435,6 +504,15 @@ impl ControlMetrics {
 
     pub(crate) fn snapshot_saved(&self, index: u64) {
         self.snapshot_index.set(gauge_value_u64(index));
+    }
+
+    /// A fork that reached `outcome`, one of [`OUTCOMES_FORK`](names::OUTCOMES_FORK), `ready`
+    /// after `took` from its request.
+    pub(crate) fn fork_finished(&self, outcome: &'static str, took: Option<Duration>) {
+        self.forks.inc(outcome);
+        if let Some(took) = took {
+            self.fork_ready_duration.observe(took.as_secs_f64());
+        }
     }
 }
 
@@ -788,6 +866,31 @@ impl Metrics {
         r.add(
             "fleetring_change_backlog_batches_max",
             sampled.change_backlog_max.clone(),
+        );
+        r.add("fleetring_forks", control.forks.0.clone());
+        r.add(
+            "fleetring_fork_ready_seconds",
+            control.fork_ready_duration.clone(),
+        );
+        r.add(
+            "fleetring_fork_attempts",
+            replication.fork_attempts.0.clone(),
+        );
+        r.add(
+            "fleetring_fork_seed_bytes",
+            replication.fork_seed_bytes.clone(),
+        );
+        r.add(
+            "fleetring_fork_pin_seconds",
+            replication.fork_pin_duration.clone(),
+        );
+        r.add(
+            "fleetring_fork_pinned_wal_bytes",
+            replication.fork_pinned_wal.clone(),
+        );
+        r.add(
+            "fleetring_fork_reserved_disk_bytes",
+            replication.fork_reserved.clone(),
         );
         debug_assert_eq!(registrar.next, FAMILIES.len(), "every family is registered");
         Self {

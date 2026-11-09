@@ -499,7 +499,7 @@ impl Database for DatabaseService {
                 replicated: status.home == Some(MarkHome::Replicated),
             })
             .collect();
-        let orphans = replication
+        let mut orphans: Vec<OrphanStatus> = replication
             .orphans()
             .await
             .into_iter()
@@ -508,8 +508,28 @@ impl Database for DatabaseService {
                 database: orphan.database.to_string(),
                 epoch: orphan.epoch.get(),
                 bytes: orphan.bytes,
+                staged: None,
             })
             .collect();
+        orphans.extend(
+            replication
+                .forks()
+                .store()
+                .orphans()
+                .into_iter()
+                .filter(|(key, _)| caller.sees(Action::Read, &key.fork.name))
+                .map(|(key, bytes)| OrphanStatus {
+                    database: key.fork.name.to_string(),
+                    epoch: 0,
+                    bytes,
+                    staged: Some(fleetring_proto::v1::StagedOrphan {
+                        fork_incarnation: key.fork.incarnation.get(),
+                        operation: key.fork.operation.to_bytes().to_vec(),
+                        attempt: key.attempt,
+                    }),
+                }),
+        );
+        orphans.sort_by(|a, b| a.database.cmp(&b.database));
         Ok(Response::new(NodeStatusResponse {
             node_id: self.node.id().to_string(),
             membership_epoch: view.epoch().get(),
@@ -536,6 +556,18 @@ impl Database for DatabaseService {
         request: Request<RemoveOrphanRequest>,
     ) -> Result<Response<RemoveOrphanResponse>, Status> {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
+        if let Some(staged) = &request.get_ref().staged {
+            let key = crate::replication::fork::staged::StagedKey {
+                fork: fleetring_control::fork::ForkIdentity::new(
+                    name,
+                    fleetring_control::Incarnation::new(staged.fork_incarnation),
+                    crate::control::fork::operation_from_proto(&staged.operation)?,
+                ),
+                attempt: staged.attempt,
+            };
+            self.node.remove_staged_orphan(&key).await?;
+            return Ok(Response::new(RemoveOrphanResponse { epoch: 0 }));
+        }
         let epoch = self.node.remove_orphan(&name).await?;
         Ok(Response::new(RemoveOrphanResponse { epoch: epoch.get() }))
     }

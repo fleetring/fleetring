@@ -28,9 +28,9 @@ pub fn release() -> Release {
 /// Returns the software this build runs: its release, the control-log format it reads, and the
 /// fleet features it supports. A release reports a feature only once it acts on every command
 /// the feature covers (ADR-0041, point 3): this one carries out all of them, `expiry` included,
-/// since its control node sweeps expired databases, except [`Feature::Fork`]. Its control state
-/// represents and drives forks (ADR-0046), but its data nodes don't seed them yet, so no fleet
-/// of this build can enable forks.
+/// since its control node sweeps expired databases, and [`Feature::Fork`], since its control
+/// state drives forks and its data nodes seed them, open them only after their fork-reset write,
+/// and gate them until then (ADR-0046).
 #[must_use]
 pub fn running() -> Software {
     SUPPORTED.into_iter().fold(
@@ -39,9 +39,13 @@ pub fn running() -> Software {
     )
 }
 
-/// The fleet features this build acts on in full. `fork` joins once data nodes seed forks
-/// (#135).
-const SUPPORTED: [Feature; 3] = [Feature::Undrain, Feature::Metadata, Feature::Expiry];
+/// The fleet features this build acts on in full.
+const SUPPORTED: [Feature; 4] = [
+    Feature::Undrain,
+    Feature::Metadata,
+    Feature::Expiry,
+    Feature::Fork,
+];
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
 /// release, the protocol, the control-log format, the fleet features, and `config_check`, true
@@ -98,13 +102,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn this_build_reports_a_release_with_every_feature_but_fork() {
+    fn this_build_reports_a_release_with_every_feature() {
         let software = running();
         assert_eq!(software.release().to_string(), VERSION);
         assert!(
             Feature::ALL
                 .into_iter()
-                .all(|feature| software.supports(feature) == (feature != Feature::Fork))
+                .all(|feature| software.supports(feature))
         );
         assert_eq!(
             software_from_proto(software_to_proto(&software)).expect("valid"),
@@ -116,7 +120,7 @@ mod tests {
         assert_eq!(stored["features"], serde_json::json!(["undrain"]));
         assert_eq!(
             stored["newer_features"],
-            serde_json::json!(["expiry", "metadata"])
+            serde_json::json!(["expiry", "fork", "metadata"])
         );
         // `upgrade --software` lists `expiry` now that the control node sweeps expired
         // databases (ADR-0041, point 3).
@@ -124,7 +128,7 @@ mod tests {
             serde_json::from_str(&running_json()).expect("upgrade --software prints JSON");
         assert_eq!(
             printed["features"],
-            serde_json::json!(["undrain", "metadata", "expiry"])
+            serde_json::json!(["undrain", "metadata", "expiry", "fork"])
         );
         // An upgrade runs this build's `serve --check` before it swaps it in (#95).
         assert_eq!(printed["config_check"], serde_json::json!(true));

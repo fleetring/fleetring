@@ -634,6 +634,29 @@ fn placement(
     })
 }
 
+/// The forks that aren't ready yet whose replica set names `node`: those it seeds, or opens
+/// once seeded (ADR-0046, points 4 and 6).
+fn pending_forks(state: &State, node: &NodeId) -> Vec<String> {
+    state
+        .databases()
+        .filter(|database| {
+            database.fork().is_some_and(|fork| {
+                matches!(
+                    fork.state(),
+                    fleetring_control::fork::ForkState::Seeding { .. }
+                        | fleetring_control::fork::ForkState::Seeded { .. }
+                )
+            })
+        })
+        .filter(|database| {
+            state
+                .replica_set(database.name())
+                .is_ok_and(|replicas| replicas.contains(node))
+        })
+        .map(|database| database.name().to_string())
+        .collect()
+}
+
 /// What a membership update says about a member besides its attributes, which changes without
 /// the membership epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -942,6 +965,7 @@ impl Control for ControlService {
             membership_epoch: state.membership_epoch().get(),
             unknown_databases,
             revocations: revocations_to_proto(state.revocations()),
+            forks: pending_forks(&state, &id),
         }))
     }
 

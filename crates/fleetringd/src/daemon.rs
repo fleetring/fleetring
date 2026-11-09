@@ -18,7 +18,9 @@ use crate::control::{
     ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService, Failover,
     FailoverSettings, NoControl, OpenError,
 };
-use crate::data::{DataNode, DatabaseService, DrainSettings, LeaseKeeper, LeaseSettings};
+use crate::data::{
+    DataNode, DatabaseService, DrainSettings, ForkKeeper, LeaseKeeper, LeaseSettings,
+};
 use crate::dev::DevMode;
 use crate::durability::{Archive, ArchiveError, ArchiveParts, ControlMetadata, build_store};
 use crate::engine::{DatabaseEngine, Execution, InvalidPageSizeError, SqliteEngine};
@@ -95,6 +97,9 @@ struct DataRole {
     changes: ChangeStreams,
     node: DataNode,
     keeper: LeaseKeeper,
+    /// The node's fork work: seeding, the first lease of a seeded fork, and deleting staged
+    /// copies on signals (ADR-0046).
+    forks: ForkKeeper,
     drain: DrainSettings,
 }
 
@@ -471,6 +476,7 @@ impl Daemon {
                     // fence this node and clients get redirected.
                     data.node.drain_before_leaving(data.drain).await;
                 }
+                drop(data.forks);
                 drop(data.keeper);
                 match stop {
                     Stop::Restart => data.tasks.stop_without_leaving().await,
@@ -715,6 +721,7 @@ fn start_data(
         },
     );
     statuses.set(replication.clone());
+    replication.configure_forks(config.fork, environment.fork_faults());
     let mut sinks = config
         .changes
         .sink
@@ -751,6 +758,7 @@ fn start_data(
             drop_flush_limit: environment.drop_flush_limit(),
         },
     );
+    let forks = ForkKeeper::start(node.clone(), config.membership.heartbeat_interval());
     let role = DataRole {
         membership,
         tasks,
@@ -758,6 +766,7 @@ fn start_data(
         changes,
         node: node.clone(),
         keeper,
+        forks,
         drain,
     };
     Ok((role, node))
@@ -811,6 +820,10 @@ impl DatabaseStatuses for ReplicationStatuses {
             .get()
             .map(DatabaseStatuses::statuses)
             .unwrap_or_default()
+    }
+
+    fn disk_free_bytes(&self) -> Option<u64> {
+        self.0.get().and_then(DatabaseStatuses::disk_free_bytes)
     }
 }
 

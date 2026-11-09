@@ -39,6 +39,42 @@ pub(crate) struct HeldLease {
     /// them, as a promotion's is, learns them from the control plane before it is served
     /// ([`DataNode::start_serving`]).
     pub(crate) durability: Option<Durability>,
+    /// Whether the database is a fork that isn't ready, as the placement the lease came with
+    /// says; [`ForkGate::Unknown`] for a lease built without one, which learns it with its
+    /// durability settings.
+    pub(crate) fork: ForkGate,
+    /// The database's incarnation, from the placement the lease came with, if it came with one.
+    pub(crate) incarnation: Option<fleetring_control::Incarnation>,
+}
+
+/// What a placement says about the fork that made a database, for its primary's readiness gate
+/// (ADR-0046, point 6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkGate {
+    /// No fork made the database: it is served as soon as it is led.
+    Ordinary,
+    /// A fork made it and isn't ready: no client is served until its reset commits.
+    Pending,
+    /// A fork made it and is ready: it is served once its copy shows the fork's marker.
+    Ready,
+    /// Not known yet.
+    Unknown,
+}
+
+impl ForkGate {
+    /// What `placement` says.
+    pub(crate) fn of(placement: &Placement) -> Self {
+        use fleetring_proto::v1::ForkState;
+        match placement
+            .fork
+            .as_ref()
+            .map(|fork| ForkState::try_from(fork.state))
+        {
+            None => Self::Ordinary,
+            Some(Ok(ForkState::Ready)) => Self::Ready,
+            Some(_) => Self::Pending,
+        }
+    }
 }
 
 impl HeldLease {
@@ -64,6 +100,8 @@ impl HeldLease {
             epoch: LeaseEpoch::new(placement.epoch),
             replication_factor,
             durability: Some(durability_of(placement, replication_factor)),
+            fork: ForkGate::of(placement),
+            incarnation: Some(fleetring_control::Incarnation::new(placement.incarnation)),
         }
     }
 
@@ -74,6 +112,8 @@ impl HeldLease {
             epoch,
             replication_factor,
             durability: None,
+            fork: ForkGate::Unknown,
+            incarnation: None,
         }
     }
 
@@ -224,6 +264,9 @@ impl Drop for Counted<'_> {
         });
     }
 }
+
+/// How long a client should wait before it retries a call to a fork that isn't ready.
+const FORK_NOT_READY_RETRY: Duration = Duration::from_millis(500);
 
 /// What a node answers a creation or restore of a name whose dropped database it is still
 /// flushing or deleting; a client retries it ([`DataNode::check_not_dropping`]).
@@ -470,6 +513,29 @@ impl DataNode {
         Ok(epoch)
     }
 
+    /// Deletes this node's staged orphan `key` at an operator's request (ADR-0046, point 4.6).
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if the node keeps no staged orphan of that name, identity, and attempt.
+    pub(crate) async fn remove_staged_orphan(
+        &self,
+        key: &crate::replication::fork::staged::StagedKey,
+    ) -> Result<(), Status> {
+        let _creating = self.inner.creating.lock(&key.fork.name).await;
+        let replication = self.replication();
+        if !replication.forks().store().is_orphan(key) {
+            return Err(Status::not_found(format!(
+                "node {} keeps no staged orphan of {} for attempt {}",
+                self.inner.id, key.fork, key.attempt
+            )));
+        }
+        replication
+            .delete_staged(key, "an operator's request")
+            .await;
+        Ok(())
+    }
+
     /// Refuses a new database named `name` while this node still holds a dropped database of
     /// that name: it serves it, or is flushing and deleting its copy. Creating the new one now
     /// would open the old files as its own, and the old copy's deletion would then take them.
@@ -477,7 +543,7 @@ impl DataNode {
     /// # Errors
     ///
     /// `UNAVAILABLE` saying the name [`BEING_DROPPED`]; a client retries it.
-    fn check_not_dropping(&self, name: &DatabaseName) -> Result<(), Status> {
+    pub(super) fn check_not_dropping(&self, name: &DatabaseName) -> Result<(), Status> {
         if self.lock_retiring().contains_key(name) || self.inner.replication.serving(name).is_some()
         {
             return Err(Status::unavailable(format!("{name} {BEING_DROPPED}")));
@@ -495,7 +561,7 @@ impl DataNode {
     ///
     /// `FAILED_PRECONDITION` naming the orphan, its node, and its epoch, and the command that
     /// removes it.
-    fn refuse_orphan(&self, name: &DatabaseName) -> Result<(), Status> {
+    pub(super) fn refuse_orphan(&self, name: &DatabaseName) -> Result<(), Status> {
         let Some(epoch) = self.inner.replication.highest_epoch(name) else {
             return Ok(());
         };
@@ -570,6 +636,9 @@ impl DataNode {
         // copy this one installs.
         let _creating = self.inner.creating.lock(name).await;
         let placement = self.locate(name).await?;
+        if ForkGate::of(&placement) == ForkGate::Pending {
+            refuse_fork(name, &placement, "restored")?;
+        }
         let id = self.inner.id.as_str();
         if placement.epoch > 0 || placement.primary.is_some() {
             return Err(Status::failed_precondition(format!(
@@ -675,6 +744,15 @@ impl DataNode {
     /// refusal is checked and the request counted under one lock, so a drain that refuses
     /// requests afterwards sees every request admitted before it.
     fn admit(&self, name: &DatabaseName, lease: HeldLease) -> Result<Admitted<'_>, Status> {
+        if self.inner.replication.is_gated(name) {
+            return Err(crate::replication::fork::with_retry_after(
+                Status::unavailable(format!(
+                    "database {name} is a fork that isn't ready: its fork-reset write hasn't \
+                     committed yet; retry"
+                )),
+                FORK_NOT_READY_RETRY,
+            ));
+        }
         let refusing = self.refusing();
         if refusing.contains(name) {
             return Err(Status::unavailable(format!(
@@ -711,6 +789,7 @@ impl DataNode {
     pub(crate) async fn create(&self, name: &DatabaseName) -> Result<Placement, Status> {
         let _creating = self.inner.creating.lock(name).await;
         let placement = self.locate(name).await?;
+        refuse_fork(name, &placement, "created")?;
         let id = self.inner.id.as_str();
         match placement.primary.as_deref() {
             Some(primary) if primary == id => {
@@ -845,21 +924,51 @@ impl DataNode {
         lease: HeldLease,
         start: Option<crate::engine::Position>,
     ) -> Result<(), Status> {
-        let durability = match lease.durability {
-            Some(durability) => durability,
-            None => {
-                let placement = self.locate(name).await.map_err(|status| {
-                    Status::unavailable(format!(
-                        "can't learn the durability settings of {name}: {status}"
-                    ))
-                })?;
-                durability_of(&placement, lease.replication_factor)
+        let mut lease = lease;
+        if lease.durability.is_none() || lease.fork == ForkGate::Unknown {
+            let placement = self.locate(name).await.map_err(|status| {
+                Status::unavailable(format!(
+                    "can't learn the durability settings of {name}: {status}"
+                ))
+            })?;
+            lease.durability = Some(
+                lease
+                    .durability
+                    .unwrap_or_else(|| durability_of(&placement, lease.replication_factor)),
+            );
+            lease.fork = ForkGate::of(&placement);
+            lease.incarnation = Some(fleetring_control::Incarnation::new(placement.incarnation));
+        }
+        let durability = lease
+            .durability
+            .unwrap_or_else(|| Durability::quorum(lease.replication_factor));
+        // A fork that isn't known to be ready serves no client, and starts no change stream,
+        // until its primary has checked its copy and, if the copy lacks the fork's marker, run
+        // the fork-reset write at its bootstrap quorum (ADR-0046, point 6.2).
+        let gated = matches!(lease.fork, ForkGate::Pending | ForkGate::Ready);
+        if gated {
+            crate::data::fork::close_unless_open(self, name, lease.epoch);
+        }
+        if lease.fork == ForkGate::Pending {
+            // Streams start as soon as the node leads: to the recorded holders alone.
+            crate::data::fork::freeze_holders(self, name).await;
+        }
+        if let Some(incarnation) = lease.incarnation {
+            match self
+                .inner
+                .replication
+                .record_incarnation(name, incarnation)
+                .await
+            {
+                Ok(recorded) if recorded != incarnation => {
+                    tracing::warn!(database = %name, %recorded, placed = %incarnation, "this node's copy records another incarnation than the database it serves");
+                }
+                Ok(_) => {}
+                Err(status) => {
+                    tracing::warn!(database = %name, %status, "can't record the copy's incarnation");
+                }
             }
-        };
-        let lease = HeldLease {
-            durability: Some(durability),
-            ..lease
-        };
+        }
         let role =
             PrimaryRole::new(lease.replication_factor, lease.epoch).with_durability(durability);
         let serving = self.inner.replication.serving(name) == Some(role);
@@ -884,15 +993,34 @@ impl DataNode {
         }
         let _settling = Counted::begin(&self.inner.settling, name);
         self.leases().insert(name.clone(), lease);
+        if gated {
+            crate::data::fork::open_when_ready(self, name, lease);
+        }
         self.await_replicas(name).await;
         Ok(())
     }
 
     /// Records the lease `placement` names and serves the database as its primary at the lease's
     /// epoch, as [`DataNode::start_serving`] does.
-    async fn serve(&self, name: &DatabaseName, placement: &Placement) -> Result<HeldLease, Status> {
+    pub(super) async fn serve(
+        &self,
+        name: &DatabaseName,
+        placement: &Placement,
+    ) -> Result<HeldLease, Status> {
+        self.serve_at(name, placement, None).await
+    }
+
+    /// Serves `name` as [`DataNode::serve`] does, with its epoch's log beginning at `start`, as a
+    /// fork's first primary's begins at the position its staged copy holds (ADR-0046, point
+    /// 6.2).
+    pub(super) async fn serve_at(
+        &self,
+        name: &DatabaseName,
+        placement: &Placement,
+        start: Option<crate::engine::Position>,
+    ) -> Result<HeldLease, Status> {
         let lease = HeldLease::of(placement);
-        self.start_serving(name, lease, None).await?;
+        self.start_serving(name, lease, start).await?;
         Ok(lease)
     }
 
@@ -992,6 +1120,22 @@ impl Drop for NameGuard<'_> {
             map.remove(&self.name);
         }
     }
+}
+
+/// Refuses to make `name` an empty database through `Database.Create` or `Database.Restore`
+/// when `placement` shows a fork made it: its holders open their staged copies instead, and no
+/// path makes an empty database in their place (ADR-0046, point 6.2).
+///
+/// # Errors
+///
+/// `FAILED_PRECONDITION` naming the fork.
+fn refuse_fork(name: &DatabaseName, placement: &Placement, verb: &str) -> Result<(), Status> {
+    if placement.fork.is_none() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "{name} is a fork: its holders open their staged copies, so it isn't {verb} here"
+    )))
 }
 
 /// The redirect to `primary`, or `UNAVAILABLE` if the control plane knows no address for it.

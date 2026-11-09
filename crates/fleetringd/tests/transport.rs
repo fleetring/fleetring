@@ -58,6 +58,7 @@ impl Control for StubControl {
             membership_epoch: MEMBERSHIP_EPOCH,
             unknown_databases: Vec::new(),
             revocations: Vec::new(),
+            forks: Vec::new(),
         }))
     }
 

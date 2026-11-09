@@ -79,6 +79,18 @@ impl Packer {
         self.offset
     }
 
+    /// How many bytes the whole stream takes: every file's header and content.
+    pub(crate) fn total_len(&self) -> u64 {
+        self.snapshot
+            .files()
+            .iter()
+            .map(|file| {
+                let header = 2 + 8 + u64::try_from(file.name().len()).unwrap_or(u64::MAX);
+                header.saturating_add(file.len())
+            })
+            .fold(0, u64::saturating_add)
+    }
+
     /// The next up to `max` bytes of the stream, or `None` once all of it has been emitted.
     ///
     /// # Errors
@@ -146,7 +158,9 @@ impl Packer {
     }
 }
 
-fn file_header(name: &str, len: u64) -> Vec<u8> {
+/// The header that starts a file's entry in the stream: its name's length, its name, and its
+/// content's length.
+pub(crate) fn file_header(name: &str, len: u64) -> Vec<u8> {
     let name_len = u16::try_from(name.len()).unwrap_or(u16::MAX);
     let mut header = Vec::with_capacity(2 + name.len() + 8);
     header.extend_from_slice(&name_len.to_be_bytes());
@@ -163,6 +177,8 @@ pub(crate) struct Unpacker {
     dir: PathBuf,
     state: State,
     names: BTreeSet<String>,
+    /// Each file's name and length, in stream order.
+    files: Vec<(String, u64)>,
     offset: u64,
     hasher: XxHash3_128,
 }
@@ -205,6 +221,7 @@ impl Unpacker {
             dir: dir.to_owned(),
             state: State::NameLen(Vec::new()),
             names: BTreeSet::new(),
+            files: Vec::new(),
             offset: 0,
             hasher: XxHash3_128::new(),
         })
@@ -213,6 +230,11 @@ impl Unpacker {
     /// How many bytes of the stream have arrived.
     pub(crate) fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Each file the stream has started so far, with its length, in stream order.
+    pub(crate) fn files(&self) -> &[(String, u64)] {
+        &self.files
     }
 
     /// Takes the next bytes of the stream.
@@ -261,7 +283,12 @@ impl Unpacker {
                 State::ContentLen { name, mut bytes } => {
                     fill(&mut bytes, 8, &mut data);
                     match <[u8; 8]>::try_from(bytes.as_slice()) {
-                        Ok(len) => self.start_file(&name, u64::from_be_bytes(len))?,
+                        Ok(len) => {
+                            let len = u64::from_be_bytes(len);
+                            let started = self.start_file(&name, len)?;
+                            self.files.push((name, len));
+                            started
+                        }
                         Err(_) => State::ContentLen { name, bytes },
                     }
                 }

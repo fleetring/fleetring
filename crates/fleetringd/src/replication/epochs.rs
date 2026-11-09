@@ -37,6 +37,11 @@ pub(super) struct Record {
     /// The epoch this node was promoted to lead, and the position its log had then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     led: Option<Led>,
+    /// The incarnation of the database this copy belongs to (ADR-0046, point 1.3), once this
+    /// node led it: the first placement it served under names it. Absent from records written
+    /// before incarnations, and before the node first led the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation: Option<u64>,
 }
 
 /// An epoch this node leads after a promotion, and where its log began.
@@ -61,6 +66,11 @@ impl Record {
     /// The epoch of the primary that wrote the last frames of the log, 0 if unknown.
     pub(super) fn log_epoch(&self) -> u64 {
         self.log_epoch
+    }
+
+    /// The incarnation of the database this copy belongs to, once recorded.
+    pub(super) fn incarnation(&self) -> Option<fleetring_control::Incarnation> {
+        self.incarnation.map(fleetring_control::Incarnation::new)
     }
 
     /// Where the log of `epoch` began, if this node was promoted to lead it.
@@ -219,6 +229,21 @@ impl Epochs {
                 });
             }
             Ok(())
+        })
+    }
+
+    /// Records durably that this node's copy of `database` belongs to `incarnation`, unless it
+    /// recorded one already. Returns the incarnation recorded, which differs from
+    /// `incarnation` when the copy belongs to an earlier database of the name.
+    ///
+    /// It blocks on the file system when the record changes.
+    pub(super) fn record_incarnation(
+        &self,
+        database: &DatabaseName,
+        incarnation: u64,
+    ) -> Result<u64, EpochError> {
+        self.update(database, |record| {
+            Ok(*record.incarnation.get_or_insert(incarnation))
         })
     }
 

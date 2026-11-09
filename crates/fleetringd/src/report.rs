@@ -1364,6 +1364,7 @@ mod tests {
                 database: name("old"),
                 epoch: fleetring_control::LeaseEpoch::new(4),
                 bytes: 4096,
+                staged: None,
             }],
         };
         let json = serde_json::to_value(node_status(&status)).expect("serializes");

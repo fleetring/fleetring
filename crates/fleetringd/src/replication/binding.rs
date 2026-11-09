@@ -20,14 +20,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use fleetring::{NodeId, ReplicationFactor, Ring};
-use fleetring_control::{DatabaseName, LeaseEpoch};
-use fleetring_proto::v1::LocateRequest;
+use fleetring_control::fork::ForkIdentity;
+use fleetring_control::{DatabaseName, Incarnation, LeaseEpoch};
+use fleetring_proto::v1::{LocateRequest, SnapshotRequest};
 use tonic::Status;
+use tonic::metadata::MetadataValue;
 
 use super::Inner;
+use super::fork::view::{holders_from_placement, view_from_placement};
+use super::fork::{DatabaseView, ForkPhase, ForkView};
 use crate::MembershipView;
-use crate::auth::{Binding, BindingDenied, Unbound};
+use crate::auth::{BINDING_KEY, Binding, BindingDenied, SeedingMismatch, Unbound};
 use crate::control::ControlClient;
+use crate::control::fork::operation_from_proto;
 
 /// Who may lead a database now, as control state says (ADR-0031, point 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +62,9 @@ impl EpochHolders {
 pub type HoldersFuture<'a> =
     Pin<Box<dyn Future<Output = Result<EpochHolders, Status>> + Send + 'a>>;
 
+/// The future [`EpochAuthority::view`] returns.
+pub type ViewFuture<'a> = Pin<Box<dyn Future<Output = Result<DatabaseView, Status>> + Send + 'a>>;
+
 /// Where a data node asks who leads an epoch.
 pub trait EpochAuthority: fmt::Debug + Send + Sync + 'static {
     /// Who leads `database` now.
@@ -65,6 +73,24 @@ pub trait EpochAuthority: fmt::Debug + Send + Sync + 'static {
     ///
     /// `UNAVAILABLE` when control state can't be reached, `NOT_FOUND` for an unknown database.
     fn holders(&self, database: &DatabaseName) -> HoldersFuture<'_>;
+
+    /// Who leads `database` now, with its incarnation and its fork record (ADR-0046). An
+    /// authority that knows no more than [`holders`](Self::holders) answers the legacy
+    /// incarnation and no fork, which every seeding check refuses.
+    ///
+    /// # Errors
+    ///
+    /// As [`holders`](Self::holders).
+    fn view(&self, database: &DatabaseName) -> ViewFuture<'_> {
+        let holders = self.holders(database);
+        Box::pin(async move {
+            Ok(DatabaseView {
+                holders: holders.await?,
+                incarnation: Incarnation::LEGACY,
+                fork: None,
+            })
+        })
+    }
 }
 
 /// The control plane's answer to `Locate`: the epoch, the primary, and the candidate.
@@ -79,32 +105,21 @@ impl EpochAuthority for ControlClient {
                 .await?
                 .placement
                 .ok_or_else(|| Status::internal("the reply has no placement"))?;
-            let node = |text: &str| {
-                text.parse::<NodeId>().map_err(|error| {
-                    Status::internal(format!("the reply has an invalid node id: {error}"))
-                })
-            };
-            let replicas = placement
-                .replicas
-                .iter()
-                .map(|replica| node(&replica.node_id))
-                .collect::<Result<Vec<_>, _>>()?;
-            let replication_factor = u8::try_from(placement.replication_factor)
-                .ok()
-                .and_then(ReplicationFactor::new)
-                .or_else(|| {
-                    u8::try_from(replicas.len())
-                        .ok()
-                        .and_then(ReplicationFactor::new)
-                })
-                .unwrap_or(ReplicationFactor::ONE);
-            Ok(EpochHolders {
-                epoch: LeaseEpoch::new(placement.epoch),
-                holder: placement.primary.as_deref().map(node).transpose()?,
-                candidate: placement.candidate.as_deref().map(node).transpose()?,
-                replicas,
-                replication_factor,
-            })
+            holders_from_placement(&placement)
+        })
+    }
+
+    fn view(&self, database: &DatabaseName) -> ViewFuture<'_> {
+        let request = LocateRequest {
+            database: database.to_string(),
+        };
+        Box::pin(async move {
+            let placement = self
+                .locate(request)
+                .await?
+                .placement
+                .ok_or_else(|| Status::internal("the reply has no placement"))?;
+            view_from_placement(&placement)
         })
     }
 }
@@ -123,6 +138,10 @@ impl EpochAuthority for BTreeMap<DatabaseName, EpochHolders> {
 impl<T: EpochAuthority> EpochAuthority for Arc<T> {
     fn holders(&self, database: &DatabaseName) -> HoldersFuture<'_> {
         (**self).holders(database)
+    }
+
+    fn view(&self, database: &DatabaseName) -> ViewFuture<'_> {
+        (**self).view(database)
     }
 }
 
@@ -352,15 +371,17 @@ pub(super) async fn check_promote(
 
 /// Checks a `DropCopy` naming `database` at `epoch`, whoever made it (ADR-0042). The drop
 /// stands only if control state no longer holds the database, or holds a newer one of the name at
-/// a lower epoch, and `epoch` is exactly the highest epoch this node's copy recorded, so the
-/// notice names this copy's incarnation. A live database's control epoch equals its copies'
-/// highest, and a database created again under the name restarts its epochs, so neither a
-/// forged notice nor a late one for an earlier incarnation deletes anything.
+/// a lower epoch or, when the notice names one, at another incarnation (ADR-0046, point 4.6),
+/// and `epoch` is exactly the highest epoch this node's copy recorded, so the notice names this
+/// copy's incarnation. A live database's control epoch equals its copies' highest, and a
+/// database created again under the name restarts its epochs and draws a new incarnation, so
+/// neither a forged notice nor a late one for an earlier incarnation deletes anything.
 ///
 /// # Errors
 ///
-/// - A notice for a database control state still holds at `epoch` or later fails the binding:
-///   `PERMISSION_DENIED` for a node certificate, `FAILED_PRECONDITION` for a plaintext caller.
+/// - A notice for a database control state still holds at `epoch` or later, at the notice's
+///   incarnation, fails the binding: `PERMISSION_DENIED` for a node certificate,
+///   `FAILED_PRECONDITION` for a plaintext caller.
 /// - One whose epoch isn't this node's copy's gets `FAILED_PRECONDITION`, and changes nothing: a
 ///   replica that missed a promotion is told of the drop honestly, and keeps its copy as an
 ///   orphan. A node with no copy of the name accepts it, and has nothing to delete.
@@ -368,11 +389,15 @@ pub(super) async fn check_drop(
     inner: &Inner,
     database: &DatabaseName,
     epoch: u64,
+    incarnation: Option<Incarnation>,
     caller: Option<&NodeId>,
 ) -> Result<(), Status> {
     let lease_epoch = LeaseEpoch::new(epoch);
-    let dropped = match inner.authority.holders(database).await {
-        Ok(holders) => holders.epoch < lease_epoch,
+    let dropped = match inner.authority.view(database).await {
+        Ok(view) => {
+            view.holders.epoch < lease_epoch
+                || incarnation.is_some_and(|dropped| dropped != view.incarnation)
+        }
         Err(status) if status.code() == tonic::Code::NotFound => true,
         Err(status) => return Err(status),
     };
@@ -392,6 +417,9 @@ pub(super) async fn check_drop(
     match inner.epochs.highest(database) {
         None => Ok(()),
         Some(highest) if highest == epoch => Ok(()),
+        // A notice that names a seeding fork's identity is about its staged copies, which the
+        // node judges again under the name's lock; its copy of the name, if any, stays.
+        Some(_) if epoch == 0 && incarnation.is_some() => Ok(()),
         Some(highest) => Err(Status::failed_precondition(format!(
             "this node's copy of {database} is at epoch {highest}, not the dropped epoch {epoch}; \
              it keeps the copy"
@@ -472,4 +500,239 @@ fn not_follower(database: &DatabaseName, caller: &NodeId) -> BindingDenied {
             database: database.clone(),
         },
     )
+}
+
+/// A `Snapshot` request that seeds a fork (ADR-0046, points 4.1 and 4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SeedingRequest {
+    /// The database the request names: the source, from the seeder; the fork, from a peer.
+    pub(super) database: DatabaseName,
+    /// The fork identity the request names.
+    pub(super) fork: ForkIdentity,
+    /// The attempt it names.
+    pub(super) attempt: u32,
+    /// The source incarnation it names.
+    pub(super) source_incarnation: Incarnation,
+    /// Whether it asks the seeder for its staged copy, rather than the source's primary for a
+    /// pinned copy.
+    pub(super) staged: bool,
+}
+
+impl SeedingRequest {
+    /// The fork `request` seeds, or `None` if it names no fork and asks for a follower's
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for an invalid name or operation ID, or a staged request whose
+    /// database isn't the fork.
+    pub(super) fn parse(request: &SnapshotRequest) -> Result<Option<Self>, Status> {
+        let Some(fork) = request.fork.as_deref() else {
+            return Ok(None);
+        };
+        let parse = |text: &str| -> Result<DatabaseName, Status> {
+            text.parse().map_err(|error| {
+                Status::invalid_argument(format!("invalid database name: {error}"))
+            })
+        };
+        let fork = parse(fork)?;
+        let database = parse(&request.database)?;
+        if request.staged && database != fork {
+            return Err(Status::invalid_argument(format!(
+                "a request for a staged copy names the fork, '{fork}', not '{database}'"
+            )));
+        }
+        Ok(Some(Self {
+            database,
+            fork: ForkIdentity::new(
+                fork,
+                Incarnation::new(request.fork_incarnation),
+                operation_from_proto(&request.operation)?,
+            ),
+            attempt: request.fork_attempt,
+            source_incarnation: Incarnation::new(request.source_incarnation),
+            staged: request.staged,
+        }))
+    }
+}
+
+/// What a seeding request was granted: for a request to the source's primary, the epoch it
+/// leads the source at.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SeedingGrant {
+    pub(super) source_epoch: LeaseEpoch,
+}
+
+/// Refuses a seeding request that `caller` made: `PERMISSION_DENIED` with [`BINDING_KEY`]
+/// metadata naming `seeding`, counted and audited as every binding refusal is. A plaintext
+/// caller, which carries no identity to audit, gets the same status.
+fn refuse_seeding(
+    inner: &Inner,
+    request: &SeedingRequest,
+    caller: Option<&NodeId>,
+    mismatch: SeedingMismatch,
+) -> Status {
+    let reason = Unbound::NotSeeding {
+        fork: request.fork.name.clone(),
+        mismatch,
+    };
+    match caller {
+        Some(caller) => refuse(
+            inner,
+            Some(&request.fork.name),
+            BindingDenied::new("Snapshot", caller.clone(), reason),
+        ),
+        None => {
+            inner.binding_refused(Some(&request.fork.name));
+            tracing::warn!(target: "fleetringd::audit", principal = "plaintext", rpc = "Snapshot", database = %request.fork.name, binding = Binding::Seeding.as_str(), "denied");
+            let mut status = Status::permission_denied(format!(
+                "Snapshot refused for a plaintext peer: {reason}"
+            ));
+            status.metadata_mut().insert(
+                BINDING_KEY,
+                MetadataValue::from_static(Binding::Seeding.as_str()),
+            );
+            status
+        }
+    }
+}
+
+/// The fork `request` names, as control state shows it, if its whole identity matches; a
+/// refusal otherwise.
+async fn current_fork(
+    inner: &Inner,
+    request: &SeedingRequest,
+    caller: Option<&NodeId>,
+) -> Result<(DatabaseView, ForkView), Status> {
+    let refused = |mismatch| Err(refuse_seeding(inner, request, caller, mismatch));
+    let view = match inner.authority.view(&request.fork.name).await {
+        Ok(view) => view,
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            return refused(SeedingMismatch::NoFork);
+        }
+        Err(status) => return Err(status),
+    };
+    let Some(fork) = view.fork.clone() else {
+        return refused(SeedingMismatch::NoFork);
+    };
+    if fork.identity.incarnation != request.fork.incarnation {
+        return refused(SeedingMismatch::ForkIncarnation);
+    }
+    if fork.identity.operation != request.fork.operation {
+        return refused(SeedingMismatch::Operation);
+    }
+    Ok((view, fork))
+}
+
+/// The attempt's seeder, if `fork` is seeding exactly `attempt`; a refusal otherwise.
+fn seeding_attempt(
+    inner: &Inner,
+    request: &SeedingRequest,
+    caller: Option<&NodeId>,
+    fork: &ForkView,
+) -> Result<Option<NodeId>, Status> {
+    match &fork.phase {
+        ForkPhase::Seeding {
+            attempt, seeder, ..
+        } if *attempt == request.attempt => Ok(seeder.clone()),
+        ForkPhase::Seeding { attempt, .. } => Err(refuse_seeding(
+            inner,
+            request,
+            caller,
+            SeedingMismatch::Attempt {
+                requested: request.attempt,
+                current: *attempt,
+            },
+        )),
+        _ => Err(refuse_seeding(
+            inner,
+            request,
+            caller,
+            SeedingMismatch::NotSeeding,
+        )),
+    }
+}
+
+/// Checks a seeding `Snapshot` that `caller` asks this node for (ADR-0046, points 4.1 and 4.4),
+/// comparing the whole fork identity, the attempt, the source, and the source incarnation with
+/// this node's control-state view, before anything is pinned or read.
+///
+/// - **From the seeder, to the source's primary:** this node holds the source's lease at the
+///   source incarnation the request names; the fork is seeding the request's attempt from that
+///   source and incarnation; and the caller is the attempt's seeder.
+/// - **From a replica, to the seeder** (`staged`): the fork is seeding the request's attempt;
+///   this node is its seeder; and the caller is in the fork's replica set.
+///
+/// The identity checks run for every caller; the caller's own role is checked only for a node
+/// certificate, since a plaintext peer carries no identity (ADR-0031).
+///
+/// # Errors
+///
+/// A `seeding` binding refusal, and the authority's error as it is, `UNAVAILABLE` while control
+/// state can't be reached.
+pub(super) async fn check_seeding(
+    inner: &Inner,
+    request: &SeedingRequest,
+    caller: Option<&NodeId>,
+) -> Result<SeedingGrant, Status> {
+    let refused = |mismatch| Err(refuse_seeding(inner, request, caller, mismatch));
+    // A seeder may be its source's primary, as on a node of its own, and asks itself; a node is
+    // never its own peer.
+    if request.staged && caller == Some(&inner.node) {
+        return refused(SeedingMismatch::NotReplica);
+    }
+    let (view, fork) = current_fork(inner, request, caller).await?;
+    if request.staged {
+        // A peer may leave the source incarnation unset; one it sets must be the fork's.
+        if !request.source_incarnation.is_legacy()
+            && request.source_incarnation != fork.source_incarnation
+        {
+            return refused(SeedingMismatch::SourceIncarnation);
+        }
+        let seeder = seeding_attempt(inner, request, caller, &fork)?;
+        if seeder.as_ref() != Some(&inner.node) {
+            return refused(SeedingMismatch::NotTheSeeder);
+        }
+        if let Some(caller) = caller
+            && !view.holders.replicas.contains(caller)
+        {
+            return refused(SeedingMismatch::NotReplica);
+        }
+        return Ok(SeedingGrant {
+            source_epoch: LeaseEpoch::ZERO,
+        });
+    }
+    if fork.source != request.database {
+        return refused(SeedingMismatch::Source);
+    }
+    if fork.source_incarnation != request.source_incarnation {
+        return refused(SeedingMismatch::SourceIncarnation);
+    }
+    let seeder = seeding_attempt(inner, request, caller, &fork)?;
+    if let Some(caller) = caller
+        && seeder.as_ref() != Some(caller)
+    {
+        return refused(SeedingMismatch::NotSeeder);
+    }
+    let source = match inner.authority.view(&request.database).await {
+        Ok(source) => source,
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            return refused(SeedingMismatch::SourceIncarnation);
+        }
+        Err(status) => return Err(status),
+    };
+    if source.incarnation != request.source_incarnation {
+        return refused(SeedingMismatch::SourceIncarnation);
+    }
+    let epoch = source.holders.epoch;
+    let leads = source.holders.holder.as_ref() == Some(&inner.node)
+        && inner
+            .primary(&request.database)
+            .is_some_and(|primary| primary.role().epoch == epoch);
+    if !leads {
+        return refused(SeedingMismatch::NotSourcePrimary);
+    }
+    Ok(SeedingGrant {
+        source_epoch: epoch,
+    })
 }

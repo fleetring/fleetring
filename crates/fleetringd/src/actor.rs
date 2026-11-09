@@ -44,9 +44,10 @@ use crate::changes::MarkHome;
 use crate::engine::{
     Autocommit, CallResult, CaptureMode, CheckpointMarker, Database, DatabaseCapability,
     DatabaseEngine, DatabaseSnapshot, EngineCapability, EngineError, Executed, Execution,
-    FrameBatch, FrameSource, Interrupt, Interruption, LogicalChanges, OpenMode, PinnedSnapshot,
-    Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange, Rows, Schema,
-    SchemaRequest, SessionAccess, SessionCall, Shape, Statement, Transaction, WriteIntent,
+    ForkMarker, ForkReset, FrameBatch, FrameSource, Interrupt, Interruption, LogicalChanges,
+    OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, ReplicaPosition, RowChange,
+    Rows, Schema, SchemaRequest, SessionAccess, SessionCall, Shape, Statement, Transaction,
+    WriteIntent,
 };
 use crate::publisher::{
     Acknowledged, Acknowledgement, BatchPublisher, CommittedBatch, ReplicationError,
@@ -238,6 +239,8 @@ pub(crate) enum Request {
     ReplicaPositions(Reply<Vec<ReplicaPosition>>),
     SessionCall(SessionTurn, Ticket, Reply<SessionRan>),
     SessionEnd(SessionId, Reply<()>),
+    ForkMarker(Reply<Option<ForkMarker>>),
+    ForkReset(ForkMarker, Reply<(ForkReset, Option<Acknowledgement>)>),
 }
 
 impl Request {
@@ -246,7 +249,10 @@ impl Request {
     /// Snapshots read only the committed log, which an open transaction never changes, so a
     /// follower's catch-up never waits for one.
     fn needs_writer(&self) -> bool {
-        matches!(self, Self::Execute(..) | Self::Checkpoint(_))
+        matches!(
+            self,
+            Self::Execute(..) | Self::Checkpoint(_) | Self::ForkReset(..)
+        )
     }
 
     /// Answers the request with `error` without running it.
@@ -309,6 +315,12 @@ impl Request {
             Self::SessionEnd(_, reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::ForkMarker(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::ForkReset(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
         }
     }
 }
@@ -335,6 +347,8 @@ impl fmt::Debug for Request {
             Self::ReplicaPositions(_) => "ReplicaPositions",
             Self::SessionCall(..) => "SessionCall",
             Self::SessionEnd(..) => "SessionEnd",
+            Self::ForkMarker(_) => "ForkMarker",
+            Self::ForkReset(..) => "ForkReset",
         })
     }
 }
@@ -775,6 +789,32 @@ impl DatabaseHandle {
         at: Option<Position>,
     ) -> Result<PinnedSnapshot, DatabaseError> {
         self.call(|reply| Request::PinSnapshotAt(at, reply)).await
+    }
+
+    /// The marker of the last fork reset the database committed, if it holds one (ADR-0046,
+    /// point 6.1); see [`Database::fork_marker`](crate::engine::Database::fork_marker).
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] if the database is closed, its engine can't fork, or the marker can't
+    /// be read.
+    pub async fn fork_marker(&self) -> Result<Option<ForkMarker>, DatabaseError> {
+        self.call(Request::ForkMarker).await
+    }
+
+    /// Runs a fork's reset for `marker`, unless the database holds its marker already, and
+    /// puts the transaction it wrote, if any, in replication's hands (ADR-0046, point 6.1); see
+    /// [`Database::fork_reset`](crate::engine::Database::fork_reset). Returns what it did; the
+    /// caller waits for the quorum it needs.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] if the database is closed, its engine can't fork, or the reset fails;
+    /// nothing is written then.
+    pub async fn fork_reset(&self, marker: ForkMarker) -> Result<ForkReset, DatabaseError> {
+        self.call(|reply| Request::ForkReset(marker, reply))
+            .await
+            .map(|(reset, _acknowledgement)| reset)
     }
 
     /// How far each replica of a self-replicating database has got.
@@ -1498,6 +1538,14 @@ impl Actor {
                     .await;
                 let _ = reply.send(result);
             }
+            Request::ForkMarker(reply) => {
+                let result = self.call(|database| Ok(database.fork_marker()?)).await;
+                let _ = reply.send(result);
+            }
+            Request::ForkReset(marker, reply) => {
+                let result = self.fork_reset(marker).await;
+                let _ = reply.send(result);
+            }
             Request::ReplicaPositions(reply) => {
                 let result = self
                     .call(|database| match database.capability() {
@@ -1544,6 +1592,61 @@ impl Actor {
                 // Capture runs whatever the outcome, so a commit is never missed. A rolled-back
                 // transaction, an interrupted one included, leaves no committed frames, so it
                 // yields no batch.
+                let captured = match database.capability() {
+                    DatabaseCapability::FrameSource(frames) => {
+                        Some(frames.committed_since(last.as_ref()))
+                    }
+                    _ => None,
+                };
+                (result, captured)
+            })
+            .await;
+        let (result, captured) = match outcome {
+            Ok(outcome) => outcome,
+            Err(stopped) => {
+                self.fail(EngineError::Storage(stopped.into()));
+                return Err(DatabaseError::Interrupted {
+                    name: self.name.clone(),
+                });
+            }
+        };
+        let acknowledgement = match captured {
+            None | Some(Ok(None)) => None,
+            Some(Ok(Some(batch))) => {
+                self.last = Some(batch.end.clone());
+                Some(self.publisher.publish(CommittedBatch {
+                    database: self.name.clone(),
+                    batch,
+                }))
+            }
+            Some(Err(error)) => {
+                let source = self.fail(error);
+                return Err(DatabaseError::Failed {
+                    name: self.name.clone(),
+                    source,
+                });
+            }
+        };
+        Ok((result?, acknowledgement))
+    }
+
+    /// Runs a fork's reset, and captures and publishes the transaction it wrote, if any, as a
+    /// write's batch is (ADR-0046, point 6.1).
+    async fn fork_reset(
+        &mut self,
+        marker: ForkMarker,
+    ) -> Result<(ForkReset, Option<Acknowledgement>), DatabaseError> {
+        if let Some(source) = &self.failed {
+            return Err(DatabaseError::Failed {
+                name: self.name.clone(),
+                source: Arc::clone(source),
+            });
+        }
+        let last = self.last.clone();
+        let outcome = self
+            .executor
+            .run(move |database| {
+                let result = database.fork_reset(&marker);
                 let captured = match database.capability() {
                     DatabaseCapability::FrameSource(frames) => {
                         Some(frames.committed_since(last.as_ref()))
