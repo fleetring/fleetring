@@ -17,6 +17,7 @@ mod history;
 mod membership;
 mod observe;
 mod replication;
+mod router;
 
 use std::error::Error;
 

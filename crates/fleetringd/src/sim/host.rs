@@ -11,6 +11,8 @@ use crate::control::ControlHandle;
 use crate::durability::ObjectStore;
 use crate::observe::Metrics;
 use crate::replication::Replication;
+use crate::router::{Router, RouterConfig};
+use crate::sim::rng::SimEntropy;
 use crate::sim::seeds::millis;
 use crate::sim::trace::{Event, EventKind, Trace};
 use crate::sim::workload::History;
@@ -83,6 +85,33 @@ impl Shared {
             receiver
         })
     }
+}
+
+/// One incarnation of the router host: starts the router with `identity`, toward the fleet, and
+/// serves until the test stops it or turmoil crashes it. Each incarnation draws its batons'
+/// secrets from `seed` and the time it starts, so that a restarted router never repeats one.
+pub(super) async fn run_router(
+    name: String,
+    config: RouterConfig,
+    identity: Identity,
+    seed: u64,
+    shared: Shared,
+) -> turmoil::Result {
+    let mut stop = shared
+        .stop_signal(&name)
+        .ok_or_else(|| format!("no stop signal for {name}"))?;
+    let elapsed = turmoil::sim_elapsed().unwrap_or_default();
+    let clock = SimClock::new(Timestamp::from_millis(millis(elapsed)));
+    let environment = Environment::simulated(clock)
+        .with_network(Network::simulated().with_security(Security::Tls(identity)));
+    let entropy = Arc::new(SimEntropy::new(seed ^ millis(elapsed)));
+    let router = Router::start_with(config, environment, entropy).await?;
+    shared.record(&name, EventKind::Started);
+    // A dropped sender also means stop.
+    let _stopped = stop.changed().await;
+    router.stop().await;
+    shared.record(&name, EventKind::Stopped);
+    Ok(())
 }
 
 /// One incarnation of a host: starts the daemon with `identity`, publishes its handles, and
