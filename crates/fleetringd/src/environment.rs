@@ -61,6 +61,18 @@ pub struct Network {
     link: Link,
     security: Security,
     credentials: Credentials,
+    keep_alive: Option<KeepAlive>,
+}
+
+/// HTTP/2 keep-alive on a network's channels: while a call is open, the connection is pinged
+/// every `interval`, and closed if a ping goes `timeout` unanswered, so that a call on a peer that
+/// went away fails instead of waiting on a connection nothing will ever answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepAlive {
+    /// How often an open connection is pinged.
+    pub interval: Duration,
+    /// How long a ping may go unanswered.
+    pub timeout: Duration,
 }
 
 impl Network {
@@ -72,6 +84,7 @@ impl Network {
             link: Link::Tcp(transport),
             security: Security::Plaintext,
             credentials: Credentials::none(),
+            keep_alive: None,
         }
     }
 
@@ -84,6 +97,7 @@ impl Network {
             link: Link::Simulated,
             security: Security::Plaintext,
             credentials: Credentials::none(),
+            keep_alive: None,
         }
     }
 
@@ -91,6 +105,13 @@ impl Network {
     #[must_use]
     pub fn with_security(mut self, security: Security) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Pings this network's channels as `keep_alive` says while a call is open on them.
+    #[must_use]
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
         self
     }
 
@@ -164,6 +185,11 @@ impl Network {
             endpoint = endpoint
                 .connect_timeout(transport.connect_timeout)
                 .timeout(transport.request_timeout);
+        }
+        if let Some(keep_alive) = self.keep_alive {
+            endpoint = endpoint
+                .http2_keep_alive_interval(keep_alive.interval)
+                .keep_alive_timeout(keep_alive.timeout);
         }
         let link = self.link;
         let security = self.security.clone();

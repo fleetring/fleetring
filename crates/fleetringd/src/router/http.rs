@@ -5,9 +5,17 @@
 //! token can't read the database `403`, and a body over `max_request_bytes` `413`. Refusals carry
 //! a Hrana error body, `{"message": …, "code": …}`. Nothing a request carries, SQL, rows, or
 //! tokens, is logged.
+//!
+//! A connection is closed once it goes `[http] idle_timeout_ms` without a request in flight, a
+//! connection that never sends a request, or never finishes one's headers, included; HTTP/2
+//! connections are pinged, and closed if the client stops answering. One client address holds at
+//! most `[http] max_connections_per_ip` connections.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::{BodyExt as _, Full, Limited};
@@ -22,6 +30,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use crate::clock::Clock as _;
@@ -43,6 +52,15 @@ const MAX_CONNECTIONS: usize = 16_384;
 
 /// How many requests one HTTP/2 connection may have in flight.
 const MAX_CONCURRENT_STREAMS: u32 = 256;
+
+/// How often an HTTP/2 connection is pinged.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long an HTTP/2 ping may go unanswered before the connection is closed.
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long an idle connection being closed may take to finish closing.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// How long the accept loop waits after a failed accept.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
@@ -66,6 +84,7 @@ pub(crate) async fn serve(
     mut stop: watch::Receiver<bool>,
 ) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_ip = Arc::new(PerIp::new(context.config.http.max_connections_per_ip.get()));
     let mut connections = JoinSet::new();
     loop {
         let accepted = tokio::select! {
@@ -73,8 +92,8 @@ pub(crate) async fn serve(
             accepted = listener.accept() => accepted,
             Some(_) = connections.join_next(), if !connections.is_empty() => continue,
         };
-        let stream = match accepted {
-            Ok(stream) => stream,
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
             Err(error) => {
                 tracing::warn!(%error, "the router couldn't accept a connection");
                 tokio::time::sleep(ACCEPT_RETRY).await;
@@ -85,15 +104,114 @@ pub(crate) async fn serve(
             tracing::warn!(max = MAX_CONNECTIONS, "too many connections; closing one");
             continue;
         };
+        let Some(held) = PerIp::hold(&per_ip, peer) else {
+            tracing::debug!(%peer, "too many connections from one address; closing one");
+            continue;
+        };
         let context = Arc::clone(&context);
         let tls = tls.clone();
         connections.spawn(async move {
             stream.serve(tls, context).await;
+            drop(held);
             drop(slot);
         });
     }
     // Every connection goes with the server, and with it every request's work.
     connections.shutdown().await;
+}
+
+/// How many connections each client address holds.
+#[derive(Debug)]
+struct PerIp {
+    max: usize,
+    held: Mutex<BTreeMap<IpAddr, usize>>,
+}
+
+impl PerIp {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            held: Mutex::default(),
+        }
+    }
+
+    /// A place for one more connection from `peer`, unless its address holds `max` already.
+    fn hold(this: &Arc<Self>, peer: SocketAddr) -> Option<Held> {
+        let ip = peer.ip();
+        let mut held = this.held.lock().expect("connection count lock poisoned");
+        let count = held.entry(ip).or_default();
+        if *count >= this.max {
+            return None;
+        }
+        *count += 1;
+        Some(Held {
+            per_ip: Arc::clone(this),
+            ip,
+        })
+    }
+}
+
+/// One connection's place in its address's count, given back as it drops.
+#[derive(Debug)]
+struct Held {
+    per_ip: Arc<PerIp>,
+    ip: IpAddr,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut held = self
+            .per_ip
+            .held
+            .lock()
+            .expect("connection count lock poisoned");
+        if let Some(count) = held.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Whether a connection has a request in flight, and since when it hasn't.
+#[derive(Debug)]
+struct Activity {
+    in_flight: AtomicUsize,
+    last: Mutex<Instant>,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// When the connection went idle, or `None` while a request is in flight.
+    fn idle_since(&self) -> Option<Instant> {
+        let last = *self.last.lock().expect("activity lock poisoned");
+        (self.in_flight.load(Ordering::Acquire) == 0).then_some(last)
+    }
+}
+
+/// A request in flight on a connection, until it drops.
+#[derive(Debug)]
+struct Busy(Arc<Activity>);
+
+impl Busy {
+    fn new(activity: &Arc<Activity>) -> Self {
+        activity.in_flight.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(activity))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        *self.0.last.lock().expect("activity lock poisoned") = Instant::now();
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Serves one accepted connection, through TLS if there is an acceptor.
@@ -113,14 +231,24 @@ where
     }
 }
 
-/// Serves HTTP/1.1 or HTTP/2 on `stream` until the client closes it.
+/// Serves HTTP/1.1 or HTTP/2 on `stream` until the client closes it, or it goes idle.
 async fn http<S>(stream: S, context: Arc<Context>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |request: Request<Incoming>| {
-        let context = Arc::clone(&context);
-        async move { Ok::<_, Infallible>(answer(&context, request).await) }
+    let idle = context.config.http.idle_timeout();
+    let activity = Arc::new(Activity::new());
+    let service = service_fn({
+        let activity = Arc::clone(&activity);
+        move |request: Request<Incoming>| {
+            let context = Arc::clone(&context);
+            let busy = Busy::new(&activity);
+            async move {
+                let response = answer(&context, request).await;
+                drop(busy);
+                Ok::<_, Infallible>(response)
+            }
+        }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
@@ -130,11 +258,36 @@ where
     builder
         .http2()
         .timer(TokioTimer::new())
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS);
-    if let Err(error) = builder
-        .serve_connection(TokioIo::new(stream), service)
-        .await
-    {
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT);
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    let ended = loop {
+        // While a request is in flight, look again an idle period from now.
+        let deadline = activity
+            .idle_since()
+            .map_or_else(|| Instant::now() + idle, |since| since + idle);
+        tokio::select! {
+            ended = connection.as_mut() => break ended,
+            () = tokio::time::sleep_until(deadline) => {
+                let idle_now = activity
+                    .idle_since()
+                    .is_some_and(|since| since + idle <= Instant::now());
+                if !idle_now {
+                    continue;
+                }
+                tracing::debug!("closing an idle router connection");
+                connection.as_mut().graceful_shutdown();
+                match tokio::time::timeout(CLOSE_GRACE, connection.as_mut()).await {
+                    Ok(ended) => break ended,
+                    // Dropping it closes it.
+                    Err(_) => return,
+                }
+            }
+        }
+    };
+    if let Err(error) = ended {
         tracing::debug!(%error, "router connection ended");
     }
 }

@@ -52,12 +52,19 @@ use self::placement::PlacementCache;
 use self::streams::Streams;
 use crate::clock::Clock;
 use crate::control::ControlClient;
-use crate::environment::Environment;
+use crate::environment::{Environment, KeepAlive};
 use crate::tls::{Identity, IdentityError, Security};
 use crate::transport::Peers;
 
 /// How often idle streams are looked for.
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// HTTP/2 keep-alive on the router's channels to nodes: a ping every 30 seconds while a session is
+/// open, and the connection closed if one goes 20 seconds unanswered.
+const PEER_KEEP_ALIVE: KeepAlive = KeepAlive {
+    interval: Duration::from_secs(30),
+    timeout: Duration::from_secs(20),
+};
 
 /// What every request the router serves shares.
 #[derive(Debug)]
@@ -154,10 +161,13 @@ impl Router {
             crate::tls::Peer::Principal(principal) => principal,
             _ => return Err(StartError::NodeIdentity),
         };
+        // A session's stream to a primary that went away, behind a partition or with its power,
+        // fails within the keep-alive's bound instead of holding its Hrana stream.
         let network = environment
             .network()
             .clone()
-            .with_security(Security::Tls(identity.clone()));
+            .with_security(Security::Tls(identity.clone()))
+            .with_keep_alive(PEER_KEEP_ALIVE);
         let tls = match (&config.http.cert, &config.http.key) {
             (Some(cert), Some(key)) => Some(server_tls(cert, key)?),
             _ => None,
@@ -318,17 +328,18 @@ impl RouterListener {
         }
     }
 
-    pub(crate) async fn accept(&self) -> io::Result<Accepted> {
+    /// The next connection, and the address it comes from.
+    pub(crate) async fn accept(&self) -> io::Result<(Accepted, SocketAddr)> {
         match self {
             Self::Tcp(listener) => {
-                let (stream, _peer) = listener.accept().await?;
+                let (stream, peer) = listener.accept().await?;
                 let _ = stream.set_nodelay(true);
-                Ok(Accepted::Tcp(stream))
+                Ok((Accepted::Tcp(stream), peer))
             }
             #[cfg(feature = "simulation")]
             Self::Simulated(listener) => {
-                let (stream, _peer) = listener.accept().await?;
-                Ok(Accepted::Simulated(stream))
+                let (stream, peer) = listener.accept().await?;
+                Ok((Accepted::Simulated(stream), peer))
             }
         }
     }
