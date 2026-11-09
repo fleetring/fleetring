@@ -4,6 +4,8 @@
 - **Date:** 2026-11-02
 - **Related:** ADR-0017 (control state machine), ADR-0018 (epochs), ADR-0022 (failover), ADR-0025 (principals and scopes), ADR-0026 (scope enforcement, proposed with FR-047); tickets FR-046, FR-047, FR-050
 
+*Note (2026-11-08):* [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed) proposes one more binding, **`seeding`**: under it, the source's primary serves a fork's seeder, and the seeder serves the fork's other replicas, on `Replication.Snapshot`, each checked against the fork's full identity (ADR-0046, points 4.1 and 4.4). It is proposed, not part of this decision, until ADR-0046 is accepted. The text below is unchanged.
+
 ## Context
 
 FR-046 made node identity unforgeable: a node's certificate names its ID, and the membership calls refuse a request that names another node. FR-047 narrows node certificates to node calls. But a node call still accepts any node for any database. A stolen node key can open a `Replicate` stream to any replica at a higher epoch, which the replica records durably, fencing the real primary out, and then have it apply forged batches; fence any replica for a promotion that doesn't exist; read any database whole through `Snapshot` or `Fetch`; and report itself as a candidate. Epochs contain much of this, since a forged epoch is above nothing the control plane granted, but no code verifies that the node presenting an epoch is the one control state gave it to.
