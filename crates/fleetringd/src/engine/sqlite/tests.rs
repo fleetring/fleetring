@@ -1,9 +1,10 @@
-//! The confinement of user statements to the database they name, and the schema the adapter
-//! reports.
+//! The confinement of user statements to the database they name, the schema the adapter
+//! reports, and a fork's reset.
 
 use super::*;
 use crate::engine::{
-    Internal, Interruption, MAX_SCHEMA_OBJECTS, ObjectKind, RowCount, SchemaObject,
+    ForkMarker, ForkReset, Internal, Interruption, MAX_SCHEMA_OBJECTS, ObjectKind, RowCount,
+    SchemaObject,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -1608,5 +1609,120 @@ fn a_user_statement_with_the_text_of_an_adapter_statement_is_still_refused() -> 
         refusal(shape)?.contains("table_list"),
         "refused as the pragma it is"
     );
+    Ok(())
+}
+
+/// A fork's marker for these tests.
+fn fork_marker(operation: u8) -> ForkMarker {
+    ForkMarker {
+        fork_incarnation: 0xfeed,
+        operation: [operation; 16],
+        source_incarnation: 0xbeef,
+        at: Position::new([operation; 20]),
+    }
+}
+
+/// The length of the file at `path`, or 0 if there is none.
+fn file_len(path: &Path) -> Result<u64, Box<dyn Error>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[test]
+fn a_fork_reset_that_never_committed_leaves_no_marker_and_no_part_of_the_reset() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let primary = dir.path().join("primary");
+    let mut db = database(&primary)?;
+    db.start_recording(CaptureMode::Full)?;
+    db.stage("audit", &Position::new([1; 20]));
+    for value in 0..200 {
+        exec(&mut db, &format!("INSERT INTO t VALUES ({value})"))?;
+        db.position()?;
+    }
+    let records = change_records(&db)?;
+    let marks = db.marks()?;
+    assert!(records > 0 && !marks.is_empty());
+    let marker = fork_marker(1);
+
+    // The reset's transaction, up to its commit and no further. A one-page cache spills the
+    // pages it dirties into the WAL, uncommitted, as a large transaction's would.
+    db.writer.execute_batch("PRAGMA cache_size = 1")?;
+    let start = db.read_wal(None)?.map(|batch| batch.end());
+    let wal = db.wal_path();
+    let committed_len = file_len(&wal)?;
+    db.writer.execute_batch("BEGIN IMMEDIATE")?;
+    assert_eq!(
+        fork::reset(&db.writer, &marker, start)?,
+        fork::Outcome::Written
+    );
+    assert!(
+        file_len(&wal)? > committed_len,
+        "the uncommitted reset spilled frames into the WAL"
+    );
+
+    // The crash: the files as they are now, which a restart finds, while the process that held
+    // the transaction goes away without committing it.
+    let crashed = dir.path().join("crashed");
+    fs::create_dir_all(&crashed)?;
+    fs::copy(&db.path, crashed.join(DATABASE_FILE))?;
+    fs::copy(&wal, crashed.join(WAL_FILE))?;
+    drop(db);
+
+    for location in [&crashed, &primary] {
+        let mut reopened = SqliteDatabase::open(
+            location.join(DATABASE_FILE),
+            OpenMode::Existing,
+            4096,
+            Arc::default(),
+        )?;
+        assert_eq!(reopened.fork_marker()?, None, "{}", location.display());
+        assert_eq!(
+            change_records(&reopened)?,
+            records,
+            "{}",
+            location.display()
+        );
+        assert_eq!(reopened.marks()?, marks, "{}", location.display());
+        // The next primary runs the reset, exactly once.
+        assert!(matches!(
+            reopened.fork_reset(&marker)?,
+            ForkReset::Written { .. }
+        ));
+        assert_eq!(reopened.fork_reset(&marker)?, ForkReset::AlreadyDone);
+        assert_eq!(reopened.fork_marker()?, Some(marker.clone()));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reset_is_refused_while_a_session_holds_the_writer_and_writes_nothing() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.writer.execute_batch("BEGIN IMMEDIATE")?;
+    assert!(matches!(
+        db.fork_reset(&fork_marker(1)),
+        Err(EngineError::Statement { .. })
+    ));
+    db.writer.execute_batch("ROLLBACK")?;
+    assert_eq!(db.fork_marker()?, None);
+    Ok(())
+}
+
+#[test]
+fn a_foreign_marker_table_stops_the_reset() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // Planted from outside, with the adapter's name and another shape.
+    db.writer
+        .execute_batch("CREATE TABLE _fleetring_fork (fork_incarnation, operation)")?;
+    let refused = refusal(db.fork_reset(&fork_marker(1)))?;
+    assert!(
+        refused.contains("isn't one fleetringd created"),
+        "{refused}"
+    );
+    assert!(refusal(db.fork_marker())?.contains("_fleetring_fork"));
     Ok(())
 }

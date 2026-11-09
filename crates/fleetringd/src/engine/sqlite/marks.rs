@@ -35,6 +35,8 @@ const CREATE: &str = "CREATE TABLE IF NOT EXISTS _fleetring_sinks \
 const UPSERT: &str = "INSERT INTO _fleetring_sinks (sink, position) VALUES (?1, ?2) \
     ON CONFLICT (sink) DO UPDATE SET position = excluded.position";
 
+const CLEAR: &str = "DELETE FROM _fleetring_sinks";
+
 const READ: &str = "SELECT sink, position FROM _fleetring_sinks ORDER BY sink";
 
 /// The marks staged for the next write transaction, on one write connection.
@@ -96,16 +98,29 @@ impl Marks {
         }
     }
 
+    /// Forgets every staged mark, after a fork's reset cleared the recorded ones: they were
+    /// staged for positions of the history the reset ends.
+    pub(super) fn discard_staged(&mut self) {
+        self.staged.clear();
+    }
+
+    /// Inside an open write transaction: deletes every recorded mark. A fork's reset does this,
+    /// since the marks it inherited are its source's sinks' (ADR-0046, point 6.1).
+    pub(super) fn clear(writer: &Connection) -> Result<(), EngineError> {
+        if !Self::table_exists(writer)? {
+            return Ok(());
+        }
+        writer
+            .prepare_cached(CLEAR)
+            .map_err(storage)?
+            .execute([])
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Reads every recorded mark; an absent table is no marks.
     pub(super) fn read(conn: &Connection) -> Result<BTreeMap<String, Vec<u8>>, EngineError> {
-        let present = conn
-            .prepare_cached("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1")
-            .map_err(storage)?
-            .query_row(params![TABLE], |_| Ok(()))
-            .optional()
-            .map_err(storage)?
-            .is_some();
-        if !present {
+        if !Self::table_exists(conn)? {
             return Ok(BTreeMap::new());
         }
         let mut statement = conn.prepare_cached(READ).map_err(storage)?;
@@ -115,5 +130,16 @@ impl Marks {
             .collect::<rusqlite::Result<_>>()
             .map_err(storage)?;
         Ok(marks)
+    }
+
+    /// Whether the marks table exists in the database `conn` reads.
+    fn table_exists(conn: &Connection) -> Result<bool, EngineError> {
+        Ok(conn
+            .prepare_cached("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1")
+            .map_err(storage)?
+            .query_row(params![TABLE], |_| Ok(()))
+            .optional()
+            .map_err(storage)?
+            .is_some())
     }
 }

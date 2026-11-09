@@ -347,6 +347,27 @@ impl Recorder {
     }
 }
 
+/// Inside an open write transaction: deletes every recorded change, and leaves a floor at
+/// `start`, the position the transaction starts from, so that a reader asking for anything from
+/// before it is told the changes there aren't held. A fork's reset does this, since the record it
+/// inherited is its source's (ADR-0046, point 6.1). A database with no change table keeps none.
+///
+/// The ids restart at the floor's, which keeps them contiguous.
+pub(super) fn clear(
+    writer: &Connection,
+    start: Option<fleetring_wal::Position>,
+) -> Result<(), EngineError> {
+    if !table_exists(writer)? {
+        return Ok(());
+    }
+    writer
+        .prepare_cached(&format!("DELETE FROM \"{CHANGES_TABLE}\""))
+        .map_err(storage)?
+        .execute([])
+        .map_err(storage)?;
+    insert_floor(writer, 1, &start_bytes(start))
+}
+
 /// Inserts a floor at `id`, saying that every transaction that started at or after `start` is
 /// recorded and held.
 fn insert_floor(writer: &Connection, id: i64, start: &[u8]) -> Result<(), EngineError> {

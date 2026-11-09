@@ -12,20 +12,21 @@
 //!   neither schema's version has moved, so a statement that changes no schema costs two cookie
 //!   reads. The recorder's temporary triggers, which sit on user tables and are rebuilt whenever
 //!   the schema changes, are left out of the comparison; a user statement can't create one.
-//! - **The adapter adopts no foreign object.** Before it records changes or reads or writes sink
-//!   marks, the adapter calls [`Reserved::foreign`], which finds any object in the namespace that
-//!   isn't one of its own: a change or marks table of another shape, any trigger on a reserved
-//!   table, any index or view there, or any temporary object, which would shadow the adapter's
-//!   tables. The adapter's own statements run with the confinement clear, so a trigger it adopted
-//!   would run unconfined. A database holding such an object isn't recorded or marked, and the
-//!   object is left in place: removing it is the operator's decision.
+//! - **The adapter adopts no foreign object.** Before it records changes, reads or writes sink
+//!   marks, or reads or writes a fork's marker, the adapter calls [`Reserved::foreign`], which
+//!   finds any object in the namespace that isn't one of its own: a change, marks, or fork table
+//!   of another shape, any trigger on a reserved table, any index or view there, or any temporary
+//!   object, which would shadow the adapter's tables. The adapter's own statements run with the
+//!   confinement clear, so a trigger it adopted would run unconfined. A database holding such an
+//!   object isn't recorded, marked, or reset, and the object is left in place: removing it is the
+//!   operator's decision.
 
 use std::fmt;
 
 use rusqlite::{Connection, params};
 
 use super::changes::{CHANGES_TABLE, RESERVED_PREFIX, TRIGGER_PREFIX};
-use super::{marks, storage};
+use super::{fork, marks, storage};
 use crate::engine::EngineError;
 
 /// Whether `name` is reserved for the adapter: whether it begins with [`RESERVED_PREFIX`],
@@ -91,17 +92,25 @@ const CHANGES_COLUMNS: &[ColumnShape] = &[
 /// The marks table's columns, as the marks module creates them.
 const MARKS_COLUMNS: &[ColumnShape] = &[("sink", "TEXT", true, 1), ("position", "BLOB", true, 0)];
 
+/// The fork marker table's columns, as the fork module creates them.
+const FORK_COLUMNS: &[ColumnShape] = &[
+    ("fork_incarnation", "INTEGER", true, 1),
+    ("operation", "BLOB", true, 2),
+    ("source_incarnation", "INTEGER", true, 0),
+    ("at", "BLOB", true, 0),
+];
+
 /// A table the adapter creates.
 struct OwnTable {
     name: &'static str,
     columns: &'static [ColumnShape],
-    /// Whether it is `WITHOUT ROWID` and whether it is `STRICT`: the marks table is both, and the
-    /// change table neither.
+    /// Whether it is `WITHOUT ROWID` and whether it is `STRICT`: the marks and fork tables are
+    /// both, and the change table neither.
     without_rowid: bool,
     strict: bool,
 }
 
-const OWN_TABLES: [OwnTable; 2] = [
+const OWN_TABLES: [OwnTable; 3] = [
     OwnTable {
         name: CHANGES_TABLE,
         columns: CHANGES_COLUMNS,
@@ -111,6 +120,12 @@ const OWN_TABLES: [OwnTable; 2] = [
     OwnTable {
         name: marks::TABLE,
         columns: MARKS_COLUMNS,
+        without_rowid: true,
+        strict: true,
+    },
+    OwnTable {
+        name: fork::TABLE,
+        columns: FORK_COLUMNS,
         without_rowid: true,
         strict: true,
     },
