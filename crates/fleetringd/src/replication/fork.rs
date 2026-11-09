@@ -210,10 +210,11 @@ pub(crate) struct Forks {
     gated: Mutex<BTreeSet<DatabaseName>>,
     /// The epoch each fork's gate was last opened at on this node, and the task opening one.
     opening: Mutex<BTreeMap<DatabaseName, Opening>>,
-    /// The replica set of each seeded fork whose primary here serves no client yet, as control
-    /// state froze it: its recorded holders, whatever the ring says (ADR-0046, point 3.10). The
-    /// primary streams to them alone, and counts only them toward a write quorum, while its
-    /// gate is closed.
+    /// The replica set of each fork this node last saw seeded, as control state froze it: its
+    /// recorded holders, whatever the ring says (ADR-0046, point 3.10). A primary here streams
+    /// to them alone, counts only them toward a write quorum, and a promotion fences only them,
+    /// until this node sees the fork ready, gate open or not; a follower accepts a stream only
+    /// as one of them.
     frozen: Mutex<BTreeMap<DatabaseName, Vec<fleetring::NodeId>>>,
     /// The free space and volume the test hooks last said, with the data directory's size
     /// then, which what it grows by since comes off the free space.
@@ -493,6 +494,29 @@ impl Forks {
             .expect("fork replica set lock poisoned")
             .get(name)
             .cloned()
+    }
+
+    /// The names with a frozen replica set.
+    pub(crate) fn frozen_names(&self) -> BTreeSet<DatabaseName> {
+        self.frozen
+            .lock()
+            .expect("fork replica set lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Freezes `name`'s replica set at the recorded holders while `fork` is seeded, and lets it
+    /// follow the ring again once it is anything else: seeding, ready, failed, or no fork at
+    /// all. A state this build doesn't know changes nothing.
+    pub(crate) fn follow_view(&self, name: &DatabaseName, fork: Option<&ForkView>) {
+        match fork.map(|fork| &fork.phase) {
+            Some(ForkPhase::Seeded { holders, .. }) => {
+                self.freeze(name, Some(holders.iter().cloned().collect()));
+            }
+            Some(ForkPhase::Unknown) => {}
+            _ => self.freeze(name, None),
+        }
     }
 
     /// Whether `name`'s gate was opened at `epoch` on this node.

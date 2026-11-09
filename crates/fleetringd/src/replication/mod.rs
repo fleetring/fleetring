@@ -1367,19 +1367,14 @@ impl Inner {
         });
     }
 
-    /// The replica set of `primary`'s database in the current membership view.
+    /// The replica set of `primary`'s database in the current membership view: a seeded fork's
+    /// recorded holders until this node sees it ready, whatever the ring says (ADR-0046, point
+    /// 3.10), so that no write counts a node the control plane wouldn't fence for it.
     fn followers_of(&self, primary: &Primary) -> Quorum {
         let role = primary.role();
         let factor = role.replication_factor;
         let view = self.membership.view();
-        // The primary of a seeded fork that serves no client yet keeps the replica set control
-        // state froze for it: the recorded holders.
-        let frozen = self
-            .forks
-            .is_gated(primary.name())
-            .then(|| self.forks.frozen(primary.name()))
-            .flatten();
-        let members: Vec<NodeId> = frozen.unwrap_or_else(|| {
+        let members: Vec<NodeId> = self.forks.frozen(primary.name()).unwrap_or_else(|| {
             view.ring().map_or_else(Vec::new, |ring| {
                 ring.replicas_n(primary.name().as_str(), factor).to_ids()
             })

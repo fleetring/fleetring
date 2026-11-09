@@ -90,6 +90,7 @@ async fn run(node: DataNode, poll: Duration) {
         let forks = node.replication().forks();
         names.extend(forks.store().names());
         names.extend(forks.gated());
+        names.extend(forks.frozen_names());
         for name in names {
             if let Err(status) = tend(&node, &name).await {
                 tracing::debug!(database = %name, %status, "fork work will try again");
@@ -107,6 +108,7 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
         Err(status) if missing_database(&status).is_some() => {
             // A name control state doesn't know: its staged copies are orphans (ADR-0042).
             forks.observe(name, None);
+            forks.follow_view(name, None);
             forks.abandon_seeds(name, None);
             mark_orphans(node, name, None);
             return Ok(());
@@ -114,6 +116,9 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
         Err(status) => return Err(status),
     };
     let view = view_from_placement(&placement)?;
+    // A seeded fork's replica set is its recorded holders until this node sees it ready, its
+    // gate open or not (ADR-0046, point 3.10).
+    forks.follow_view(name, view.fork.as_ref());
     let Some(fork) = view.fork else {
         forks.observe(name, None);
         forks.abandon_seeds(name, None);
@@ -163,7 +168,7 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
                     open_first(node, &placement, &key, at, chain_hash).await?;
                 }
                 Some(primary) if primary != me.as_str() => {
-                    report_follower_reset(node, &fork.identity, reset.as_ref());
+                    report_follower_reset(node, &fork.identity, reset.as_ref()).await;
                 }
                 _ => {}
             }
@@ -268,7 +273,7 @@ fn seed(node: &DataNode, fork: &ForkView, key: StagedKey, seeder: &NodeId) {
 
 /// Reports the fork's reset committed on this follower once its durable log reaches the
 /// position the fork's primary reported it committed at, at that primary's epoch.
-fn report_follower_reset(
+async fn report_follower_reset(
     node: &DataNode,
     fork: &ForkIdentity,
     reset: Option<&(LeaseEpoch, Position)>,
@@ -277,6 +282,11 @@ fn report_follower_reset(
         return;
     };
     let replication = node.replication();
+    replication
+        .forks()
+        .faults()
+        .pass(FaultPoint::FollowerReset, fork.operation)
+        .await;
     let reached = replication.highest_epoch(&fork.name) == Some(*epoch)
         && replication
             .follower_status(&fork.name)
@@ -365,8 +375,7 @@ async fn open_first(
 
 /// Freezes the replica set of `name`, a seeded fork that isn't ready, at its recorded holders,
 /// as control state shows them now, before its primary here starts streaming (ADR-0046, point
-/// 3.10). A placement it can't learn leaves the replica set to the ring until the opening task
-/// learns it.
+/// 3.10). A placement it can't learn leaves the replica set as this node last saw it.
 pub(crate) async fn freeze_holders(node: &DataNode, name: &DatabaseName) {
     let Ok(placement) = node.locate(name).await else {
         return;
@@ -374,15 +383,9 @@ pub(crate) async fn freeze_holders(node: &DataNode, name: &DatabaseName) {
     let Ok(view) = view_from_placement(&placement) else {
         return;
     };
-    if let Some(ForkView {
-        phase: ForkPhase::Seeded { holders, .. },
-        ..
-    }) = view.fork
-    {
-        node.replication()
-            .forks()
-            .freeze(name, Some(holders.into_iter().collect()));
-    }
+    node.replication()
+        .forks()
+        .follow_view(name, view.fork.as_ref());
 }
 
 /// Closes `name`'s readiness gate before its primary here serves at `epoch`, unless the gate
@@ -427,7 +430,8 @@ async fn open(node: DataNode, name: DatabaseName, lease: HeldLease) {
         }
         match try_open(&node, &name, lease).await {
             Ok(Opened::Open) => {
-                replication.forks().freeze(&name, None);
+                // The replica set stays frozen at the holders until the fork is seen ready: a
+                // write served from here on counts only them, as a promotion fences only them.
                 replication.forks().mark_opened(&name, lease.epoch);
                 replication.open_gate(&name);
                 tracing::info!(target: "fleetringd::audit", database = %name, epoch = lease.epoch.get(), "the fork serves clients");
@@ -476,10 +480,8 @@ async fn try_open(
                 Ok(Opened::Refused)
             }
         }
-        ForkPhase::Seeded { at, holders, .. } => {
-            node.replication()
-                .forks()
-                .freeze(name, Some(holders.iter().cloned().collect()));
+        ForkPhase::Seeded { at, .. } => {
+            node.replication().forks().follow_view(name, Some(&fork));
             reset(node, name, lease, &fork, at, &handle).await
         }
         _ => Err(Status::failed_precondition(format!(
