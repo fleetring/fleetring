@@ -263,9 +263,16 @@ id = "node-1"
 # stream's transaction holds the writer from its first write to its COMMIT or ROLLBACK: other
 # writes wait, reads go on. A transaction open longer than `transaction_timeout_ms` is rolled
 # back, so a client that walks away can't hold a database; a write past `max_waiting_writes`
-# behind one is refused with RESOURCE_EXHAUSTED and never runs.
+# behind one is refused with RESOURCE_EXHAUSTED and never runs, and one principal's sessions may
+# take at most half those places. A write's [limits] statement_timeout_ms counts from when it
+# starts, after any wait behind a transaction, and it may wait up to `transaction_timeout_ms`
+# besides: a write queued behind a transaction of full length still gets its whole statement
+# time. A call's own deadline, as `db exec --timeout` sets, bounds the wait and the statement
+# both. A waiting write holds up no drain: it is admitted when it starts, under its lease.
 # transaction_timeout_ms = 30000
 # max_waiting_writes = 64          # per database
+# max_sessions_per_principal = 256 # sessions one principal (a forwarded token's own) may hold
+# idle_timeout_ms = 60000          # a session with no call for this long is ended
 
 # [log]
 # How log lines are written to stderr: "text" (the default) or "json", one object per line with

@@ -8,7 +8,7 @@ use fleetringd::engine::{
     DatabaseEngine, EngineCapability, EngineError, Execution, FrameFollower, Interruption,
     Position, SqliteEngine, Statement, Transaction, Value,
 };
-use fleetringd::{CommittedBatch, DatabaseError};
+use fleetringd::{CommittedBatch, DatabaseError, StatementLimit};
 use rusqlite::Connection;
 use tokio::time::{Instant, timeout};
 
@@ -603,7 +603,8 @@ async fn an_interrupted_write_commits_and_publishes_nothing() -> TestResult {
     let deadline = Instant::now() + SHORT;
     let error = timeout(
         HANG_GUARD,
-        fx.registry.execute_until(&db, runaway, deadline),
+        fx.registry
+            .execute_until(&db, runaway, StatementLimit::until(deadline)),
     )
     .await?
     .expect_err("a write that never ends");
@@ -652,7 +653,11 @@ async fn inline_execution_stops_a_request_whose_deadline_passed_before_it_ran() 
     fx.create(&db).await?;
     let error = fx
         .registry
-        .execute_until(&db, Transaction::from(fx.put("late", 1)), Instant::now())
+        .execute_until(
+            &db,
+            Transaction::from(fx.put("late", 1)),
+            StatementLimit::until(Instant::now()),
+        )
         .await
         .expect_err("a deadline already past");
     assert_eq!(

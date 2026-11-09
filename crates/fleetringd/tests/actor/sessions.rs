@@ -14,7 +14,7 @@ use fleetringd::engine::{
 };
 use fleetringd::{
     Acknowledgement, BatchPublisher, CommittedBatch, DatabaseError, RecordingPublisher, Registry,
-    ReplicationError, SessionCalled, SessionId, SessionLimits,
+    ReplicationError, SessionCalled, SessionId, SessionLimits, SessionTurn, StatementLimit,
 };
 use tempfile::TempDir;
 
@@ -546,10 +546,13 @@ async fn call(
     registry
         .session_call(
             db,
-            SessionId::new(session),
-            execute(sql),
-            SessionAccess::ReadWrite,
-            holding,
+            SessionTurn::new(
+                SessionId::new(session),
+                "app",
+                execute(sql),
+                SessionAccess::ReadWrite,
+                holding,
+            ),
             None,
         )
         .await
@@ -821,10 +824,13 @@ async fn a_call_that_commits_several_transactions_publishes_one_batch_each() -> 
     let called = registry
         .session_call(
             &db,
-            SessionId::new(1),
-            sequence,
-            SessionAccess::ReadWrite,
-            Autocommit::On,
+            SessionTurn::new(
+                SessionId::new(1),
+                "app",
+                sequence,
+                SessionAccess::ReadWrite,
+                Autocommit::On,
+            ),
             None,
         )
         .await?;
@@ -916,10 +922,13 @@ async fn a_read_only_session_never_waits_for_another_sessions_transaction() -> T
         Duration::from_millis(10),
         registry.session_call(
             &db,
-            SessionId::new(2),
-            execute("INSERT INTO t VALUES (2)"),
-            SessionAccess::ReadOnly,
-            Autocommit::On,
+            SessionTurn::new(
+                SessionId::new(2),
+                "app",
+                execute("INSERT INTO t VALUES (2)"),
+                SessionAccess::ReadOnly,
+                Autocommit::On,
+            ),
             None,
         ),
     )
@@ -933,5 +942,165 @@ async fn a_read_only_session_never_waits_for_another_sessions_transaction() -> T
         .query(&db, Statement::new("SELECT v FROM t"))
         .await?;
     assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+    Ok(())
+}
+
+/// A call of session `session`, opened by `principal`, in autocommit, run in the background.
+fn spawn_call(
+    registry: &Registry,
+    db: &DatabaseName,
+    session: u64,
+    principal: &str,
+    sql: &str,
+) -> tokio::task::JoinHandle<Result<SessionCalled, DatabaseError>> {
+    let registry = registry.clone();
+    let db = db.clone();
+    let turn = SessionTurn::new(
+        SessionId::new(session),
+        principal,
+        execute(sql),
+        SessionAccess::ReadWrite,
+        Autocommit::On,
+    );
+    tokio::spawn(async move { registry.session_call(&db, turn, None).await })
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_write_waiting_behind_a_transaction_gets_its_whole_statement_time() -> TestResult {
+    let limits = SessionLimits {
+        transaction_timeout: Duration::from_secs(1),
+        ..SessionLimits::default()
+    };
+    let (registry, _publisher, _dir) = registry(limits);
+    let db = name("patient");
+    create(&registry, &db).await?;
+    call(&registry, &db, 1, "BEGIN", Autocommit::On).await?;
+    call(
+        &registry,
+        &db,
+        1,
+        "INSERT INTO t VALUES (1)",
+        Autocommit::InTransaction,
+    )
+    .await?;
+    // 300 ms to run, counted once it starts, and up to 5 s to wait for its turn.
+    let waiting = tokio::spawn({
+        let registry = registry.clone();
+        let db = db.clone();
+        async move {
+            let limit = StatementLimit {
+                budget: Duration::from_millis(300),
+                latest: tokio::time::Instant::now() + Duration::from_secs(5),
+            };
+            registry
+                .execute_until(
+                    &db,
+                    Transaction::from(Statement::new("INSERT INTO t VALUES (2)")),
+                    limit,
+                )
+                .await
+        }
+    });
+    // The transaction runs for its whole second, then rolls back, and the write runs.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    waiting.await??;
+    let rows = registry
+        .query(&db, Statement::new("SELECT v FROM t"))
+        .await?;
+    assert_eq!(rows.rows, vec![vec![Value::Integer(2)]]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_write_waits_no_later_than_its_latest_moment() -> TestResult {
+    let limits = SessionLimits {
+        transaction_timeout: Duration::from_secs(10),
+        ..SessionLimits::default()
+    };
+    let (registry, _publisher, _dir) = registry(limits);
+    let db = name("impatient");
+    create(&registry, &db).await?;
+    call(&registry, &db, 1, "BEGIN", Autocommit::On).await?;
+    let limit = StatementLimit {
+        budget: Duration::from_secs(30),
+        latest: tokio::time::Instant::now() + Duration::from_millis(500),
+    };
+    let waiting = tokio::spawn({
+        let registry = registry.clone();
+        let db = db.clone();
+        async move {
+            registry
+                .execute_until(
+                    &db,
+                    Transaction::from(Statement::new("INSERT INTO t VALUES (2)")),
+                    limit,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    call(&registry, &db, 1, "COMMIT", Autocommit::InTransaction).await?;
+    let late = waiting
+        .await?
+        .expect_err("it waited past its latest moment");
+    assert!(
+        matches!(
+            late.engine_error(),
+            Some(fleetringd::engine::EngineError::Interrupted(
+                Interruption::Deadline
+            ))
+        ),
+        "{late:?}"
+    );
+    let rows = registry
+        .query(&db, Statement::new("SELECT v FROM t"))
+        .await?;
+    assert!(rows.rows.is_empty(), "it never ran");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn one_principal_takes_at_most_half_the_waiting_places() -> TestResult {
+    let limits = SessionLimits {
+        max_waiting_writes: 4,
+        ..SessionLimits::default()
+    };
+    let (registry, _publisher, _dir) = registry(limits);
+    let db = name("shared");
+    create(&registry, &db).await?;
+    call(&registry, &db, 1, "BEGIN", Autocommit::On).await?;
+    let mut queued = Vec::new();
+    for session in [2, 3] {
+        queued.push(spawn_call(&registry, &db, session, "greedy", "BEGIN"));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let refused = spawn_call(&registry, &db, 4, "greedy", "BEGIN")
+        .await?
+        .expect_err("past its share");
+    assert!(matches!(refused, DatabaseError::Busy { .. }), "{refused:?}");
+    // Another principal still finds a place.
+    queued.push(spawn_call(
+        &registry,
+        &db,
+        5,
+        "polite",
+        "INSERT INTO t VALUES (5)",
+    ));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(queued.iter().all(|call| !call.is_finished()), "all wait");
+    call(&registry, &db, 1, "COMMIT", Autocommit::InTransaction).await?;
+    // The first greedy session's BEGIN takes the writer; end it, and the rest run.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    for session in [2, 3] {
+        registry.session_end(&db, SessionId::new(session)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for call in queued {
+        call.await??;
+    }
+    let rows = registry
+        .query(&db, Statement::new("SELECT v FROM t"))
+        .await?;
+    assert_eq!(rows.rows, vec![vec![Value::Integer(5)]]);
     Ok(())
 }

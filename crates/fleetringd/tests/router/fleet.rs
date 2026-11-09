@@ -41,6 +41,10 @@ pub(crate) struct Options {
     pub(crate) data_nodes: usize,
     /// `[sessions] transaction_timeout_ms` on every data node.
     pub(crate) transaction_timeout_ms: u64,
+    /// More `[sessions]` lines for every data node.
+    pub(crate) sessions: String,
+    /// More tables for every node, after `[sessions]`.
+    pub(crate) node_tables: String,
     /// The router's `[streams]` and `[routing]` tables, and any other it needs.
     pub(crate) router_tables: String,
 }
@@ -50,6 +54,8 @@ impl Default for Options {
         Self {
             data_nodes: 3,
             transaction_timeout_ms: 30_000,
+            sessions: String::new(),
+            node_tables: String::new(),
             router_tables: String::new(),
         }
     }
@@ -80,7 +86,7 @@ impl Fleet {
             "control",
             "control",
             None,
-            options.transaction_timeout_ms,
+            &options,
         )?)?)
         .await?;
         let address = control.control_address().ok_or("no control address")?;
@@ -93,7 +99,7 @@ impl Fleet {
                     &format!("data-{index}"),
                     "data",
                     Some(address),
-                    options.transaction_timeout_ms,
+                    &options,
                 )?)?)
                 .await?,
             );
@@ -345,14 +351,17 @@ fn node_config(
     id: &str,
     role: &str,
     control: Option<SocketAddr>,
-    transaction_timeout_ms: u64,
+    options: &Options,
 ) -> Result<String, Box<dyn Error>> {
     let address = control.map_or_else(String::new, |address| format!("address = \"{address}\"\n"));
     Ok(format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
          \n[membership]\nheartbeat_interval_ms = 100\n\n[control]\n{address}\
-         \n[sessions]\ntransaction_timeout_ms = {transaction_timeout_ms}\n{}{PRINCIPALS}",
+         \n[sessions]\ntransaction_timeout_ms = {}\n{}\n{}\n{}{PRINCIPALS}",
         dir.join(id),
+        options.transaction_timeout_ms,
+        options.sessions,
+        options.node_tables,
         tls.node_table(id)?,
     ))
 }
