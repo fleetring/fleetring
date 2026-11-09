@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{Action, DatabaseName, LeaseEpoch};
+use fleetring_control::{Action, DatabaseName, Incarnation, LeaseEpoch};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, CreateDatabaseRequest, Engine, FenceRequest, HeartbeatRequest,
@@ -15,8 +15,9 @@ use fleetring_proto::v1::{
 
 use crate::auth::refused_binding;
 use crate::control::ControlClient;
+use crate::control::fork::replica_to_proto;
 use crate::control::rejection_status;
-use crate::data::{Client, DatabaseSpec, Expiry, LeaseUpdate, NewMetadata};
+use crate::data::{Client, DatabaseSpec, Expiry, ForkSpec, LeaseUpdate, NewMetadata};
 use crate::engine::{Statement, Value};
 use crate::environment::Network;
 use crate::replication::LeaseChange;
@@ -163,6 +164,8 @@ impl NodeClients {
     fn for_operation(&mut self, operation: &Operation) -> Option<ControlClient> {
         let node = match operation {
             Operation::Join { node }
+            | Operation::JoinWith { node, .. }
+            | Operation::Report { node, .. }
             | Operation::Heartbeat { node }
             | Operation::AcquireLease { node, .. }
             | Operation::RenewLease { node, .. } => node,
@@ -227,6 +230,59 @@ async fn execute(
             .map(|response| Ack::Joined {
                 membership_epoch: response.membership_epoch,
             }),
+        Operation::JoinWith { node, features } => client
+            .join(JoinRequest {
+                protocol: Some(PROTOCOL_VERSION),
+                node: Some(Node {
+                    id: node.to_string(),
+                    zone: None,
+                    host: None,
+                    weight: 1,
+                    address: None,
+                }),
+                software: Some(software_to_proto(
+                    &features
+                        .iter()
+                        .copied()
+                        .fold(running(), fleetring_control::Software::with_feature),
+                )),
+            })
+            .await
+            .map(|response| Ack::Joined {
+                membership_epoch: response.membership_epoch,
+            }),
+        Operation::Report {
+            node,
+            replicas,
+            disk_free_bytes,
+        } => client
+            .heartbeat(HeartbeatRequest {
+                node_id: node.to_string(),
+                databases: replicas
+                    .iter()
+                    .map(|replica| replica_to_proto(replica, None))
+                    .collect(),
+                software: Some(software_to_proto(&running())),
+                disk_free_bytes: *disk_free_bytes,
+            })
+            .await
+            .map(|_| Ack::HeartbeatRecorded),
+        Operation::Fork {
+            source,
+            target,
+            operation,
+            replication_factor,
+        } => {
+            let mut spec = ForkSpec::new(*operation);
+            spec.database.replication_factor = u8::try_from(*replication_factor)
+                .ok()
+                .and_then(ReplicationFactor::new);
+            data.fork_database(source, target, &spec)
+                .await
+                .map(|status| Ack::Forked {
+                    incarnation: Incarnation::new(status.incarnation),
+                })
+        }
         Operation::Heartbeat { node } => client
             .heartbeat(HeartbeatRequest {
                 node_id: node.to_string(),

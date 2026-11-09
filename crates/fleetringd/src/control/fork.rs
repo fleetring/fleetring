@@ -189,10 +189,10 @@ fn seed_failure_reason(reason: i32, retryable: bool) -> Option<SeedFailureReason
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "simulation")),
     expect(
         dead_code,
-        reason = "data nodes report forks with it in FR-085's stage C"
+        reason = "the simulation's reports use it until data nodes report forks (FR-085, stage C)"
     )
 )]
 fn seed_failure_reason_to_proto(reason: SeedFailureReason) -> proto::SeedFailureReason {
@@ -209,10 +209,10 @@ fn seed_failure_reason_to_proto(reason: SeedFailureReason) -> proto::SeedFailure
 /// The status a heartbeat carries for `replica`, with `progress` if it streams a copy: what a
 /// data node sends, and what [`replica_from_proto`] reads back.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "simulation")),
     expect(
         dead_code,
-        reason = "data nodes report forks with it in FR-085's stage C"
+        reason = "the simulation's reports use it until data nodes report forks (FR-085, stage C)"
     )
 )]
 pub(crate) fn replica_to_proto(

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{DatabaseName, LeaseEpoch};
+use fleetring_control::{DatabaseName, Feature, HostedReplica, Incarnation, LeaseEpoch};
 use tonic::Code;
 
 use crate::sim::SimRng;
@@ -36,6 +36,44 @@ pub enum Operation {
     Heartbeat {
         /// The node.
         node: NodeId,
+    },
+    /// Joins `node` reporting this build's software with `features` besides, as a node of a
+    /// later release would: so that a scenario of nodes without data, such as FR-087's, can
+    /// enable a fleet feature this build doesn't report yet, `fork` among them.
+    JoinWith {
+        /// The node.
+        node: NodeId,
+        /// The fleet features it reports beyond this build's.
+        features: Vec<Feature>,
+    },
+    /// Sends a heartbeat for `node` that reports `replicas`, with what each says about a fork
+    /// of its name (staged copies, seed failures, lost copies, and reset writes; ADR-0046, point
+    /// 4.5), and the free bytes on its volume: what a data node that seeds forks reports, sent
+    /// without one. The heartbeat replaces everything `node` reported before, as any does.
+    ///
+    /// A scenario delays a report by sending it later, and duplicates it by sending it again;
+    /// a report for another fork identity is sent the same way, and must count for nothing.
+    Report {
+        /// The node.
+        node: NodeId,
+        /// The databases it hosts, as it reports them.
+        replicas: Vec<HostedReplica>,
+        /// The free bytes on its data volume, if it says.
+        disk_free_bytes: Option<u64>,
+    },
+    /// Forks `source` as `target` with `replication_factor` replicas (0 for the fleet's
+    /// default) under `operation`, through the control plane's `ForkDatabase`, as
+    /// `db fork --detach` does. Sent again with the same operation, it is a resend, and answers
+    /// with the same operation.
+    Fork {
+        /// The database copied.
+        source: DatabaseName,
+        /// The fork.
+        target: DatabaseName,
+        /// The operation's ID.
+        operation: fleetring_control::fork::OperationId,
+        /// How many replicas the fork should have.
+        replication_factor: u32,
     },
     /// Removes `node`, as an operator on the control host would: it is submitted to the control
     /// node in process, not through the `Leave` RPC a node calls when it shuts down.
@@ -169,7 +207,10 @@ impl Operation {
             | Self::ImpostorReplicate { database, .. }
             | Self::ImpostorFence { database, .. }
             | Self::ImpostorSnapshot { database, .. } => Some(database),
+            Self::Fork { target, .. } => Some(target),
             Self::Join { .. }
+            | Self::JoinWith { .. }
+            | Self::Report { .. }
             | Self::Heartbeat { .. }
             | Self::Leave { .. }
             | Self::Drain { .. } => None,
@@ -186,6 +227,33 @@ impl fmt::Display for Operation {
         match self {
             Self::Join { node } => write!(f, "join {node}"),
             Self::Heartbeat { node } => write!(f, "heartbeat {node}"),
+            Self::JoinWith { node, features } => {
+                write!(f, "join {node} with")?;
+                for feature in features {
+                    write!(f, " {feature}")?;
+                }
+                Ok(())
+            }
+            Self::Report {
+                node,
+                replicas,
+                disk_free_bytes,
+            } => {
+                write!(f, "report {} databases from {node}", replicas.len())?;
+                if let Some(free) = disk_free_bytes {
+                    write!(f, ", {free} bytes free")?;
+                }
+                Ok(())
+            }
+            Self::Fork {
+                source,
+                target,
+                operation,
+                replication_factor,
+            } => write!(
+                f,
+                "fork {source} as {target} rf {replication_factor} operation {operation}"
+            ),
             Self::Leave { node } => write!(f, "leave {node}"),
             Self::Drain { node } => write!(f, "drain {node}"),
             Self::CreateDatabase {
@@ -420,6 +488,11 @@ pub enum Ack {
     },
     /// The node served an impostor's node call, which a node bound to placement never does.
     Served,
+    /// The control plane accepted a fork, or answered a resend with the operation's status.
+    Forked {
+        /// The fork's incarnation.
+        incarnation: Incarnation,
+    },
 }
 
 impl fmt::Display for Ack {
@@ -472,6 +545,7 @@ impl fmt::Display for Ack {
                 binding: None,
             } => write!(f, "refused {code:?}"),
             Self::Served => f.write_str("served"),
+            Self::Forked { incarnation } => write!(f, "forked at incarnation {incarnation}"),
             Self::Read { values } => {
                 const SHOWN: usize = 6;
                 write!(f, "read {} values", values.len())?;
