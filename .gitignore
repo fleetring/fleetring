@@ -1,1 +1,3 @@
 /target
+/tests/router-conformance/target
+/tests/router/node/node_modules

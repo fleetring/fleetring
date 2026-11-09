@@ -4,7 +4,6 @@
 #[path = "../support/mod.rs"]
 mod support;
 
-mod conformance;
 mod fleet;
 mod http;
 mod sessions;
