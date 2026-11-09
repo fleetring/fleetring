@@ -145,11 +145,16 @@ impl RoutingConfig {
 const DEFAULT_IDLE_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(10_000).expect("nonzero");
 /// How many Hrana streams one router holds.
 const DEFAULT_MAX_STREAMS: NonZeroUsize = NonZeroUsize::new(10_000).expect("nonzero");
+/// How many Hrana streams one principal holds on one router.
+const DEFAULT_MAX_STREAMS_PER_PRINCIPAL: NonZeroUsize = NonZeroUsize::new(256).expect("nonzero");
 /// The largest request body: 8 MiB.
 const DEFAULT_MAX_REQUEST_BYTES: NonZeroUsize =
     NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero");
 /// How many SQL texts one stream may store.
 const DEFAULT_MAX_SQL_PER_STREAM: NonZeroUsize = NonZeroUsize::new(128).expect("nonzero");
+/// The most bytes of rows one response carries: twice what a node lets one call read.
+const DEFAULT_MAX_RESPONSE_BYTES: NonZeroUsize =
+    NonZeroUsize::new(2 * crate::engine::MAX_RESULT_BYTES).expect("nonzero");
 /// How many statements one request may carry: its stream requests and their batch steps.
 const DEFAULT_MAX_STATEMENTS: NonZeroUsize = NonZeroUsize::new(1_000).expect("nonzero");
 
@@ -163,6 +168,9 @@ pub struct StreamsConfig {
     pub idle_timeout_ms: NonZeroU64,
     /// How many streams the router holds at once; a request for one more gets `503`.
     pub max_streams: NonZeroUsize,
+    /// How many of those streams one principal, a token's own, may hold; a request for one more
+    /// gets `429`.
+    pub max_streams_per_principal: NonZeroUsize,
     /// The largest request body, in bytes; a larger one gets `413`.
     pub max_request_bytes: NonZeroUsize,
     /// How many SQL texts a stream may store with `store_sql`.
@@ -170,6 +178,10 @@ pub struct StreamsConfig {
     /// How many statements one request may carry, counting each stream request and each batch
     /// step; a request with more gets `413`.
     pub max_statements: NonZeroUsize,
+    /// The most bytes of rows one response carries, over all its requests; a request whose rows
+    /// would take more fails with `RESULT_TOO_LARGE`, and the stream goes on. A node bounds one
+    /// call's rows on its own, at 32 MiB.
+    pub max_response_bytes: NonZeroUsize,
 }
 
 impl Default for StreamsConfig {
@@ -177,9 +189,11 @@ impl Default for StreamsConfig {
         Self {
             idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
             max_streams: DEFAULT_MAX_STREAMS,
+            max_streams_per_principal: DEFAULT_MAX_STREAMS_PER_PRINCIPAL,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_sql_per_stream: DEFAULT_MAX_SQL_PER_STREAM,
             max_statements: DEFAULT_MAX_STATEMENTS,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -331,6 +345,7 @@ mod tests {
         let config = with("127.0.0.1:8080", "").expect("valid");
         assert_eq!(config.streams.idle_timeout(), Duration::from_secs(10));
         assert_eq!(config.streams.max_streams.get(), 10_000);
+        assert_eq!(config.streams.max_streams_per_principal.get(), 256);
         assert_eq!(config.streams.max_request_bytes.get(), 8 * 1024 * 1024);
         assert_eq!(config.streams.max_sql_per_stream.get(), 128);
         assert_eq!(config.routing.placement_ttl(), Duration::from_secs(60));
