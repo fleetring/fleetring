@@ -29,6 +29,8 @@ pub struct DatabaseReport {
     /// Why there is no schema, when it was asked for and the primary couldn't give it: a primary
     /// that runs an older release, or an engine that can't describe itself. `null` otherwise.
     pub schema_unavailable: Option<String>,
+    /// The fork that made the database, or `null` for one no fork made.
+    pub fork: Option<ForkStatusReport>,
 }
 
 impl DatabaseReport {
@@ -82,6 +84,9 @@ pub struct SchemaObjectReport {
 pub struct PlacementReport {
     /// The engine it runs on.
     pub engine: String,
+    /// The database's incarnation: 16 lowercase hex digits, all zero for one created before
+    /// forks were enabled (ADR-0046, point 1).
+    pub incarnation: String,
     /// Its lease epoch, 0 before its first lease.
     pub lease_epoch: u64,
     /// How many replicas it should have.
@@ -263,6 +268,8 @@ pub struct DatabaseLocation {
     /// Its metadata, or `null` for a database without any. A listing leaves the description's
     /// text out.
     pub metadata: Option<MetadataReport>,
+    /// The fork that made the database, or `null` for one no fork made.
+    pub fork: Option<ForkStatusReport>,
 }
 
 /// `db list`'s result: the databases the caller may see, by name.
@@ -527,4 +534,96 @@ mod tests {
         assert_eq!(printable("a\u{1b}[2J"), "a\\u{001B}[2J");
         assert_eq!(printable("x\u{200B}y\u{2028}"), "x\\u{200B}y\\u{2028}");
     }
+}
+
+/// Why a fork failed, the cause of its last retry, and how many attempts it made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForkFailureReport {
+    /// `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`,
+    /// `source_too_large`, `insufficient_disk`, or `engine_unsupported`. The list is open: a
+    /// script treats an unknown reason as a failure.
+    pub reason: String,
+    /// For `retries_exhausted` and `deadline_exceeded`: `seeder_down`, `attempt_timed_out`,
+    /// `transfer_failed`, `pin_expired`, `holder_lost`, `holders_left`, or
+    /// `seeder_disk_refused`; else `null`.
+    pub last_cause: Option<String>,
+    /// How many attempts it made; 0 when the control plane no longer knows.
+    pub attempts: u32,
+}
+
+/// A fork's record in `db show`, `db locate` and `db list`: its state and its provenance. A
+/// field that doesn't apply in the current state is `null`, or empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForkStatusReport {
+    /// `seeding`, `seeded`, `ready`, `failed`, or `cancelled`.
+    pub state: &'static str,
+    /// The operation that made the fork: 26 lowercase base32 characters.
+    pub operation_id: String,
+    /// The database it copies.
+    pub source: String,
+    /// The source's incarnation the fork copies: 16 lowercase hex digits.
+    pub source_incarnation: String,
+    /// The current attempt while seeding, and the attempts made once failed.
+    pub attempt: u32,
+    /// The most attempts the fork makes.
+    pub max_attempts: u32,
+    /// While seeding, the attempt's seeder.
+    pub seeder: Option<String>,
+    /// While seeding, the replicas passed over as seeders.
+    pub seeder_excluded: Vec<String>,
+    /// While seeding, the replicas that refused the copy for want of disk.
+    pub disk_refused: Vec<String>,
+    /// The replicas that report the staged copy, or the recorded holders once seeded.
+    pub holders: Vec<String>,
+    /// How many holders the fork needs.
+    pub holders_needed: u32,
+    /// While seeding, the bytes the seeder staged.
+    pub bytes: Option<u64>,
+    /// While seeding, the bytes in all.
+    pub total_bytes: Option<u64>,
+    /// Once seeded, the source position the copy holds.
+    pub position: Option<String>,
+    /// Once seeded, the chain hash at that position.
+    pub chain_hash: Option<String>,
+    /// Once failed, why.
+    pub failure: Option<ForkFailureReport>,
+    /// The principal that asked for the fork, if it had a name.
+    pub requested_by: Option<String>,
+    /// When it was asked for, RFC 3339.
+    pub requested_at: String,
+    /// While seeding, when the fork fails if it is still seeding.
+    pub deadline_at: Option<String>,
+    /// When the copy was complete.
+    pub completed_at: Option<String>,
+    /// When the fork became ready.
+    pub ready_at: Option<String>,
+    /// When the fork failed.
+    pub failed_at: Option<String>,
+}
+
+/// `db fork`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForkReport {
+    /// The operation: 26 lowercase base32 characters.
+    pub operation_id: String,
+    /// The fork's name.
+    pub database: String,
+    /// The fork's incarnation: 16 lowercase hex digits.
+    pub incarnation: String,
+    /// `seeding`, `seeded`, `ready`, `failed`, or `cancelled`.
+    pub state: &'static str,
+    /// The database it copies.
+    pub source: String,
+    /// The source's incarnation the fork copies: 16 lowercase hex digits.
+    pub source_incarnation: String,
+    /// The source position the fork holds, `null` until it is seeded.
+    pub position: Option<String>,
+    /// The chain hash at that position, `null` until it is seeded.
+    pub chain_hash: Option<String>,
+    /// Why it failed, or `null`.
+    pub failure: Option<ForkFailureReport>,
+    /// How long the command ran.
+    pub elapsed_ms: u64,
+    /// Where the fork lives, or `null` once it is gone.
+    pub placement: Option<PlacementReport>,
 }

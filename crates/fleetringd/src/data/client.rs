@@ -77,6 +77,10 @@ pub struct Location {
     /// Its description, labels, and creator (ADR-0041), or `None` for a database without
     /// metadata, or from a control node that predates it.
     pub metadata: Option<MetadataView>,
+    /// Its incarnation (ADR-0046), all zero for a database created before forks were enabled.
+    pub incarnation: Incarnation,
+    /// The fork that made it, its state and provenance, or `None` for a database no fork made.
+    pub fork: Option<fleetring_client::output::ForkStatusReport>,
 }
 
 /// A fork request (ADR-0046): its operation ID, and what the fork is created with besides its

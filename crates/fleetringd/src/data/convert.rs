@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
+use fleetring_control::Incarnation;
 use fleetring_control::{
     Acks, DatabaseName, Description, DescriptionChange, Durability, Engine, LabelKey, LabelValue,
     Labels, LeaseEpoch, Liveness, Metadata, MetadataChange, ReplicaRole, Revocations, Revoked,
@@ -616,6 +617,11 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         replication_factor,
         durability,
         metadata: placement.metadata.map(metadata_view),
+        incarnation: Incarnation::new(placement.incarnation),
+        fork: placement
+            .fork
+            .as_ref()
+            .map(crate::fork_report::status_report),
     })
 }
 
