@@ -25,8 +25,8 @@ use fleetring_client::context::{Context, ContextName};
 use fleetring_client::dirs::{self, DirsError};
 use fleetring_control::{Millis, Timestamp, TokenId};
 use fleetringd::auth::{
-    BearerToken, Grant, IssueError, MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS, ParseScopeError,
-    Scope,
+    BearerToken, IssueError, MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS, ParseScopeError, Scope,
+    TokenSpec,
 };
 use fleetringd::dev::{self, DevChecked, DevError};
 use fleetringd::mcp::Access;
@@ -304,7 +304,7 @@ impl Issuer<'_> {
 
 /// What a new identity gets.
 #[derive(Debug, Clone)]
-pub(crate) struct MintGrant {
+pub(crate) struct MintSpec {
     /// The token's scopes.
     pub(crate) scopes: Vec<Scope>,
     /// Whether they are the defaults or `--scope`'s.
@@ -528,7 +528,7 @@ impl AgentDir {
     }
 
     /// Mints a new identity from `issuer`: a certificate for `agent-<id>` and a token with
-    /// `grant`'s scopes, both valid from `now`, with `ca.crt` and `identity.toml`. Holds the
+    /// `spec`'s scopes, both valid from `now`, with `ca.crt` and `identity.toml`. Holds the
     /// directory's lock while it works.
     ///
     /// # Errors
@@ -538,7 +538,7 @@ impl AgentDir {
     pub(crate) fn mint(
         &self,
         issuer: Issuer<'_>,
-        grant: &MintGrant,
+        spec: &MintSpec,
         now: Timestamp,
     ) -> Result<AgentRecord, AgentError> {
         let _lock = self.lock(Missing::Create)?;
@@ -548,7 +548,7 @@ impl AgentDir {
                 dir: self.dir.clone(),
             });
         }
-        self.write_new(issuer, grant, now)
+        self.write_new(issuer, spec, now)
     }
 
     /// Uses the identity if there is one, renewing what [`renewal`](Self::renewal) says is due,
@@ -563,12 +563,12 @@ impl AgentDir {
     pub(crate) fn acquire(
         &self,
         issuer: Issuer<'_>,
-        grant: &MintGrant,
+        spec: &MintSpec,
         now: Timestamp,
     ) -> Result<Acquired, AgentError> {
         let _lock = self.lock(Missing::Create)?;
         let Some(old) = self.record()? else {
-            return self.write_new(issuer, grant, now).map(Acquired::Minted);
+            return self.write_new(issuer, spec, now).map(Acquired::Minted);
         };
         self.check_fleet(&old, issuer.authority())?;
         let renewal = self.renewal(&old, issuer.authority().certificate_pem(), now);
@@ -577,7 +577,7 @@ impl AgentDir {
         }
         // Read before the new token replaces it.
         let old_token = renewal.token().then(|| self.old_token(&old, now));
-        let record = self.reissue(issuer, &old, renewal, grant, now)?;
+        let record = self.reissue(issuer, &old, renewal, spec, now)?;
         Ok(Acquired::Renewed {
             record,
             old: old_token,
@@ -600,7 +600,7 @@ impl AgentDir {
     pub(crate) fn renew(
         &self,
         issuer: Issuer<'_>,
-        grant: &MintGrant,
+        spec: &MintSpec,
         now: Timestamp,
     ) -> Result<Renewed, AgentError> {
         let no_identity = || AgentError::NoIdentity {
@@ -633,7 +633,7 @@ impl AgentDir {
             }
             None => (old, ScopeRenewal::Kept),
         };
-        let record = self.reissue(issuer, &old, Renewal::Both, grant, now)?;
+        let record = self.reissue(issuer, &old, Renewal::Both, spec, now)?;
         Ok(Renewed {
             record,
             old: old_token,
@@ -792,21 +792,20 @@ impl AgentDir {
     fn write_new(
         &self,
         issuer: Issuer<'_>,
-        grant: &MintGrant,
+        spec: &MintSpec,
         now: Timestamp,
     ) -> Result<AgentRecord, AgentError> {
         let authority = issuer.authority();
-        let written =
-            self.write_credentials(authority, Renewal::Both, &grant.scopes, grant, now)?;
+        let written = self.write_credentials(authority, Renewal::Both, &spec.scopes, spec, now)?;
         let record = AgentRecord {
-            version: grant.scopes_from.record_version(),
+            version: spec.scopes_from.record_version(),
             principal: self.id.principal().to_string(),
-            owner: grant.owner.clone(),
+            owner: spec.owner.clone(),
             parent: None,
             fleet: authority.fleet().to_string(),
-            scopes: grant.scopes.iter().map(ToString::to_string).collect(),
-            scopes_from: grant.scopes_from,
-            read_only: grant.access == Access::ReadOnly,
+            scopes: spec.scopes.iter().map(ToString::to_string).collect(),
+            scopes_from: spec.scopes_from,
+            read_only: spec.access == Access::ReadOnly,
             token_id: written.token_id.unwrap_or_default(),
             token_expires_at: written.token_expires_at.unwrap_or_default(),
             cert_expires_at: written.cert_expires_at.unwrap_or_default(),
@@ -822,7 +821,7 @@ impl AgentDir {
         issuer: Issuer<'_>,
         old: &AgentRecord,
         renewal: Renewal,
-        grant: &MintGrant,
+        spec: &MintSpec,
         now: Timestamp,
     ) -> Result<AgentRecord, AgentError> {
         let scopes = old
@@ -834,7 +833,7 @@ impl AgentDir {
                 path: self.record_file(),
                 source,
             })?;
-        let written = self.write_credentials(issuer.authority(), renewal, &scopes, grant, now)?;
+        let written = self.write_credentials(issuer.authority(), renewal, &scopes, spec, now)?;
         let record = AgentRecord {
             token_id: written.token_id.unwrap_or_else(|| old.token_id.clone()),
             token_expires_at: written
@@ -858,19 +857,19 @@ impl AgentDir {
         authority: &Authority,
         renewal: Renewal,
         scopes: &[Scope],
-        grant: &MintGrant,
+        spec: &MintSpec,
         now: Timestamp,
     ) -> Result<Written, AgentError> {
         let principal = self.id.principal();
         let mut written = Written::default();
         let mut token = None;
         if renewal.token() {
-            let ttl = grant.token_ttl.min(MAX_TOKEN_LIFETIME);
+            let ttl = spec.token_ttl.min(MAX_TOKEN_LIFETIME);
             let id = new_token_id()?;
             let expires_at = now.saturating_add(Millis::new(
                 u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
             ));
-            let issued = authority.token_signer()?.issue(&Grant {
+            let issued = authority.token_signer()?.issue(&TokenSpec {
                 principal: principal.clone(),
                 scopes: scopes.iter().cloned().collect(),
                 id: id.clone(),
@@ -880,9 +879,9 @@ impl AgentDir {
             token = Some((issued, id, expires_at));
         }
         if renewal.certificate() {
-            let issued = authority.issue_client(&principal, Validity::new(now, grant.cert_ttl))?;
+            let issued = authority.issue_client(&principal, Validity::new(now, spec.cert_ttl))?;
             let lifetime =
-                Millis::new(u64::try_from(grant.cert_ttl.as_millis()).unwrap_or(u64::MAX));
+                Millis::new(u64::try_from(spec.cert_ttl.as_millis()).unwrap_or(u64::MAX));
             write_private(&self.ca_file(), authority.certificate_pem().as_bytes())?;
             write_private(&self.cert_file(), issued.certificate_pem().as_bytes())?;
             write_private(&self.key_file(), issued.key_pem().as_bytes())?;
@@ -1241,8 +1240,8 @@ mod tests {
         .expect("an authority")
     }
 
-    fn grant(agent: &AgentId) -> MintGrant {
-        MintGrant {
+    fn spec(agent: &AgentId) -> MintSpec {
+        MintSpec {
             scopes: agent.default_scopes(Access::ReadWrite),
             scopes_from: ScopesFrom::Defaults,
             access: Access::ReadWrite,
@@ -1372,12 +1371,12 @@ mod tests {
         let now = Timestamp::from_millis(1_800_000_000_000);
         let dir = AgentDir::new(root.path(), agent.clone());
         // An identity as 0.7 minted it: version 1 and `admin:agent-42-*` alone.
-        let old = MintGrant {
+        let old = MintSpec {
             scopes: vec!["admin:agent-42-*".parse()?],
-            ..grant(&agent)
+            ..spec(&agent)
         };
         dir.mint(Issuer::Authority(&issuing), &old, now)?;
-        let renewed = dir.renew(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        let renewed = dir.renew(Issuer::Authority(&issuing), &spec(&agent), now)?;
         assert_eq!(
             renewed.scopes,
             ScopeRenewal::Widened {
@@ -1395,22 +1394,22 @@ mod tests {
         let claims = String::from_utf8(URL_SAFE_NO_PAD.decode(payload)?)?;
         assert!(claims.contains("stream:agent-42-*"), "{claims}");
         // A second renewal has nothing to add.
-        let again = dir.renew(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        let again = dir.renew(Issuer::Authority(&issuing), &spec(&agent), now)?;
         assert_eq!(again.scopes, ScopeRenewal::Kept);
         assert_eq!(again.record.scopes, renewed.record.scopes);
 
         // The same scope chosen with --scope is recorded so, at version 2, and kept.
         let chosen = AgentDir::new(root.path(), id("43"));
-        let flags = MintGrant {
+        let flags = MintSpec {
             scopes: vec!["admin:agent-43-*".parse()?],
             scopes_from: ScopesFrom::Flags,
-            ..grant(&id("43"))
+            ..spec(&id("43"))
         };
         let record = chosen.mint(Issuer::Authority(&issuing), &flags, now)?;
         assert_eq!(record.version, 2);
         let text = fs::read_to_string(chosen.record_file())?;
         assert!(text.contains("scopes_from = \"flags\""), "{text}");
-        let kept = chosen.renew(Issuer::Authority(&issuing), &grant(&id("43")), now)?;
+        let kept = chosen.renew(Issuer::Authority(&issuing), &spec(&id("43")), now)?;
         assert_eq!(kept.scopes, ScopeRenewal::Kept);
         assert_eq!(kept.record.scopes, ["admin:agent-43-*"]);
         assert_eq!(kept.record.version, 2);
@@ -1448,7 +1447,7 @@ mod tests {
         let dir = AgentDir::new(&root.path().join("agents"), agent.clone());
         let issuing = authority("dev");
         let now = Timestamp::from_millis(1_800_000_000_000);
-        let record = dir.mint(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        let record = dir.mint(Issuer::Authority(&issuing), &spec(&agent), now)?;
         assert_eq!(record.principal, "agent-42");
         assert_eq!(record.owner, "admin");
         assert_eq!(record.parent, None);
@@ -1481,7 +1480,7 @@ mod tests {
         assert_eq!(dir.record()?, Some(record.clone()));
         // A second mint refuses, and names `renew`.
         let again = dir
-            .mint(Issuer::Authority(&issuing), &grant(&agent), now)
+            .mint(Issuer::Authority(&issuing), &spec(&agent), now)
             .expect_err("an identity exists");
         assert!(again.to_string().contains("agent renew 42"), "{again}");
         // Nothing is due a day later; the token is due once fewer than 7 days remain.
@@ -1510,7 +1509,7 @@ mod tests {
         let dir = AgentDir::new(root.path(), agent.clone());
         let issuing = authority("dev");
         let now = Timestamp::from_millis(1_800_000_000_000);
-        let record = dir.mint(Issuer::Authority(&issuing), &grant(&agent), now)?;
+        let record = dir.mint(Issuer::Authority(&issuing), &spec(&agent), now)?;
         let token = BearerToken::new(fs::read_to_string(dir.token_file())?.trim());
         let (id, exp) = token.claimed_id_and_expiry().ok_or("a token")?;
         // A record that says the token ends sooner, under another ID, changes nothing.
@@ -1539,7 +1538,7 @@ mod tests {
         let issuing = authority("dev");
         let renewed = dir.renew(
             Issuer::Authority(&issuing),
-            &grant(&id("9")),
+            &spec(&id("9")),
             Timestamp::from_millis(1_800_000_000_000),
         );
         assert!(matches!(renewed, Err(AgentError::NoIdentity { .. })));

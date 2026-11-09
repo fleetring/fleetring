@@ -74,7 +74,6 @@ const _: () = {
     assert_debug_send_sync::<auth::Credential>();
     assert_debug_send_sync::<auth::Denied>();
     assert_debug_send_sync::<auth::ForNodes>();
-    assert_debug_send_sync::<auth::Grant>();
     assert_debug_send_sync::<auth::Needed>();
     assert_debug_send_sync::<auth::Requirement>();
     assert_debug_send_sync::<auth::Rpc>();
@@ -85,6 +84,7 @@ const _: () = {
     assert_debug_send_sync::<auth::Target<'static>>();
     assert_debug_send_sync::<auth::TokenError>();
     assert_debug_send_sync::<auth::TokenSigner>();
+    assert_debug_send_sync::<auth::TokenSpec>();
     assert_debug_send_sync::<auth::TokenVerifier>();
     assert_debug_send_sync::<auth::Unbound>();
     assert_debug_send_sync::<auth::Verified>();
