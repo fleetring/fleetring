@@ -254,9 +254,27 @@ fn refused(database: &DatabaseName, status: &Status) -> Result<String, OpenError
             "database {database} doesn't exist"
         ))),
         Code::PermissionDenied | Code::Unauthenticated => Err(OpenError::Denied(message)),
-        Code::Unimplemented => Err(OpenError::Failed(format!(
-            "the primary of {database} runs a release without sessions (protocol 1.3); upgrade it"
+        // Not a fault of the router's: the fleet is part way through an upgrade, and the request
+        // may be retried once the primary runs one with sessions.
+        Code::Unimplemented => Err(OpenError::Unavailable(format!(
+            "the primary of {database} runs a release without sessions (0.7 or older, protocol \
+             1.3); upgrade it to 0.8 or later and retry"
         ))),
         _ => Err(OpenError::Failed(message)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_primary_without_sessions_is_unavailable_until_it_is_upgraded() {
+        let database: DatabaseName = "old".parse().expect("a name");
+        let refusal = refused(&database, &Status::unimplemented("unknown method Session"));
+        let Err(OpenError::Unavailable(message)) = refusal else {
+            panic!("{refusal:?}");
+        };
+        assert!(message.contains("upgrade it"), "{message}");
     }
 }

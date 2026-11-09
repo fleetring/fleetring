@@ -51,8 +51,13 @@ pub struct RouterConfig {
     pub log: LogConfig,
 }
 
+/// How long a connection may go without a request before the router closes it: 30 seconds.
+const DEFAULT_HTTP_IDLE_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(30_000).expect("nonzero");
+/// How many connections one client address may hold open at once.
+const DEFAULT_MAX_CONNECTIONS_PER_IP: NonZeroUsize = NonZeroUsize::new(1_024).expect("nonzero");
+
 /// The `[http]` table: how the router serves HTTP.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct HttpConfig {
@@ -67,6 +72,34 @@ pub struct HttpConfig {
     /// Whether plaintext may be served on an address that isn't loopback. Tokens would then
     /// cross the network in the clear.
     pub allow_plaintext: Plaintext,
+    /// How long a connection may go without a request, in milliseconds, before the router closes
+    /// it, a connection that never sends one included.
+    pub idle_timeout_ms: NonZeroU64,
+    /// How many connections one client IP address may hold open at once; one more is closed as
+    /// it is accepted. Behind a load balancer that doesn't keep client addresses, every
+    /// connection comes from the balancer's few: raise it there.
+    pub max_connections_per_ip: NonZeroUsize,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            cert: None,
+            key: None,
+            advertise_url: None,
+            allow_plaintext: Plaintext::default(),
+            idle_timeout_ms: DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+            max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
+        }
+    }
+}
+
+impl HttpConfig {
+    /// How long a connection may go without a request.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_timeout_ms.get())
+    }
 }
 
 /// The `[control]` table: the control node the router asks where databases live.
