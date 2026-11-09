@@ -247,7 +247,12 @@ A draft for 0.7.0's notes, under "Breaking changes" (ADR-0043, points 1 and 3). 
 
 ### 0.8.0: `db watch`, `fleet`, and the router
 
-A draft for 0.8.0's notes (ADR-0045; ADR-0037; ADR-0043's amendment of 2026-11-07; ADR-0016's and ADR-0038's amendments of 2026-11-08; FR-066, #69; FR-075, #103; FR-078, #109; FR-081, #126; FR-088, #138; #95).
+A draft for 0.8.0's notes (ADR-0045; ADR-0037; ADR-0043's amendment of 2026-11-07; ADR-0016's and ADR-0038's amendments of 2026-11-08; FR-066, #69; FR-075, #103; FR-078, #109; FR-081, #126; FR-088, #138; #95; #152; #153).
+
+**Security:**
+
+- **The bundled SQLite moves from 3.50.2 to 3.54.1, for CVE-2026-119375** (RUSTSEC-2026-0459, medium; #152). SQLite before 3.54.0 that opens a database beside a crafted `-wal` file whose page size is smaller than the database's can return uninitialized memory from the process in ordinary query results. SQL can't reach it: the statements a node runs can't attach, create, or choose a database file or set the page size. A node opens such a pair only when it restores from an archive (`fleetring archive restore`, `db restore`) or installs a snapshot or WAL from a peer, so an attacker who can write your archive's object store could read node memory back through a restored database; archive objects carry checksums that catch damage, not forgery. Every release before 0.8.0 is affected. Upgrade, and until every node runs 0.8.0, restore only from archive stores that only your nodes and operators can write. A peer could do the same, but a peer already holds a node's credentials. 3.54 also fixes SQLite's WAL-reset corruption bug, which 3.50.2 carried.
+- **The MCP server's `rmcp` moves from 3.8.0 to 3.9.0** (RUSTSEC-2026-0462; #153). The advisory is in `rmcp`'s HTTP clients, which `fleetring mcp` doesn't build or run: it serves over stdio, so no release was affected.
 
 **Features:**
 
@@ -270,6 +275,9 @@ A draft for 0.8.0's notes (ADR-0045; ADR-0037; ADR-0043's amendment of 2026-11-0
 
 **Upgrading from 0.7:**
 
+- **Text that SQL makes from a REAL value keeps 17 significant digits,** where 0.7's SQLite kept 15 (SQLite 3.53.0): `CAST(1.0/3 AS TEXT)` is `0.33333333333333332`, not `0.333333333333333`, while `0.1` stays `0.1`. The same goes for `||`, `printf('%s', …)`, `json_array()`, and a REAL stored in a TEXT column. REAL values themselves, and the numbers that queries return, are unchanged. Row changes are recorded as JSON, so `db watch` and the `changes` tool now report a REAL value that a 0.8 primary recorded exactly, where a 0.7 primary rounded it to 15 digits. During a rolling upgrade a 0.7 primary and a 0.8 primary write different text for the same statement; replicas copy the primary's pages, so the copies of a database never disagree, but a database written across the upgrade can hold both forms.
+- **SQLite now authorizes the functions in a `CREATE TABLE`'s `DEFAULT` clauses** (SQLite 3.54.0), when the table is created and when a default is used. A default that calls `load_extension` or a function in FleetRing's reserved namespace is refused like the same call anywhere else.
+- **`fleetring mcp`'s output schemas list as `required` the fields every result already carries,** `null` when empty, such as `written_by`, `primary`, `notice` and `hint` (`rmcp` 3.9). The results are unchanged; a client that validates them against the schemas sees the same objects.
 - **The configuration check starts with the next upgrade.** 0.7's `upgrade` doesn't know `serve --check`, so an upgrade from 0.7 to 0.8 installs 0.8 without asking it about the node's configuration: run the 0.8 binary's `fleetring serve --config <file> --check` first if a setting changed. Upgrades and rollbacks run by 0.8 and later ask every release that has the check, and install a release before 0.8 with a note that its configuration wasn't checked.
 - **Upgrade every data node before you point applications at a router.** A 0.7 primary doesn't know `Database.Session`, and the router answers its databases' requests with an error that says to upgrade it. `[sessions]` is new in 0.8.0, and a 0.7 node refuses it as an unknown field, as it does `[limits]`.
 - **Nodes of 0.7 and 0.8 run side by side;** nothing is gated. A `db watch` whose primary runs 0.7 fails with `the primary runs an older release of fleetring, which can't stream changes; upgrade it`, and a watch that follows its database onto a 0.7 primary ends there with that error and the position to resume after.
