@@ -6,7 +6,7 @@
 //! membership view is published by hand, and an [`Authority`] the test controls stands in for
 //! control state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, LeaseEpoch};
+use fleetring_control::fork::{ForkIdentity, OperationId};
+use fleetring_control::{DatabaseName, Incarnation, LeaseEpoch};
 use fleetring_proto::v1::replicate_message::Message;
 use fleetring_proto::v1::{
     FenceRequest, FetchRequest, Member as ProtoMember, MembershipUpdate, Node as ProtoNode,
@@ -23,10 +24,10 @@ use fleetring_proto::v1::{
 };
 use fleetringd::auth::refused_binding;
 use fleetringd::clock::SystemClock;
-use fleetringd::engine::{EngineConfig, Execution, Statement, Transaction};
+use fleetringd::engine::{EngineConfig, Execution, Position, Statement, Transaction};
 use fleetringd::replication::{
-    EpochAuthority, EpochHolders, HoldersFuture, PeerAddresses, PrimaryRole, Replication,
-    ReplicationParts,
+    ChainHash, DatabaseView, EpochAuthority, EpochHolders, ForkPhase, ForkView, HoldersFuture,
+    PeerAddresses, PrimaryRole, Replication, ReplicationParts, ViewFuture,
 };
 use fleetringd::tls::Security;
 use fleetringd::transport::{Listener, Peers, incoming, replication_client};
@@ -50,6 +51,8 @@ const DATABASE: &str = "orders";
 #[derive(Debug, Default)]
 struct Authority {
     holders: Mutex<BTreeMap<DatabaseName, EpochHolders>>,
+    /// The fork record control state shows for the database, if any.
+    fork: Mutex<Option<ForkView>>,
     calls: AtomicU64,
     down: AtomicBool,
 }
@@ -88,6 +91,18 @@ impl EpochAuthority for Authority {
                 .ok_or_else(|| Status::not_found(format!("database '{database}' does not exist")))
         };
         Box::pin(std::future::ready(answer))
+    }
+
+    fn view(&self, database: &DatabaseName) -> ViewFuture<'_> {
+        let holders = self.holders(database);
+        let fork = self.fork.lock().expect("authority lock").clone();
+        Box::pin(async move {
+            Ok(DatabaseView {
+                holders: holders.await?,
+                incarnation: Incarnation::new(7),
+                fork,
+            })
+        })
     }
 }
 
@@ -481,6 +496,40 @@ async fn a_fence_naming_another_candidate_than_the_caller_is_refused() -> TestRe
     assert_eq!(
         refused.message(),
         "Fence refused for node 'd': the request names node 'b'"
+    );
+    assert_eq!(bound.highest_epoch("c"), Some(1), "c recorded nothing");
+    Ok(())
+}
+
+/// A fork seeded on `a` and `b` is fenced only on them, its recorded holders, whatever the ring
+/// says: `c`, on the ring, refuses the candidate's fence and records nothing, so it never takes
+/// the candidate's stream and acknowledges no write the holders must keep (ADR-0046, point
+/// 3.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_of_a_seeded_fork_on_a_node_that_isnt_a_holder_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    let holders: BTreeSet<NodeId> = ["a", "b"].into_iter().map(id).collect();
+    *bound.authority.fork.lock().expect("authority lock") = Some(ForkView {
+        identity: ForkIdentity::new(
+            name(DATABASE),
+            Incarnation::new(7),
+            OperationId::from_bytes([7; 16]),
+        ),
+        source: name("source"),
+        source_incarnation: Incarnation::new(3),
+        phase: ForkPhase::Seeded {
+            attempt: 1,
+            at: Position::from(vec![1]),
+            chain_hash: ChainHash::from_bytes(&[0; 32]).ok_or("a chain hash")?,
+            holders,
+            reset: None,
+        },
+    });
+    bound.authority.set(2, None, Some("b"), &["a", "b"]);
+    let refused = assert_refused(bound.fence("b", "c", 2, "b").await, "replica")?;
+    assert_eq!(
+        refused.message(),
+        "Fence refused for node 'b': not a replica of database 'orders'"
     );
     assert_eq!(bound.highest_epoch("c"), Some(1), "c recorded nothing");
     Ok(())

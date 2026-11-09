@@ -707,10 +707,10 @@ async fn carry_out(
     // A holder of a fork that isn't ready, which never followed its first primary, fences and
     // ranks with its verified staged copy (ADR-0046, point 6.2).
     replication.install_holder_copy(database).await?;
-    // A seeded fork's replica set is its recorded holders, whatever the ring says: the
-    // promotion fences them, and only them, as control state's quorums assume (ADR-0046, point
-    // 3.10).
-    replication.learn_fork_replicas(database).await;
+    // A seeded fork's replica set is its recorded holders, whatever the ring says, and a ready
+    // fork's until they are released: the promotion fences them, and only them, as control
+    // state's quorums assume (ADR-0046, point 3.10). One that can't learn which is tried again.
+    replication.learn_fork_replicas(database).await?;
     let me = node.id().clone();
     let replicas = replication.replica_set(database, request.replication_factor);
     if !replicas.contains(&me) {
