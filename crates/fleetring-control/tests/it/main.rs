@@ -3,6 +3,8 @@
 
 mod common;
 mod durability;
+mod fork;
+mod fork_lifecycle;
 mod metadata;
 mod properties;
 mod replay;

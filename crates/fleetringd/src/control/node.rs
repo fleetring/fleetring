@@ -182,7 +182,8 @@ impl Committed {
 type Reply = oneshot::Sender<Result<Committed, SubmitError>>;
 
 enum Mail {
-    Submit { action: Action, reply: Reply },
+    // Boxed: an action is large, and a stop request is small.
+    Submit { action: Box<Action>, reply: Reply },
     Stop { done: oneshot::Sender<()> },
 }
 
@@ -207,7 +208,10 @@ impl ControlHandle {
     pub async fn submit(&self, action: Action) -> Result<Committed, SubmitError> {
         let (reply, receive) = oneshot::channel();
         self.mailbox
-            .send(Mail::Submit { action, reply })
+            .send(Mail::Submit {
+                action: Box::new(action),
+                reply,
+            })
             .await
             .map_err(|_| SubmitError::Stopped)?;
         receive.await.map_err(|_| SubmitError::Stopped)?
@@ -450,7 +454,7 @@ impl Writer {
         let mut next = Some(first);
         while let Some(mail) = next.take() {
             match mail {
-                Mail::Submit { action, reply } => submits.push((action, reply)),
+                Mail::Submit { action, reply } => submits.push((*action, reply)),
                 Mail::Stop { done } => {
                     stop = Some(done);
                     break;
