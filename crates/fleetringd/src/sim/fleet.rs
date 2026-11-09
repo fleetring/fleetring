@@ -535,6 +535,7 @@ fn host_config(
         log: crate::LogConfig::default(),
         limits: crate::LimitsConfig::default(),
         sessions: crate::SessionsConfig::default(),
+        fork: crate::ForkConfig::default(),
     })
 }
 

@@ -43,7 +43,7 @@ pub use actor::{
 };
 pub use config::{
     AdminConfig, AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, ControlSettings,
-    HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig, LogFormat,
+    ForkConfig, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig, LogFormat,
     MembershipSettings, NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext,
     PrincipalConfig, ReplicationConfig, SessionsConfig, TlsConfig, TokenForwarding,
 };
@@ -66,6 +66,7 @@ const _: () = {
     assert_debug_send_sync::<AdminListener>();
     assert_debug_send_sync::<AdminPlaintext>();
     assert_debug_send_sync::<AdminTls>();
+    assert_debug_send_sync::<ForkConfig>();
     assert_debug_send_sync::<LimitsConfig>();
     assert_debug_send_sync::<LogConfig>();
     assert_debug_send_sync::<LogFormat>();

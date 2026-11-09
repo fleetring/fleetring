@@ -5,12 +5,13 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
 use fleetring::{Host, NodeId, ReplicationFactor, Weight, Zone};
+use fleetring_control::fork::ForkLimits;
 use fleetring_control::{Acks, ControlConfig, Member, Millis};
 use serde::Deserialize;
 
@@ -53,7 +54,8 @@ use crate::tls::Principal;
 /// of databases created without them; see [`ReplicationConfig`]. The `[changes]`
 /// table lists the sinks that receive each database's changes; see [`ChangesConfig`]. Each
 /// `[[archive]]` entry writes databases to an object store; see [`ArchiveConfig`]. The
-/// `[limits]` table bounds how long a statement runs on a data node; see [`LimitsConfig`].
+/// `[limits]` table bounds how long a statement runs on a data node; see [`LimitsConfig`]. The
+/// `[fork]` table sets forks' budgets and bounds; see [`ForkConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -114,6 +116,195 @@ pub struct Config {
     /// may wait for it (ADR-0037).
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// Forks' budgets and timeouts on the control node, and what seeding one may cost a data
+    /// node (ADR-0046, point 7).
+    #[serde(default)]
+    pub fork: ForkConfig,
+}
+
+/// The `[fork]` table: what a fork may take (ADR-0046, point 7). New in 0.8.0. Every default is
+/// provisional: FR-087 measures it, and ADR-0046 is amended with the measured value.
+///
+/// ```toml
+/// [fork]
+/// # The control node's, recorded with each fork it accepts: changing them affects new forks only.
+/// max_attempts = 5                    # attempts before a fork fails, retries exhausted
+/// deadline_ms = 3600000               # how long a fork may stay seeding
+/// attempt_timeout_ms = 1800000        # how long one attempt may run before the next starts
+/// seeder_timeout_ms = 120000          # how long a seeder may be down before the next attempt
+/// operation_retention_ms = 604800000  # how long an operation's record outlives its outcome
+/// # Each data node's.
+/// transfer_retries = 3                # a seeder's retries of a broken transfer, per attempt
+/// transfer_backoff_ms = 1000          # the first retry's wait, doubling after each
+/// max_pin_ms = 600000                 # how long a source's primary pins a copy for one seed
+/// max_pin_wal_bytes = 1073741824      # how much the source's WAL may grow while it is pinned
+/// max_pin_ms_per_hour = 1200000       # pins of one source database in any hour
+/// max_pins_per_node = 2               # pins a source's primary holds at once
+/// max_pins_per_database = 1           # pins of one source database at once
+/// max_seeds_per_node = 2              # staged copies a node downloads at once
+/// ```
+///
+/// A pin past `max_pin_ms` or `max_pin_wal_bytes` ends its stream with `ABORTED` and is released:
+/// the source's writes always win over a fork. A request past `max_pin_ms_per_hour`,
+/// `max_pins_per_node`, `max_pins_per_database`, or `max_seeds_per_node` is refused with
+/// `RESOURCE_EXHAUSTED` and a retry-after, which doesn't fail the attempt. The control node's
+/// cap on fork operations it keeps, 10,000, and a data node's disk admission, room for the copy
+/// and a tenth more beside the larger of 1 GiB and 5% of the volume, are fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForkConfig {
+    /// The most attempts a fork makes before it fails. At least 1.
+    pub max_attempts: NonZeroU32,
+    /// How long a fork may stay seeding before it fails, in milliseconds.
+    pub deadline_ms: NonZeroU64,
+    /// How long one attempt may run before the control node starts the next, in milliseconds.
+    /// At most `deadline_ms`.
+    pub attempt_timeout_ms: NonZeroU64,
+    /// How long an attempt's seeder may be down before the control node starts the next attempt
+    /// without it, in milliseconds. At most `attempt_timeout_ms`.
+    pub seeder_timeout_ms: NonZeroU64,
+    /// How long a fork operation's record, and so the deduplication of its ID, outlives its
+    /// final outcome, in milliseconds.
+    pub operation_retention_ms: NonZeroU64,
+    /// How many times a seeder fetches again after a transfer breaks, within one attempt,
+    /// before it reports the attempt failed.
+    pub transfer_retries: u32,
+    /// How long a seeder waits before its first retry, in milliseconds; each retry waits twice
+    /// as long as the last.
+    pub transfer_backoff_ms: NonZeroU64,
+    /// The longest a source's primary pins a copy for one seeding stream, in milliseconds,
+    /// including any checkpoint it holds back meanwhile.
+    pub max_pin_ms: NonZeroU64,
+    /// How many bytes a source's WAL may grow while a seeding stream pins it.
+    pub max_pin_wal_bytes: NonZeroU64,
+    /// How long, in milliseconds, one source database may be pinned in any hour, across forks.
+    /// At least `max_pin_ms`.
+    pub max_pin_ms_per_hour: NonZeroU64,
+    /// How many seeding pins a source's primary holds at once.
+    pub max_pins_per_node: NonZeroUsize,
+    /// How many seeding pins of one source database a primary holds at once. At most
+    /// `max_pins_per_node`.
+    pub max_pins_per_database: NonZeroUsize,
+    /// How many staged copies a node downloads at once.
+    pub max_seeds_per_node: NonZeroUsize,
+}
+
+/// The `[fork]` defaults of ADR-0046, point 7, all provisional.
+const DEFAULT_FORK_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).expect("5 is nonzero");
+const DEFAULT_FORK_DEADLINE: NonZeroU64 = NonZeroU64::new(60 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_ATTEMPT_TIMEOUT: NonZeroU64 = NonZeroU64::new(30 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_SEEDER_TIMEOUT: NonZeroU64 = NonZeroU64::new(2 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_OPERATION_RETENTION: NonZeroU64 =
+    NonZeroU64::new(7 * 24 * 60 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_TRANSFER_RETRIES: u32 = 3;
+const DEFAULT_FORK_TRANSFER_BACKOFF: NonZeroU64 = NonZeroU64::new(1_000).expect("nonzero");
+const DEFAULT_FORK_MAX_PIN: NonZeroU64 = NonZeroU64::new(10 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_MAX_PIN_WAL_BYTES: NonZeroU64 = NonZeroU64::new(1 << 30).expect("nonzero");
+const DEFAULT_FORK_MAX_PIN_PER_HOUR: NonZeroU64 =
+    NonZeroU64::new(20 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_MAX_PINS_PER_NODE: NonZeroUsize = NonZeroUsize::new(2).expect("nonzero");
+const DEFAULT_FORK_MAX_PINS_PER_DATABASE: NonZeroUsize = NonZeroUsize::new(1).expect("nonzero");
+const DEFAULT_FORK_MAX_SEEDS_PER_NODE: NonZeroUsize = NonZeroUsize::new(2).expect("nonzero");
+
+impl ForkConfig {
+    /// The limits the control node records with each fork it accepts (ADR-0046, point 3.1).
+    #[must_use]
+    pub fn limits(&self) -> ForkLimits {
+        ForkLimits {
+            max_attempts: self.max_attempts.get(),
+            deadline: Millis::new(self.deadline_ms.get()),
+            attempt_timeout: Millis::new(self.attempt_timeout_ms.get()),
+            seeder_timeout: Millis::new(self.seeder_timeout_ms.get()),
+            operation_retention: Millis::new(self.operation_retention_ms.get()),
+        }
+    }
+
+    /// Returns how long a seeder waits before its first retry of a broken transfer.
+    #[must_use]
+    pub fn transfer_backoff(&self) -> Duration {
+        Duration::from_millis(self.transfer_backoff_ms.get())
+    }
+
+    /// Returns the longest a source's primary pins a copy for one seeding stream.
+    #[must_use]
+    pub fn max_pin(&self) -> Duration {
+        Duration::from_millis(self.max_pin_ms.get())
+    }
+
+    /// Returns how long one source database may be pinned in any hour.
+    #[must_use]
+    pub fn max_pin_per_hour(&self) -> Duration {
+        Duration::from_millis(self.max_pin_ms_per_hour.get())
+    }
+
+    /// Checks the rules between the table's fields.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] if `seeder_timeout_ms` is above `attempt_timeout_ms`,
+    /// `attempt_timeout_ms` above `deadline_ms`, `max_pin_ms` above `max_pin_ms_per_hour`, or
+    /// `max_pins_per_database` above `max_pins_per_node`.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let above = |field: &'static str, value: u64, other: &str, limit: u64| {
+            Err(ConfigError::Invalid {
+                field,
+                reason: format!("{value} is above fork.{other} ({limit})"),
+            })
+        };
+        if self.seeder_timeout_ms > self.attempt_timeout_ms {
+            return above(
+                "fork.seeder_timeout_ms",
+                self.seeder_timeout_ms.get(),
+                "attempt_timeout_ms",
+                self.attempt_timeout_ms.get(),
+            );
+        }
+        if self.attempt_timeout_ms > self.deadline_ms {
+            return above(
+                "fork.attempt_timeout_ms",
+                self.attempt_timeout_ms.get(),
+                "deadline_ms",
+                self.deadline_ms.get(),
+            );
+        }
+        if self.max_pin_ms > self.max_pin_ms_per_hour {
+            return above(
+                "fork.max_pin_ms",
+                self.max_pin_ms.get(),
+                "max_pin_ms_per_hour",
+                self.max_pin_ms_per_hour.get(),
+            );
+        }
+        if self.max_pins_per_database > self.max_pins_per_node {
+            return above(
+                "fork.max_pins_per_database",
+                u64::try_from(self.max_pins_per_database.get()).unwrap_or(u64::MAX),
+                "max_pins_per_node",
+                u64::try_from(self.max_pins_per_node.get()).unwrap_or(u64::MAX),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for ForkConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_FORK_MAX_ATTEMPTS,
+            deadline_ms: DEFAULT_FORK_DEADLINE,
+            attempt_timeout_ms: DEFAULT_FORK_ATTEMPT_TIMEOUT,
+            seeder_timeout_ms: DEFAULT_FORK_SEEDER_TIMEOUT,
+            operation_retention_ms: DEFAULT_FORK_OPERATION_RETENTION,
+            transfer_retries: DEFAULT_FORK_TRANSFER_RETRIES,
+            transfer_backoff_ms: DEFAULT_FORK_TRANSFER_BACKOFF,
+            max_pin_ms: DEFAULT_FORK_MAX_PIN,
+            max_pin_wal_bytes: DEFAULT_FORK_MAX_PIN_WAL_BYTES,
+            max_pin_ms_per_hour: DEFAULT_FORK_MAX_PIN_PER_HOUR,
+            max_pins_per_node: DEFAULT_FORK_MAX_PINS_PER_NODE,
+            max_pins_per_database: DEFAULT_FORK_MAX_PINS_PER_DATABASE,
+            max_seeds_per_node: DEFAULT_FORK_MAX_SEEDS_PER_NODE,
+        }
+    }
 }
 
 /// How long a statement may run on a data node unless `[limits] statement_timeout_ms` says
@@ -996,6 +1187,7 @@ impl Config {
             });
         }
         self.validate_admin()?;
+        self.fork.validate()?;
         self.changes.validate()?;
         let mut names: BTreeSet<&str> = self
             .changes
@@ -1246,6 +1438,67 @@ mod tests {
         assert!(matches!(zero, ConfigError::Parse(_)), "{message}");
         assert!(message.contains("statement_timeout_ms"), "{message}");
         let unknown = with("\n[limits]\nstatement_timeout = \"30s\"\n");
+        assert!(unknown.is_err(), "unknown fields are refused: {unknown:?}");
+    }
+
+    #[test]
+    fn fork_defaults_are_adr_0046s_and_the_timeouts_nest() {
+        let defaults = with("").expect("a minimal config");
+        assert_eq!(defaults.fork, ForkConfig::default());
+        assert_eq!(
+            with("\n[fork]\n").expect("an empty [fork]").fork,
+            defaults.fork
+        );
+        // The control rows travel in every fork command; they match the control crate's own.
+        assert_eq!(defaults.fork.limits(), ForkLimits::default());
+        assert_eq!(defaults.fork.transfer_retries, 3);
+        assert_eq!(defaults.fork.transfer_backoff(), Duration::from_secs(1));
+        assert_eq!(defaults.fork.max_pin(), Duration::from_secs(600));
+        assert_eq!(defaults.fork.max_pin_wal_bytes.get(), 1 << 30);
+        assert_eq!(defaults.fork.max_pin_per_hour(), Duration::from_secs(1_200));
+        assert_eq!(defaults.fork.max_pins_per_node.get(), 2);
+        assert_eq!(defaults.fork.max_pins_per_database.get(), 1);
+        assert_eq!(defaults.fork.max_seeds_per_node.get(), 2);
+
+        let set = with(
+            "\n[fork]\nmax_attempts = 2\ndeadline_ms = 9000\nattempt_timeout_ms = 3000\n\
+             seeder_timeout_ms = 1000\noperation_retention_ms = 60000\n",
+        )
+        .expect("set limits");
+        assert_eq!(
+            set.fork.limits(),
+            ForkLimits {
+                max_attempts: 2,
+                deadline: Millis::new(9_000),
+                attempt_timeout: Millis::new(3_000),
+                seeder_timeout: Millis::new(1_000),
+                operation_retention: Millis::new(60_000),
+            }
+        );
+        for (table, field) in [
+            ("seeder_timeout_ms = 3600000", "fork.seeder_timeout_ms"),
+            ("attempt_timeout_ms = 7200000", "fork.attempt_timeout_ms"),
+            ("max_pin_ms = 3600000", "fork.max_pin_ms"),
+            ("max_pins_per_database = 3", "fork.max_pins_per_database"),
+        ] {
+            let refused = with(&format!("\n[fork]\n{table}\n")).expect_err(table);
+            let ConfigError::Invalid { field: named, .. } = &refused else {
+                panic!("{table}: {refused}");
+            };
+            assert_eq!(*named, field, "{refused}");
+        }
+        for zero in [
+            "max_attempts = 0",
+            "deadline_ms = 0",
+            "max_seeds_per_node = 0",
+        ] {
+            let refused = with(&format!("\n[fork]\n{zero}\n")).expect_err(zero);
+            assert!(
+                matches!(refused, ConfigError::Parse(_)),
+                "{zero}: {refused}"
+            );
+        }
+        let unknown = with("\n[fork]\ndeadline = \"1h\"\n");
         assert!(unknown.is_err(), "unknown fields are refused: {unknown:?}");
     }
 
