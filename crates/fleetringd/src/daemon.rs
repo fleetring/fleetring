@@ -284,6 +284,7 @@ impl Daemon {
                     .with_clock(environment.clock())
                     .with_entropy(environment.entropy())
                     .with_fork_limits(config.fork.limits())
+                    .with_fork_faults(environment.fork_faults())
                     .with_dev_mode(config.dev)
                     .with_network(network.clone())
             }),

@@ -18,8 +18,11 @@ use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{Client, DatabaseSpec, NewMetadata, restored_metadata};
 use fleetringd::durability::RestoreTarget;
 use fleetringd::engine::{Statement, Value as EngineValue};
+#[cfg(feature = "fault-hooks")]
+use fleetringd::replication::FaultPoint;
+use fleetringd::replication::ForkFaults;
 use fleetringd::transport::Credentials;
-use fleetringd::{Config, Daemon};
+use fleetringd::{Config, Daemon, Environment};
 use serde_json::{Value, json};
 
 mod support;
@@ -40,6 +43,10 @@ const ARCHIVE: &str = "backups";
 /// One node, data and control, that archives every database.
 struct Node {
     daemon: Daemon,
+    /// The data node a fork needs beside its source's, and the fault hooks of both nodes, for a
+    /// [`Setup::Forking`] node.
+    extra: Vec<Daemon>,
+    faults: Vec<ForkFaults>,
     tls: Tls,
     control: String,
     token: String,
@@ -56,6 +63,10 @@ enum Setup {
     /// As [`Setup::Recording`], but the sink is a webhook nobody answers, so it never delivers
     /// and nothing it records is released: a backlog stays readable however long it grows.
     Held,
+    /// As [`Setup::Plain`], with a second data node, since a fork's copies are placed apart from
+    /// its source's, and fault hooks on both (`tests/fork.rs`).
+    #[cfg(feature = "fault-hooks")]
+    Forking,
 }
 
 /// The `stream` scope agent identities get beside [`AGENT_SCOPE`] (FR-081).
@@ -82,6 +93,8 @@ impl Node {
                  databases = {RECORDED}\npath = {:?}\n",
                 dir.join("sink"),
             ),
+            #[cfg(feature = "fault-hooks")]
+            Setup::Forking => String::from("\n[replication]\nreplication_factor = 1\n"),
             Setup::Held => format!(
                 "\n[[changes.sink]]\nname = \"hook\"\nkind = \"webhook\"\nformat = \"logical\"\n\
                  databases = {RECORDED}\nurl = \"http://127.0.0.1:{}/changes\"\n\
@@ -99,33 +112,68 @@ impl Node {
             tls.node_table("node-1")?,
             dir.join("archive"),
         );
-        let daemon = Daemon::start(Config::from_toml(&config)?).await?;
+        #[cfg_attr(not(feature = "fault-hooks"), expect(unused_mut))]
+        let mut faults = vec![ForkFaults::default()];
+        #[cfg_attr(not(feature = "fault-hooks"), expect(unused_mut))]
+        let mut extra = Vec::new();
+        #[cfg(feature = "fault-hooks")]
+        let environment = if setup == Setup::Forking {
+            // Room for any fork here, whatever the machine running the tests has free.
+            faults[0] = ForkFaults::new();
+            faults[0].set_disk(1 << 40, 2 << 40);
+            Environment::production().with_fork_faults(faults[0].clone())
+        } else {
+            Environment::production()
+        };
+        #[cfg(not(feature = "fault-hooks"))]
+        let environment = Environment::production();
+        let daemon = Daemon::start_with(Config::from_toml(&config)?, environment).await?;
         let control = daemon
             .control_address()
             .ok_or("no control address")?
             .to_string();
+        #[cfg(feature = "fault-hooks")]
+        if setup == Setup::Forking {
+            let second = format!(
+                "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"data\"\n\n[node]\nid = \"node-2\"\n\
+                 \n[membership]\nheartbeat_interval_ms = 100\n{}\
+                 \n[control]\naddress = \"{control}\"\n",
+                dir.join("node-2"),
+                tls.node_table("node-2")?,
+            );
+            let hooks = ForkFaults::new();
+            hooks.set_disk(1 << 40, 2 << 40);
+            let environment = Environment::production().with_fork_faults(hooks.clone());
+            extra.push(Daemon::start_with(Config::from_toml(&second)?, environment).await?);
+            faults.push(hooks);
+        }
         let scopes: &[&str] = match setup {
+            #[cfg(feature = "fault-hooks")]
+            Setup::Forking => &[AGENT_SCOPE],
             Setup::Plain => &[AGENT_SCOPE],
             Setup::Recording | Setup::Held => &[AGENT_SCOPE, AGENT_STREAM_SCOPE],
         };
         let token = issue_token(&tls, scopes)?;
         let node = Self {
             daemon,
+            extra,
+            faults,
             tls,
             control,
             token,
         };
         let admin = node.admin()?;
+        let members = 1 + node.extra.len();
         tokio::time::timeout(HANG_GUARD, async {
             loop {
                 match admin.status().await {
-                    Ok(view) if view.members().len() == 1 => return,
+                    Ok(view) if view.members().len() == members => return,
                     _ => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
             }
         })
         .await
-        .map_err(|_| "the node never joined its own fleet")?;
+        .map_err(|_| "the nodes never joined the fleet")?;
         Ok(node)
     }
 
@@ -166,6 +214,9 @@ impl Node {
     }
 
     async fn stop(self) {
+        for daemon in self.extra {
+            daemon.run_until(async {}).await;
+        }
         self.daemon.run_until(async {}).await;
     }
 }
@@ -1583,10 +1634,10 @@ async fn db_fork_is_offered_with_write_access_and_refuses_what_it_does_not_know(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
+#[cfg(feature = "fault-hooks")]
 async fn db_fork_forks_and_never_returns_the_sources_description_or_a_token() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let node = Node::start(dir.path()).await?;
+    let node = Node::start_with(dir.path(), Setup::Forking).await?;
     let mut mcp = node.mcp(&[]).await?;
     mcp.ok(
         "db_create",
@@ -1630,18 +1681,20 @@ async fn db_fork_forks_and_never_returns_the_sources_description_or_a_token() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
+#[cfg(feature = "fault-hooks")]
+#[ignore = "waits out the 60 s MCP call limit; run with --ignored"]
 async fn db_fork_does_not_report_success_while_the_reset_is_held() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let node = Node::start(dir.path()).await?;
+    let node = Node::start_with(dir.path(), Setup::Forking).await?;
     let mut mcp = node.mcp(&[]).await?;
     mcp.ok(
         "db_create",
         json!({"name": "agent-42-src", "replication_factor": 1}),
     )
     .await?;
-    // TODO(#135): hold the fork reset, a test-only hook on the data node that delays the
-    // primary's fork-reset write until the test releases it.
+    for faults in &node.faults {
+        faults.hold(FaultPoint::BeforeReset);
+    }
     let forked = mcp
         .ok(
             "db_fork",
@@ -1656,7 +1709,9 @@ async fn db_fork_does_not_report_success_while_the_reset_is_held() -> TestResult
             .is_some_and(|step| step.contains("db_show")),
         "{forked}"
     );
-    // TODO(#135): release the held reset; calling again with the operation_id then reports ready.
+    for faults in &node.faults {
+        faults.release(FaultPoint::BeforeReset);
+    }
     let operation = forked["operation_id"].clone();
     let again = mcp
         .ok(
