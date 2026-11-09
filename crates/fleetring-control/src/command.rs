@@ -300,10 +300,10 @@ pub enum Action {
     ///
     /// The source is resolved to its current incarnation and must be ready, and must be the
     /// incarnation the caller expects if it names one; a relative expiry is resolved against
-    /// the command's time. The fork gets the next incarnation, the source's engine, and the
+    /// the command's time. The fork gets the incarnation the command carries, the source's engine, and the
     /// intent's own durability and metadata (nothing is copied from the source), and starts
     /// seeding at attempt 1 with the first live member of its replica set as the seeder. It is
-    /// refused early when fewer than its write quorum of replicas have room for the copy, as far
+    /// refused early when fewer than its completion quorum of replicas have room for the copy, as far
     /// as their heartbeats say.
     ///
     /// A resubmission with a known operation ID resolves nothing again: from the same requester

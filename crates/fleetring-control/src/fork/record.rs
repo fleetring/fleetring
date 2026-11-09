@@ -187,7 +187,7 @@ impl Fork {
         self.state = state;
     }
 
-    /// Returns whether a write quorum holds the copy: [`ForkState::Seeded`] or
+    /// Returns whether a completion quorum holds the copy: [`ForkState::Seeded`] or
     /// [`ForkState::Ready`].
     #[must_use]
     pub fn is_seeded(&self) -> bool {
