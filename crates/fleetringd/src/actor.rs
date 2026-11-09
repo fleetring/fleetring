@@ -1141,6 +1141,13 @@ impl Actor {
                     let _ = reply.send(Err(self.lost(work.session)));
                     return;
                 }
+                // A read-only session never needs the writer: it runs now, and the engine
+                // refuses whatever it may not run.
+                if work.access == SessionAccess::ReadOnly {
+                    let result = self.session_read(work, interrupt).await;
+                    let _ = reply.send(result);
+                    return;
+                }
                 // Another session's transaction holds the writer: a call that only reads runs
                 // now, against the latest commit; one that may write waits.
                 let call = work.call.clone();

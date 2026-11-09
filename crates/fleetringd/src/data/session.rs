@@ -26,6 +26,8 @@
 use fleetring_client::redirect::primary_hint;
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::{self as proto, session_request, session_response};
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,6 +52,14 @@ pub(crate) type SessionStream = BoxStream<proto::SessionResponse>;
 /// a time, so one is all it ever buffers.
 const RESPONSE_BUFFER: usize = 2;
 
+/// How long a session's caller has to send the message that opens it.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a session may go without a call before the node ends it, so that callers who leave
+/// sessions open can't hold the node's places for sessions. Longer than a transaction may stay
+/// open, and than a router keeps an idle Hrana stream.
+pub(crate) const SESSION_IDLE: Duration = Duration::from_secs(120);
+
 /// The code of a commit no write quorum acknowledged (ADR-0037, point 13).
 pub(crate) const UNACKNOWLEDGED: &str = "FLEETRING_UNACKNOWLEDGED";
 
@@ -70,7 +80,10 @@ pub(crate) async fn open(
     mut request: Request<Streaming<proto::SessionRequest>>,
 ) -> Result<SessionStream, Status> {
     let caller = authorized(&request)?.clone();
-    let first = request.get_mut().message().await?.ok_or_else(opens_first)?;
+    let first = tokio::time::timeout(OPEN_TIMEOUT, request.get_mut().message())
+        .await
+        .map_err(|_| Status::deadline_exceeded("a session's first message didn't arrive in time"))??
+        .ok_or_else(opens_first)?;
     let Some(session_request::Request::Open(opening)) = first.request else {
         return Err(opens_first());
     };
@@ -157,6 +170,12 @@ impl Session {
                         break Some(Status::unavailable("the node is stopping"));
                     }
                     continue;
+                }
+                () = tokio::time::sleep(SESSION_IDLE) => {
+                    break Some(Status::deadline_exceeded(format!(
+                        "the session had no call for {} s",
+                        SESSION_IDLE.as_secs()
+                    )));
                 }
                 message = incoming.message() => message,
             };

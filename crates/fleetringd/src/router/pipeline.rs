@@ -255,6 +255,23 @@ impl Run<'_> {
                         format!("a stream stores at most {max} SQL texts; close one first"),
                     ));
                 }
+                // Stored texts take no more than one request may carry.
+                let max_bytes = self.context.config.streams.max_request_bytes.get();
+                let stored: usize = self
+                    .stream
+                    .sql
+                    .iter()
+                    .filter(|(id, _)| **id != sql_id)
+                    .map(|(_, text)| text.len())
+                    .sum();
+                if stored.saturating_add(sql.len()) > max_bytes {
+                    return Err(Error::new(
+                        code::RESOURCE_EXHAUSTED,
+                        format!(
+                            "a stream stores at most {max_bytes} bytes of SQL; close some first"
+                        ),
+                    ));
+                }
                 self.stream.sql.insert(sql_id, sql);
                 Ok(StreamResponse::StoreSql)
             }
@@ -397,9 +414,14 @@ impl Run<'_> {
                 self.stream.session = Some(opened.map_err(open_error)?);
             }
             let timeout = self.context.config.routing.call_timeout();
-            let session = self.stream.session.as_mut().expect("a session is open");
+            // The call owns the session while it runs: if the request goes away mid-call, the
+            // session goes with it, which cancels the call on the node and rolls back its open
+            // transaction, and the stream then has none.
+            let mut session = self.stream.session.take().expect("a session is open");
             let primary = session.primary.clone();
-            let error = match session.call(&call, timeout).await {
+            let called = session.call(&call, timeout).await;
+            self.stream.session = Some(session);
+            let error = match called {
                 Ok(result) => match &result.result {
                     Some(Answer::NotRun(not_run)) => {
                         let error = Error::new(&not_run.code, not_run.message.clone());
