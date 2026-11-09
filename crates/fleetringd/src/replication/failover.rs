@@ -488,13 +488,17 @@ impl Replication {
     }
 
     /// The members of `database`'s replica set in this node's membership view, in preference
-    /// order.
+    /// order: a seeded fork's recorded holders, in node-ID order, while this node sees it seeded,
+    /// whatever the ring says (ADR-0046, point 3.10).
     #[must_use]
     pub fn replica_set(
         &self,
         database: &DatabaseName,
         replication_factor: ReplicationFactor,
     ) -> Vec<NodeId> {
+        if let Some(holders) = self.inner.forks.frozen(database) {
+            return holders;
+        }
         self.inner
             .membership
             .view()
@@ -503,6 +507,18 @@ impl Replication {
                 ring.replicas_n(database.as_str(), replication_factor)
                     .to_ids()
             })
+    }
+
+    /// Learns from control state whether `database` is a seeded fork, whose replica set is its
+    /// recorded holders, as [`replica_set`](Self::replica_set) answers from then on. A control
+    /// state it can't reach leaves what this node saw last.
+    pub(crate) async fn learn_fork_replicas(&self, database: &DatabaseName) {
+        match self.inner.authority.view(database).await {
+            Ok(view) => self.inner.forks.follow_view(database, view.fork.as_ref()),
+            Err(status) => {
+                tracing::debug!(database = %database, %status, "can't learn whether the database is a seeded fork; keeping its replica set as last seen");
+            }
+        }
     }
 
     /// The promotion quorum Q for a replica set of `members` members.
