@@ -49,6 +49,7 @@ use crate::data::convert::{
 use crate::data::{Descriptions, Expiry, ExpiryRequest, LabelRequirement, is_invisible};
 use crate::dev::DevMode;
 use crate::environment::Network;
+use crate::replication::ForkFaults;
 use crate::router::{Entropy, SystemEntropy};
 use crate::software::{software_from_proto, software_to_proto};
 use crate::tls::Peer;
@@ -118,6 +119,8 @@ pub struct ControlService {
     entropy: Arc<dyn Entropy>,
     /// The limits each fork this service proposes records (ADR-0046, point 7).
     fork_limits: ForkLimits,
+    /// Test-only faults: a lost reply to a fork request (FR-086).
+    fork_faults: ForkFaults,
     /// The progress of the copies replicas stream, for forks' status.
     progress: SeedProgressBoard,
 }
@@ -136,6 +139,7 @@ impl ControlService {
             notices: None,
             entropy: Arc::new(SystemEntropy::new()),
             fork_limits: ForkLimits::new(),
+            fork_faults: ForkFaults::default(),
             progress: SeedProgressBoard::default(),
         }
     }
@@ -145,6 +149,14 @@ impl ControlService {
     #[must_use]
     pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
         self.entropy = entropy;
+        self
+    }
+
+    /// Passes the fork requests this service applies through `faults`, which a test uses to
+    /// lose a reply (FR-086). Without the `fault-hooks` feature the faults do nothing.
+    #[must_use]
+    pub fn with_fork_faults(mut self, faults: ForkFaults) -> Self {
+        self.fork_faults = faults;
         self
     }
 
@@ -1167,6 +1179,9 @@ impl Control for ControlService {
             ));
         }
         let (_, state) = self.submit_drawing(action).await?;
+        if self.fork_faults.take_reply_drop() {
+            return Err(Status::unavailable("the reply was lost"));
+        }
         let record = state
             .fork_operation(&operation, state.now())
             .ok_or_else(|| Status::internal("the fork left no operation record"))?;

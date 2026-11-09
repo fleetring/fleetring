@@ -91,6 +91,10 @@ name = "sim"
 required-features = ["simulation"]
 
 [[test]]
+name = "fork_cli"
+required-features = ["fault-hooks"]
+
+[[test]]
 name = "fork"
 required-features = ["fault-hooks"]
 

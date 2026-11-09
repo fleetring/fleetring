@@ -1,10 +1,8 @@
 //! FR-086: `fleetring db fork`, fork status in `db show` and `db list`, and the cancelling `db
 //! drop` (`docs/cli.md`, section 15), driven through the real binary against one node.
 //!
-//! The tests that need a fork to progress are ignored until the fork data path lands (FR-085,
-//! #135): a build without it doesn't report the `fork` feature, so no fork reaches `ready`. The
-//! faults some of them need, a held fork reset and a dropped reply, are test-only hooks that
-//! don't exist yet; each test names the hook it needs in a `TODO(#135)`.
+//! The fault hooks (`fault-hooks`, as in `tests/fork.rs`) hold a fork's reset or its seeding, fake
+//! the node's free disk, and lose the reply to a fork request.
 
 use std::error::Error;
 use std::process::{Output, Stdio};
@@ -12,7 +10,8 @@ use std::time::Duration;
 
 use fleetring_control::fork::OperationId;
 use fleetringd::data::Client;
-use fleetringd::{Config, Daemon};
+use fleetringd::replication::{FaultPoint, ForkFaults};
+use fleetringd::{Config, Daemon, Environment};
 use serde_json::Value;
 
 use crate::support::Tls;
@@ -22,8 +21,8 @@ mod support;
 type TestResult = Result<(), Box<dyn Error>>;
 type Sendable<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
-/// Why the end-to-end tests wait.
-const NEEDS_SEEDING: &str = "needs FR-085 seeding (#135)";
+/// The free space the node believes its volume has, whatever the machine running the tests has.
+const ROOMY: u64 = 1 << 40;
 
 /// Guards against a hang only.
 const HANG_GUARD: Duration = Duration::from_secs(60);
@@ -45,6 +44,7 @@ fn code(output: &Output) -> Option<i32> {
 struct Fleet {
     tls: Tls,
     control: String,
+    faults: Faults,
 }
 
 impl Fleet {
@@ -89,38 +89,92 @@ impl Fleet {
     }
 }
 
-/// One node that is both the control plane and a data node, and a second principal, `other`,
-/// who may administer everything.
-async fn fleet(dir: &std::path::Path) -> Result<(Daemon, Fleet), Box<dyn Error>> {
+/// The fault hooks of every data node in the fleet. A fork's copies land on whichever node does
+/// not hold its source, so a hold applies to all of them.
+#[derive(Clone)]
+struct Faults(Vec<ForkFaults>);
+
+impl Faults {
+    fn hold(&self, point: FaultPoint) {
+        self.0.iter().for_each(|faults| faults.hold(point));
+    }
+
+    fn release(&self, point: FaultPoint) {
+        self.0.iter().for_each(|faults| faults.release(point));
+    }
+
+    /// The control node's reply to the next fork request is lost after the fork is recorded.
+    fn drop_next_fork_reply(&self) {
+        self.0[0].drop_next_fork_reply();
+    }
+}
+
+/// The daemons of the fleet.
+struct Daemons(Vec<Daemon>);
+
+impl Daemons {
+    async fn run_until<F: std::future::Future>(self, until: F) {
+        until.await;
+        for daemon in self.0.into_iter().rev() {
+            daemon.run_until(async {}).await;
+        }
+    }
+}
+
+/// Two nodes: `node-1` is the control plane and a data node, `node-2` a data node, because a
+/// fork's copies are placed apart from its source's. A second principal, `other`, may
+/// administer only `scratch-*` databases.
+async fn fleet(dir: &std::path::Path) -> Result<(Daemons, Fleet), Box<dyn Error>> {
     let tls = Tls::create(dir)?;
     tls.authority()
         .issue_client(&"other".parse()?, Tls::validity())?
         .write(tls.dir(), "client.other")?;
     let config = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"both\"\n\n[node]\nid = \"node-1\"\n\
+         \n[replication]\nreplication_factor = 1\n\
          \n[membership]\nheartbeat_interval_ms = 100\n{}\
-         \n[[principal]]\nname = \"other\"\nscopes = [\"admin:*\"]\n",
+         \n[fork]\ntransfer_backoff_ms = 50\n\
+         \n[[principal]]\nname = \"other\"\nscopes = [\"admin:scratch-*\"]\n",
         dir.join("node-1"),
         tls.node_table("node-1")?,
     );
-    let daemon = Daemon::start(Config::from_toml(&config)?).await?;
+    let first = ForkFaults::new();
+    first.set_disk(ROOMY, 2 * ROOMY);
+    let environment = Environment::production().with_fork_faults(first.clone());
+    let daemon = Daemon::start_with(Config::from_toml(&config)?, environment).await?;
     let control = daemon
         .control_address()
         .ok_or("no control address")?
         .to_string();
-    let fleet = Fleet { tls, control };
+    let second_config = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"data\"\n\n[node]\nid = \"node-2\"\n\
+         \n[membership]\nheartbeat_interval_ms = 100\n{}\
+         \n[control]\naddress = \"{control}\"\n\
+         \n[fork]\ntransfer_backoff_ms = 50\n",
+        dir.join("node-2"),
+        tls.node_table("node-2")?,
+    );
+    let second = ForkFaults::new();
+    second.set_disk(ROOMY, 2 * ROOMY);
+    let environment = Environment::production().with_fork_faults(second.clone());
+    let other = Daemon::start_with(Config::from_toml(&second_config)?, environment).await?;
+    let fleet = Fleet {
+        tls,
+        control,
+        faults: Faults(vec![first, second]),
+    };
     let admin = fleet.admin()?;
     tokio::time::timeout(HANG_GUARD, async {
         loop {
             match admin.status().await {
-                Ok(view) if view.members().len() == 1 => return,
+                Ok(view) if view.members().len() == 2 => return,
                 _ => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
     })
     .await
-    .map_err(|_| "the node never joined its own fleet")?;
-    Ok((daemon, fleet))
+    .map_err(|_| "the nodes never joined the fleet")?;
+    Ok((Daemons(vec![daemon, other]), fleet))
 }
 
 /// A database `notes` with one row in it.
@@ -212,9 +266,7 @@ async fn a_database_no_fork_made_shows_no_fork_and_lists_no_fork_column() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
 async fn db_fork_prints_the_operation_id_waits_for_ready_and_exits_0() -> TestResult {
-    let _ = NEEDS_SEEDING;
     let dir = tempfile::tempdir()?;
     let (daemon, fleet) = fleet(dir.path()).await?;
     let checks = tokio::task::spawn_blocking(move || -> Sendable {
@@ -240,22 +292,17 @@ async fn db_fork_prints_the_operation_id_waits_for_ready_and_exits_0() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
 async fn db_fork_keeps_waiting_after_seeded_while_the_reset_is_held() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (daemon, fleet) = fleet(dir.path()).await?;
-    // TODO(#135): hold the fork reset, a test-only hook on the data node that makes the primary
-    // delay its fork-reset write until the test releases it.
     let checks = tokio::task::spawn_blocking(move || -> Sendable {
         with_notes(&fleet)?;
-        let child = fleet
-            .command(&["db", "fork", "notes", "notes-exp", "--timeout", "5s"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        fleet.faults.hold(FaultPoint::BeforeReset);
+        let detached = fleet.ok(&["db", "fork", "notes", "notes-exp", "--detach"])?;
+        let id = printed_operation(&detached)?.to_string();
         // Seeded but not ready: the fork serves nobody.
         let mut opening = String::new();
-        for _ in 0..200 {
+        for _ in 0..400 {
             let shown = stdout(&fleet.ok(&["db", "show", "notes-exp", "--no-schema"])?);
             if shown.contains("opening: not yet usable") {
                 opening = shown;
@@ -264,24 +311,38 @@ async fn db_fork_keeps_waiting_after_seeded_while_the_reset_is_held() -> TestRes
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(opening.contains("opening: not yet usable"), "{opening}");
+        // Which refusal a client gets depends on whether the lease is out yet (ADR-0046); the
+        // fork serves nobody either way.
         let query = fleet.run(&["db", "query", "notes-exp", "SELECT 1"])?;
-        assert!(!query.status.success());
-        assert!(
-            stderr(&query).contains("fork not ready"),
-            "{}",
-            stderr(&query)
-        );
-        // TODO(#135): release the held fork reset here, then the command exits 0.
-        let output = child.wait_with_output()?;
+        assert!(!query.status.success(), "{}", stdout(&query));
+        let output = fleet.run(&[
+            "db",
+            "fork",
+            "notes",
+            "notes-exp",
+            "--operation-id",
+            &id,
+            "--timeout",
+            "2s",
+        ])?;
         assert_eq!(
             code(&output),
             Some(4),
-            "the wait ran out while the reset was held"
+            "the wait ran out while the reset was held: {}",
+            stderr(&output)
         );
         assert!(
             stderr(&output).contains("opening notes-exp"),
             "{}",
             stderr(&output)
+        );
+        // Released, the reset runs and the same command goes on to ready.
+        fleet.faults.release(FaultPoint::BeforeReset);
+        let resumed = fleet.ok(&["db", "fork", "notes", "notes-exp", "--operation-id", &id])?;
+        assert!(
+            stdout(&resumed).contains("state: ready"),
+            "{}",
+            stdout(&resumed)
         );
         Ok(())
     });
@@ -292,16 +353,13 @@ async fn db_fork_keeps_waiting_after_seeded_while_the_reset_is_held() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
 async fn a_lost_reply_is_resent_with_the_same_id_and_yields_one_fork() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (daemon, fleet) = fleet(dir.path()).await?;
-    // TODO(#135): drop the first ForkDatabase reply, a test-only hook (or a proxy in front of
-    // the control address) that lets the control plane record the fork and then fails the first
-    // reply with UNAVAILABLE.
-    let admin = fleet.admin()?;
     let checks = tokio::task::spawn_blocking(move || -> Sendable {
         with_notes(&fleet)?;
+        // The control plane records the fork and fails the first reply with UNAVAILABLE.
+        fleet.faults.drop_next_fork_reply();
         let forked = fleet.ok(&["db", "fork", "notes", "notes-exp"])?;
         assert!(stdout(&forked).contains("state: ready"));
         let listed = stdout(&fleet.ok(&["db", "list", "--prefix", "notes-exp"])?);
@@ -309,15 +367,12 @@ async fn a_lost_reply_is_resent_with_the_same_id_and_yields_one_fork() -> TestRe
         Ok(())
     });
     let checked = checks.await;
-    // One operation: reading it by the printed ID finds the one fork.
-    let _ = admin;
     daemon.run_until(async {}).await;
     checked?.map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
 async fn an_operation_id_resumes_after_detach_and_a_changed_argument_is_a_conflict() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (daemon, fleet) = fleet(dir.path()).await?;
@@ -383,15 +438,13 @@ async fn an_operation_id_resumes_after_detach_and_a_changed_argument_is_a_confli
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs FR-085 seeding (#135)"]
 async fn dropping_the_target_during_seeding_cancels_the_fork() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (daemon, fleet) = fleet(dir.path()).await?;
-    // TODO(#135): hold the seeding, a test-only hook on the data node that keeps a fork in
-    // `seeding` until the test releases it, so that the drop lands while it is pending.
-    let admin = fleet.admin()?;
     let checks = tokio::task::spawn_blocking(move || -> Sendable {
         with_notes(&fleet)?;
+        // The seeder is held before it asks the source, so the fork stays in `seeding`.
+        fleet.faults.hold(FaultPoint::Fetch);
         let detached = fleet.ok(&["db", "fork", "notes", "notes-exp", "--detach"])?;
         let id = printed_operation(&detached)?;
         let shown = stdout(&fleet.ok(&["db", "show", "notes-exp", "--no-schema"])?);
@@ -401,6 +454,7 @@ async fn dropping_the_target_during_seeding_cancels_the_fork() -> TestResult {
             dropped.contains(&format!("cancelled the fork in progress (operation {id})")),
             "{dropped}"
         );
+        fleet.faults.release(FaultPoint::Fetch);
         // The operation reports `cancelled`, and exits 1.
         let resumed = fleet.run(&[
             "db",
@@ -418,8 +472,6 @@ async fn dropping_the_target_during_seeding_cancels_the_fork() -> TestResult {
         Ok(())
     });
     let checked = checks.await;
-    // TODO(#135): `admin.fork_operation(id)` reports `Cancelled` for the first operation.
-    let _ = admin;
     daemon.run_until(async {}).await;
     checked?.map_err(|error| error.to_string())?;
     Ok(())

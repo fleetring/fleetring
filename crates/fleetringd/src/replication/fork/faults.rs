@@ -81,6 +81,8 @@ struct Hooks {
     /// The free space and the size of the node's data volume the node believes it has, in
     /// bytes, less what its data directory grows by from then on, in place of the volume's own.
     disk: std::sync::Mutex<Option<(u64, u64)>>,
+    /// Whether the control service fails the reply to the next fork request it applies.
+    drop_reply: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "fault-hooks")]
@@ -94,6 +96,7 @@ impl ForkFaults {
                 arrived: watch::Sender::new(BTreeMap::new()),
                 passed: std::sync::Mutex::new(BTreeMap::new()),
                 disk: std::sync::Mutex::new(None),
+                drop_reply: std::sync::atomic::AtomicBool::new(false),
             })),
         }
     }
@@ -165,6 +168,16 @@ impl ForkFaults {
         matches!(tokio::time::timeout(limit, reached).await, Ok(Ok(_)))
     }
 
+    /// Makes the control service apply the next fork request it gets and then answer
+    /// `UNAVAILABLE`, as a reply lost on the way would, once.
+    pub fn drop_next_fork_reply(&self) {
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .drop_reply
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Makes the node believe its data volume holds `volume` bytes, of which `free` are free
     /// less what its data directory grows by from now on, in place of what the volume says.
     pub fn set_disk(&self, free: u64, volume: u64) {
@@ -218,6 +231,21 @@ impl ForkFaults {
         }
         #[cfg(not(feature = "fault-hooks"))]
         let _ = (point, operation);
+    }
+
+    /// Whether the reply to the fork request just applied is to be dropped; true once per
+    /// [`drop_next_fork_reply`](Self::drop_next_fork_reply).
+    pub(crate) fn take_reply_drop(&self) -> bool {
+        #[cfg(feature = "fault-hooks")]
+        {
+            self.hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .drop_reply
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            })
+        }
+        #[cfg(not(feature = "fault-hooks"))]
+        false
     }
 
     /// The free space and size of the data volume a test made the node believe it has, if it
