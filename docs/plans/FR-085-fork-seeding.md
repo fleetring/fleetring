@@ -61,8 +61,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo +1.88 check --workspace --exclude fleetringd --all-features --all-targets
-cargo +1.89 check -p fleetringd --all-features --all-targets
+cargo +1.88 check --workspace --exclude fleetringd --exclude fleetring-client --exclude fleetring-wal-sqlite-tests --all-features --all-targets
+cargo +1.89 check -p fleetringd -p fleetring-client -p fleetring-wal-sqlite-tests --all-features --all-targets
 ```
 
 Plus the simulation suite and the rolling-upgrade check before the PR.
