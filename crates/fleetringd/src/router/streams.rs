@@ -1,13 +1,16 @@
 //! Hrana streams and their batons (ADR-0037, points 19 and 23).
 //!
 //! A baton is `base64url(stream ID ‖ 16 random bytes ‖ sequence)`, with the stream ID a
-//! big-endian `u64` and the sequence a big-endian `u32`. The random bytes are the stream's
+//! big-endian `u64` and the sequence a big-endian `u32`. The stream ID is random too, so that a
+//! baton tells nothing of how many streams came before it. The random bytes are the stream's
 //! secret, drawn once from an injected [`Entropy`], and compared in constant time; the sequence
 //! moves on with every request, so a baton is accepted once, for its stream's current request,
 //! and a replayed or forked one is refused. A stream belongs to the token that opened it:
 //! another principal's request is refused with `403`, as is the same principal's with another
-//! token. A stream idle past its timeout expires, and dropping it closes its session, which
-//! rolls back what it left open on the primary.
+//! token, so a client that rotates its token mid-stream opens a new stream. A principal holds at
+//! most `max_streams_per_principal` streams, so that one caller can't take every place. A stream
+//! idle past its timeout expires, and dropping it closes its session, which rolls back what it
+//! left open on the primary.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -181,6 +184,8 @@ pub(crate) enum StreamRefusal {
     Forbidden(String),
     /// `503`: the router holds as many streams as it may.
     Full,
+    /// `429`: the caller's principal holds as many streams as one principal may.
+    PrincipalFull(usize),
 }
 
 impl StreamRefusal {
@@ -197,6 +202,13 @@ impl StreamRefusal {
                 code::RESOURCE_EXHAUSTED,
                 "the router holds as many streams as it may; retry later",
             ),
+            Self::PrincipalFull(max) => Error::new(
+                code::RESOURCE_EXHAUSTED,
+                format!(
+                    "this principal holds {max} streams already, as many as [streams] \
+                     max_streams_per_principal allows; close one, or let one expire"
+                ),
+            ),
         }
     }
 }
@@ -210,8 +222,23 @@ pub(crate) struct Streams {
 
 #[derive(Debug, Default)]
 struct Table {
-    next_id: u64,
     streams: BTreeMap<u64, Entry>,
+    /// How many streams each principal holds; a principal with none has no entry.
+    held: BTreeMap<Principal, usize>,
+}
+
+impl Table {
+    /// Removes the stream `id`, giving its principal's place back.
+    fn remove(&mut self, id: u64) -> Option<Entry> {
+        let entry = self.streams.remove(&id)?;
+        if let Some(count) = self.held.get_mut(&entry.principal) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.held.remove(&entry.principal);
+            }
+        }
+        Some(entry)
+    }
 }
 
 /// A stream in the table, with its secret kept outside its lock, so that a baton is checked
@@ -219,6 +246,7 @@ struct Table {
 #[derive(Debug)]
 struct Entry {
     secret: [u8; SECRET_BYTES],
+    principal: Principal,
     stream: Arc<tokio::sync::Mutex<HranaStream>>,
 }
 
@@ -235,7 +263,9 @@ impl Streams {
     ///
     /// # Errors
     ///
-    /// [`StreamRefusal::Full`] if the router holds `max_streams` already.
+    /// [`StreamRefusal::Full`] if the router holds `max_streams` already, and
+    /// [`StreamRefusal::PrincipalFull`] if the caller's principal holds
+    /// `max_streams_per_principal`.
     pub(crate) fn create(
         &self,
         caller: &Caller,
@@ -248,8 +278,18 @@ impl Streams {
         if table.streams.len() >= self.limits.max_streams.get() {
             return Err(StreamRefusal::Full);
         }
-        table.next_id += 1;
-        let id = table.next_id;
+        let per_principal = self.limits.max_streams_per_principal.get();
+        if table.held.get(&caller.principal).copied().unwrap_or(0) >= per_principal {
+            return Err(StreamRefusal::PrincipalFull(per_principal));
+        }
+        let id = loop {
+            let mut id = [0; 8];
+            entropy.fill(&mut id);
+            let id = u64::from_be_bytes(id);
+            if !table.streams.contains_key(&id) {
+                break id;
+            }
+        };
         let stream = Arc::new(tokio::sync::Mutex::new(HranaStream {
             id,
             secret,
@@ -267,7 +307,15 @@ impl Streams {
         let locked = Arc::clone(&stream)
             .try_lock_owned()
             .map_err(|_| StreamRefusal::Invalid("a new stream is already locked".to_owned()))?;
-        table.streams.insert(id, Entry { secret, stream });
+        *table.held.entry(caller.principal.clone()).or_default() += 1;
+        table.streams.insert(
+            id,
+            Entry {
+                secret,
+                principal: caller.principal.clone(),
+                stream,
+            },
+        );
         Ok(locked)
     }
 
@@ -329,7 +377,7 @@ impl Streams {
 
     /// Removes the stream `id`, which closes its session.
     pub(crate) fn remove(&self, id: u64) {
-        let removed = self.lock().streams.remove(&id);
+        let removed = self.lock().remove(id);
         drop(removed);
     }
 
@@ -351,9 +399,7 @@ impl Streams {
                 })
                 .map(|(id, _)| *id)
                 .collect();
-            ids.into_iter()
-                .filter_map(|id| table.streams.remove(&id))
-                .collect()
+            ids.into_iter().filter_map(|id| table.remove(id)).collect()
         };
         if !expired.is_empty() {
             tracing::debug!(count = expired.len(), "expired idle Hrana streams");
