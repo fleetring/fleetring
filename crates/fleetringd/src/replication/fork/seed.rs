@@ -345,6 +345,13 @@ async fn receive(
             ))));
         }
         if let Some(position) = current.position {
+            if unpacker.offset() != total {
+                return Err(Fetch::Failed(Status::data_loss(format!(
+                    "the copy's stream ended after {} of the {total} bytes its first chunk \
+                     announced",
+                    unpacker.offset()
+                ))));
+            }
             return finish(
                 inner,
                 plan,
@@ -359,6 +366,7 @@ async fn receive(
             .await;
         }
         let data = current.data;
+        within_total(total, unpacker.offset(), data.len()).map_err(Fetch::Failed)?;
         let (returned, written) = blocking(inner.execution, move || {
             let written = unpacker.write(&data);
             (unpacker, written)
@@ -370,6 +378,21 @@ async fn receive(
         })?;
         progress(unpacker.offset());
     }
+}
+
+/// Refuses a chunk of `len` bytes at `offset` that would take a stream past the `total` bytes
+/// its first chunk announced, and admitted room for: `DATA_LOSS`, which ends the fetch and
+/// releases its reservation.
+fn within_total(total: u64, offset: u64, len: usize) -> Result<(), Status> {
+    let end = u64::try_from(len)
+        .ok()
+        .and_then(|len| offset.checked_add(len));
+    if end.is_none_or(|end| end > total) {
+        return Err(Status::data_loss(format!(
+            "the copy's stream runs past the {total} bytes its first chunk announced"
+        )));
+    }
+    Ok(())
 }
 
 /// Verifies the stream's end, checks the copy with the engine, and commits it.
@@ -444,4 +467,20 @@ async fn finish(
         Fetch::Failed(Status::internal(format!("can't stage the copy: {error}")))
     })?;
     Ok(sidecar)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_never_runs_past_the_size_it_announced() {
+        assert!(within_total(10, 0, 10).is_ok());
+        assert!(within_total(10, 4, 6).is_ok());
+        assert!(within_total(10, 10, 0).is_ok());
+        let past = within_total(10, 4, 7).expect_err("one byte past");
+        assert_eq!(past.code(), Code::DataLoss);
+        assert!(within_total(0, 0, 1).is_err());
+        assert!(within_total(u64::MAX, u64::MAX, 1).is_err());
+    }
 }
