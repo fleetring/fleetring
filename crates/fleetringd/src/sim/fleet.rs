@@ -498,6 +498,7 @@ fn host_config(
         admin: crate::AdminConfig::default(),
         log: crate::LogConfig::default(),
         limits: crate::LimitsConfig::default(),
+        sessions: crate::SessionsConfig::default(),
     })
 }
 

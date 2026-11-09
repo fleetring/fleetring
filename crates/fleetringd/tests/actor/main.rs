@@ -5,4 +5,5 @@ mod common;
 mod memory;
 mod pinned;
 mod registry;
+mod sessions;
 mod sqlite;

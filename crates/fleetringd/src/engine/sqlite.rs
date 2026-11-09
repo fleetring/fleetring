@@ -42,6 +42,7 @@ mod marks;
 mod pins;
 mod reserved;
 mod schema;
+mod session;
 #[cfg(test)]
 mod tests;
 
@@ -57,7 +58,7 @@ use std::sync::{Arc, Mutex};
 
 use fleetring_wal::{Batch, ReadError, ReadFileError, read_committed_file};
 use rusqlite::config::DbConfig;
-use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, ffi, params};
 
@@ -67,12 +68,13 @@ use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX, Watched};
 use self::marks::Marks;
 use self::pins::Pins;
 use self::reserved::{Reserved, is_reserved};
+use self::session::{Control, OpenTransaction};
 use crate::engine::{
     BatchTransaction, CaptureMode, CheckpointMarker, Database, DatabaseCapability, DatabaseEngine,
     DatabaseSnapshot, EngineCapability, EngineError, EngineKind, Executed, FrameBatch,
     FrameFollower, FrameSource, FrameSourceEngine, Interrupt, LogicalChanges, LogicalSupport,
     OpenMode, PinnedSnapshot, Position, ReadLimit, RecordedTransaction, RowChange, Rows, Schema,
-    SchemaRequest, SinkMarks, SnapshotFile, Statement, Transaction, Value,
+    SchemaRequest, SinkMarks, SnapshotFile, SqlSessions, Statement, Transaction, Value,
 };
 
 /// The database file inside a database's location. The WAL sits next to it.
@@ -250,6 +252,8 @@ struct SqliteDatabase {
     marks: Marks,
     /// The reserved part of the write connection's schema, which user statements may not change.
     reserved: Reserved,
+    /// The transaction a SQL session holds open on the writer, if one does (ADR-0037).
+    transaction: Option<OpenTransaction>,
 }
 
 impl SqliteDatabase {
@@ -316,6 +320,7 @@ impl SqliteDatabase {
             recorder: None,
             marks: Marks::default(),
             reserved: Reserved::default(),
+            transaction: None,
         })
     }
 
@@ -468,6 +473,12 @@ impl Database for SqliteDatabase {
     ) -> Result<Executed, EngineError> {
         // A caller that has already gone, or run out of time, gets nothing started.
         interrupt.check()?;
+        // The caller runs writes only while no session holds the writer, so this never happens.
+        if !self.writer.is_autocommit() {
+            return Err(EngineError::Statement {
+                message: "a session's transaction holds the database's writer".to_owned(),
+            });
+        }
         self.writer
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(classify)?;
@@ -622,6 +633,10 @@ impl Database for SqliteDatabase {
         Some(self)
     }
 
+    fn sql_sessions(&mut self) -> Option<&mut dyn SqlSessions> {
+        Some(self)
+    }
+
     fn close(self: Box<Self>) -> Result<(), EngineError> {
         let Self { reader, writer, .. } = *self;
         reader.close().map_err(|(_, error)| storage(error))?;
@@ -657,6 +672,10 @@ impl FrameSource for SqliteDatabase {
     fn checkpoint(&mut self) -> Result<CheckpointMarker, EngineError> {
         // A snapshot being read must see the database file and the WAL as they were pinned.
         if self.pins.is_pinned(&self.path) {
+            return Err(EngineError::CheckpointBlocked);
+        }
+        // Nor while a session's transaction holds the writer.
+        if !self.writer.is_autocommit() {
             return Err(EngineError::CheckpointBlocked);
         }
         let position = self.position()?.ok_or(EngineError::CheckpointBlocked)?;
@@ -849,6 +868,9 @@ struct Confinement {
     defines_program: AtomicBool,
     /// Why the user statement was refused, kept for its error.
     refused: Mutex<Option<Refusal>>,
+    /// What the user statement being prepared does to a transaction, for a SQL session to read
+    /// (ADR-0037, point 12). Never refused here: `Execute` refuses transaction control itself.
+    control: Mutex<Option<Control>>,
 }
 
 impl Confinement {
@@ -932,6 +954,9 @@ fn confine(conn: &Connection) -> Arc<Confinement> {
         {
             return Authorization::Allow;
         }
+        if let Some(control) = control_of(&context.action) {
+            *seen.control.lock().expect("control lock poisoned") = Some(control);
+        }
         if matches!(
             context.action,
             AuthAction::CreateTrigger { .. }
@@ -950,6 +975,24 @@ fn confine(conn: &Connection) -> Arc<Confinement> {
         }
     }));
     confinement
+}
+
+/// What `action` does to a transaction, if it is a transaction's or a savepoint's control. The
+/// authorizer reports `COMMIT` and `END` as a transaction operation it has no name for.
+fn control_of(action: &AuthAction<'_>) -> Option<Control> {
+    match *action {
+        AuthAction::Transaction { operation } => Some(match operation {
+            TransactionOperation::Begin => Control::Begin,
+            TransactionOperation::Rollback => Control::Rollback,
+            _ => Control::Commit,
+        }),
+        AuthAction::Savepoint { operation, .. } => Some(match operation {
+            TransactionOperation::Begin => Control::Savepoint,
+            TransactionOperation::Release => Control::Release,
+            _ => Control::RollbackTo,
+        }),
+        _ => None,
+    }
 }
 
 /// Why a user statement may not perform `action`, if it may not.
@@ -1106,6 +1149,7 @@ impl<'c> UserStatement<'c> {
         confinement.user.store(true, Ordering::Relaxed);
         confinement.defines_program.store(false, Ordering::Relaxed);
         *confinement.refused.lock().expect("refusal lock poisoned") = None;
+        *confinement.control.lock().expect("control lock poisoned") = None;
         Self(confinement)
     }
 }
