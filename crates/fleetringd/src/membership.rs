@@ -168,6 +168,8 @@ pub struct Membership {
     current: Arc<ArcSwap<MembershipView>>,
     updates: watch::Receiver<Arc<MembershipView>>,
     denylist: Denylist,
+    /// The forks the last heartbeat reply said name this node (ADR-0046).
+    forks: Arc<watch::Sender<std::collections::BTreeSet<fleetring_control::DatabaseName>>>,
 }
 
 impl Membership {
@@ -237,6 +239,7 @@ impl Membership {
                 databases: Box::new(databases),
                 unknown: std::collections::BTreeSet::new(),
                 denylist: membership.denylist.clone(),
+                forks: Arc::clone(&membership.forks),
                 metrics,
             },
             Arc::clone(&resubscribe),
@@ -287,9 +290,24 @@ impl Membership {
                 current,
                 updates,
                 denylist,
+                forks: Arc::new(watch::Sender::new(std::collections::BTreeSet::new())),
             },
             publisher,
         )
+    }
+
+    /// The forks that aren't ready yet whose replica set names this node, as the last heartbeat
+    /// reply listed them (ADR-0046): the node seeds them, or opens them once seeded.
+    #[must_use]
+    pub fn pending_forks(&self) -> std::collections::BTreeSet<fleetring_control::DatabaseName> {
+        self.forks.borrow().clone()
+    }
+
+    /// Waits until the forks [`pending_forks`](Self::pending_forks) lists change.
+    pub(crate) fn forks_changed(
+        &self,
+    ) -> watch::Receiver<std::collections::BTreeSet<fleetring_control::DatabaseName>> {
+        self.forks.subscribe()
     }
 
     /// Returns the revoked tokens and signing keys, as the last heartbeat reply listed them
@@ -347,11 +365,21 @@ impl Membership {
 pub trait DatabaseStatuses: fmt::Debug + Send + Sync + 'static {
     /// The role, epoch, and position of every database this node hosts, one entry each.
     fn statuses(&self) -> Vec<DatabaseStatus>;
+
+    /// The free bytes on the node's data volume, for the control plane's best-effort fork
+    /// admission (ADR-0046, point 7.3), if the node knows them.
+    fn disk_free_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl<T: DatabaseStatuses + ?Sized> DatabaseStatuses for Arc<T> {
     fn statuses(&self) -> Vec<DatabaseStatus> {
         (**self).statuses()
+    }
+
+    fn disk_free_bytes(&self) -> Option<u64> {
+        (**self).disk_free_bytes()
     }
 }
 
@@ -695,6 +723,8 @@ struct Heartbeats {
     unknown: std::collections::BTreeSet<String>,
     /// Where each reply's denylist goes.
     denylist: Denylist,
+    /// Where each reply's forks go.
+    forks: Arc<watch::Sender<std::collections::BTreeSet<fleetring_control::DatabaseName>>>,
     /// Where heartbeats are counted and timed.
     metrics: MembershipMetrics,
 }
@@ -707,7 +737,7 @@ impl Heartbeats {
             node_id: id.to_owned(),
             databases: self.databases.statuses(),
             software: Some(software_to_proto(&running())),
-            ..HeartbeatRequest::default()
+            disk_free_bytes: self.databases.disk_free_bytes(),
         };
         let sent = tokio::time::Instant::now();
         let result = timeout(self.limit, self.client.heartbeat(request)).await;
@@ -724,6 +754,18 @@ impl Heartbeats {
             self.unknown = unknown;
             self.denylist
                 .replace(revocations_from_proto(response.revocations.clone()));
+            let forks: std::collections::BTreeSet<fleetring_control::DatabaseName> = response
+                .forks
+                .iter()
+                .filter_map(|name| name.parse().ok())
+                .collect();
+            self.forks.send_if_modified(|current| {
+                let changed = *current != forks;
+                if changed {
+                    *current = forks;
+                }
+                changed
+            });
         }
         result
     }

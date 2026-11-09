@@ -108,6 +108,19 @@ pub(crate) const OUTCOMES_CONTROL: &[&str] = &["applied", "rejected"];
 /// The `outcome` label's values on `fleetring_change_deliveries_total`.
 pub(crate) const OUTCOMES_DELIVERY: &[&str] = &["delivered", "failed"];
 
+/// The `outcome` label's values on `fleetring_forks_total` (ADR-0046, point 11).
+pub(crate) const OUTCOMES_FORK: &[&str] = &["ready", "failed", "cancelled"];
+
+/// The `outcome` label's values on `fleetring_fork_attempts_total`: how a node's fetch of a
+/// fork's copy in an attempt ended (ADR-0046, point 11, names the label `result`; ADR-0034's
+/// allow-list names it `outcome`).
+pub(crate) const OUTCOMES_FORK_ATTEMPT: &[&str] = &[
+    "staged",
+    "insufficient_disk",
+    "pin_expired",
+    "transfer_failed",
+];
+
 /// The `state` label's values on `fleetring_replication_followers`.
 pub(crate) const FOLLOWER_STATES: &[&str] = &["caught_up", "behind", "disconnected", "reseeding"];
 
@@ -405,6 +418,48 @@ pub const FAMILIES: &[FamilySpec] = &[
         &["sink"],
         "The largest backlog of any one database",
     ),
+    family(
+        "fleetring_forks",
+        Counter,
+        &["outcome"],
+        "Forks that reached a final outcome, as this control node applied it",
+    ),
+    family(
+        "fleetring_fork_ready_seconds",
+        Histogram,
+        &[],
+        "Time from a fork's request to its readiness",
+    ),
+    family(
+        "fleetring_fork_attempts",
+        Counter,
+        &["outcome"],
+        "Copies of forks this node fetched in an attempt, by how each fetch ended",
+    ),
+    family(
+        "fleetring_fork_seed_bytes",
+        Histogram,
+        &[],
+        "Sizes of the copies of forks this node staged",
+    ),
+    family(
+        "fleetring_fork_pin_seconds",
+        Histogram,
+        &[],
+        "How long this node, as a source's primary, held each seeding pin",
+    ),
+    family(
+        "fleetring_fork_pinned_wal_bytes",
+        Gauge,
+        &[],
+        "WAL bytes the seeding pins this node holds keep from being checkpointed",
+    ),
+    family(
+        "fleetring_fork_reserved_disk_bytes",
+        Gauge,
+        &[],
+        "Disk this node reserved for copies of forks it is fetching",
+    ),
 ];
 
 /// The family named `name`.
@@ -434,6 +489,8 @@ pub fn closed_values(family: &str, label: &str) -> Option<&'static [&'static str
         ("fleetring_promotions", "outcome") => OUTCOMES_PROMOTION,
         ("fleetring_control_commands", "outcome") => OUTCOMES_CONTROL,
         ("fleetring_change_deliveries", "outcome") => OUTCOMES_DELIVERY,
+        ("fleetring_forks", "outcome") => OUTCOMES_FORK,
+        ("fleetring_fork_attempts", "outcome") => OUTCOMES_FORK_ATTEMPT,
         _ => return None,
     };
     Some(values)

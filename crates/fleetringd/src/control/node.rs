@@ -544,6 +544,7 @@ impl Writer {
     fn apply_logged(&mut self, index: LogIndex, command: Command) -> Committed {
         self.last_index = index;
         let action = action_label(&command.action);
+        let pending = pending_forks(&self.state);
         let outcome = apply(&mut self.state, command.clone());
         let label = if outcome.is_ok() {
             "applied"
@@ -551,6 +552,9 @@ impl Writer {
             "rejected"
         };
         self.metrics.command(index.get(), action, label);
+        if outcome.is_ok() {
+            count_finished_forks(&self.state, &pending, &self.metrics);
+        }
         let state = if outcome.is_ok() {
             let state = Arc::new(self.state.clone());
             self.publish.send_replace(Arc::clone(&state));
@@ -575,6 +579,49 @@ impl Writer {
             outcome,
             state,
         }
+    }
+}
+
+/// The fork operations that are still pending in `state`.
+fn pending_forks(state: &State) -> Vec<fleetring_control::fork::OperationId> {
+    state
+        .fork_operations()
+        .filter(|(_, record)| !record.outcome().is_terminal())
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Counts each of `pending` that `state` shows at a final outcome, with how long a ready one
+/// took from its request (ADR-0046, point 11), and logs it as an audit line.
+fn count_finished_forks(
+    state: &State,
+    pending: &[fleetring_control::fork::OperationId],
+    metrics: &crate::observe::ControlMetrics,
+) {
+    use fleetring_control::fork::{ForkState, OperationOutcome};
+    for id in pending {
+        let Some((_, record)) = state.fork_operations().find(|(known, _)| *known == id) else {
+            continue;
+        };
+        let outcome = match record.outcome() {
+            OperationOutcome::Ready { .. } => "ready",
+            OperationOutcome::Failed { .. } => "failed",
+            OperationOutcome::Cancelled { .. } => "cancelled",
+            _ => continue,
+        };
+        let took = state
+            .database(record.target())
+            .and_then(|database| database.fork())
+            .and_then(|fork| match fork.state() {
+                ForkState::Ready { ready_at, .. } => Some(std::time::Duration::from_millis(
+                    ready_at
+                        .as_millis()
+                        .saturating_sub(fork.requested_at().as_millis()),
+                )),
+                _ => None,
+            });
+        metrics.fork_finished(outcome, took);
+        tracing::info!(target: "fleetringd::audit", operation = %id, fork = %record.target(), incarnation = %record.target_incarnation(), source = %record.intent().source, source_incarnation = %record.source_incarnation(), outcome, "fork finished");
     }
 }
 

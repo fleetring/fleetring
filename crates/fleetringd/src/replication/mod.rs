@@ -117,6 +117,7 @@ mod chain;
 mod epochs;
 mod failover;
 mod follower;
+pub(crate) mod fork;
 mod primary;
 mod snapshot;
 
@@ -153,11 +154,14 @@ use crate::transport::{Peers, replication_server};
 use crate::{Membership, Registry};
 
 pub(crate) use self::archive::{Packer, Unpacker, remove_dir_if_present};
+pub use self::binding::ViewFuture;
 pub use self::binding::{EpochAuthority, EpochHolders, HoldersFuture};
 pub use self::chain::{ChainHash, ParseChainHashError};
 pub(crate) use self::failover::DropNotice;
 pub use self::failover::{Fenced, PromotionRequest};
 pub use self::follower::ReplicationService;
+pub use self::fork::faults::ForkFaults;
+pub use self::fork::{DatabaseView, FaultPoint, ForkPhase, ForkView, RETRY_AFTER_KEY};
 
 /// The metadata key on a `Replicate` stream that names the primary, so that a follower without a
 /// copy knows whom to fetch one from.
@@ -458,6 +462,9 @@ struct Inner {
     /// The copies this node keeps, closed, as orphans, each with the highest epoch it recorded
     /// (ADR-0042). Streams, fences, fetches, and promotions naming one are refused.
     orphans: Mutex<BTreeMap<DatabaseName, LeaseEpoch>>,
+    /// The node's fork state: staged copies, seeds, pins, reservations, reports, and the
+    /// readiness gate (ADR-0046).
+    forks: Arc<fork::Forks>,
     /// How many streams have ended, by the database they followed. A stream that ends may mean
     /// the database was dropped; the node asks the control plane (see [`ended_streams`]).
     ///
@@ -519,7 +526,10 @@ impl Replication {
             settings,
             metrics,
         } = parts;
+        let forks = Arc::new(fork::Forks::new(&state_dir, metrics.clone()));
+        forks.store().scan();
         let inner = Arc::new(Inner {
+            forks,
             node,
             engine,
             membership,
@@ -635,9 +645,14 @@ impl Replication {
         ));
         let previous = {
             let mut primaries = self.inner.lock_primaries();
-            self.inner.served.send_modify(|served| {
-                served.insert(database.clone(), role.epoch);
-            });
+            // A fork that isn't ready joins the served databases only once its gate opens, so
+            // that no change stream, archive, or lease watcher acts on it before (ADR-0046,
+            // point 6.2).
+            if !self.inner.forks.is_gated(&database) {
+                self.inner.served.send_modify(|served| {
+                    served.insert(database.clone(), role.epoch);
+                });
+            }
             primaries.insert(database, Served { primary, driver })
         };
         drop(previous);
@@ -1020,11 +1035,22 @@ impl DatabaseStatuses for Replication {
                         .committed()
                         .map(Position::into_bytes)
                         .unwrap_or_default(),
+                    // The size a fork of it would copy, for the control plane's admission.
+                    size_bytes: Some(failover::size_on_disk(
+                        &self.inner.registry().location(name),
+                    )),
                     ..DatabaseStatus::default()
                 },
             );
         }
+        self.inner.forks.decorate(&mut statuses, |name| {
+            self.inner.epochs.record(name).log_epoch()
+        });
         statuses.into_values().collect()
+    }
+
+    fn disk_free_bytes(&self) -> Option<u64> {
+        self.inner.forks.disk_free_bytes()
     }
 }
 
@@ -1346,8 +1372,17 @@ impl Inner {
         let role = primary.role();
         let factor = role.replication_factor;
         let view = self.membership.view();
-        let members: Vec<NodeId> = view.ring().map_or_else(Vec::new, |ring| {
-            ring.replicas_n(primary.name().as_str(), factor).to_ids()
+        // The primary of a seeded fork that serves no client yet keeps the replica set control
+        // state froze for it: the recorded holders.
+        let frozen = self
+            .forks
+            .is_gated(primary.name())
+            .then(|| self.forks.frozen(primary.name()))
+            .flatten();
+        let members: Vec<NodeId> = frozen.unwrap_or_else(|| {
+            view.ring().map_or_else(Vec::new, |ring| {
+                ring.replicas_n(primary.name().as_str(), factor).to_ids()
+            })
         });
         let includes_self = members.is_empty() || members.contains(&self.node);
         let size = u8::try_from(members.len())

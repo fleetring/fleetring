@@ -67,12 +67,15 @@ zeroize = "1"
 # `fleetringd upgrade` restarts a running daemon in place with SIGHUP (ADR-0038). rustix is
 # already in the tree, through tempfile.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "process", "fs"] }
 
 [features]
 # The simulation harness (`fleetringd::sim`): the daemon over turmoil's simulated network and
 # clock (ADR-0020).
 simulation = ["dep:turmoil"]
+# Fault hooks for the fork tests (FR-085): points where a test holds a node's fork work, and a
+# stand-in for its free disk. Never enable in release builds.
+fault-hooks = []
 
 [lints]
 workspace = true
@@ -86,6 +89,10 @@ path = "src/main.rs"
 [[test]]
 name = "sim"
 required-features = ["simulation"]
+
+[[test]]
+name = "fork"
+required-features = ["fault-hooks"]
 
 [[bench]]
 name = "capture"

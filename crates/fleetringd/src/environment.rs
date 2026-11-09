@@ -19,6 +19,7 @@ use crate::control::{ControlClient, StorageIo};
 use crate::data::DROP_FLUSH_LIMIT;
 use crate::durability::ObjectStore;
 use crate::engine::Execution;
+use crate::replication::ForkFaults;
 use crate::router::{Entropy, SystemEntropy};
 use crate::tls::{Conn, Raw, Security};
 use crate::transport::{Credentials, TransportConfig};
@@ -238,6 +239,8 @@ pub struct Environment {
     object_stores: BTreeMap<String, Arc<dyn ObjectStore>>,
     /// How long a dropped database's change streams have to flush before its copy is deleted.
     drop_flush_limit: Duration,
+    /// The fork tests' fault hooks; empty, and inert, unless a test gives some.
+    fork_faults: ForkFaults,
 }
 
 impl Environment {
@@ -251,6 +254,7 @@ impl Environment {
             execution: Execution::Threads,
             object_stores: BTreeMap::new(),
             drop_flush_limit: DROP_FLUSH_LIMIT,
+            fork_faults: ForkFaults::default(),
         }
     }
 
@@ -270,6 +274,7 @@ impl Environment {
             execution: Execution::Inline,
             object_stores: BTreeMap::new(),
             drop_flush_limit: DROP_FLUSH_LIMIT,
+            fork_faults: ForkFaults::default(),
         }
     }
 
@@ -332,6 +337,21 @@ impl Environment {
     #[must_use]
     pub fn drop_flush_limit(&self) -> Duration {
         self.drop_flush_limit
+    }
+
+    /// Passes the node's fork work through `faults`, which a test holds and releases (FR-085).
+    /// Only with the `fault-hooks` feature, which release builds never enable.
+    #[cfg(feature = "fault-hooks")]
+    #[must_use]
+    pub fn with_fork_faults(mut self, faults: ForkFaults) -> Self {
+        self.fork_faults = faults;
+        self
+    }
+
+    /// The fault hooks the node's fork work passes.
+    #[must_use]
+    pub fn fork_faults(&self) -> ForkFaults {
+        self.fork_faults.clone()
     }
 
     /// The store that replaces the one the archive named `archive` names, if any.

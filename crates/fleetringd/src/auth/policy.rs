@@ -278,7 +278,7 @@ pub const RPCS: &[Rpc] = &[
     rpc(
         "/fleetring.v1.Replication/Snapshot",
         Requirement::Node,
-        Binding::Follower,
+        Binding::FollowerOrSeeding,
     ),
     rpc(
         "/fleetring.v1.Replication/Fetch",
@@ -741,7 +741,9 @@ mod tests {
                 | Binding::Candidate
                 | Binding::HolderOrCandidate
                 | Binding::Follower
-                | Binding::Dropped) => binding.as_str(),
+                | Binding::Dropped
+                | Binding::Seeding
+                | Binding::FollowerOrSeeding) => binding.as_str(),
             };
             let row = format!(
                 "| `{service}.{}` | {} | {binding} |",

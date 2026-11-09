@@ -67,6 +67,7 @@ pub(crate) mod calls;
 mod client;
 pub(crate) mod convert;
 mod drain;
+mod fork;
 mod lease;
 mod leases;
 mod metadata;
@@ -81,9 +82,10 @@ pub use client::{
     ArchiveDescription, ArchiveVerification, ArchivedSnapshot, ChangeUpdate, ChangeUpdates,
     ChangedTransaction, Client, DatabaseSpec, DurabilityChange, ForkSpec, LeaseUpdate,
     LeaseUpdates, Location, NodeStatus, Orphan, ReplicaInfo, Restoration, RestoredExpiry,
-    ServedDatabase, Verification, WITHOUT_WATCH, Written,
+    ServedDatabase, StagedOrphan, Verification, WITHOUT_WATCH, Written,
 };
 pub(crate) use drain::DrainSettings;
+pub(crate) use fork::ForkKeeper;
 pub(crate) use lease::{DROP_FLUSH_LIMIT, LeaseKeeper, LeaseSettings};
 pub(crate) use metadata::is_invisible;
 pub use metadata::{

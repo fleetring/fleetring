@@ -94,6 +94,7 @@ const _: () = {
     assert_debug_send_sync::<auth::TokenSpec>();
     assert_debug_send_sync::<auth::TokenVerifier>();
     assert_debug_send_sync::<auth::Unbound>();
+    assert_debug_send_sync::<auth::SeedingMismatch>();
     assert_debug_send_sync::<auth::Verified>();
     assert_debug_send_sync::<auth::VerifyingKey>();
     assert_debug_send_sync::<changes::ChangeStreams>();

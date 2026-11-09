@@ -521,8 +521,27 @@ impl Replication for ReplicationService {
         let caller = calling_node(&Peer::of(&request), "DropCopy")?;
         let request = request.into_inner();
         let name = parse_database(&request.database)?;
-        binding::check_drop(&self.inner, &name, request.epoch, caller.as_ref()).await?;
-        failover::drop_rpc(&self.inner, name, LeaseEpoch::new(request.epoch));
+        let incarnation = request.incarnation.map(fleetring_control::Incarnation::new);
+        let operation = request
+            .operation
+            .as_deref()
+            .map(crate::control::fork::operation_from_proto)
+            .transpose()?;
+        binding::check_drop(
+            &self.inner,
+            &name,
+            request.epoch,
+            incarnation,
+            caller.as_ref(),
+        )
+        .await?;
+        failover::drop_rpc(
+            &self.inner,
+            name,
+            LeaseEpoch::new(request.epoch),
+            incarnation,
+            operation,
+        );
         Ok(Response::new(DropCopyResponse {}))
     }
 
@@ -532,6 +551,11 @@ impl Replication for ReplicationService {
     ) -> Result<Response<Self::SnapshotStream>, Status> {
         let caller = calling_node(&Peer::of(&request), "Snapshot")?;
         let request = request.into_inner();
+        if let Some(seeding) = binding::SeedingRequest::parse(&request)? {
+            let grant = binding::check_seeding(&self.inner, &seeding, caller.as_ref()).await?;
+            let stream = super::fork::source::serve(&self.inner, seeding, grant).await?;
+            return Ok(Response::new(Box::pin(stream)));
+        }
         if let Some(caller) = &caller {
             let name = parse_database(&request.database)?;
             binding::check_snapshot(&self.inner, &name, request.epoch, caller).await?;
@@ -773,9 +797,13 @@ impl Follow {
         }
     }
 
-    /// Fetches the database's first copy from the primary and moves it to `location`.
+    /// Fetches the database's first copy from the primary and moves it to `location`, or, for a
+    /// fork this node holds a staged copy of, installs that copy instead (ADR-0046, point 6.2).
     async fn bootstrap(&self, location: &Path) -> Result<(), Status> {
         let inner = &self.inner;
+        if super::fork::install_holder(inner, &self.name).await? {
+            return Ok(());
+        }
         let primary = self.primary.as_ref().ok_or_else(|| {
             Status::failed_precondition(format!(
                 "no copy of {} here, and the stream names no primary to copy it from",

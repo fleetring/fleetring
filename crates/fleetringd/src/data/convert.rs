@@ -674,6 +674,21 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
                 database: parse_reply("database name", &orphan.database)?,
                 epoch: LeaseEpoch::new(orphan.epoch),
                 bytes: orphan.bytes,
+                staged: orphan
+                    .staged
+                    .map(|staged| {
+                        Ok::<_, Status>(crate::data::StagedOrphan {
+                            incarnation: fleetring_control::Incarnation::new(
+                                staged.fork_incarnation,
+                            ),
+                            operation: crate::control::fork::operation_from_proto(
+                                &staged.operation,
+                            )
+                            .map_err(|status| Status::internal(status.message().to_owned()))?,
+                            attempt: staged.attempt,
+                        })
+                    })
+                    .transpose()?,
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;

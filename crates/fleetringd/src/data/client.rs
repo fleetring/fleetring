@@ -260,6 +260,38 @@ pub struct Orphan {
     pub epoch: LeaseEpoch,
     /// The size of its files on disk, in bytes.
     pub bytes: u64,
+    /// For a staged copy of a fork whose identity the node can't confirm (ADR-0046, point
+    /// 4.6), the identity and the attempt that name it; `None` for a database's copy.
+    pub staged: Option<StagedOrphan>,
+}
+
+/// What names a staged orphan besides its database: the fork's incarnation, its operation, and
+/// the attempt that fetched the copy (ADR-0046, point 4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StagedOrphan {
+    /// The fork's incarnation.
+    pub incarnation: fleetring_control::Incarnation,
+    /// The fork's operation.
+    pub operation: fleetring_control::fork::OperationId,
+    /// The attempt.
+    pub attempt: u32,
+}
+
+impl StagedOrphan {
+    /// The staged orphan of `incarnation`, `operation`, and `attempt`.
+    #[must_use]
+    pub fn new(
+        incarnation: fleetring_control::Incarnation,
+        operation: fleetring_control::fork::OperationId,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            incarnation,
+            operation,
+            attempt,
+        }
+    }
 }
 
 /// A database one node serves, as primary or follower.
@@ -1255,6 +1287,7 @@ impl Client {
             .database(address)?
             .remove_orphan(RemoveOrphanRequest {
                 database: name.to_string(),
+                staged: None,
             })
             .await
             .map_err(|status| {
@@ -1266,6 +1299,42 @@ impl Client {
             })?
             .into_inner();
         Ok(LeaseEpoch::new(response.epoch))
+    }
+
+    /// Deletes the staged orphan of the fork `name` that `staged` names, which the data node at
+    /// `address` (`host:port`) keeps because it can't confirm its identity (ADR-0046, point
+    /// 4.6). It needs the `fleet` scope.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` if the node holds no staged orphan of that name, identity, and attempt;
+    /// `UNIMPLEMENTED` if the node runs a release that keeps no orphans; and `UNAVAILABLE` if it
+    /// can't be reached. A node that predates forks ignores the identity and answers as for a
+    /// database's orphan copy.
+    pub async fn remove_staged_orphan(
+        &self,
+        address: &str,
+        name: &DatabaseName,
+        staged: StagedOrphan,
+    ) -> Result<(), Status> {
+        self.database(address)?
+            .remove_orphan(RemoveOrphanRequest {
+                database: name.to_string(),
+                staged: Some(fleetring_proto::v1::StagedOrphan {
+                    fork_incarnation: staged.incarnation.get(),
+                    operation: staged.operation.to_bytes().to_vec(),
+                    attempt: staged.attempt,
+                }),
+            })
+            .await
+            .map_err(|status| {
+                if unknown_call(&status) {
+                    Status::unimplemented(WITHOUT_ORPHANS)
+                } else {
+                    status
+                }
+            })?;
+        Ok(())
     }
 
     /// Follows the leases the data node at `address` (`host:port`) holds: the first update holds

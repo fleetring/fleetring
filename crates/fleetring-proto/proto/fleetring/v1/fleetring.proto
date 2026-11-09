@@ -321,6 +321,9 @@ message HeartbeatResponse {
   // Every revoked token and signing key the control plane lists, in order. Empty from a control
   // node that predates the field.
   repeated Revocation revocations = 3;
+  // The forks that aren't ready yet whose replica set names the node: it seeds them, or opens
+  // them once seeded (ADR-0046, points 4 and 6). Empty from a control node that predates forks.
+  repeated string forks = 4;
 }
 
 // A token or signing key on the denylist, and when the entry may be forgotten.
@@ -574,6 +577,9 @@ message ForkStatus {
   optional uint64 ready_at_ms = 21;
   optional uint64 failed_at_ms = 22;
   // Once ready: the epoch of the primary that committed the fork-reset write, and its position.
+  // While seeded, the fork-reset write the fork's current primary reports committed at its
+  // bootstrap quorum, if it does: the position a follower's log must reach before the follower
+  // reports the reset too (ADR-0046, point 6.2). Unset from a control node that predates it.
   optional uint64 reset_epoch = 23;
   optional bytes reset_position = 24;
   // While seeding, why the previous attempt ended; unspecified for the first.
@@ -821,8 +827,11 @@ service Replication {
   // Scope: node.
   // Binding: candidate.
   rpc Fence(FenceRequest) returns (FenceResponse);
+  // A request that names a fork seeds it (ADR-0046, point 4), under the `seeding` binding: the
+  // caller is the attempt's seeder, asking the source's primary, or a replica of the fork,
+  // asking the seeder for its staged copy.
   // Scope: node.
-  // Binding: follower.
+  // Binding: follower or seeding.
   rpc Snapshot(SnapshotRequest) returns (stream SnapshotChunk);
   // A candidate fetches the frames it lacks from the most advanced fenced member.
   // Scope: node.
@@ -1329,6 +1338,10 @@ message ColumnNames {
 
 message RemoveOrphanRequest {
   string database = 1;
+  // Set to remove a staged orphan (ADR-0046, point 4.6), which all four of `database` and these
+  // fields name; unset for a database's orphan copy. A node that predates forks ignores it and
+  // answers as for a copy.
+  StagedOrphan staged = 2;
 }
 
 message RemoveOrphanResponse {
@@ -1340,10 +1353,20 @@ message RemoveOrphanResponse {
 // only at a lower epoch, and the node saw no drop (ADR-0042).
 message OrphanStatus {
   string database = 1;
-  // The highest epoch the copy has recorded.
+  // The highest epoch the copy has recorded; 0 for a staged copy.
   uint64 epoch = 2;
   // The size of the copy's files on disk.
   uint64 bytes = 3;
+  // Set for a staged copy of a fork whose identity this node can't confirm (ADR-0046, point
+  // 4.6): the fork's identity and the attempt that fetched it, which `RemoveOrphan` names.
+  StagedOrphan staged = 4;
+}
+
+// A staged copy kept as an orphan: the fork identity it was fetched for, and the attempt.
+message StagedOrphan {
+  fixed64 fork_incarnation = 1;
+  bytes operation = 2;
+  uint32 attempt = 3;
 }
 
 // What kind of object a schema entry is (ADR-0041 point 6).

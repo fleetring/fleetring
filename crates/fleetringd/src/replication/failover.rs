@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor};
-use fleetring_control::{DatabaseName, LeaseEpoch, Quorums};
+use fleetring_control::fork::OperationId;
+use fleetring_control::{DatabaseName, Incarnation, LeaseEpoch, Quorums};
 use fleetring_proto::v1::{
     self as proto, FenceRequest, FenceResponse, FetchRequest, FetchResponse, PromoteRequest,
 };
@@ -59,6 +60,10 @@ pub(crate) struct DropNotice {
     /// How many notices of a drop of the name have arrived since this node started, so that a
     /// watcher tells a new one from one it acted on.
     pub(crate) count: u64,
+    /// The dropped database's incarnation, from a control node that sends it.
+    pub(crate) incarnation: Option<Incarnation>,
+    /// The dropped fork's operation, if the database was a fork (ADR-0046, point 4.6).
+    pub(crate) operation: Option<OperationId>,
 }
 
 /// A copy this node keeps as an orphan (ADR-0042), as [`Replication::orphans`] reports it.
@@ -274,12 +279,23 @@ pub(super) fn promote_rpc(inner: &Inner, request: PromoteRequest) -> Result<(), 
 
 /// The `DropCopy` RPC, once its binding has confirmed the drop with control state: queues the
 /// drop for the node's lease keeper, which deletes the copy (ADR-0042).
-pub(super) fn drop_rpc(inner: &Inner, database: DatabaseName, epoch: LeaseEpoch) {
+pub(super) fn drop_rpc(
+    inner: &Inner,
+    database: DatabaseName,
+    epoch: LeaseEpoch,
+    incarnation: Option<Incarnation>,
+    operation: Option<OperationId>,
+) {
     inner.drops.send_modify(|drops| {
-        let notice = drops
-            .entry(database)
-            .or_insert(DropNotice { epoch, count: 0 });
+        let notice = drops.entry(database).or_insert(DropNotice {
+            epoch,
+            count: 0,
+            incarnation,
+            operation,
+        });
         notice.epoch = epoch;
+        notice.incarnation = incarnation;
+        notice.operation = operation;
         notice.count += 1;
     });
 }
@@ -896,7 +912,7 @@ impl Replication {
 }
 
 /// The total size of the files under `path`, or 0 for what can't be read.
-fn size_on_disk(path: &std::path::Path) -> u64 {
+pub(super) fn size_on_disk(path: &std::path::Path) -> u64 {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return 0;
     };

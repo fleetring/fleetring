@@ -70,6 +70,12 @@ struct State {
     followers: BTreeMap<NodeId, Progress>,
     /// How far each change stream's sink has got (FR-039).
     sinks: BTreeMap<String, SinkProgress>,
+    /// Payload bytes published since this primary started serving, which a fork's pin measures
+    /// the WAL's growth by.
+    published_bytes: u64,
+    /// Checkpoints wait until then, while a fork's seeder waits for the acknowledged position to
+    /// enter the log (ADR-0046, point 4.2).
+    checkpoint_hold: Option<Timestamp>,
 }
 
 /// A published batch, with the chain hash at its end if the chain covered it.
@@ -165,6 +171,27 @@ impl Primary {
     /// How many batches have been published since this primary started serving.
     pub(super) fn published(&self) -> u64 {
         self.lock().published
+    }
+
+    /// How many payload bytes have been published since this primary started serving.
+    pub(super) fn published_bytes(&self) -> u64 {
+        self.lock().published_bytes
+    }
+
+    /// Holds checkpoints until `until`, as a fork's seeding request does while the position its
+    /// source's write quorum acknowledged is behind the log's start (ADR-0046, point 4.2), unless
+    /// a hold is in force at `now` already: a seeder asking again doesn't extend it, so one hold
+    /// lasts at most as long as the first request asked.
+    pub(super) fn hold_checkpoints(&self, now: Timestamp, until: Timestamp) {
+        let mut state = self.lock();
+        if state.checkpoint_hold.is_none_or(|held| held <= now) {
+            state.checkpoint_hold = Some(until);
+        }
+    }
+
+    /// Lets checkpoints run again, once the seeding request that held them has its pin.
+    pub(super) fn release_checkpoints(&self) {
+        self.lock().checkpoint_hold = None;
     }
 
     /// The chain hash at `position`, if the chain is built and holds it.
@@ -421,7 +448,7 @@ impl Primary {
     }
 
     /// How many of `followers` have acknowledged `end` or later.
-    fn acknowledged_by(&self, followers: &[NodeId], end: &Position) -> usize {
+    pub(super) fn acknowledged_by(&self, followers: &[NodeId], end: &Position) -> usize {
         let state = self.lock();
         followers
             .iter()
@@ -566,6 +593,9 @@ impl Primary {
         if state.checkpoints % 2 == 1 || state.log_bytes < threshold {
             return None;
         }
+        if state.checkpoint_hold.is_some_and(|until| now < until) {
+            return None;
+        }
         let limit = u64::try_from(lag_limit.as_millis()).unwrap_or(u64::MAX);
         // A sink that is behind holds the checkpoint back, until it has been for `lag_limit`.
         let committed = state.committed.clone();
@@ -688,9 +718,9 @@ impl State {
 
     fn append(&mut self, shipped: Shipped, retained_bytes: usize) {
         let batch = &shipped.batch;
-        self.log_bytes = self
-            .log_bytes
-            .saturating_add(u64::try_from(batch.payload.len()).unwrap_or(u64::MAX));
+        let bytes = u64::try_from(batch.payload.len()).unwrap_or(u64::MAX);
+        self.log_bytes = self.log_bytes.saturating_add(bytes);
+        self.published_bytes = self.published_bytes.saturating_add(bytes);
         self.recent_bytes += batch.payload.len();
         if self.recent.is_empty() {
             // Batches are published in commit order, each continuing the one before.

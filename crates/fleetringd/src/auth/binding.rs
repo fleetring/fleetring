@@ -42,6 +42,14 @@ pub enum Binding {
     /// The request's epoch is the receiving node's copy's own highest epoch, and control state
     /// no longer holds the database at it: that copy's database was dropped (ADR-0042).
     Dropped,
+    /// The request seeds a fork, and the receiving node's control-state view shows that fork,
+    /// with the request's whole fork identity, attempt, source, and source incarnation, seeding
+    /// from the caller: the attempt's seeder asks the source's primary, or a replica of the fork
+    /// asks the seeder for its staged copy (ADR-0046, points 4.1 and 4.4).
+    Seeding,
+    /// `Snapshot`'s binding: [`Binding::Follower`] for a request that names no fork, and
+    /// [`Binding::Seeding`] for one that does.
+    FollowerOrSeeding,
 }
 
 impl Binding {
@@ -58,6 +66,8 @@ impl Binding {
             Self::HolderOrCandidate => "holder or candidate",
             Self::Follower => "follower",
             Self::Dropped => "dropped",
+            Self::Seeding => "seeding",
+            Self::FollowerOrSeeding => "follower or seeding",
         }
     }
 }
@@ -108,6 +118,68 @@ pub enum Unbound {
         /// The epoch.
         epoch: LeaseEpoch,
     },
+    /// A seeding request doesn't match the fork as the receiving node's control-state view
+    /// shows it (ADR-0046, point 4).
+    NotSeeding {
+        /// The fork the request names.
+        fork: DatabaseName,
+        /// What doesn't match.
+        mismatch: SeedingMismatch,
+    },
+}
+
+/// What in a seeding request doesn't match the fork, its source, or the receiving node
+/// (ADR-0046, points 4.1 and 4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeedingMismatch {
+    /// No database of the fork's name exists, or it isn't a fork.
+    NoFork,
+    /// The fork's incarnation isn't the one the request names.
+    ForkIncarnation,
+    /// The fork's operation isn't the one the request names.
+    Operation,
+    /// The fork isn't seeding.
+    NotSeeding,
+    /// The fork is seeding another attempt.
+    Attempt {
+        /// The attempt the request names.
+        requested: u32,
+        /// The fork's current attempt.
+        current: u32,
+    },
+    /// The request names a source other than the fork's.
+    Source,
+    /// The source's incarnation isn't the one the request, or the fork, names.
+    SourceIncarnation,
+    /// The receiving node doesn't hold the source's lease.
+    NotSourcePrimary,
+    /// The caller isn't the attempt's seeder.
+    NotSeeder,
+    /// The receiving node isn't the attempt's seeder, so it serves no staged copy.
+    NotTheSeeder,
+    /// The caller isn't in the fork's replica set.
+    NotReplica,
+}
+
+impl fmt::Display for SeedingMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoFork => f.write_str("no fork of that name exists"),
+            Self::ForkIncarnation => f.write_str("the fork has another incarnation"),
+            Self::Operation => f.write_str("the fork was made by another operation"),
+            Self::NotSeeding => f.write_str("the fork isn't seeding"),
+            Self::Attempt { requested, current } => {
+                write!(f, "the fork seeds attempt {current}, not {requested}")
+            }
+            Self::Source => f.write_str("the request names another source than the fork's"),
+            Self::SourceIncarnation => f.write_str("the source has another incarnation"),
+            Self::NotSourcePrimary => f.write_str("this node doesn't hold the source's lease"),
+            Self::NotSeeder => f.write_str("the caller isn't the attempt's seeder"),
+            Self::NotTheSeeder => f.write_str("this node isn't the attempt's seeder"),
+            Self::NotReplica => f.write_str("the caller isn't a replica of the fork"),
+        }
+    }
 }
 
 impl Unbound {
@@ -121,6 +193,7 @@ impl Unbound {
             Self::NotCandidate { .. } => Binding::Candidate,
             Self::NotFollower { .. } => Binding::Follower,
             Self::NotDropped { .. } => Binding::Dropped,
+            Self::NotSeeding { .. } => Binding::Seeding,
         }
     }
 
@@ -134,6 +207,7 @@ impl Unbound {
             | Self::NotCandidate { database, .. }
             | Self::NotFollower { database }
             | Self::NotDropped { database, .. } => Some(database),
+            Self::NotSeeding { fork, .. } => Some(fork),
         }
     }
 
@@ -144,7 +218,10 @@ impl Unbound {
             Self::NotHolder { epoch, .. }
             | Self::NotCandidate { epoch, .. }
             | Self::NotDropped { epoch, .. } => Some(*epoch),
-            Self::OtherNode { .. } | Self::NotReplica { .. } | Self::NotFollower { .. } => None,
+            Self::OtherNode { .. }
+            | Self::NotReplica { .. }
+            | Self::NotFollower { .. }
+            | Self::NotSeeding { .. } => None,
         }
     }
 }
@@ -174,6 +251,9 @@ impl fmt::Display for Unbound {
                     f,
                     "database '{database}' isn't dropped at epoch {epoch}: control state holds it"
                 )
+            }
+            Self::NotSeeding { fork, mismatch } => {
+                write!(f, "not seeding fork '{fork}': {mismatch}")
             }
         }
     }
@@ -308,6 +388,18 @@ mod tests {
                  control state holds it",
                 "dropped",
             ),
+            (
+                Unbound::NotSeeding {
+                    fork: db.clone(),
+                    mismatch: SeedingMismatch::Attempt {
+                        requested: 1,
+                        current: 2,
+                    },
+                },
+                "Fence refused for node 'a': not seeding fork 'tenant:acme': the fork seeds \
+                 attempt 2, not 1",
+                "seeding",
+            ),
         ];
         for (reason, message, binding) in cases {
             let denied = BindingDenied::new("Fence", node("a"), reason);
@@ -348,6 +440,8 @@ mod tests {
             Binding::HolderOrCandidate,
             Binding::Follower,
             Binding::Dropped,
+            Binding::Seeding,
+            Binding::FollowerOrSeeding,
         ]
         .iter()
         .map(ToString::to_string)
@@ -362,7 +456,9 @@ mod tests {
                 "candidate",
                 "holder or candidate",
                 "follower",
-                "dropped"
+                "dropped",
+                "seeding",
+                "follower or seeding"
             ]
         );
     }
