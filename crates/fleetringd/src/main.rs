@@ -24,7 +24,7 @@ use fleetring_control::{
 use fleetring_control::{KeyId, Millis, ParseReleaseError, Release, Timestamp, TokenId};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
-use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, Grant, MAX_TOKEN_LIFETIME, Scope};
+use fleetringd::auth::{BearerToken, DEFAULT_TOKEN_LIFETIME, MAX_TOKEN_LIFETIME, Scope, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{
     ArchiveDescription, Client, DatabaseSpec, Expiry, LabelRequirement, LeaseUpdate, LeaseUpdates,
@@ -3009,14 +3009,14 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             let id = agent::new_token_id()?;
             let not_before = SystemClock.now();
             let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-            let grant = Grant {
+            let spec = TokenSpec {
                 principal: principal.clone(),
                 scopes: scopes.into_iter().collect(),
                 id: id.clone(),
                 not_before,
                 expires_at: not_before.saturating_add(Millis::new(ttl_millis)),
             };
-            let token = signer.issue(&grant)?;
+            let token = signer.issue(&spec)?;
             note(format!(
                 "issued token {id} for {principal}, signed by key {}, for {}s",
                 signer.key_id(),

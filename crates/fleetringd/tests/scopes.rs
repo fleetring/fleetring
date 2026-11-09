@@ -14,7 +14,7 @@ use fleetring::ReplicationFactor;
 use fleetring_control::{Acks, DatabaseName, Millis};
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{CreateRequest, Revocation, RevokeTokenRequest, TransferLeaseRequest};
-use fleetringd::auth::{BearerToken, Grant, TokenSigner};
+use fleetringd::auth::{BearerToken, TokenSigner, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::{Client, DatabaseSpec, LeaseUpdate};
 use fleetringd::engine::{Internal, RowCount, SchemaRequest, Statement, Value};
@@ -90,7 +90,7 @@ fn token(
 ) -> Result<BearerToken, Box<dyn Error>> {
     let now = SystemClock.now();
     let lifetime = Millis::new(u64::try_from(lifetime.as_millis())?);
-    Ok(signer.issue(&Grant {
+    Ok(signer.issue(&TokenSpec {
         principal: principal.parse()?,
         scopes: scopes
             .iter()

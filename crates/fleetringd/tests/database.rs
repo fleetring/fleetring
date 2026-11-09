@@ -4161,7 +4161,7 @@ mod orphans {
 
     use fleetring::ReplicationFactor;
     use fleetring_proto::v1::DropCopyRequest;
-    use fleetringd::auth::Grant;
+    use fleetringd::auth::TokenSpec;
     use fleetringd::clock::{Clock as _, SystemClock};
     use fleetringd::data::Client;
     use fleetringd::engine::Statement;
@@ -4449,7 +4449,7 @@ mod orphans {
         // Admin on every database isn't enough: removing an orphan is a fleet operation.
         let signer = fleet.tls.authority().token_signer()?;
         let now = SystemClock.now();
-        let token = signer.issue(&Grant {
+        let token = signer.issue(&TokenSpec {
             principal: "tester".parse()?,
             scopes: ["admin:*".parse()?].into_iter().collect(),
             id: "no-fleet".parse()?,

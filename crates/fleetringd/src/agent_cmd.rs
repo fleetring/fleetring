@@ -33,7 +33,7 @@ use fleetringd::upgrade::{Running, running};
 
 use crate::agent::{
     self, AUTHORITY_CERT_LIFETIME, Acquired, AgentDir, AgentError, AgentId, AgentRecord,
-    DEV_CERT_LIFETIME, IssuedBy, Issuer, MintGrant, OldToken, RENEW_TOKEN_WITHIN, Renewal, Renewed,
+    DEV_CERT_LIFETIME, IssuedBy, Issuer, MintSpec, OldToken, RENEW_TOKEN_WITHIN, Renewal, Renewed,
     ScopeRenewal, ScopesFrom,
 };
 use crate::confirm::{self, Place};
@@ -386,8 +386,8 @@ pub(crate) async fn prepare_agent(
     acquire_node(dev_dir, MachineOutput::Yes).await?;
     // Immediately before the mint, whatever found or started the node.
     let checked = dev::check_dev_dir(dev_dir)?;
-    let grant = dev_grant(dir.id(), Vec::new(), access, None);
-    let acquired = dir.acquire(Issuer::Dev(&checked), &grant, SystemClock.now())?;
+    let spec = dev_spec(dir.id(), Vec::new(), access, None);
+    let acquired = dir.acquire(Issuer::Dev(&checked), &spec, SystemClock.now())?;
     match &acquired {
         Acquired::Minted(_) => note(format!(
             "minted agent {}'s identity in {}",
@@ -516,7 +516,7 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
                 .unwrap_or_else(|| "authority".to_owned());
             let cert_ttl = args.ttl.unwrap_or(AUTHORITY_CERT_LIFETIME);
             let (scopes, scopes_from) = scopes_or_default(&args.id, args.scopes, access);
-            let grant = MintGrant {
+            let spec = MintSpec {
                 scopes,
                 scopes_from,
                 access,
@@ -524,13 +524,13 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
                 token_ttl: cert_ttl.min(MAX_TOKEN_LIFETIME),
                 owner,
             };
-            dir.mint(Issuer::Authority(&authority), &grant, now)?
+            dir.mint(Issuer::Authority(&authority), &spec, now)?
         }
         (None, Some(dev_dir)) => {
             acquire_node(dev_dir, MachineOutput::No).await?;
             let checked = dev::check_dev_dir(dev_dir)?;
-            let grant = dev_grant(&args.id, args.scopes, access, args.ttl);
-            dir.mint(Issuer::Dev(&checked), &grant, now)?
+            let spec = dev_spec(&args.id, args.scopes, access, args.ttl);
+            dir.mint(Issuer::Dev(&checked), &spec, now)?
         }
         (None, None) => {
             return Err(format!(
@@ -572,10 +572,10 @@ fn scopes_or_default(id: &AgentId, scopes: Vec<Scope>, access: Access) -> (Vec<S
 
 /// What a dev mode identity gets: a certificate for a year, or `ttl`, and a token for 30 days,
 /// or `ttl` if that is shorter, signed by dev mode's admin.
-fn dev_grant(id: &AgentId, scopes: Vec<Scope>, access: Access, ttl: Option<Duration>) -> MintGrant {
+fn dev_spec(id: &AgentId, scopes: Vec<Scope>, access: Access, ttl: Option<Duration>) -> MintSpec {
     let cert_ttl = ttl.unwrap_or(DEV_CERT_LIFETIME);
     let (scopes, scopes_from) = scopes_or_default(id, scopes, access);
-    MintGrant {
+    MintSpec {
         scopes,
         scopes_from,
         access,
@@ -721,7 +721,7 @@ async fn renew(
         (Some(authority_dir), _) => {
             let authority = agent::load_authority(authority_dir)?;
             // A renewal takes the scopes and the access from the record.
-            let grant = MintGrant {
+            let spec = MintSpec {
                 scopes: Vec::new(),
                 scopes_from: ScopesFrom::Defaults,
                 access: Access::ReadWrite,
@@ -729,13 +729,13 @@ async fn renew(
                 token_ttl: MAX_TOKEN_LIFETIME,
                 owner: String::new(),
             };
-            let renewed = dir.renew(Issuer::Authority(&authority), &grant, now)?;
+            let renewed = dir.renew(Issuer::Authority(&authority), &spec, now)?;
             (renewed, target.client().ok())
         }
         (None, Some(dev_dir)) => {
             let checked = dev::check_dev_dir(dev_dir)?;
-            let grant = dev_grant(dir.id(), Vec::new(), Access::ReadWrite, None);
-            let renewed = dir.renew(Issuer::Dev(&checked), &grant, now)?;
+            let spec = dev_spec(dir.id(), Vec::new(), Access::ReadWrite, None);
+            let renewed = dir.renew(Issuer::Dev(&checked), &spec, now)?;
             (renewed, dev_admin(&checked).ok())
         }
         (None, None) => {
