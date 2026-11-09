@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-orphan\-remove \- Deletes a data node\*(Aqs orphan copy of a database, for good
 .SH SYNOPSIS
-\fBfleetring orphan remove\fR [\fB\-\-node\fR] [\fB\-\-address\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBfleetring orphan remove\fR [\fB\-\-node\fR] [\fB\-\-address\fR] [\fB\-\-yes\fR] [\fB\-\-incarnation\fR] [\fB\-\-operation\-id\fR] [\fB\-\-attempt\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Deletes a data node\*(Aqs orphan copy of a database, for good
 .PP
@@ -25,6 +25,17 @@ Nothing else is needed.
 Deletes without asking
 
 Without it, the command asks first on a terminal, and refuses elsewhere.
+.TP
+\fB\-\-incarnation\fR \fI<INCARNATION>\fR
+The fork incarnation of a staged copy, 16 hex digits, as `orphan list` prints it
+
+A fork\*(Aqs staged copy is named by the database, this incarnation, `\-\-operation\-id` and `\-\-attempt`, all four.
+.TP
+\fB\-\-operation\-id\fR \fI<OPERATION_ID>\fR
+The fork operation ID of a staged copy, as `orphan list` prints it
+.TP
+\fB\-\-attempt\fR \fI<ATTEMPT>\fR
+The attempt that fetched a staged copy, as `orphan list` prints it
 .TP
 \fB\-\-control\fR \fI<CONTROL>\fR
 The control node\*(Aqs address, `host:port`

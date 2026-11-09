@@ -248,6 +248,15 @@ pub fn orphan_report(node: &str, orphan: &Orphan) -> OrphanReport {
         database: orphan.database.to_string(),
         epoch: orphan.epoch.get(),
         bytes: orphan.bytes,
+        kind: if orphan.staged.is_some() {
+            "staged"
+        } else {
+            "database"
+        }
+        .to_owned(),
+        incarnation: orphan.staged.map(|staged| staged.incarnation.to_string()),
+        operation_id: orphan.staged.map(|staged| staged.operation.to_string()),
+        attempt: orphan.staged.map(|staged| staged.attempt),
     }
 }
 
@@ -1386,7 +1395,16 @@ mod tests {
                 "databases": [],
                 "membership_epoch": "number",
                 "node": "string",
-                "orphans": [{ "bytes": "number", "database": "string", "epoch": "number", "node": "string" }],
+                "orphans": [{
+                    "attempt": "null",
+                    "bytes": "number",
+                    "database": "string",
+                    "epoch": "number",
+                    "incarnation": "null",
+                    "kind": "string",
+                    "node": "string",
+                    "operation_id": "null",
+                }],
                 "ring_fingerprint": "null",
                 "sinks": [{
                     "acknowledged": "null",
@@ -1403,6 +1421,50 @@ mod tests {
         );
         assert_eq!(json["sinks"][0]["mark"], "replicated");
         assert_eq!(json["orphans"][0]["node"], "node-1");
+    }
+
+    /// A staged copy of a fork is an orphan that names its fork: `orphan list --json` carries `kind`
+    /// `staged` and the identity `orphan remove` needs, all four fields `null` or plain for a
+    /// database's copy (`docs/cli.md`, section 15).
+    #[test]
+    fn a_staged_orphan_reports_its_fork_identity_and_a_database_copy_nulls() {
+        use crate::data::StagedOrphan;
+        use fleetring_control::fork::OperationId;
+        use fleetring_control::{Incarnation, LeaseEpoch};
+
+        let database = name("notes-exp");
+        let operation = OperationId::from_bytes([7; 16]);
+        let staged = Orphan {
+            database: database.clone(),
+            epoch: LeaseEpoch::new(0),
+            bytes: 8192,
+            staged: Some(StagedOrphan::new(Incarnation::new(255), operation, 2)),
+        };
+        let ordinary = Orphan {
+            database,
+            epoch: LeaseEpoch::new(3),
+            bytes: 4096,
+            staged: None,
+        };
+        let json = serde_json::to_value(orphan_report("data-1", &staged)).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "node": "data-1",
+                "database": "notes-exp",
+                "epoch": 0,
+                "bytes": 8192,
+                "kind": "staged",
+                "incarnation": "00000000000000ff",
+                "operation_id": operation.to_string(),
+                "attempt": 2,
+            })
+        );
+        let json = serde_json::to_value(orphan_report("data-1", &ordinary)).expect("serializes");
+        assert!(json["incarnation"].is_null());
+        assert!(json["operation_id"].is_null());
+        assert!(json["attempt"].is_null());
+        assert_eq!(json["kind"], "database");
     }
 
     #[test]

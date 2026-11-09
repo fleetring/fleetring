@@ -249,6 +249,15 @@ pub struct OrphanReport {
     pub epoch: u64,
     /// Its size on disk.
     pub bytes: u64,
+    /// `database` for a database's copy, `staged` for a fork's staged copy whose identity the
+    /// node can't confirm (ADR-0046, point 4.6).
+    pub kind: String,
+    /// A staged copy's fork incarnation, as 16 hex digits; `null` for a database's copy.
+    pub incarnation: Option<String>,
+    /// A staged copy's fork operation ID; `null` for a database's copy.
+    pub operation_id: Option<String>,
+    /// The attempt that fetched a staged copy; `null` for a database's copy.
+    pub attempt: Option<u32>,
 }
 
 /// `orphan list`'s result: each data node's orphans, in node and then database order.
