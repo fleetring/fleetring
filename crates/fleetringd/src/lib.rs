@@ -49,7 +49,7 @@ pub use config::{
 };
 pub use daemon::{Daemon, StartError, Stop};
 pub use data_dir::{DataDir, DataDirError};
-pub use environment::{Environment, Network};
+pub use environment::{Environment, KeepAlive, Network};
 pub use membership::{
     DatabaseStatuses, ManualMembership, Membership, MembershipTasks, MembershipView,
 };
@@ -150,6 +150,7 @@ const _: () = {
     assert_debug_send_sync::<dev::Prepared>();
     assert_debug_send_sync::<Environment>();
     assert_debug_send_sync::<Network>();
+    assert_debug_send_sync::<KeepAlive>();
     assert_debug_send_sync::<ManualMembership>();
     assert_debug_send_sync::<Membership>();
     assert_debug_send_sync::<MembershipSettings>();

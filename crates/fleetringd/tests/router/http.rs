@@ -1,6 +1,6 @@
 //! Hrana over HTTP through the router: pipelines, transactions, batches, cursors, the version
 //! probes, authentication, batons, failover by drain, and the bounds on idle streams and open
-//! transactions.
+//! transactions, streams, and connections.
 
 use std::time::Duration;
 
@@ -8,14 +8,15 @@ use fleetringd::engine::{Statement, Value as SqlValue};
 use fleetringd::transport::Credentials;
 use http_body_util::Full;
 use hyper::body::Bytes;
-use hyper::{Method, StatusCode};
+use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client as HttpClient;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::{Value, json};
 use tonic::Code;
 
 use crate::fleet::{
-    Fleet, Options, TestResult, close, execute, integer, issue, pipeline, send, start_router, text,
+    Fleet, HANG_GUARD, Options, TestResult, close, execute, integer, issue, pipeline, send,
+    start_router, text,
 };
 use crate::support::Tls;
 
@@ -809,6 +810,84 @@ async fn a_result_too_large_leaves_the_transaction_open() -> TestResult {
         committed.text
     );
     assert_eq!(fleet.values("large").await?, [SqlValue::from("kept")]);
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_connections_are_closed() -> TestResult {
+    use tokio::io::AsyncReadExt as _;
+
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        router_tables: "\n[http]\nidle_timeout_ms = 300\n".to_owned(),
+        ..Options::default()
+    })
+    .await?;
+    let router = fleet.router();
+    // An HTTP/2 connection that sent one request and then nothing.
+    let tcp = tokio::net::TcpStream::connect(router).await?;
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp)).await?;
+    let connection = tokio::spawn(connection);
+    let probe = Request::builder()
+        .uri(format!("http://{router}/db/idle/v3"))
+        .body(Full::new(Bytes::new()))?;
+    let answered = tokio::time::timeout(HANG_GUARD, sender.send_request(probe)).await??;
+    assert_eq!(answered.status(), StatusCode::OK);
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(HANG_GUARD, connection).await???;
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "closed after {:?}, before its idle timeout",
+        started.elapsed()
+    );
+    // A connection that never sends a byte, not even a preface, is closed too.
+    let mut silent = tokio::net::TcpStream::connect(router).await?;
+    let mut byte = [0; 1];
+    let read = tokio::time::timeout(HANG_GUARD, silent.read(&mut byte)).await?;
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_address_holds_at_most_its_connections() -> TestResult {
+    use tokio::io::AsyncReadExt as _;
+
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        router_tables: "\n[http]\nmax_connections_per_ip = 2\n".to_owned(),
+        ..Options::default()
+    })
+    .await?;
+    let router = fleet.router();
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(tokio::net::TcpStream::connect(router).await?);
+    }
+    let mut refused = tokio::net::TcpStream::connect(router).await?;
+    let mut byte = [0; 1];
+    let read = tokio::time::timeout(HANG_GUARD, refused.read(&mut byte)).await?;
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    // The two it holds stay open.
+    for stream in &mut held {
+        let waited = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut byte)).await;
+        assert!(waited.is_err(), "{waited:?}");
+    }
+    // A closed one gives its place back.
+    drop(held.pop());
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let mut again = tokio::net::TcpStream::connect(router).await?;
+            let waited =
+                tokio::time::timeout(Duration::from_millis(200), again.read(&mut byte)).await;
+            if waited.is_err() {
+                return Ok::<_, std::io::Error>(());
+            }
+        }
+    })
+    .await??;
     fleet.stop().await;
     Ok(())
 }

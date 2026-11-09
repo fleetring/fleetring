@@ -1,4 +1,6 @@
 # Dependency policy (ADR-0009). Run locally with `cargo deny check`.
+# Not checked: `tests/router-conformance`, a workspace of its own that tests the router with the
+# libSQL client and never ships; its dependencies stay out of the release's graph and lock.
 
 [graph]
 all-features = true
