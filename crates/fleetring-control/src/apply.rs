@@ -7,12 +7,17 @@ use fleetring::{Epoch, NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::command::UnknownReports;
+use crate::fork::apply as forks;
+use crate::fork::{
+    CancelCause, ForkFailure, ForkIdentity, IntentField, OperationId, OperationOutcome, RetryCause,
+};
+use crate::member::ForkReports;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
     Action, Command, Database, DatabaseName, DescriptionChange, Durability, DurabilityError,
-    Engine, ExpiryChange, Feature, HostedReplica, Lease, LeaseEpoch, MAX_LABELS, Member, Metadata,
-    MetadataChange, MetadataSpec, Position, PrincipalName, Promotion, Quorums, Release, Revoked,
-    Software, State, Timestamp,
+    Engine, ExpiryChange, Feature, HostedReplica, Incarnation, Lease, LeaseEpoch, MAX_LABELS,
+    Member, Metadata, MetadataChange, MetadataSpec, Position, PrincipalName, Promotion, Quorums,
+    Release, Revoked, Software, State, Timestamp,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -38,6 +43,10 @@ pub type Outcome = Result<Applied, Rejection>;
 /// **Expiry** is judged at the command's time alone: no clock is read, so an expiry passes at
 /// the same command in every replay.
 ///
+/// **Forks** (ADR-0046): a command that drives an existing fork names its fork identity
+/// ([`Action::fork_identity`]), and is refused with [`Rejection::StaleForkIdentity`] before any
+/// other check, the feature gate included, unless that identity is the current fork's.
+///
 /// # Errors
 ///
 /// Returns a [`Rejection`] when the command breaks a rule of ADR-0017 or ADR-0018; each variant
@@ -62,6 +71,7 @@ pub type Outcome = Result<Applied, Rejection>;
 ///     engine: Engine::Sqlite,
 ///     durability: None,
 ///     metadata: None,
+///     incarnation: fleetring_control::Incarnation::LEGACY,
 /// }))?;
 /// let granted = apply(&mut state, Command::new(at, Action::AcquireLease {
 ///     database: "tenant:acme".parse()?,
@@ -73,6 +83,9 @@ pub type Outcome = Result<Applied, Rejection>;
 /// ```
 pub fn apply(state: &mut State, command: Command) -> Outcome {
     let now = command.at.max(state.now);
+    if let Some(identity) = command.action.fork_identity() {
+        crate::fork::rules::current_fork(state, identity)?;
+    }
     let features = command.action.features();
     for feature in features {
         state.check_feature(*feature)?;
@@ -85,21 +98,36 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             replicas,
             unknown_reports,
             software,
-        } => heartbeat(state, now, id, replicas, unknown_reports, software),
+            disk_free_bytes,
+        } => heartbeat(
+            state,
+            now,
+            Reported {
+                id,
+                replicas,
+                unknown_reports,
+                software,
+                disk_free_bytes,
+            },
+        ),
         Action::CreateDatabase {
             name,
             replication_factor,
             engine,
             durability,
             metadata,
+            incarnation,
         } => create_database(
             state,
             now,
-            name,
-            replication_factor,
-            engine,
-            durability,
-            metadata,
+            Creation {
+                name,
+                replication_factor,
+                engine,
+                durability,
+                metadata,
+                incarnation,
+            },
         ),
         Action::UpdateDatabase {
             name,
@@ -112,7 +140,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             database,
             durability,
         } => change_durability(state, database, durability),
-        Action::DropDatabase { name } => drop_database(state, name),
+        Action::DropDatabase { name } => drop_database(state, now, name),
         Action::AcquireLease { database, node } => acquire_lease(state, now, database, node),
         Action::RenewLease {
             database,
@@ -131,12 +159,64 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         }
         Action::Tick => {
             state.revocations.forget_through(now);
+            forks::tick(state, now);
             Ok(Applied::Ticked { at: now })
         }
         Action::Drain { id } => drain(state, id),
         Action::Undrain { id } => undrain(state, id),
         Action::TransferLease { database, target } => transfer_lease(state, now, database, target),
         Action::RevokeToken { revoked, until } => revoke_token(state, now, revoked, until),
+        Action::ForkDatabase {
+            operation,
+            intent,
+            incarnation,
+            resolved_expiry,
+            limits,
+        } => forks::fork_database(
+            state,
+            now,
+            operation,
+            intent,
+            forks::Proposed {
+                incarnation,
+                resolved_expiry,
+                limits,
+            },
+        ),
+        Action::CompleteFork {
+            fork,
+            attempt,
+            at,
+            chain_hash,
+            holders,
+        } => forks::complete_fork(state, now, &fork, attempt, at, chain_hash, holders),
+        Action::RetryForkSeed {
+            fork,
+            attempt,
+            cause,
+            exclude_seeder,
+        } => forks::retry_fork_seed(state, now, &fork, attempt, cause, exclude_seeder),
+        Action::RecordForkDiskRefusal {
+            fork,
+            attempt,
+            node,
+        } => forks::record_disk_refusal(state, now, &fork, attempt, node),
+        Action::DropForkHolder {
+            fork,
+            attempt,
+            holder,
+            cause,
+        } => forks::drop_fork_holder(state, now, &fork, attempt, holder, cause),
+        Action::FailFork {
+            fork,
+            attempt,
+            reason,
+        } => forks::fail_fork(state, now, &fork, attempt, reason),
+        Action::MarkForkReady {
+            fork,
+            epoch,
+            reset_position,
+        } => forks::mark_fork_ready(state, now, &fork, epoch, reset_position),
     }?;
     state.features.extend(features.iter().copied());
     state.now = now;
@@ -297,6 +377,87 @@ pub enum Applied {
         epoch: LeaseEpoch,
         /// The expiry that had passed.
         expires_at: Timestamp,
+    },
+
+    /// A fork was created and started seeding at attempt 1.
+    ForkCreated {
+        /// The fork.
+        database: DatabaseName,
+        /// Its incarnation.
+        incarnation: Incarnation,
+        /// The operation that made it.
+        operation: OperationId,
+        /// The first attempt's seeder.
+        seeder: NodeId,
+    },
+
+    /// A fork request repeated a known operation; nothing changed.
+    ForkResent {
+        /// The operation.
+        operation: OperationId,
+        /// The fork it made.
+        database: DatabaseName,
+        /// The fork's incarnation.
+        incarnation: Incarnation,
+        /// What has become of it.
+        outcome: OperationOutcome,
+    },
+
+    /// A fork's write quorum holds its copy: it is seeded.
+    ForkSeeded {
+        /// The fork.
+        database: DatabaseName,
+        /// The replicas that hold the copy, the only ones that may take its first lease.
+        holders: BTreeSet<NodeId>,
+    },
+
+    /// A fork's attempt ended and the next began.
+    ForkRetried {
+        /// The fork.
+        database: DatabaseName,
+        /// The new attempt.
+        attempt: u32,
+        /// Its seeder.
+        seeder: NodeId,
+        /// Why the last attempt ended.
+        cause: RetryCause,
+    },
+
+    /// A replica of a seeding fork refused the copy for want of disk; the attempt goes on
+    /// without it.
+    ForkDiskRefusalRecorded {
+        /// The fork.
+        database: DatabaseName,
+        /// The replica.
+        node: NodeId,
+    },
+
+    /// A holder left a seeded fork's holders, and enough remain.
+    ForkHolderDropped {
+        /// The fork.
+        database: DatabaseName,
+        /// The holder.
+        holder: NodeId,
+        /// Why.
+        cause: RetryCause,
+    },
+
+    /// A fork failed for good.
+    ForkFailed {
+        /// The fork.
+        database: DatabaseName,
+        /// Why.
+        reason: ForkFailure,
+    },
+
+    /// A fork's reset is committed: it is ready.
+    ForkReady {
+        /// The fork.
+        database: DatabaseName,
+        /// The epoch of the primary that committed the reset.
+        epoch: LeaseEpoch,
+        /// The reset write's position.
+        reset_position: Position,
     },
 }
 
@@ -611,6 +772,192 @@ pub enum Rejection {
         /// The database's expiry, if it has one.
         expires_at: Option<Timestamp>,
     },
+
+    /// A command meant for a fork names a fork identity that isn't the current one: the fork
+    /// was dropped, or its name now belongs to another database (ADR-0046, point 3). Checked
+    /// before anything else; the command changes nothing.
+    #[error("fork {fork} is not the current database of that name")]
+    StaleForkIdentity {
+        /// The identity the command named.
+        fork: ForkIdentity,
+    },
+
+    /// A fork request reused a known operation ID, from its requester, asking for something
+    /// else (ADR-0046, point 5.2).
+    #[error("operation {operation} was requested with a different {field}")]
+    OperationConflict {
+        /// The operation.
+        operation: OperationId,
+        /// The first field of the intent that differs.
+        field: IntentField,
+    },
+
+    /// A fork request reused an operation ID another principal requested. Nothing about the
+    /// operation is revealed (ADR-0046, point 5.2).
+    #[error("operation {operation} isn't yours")]
+    OperationNotYours {
+        /// The operation.
+        operation: OperationId,
+    },
+
+    /// Control state holds as many fork operations as it may; a new one waits until records
+    /// past their retention are forgotten (ADR-0046, point 5.3).
+    #[error("too many fork operations: at most {max} are kept; retry later")]
+    TooManyOperations {
+        /// The most kept.
+        max: usize,
+    },
+
+    /// A fork's source is itself a fork that isn't ready yet.
+    #[error("source '{source_database}' is not ready")]
+    SourceNotReady {
+        /// The source.
+        source_database: DatabaseName,
+    },
+
+    /// A fork's source isn't the incarnation the command expects: it was dropped, or dropped
+    /// and recreated.
+    #[error(
+        "source '{source_database}' is not at incarnation {expected}{}",
+        match current {
+            Some(current) => format!("; it is at {current}"),
+            None => "; it was dropped".to_owned(),
+        }
+    )]
+    SourceIncarnationMismatch {
+        /// The source.
+        source_database: DatabaseName,
+        /// The incarnation the command expects.
+        expected: Incarnation,
+        /// The source's incarnation, or `None` if it no longer exists.
+        current: Option<Incarnation>,
+    },
+
+    /// Fewer replicas of a new fork than its write quorum have room for the copy, as far as
+    /// their heartbeats say (ADR-0046, point 7.3).
+    #[error("fork '{database}' needs room for its copy on {need} replicas; {admitting} have it")]
+    InsufficientDisk {
+        /// The fork.
+        database: DatabaseName,
+        /// How many replicas have room.
+        admitting: usize,
+        /// The fork's write quorum.
+        need: u8,
+    },
+
+    /// The fork isn't seeding at the attempt the command names: it moved on to another
+    /// attempt, completed, or failed.
+    #[error("fork '{database}' is not seeding at attempt {attempt}")]
+    ForkNotSeeding {
+        /// The fork.
+        database: DatabaseName,
+        /// The attempt the command named.
+        attempt: u32,
+    },
+
+    /// The fork isn't seeded: it is still seeding, or already ready, or failed.
+    #[error("fork '{database}' is not seeded")]
+    ForkNotSeeded {
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// A fork's completion names fewer holders than the fork's write quorum.
+    #[error("a fork needs {need} replicas holding its staged copy; {have} were named")]
+    NotEnoughHolders {
+        /// How many holders the command named.
+        have: usize,
+        /// The fork's write quorum.
+        need: u8,
+    },
+
+    /// A holder's latest report isn't the staged copy the completion claims.
+    #[error("node '{id}' has not reported the claimed staged copy of fork '{database}'")]
+    HolderReportMismatch {
+        /// The holder.
+        id: NodeId,
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// A fork that isn't seeded takes no lease (ADR-0046, point 3.7).
+    #[error("fork '{database}' is not seeded and takes no lease")]
+    LeaseOnUnseededFork {
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// A seeded fork's first lease goes only to a replica that holds the staged copy.
+    #[error(
+        "node '{id}' holds no staged copy of fork '{database}', so it can't take its first lease"
+    )]
+    FirstLeaseNotHolder {
+        /// The node.
+        id: NodeId,
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// Fewer members of the fork's replica set than its bootstrap quorum reported the reset
+    /// committed at the epoch and position the command names.
+    #[error("too few replicas reported the reset of fork '{database}' committed")]
+    ResetNotReported {
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// A creation's incarnation is the legacy 0, which a creation may carry only before forks
+    /// are enabled, or a database or a fork operation records it already. The control node
+    /// draws another and asks again.
+    #[error("incarnation {incarnation} is unavailable")]
+    IncarnationUnavailable {
+        /// The incarnation.
+        incarnation: Incarnation,
+    },
+
+    /// A seeded fork's first lease goes only to a holder whose latest report still shows the
+    /// staged copy the fork completed with, at log epoch 0 (ADR-0046, point 3.9).
+    #[error("node '{id}' no longer reports the staged copy of fork '{database}'")]
+    StagedCopyNotReported {
+        /// The holder.
+        id: NodeId,
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// The source's engine can't fork (ADR-0046, point 9).
+    #[error("databases on {engine} can't be forked yet")]
+    EngineCannotFork {
+        /// The engine.
+        engine: Engine,
+    },
+
+    /// A completion names a holder that refused the copy for want of disk.
+    #[error("node '{id}' refused the copy of fork '{database}' for want of disk")]
+    DiskRefusedHolder {
+        /// The holder.
+        id: NodeId,
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// A holder may leave a seeded fork's holders only if it is no longer a member, or, before
+    /// the first lease, if its latest report says its copy is lost.
+    #[error("node '{id}' is a member holding its copy of fork '{database}'")]
+    HolderNotDroppable {
+        /// The holder.
+        id: NodeId,
+        /// The fork.
+        database: DatabaseName,
+    },
+
+    /// A fork's durability can't change until it is ready: its completion counted holders
+    /// under the settings it was made with.
+    #[error("fork '{database}' is not ready; its durability can't change yet")]
+    ForkNotReady {
+        /// The fork.
+        database: DatabaseName,
+    },
 }
 
 fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
@@ -649,6 +996,7 @@ fn join(state: &mut State, now: Timestamp, member: Member) -> Outcome {
             last_heartbeat: now,
             reports: BTreeMap::new(),
             draining: false,
+            disk_free_bytes: None,
         },
     );
     Ok(Applied::MemberJoined {
@@ -720,14 +1068,23 @@ fn leave(state: &mut State, id: NodeId) -> Outcome {
     })
 }
 
-fn heartbeat(
-    state: &mut State,
-    now: Timestamp,
+/// What a heartbeat reports.
+struct Reported {
     id: NodeId,
     replicas: Vec<HostedReplica>,
     unknown_reports: UnknownReports,
     software: Option<Software>,
-) -> Outcome {
+    disk_free_bytes: Option<u64>,
+}
+
+fn heartbeat(state: &mut State, now: Timestamp, reported: Reported) -> Outcome {
+    let Reported {
+        id,
+        replicas,
+        unknown_reports,
+        software,
+        disk_free_bytes,
+    } = reported;
     let Some(entry) = state.members.get(&id) else {
         return Err(Rejection::UnknownMember { id });
     };
@@ -754,10 +1111,17 @@ fn heartbeat(
             }
         }
     }
+    // What replicas say about forks is recorded only once forks are enabled, so that control
+    // state stays byte for byte as it was until then (ADR-0046, point 8).
+    let (forks, disk_free_bytes) = if state.is_enabled(Feature::Fork) {
+        (ForkReports::Record, disk_free_bytes)
+    } else {
+        (ForkReports::Drop, None)
+    };
     let reports = replicas
         .into_iter()
         .filter(|replica| !unknown.contains(replica.database()))
-        .map(|replica| replica.into_report(now))
+        .map(|replica| replica.into_report(now, forks))
         .collect();
 
     let Some(entry) = state.members.get_mut(&id) else {
@@ -765,21 +1129,32 @@ fn heartbeat(
     };
     entry.last_heartbeat = now;
     entry.reports = reports;
+    entry.disk_free_bytes = disk_free_bytes;
     if let Some(software) = software {
         entry.member = entry.member.clone().with_software(software);
     }
     Ok(Applied::HeartbeatRecorded { id, unknown })
 }
 
-fn create_database(
-    state: &mut State,
-    now: Timestamp,
+/// What a `CreateDatabase` asks for.
+struct Creation {
     name: DatabaseName,
     replication_factor: ReplicationFactor,
     engine: Engine,
     durability: Option<Durability>,
     metadata: Option<MetadataSpec>,
-) -> Outcome {
+    incarnation: Incarnation,
+}
+
+fn create_database(state: &mut State, now: Timestamp, creation: Creation) -> Outcome {
+    let Creation {
+        name,
+        replication_factor,
+        engine,
+        durability,
+        metadata,
+        incarnation,
+    } = creation;
     if state.databases.contains_key(&name) {
         return Err(Rejection::DatabaseExists { database: name });
     }
@@ -793,6 +1168,14 @@ fn create_database(
     if let Some(expires_at) = metadata.as_ref().and_then(|spec| spec.expires_at) {
         check_expiry(&name, now, expires_at)?;
     }
+    // Incarnations start with the `fork` feature, so that a fleet that can still roll back
+    // stores nothing new (ADR-0046, point 1.2): until then one in the command is ignored.
+    let incarnation = if state.is_enabled(Feature::Fork) {
+        forks::check_incarnation(state, incarnation)?;
+        incarnation
+    } else {
+        Incarnation::LEGACY
+    };
     let metadata = metadata.map(|spec| Metadata::created(spec, now));
     state.databases.insert(
         name.clone(),
@@ -802,13 +1185,14 @@ fn create_database(
             engine,
             durability,
             metadata,
-        ),
+        )
+        .with_incarnation(incarnation),
     );
     Ok(Applied::DatabaseCreated { database: name })
 }
 
 /// Rejects an expiry at or before `now`, which would expire the database at once.
-fn check_expiry(
+pub(crate) fn check_expiry(
     database: &DatabaseName,
     now: Timestamp,
     expires_at: Timestamp,
@@ -891,7 +1275,7 @@ fn expire_database(state: &mut State, now: Timestamp, name: DatabaseName) -> Out
             expires_at,
         });
     };
-    let Some(database) = remove_database(state, &name) else {
+    let Some(database) = remove_database(state, now, &name, CancelCause::Expired) else {
         return Err(Rejection::UnknownDatabase { database: name });
     };
     Ok(Applied::DatabaseExpired {
@@ -903,6 +1287,9 @@ fn expire_database(state: &mut State, now: Timestamp, name: DatabaseName) -> Out
 
 fn change_durability(state: &mut State, database: DatabaseName, durability: Durability) -> Outcome {
     let db = state.database_or_reject(&database)?;
+    if !db.is_ready() {
+        return Err(Rejection::ForkNotReady { database });
+    }
     durability
         .check(db.replication_factor())
         .map_err(|source| Rejection::InvalidDurability {
@@ -919,8 +1306,8 @@ fn change_durability(state: &mut State, database: DatabaseName, durability: Dura
     })
 }
 
-fn drop_database(state: &mut State, name: DatabaseName) -> Outcome {
-    let Some(database) = remove_database(state, &name) else {
+fn drop_database(state: &mut State, now: Timestamp, name: DatabaseName) -> Outcome {
+    let Some(database) = remove_database(state, now, &name, CancelCause::Dropped) else {
         return Err(Rejection::UnknownDatabase { database: name });
     };
     Ok(Applied::DatabaseDropped {
@@ -932,12 +1319,19 @@ fn drop_database(state: &mut State, name: DatabaseName) -> Outcome {
 /// Removes the database, with its lease and any promotion, and every member's report of it, so
 /// that no stale report outlives it; returns it, or `None` if there is no such database. Reports
 /// are replaced wholesale by each heartbeat anyway; dropping them here keeps a snapshot taken
-/// right after the drop identical to one taken after the next heartbeats.
-fn remove_database(state: &mut State, name: &DatabaseName) -> Option<Database> {
+/// right after the drop identical to one taken after the next heartbeats. A fork dropped before
+/// it was ready has its operation cancelled for `cause` (ADR-0046, point 3.6).
+fn remove_database(
+    state: &mut State,
+    now: Timestamp,
+    name: &DatabaseName,
+    cause: CancelCause,
+) -> Option<Database> {
     let database = state.databases.remove(name)?;
     for entry in state.members.values_mut() {
         entry.reports.remove(name);
     }
+    forks::dropped(state, &database, now, cause);
     Some(database)
 }
 
@@ -948,6 +1342,9 @@ fn acquire_lease(
     node: NodeId,
 ) -> Outcome {
     let db = state.database_or_reject(&database)?;
+    if db.fork().is_some_and(|fork| !fork.is_seeded()) {
+        return Err(Rejection::LeaseOnUnseededFork { database });
+    }
     if db.lease().is_some() {
         return Err(Rejection::LeaseAlreadyIssued { database });
     }
@@ -967,6 +1364,7 @@ fn acquire_lease(
     if !state.replica_set(&database)?.contains(&node) {
         return Err(Rejection::NotInReplicaSet { id: node, database });
     }
+    forks::check_lease(state, db, &node)?;
     let lease = Lease::new(
         node,
         epoch,
@@ -1119,18 +1517,21 @@ fn best_candidate(
     excluded: Option<&NodeId>,
 ) -> Result<(NodeId, Position), Rejection> {
     let mut best: Option<(&NodeId, LeaseEpoch, &Position)> = None;
+    let db = state.database_or_reject(database)?;
     let replicas = state.replica_set(database)?;
     for id in &replicas {
         if Some(id) == excluded || !state.is_live(id, now) || state.is_draining(id) {
             continue;
         }
-        let Some(report) = state.report(id, database) else {
+        let Some(rank) = state
+            .report(id, database)
+            .and_then(|report| crate::fork::rules::candidate_rank(db, report))
+        else {
             continue;
         };
-        let rank = (report.log_epoch(), report.position());
         // Strictly greater, so the earliest in preference order wins ties (ADR-0018, point 7).
         if best.is_none_or(|(_, log_epoch, position)| rank > (log_epoch, position)) {
-            best = Some((id, report.log_epoch(), report.position()));
+            best = Some((id, rank.0, rank.1));
         }
     }
     let Some((candidate, _, position)) = best else {

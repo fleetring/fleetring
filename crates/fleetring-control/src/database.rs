@@ -7,6 +7,7 @@ use std::str::FromStr;
 use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
+use crate::fork::Fork;
 use crate::{Metadata, Timestamp};
 
 /// The longest database name, in bytes.
@@ -124,6 +125,17 @@ pub enum ParseDatabaseNameError {
 pub enum Engine {
     /// SQLite, replicated by shipping WAL frames (ADR-0016).
     Sqlite,
+}
+
+impl Engine {
+    /// Returns whether a database on this engine can be forked: its adapter is a frame source
+    /// that pins snapshots and runs the conditional fork reset (ADR-0046, point 9).
+    #[must_use]
+    pub const fn can_fork(self) -> bool {
+        match self {
+            Self::Sqlite => true,
+        }
+    }
 }
 
 impl fmt::Display for Engine {
@@ -434,6 +446,103 @@ impl fmt::Display for LeaseEpoch {
     }
 }
 
+/// A database's incarnation: which life of its name a database is (ADR-0046, point 1).
+///
+/// The control node that proposes a creation draws its incarnation as 64 random bits and carries
+/// it in the command, as it carries the time, so `apply` stays pure and a replay gives the same
+/// incarnations. No rule rests on incarnations growing or never repeating: fencing compares a
+/// fork's whole identity. Incarnations are stored once the `fork` fleet feature is enabled; every
+/// database created before then, and every record written before incarnations existed, has
+/// [`Incarnation::LEGACY`], 0. Every fork has a nonzero incarnation.
+///
+/// Text and JSON write an incarnation as 16 lowercase hex digits, since a 64-bit integer doesn't
+/// survive every JSON reader.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring_control::Incarnation;
+///
+/// assert_eq!(Incarnation::default(), Incarnation::LEGACY);
+/// assert_eq!(Incarnation::new(0xAB).to_string(), "00000000000000ab");
+/// assert_eq!("00000000000000ab".parse(), Ok(Incarnation::new(0xAB)));
+/// assert!("ab".parse::<Incarnation>().is_err());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Incarnation(u64);
+
+impl Incarnation {
+    /// The incarnation of every database created before incarnations were stored.
+    pub const LEGACY: Self = Self(0);
+
+    /// Returns the incarnation with the value `value`.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the incarnation as an integer.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Returns whether this is [`Incarnation::LEGACY`].
+    #[must_use]
+    pub const fn is_legacy(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Display for Incarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl FromStr for Incarnation {
+    type Err = ParseIncarnationError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let valid = text.len() == 16
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid {
+            return Err(ParseIncarnationError {
+                text: text.to_owned(),
+            });
+        }
+        u64::from_str_radix(text, 16)
+            .map(Self)
+            .map_err(|_| ParseIncarnationError {
+                text: text.to_owned(),
+            })
+    }
+}
+
+impl TryFrom<String> for Incarnation {
+    type Error = ParseIncarnationError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+
+impl From<Incarnation> for String {
+    fn from(incarnation: Incarnation) -> Self {
+        incarnation.to_string()
+    }
+}
+
+/// Why a string is not an [`Incarnation`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("'{text}' isn't an incarnation: expected 16 lowercase hex digits")]
+pub struct ParseIncarnationError {
+    text: String,
+}
+
 /// The right of one node to accept writes for a database at one epoch, until an expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
@@ -557,6 +666,10 @@ impl Promotion {
 ///
 /// A database may carry [`Metadata`] (ADR-0041). One without any is stored exactly as before
 /// metadata existed.
+///
+/// A database has an [`Incarnation`], and a database made by a fork carries its [`Fork`] record
+/// (ADR-0046). A database without a fork record is an ordinary database, fully seeded and ready;
+/// one with the legacy incarnation and no fork record is stored exactly as before forks existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "DatabaseRecord", into = "DatabaseRecord")]
 pub struct Database {
@@ -569,11 +682,14 @@ pub struct Database {
     lease: Option<Lease>,
     promotion: Option<Promotion>,
     metadata: Option<Metadata>,
+    incarnation: Incarnation,
+    fork: Option<Fork>,
 }
 
 /// A database as it is stored: the durability fields are optional, so records written before
-/// they existed load with the defaults, and the metadata comes last and only when there is
-/// some, so a record without it is written byte for byte as before metadata existed.
+/// they existed load with the defaults, and the metadata, the incarnation, and the fork record
+/// come last and only when they say something, so a record without them is written byte for byte
+/// as before they existed.
 #[derive(Serialize, Deserialize)]
 struct DatabaseRecord {
     name: DatabaseName,
@@ -590,6 +706,10 @@ struct DatabaseRecord {
     promotion: Option<Promotion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metadata: Option<Metadata>,
+    #[serde(default, skip_serializing_if = "Incarnation::is_legacy")]
+    incarnation: Incarnation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork: Option<Fork>,
 }
 
 impl From<DatabaseRecord> for Database {
@@ -610,6 +730,8 @@ impl From<DatabaseRecord> for Database {
             lease: record.lease,
             promotion: record.promotion,
             metadata: record.metadata,
+            incarnation: record.incarnation,
+            fork: record.fork,
         }
     }
 }
@@ -627,6 +749,8 @@ impl From<Database> for DatabaseRecord {
             lease: database.lease,
             promotion: database.promotion,
             metadata: database.metadata,
+            incarnation: database.incarnation,
+            fork: database.fork,
         }
     }
 }
@@ -649,7 +773,57 @@ impl Database {
             lease: None,
             promotion: None,
             metadata,
+            incarnation: Incarnation::LEGACY,
+            fork: None,
         }
+    }
+
+    /// Gives the database `incarnation`.
+    #[must_use]
+    pub(crate) fn with_incarnation(mut self, incarnation: Incarnation) -> Self {
+        self.incarnation = incarnation;
+        self
+    }
+
+    /// Records that the database is made by `fork`.
+    #[must_use]
+    pub(crate) fn with_fork(mut self, fork: Fork) -> Self {
+        self.fork = Some(fork);
+        self
+    }
+
+    /// Returns which of the databases ever given this name the database is:
+    /// [`Incarnation::LEGACY`] for one created before incarnations were assigned.
+    #[must_use]
+    pub fn incarnation(&self) -> Incarnation {
+        self.incarnation
+    }
+
+    /// Returns the fork that made the database, or `None` for an ordinary database.
+    #[must_use]
+    pub fn fork(&self) -> Option<&Fork> {
+        self.fork.as_ref()
+    }
+
+    pub(crate) fn fork_mut(&mut self) -> Option<&mut Fork> {
+        self.fork.as_mut()
+    }
+
+    /// Returns whether a write quorum of the database's replicas holds its data: always for an
+    /// ordinary database, and for a fork once it is
+    /// [`Seeded`](crate::fork::ForkState::Seeded) or [`Ready`](crate::fork::ForkState::Ready).
+    /// Only a seeded database may take a lease (ADR-0046, point 3.7).
+    #[must_use]
+    pub fn is_seeded(&self) -> bool {
+        self.fork.as_ref().is_none_or(Fork::is_seeded)
+    }
+
+    /// Returns whether clients may use the database: always for an ordinary database, and for a
+    /// fork once its reset is committed and recorded, [`Ready`](crate::fork::ForkState::Ready)
+    /// (ADR-0046, point 6).
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.fork.as_ref().is_none_or(Fork::is_ready)
     }
 
     /// Returns the database's name.
@@ -725,6 +899,13 @@ impl Database {
 
     pub(crate) fn set_lease(&mut self, lease: Lease) {
         self.lease = Some(lease);
+    }
+
+    /// Removes the lease and any promotion, keeping the epoch, so that the next lease is a
+    /// first lease at a higher epoch: a fork that seeds again after losing its copy.
+    pub(crate) fn clear_lease(&mut self) {
+        self.lease = None;
+        self.promotion = None;
     }
 
     pub(crate) fn promotion_mut(&mut self) -> Option<&mut Promotion> {

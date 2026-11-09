@@ -1107,6 +1107,7 @@ mod tests {
                 engine: fleetring_control::Engine::Sqlite,
                 durability: None,
                 metadata: None,
+                incarnation: fleetring_control::Incarnation::LEGACY,
             },
             Action::AcquireLease {
                 database: "db".parse().expect("name"),

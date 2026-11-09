@@ -229,11 +229,14 @@ pub enum Feature {
     /// [`Action::ExpireDatabase`](crate::Action::ExpireDatabase). Each of them needs
     /// [`Feature::Metadata`] too.
     Expiry,
+    /// Forks (ADR-0046): [`Action::ForkDatabase`](crate::Action::ForkDatabase) and the commands
+    /// that drive a fork. Enabling it also starts database incarnations.
+    Fork,
 }
 
 impl Feature {
     /// Every feature this release knows, in order.
-    pub const ALL: [Self; 3] = [Self::Undrain, Self::Metadata, Self::Expiry];
+    pub const ALL: [Self; 4] = [Self::Undrain, Self::Metadata, Self::Expiry, Self::Fork];
 
     /// Returns the feature's name, as members report it and errors print it.
     #[must_use]
@@ -242,6 +245,7 @@ impl Feature {
             Self::Undrain => "undrain",
             Self::Metadata => "metadata",
             Self::Expiry => "expiry",
+            Self::Fork => "fork",
         }
     }
 }
@@ -508,7 +512,7 @@ mod tests {
         let stored = serde_json::to_string(&software).expect("serializes");
         assert_eq!(
             stored,
-            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["expiry","metadata"]}"#
+            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["expiry","fork","metadata"]}"#
         );
         assert_eq!(
             serde_json::from_str::<Software>(&stored).expect("decodes"),

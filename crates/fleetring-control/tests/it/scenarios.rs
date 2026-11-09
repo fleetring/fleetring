@@ -545,6 +545,7 @@ fn heartbeat_at(node: &str, database: &str, log_epoch: u64, position: &[u8]) -> 
         ],
         unknown_reports: fleetring_control::UnknownReports::Skip,
         software: None,
+        disk_free_bytes: None,
     }
 }
 

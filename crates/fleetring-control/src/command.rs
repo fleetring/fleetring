@@ -1,11 +1,16 @@
 //! Commands: the only way to change control state.
 
+use std::collections::BTreeSet;
+
 use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
+use crate::fork::{
+    ChainHash, ForkFailure, ForkIdentity, ForkIntent, ForkLimits, OperationId, RetryCause,
+};
 use crate::{
-    DatabaseName, Durability, Engine, Feature, HostedReplica, LeaseEpoch, Member, MetadataChange,
-    MetadataSpec, Position, PrincipalName, Revoked, Software, Timestamp,
+    DatabaseName, Durability, Engine, Feature, HostedReplica, Incarnation, LeaseEpoch, Member,
+    MetadataChange, MetadataSpec, Position, PrincipalName, Revoked, Software, Timestamp,
 };
 
 /// The features of a command that needs database metadata.
@@ -13,6 +18,15 @@ const METADATA: &[Feature] = &[Feature::Metadata];
 
 /// The features of a command that needs database metadata and sets an expiry or acts on one.
 const METADATA_AND_EXPIRY: &[Feature] = &[Feature::Metadata, Feature::Expiry];
+
+/// The features of a command that drives a fork.
+const FORK: &[Feature] = &[Feature::Fork];
+
+/// The features of a fork request, which records metadata.
+const FORK_AND_METADATA: &[Feature] = &[Feature::Fork, Feature::Metadata];
+
+/// The features of a fork request that sets an expiry.
+const FORK_METADATA_AND_EXPIRY: &[Feature] = &[Feature::Fork, Feature::Metadata, Feature::Expiry];
 
 /// One change to control state, stamped with the control node's time.
 ///
@@ -87,6 +101,13 @@ pub enum Action {
         /// Heartbeats logged before this field existed carry none, and change no software.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         software: Option<Software>,
+        /// The free bytes on the member's data volume, for the control plane's best-effort fork
+        /// admission (ADR-0046, point 7.3). Recorded only once the `fork` feature is enabled, so
+        /// that control state stays as it was until then.
+        ///
+        /// Heartbeats logged before this field existed carry none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disk_free_bytes: Option<u64>,
     },
 
     /// Records a new database.
@@ -107,6 +128,13 @@ pub enum Action {
         /// what one did before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<MetadataSpec>,
+        /// The database's incarnation: 64 random bits the proposing control node draws, so that
+        /// a name dropped and created again names another life of it (ADR-0046, point 1).
+        /// Stored once [`Feature::Fork`] is enabled, when 0 is refused, and ignored until then,
+        /// so that a fleet that can still roll back stores nothing new. Creations logged before
+        /// the field existed carry 0.
+        #[serde(default, skip_serializing_if = "Incarnation::is_legacy")]
+        incarnation: Incarnation,
     },
 
     /// Changes a database's metadata with a patch (ADR-0041, point 2): only the description,
@@ -266,6 +294,144 @@ pub enum Action {
         /// When the entry may be forgotten.
         until: Timestamp,
     },
+
+    /// Creates a database as a copy of another, seeded by an operation with a client-chosen ID
+    /// (ADR-0046, points 3.1 and 5).
+    ///
+    /// The source is resolved to its current incarnation and must be ready, and must be the
+    /// incarnation the caller expects if it names one; a relative expiry is resolved against
+    /// the command's time. The fork gets the next incarnation, the source's engine, and the
+    /// intent's own durability and metadata (nothing is copied from the source), and starts
+    /// seeding at attempt 1 with the first live member of its replica set as the seeder. It is
+    /// refused early when fewer than its write quorum of replicas have room for the copy, as far
+    /// as their heartbeats say.
+    ///
+    /// A resubmission with a known operation ID resolves nothing again: from the same requester
+    /// with the same intent it changes nothing and returns the operation's outcome; from another
+    /// requester, or with another intent, it is refused. Needs [`Feature::Fork`] and [`Feature::Metadata`], and [`Feature::Expiry`]
+    /// too if it sets an expiry. The first one accepted starts incarnations.
+    ForkDatabase {
+        /// The operation's ID, chosen by the client.
+        operation: OperationId,
+        /// What the caller asked for, exactly as given.
+        intent: ForkIntent,
+        /// The fork's incarnation: 64 random bits the proposing control node draws, never 0. A
+        /// resubmission's is ignored.
+        incarnation: Incarnation,
+        /// The absolute expiry the control service resolved from a relative one in the intent,
+        /// as it resolves `--expires-in` (ADR-0041). A resubmission's is ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_expiry: Option<Timestamp>,
+        /// The fork's budgets and timeouts, from the control node's configuration.
+        limits: ForkLimits,
+    },
+
+    /// Records that a completion quorum of a fork's replicas durably holds the same staged copy
+    /// (ADR-0046, point 3.2): the fork becomes seeded, its holders become its replica set until
+    /// it is ready, and one of them may take its first lease.
+    ///
+    /// Accepted only for the current fork identity, seeding at exactly `attempt`, while the
+    /// source still exists at the fork's source incarnation, when every holder is in the
+    /// current replica set, didn't refuse on disk, and last reported this staged copy at log
+    /// epoch 0, and when the holders reach the completion quorum C = max(⌊R/2⌋ + 1, W,
+    /// `min_replicas`). Proposed by the control node's fork driver only. Needs
+    /// [`Feature::Fork`].
+    CompleteFork {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The attempt that fetched the copy.
+        attempt: u32,
+        /// The source position the copy holds.
+        at: Position,
+        /// The copy's chain hash.
+        chain_hash: ChainHash,
+        /// The replicas that hold it.
+        holders: BTreeSet<NodeId>,
+    },
+
+    /// Ends a fork's current attempt and starts the next with a new seeder, or fails the fork
+    /// if its attempts or its time have run out (ADR-0046, point 3.3).
+    ///
+    /// `exclude_seeder` joins the replicas passed over as seeders, a preference rather than a
+    /// ban: the next seeder is the first live member of the replica set, in preference order,
+    /// that is neither passed over nor disk-refused, or, if every live one that isn't
+    /// disk-refused was passed over, the first of those. Past the budget the fork fails with
+    /// [`ForkFailure::RetriesExhausted`], and past the deadline with
+    /// [`ForkFailure::DeadlineExceeded`], each keeping `cause`. Accepted only for the current
+    /// fork identity, seeding at `attempt`. Proposed by the control node's fork driver only.
+    /// Needs [`Feature::Fork`].
+    RetryForkSeed {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The attempt that ended.
+        attempt: u32,
+        /// Why it ended.
+        cause: RetryCause,
+        /// The seeder to pass over from now on, because it failed as one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exclude_seeder: Option<NodeId>,
+    },
+
+    /// Records that a replica of a seeding fork refused the copy for want of disk (ADR-0046,
+    /// point 3.4): it is never seeder or holder for this fork. If it was the seeder, the next
+    /// attempt starts as with [`Action::RetryForkSeed`]; if fewer replicas than the completion
+    /// quorum remain with room, the fork fails with [`ForkFailure::InsufficientDisk`]. Seeder
+    /// exclusions never count toward that. Accepted only for the current fork identity, seeding
+    /// at `attempt`. Proposed by the control node's fork driver only. Needs [`Feature::Fork`].
+    RecordForkDiskRefusal {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The current attempt.
+        attempt: u32,
+        /// The replica that refused.
+        node: NodeId,
+    },
+
+    /// Removes a holder from a seeded fork (ADR-0046, point 3.6): one whose latest report says
+    /// its staged copy is lost, before the first lease, or one that is no longer a fleet member,
+    /// at any time before the fork is ready. If fewer holders than the completion quorum remain,
+    /// the fork seeds again at the next attempt, with a fresh deadline, its lease and any
+    /// promotion cleared and its epoch kept. Accepted only for the current fork identity, seeded
+    /// at `attempt`. Proposed by the control node's fork driver only. Needs [`Feature::Fork`].
+    DropForkHolder {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The attempt that seeded it.
+        attempt: u32,
+        /// The holder.
+        holder: NodeId,
+        /// Why: [`RetryCause::HolderLost`] or [`RetryCause::HoldersLeft`].
+        cause: RetryCause,
+    },
+
+    /// Fails a seeding fork for a permanent reason (ADR-0046, point 3.4). Accepted only for the
+    /// current fork identity at its current attempt. Proposed by the control node's fork driver
+    /// only. Needs [`Feature::Fork`].
+    FailFork {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The current attempt.
+        attempt: u32,
+        /// Why it fails.
+        reason: ForkFailure,
+    },
+
+    /// Records that a seeded fork's primary committed the fork-reset write (ADR-0046, point
+    /// 3.7): the fork becomes ready, and its replica set follows placement again. It mirrors the
+    /// marker in the database, which decides.
+    ///
+    /// Accepted only for the current fork identity, while seeded, for an epoch the database
+    /// has issued, when at least the bootstrap quorum W_boot = max(⌊R/2⌋ + 1, W) of its replica
+    /// set last reported the reset committed for this identity at that epoch and position.
+    /// Proposed by the control node's fork driver only. Needs [`Feature::Fork`].
+    MarkForkReady {
+        /// The fork.
+        fork: ForkIdentity,
+        /// The epoch of the primary that committed the reset.
+        epoch: LeaseEpoch,
+        /// The reset write's position.
+        reset_position: Position,
+    },
 }
 
 impl Action {
@@ -314,7 +480,35 @@ impl Action {
                 }
             }
             Self::ExpireDatabase { .. } => METADATA_AND_EXPIRY,
+            Self::ForkDatabase { intent, .. } => {
+                if !intent.expiry.is_never() {
+                    FORK_METADATA_AND_EXPIRY
+                } else {
+                    FORK_AND_METADATA
+                }
+            }
+            Self::CompleteFork { .. }
+            | Self::RetryForkSeed { .. }
+            | Self::RecordForkDiskRefusal { .. }
+            | Self::FailFork { .. }
+            | Self::DropForkHolder { .. }
+            | Self::MarkForkReady { .. } => FORK,
             _ => &[],
+        }
+    }
+
+    /// Returns the fork identity that fences the action: that of a command that drives an
+    /// existing fork, which `apply` checks before anything else (ADR-0046, point 3).
+    #[must_use]
+    pub fn fork_identity(&self) -> Option<&ForkIdentity> {
+        match self {
+            Self::CompleteFork { fork, .. }
+            | Self::RetryForkSeed { fork, .. }
+            | Self::RecordForkDiskRefusal { fork, .. }
+            | Self::FailFork { fork, .. }
+            | Self::DropForkHolder { fork, .. }
+            | Self::MarkForkReady { fork, .. } => Some(fork),
+            _ => None,
         }
     }
 }

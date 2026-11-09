@@ -22,6 +22,9 @@
 //!    through `Replication.DropCopy` (ADR-0042). A command refused or rejected is skipped; only
 //!    a stopped control node ends the task. Expiry doesn't depend on
 //!    leases, so it waits for no settling.
+//! 5. **Forks.** After the settling below, on every tick it submits what the fork driver
+//!    proposes ([`fork::actions`]): completions, retries, failures, readiness, and a tick when
+//!    a fork's deadline or an operation's retention has passed (ADR-0046, point 3.8).
 //!
 //! A control node that has just started gives primaries one lease duration plus the failover
 //! margin to renew before it starts any promotion: leases look expired after an outage only
@@ -32,7 +35,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fleetring_control::{Action, Applied, DatabaseName, LeaseEpoch, Millis, State, Timestamp};
+use fleetring_control::{
+    Action, Applied, DatabaseName, LeaseEpoch, Millis, State, Timestamp, fork,
+};
 use fleetring_proto::v1::PromoteRequest;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
@@ -286,6 +291,9 @@ async fn run(
                     Err(_) => return,
                 }
             }
+            if drive_forks(&handle, now).await == Sweep::Stop {
+                return;
+            }
         }
         notify_candidates(
             &handle.state(),
@@ -295,6 +303,27 @@ async fn run(
             &mut notified,
         );
     }
+}
+
+/// Submits what the fork driver proposes at `now` ([`fork::actions`]), one command at a time,
+/// and logs what became of each (ADR-0046, point 3.8). The driver reads only the state, so a
+/// restarted control node proposes the same commands; `apply` checks each one again, so a
+/// proposal made stale by an earlier one is refused and changes nothing. Says whether the timer
+/// goes on: it stops only with the control node.
+async fn drive_forks(handle: &ControlHandle, now: Timestamp) -> Sweep {
+    for action in fork::actions(&handle.state(), now) {
+        match handle.submit(action).await {
+            Ok(committed) => match committed.outcome() {
+                Ok(applied) => tracing::info!(?applied, "a fork moved on"),
+                Err(rejection) => tracing::debug!(%rejection, "a fork proposal was refused"),
+            },
+            Err(SubmitError::Stopped) => return Sweep::Stop,
+            Err(error) => {
+                tracing::warn!(%error, "can't log a fork proposal; the next tick proposes again");
+            }
+        }
+    }
+    Sweep::Continue
 }
 
 /// Tells the candidate of every promotion in progress, unless it was told less than
@@ -406,6 +435,7 @@ mod tests {
                     expires_at: Some(expires_at),
                     ..MetadataSpec::default()
                 }),
+                incarnation: fleetring_control::Incarnation::LEGACY,
             })
             .await
             .expect("the creation commits");

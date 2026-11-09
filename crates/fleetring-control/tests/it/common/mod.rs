@@ -10,6 +10,8 @@ use fleetring_control::{
 };
 use proptest::prelude::*;
 
+pub(crate) mod fork;
+
 /// Node IDs the generator draws from.
 pub(crate) const NODES: [&str; 5] = ["n0", "n1", "n2", "n3", "n4"];
 
@@ -59,6 +61,7 @@ pub(crate) fn create(name: &str, replication_factor: u8) -> Action {
         engine: Engine::Sqlite,
         durability: None,
         metadata: None,
+        incarnation: fleetring_control::Incarnation::LEGACY,
     }
 }
 
@@ -70,6 +73,7 @@ pub(crate) fn create_with(name: &str, replication_factor: u8, acks: Acks) -> Act
         engine: Engine::Sqlite,
         durability: Some(Durability::new(acks, factor(replication_factor))),
         metadata: None,
+        incarnation: fleetring_control::Incarnation::LEGACY,
     }
 }
 
@@ -84,6 +88,7 @@ pub(crate) fn heartbeat(node: &str, reports: &[(&str, &[u8])]) -> Action {
             .collect(),
         unknown_reports: fleetring_control::UnknownReports::Skip,
         software: None,
+        disk_free_bytes: None,
     }
 }
 
@@ -277,6 +282,7 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
                 replicas,
                 unknown_reports,
                 software: (b % 7 == 2).then(|| reported(b)),
+                disk_free_bytes: None,
             }
         }
         9 => Action::AcquireLease {
