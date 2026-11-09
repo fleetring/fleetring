@@ -1620,3 +1620,86 @@ async fn a_seeded_fork_streams_only_to_its_holders_until_it_is_ready() -> TestRe
     fleet.stop().await;
     Ok(())
 }
+
+fn fast_failover() -> Settings {
+    Settings {
+        control: FAST_LEASES,
+        stay: true,
+        ..Settings::default()
+    }
+}
+
+/// A holder promotes a seeded fork whose placement moved: it fences the recorded holders, never
+/// the node the ring moved the fork onto, and the fork becomes ready with every acknowledged
+/// write (ADR-0046, points 3.9 and 3.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_promotes_a_seeded_fork_over_its_holders_after_placement_moved() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let Moved {
+        mut fleet,
+        client,
+        target,
+        id,
+        primary,
+        holders,
+        joiner,
+        ..
+    } = seeded_then_moved(dir.path(), fast_failover, 41).await?;
+    write_once_served(&client, &target, "after the move").await?;
+    // Both followers hold everything, so the holders rank equal and the lowest ID, the holder
+    // the ring moved the fork off, is the candidate.
+    wait_until("both followers hold every write", async || {
+        fleet
+            .daemon(&primary)
+            .ok()
+            .and_then(|daemon| daemon.replication())
+            .and_then(|replication| replication.primary_status(&target))
+            .is_some_and(|status| {
+                status.followers.len() == 2
+                    && status.followers.iter().all(|follower| {
+                        follower.reported && follower.acknowledged == status.committed
+                    })
+            })
+    })
+    .await?;
+    fleet.crash(&primary).await?;
+    let mut promoted = None;
+    wait_until("a holder is promoted", async || {
+        promoted = client
+            .locate(&target)
+            .await
+            .ok()
+            .and_then(|location| location.primary)
+            .filter(|node| *node != primary);
+        promoted.is_some()
+    })
+    .await?;
+    let promoted = promoted.ok_or("no primary")?;
+    assert!(holders.contains(&promoted), "{promoted} is a holder");
+    let joined = fleet
+        .daemon(&joiner)?
+        .replication()
+        .ok_or("no replication")?;
+    assert_eq!(
+        joined.highest_epoch(&target),
+        None,
+        "the node the ring moved the fork onto was never fenced"
+    );
+    assert_eq!(
+        client.fork_operation(id).await?.state(),
+        proto::ForkState::Seeded
+    );
+    // The promoted holder serves every acknowledged write once its gate opens.
+    wait_until("the promoted holder serves every write", async || {
+        notes(&client, &target)
+            .await
+            .is_ok_and(|rows| rows.len() == 7)
+    })
+    .await?;
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::FollowerReset, id);
+    }
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    fleet.stop().await;
+    Ok(())
+}
