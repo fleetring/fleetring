@@ -151,6 +151,23 @@ pub(crate) fn drop_database(name: &str, place: &Place) -> Prompt {
     }
 }
 
+/// What `db drop` asks of a fork that isn't ready: the drop cancels it (ADR-0046, point 3.8).
+pub(crate) fn drop_fork(name: &str, place: &Place, operation: &str) -> Prompt {
+    Prompt {
+        question: format!(
+            "drop database '{name}' {}, cancelling the fork in progress (operation {operation}), \
+             and every replica's copy?",
+            place.on()
+        ),
+        expect: Expect::Typed {
+            what: "the name",
+            value: name.to_owned(),
+        },
+        refusal: format!("pass --yes to drop {name} without a prompt"),
+        declined: format!("not dropping {name}"),
+    }
+}
+
 /// What `orphan remove` asks.
 pub(crate) fn remove_orphan(name: &str, node: &str, place: &Place) -> Prompt {
     Prompt {

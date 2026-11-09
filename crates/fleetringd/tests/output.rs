@@ -158,6 +158,7 @@ fn placement_shape() -> Value {
         "candidate": "null",
         "engine": "string",
         "followers": [],
+        "incarnation": "string",
         "lease_epoch": "number",
         "min_replicas": "number",
         "primary": "string",
@@ -250,6 +251,7 @@ async fn every_read_command_prints_json_with_pinned_fields() -> TestResult {
         let located = fleet.json(&["db", "locate", "notes", "--json"])?;
         let location_shape = json!({
             "database": "string",
+            "fork": "null",
             "metadata": "null",
             "placement": placement_shape(),
         });
@@ -523,5 +525,116 @@ fn an_interrupted_follow_exits_130() -> TestResult {
     let status =
         exited(&mut follow, "dev logs -f, on Ctrl-C,").map_err(|error| error.to_string())?;
     assert_eq!(status.code(), Some(130), "{status:?}");
+    Ok(())
+}
+
+/// A fork record in `state`, as the control plane sends it.
+fn fork_record(state: fleetring_proto::v1::ForkState) -> fleetring_proto::v1::ForkStatus {
+    fleetring_proto::v1::ForkStatus {
+        state: state.into(),
+        operation_id: vec![0x5A; 16],
+        source: "notes".to_owned(),
+        source_incarnation: 0x3f9a_0c6e_21d4_b870,
+        attempt: 1,
+        max_attempts: 5,
+        seeder: Some("data-3".to_owned()),
+        seeder_excluded: vec!["data-1".to_owned()],
+        disk_refused: Vec::new(),
+        holders: vec!["data-3".to_owned()],
+        holders_needed: 2,
+        bytes: Some(10),
+        total_bytes: Some(20),
+        position: Some(vec![1, 0xa8]),
+        chain_hash: Some(vec![0x9f]),
+        requested_by: Some("tester".to_owned()),
+        requested_at_ms: 1_794_219_300_000,
+        deadline_at_ms: Some(1_794_219_900_000),
+        ..fleetring_proto::v1::ForkStatus::default()
+    }
+}
+
+/// `db show`, `db locate` and `db list` carry the fork record with pinned fields; `db fork -o
+/// json` prints the documented ones (`docs/cli.md`, section 15). Built from fixtures, so that
+/// every state is pinned without a fork in progress.
+#[test]
+fn fork_json_has_pinned_fields() -> TestResult {
+    use fleetring_proto::v1::{
+        ForkFailure, ForkFailureReason, ForkOperationStatus, ForkState, RetryCause,
+    };
+    use fleetringd::fork_report::{fork_report, status_report};
+
+    let record = status_report(&fork_record(ForkState::Seeding));
+    assert_eq!(
+        shape(&serde_json::to_value(&record)?),
+        json!({
+            "attempt": "number",
+            "bytes": "number",
+            "chain_hash": "string",
+            "completed_at": "null",
+            "deadline_at": "string",
+            "disk_refused": [],
+            "failed_at": "null",
+            "failure": "null",
+            "holders": ["string"],
+            "holders_needed": "number",
+            "max_attempts": "number",
+            "operation_id": "string",
+            "position": "string",
+            "ready_at": "null",
+            "requested_at": "string",
+            "requested_by": "string",
+            "seeder": "string",
+            "seeder_excluded": ["string"],
+            "source": "string",
+            "source_incarnation": "string",
+            "state": "string",
+            "total_bytes": "number",
+        })
+    );
+    for (state, name) in [
+        (ForkState::Seeding, "seeding"),
+        (ForkState::Seeded, "seeded"),
+        (ForkState::Ready, "ready"),
+        (ForkState::Failed, "failed"),
+    ] {
+        assert_eq!(status_report(&fork_record(state)).state, name);
+    }
+
+    let status = ForkOperationStatus {
+        operation_id: vec![0x5A; 16],
+        database: "notes-exp".to_owned(),
+        incarnation: 0x8c41_d2e0_7b5a_9f13,
+        state: ForkState::Failed.into(),
+        source: "notes".to_owned(),
+        source_incarnation: 0x3f9a_0c6e_21d4_b870,
+        failure: Some(ForkFailure {
+            reason: ForkFailureReason::RetriesExhausted.into(),
+            last_cause: RetryCause::SeederDown.into(),
+            attempts: 5,
+        }),
+        ..ForkOperationStatus::default()
+    };
+    let report = serde_json::to_value(fork_report(&status, Duration::from_millis(12_300)))?;
+    assert_eq!(
+        shape(&report),
+        json!({
+            "chain_hash": "null",
+            "database": "string",
+            "elapsed_ms": "number",
+            "failure": { "attempts": "number", "last_cause": "string", "reason": "string" },
+            "incarnation": "string",
+            "operation_id": "string",
+            "placement": "null",
+            "position": "null",
+            "source": "string",
+            "source_incarnation": "string",
+            "state": "string",
+        })
+    );
+    assert_eq!(report["incarnation"], "8c41d2e07b5a9f13");
+    assert_eq!(report["state"], "failed");
+    assert_eq!(report["failure"]["reason"], "retries_exhausted");
+    assert_eq!(report["failure"]["last_cause"], "seeder_down");
+    assert_eq!(report["elapsed_ms"], 12_300);
     Ok(())
 }
