@@ -64,6 +64,7 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | tag | [label](#label) | ADR-0041. |
 | owner (of a database) | [creator](#creator) | Being the creator grants nothing; scopes decide. "Owner" is refused for a lease holder and a primary too; it is kept for an agent's [owner](#owner) (planned). |
 | TTL (as a field or flag) | [expiry](#expiry) | "TTL" is fine in prose for the duration. |
+| connection, stream (alone, for a Hrana stream) | [Hrana stream](#hrana-stream) | A [change stream](#change-stream) and a replication stream are other things. |
 
 ## Terms
 
@@ -170,6 +171,14 @@ Where a database's actor hands each committed batch to be replicated, right afte
 - **Applies to:** daemon.
 - **Code:** `BatchPublisher` (`admit`, `publish`), `ReplicatingPublisher`, `RecordingPublisher`, module `fleetringd::publisher`. **CLI:** none.
 - **Not:** sink (a [sink](#sink) receives a change stream, after the write quorum holds a batch), feed, outbox, queue.
+
+### Baton
+
+The opaque string that continues a [Hrana stream](#hrana-stream): the [router](#router) returns one with each response and accepts it once, on the stream's next request, from the token that opened the stream (ADR-0037). It is `base64url(stream ID ‖ 16 random bytes ‖ sequence)`; the random bytes are the stream's secret, and the sequence moves on with every request, so a replayed or forked baton is refused.
+
+- **Applies to:** daemon.
+- **Code:** `router::streams::Baton`. **CLI:** none.
+- **Not:** session ID, cursor, ticket, token (a [token](#token) is a credential).
 
 ### Binding
 
@@ -507,6 +516,14 @@ Who holds a lease: for a database lease, the primary; for a keyed lease, the nam
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet.
 - **Not:** private key (alone), session key, proof key.
+
+### Hrana stream
+
+A client's sequence of Hrana requests that share one [session](#session), continued across HTTP requests by a [baton](#baton) (ADR-0037). Always say *Hrana stream*: a change stream and a replication stream are other things. A stream idle past the router's `[streams] idle_timeout_ms` expires.
+
+- **Applies to:** daemon.
+- **Code:** `router::streams::HranaStream`, `[streams]` in the router's configuration. **CLI:** none.
+- **Not:** stream (alone), connection, session (that is the node's side).
 
 ### Host
 
@@ -884,10 +901,10 @@ Returning a node to the binary its last [upgrade](#upgrade) replaced, kept besid
 
 ### Router
 
-*Planned* (MVP step 4). The front door that speaks the libSQL/Hrana protocol, so existing libSQL and Turso clients reach the right primary unchanged. It forwards its callers' tokens.
+The front door that speaks libSQL's Hrana protocol over HTTP, so existing libSQL and Turso clients reach each database's [primary](#primary) unchanged (ADR-0037). A separate process with its own identity: a client certificate for a principal every data node lists with `forward_tokens = true` and no scopes. It verifies each request's token and checks `read` before it calls any node, then forwards the token; each [Hrana stream](#hrana-stream) runs on one [session](#session) on the primary.
 
 - **Applies to:** daemon, CLI.
-- **Code:** *planned*; `forward_tokens = true` in its `[[principal]]` entry. **CLI:** *planned*.
+- **Code:** `fleetringd::router`, `RouterConfig`; `forward_tokens = true` in its `[[principal]]` entry. **CLI:** `fleetring router --config <file>`.
 - **Not:** proxy (fine in prose), gateway, load balancer, sidecar (fine for how it is deployed).
 
 ### Schema
@@ -921,6 +938,14 @@ One immutable archive object holding a run of delivered batches between two posi
 - **Applies to:** daemon, CLI.
 - **Code:** `durability::SegmentName`, `SegmentHeader`, `encode_segment`; objects under `<prefix>/<db>/segments/`. **CLI:** `segments` in `archive show` and in a restore's report.
 - **Not:** WAL file, log file, chunk, part.
+
+### Session
+
+The data plane's half of a [Hrana stream](#hrana-stream): one `Database.Session` stream from a [router](#router) to a database's [primary](#primary), in which statements run with SQLite's own transaction semantics on the primary's writer, so a transaction can span several requests (ADR-0037). A session without `write` on its database is read-only. Its open transaction holds the writer, within `[sessions]`, and rolls back when the session ends.
+
+- **Applies to:** daemon.
+- **Code:** `Database.Session`, `engine::SqlSessions`, `engine::SessionCall`, `SessionId`, `[sessions]`. **CLI:** none.
+- **Not:** connection (the HTTP or gRPC connection under it), transaction (a session can hold several, one at a time), cursor.
 
 ### Signed head
 

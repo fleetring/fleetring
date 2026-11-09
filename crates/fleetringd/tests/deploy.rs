@@ -24,3 +24,23 @@ fn the_example_config_runs_a_one_node_fleet_from_the_data_volume() -> Result<(),
     assert_eq!(config.log.format, LogFormat::Text);
     Ok(())
 }
+
+const ROUTER: &str = include_str!("../../../deploy/router.toml");
+
+/// FR-066: the router's example configuration stays valid, and sets every default it shows.
+#[test]
+fn the_example_router_config_is_valid() -> Result<(), Box<dyn Error>> {
+    let config = fleetringd::router::RouterConfig::from_toml(ROUTER)?;
+    assert_eq!(config.listen.to_string(), "0.0.0.0:8080");
+    assert!(
+        config.serves_tls(),
+        "off loopback, the example serves HTTPS"
+    );
+    assert_eq!(config.control.address.to_string(), "10.0.0.1:7400");
+    let defaults = fleetringd::router::RouterConfig::from_toml(
+        "listen = \"127.0.0.1:8080\"\n[control]\naddress = \"10.0.0.1:7400\"\n",
+    )?;
+    assert_eq!(config.routing, defaults.routing);
+    assert_eq!(config.streams, defaults.streams);
+    Ok(())
+}
