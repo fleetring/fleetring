@@ -1,0 +1,84 @@
+# An example configuration for the FleetRing router: a Hrana-over-HTTP front door that lets
+# unchanged libSQL and Turso clients reach each database's primary (ADR-0037).
+#
+#   fleetring router --config router.toml
+#
+# Clients point at https://<router>/db/<database>/, with the trailing slash, and send a FleetRing
+# token as their auth token:
+#
+#   createClient({ url: "https://router-1.example.com:8080/db/notes/", authToken: token })
+#
+# A database name with characters a URL path can't carry is percent-encoded as one segment:
+# `tenant:acme/notes` is /db/tenant%3Aacme%2Fnotes/. Every field below shows its default, unless
+# it is required or has none.
+
+# Where the router serves Hrana. Without [http] cert and key, the router serves plaintext, which
+# it does only on a loopback address unless [http] allow_plaintext = true: a bearer token never
+# crosses a network in the clear by default.
+listen = "0.0.0.0:8080"
+
+[http]
+# The router's server certificate chain and key, PEM, from any authority, a public one included:
+# application clients check it against their own trust store, not the fleet's.
+cert = "/etc/fleetring/router/server.crt"
+key = "/etc/fleetring/router/server.key"
+# The URL that reaches this router instance, returned as `base_url` with each baton, so that a
+# Hrana stream's later requests come back to the instance that holds it behind a load balancer.
+# Unset: no `base_url`.
+# advertise_url = "https://router-1.example.com:8080"
+# Serve plaintext on an address that isn't loopback. Tokens would cross the network in the clear.
+# allow_plaintext = false
+
+# The router's identity toward the fleet: a client certificate from the fleet's authority for a
+# principal that every data node lists with `forward_tokens = true` and no scopes:
+#
+#   fleetring cert client router --dir ./tls
+#
+#   [[principal]]
+#   name = "router"
+#   scopes = []
+#   forward_tokens = true
+#
+# The router acts only with its callers' tokens; with none, it can do nothing.
+[tls]
+ca = "/etc/fleetring/tls/ca.crt"
+cert = "/etc/fleetring/tls/client.router.crt"
+key = "/etc/fleetring/tls/client.router.key"
+
+[control]
+# The control node the router asks where each database's primary is, with the caller's token. It
+# follows leader redirects from there.
+address = "10.0.0.1:7400"
+
+[routing]
+# Also route a request whose Host is <name>.<host_suffix> to the database <name>, for names that
+# are DNS labels and clients that can't set a path.
+# host_suffix = "db.example.com"
+# How long a database's primary is cached, unless a redirect names a new one first.
+placement_ttl_ms = 60000
+# How many databases' primaries are cached; the oldest goes first.
+placement_cache_size = 100000
+# How long opening a session retries while a database has no primary, as during a failover.
+open_retry_ms = 5000
+# How long the router waits for a call's answer before it gives the call up as of unknown
+# outcome: beyond the nodes' [limits] statement_timeout_ms and their acknowledgement wait.
+call_timeout_ms = 60000
+
+[streams]
+# A Hrana stream with no request for this long expires, and its session on the primary closes,
+# which rolls back a transaction it left open.
+idle_timeout_ms = 10000
+# How many Hrana streams the router holds at once; a request for one more gets 503.
+max_streams = 10000
+# The largest request body; a larger one gets 413.
+max_request_bytes = 8388608
+# How many SQL texts a stream may keep with store_sql.
+max_sql_per_stream = 128
+# How many statements one request may carry, counting each request of a pipeline and each step
+# of a batch; a request with more gets 413.
+max_statements = 1000
+
+# [log]
+# "text" (the default) or "json". `--log-format` and FLEETRING_LOG_FORMAT override it, and
+# `RUST_LOG` sets the level (info by default). The router never logs tokens, SQL, or rows.
+# format = "text"

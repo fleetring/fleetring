@@ -168,7 +168,7 @@ pub struct StreamsConfig {
     /// How many SQL texts a stream may store with `store_sql`.
     pub max_sql_per_stream: NonZeroUsize,
     /// How many statements one request may carry, counting each stream request and each batch
-    /// step; a request with more gets `400`.
+    /// step; a request with more gets `413`.
     pub max_statements: NonZeroUsize,
 }
 

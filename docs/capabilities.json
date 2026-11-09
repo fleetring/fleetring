@@ -527,10 +527,11 @@
       "area": "access",
       "title": "libSQL-compatible router",
       "description": "A front door that speaks libSQL’s Hrana protocol over HTTP, so existing libSQL and Turso clients reach each database’s primary unchanged.",
-      "status": "planned",
+      "status": "built",
+      "since": "0.8.0",
       "ticket": "FR-066",
       "issue": 69,
-      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/adr/0037-router-hrana-front-door.md"
+      "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#router"
     },
     {
       "id": "rust-client",
