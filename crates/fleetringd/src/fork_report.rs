@@ -262,15 +262,26 @@ pub fn result_text(report: &ForkReport, placement: Option<&str>) -> String {
     text
 }
 
-/// A failure in one line: its reason, the cause of its last retry, and its attempts.
+/// A failure in one line, in words: why it failed, the cause of its last retry, and its attempts.
 #[must_use]
 pub fn failure_text(failure: &ForkFailureReport) -> String {
-    let mut text = failure.reason.clone();
+    let mut text = match failure.reason.as_str() {
+        "source_gone" => "the source was dropped",
+        "source_recreated" => "the source was dropped and created again",
+        "retries_exhausted" => "retries ran out",
+        "deadline_exceeded" => "the deadline passed",
+        "source_too_large" => "the source is too large to fork",
+        "insufficient_disk" => "not enough disk on its replicas",
+        "engine_unsupported" => "the source's engine can't be forked",
+        other => other,
+    }
+    .to_owned();
     if let Some(cause) = &failure.last_cause {
-        let _ = write!(text, " (last retry: {cause})");
+        let _ = write!(text, "; last retry: {}", cause.replace('_', " "));
     }
     if failure.attempts > 0 {
-        let _ = write!(text, ", {} attempts", failure.attempts);
+        let plural = if failure.attempts == 1 { "" } else { "s" };
+        let _ = write!(text, " ({} attempt{plural})", failure.attempts);
     }
     text
 }
@@ -479,7 +490,7 @@ mod tests {
         let text = section_text("notes-exp", &report);
         assert!(
             text.starts_with(
-                "fork: failed, retries_exhausted (last retry: seeder_down), 5 attempts\n"
+                "fork: failed, retries ran out; last retry: seeder down (5 attempts)\n"
             ),
             "{text}"
         );

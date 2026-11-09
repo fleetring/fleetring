@@ -103,6 +103,12 @@ impl Faults {
         self.0.iter().for_each(|faults| faults.release(point));
     }
 
+    fn set_disk(&self, free: u64, volume: u64) {
+        self.0
+            .iter()
+            .for_each(|faults| faults.set_disk(free, volume));
+    }
+
     /// The control node's reply to the next fork request is lost after the fork is recorded.
     fn drop_next_fork_reply(&self) {
         self.0[0].drop_next_fork_reply();
@@ -469,6 +475,52 @@ async fn dropping_the_target_during_seeding_cancels_the_fork() -> TestResult {
         // A new ID starts afresh.
         let again = fleet.ok(&["db", "fork", "notes", "notes-exp"])?;
         assert!(stdout(&again).contains("state: ready"));
+        Ok(())
+    });
+    let checked = checks.await;
+    daemon.run_until(async {}).await;
+    checked?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_that_fails_exits_1_with_the_failure_in_words_and_a_flat_hint() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (daemon, fleet) = fleet(dir.path()).await?;
+    let checks = tokio::task::spawn_blocking(move || -> Sendable {
+        with_notes(&fleet)?;
+        // Neither node has room for a copy.
+        fleet.faults.set_disk(1 << 20, 1 << 30);
+        let output = fleet.run(&["db", "fork", "notes", "notes-try"])?;
+        assert_eq!(
+            code(&output),
+            Some(1),
+            "{}{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let out = stdout(&output);
+        assert!(out.contains("state: failed"), "{out}");
+        assert!(
+            out.contains("failure: not enough disk on its replicas (1 attempt)"),
+            "{out}"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains(
+                "hint: `fleetring db drop notes-try` removes the failed fork; then run \
+                 `fleetring db fork notes notes-try` again."
+            ),
+            "{err}"
+        );
+        let hint = err
+            .lines()
+            .find(|line| line.starts_with("hint:"))
+            .unwrap_or("");
+        assert!(
+            !hint.contains("--operation-id"),
+            "nothing to resume: {hint}"
+        );
         Ok(())
     });
     let checked = checks.await;
