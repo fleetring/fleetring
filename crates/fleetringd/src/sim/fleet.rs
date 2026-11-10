@@ -82,7 +82,7 @@ fn host_seed(seed: u64, name: &str) -> u64 {
 /// never depends on the disk of the machine running it: the fork tests' hooks stand in for it.
 const ROOMY_DISK: u64 = 1 << 40;
 
-/// A second principal every host knows, with the same scopes as [`WORKLOAD_PRINCIPAL`]: another
+/// A second principal every host knows, with the same scopes as the workload's own: another
 /// requester for the same requests ([`Fleet::client_as`]).
 pub const OTHER_PRINCIPAL: &str = "other";
 
@@ -918,7 +918,7 @@ impl Fleet {
     }
 
     /// Adds a client named `name` that runs `workload` as the principal `principal`, which every
-    /// host knows: [`OTHER_PRINCIPAL`], or the workload's own.
+    /// host knows: [`OTHER_PRINCIPAL`], or the workload's own, `workload`.
     pub fn client_as(&mut self, name: &str, principal: &str, workload: impl Workload) {
         self.principals
             .insert(name.to_owned(), principal.to_owned());

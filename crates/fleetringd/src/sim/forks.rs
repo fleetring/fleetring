@@ -770,7 +770,7 @@ fn fencing_of_clients(history: &History, learned: &Learned) -> Result<(), Violat
 }
 
 /// Where each written value went: the database and the name's life, by value.
-fn origins<'h>(history: &'h History) -> BTreeMap<i64, (&'h DatabaseName, &'h Record)> {
+fn origins(history: &History) -> BTreeMap<i64, (&DatabaseName, &Record)> {
     let mut origins = BTreeMap::new();
     for record in history.records() {
         if let Operation::Write { database, value } = record.operation() {
