@@ -290,7 +290,11 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
     log.run(79, release.clone()).expect_err("not reported");
     let caught_up = HostedReplica::new(db("t"), ReplicaRole::Primary, Position::new([4]))
         .with_log_epoch(LeaseEpoch::new(1))
-        .with_placement_caught_up(PlacementCaughtUp::new(second.clone(), LeaseEpoch::new(1)));
+        .with_placement_caught_up(PlacementCaughtUp::new(
+            second.clone(),
+            LeaseEpoch::new(1),
+            log.state.membership_epoch(),
+        ));
     log.run(79, heartbeat_of(&order[0], vec![caught_up], None))
         .expect("hb");
     log.drive(79);

@@ -129,7 +129,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-use fleetring::{NodeId, ReplicationFactor};
+use fleetring::{Epoch, NodeId, ReplicationFactor, Ring};
 use fleetring_control::{DatabaseName, Durability, LeaseEpoch};
 use fleetring_proto::v1::replication_server::ReplicationServer;
 use fleetring_proto::v1::{DatabaseStatus, ReplicaRole};
@@ -777,14 +777,19 @@ impl Replication {
         .await
     }
 
-    /// The epoch of this node's primary of `database` once placement's write quorum holds
-    /// everything it has committed, while the database is a ready fork whose recorded holders
-    /// are still its replica set: the primary then counts both write quorums toward every write
-    /// (ADR-0046, point 3.10, as built). `None` otherwise.
+    /// The epoch of this node's primary of `database`, and the membership epoch of the ring it
+    /// checked placement under, once that placement's write quorum holds everything the primary
+    /// has committed, while the database is a ready fork whose recorded holders are still its
+    /// replica set: the primary then counts both write quorums toward every write (ADR-0046,
+    /// point 3.10, as built). `None` otherwise.
     ///
     /// The caller follows the fork's view first: every write committed after the check counted
     /// placement's write quorum, and every write before it is in the log placement now holds.
-    pub(crate) fn placement_caught_up(&self, database: &DatabaseName) -> Option<LeaseEpoch> {
+    /// Control state releases the holders only while the membership epoch is still its own.
+    pub(crate) fn placement_caught_up(
+        &self,
+        database: &DatabaseName,
+    ) -> Option<(LeaseEpoch, Epoch)> {
         let inner = &self.inner;
         let primary = inner.primary(database)?;
         if !matches!(
@@ -793,11 +798,14 @@ impl Replication {
         ) {
             return None;
         }
+        // One view: the ring checked is the ring the membership epoch names.
+        let view = inner.membership.view();
+        let ring = view.ring()?;
         let committed = primary.committed();
-        let placed = inner.write_quorum(&primary, inner.placed(&primary));
+        let placed = inner.write_quorum(&primary, placed_on(ring, &primary));
         let floor = usize::from(primary.role().durability.min_replicas());
         let held = primary.quorum_held(&Quorum::over(vec![placed], floor));
-        (committed.is_none() || held >= committed).then_some(primary.role().epoch)
+        (committed.is_none() || held >= committed).then_some((primary.role().epoch, view.epoch()))
     }
 
     /// Whether `database`'s primary has enough followers connected, live, and reporting for a
@@ -1466,10 +1474,10 @@ impl Inner {
 
     /// The replica set the ring in the current membership view places `primary`'s database on.
     fn placed(&self, primary: &Primary) -> Vec<NodeId> {
-        let factor = primary.role().replication_factor;
-        self.membership.view().ring().map_or_else(Vec::new, |ring| {
-            ring.replicas_n(primary.name().as_str(), factor).to_ids()
-        })
+        self.membership
+            .view()
+            .ring()
+            .map_or_else(Vec::new, |ring| placed_on(ring, primary))
     }
 
     /// The write quorum of `primary`'s database over the replica set `members`.
@@ -1503,6 +1511,12 @@ impl Inner {
         let n = self.transfers.fetch_add(1, Ordering::Relaxed);
         self.registry().root().join(format!(".{kind}-{n}"))
     }
+}
+
+/// The replica set `ring` places `primary`'s database on.
+fn placed_on(ring: &Ring, primary: &Primary) -> Vec<NodeId> {
+    ring.replicas_n(primary.name().as_str(), primary.role().replication_factor)
+        .to_ids()
 }
 
 fn failed(reason: String) -> ReplicationError {

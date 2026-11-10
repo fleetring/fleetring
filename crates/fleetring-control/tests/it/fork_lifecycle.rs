@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use fleetring::NodeId;
+use fleetring::{Epoch, NodeId};
 
 use fleetring_control::fork::{
     CancelCause, ChainHash, ForkExpiry, ForkFailure, ForkState, OperationOutcome,
@@ -313,10 +313,11 @@ fn a_seeded_forks_replica_set_is_frozen_until_ready() {
     );
     // Ready, it keeps its holders until its primary reports placement caught up.
     assert_eq!(replicas(&state, "t"), frozen);
+    let membership = state.membership_epoch();
     run(
         &mut state,
         45,
-        heartbeat_of(holders[0], vec![caught_up(&fork, 1)], None),
+        heartbeat_of(holders[0], vec![caught_up(&fork, 1, membership)], None),
     )
     .expect("hb");
     let released = drive(&mut state, 46);
@@ -333,11 +334,94 @@ fn a_seeded_forks_replica_set_is_frozen_until_ready() {
     assert_eq!(replicas(&state, "t"), placed(&state, "t", 3));
 }
 
-/// A report from a ready fork's primary that placement's write quorum holds its log.
-fn caught_up(fork: &fork::ForkIdentity, epoch: u64) -> HostedReplica {
+/// A report from a ready fork's primary at `epoch` that the write quorum of placement, as the
+/// ring at `membership` places it, holds its log.
+fn caught_up(fork: &fork::ForkIdentity, epoch: u64, membership: Epoch) -> HostedReplica {
     HostedReplica::new(fork.name.clone(), ReplicaRole::Primary, Position::new([4]))
         .with_log_epoch(LeaseEpoch::new(epoch))
-        .with_placement_caught_up(PlacementCaughtUp::new(fork.clone(), LeaseEpoch::new(epoch)))
+        .with_placement_caught_up(PlacementCaughtUp::new(
+            fork.clone(),
+            LeaseEpoch::new(epoch),
+            membership,
+        ))
+}
+
+/// A ready fork, its holders kept, its first primary leasing at epoch 1.
+fn ready_with_holders() -> (State, fork::ForkIdentity, Vec<String>) {
+    let mut state = fleet(&["n0", "n1", "n2"]);
+    run(&mut state, 10, fork_request(1, "t")).expect("fork");
+    let fork = identity(&state, "t");
+    let holders = replicas(&state, "t");
+    for node in &holders {
+        run(&mut state, 20, report_staged(node, &fork, 1)).expect("hb");
+    }
+    let named: Vec<&str> = holders.iter().map(String::as_str).collect();
+    run(&mut state, 20, complete(&fork, 1, &named)).expect("complete");
+    first_lease(&mut state, 30, &holders[0]).expect("first lease");
+    for node in &holders[..2] {
+        run(
+            &mut state,
+            35,
+            report_reset(node, &fork, LeaseEpoch::new(1), &[3]),
+        )
+        .expect("hb");
+    }
+    let proposed = drive(&mut state, 40);
+    assert!(
+        matches!(proposed.as_slice(), [(Action::MarkForkReady { .. }, Ok(_))]),
+        "{proposed:?}"
+    );
+    (state, fork, holders)
+}
+
+/// The primary checks placement as its ring places the fork: once the ring changes after its
+/// report, placement may name nodes that don't hold the log, so the report releases nothing
+/// until the primary reports again about the ring at the current membership epoch.
+#[test]
+fn a_ring_change_after_the_report_blocks_the_release_until_a_fresh_one() {
+    let (mut state, fork, holders) = ready_with_holders();
+    let reported_at = state.membership_epoch();
+    run(
+        &mut state,
+        45,
+        heartbeat_of(&holders[0], vec![caught_up(&fork, 1, reported_at)], None),
+    )
+    .expect("hb");
+    // The ring changes before the release is logged.
+    let member = Member::new(id("n3")).with_software(current_software());
+    run(&mut state, 46, Action::Join { member }).expect("join");
+    assert_ne!(state.membership_epoch(), reported_at);
+    assert!(fork::actions(&state, at(47)).is_empty());
+    let release = Action::ReleaseForkHolders {
+        fork: fork.clone(),
+        epoch: LeaseEpoch::new(1),
+    };
+    refused(
+        &mut state,
+        47,
+        release.clone(),
+        &Rejection::HoldersNotReleasable { database: db("t") },
+    );
+    // A fresh report, about the ring now, releases them.
+    let now = state.membership_epoch();
+    run(
+        &mut state,
+        48,
+        heartbeat_of(&holders[0], vec![caught_up(&fork, 1, now)], None),
+    )
+    .expect("hb");
+    let released = drive(&mut state, 49);
+    assert_eq!(
+        released,
+        vec![(
+            release,
+            Ok(Applied::ForkHoldersReleased {
+                database: db("t"),
+                epoch: LeaseEpoch::new(1),
+            })
+        )]
+    );
+    assert_eq!(replicas(&state, "t"), placed(&state, "t", 3));
 }
 
 /// A ready fork's primary counts its recorded holders until it sees the fork ready, however far
@@ -464,16 +548,25 @@ fn a_promotion_after_readiness_fences_the_holders_until_they_are_released() {
         release.clone(),
         &Rejection::HoldersNotReleasable { database: db("t") },
     );
+    let membership = state.membership_epoch();
     run(
         &mut state,
         2_050,
-        heartbeat_of(&holders[0], vec![caught_up(&fork, epoch.get())], None),
+        heartbeat_of(
+            &holders[0],
+            vec![caught_up(&fork, epoch.get(), membership)],
+            None,
+        ),
     )
     .expect("hb");
     run(
         &mut state,
         2_050,
-        heartbeat_of(candidate.as_str(), vec![caught_up(&fork, 1)], None),
+        heartbeat_of(
+            candidate.as_str(),
+            vec![caught_up(&fork, 1, membership)],
+            None,
+        ),
     )
     .expect("hb");
     assert!(fork::actions(&state, at(2_060)).is_empty());
@@ -501,7 +594,7 @@ fn a_promotion_after_readiness_fences_the_holders_until_they_are_released() {
         2_070,
         heartbeat_of(
             candidate.as_str(),
-            vec![caught_up(&fork, epoch.get())],
+            vec![caught_up(&fork, epoch.get(), membership)],
             None,
         ),
     )

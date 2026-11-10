@@ -981,10 +981,11 @@ pub enum Rejection {
     },
 
     /// A ready fork's holders are released only while it keeps them, and only once its lease
-    /// holder reports, at the lease's epoch, that placement's write quorum holds its log.
+    /// holder reports, at the lease's epoch, that the write quorum of placement at the current
+    /// membership epoch holds its log.
     #[error(
         "fork '{database}' keeps no holders to release, or its primary hasn't reported that \
-         placement holds its log"
+         placement at the current membership epoch holds its log"
     )]
     HoldersNotReleasable {
         /// The fork.

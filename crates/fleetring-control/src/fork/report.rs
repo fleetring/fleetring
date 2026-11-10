@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use fleetring::Epoch;
 use serde::{Deserialize, Serialize};
 
 use crate::fork::{ChainHash, ForkFailure, ForkIdentity, RetryCause};
@@ -339,30 +340,39 @@ impl ResetReport {
 /// A ready fork's primary reports that placement's write quorum holds its whole log, and that
 /// it counts both its recorded holders' and placement's write quorums toward every write from
 /// now on (ADR-0046, point 3.10, as built). `ReleaseForkHolders` needs this report from the
-/// lease holder at the current epoch before the fork's replica set leaves its holders.
+/// lease holder at the current epoch, about placement at the current membership epoch, before
+/// the fork's replica set leaves its holders.
 ///
 /// # Examples
 ///
 /// ```
+/// use fleetring::Epoch;
 /// use fleetring_control::{Incarnation, LeaseEpoch};
 /// use fleetring_control::fork::{ForkIdentity, OperationId, PlacementCaughtUp};
 ///
 /// let fork = ForkIdentity::new("t".parse()?, Incarnation::new(3), OperationId::from_bytes([1; 16]));
-/// let caught_up = PlacementCaughtUp::new(fork, LeaseEpoch::new(2));
+/// let caught_up = PlacementCaughtUp::new(fork, LeaseEpoch::new(2), Epoch::new(7));
 /// assert_eq!(caught_up.epoch(), LeaseEpoch::new(2));
+/// assert_eq!(caught_up.membership_epoch(), Epoch::new(7));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementCaughtUp {
     fork: ForkIdentity,
     epoch: LeaseEpoch,
+    membership_epoch: Epoch,
 }
 
 impl PlacementCaughtUp {
-    /// The primary of `fork` at `epoch` has placement's write quorum holding its log.
+    /// The primary of `fork` at `epoch` has the write quorum of placement, as the ring at
+    /// `membership_epoch` places the fork, holding its log.
     #[must_use]
-    pub fn new(fork: ForkIdentity, epoch: LeaseEpoch) -> Self {
-        Self { fork, epoch }
+    pub fn new(fork: ForkIdentity, epoch: LeaseEpoch, membership_epoch: Epoch) -> Self {
+        Self {
+            fork,
+            epoch,
+            membership_epoch,
+        }
     }
 
     /// Returns the fork the report is about.
@@ -375,5 +385,11 @@ impl PlacementCaughtUp {
     #[must_use]
     pub fn epoch(&self) -> LeaseEpoch {
         self.epoch
+    }
+
+    /// Returns the membership epoch of the ring whose placement the primary checked.
+    #[must_use]
+    pub fn membership_epoch(&self) -> Epoch {
+        self.membership_epoch
     }
 }

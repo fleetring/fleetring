@@ -36,7 +36,8 @@ use crate::{Action, Database, LeaseEpoch, Position, Report, State, Timestamp};
 /// - [`Action::MarkForkReady`] when the bootstrap quorum of a seeded fork's replica set reports
 ///   its reset committed;
 /// - [`Action::ReleaseForkHolders`] when a ready fork that keeps its holders has a lease holder
-///   that reports, at the lease's epoch, that placement's write quorum holds its log;
+///   that reports, at the lease's epoch, that the write quorum of placement at the current
+///   membership epoch holds its log;
 ///
 /// and a [`Action::Tick`] when a seeding fork is past its deadline, which the tick fails, or an
 /// operation's record is past its retention, which the tick forgets.
@@ -308,7 +309,8 @@ fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
 }
 
 /// A `ReleaseForkHolders` for a ready fork that keeps its holders, once the primary serving it
-/// now reports that placement's write quorum holds its log (ADR-0046, point 3.10, as built).
+/// now reports that placement's write quorum, at the current membership epoch, holds its log
+/// (ADR-0046, point 3.10, as built).
 fn release(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
     let identity = identity_of(db, fork);
     let lease = db
@@ -318,7 +320,11 @@ fn release(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
     state
         .report(lease.holder(), db.name())
         .and_then(Report::placement_caught_up)
-        .filter(|caught_up| *caught_up.fork() == identity && caught_up.epoch() == epoch)?;
+        .filter(|caught_up| {
+            *caught_up.fork() == identity
+                && caught_up.epoch() == epoch
+                && caught_up.membership_epoch() == state.membership_epoch()
+        })?;
     Some(Action::ReleaseForkHolders {
         fork: identity,
         epoch,
