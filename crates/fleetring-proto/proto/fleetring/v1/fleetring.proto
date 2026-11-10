@@ -571,9 +571,8 @@ message ForkStatus {
   repeated string seeder_excluded = 8;
   repeated string disk_refused = 9;
   // While seeding, the replicas that reported the attempt's staged copy; once seeded, the
-  // recorded holders, which are the fork's replica set until it is ready; once ready, the
-  // holders it keeps as its replica set until they are released, or none (ADR-0046, point
-  // 3.10, as built).
+  // recorded holders, which are the fork's replica set until it is ready. Empty once ready:
+  // see `kept_holders`.
   repeated string holders = 10;
   // The fork's completion quorum: how many holders seeding needs.
   uint32 holders_needed = 11;
@@ -601,6 +600,9 @@ message ForkStatus {
   optional bytes reset_position = 24;
   // While seeding, why the previous attempt ended; unspecified for the first.
   RetryCause last_cause = 25;
+  // Once ready, the recorded holders it keeps as its replica set until they are released, or
+  // none once they are (ADR-0046, point 3.10, as built). Empty in every other state.
+  repeated string kept_holders = 26;
 }
 
 // A fork request (ADR-0046, point 5.2): the caller's intent, exactly as given, and the operation

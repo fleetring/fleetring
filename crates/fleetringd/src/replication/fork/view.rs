@@ -155,8 +155,8 @@ pub(crate) fn fork_from_proto(
                 .map(|(epoch, position)| (LeaseEpoch::new(epoch), Position::from(position))),
         },
         Ok(proto::ForkState::Ready) => ForkPhase::Ready {
-            holders: (!status.holders.is_empty())
-                .then(|| nodes(&status.holders))
+            holders: (!status.kept_holders.is_empty())
+                .then(|| nodes(&status.kept_holders))
                 .transpose()?,
         },
         Ok(proto::ForkState::Failed) => ForkPhase::Failed,
@@ -218,4 +218,47 @@ pub(crate) fn holders_from_placement(placement: &proto::Placement) -> Result<Epo
         replicas,
         replication_factor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready(holders: &[&str], kept_holders: &[&str]) -> proto::ForkStatus {
+        let names = |texts: &[&str]| texts.iter().map(|text| (*text).to_owned()).collect();
+        proto::ForkStatus {
+            state: proto::ForkState::Ready.into(),
+            operation_id: vec![1; 16],
+            source: "s".to_owned(),
+            holders: names(holders),
+            kept_holders: names(kept_holders),
+            ..proto::ForkStatus::default()
+        }
+    }
+
+    /// A ready fork's kept holders come only from their own field: holders listed where a
+    /// seeding or seeded fork lists them never read as kept.
+    #[test]
+    fn a_ready_forks_kept_holders_come_from_their_own_field() {
+        let name: DatabaseName = "t".parse().expect("a name");
+        let phase = |status: &proto::ForkStatus| {
+            fork_from_proto(&name, Incarnation::new(1), status)
+                .expect("a valid record")
+                .phase
+        };
+        let kept: BTreeSet<NodeId> = ["n1", "n2"]
+            .iter()
+            .map(|text| text.parse().expect("a node"))
+            .collect();
+        assert_eq!(
+            phase(&ready(&[], &["n1", "n2"])),
+            ForkPhase::Ready {
+                holders: Some(kept)
+            }
+        );
+        assert_eq!(
+            phase(&ready(&["n1", "n2"], &[])),
+            ForkPhase::Ready { holders: None }
+        );
+    }
 }
