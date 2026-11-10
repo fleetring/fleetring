@@ -269,6 +269,11 @@ async fn fetch(inner: &Arc<Inner>, plan: &SeedPlan) -> Result<(Sidecar, Reservat
         .forks
         .admit(&plan.key, total)
         .map_err(Fetch::Refused)?;
+    inner
+        .forks
+        .faults()
+        .pass(FaultPoint::Admitted, plan.key.fork.operation)
+        .await;
     let incoming = inner.forks.store().incoming(&plan.key);
     let staged = receive(inner, plan, &from, first, &mut chunks, total, &incoming).await;
     if staged.is_err() {

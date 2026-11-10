@@ -151,7 +151,7 @@ jobs:
       - name: simulation (fixed seeds)
         env:
           RUSTFLAGS: --cfg tokio_unstable
-        run: cargo test -p fleetringd --features simulation --test sim --no-fail-fast
+        run: cargo test -p fleetringd --features simulation,fault-hooks --test sim --no-fail-fast
 
   statistics:
     name: statistical suite (release)
@@ -168,7 +168,9 @@ jobs:
 
   # The simulation harness's fixed seeds (FR-024, ADR-0020). `--cfg tokio_unstable` lets turmoil
   # seed Tokio's scheduler, so each seed must replay its trace exactly, simulated times included.
-  # The test jobs above run the same tests without it, comparing event order only.
+  # The test jobs above run the same tests without it, comparing event order only. The fork
+  # matrix (FR-087) holds data nodes' fork work at each seeding step with the fault hooks, so
+  # this job enables them; it runs every row at every step on one fixed seed.
   simulation:
     name: simulation (fixed seeds)
     if: github.event_name != 'push'
@@ -182,7 +184,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo test -p fleetringd --features simulation --test sim --no-fail-fast
+      - run: cargo test -p fleetringd --features simulation,fault-hooks --test sim --no-fail-fast
 
   # The router's conformance with the `libsql` crate's remote client (FR-066): a crate outside
   # the workspace, with its own lock file, so that `libsql`'s tree stays out of every other job.

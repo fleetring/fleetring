@@ -16,6 +16,7 @@ mod fleet;
 mod fork;
 mod history;
 mod membership;
+mod membership_lag;
 mod observe;
 mod replication;
 mod router;

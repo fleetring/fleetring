@@ -27,6 +27,9 @@ pub enum FaultPoint {
     /// A source's primary has pinned the source for a fork's seeder and hasn't sent the copy's
     /// first chunk yet: held, the seeder's stream is open and the pin is held.
     Streaming,
+    /// A node has admitted a fork's copy on its disk, reserving room for it, and hasn't received
+    /// its bytes yet.
+    Admitted,
     /// A node has committed a staged copy to disk and hasn't made it known yet: heartbeats
     /// don't report it, and peers can't fetch it.
     Staged,

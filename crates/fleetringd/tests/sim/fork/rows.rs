@@ -151,7 +151,7 @@ fn source_recreated(seed: u64, point: Point) -> Result<()> {
     }])?;
     run.traffic.count_from(1_000_000);
     run.traffic.create(source.clone(), 3);
-    run.await_writes(&source, 10)?;
+    run.await_more_writes(&source, 10)?;
     run.release(point.hook(), operation)?;
     let expected = if point.is_seeding() {
         Expected::Failed

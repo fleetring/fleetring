@@ -667,12 +667,13 @@ fn staged(fleet: &Fleet, target: &DatabaseName) -> bool {
 }
 
 /// Row 21: two concurrent forks of two replicas each compete for one node's free space, room
-/// for one copy and a half. It admits one and refuses the other, which fails for want of disk,
-/// since its completion needs both its replicas (disk admission, ADR-0046 point 7.1).
+/// for one copy and a half: the second asks while the first is admitted and its bytes haven't
+/// landed. The node admits one and refuses the other, which fails for want of disk, since its
+/// completion needs both its replicas (disk admission, ADR-0046 point 7.1).
 fn disk_competition(seed: u64, point: Point) -> Result<()> {
     let _ = point;
     let setup = Setup {
-        pad: Some(3 * 1024 * 1024),
+        pad: Some(256 * 1024),
         ..Setup::default()
     };
     let mut run = Run::start(seed, &setup)?;
@@ -702,15 +703,17 @@ fn disk_competition(seed: u64, point: Point) -> Result<()> {
             staged(fleet, &a) && staged(fleet, &b)
         })?;
     hooks.set_disk(estimate * 16 / 10, 1 << 30);
-    for seeder in [run.seeder(op_a)?, run.seeder(op_b)?] {
-        if seeder != node {
-            run.fleet
-                .set_latency(&seeder, &node, Duration::from_millis(30))?;
-        }
-    }
     run.fleet.fork_expectations().limit_copies(node.parse()?, 1);
+    // The first copy is admitted and its bytes haven't landed when the second asks.
+    hooks.hold_operation(FaultPoint::Admitted, op_a);
+    let before = hooks.arrivals(FaultPoint::Admitted);
     hooks.release_operation(FaultPoint::Fetch, op_a);
+    run.fleet.run_until(LIMIT, "the first copy admitted", |_| {
+        hooks.arrivals(FaultPoint::Admitted) > before
+    })?;
     hooks.release_operation(FaultPoint::Fetch, op_b);
+    run.wait(Duration::from_secs(2))?;
+    hooks.release_operation(FaultPoint::Admitted, op_a);
     run.fleet
         .fork_expectations()
         .expect(op_a, Expected::Terminal);
