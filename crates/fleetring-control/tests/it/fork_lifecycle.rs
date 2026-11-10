@@ -424,6 +424,71 @@ fn a_ring_change_after_the_report_blocks_the_release_until_a_fresh_one() {
     assert_eq!(replicas(&state, "t"), placed(&state, "t", 3));
 }
 
+/// A promotion in progress blocks the release at its own epoch, and says so: its candidate
+/// doesn't serve yet, and the primary it replaces may still count the holders alone.
+#[test]
+fn a_promotion_in_progress_blocks_the_release() {
+    let (mut state, fork, holders) = ready_with_holders();
+    let membership = state.membership_epoch();
+    run(
+        &mut state,
+        45,
+        heartbeat_of(&holders[0], vec![caught_up(&fork, 1, membership)], None),
+    )
+    .expect("hb");
+    // The primary goes quiet, and a promotion starts.
+    for node in &holders[1..] {
+        let follower = HostedReplica::new(db("t"), ReplicaRole::Follower, Position::new([4]))
+            .with_log_epoch(LeaseEpoch::new(1));
+        run(&mut state, 1_900, heartbeat_of(node, vec![follower], None)).expect("hb");
+    }
+    let started = run(
+        &mut state,
+        2_000,
+        Action::StartPromotion { database: db("t") },
+    );
+    let Ok(Applied::PromotionStarted {
+        candidate, epoch, ..
+    }) = started
+    else {
+        panic!("{started:?}");
+    };
+    run(
+        &mut state,
+        2_010,
+        heartbeat_of(
+            candidate.as_str(),
+            vec![caught_up(&fork, epoch.get(), membership)],
+            None,
+        ),
+    )
+    .expect("hb");
+    assert!(fork::actions(&state, at(2_020)).is_empty());
+    refused(
+        &mut state,
+        2_020,
+        Action::ReleaseForkHolders {
+            fork: fork.clone(),
+            epoch,
+        },
+        &Rejection::PromotionInProgress { database: db("t") },
+    );
+    // The lease it replaces is at an older epoch.
+    refused(
+        &mut state,
+        2_020,
+        Action::ReleaseForkHolders {
+            fork,
+            epoch: LeaseEpoch::new(1),
+        },
+        &Rejection::StaleEpoch {
+            database: db("t"),
+            given: LeaseEpoch::new(1),
+            current: epoch,
+        },
+    );
+}
+
 /// A ready fork's primary counts its recorded holders until it sees the fork ready, however far
 /// the ring has moved: a write it acknowledged then may sit on holders placement no longer
 /// names. So the holders stay the replica set a promotion fences, after readiness too, until

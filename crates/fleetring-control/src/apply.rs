@@ -609,7 +609,9 @@ pub enum Rejection {
         available_after: Timestamp,
     },
 
-    /// A promotion is already in progress and its candidate is live and not stalled.
+    /// A promotion is already in progress and its candidate is live and not stalled; or, for
+    /// `ReleaseForkHolders` at the promotion's epoch, a promotion is in progress at all: its
+    /// candidate doesn't serve yet (ADR-0046, point 3.10, as built).
     #[error("database '{database}' already has a promotion in progress")]
     PromotionInProgress {
         /// The database.
