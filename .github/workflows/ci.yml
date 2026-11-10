@@ -2,7 +2,8 @@
 # be bit-identical on big-endian, 32-bit, and wasm targets as well as the three major OSes
 # (ADR-0008).
 #
-# Pull requests, merge groups, and manual runs run every job. A push to `main` runs only `cache`,
+# Pull requests, merge groups, and manual runs run every job, except that a pull request that
+# changes only documentation no test reads runs none of the Rust jobs (see `changes`). A push to `main` runs only `cache`,
 # at the end of this file. The `main` ruleset merges a pull request only once every required
 # check has passed on a branch that is up to date with `main`, and merges by rebase, so the tree a
 # merge puts on `main` is the tree that pull request's CI already tested. Running the matrix again
@@ -38,9 +39,45 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  # Whether a pull request changes anything a job here builds, tests, or reads. Markdown that no
+  # test, doctest, or rustdoc reads (ADRs, plans, `docs/perf.md`, `RELEASING.md` and the like)
+  # doesn't; crate READMEs (rustdoc and the README tests), `docs/agents/` (the skill and
+  # quickstart tests), and `docs/spec/` (the reference implementation) do. Merge groups, manual
+  # runs, and a failure of this job count as changes, so a job is skipped only on a definite
+  # "no": a skipped job satisfies a required check.
+  changes:
+    name: changes
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ] && files=$(git diff --name-only "$BASE"...HEAD) && [ -n "$files" ]; then
+            code=false
+            while IFS= read -r file; do
+              case "$file" in
+                crates/*|docs/agents/*|docs/spec/*) code=true ;;
+                *.md) ;;
+                *) code=true ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   fmt:
     name: fmt
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -53,7 +90,8 @@ jobs:
 
   clippy:
     name: clippy
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -67,7 +105,8 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -80,54 +119,56 @@ jobs:
       # daemon's binary, so it needs more than the runner's free disk: drop toolchains it never
       # uses (#97).
       - name: free disk space
-        if: runner.os == 'Linux'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - if: needs.changes.outputs.code != 'false'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: needs.changes.outputs.code != 'false'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # On Windows runners the default temp directory is on C:, where an fsync takes 20-70 ms and
       # stalls for seconds every few minutes; the workspace disk takes about 0.3 ms. The
       # replication tests fsync every write, so they keep their files on the workspace disk (#54).
       - name: temp directory on the workspace disk
-        if: runner.os == 'Windows'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Windows'
         shell: bash
         run: |
           echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
           echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: all features
-        if: runner.os == 'Linux'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
         run: cargo test --workspace --all-features --no-fail-fast
       # The simulation tests are deterministic and OS-independent, and Linux already runs them in
       # three jobs, so macOS and Windows run every feature except `simulation` (ADR-0014). macOS
       # also enables the fork tests' fault hooks, so that `tests/fork.rs` runs there too.
       - name: all features except simulation
-        if: runner.os == 'macOS'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'macOS'
         run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/fault-hooks --no-fail-fast
       - name: all features except simulation and the fault hooks
-        if: runner.os == 'Windows'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Windows'
         run: cargo test --workspace --features fleetring/serde,fleetring/test-util --no-fail-fast
       # Feature combinations and the release profile don't depend on the OS, so only Linux runs
       # them; macOS and Windows run the suite once (ADR-0014).
       - name: default features
-        if: runner.os == 'Linux'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
         run: cargo test --workspace --no-fail-fast
       # Only the placement crate has default features (`std`); every other crate builds the same
       # with or without them, so running their suites again here would repeat the step above.
       - name: no default features
-        if: runner.os == 'Linux'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
         run: cargo test -p fleetring --no-default-features --no-fail-fast
       # Every feature but `fleetringd/fault-hooks`, which a build without debug assertions
       # refuses: the fork tests it enables run in the debug steps above.
       - name: all features but the fault hooks, release
-        if: runner.os == 'Linux'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
         run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-fail-fast
       # Runs every example, so a new one can't be left out. `cargo test` already builds them
       # on every OS, so running them on one is enough.
       - name: examples
-        if: runner.os == 'Linux'
+        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
         run: |
           for example in crates/fleetring/examples/*.rs; do
             cargo run -p fleetring --all-features --example "$(basename "$example" .rs)"
@@ -137,7 +178,8 @@ jobs:
   # covered above: `macos-latest` is an Apple Silicon runner.
   test-arm64:
     name: test (ubuntu-24.04-arm)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -155,7 +197,8 @@ jobs:
 
   statistics:
     name: statistical suite (release)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -173,7 +216,8 @@ jobs:
   # this job enables them; it runs every row at every step on one fixed seed.
   simulation:
     name: simulation (fixed seeds)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -190,7 +234,8 @@ jobs:
   # the workspace, with its own lock file, so that `libsql`'s tree stays out of every other job.
   router-conformance:
     name: router conformance (libsql)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -205,7 +250,8 @@ jobs:
 
   msrv:
     name: msrv (1.88)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -224,7 +270,8 @@ jobs:
 
   docs:
     name: docs
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -239,7 +286,8 @@ jobs:
 
   i686:
     name: test (i686, 32-bit)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -256,7 +304,8 @@ jobs:
   # still catch overflow, and every property runs at full strength there.
   s390x:
     name: test (s390x, big-endian)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -279,7 +328,8 @@ jobs:
 
   wasm:
     name: test (wasm32-wasip1)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -302,7 +352,8 @@ jobs:
   # vector, which shows the spec, not just the Rust crate, defines placement (FR-014).
   spec-reference:
     name: spec reference (Python)
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -317,7 +368,8 @@ jobs:
   # ship without the version bump it needs (FR-019).
   semver:
     name: semver-checks
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -332,7 +384,8 @@ jobs:
 
   deny:
     name: cargo-deny
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
