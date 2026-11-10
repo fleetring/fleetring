@@ -801,11 +801,12 @@ impl Replication {
         // One view: the ring checked is the ring the membership epoch names.
         let view = inner.membership.view();
         let ring = view.ring()?;
-        let committed = primary.committed();
+        // A primary that knows of nothing committed hasn't learned what placement must hold.
+        let committed = primary.committed()?;
         let placed = inner.write_quorum(&primary, placed_on(ring, &primary));
         let floor = usize::from(primary.role().durability.min_replicas());
-        let held = primary.quorum_held(&Quorum::over(vec![placed], floor));
-        (committed.is_none() || held >= committed).then_some((primary.role().epoch, view.epoch()))
+        let held = primary.quorum_held(&Quorum::over(vec![placed], floor))?;
+        (held >= committed).then_some((primary.role().epoch, view.epoch()))
     }
 
     /// Whether `database`'s primary has enough followers connected, live, and reporting for a
