@@ -122,15 +122,15 @@ pub struct Config {
     pub fork: ForkConfig,
 }
 
-/// The `[fork]` table: what a fork may take (ADR-0046, point 7). New in 0.8.0. Every default is
-/// provisional: FR-087 measures it, and ADR-0046 is amended with the measured value.
+/// The `[fork]` table: what a fork may take (ADR-0046, point 7). New in 0.8.0. The defaults are
+/// ADR-0046's, set from FR-087's measurements (`docs/perf.md`, "Forks").
 ///
 /// ```toml
 /// [fork]
 /// # The control node's, recorded with each fork it accepts: changing them affects new forks only.
 /// max_attempts = 5                    # attempts before a fork fails, retries exhausted
 /// deadline_ms = 3600000               # how long a fork may stay seeding
-/// attempt_timeout_ms = 1800000        # how long one attempt may run before the next starts
+/// attempt_timeout_ms = 1200000        # how long one attempt may run before the next starts
 /// seeder_timeout_ms = 120000          # how long a seeder may be down before the next attempt
 /// operation_retention_ms = 604800000  # how long an operation's record outlives its outcome
 /// # Each data node's.
@@ -143,7 +143,7 @@ pub struct Config {
 /// max_pins_per_database = 1           # pins of one source database at once
 /// max_seeds_per_node = 2              # staged copies a node downloads at once
 /// admission_min_free_bytes = 1073741824  # free bytes a copy must leave, at least
-/// admission_min_free_percent = 5      # free share of the volume a copy must leave, at least
+/// admission_min_free_percent = 1      # free share of the volume a copy must leave, at least
 /// ```
 ///
 /// A pin past `max_pin_ms` or `max_pin_wal_bytes` ends its stream with `ABORTED` and is released:
@@ -153,7 +153,7 @@ pub struct Config {
 /// copy only with room for it and a tenth more beside the larger of `admission_min_free_bytes`
 /// and `admission_min_free_percent` of its volume; the control node's best-effort check counts
 /// its own `admission_min_free_bytes`, which it records with each fork. `fleetring dev` writes a
-/// small margin, since a laptop's disk is rarely 95% free. The control node's cap on fork
+/// small margin, since a laptop's disk is often nearly full. The control node's cap on fork
 /// operations it keeps, 10,000, is fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -201,10 +201,10 @@ pub struct ForkConfig {
     pub admission_min_free_percent: u8,
 }
 
-/// The `[fork]` defaults of ADR-0046, point 7, all provisional.
+/// The `[fork]` defaults of ADR-0046, point 7, as FR-087's measurements set them.
 const DEFAULT_FORK_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).expect("5 is nonzero");
 const DEFAULT_FORK_DEADLINE: NonZeroU64 = NonZeroU64::new(60 * 60 * 1_000).expect("nonzero");
-const DEFAULT_FORK_ATTEMPT_TIMEOUT: NonZeroU64 = NonZeroU64::new(30 * 60 * 1_000).expect("nonzero");
+const DEFAULT_FORK_ATTEMPT_TIMEOUT: NonZeroU64 = NonZeroU64::new(20 * 60 * 1_000).expect("nonzero");
 const DEFAULT_FORK_SEEDER_TIMEOUT: NonZeroU64 = NonZeroU64::new(2 * 60 * 1_000).expect("nonzero");
 const DEFAULT_FORK_OPERATION_RETENTION: NonZeroU64 =
     NonZeroU64::new(7 * 24 * 60 * 60 * 1_000).expect("nonzero");
@@ -218,7 +218,7 @@ const DEFAULT_FORK_MAX_PINS_PER_NODE: NonZeroUsize = NonZeroUsize::new(2).expect
 const DEFAULT_FORK_MAX_PINS_PER_DATABASE: NonZeroUsize = NonZeroUsize::new(1).expect("nonzero");
 const DEFAULT_FORK_MAX_SEEDS_PER_NODE: NonZeroUsize = NonZeroUsize::new(2).expect("nonzero");
 const DEFAULT_FORK_ADMISSION_MIN_FREE_BYTES: u64 = 1 << 30;
-const DEFAULT_FORK_ADMISSION_MIN_FREE_PERCENT: u8 = 5;
+const DEFAULT_FORK_ADMISSION_MIN_FREE_PERCENT: u8 = 1;
 
 impl ForkConfig {
     /// The limits the control node records with each fork it accepts (ADR-0046, point 3.1).
@@ -1489,6 +1489,9 @@ mod tests {
         assert_eq!(defaults.fork.max_pins_per_node.get(), 2);
         assert_eq!(defaults.fork.max_pins_per_database.get(), 1);
         assert_eq!(defaults.fork.max_seeds_per_node.get(), 2);
+        assert_eq!(defaults.fork.attempt_timeout_ms.get(), 20 * 60 * 1_000);
+        assert_eq!(defaults.fork.admission_min_free_bytes, 1 << 30);
+        assert_eq!(defaults.fork.admission_min_free_percent, 1);
 
         let set = with(
             "\n[fork]\nmax_attempts = 2\ndeadline_ms = 9000\nattempt_timeout_ms = 3000\n\

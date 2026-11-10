@@ -2151,7 +2151,7 @@ const DEV_MARGIN: &str = "admission_min_free_bytes = 67108864\nadmission_min_fre
 const LAPTOP: (u64, u64) = (512 << 20, 926 << 30);
 
 /// A dev node's small disk margin admits a small fork on a nearly full laptop disk, which the
-/// default margin, max(1 GiB, 5% of the volume), refuses (ADR-0046, point 7).
+/// default margin, max(1 GiB, 1% of the volume), refuses (ADR-0046, point 7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dev_nodes_margin_admits_a_small_fork_the_default_refuses() -> TestResult {
     let dir = tempfile::tempdir()?;
