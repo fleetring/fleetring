@@ -118,6 +118,7 @@ mod database;
 pub mod fork;
 mod member;
 mod metadata;
+pub mod mutation;
 mod revocation;
 mod software;
 mod state;

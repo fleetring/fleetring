@@ -115,6 +115,7 @@ pub(super) async fn run_client(
                     execute(
                         &client,
                         node.as_ref(),
+                        &nodes,
                         &network,
                         &shared,
                         via.as_ref(),
@@ -160,6 +161,17 @@ struct NodeClients {
 }
 
 impl NodeClients {
+    /// A network that presents `node`'s certificate from the fleet's authority.
+    fn network_of(&self, node: &NodeId) -> Network {
+        let issued = self
+            .authority
+            .issue_node(node, &[node.to_string()], certificate_validity())
+            .unwrap_or_else(|error| panic!("can't issue a certificate for node {node}: {error}"));
+        let identity = Identity::from_issued(self.authority.certificate_pem(), &issued)
+            .unwrap_or_else(|error| panic!("can't load the certificate of node {node}: {error}"));
+        Network::simulated().with_security(Security::Tls(identity))
+    }
+
     /// The client for the node `operation` acts as, if it is a node's call.
     fn for_operation(&mut self, operation: &Operation) -> Option<ControlClient> {
         let node = match operation {
@@ -196,6 +208,7 @@ impl NodeClients {
 async fn execute(
     data: &Client,
     node: Option<&ControlClient>,
+    nodes: &NodeClients,
     network: &Network,
     shared: &Shared,
     via: Option<&Via>,
@@ -272,11 +285,13 @@ async fn execute(
             target,
             operation,
             replication_factor,
+            expect_source_incarnation,
         } => {
             let mut spec = ForkSpec::new(*operation);
             spec.database.replication_factor = u8::try_from(*replication_factor)
                 .ok()
                 .and_then(ReplicationFactor::new);
+            spec.expect_source_incarnation = *expect_source_incarnation;
             data.fork_database(source, target, &spec)
                 .await
                 .map(|status| Ack::Forked {
@@ -295,6 +310,15 @@ async fn execute(
         Operation::Leave { node } => {
             return submit(shared, Action::Leave { id: node.clone() }, Ack::Left).await;
         }
+        Operation::Drop { database } => data.drop_database(database).await.map(|_| Ack::Dropped),
+        Operation::Propose { action } => return propose(shared, (**action).clone()).await,
+        Operation::SeedingProbe {
+            to,
+            as_node,
+            request,
+        } => return Outcome::Acknowledged(seeding_probe(nodes, to, as_node, request).await),
+        Operation::Pad { database, bytes } => pad(data, database, *bytes).await,
+        Operation::Watch { database } => watch(data, database).await,
         Operation::Drain { node } => {
             return submit(shared, Action::Drain { id: node.clone() }, Ack::Draining).await;
         }
@@ -696,4 +720,112 @@ fn channel(network: &Network, target: &NodeId) -> Result<tonic::transport::Chann
     network
         .channel(&format!("{target}:{PORT}"))
         .map_err(|error| tonic::Status::unavailable(error.to_string()))
+}
+
+/// Submits `action` to the control node in process, as its fork driver would propose it, and
+/// says whether `apply` accepted it.
+async fn propose(shared: &Shared, action: Action) -> Outcome {
+    let Some(control) = shared.control_handle() else {
+        return Outcome::Indeterminate {
+            code: Some(tonic::Code::Unavailable),
+        };
+    };
+    match control.submit(action).await {
+        Ok(committed) => Outcome::Acknowledged(Ack::Proposed {
+            accepted: committed.into_outcome().is_ok(),
+        }),
+        Err(_) => Outcome::Indeterminate {
+            code: Some(tonic::Code::Unavailable),
+        },
+    }
+}
+
+/// Sends the seeding `Snapshot` `request` to `to` with `as_node`'s certificate, and returns how
+/// `to` answered: [`Ack::Served`] if it began a stream, else [`Ack::Refused`].
+async fn seeding_probe(
+    nodes: &NodeClients,
+    to: &NodeId,
+    as_node: &NodeId,
+    request: &crate::sim::workload::SeedingProbe,
+) -> Ack {
+    let message = SnapshotRequest {
+        database: request.database.to_string(),
+        epoch: 0,
+        fork: Some(request.fork.name.to_string()),
+        fork_incarnation: request.fork.incarnation.get(),
+        operation: crate::control::fork::operation_to_proto(request.fork.operation),
+        fork_attempt: request.attempt,
+        source_incarnation: request.source_incarnation.get(),
+        staged: request.staged,
+    };
+    let network = nodes.network_of(as_node);
+    let answer = match channel(&network, to) {
+        Ok(channel) => replication_client(channel)
+            .snapshot(message)
+            .await
+            .map(drop),
+        Err(status) => Err(status),
+    };
+    match answer {
+        Ok(()) => Ack::Served,
+        Err(status) => Ack::Refused {
+            code: status.code(),
+            binding: refused_binding(&status).map(str::to_owned),
+        },
+    }
+}
+
+/// Writes `bytes` bytes of padding to `database`, in a table of its own.
+async fn pad(client: &Client, database: &DatabaseName, bytes: u32) -> Result<Ack, tonic::Status> {
+    client
+        .execute(
+            database,
+            Statement::new("CREATE TABLE IF NOT EXISTS padding (bytes BLOB)"),
+        )
+        .await?;
+    client
+        .execute(
+            database,
+            Statement::with_params(
+                "INSERT INTO padding (bytes) VALUES (zeroblob(?))",
+                [Value::Integer(i64::from(bytes))],
+            ),
+        )
+        .await?;
+    Ok(Ack::Padded)
+}
+
+/// How long a [`Operation::Watch`] follows a database's changes.
+const WATCH_FOR: Duration = Duration::from_millis(300);
+
+/// Watches `database`'s recorded changes from the log's beginning for [`WATCH_FOR`], and returns
+/// the values of the rows it saw inserted into the writes table.
+async fn watch(client: &Client, database: &DatabaseName) -> Result<Ack, tonic::Status> {
+    let mut updates = client.watch_changes(database, None).await?;
+    let mut values = Vec::new();
+    let deadline = tokio::time::Instant::now() + WATCH_FOR;
+    loop {
+        let next = tokio::time::timeout_at(deadline, updates.next()).await;
+        match next {
+            Err(_) | Ok(Ok(None)) => break,
+            Ok(Err(status)) if values.is_empty() => return Err(status),
+            Ok(Err(_)) => break,
+            Ok(Ok(Some(crate::data::ChangeUpdate::Transaction(transaction)))) => {
+                for change in &transaction.changes {
+                    if change.table != WRITES_TABLE {
+                        continue;
+                    }
+                    let value = change.values().iter().find_map(|column| {
+                        match (column.name.as_str(), &column.value) {
+                            ("value", Value::Integer(value)) => Some(*value),
+                            _ => None,
+                        }
+                    });
+                    values.extend(value);
+                }
+            }
+            Ok(Ok(Some(_))) => {}
+        }
+    }
+    Ok(Ack::Watched { values })
 }

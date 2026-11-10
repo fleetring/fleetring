@@ -1,15 +1,17 @@
 //! One simulated host's lifecycle, and the state hosts and clients share with the test.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fleetring_control::{Liveness, Timestamp};
 use tokio::sync::watch;
 
-use crate::clock::SimClock;
+use crate::clock::{Clock, SimClock};
 use crate::control::ControlHandle;
 use crate::durability::ObjectStore;
 use crate::observe::Metrics;
+use crate::replication::ForkFaults;
 use crate::replication::Replication;
 use crate::router::{Router, RouterConfig};
 use crate::sim::rng::SimEntropy;
@@ -30,6 +32,26 @@ pub(super) enum WorkloadState {
 #[derive(Debug, Clone, Default)]
 pub(super) struct Shared {
     inner: Arc<Mutex<Inner>>,
+    /// How far every host's clock is set ahead of simulated time, in milliseconds.
+    clock_shift: Arc<AtomicU64>,
+}
+
+/// A host's clock: simulated time, set ahead by the fleet's shift ([`Shared::shift_clocks`]).
+#[derive(Debug, Clone)]
+struct ShiftedClock {
+    inner: SimClock,
+    shift: Arc<AtomicU64>,
+}
+
+impl Clock for ShiftedClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::from_millis(
+            self.inner
+                .now()
+                .as_millis()
+                .saturating_add(self.shift.load(Ordering::SeqCst)),
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +85,22 @@ impl Shared {
     pub(super) fn record(&self, source: &str, kind: EventKind) {
         let at = turmoil::sim_elapsed().unwrap_or_default();
         self.lock().trace.push(Event::new(at, source, kind));
+    }
+
+    /// Sets every host's clock `by` further ahead of simulated time, as if that much time had
+    /// passed between two steps.
+    /// Returns how far ahead the clocks are then, in milliseconds.
+    pub(super) fn shift_clocks(&self, by: std::time::Duration) -> u64 {
+        let by = millis(by);
+        self.clock_shift.fetch_add(by, Ordering::SeqCst) + by
+    }
+
+    fn clock(&self) -> ShiftedClock {
+        let elapsed = turmoil::sim_elapsed().unwrap_or_default();
+        ShiftedClock {
+            inner: SimClock::new(Timestamp::from_millis(millis(elapsed))),
+            shift: Arc::clone(&self.clock_shift),
+        }
     }
 
     pub(super) fn control_handle(&self) -> Option<ControlHandle> {
@@ -124,19 +162,25 @@ pub(super) async fn run_host(
     identity: Identity,
     seed: u64,
     shared: Shared,
+    faults: ForkFaults,
 ) -> turmoil::Result {
     let mut stop = shared
         .stop_signal(&name)
         .ok_or_else(|| format!("no stop signal for {name}"))?;
     let elapsed = turmoil::sim_elapsed().unwrap_or_default();
-    let clock = SimClock::new(Timestamp::from_millis(millis(elapsed)));
-    let mut environment = Environment::simulated(clock)
+    let mut environment = Environment::simulated(shared.clock())
         .with_network(Network::simulated().with_security(Security::Tls(identity)))
         .with_entropy(Arc::new(SimEntropy::new(seed ^ millis(elapsed))));
     let stores = shared.lock().object_stores.clone();
     for (archive, store) in stores {
         environment = environment.with_object_store(archive, store);
     }
+    #[cfg(feature = "fault-hooks")]
+    {
+        environment = environment.with_fork_faults(faults);
+    }
+    #[cfg(not(feature = "fault-hooks"))]
+    drop(faults);
     let daemon = Daemon::start_with(config, environment).await?;
     let membership = daemon.membership();
     shared.lock().running.insert(

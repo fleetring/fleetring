@@ -24,6 +24,9 @@ pub enum FaultPoint {
     /// A node is about to ask for a copy of a fork: the seeder from the source's primary, or a
     /// peer from the seeder.
     Fetch,
+    /// A source's primary has pinned the source for a fork's seeder and hasn't sent the copy's
+    /// first chunk yet: held, the seeder's stream is open and the pin is held.
+    Streaming,
     /// A node has committed a staged copy to disk and hasn't made it known yet: heartbeats
     /// don't report it, and peers can't fetch it.
     Staged,
@@ -86,8 +89,9 @@ struct Hooks {
     held: watch::Sender<BTreeSet<(FaultPoint, Scope)>>,
     /// How many times work has arrived at each point while it was held.
     arrived: watch::Sender<BTreeMap<FaultPoint, u64>>,
-    /// How many times work has passed each point, held or not.
-    passed: std::sync::Mutex<BTreeMap<FaultPoint, u64>>,
+    /// How many times work has passed each point, held or not, for all forks or one
+    /// operation's.
+    passed: std::sync::Mutex<BTreeMap<(FaultPoint, Scope), u64>>,
     /// The free space and the size of the node's data volume the node believes it has, in
     /// bytes, less what its data directory grows by from then on, in place of the volume's own.
     disk: std::sync::Mutex<Option<(u64, u64)>>,
@@ -160,9 +164,27 @@ impl ForkFaults {
                 .passed
                 .lock()
                 .expect("fault hooks lock poisoned")
-                .get(&point)
-                .copied()
-                .unwrap_or(0)
+                .iter()
+                .filter(|((passed, _), _)| *passed == point)
+                .map(|(_, count)| *count)
+                .sum()
+        })
+    }
+
+    /// How many times work has passed each point, held or not, by point and by the fork
+    /// operation it belonged to, if it belonged to one.
+    #[must_use]
+    pub fn passes_by_operation(&self) -> BTreeMap<(FaultPoint, Option<OperationId>), u64> {
+        self.hooks.as_ref().map_or_else(BTreeMap::new, |hooks| {
+            hooks
+                .passed
+                .lock()
+                .expect("fault hooks lock poisoned")
+                .iter()
+                .map(|((point, scope), count)| {
+                    ((*point, scope.map(OperationId::from_bytes)), *count)
+                })
+                .collect()
         })
     }
 
@@ -220,13 +242,13 @@ impl ForkFaults {
     async fn pass_scoped(&self, point: FaultPoint, operation: Option<OperationId>) {
         #[cfg(feature = "fault-hooks")]
         if let Some(hooks) = &self.hooks {
+            let scope = operation.map(|operation| operation.to_bytes());
             *hooks
                 .passed
                 .lock()
                 .expect("fault hooks lock poisoned")
-                .entry(point)
+                .entry((point, scope))
                 .or_default() += 1;
-            let scope = operation.map(|operation| operation.to_bytes());
             let applies = |held: &BTreeSet<(FaultPoint, Scope)>| {
                 held.contains(&(point, None)) || held.contains(&(point, scope))
             };

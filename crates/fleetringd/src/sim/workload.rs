@@ -17,10 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{DatabaseName, Feature, HostedReplica, Incarnation, LeaseEpoch};
+use fleetring_control::fork::ForkIdentity;
+use fleetring_control::{Action, DatabaseName, Feature, HostedReplica, Incarnation, LeaseEpoch};
 use tonic::Code;
 
+use crate::replication::FaultPoint;
 use crate::sim::SimRng;
+use crate::sim::check::ReplicaRows;
 use crate::sim::history::DurabilityMode;
 
 /// One operation a client sends to the fleet.
@@ -74,6 +77,46 @@ pub enum Operation {
         operation: fleetring_control::fork::OperationId,
         /// How many replicas the fork should have.
         replication_factor: u32,
+        /// The source incarnation the caller requires, or `None` for the current one.
+        expect_source_incarnation: Option<Incarnation>,
+    },
+    /// Drops `database` through the control plane, as `db drop` does: a fork that isn't ready
+    /// is cancelled (ADR-0046, point 3.8).
+    Drop {
+        /// The database.
+        database: DatabaseName,
+    },
+    /// Submits `action` to the control node in process, as its own fork driver would propose
+    /// it: how a scenario delivers a delayed proposal, such as one for a fork identity that was
+    /// dropped since (ADR-0046, point 12, row 18).
+    Propose {
+        /// The proposal.
+        action: Box<Action>,
+    },
+    /// Sends a seeding `Snapshot` request to `to` with `as_node`'s node certificate, as a fork's
+    /// seeder or replica would (ADR-0046, points 4.1 and 4.4), and records whether `to` served
+    /// it or refused it: how a scenario delivers a request of a dropped fork identity.
+    SeedingProbe {
+        /// The node asked.
+        to: NodeId,
+        /// The node the request comes from.
+        as_node: NodeId,
+        /// What it asks for.
+        request: SeedingProbe,
+    },
+    /// Adds `bytes` bytes of padding to `database` in one write, in a table of its own, so that
+    /// its copy streams in several chunks. The history checker ignores it.
+    Pad {
+        /// The database.
+        database: DatabaseName,
+        /// How many bytes.
+        bytes: u32,
+    },
+    /// Watches `database`'s recorded changes from the log's beginning, as `db watch` does, for a
+    /// moment, and records the values of the [`WRITES_TABLE`] rows it saw inserted.
+    Watch {
+        /// The database.
+        database: DatabaseName,
     },
     /// Removes `node`, as an operator on the control host would: it is submitted to the control
     /// node in process, not through the `Leave` RPC a node calls when it shuts down.
@@ -207,13 +250,20 @@ impl Operation {
             | Self::ImpostorReplicate { database, .. }
             | Self::ImpostorFence { database, .. }
             | Self::ImpostorSnapshot { database, .. } => Some(database),
-            Self::Fork { target, .. } => Some(target),
+            Self::Fork { target, .. }
+            | Self::Drop { database: target }
+            | Self::Pad {
+                database: target, ..
+            }
+            | Self::Watch { database: target } => Some(target),
             Self::Join { .. }
             | Self::JoinWith { .. }
             | Self::Report { .. }
             | Self::Heartbeat { .. }
             | Self::Leave { .. }
-            | Self::Drain { .. } => None,
+            | Self::Drain { .. }
+            | Self::Propose { .. }
+            | Self::SeedingProbe { .. } => None,
         }
     }
 }
@@ -250,10 +300,26 @@ impl fmt::Display for Operation {
                 target,
                 operation,
                 replication_factor,
-            } => write!(
-                f,
-                "fork {source} as {target} rf {replication_factor} operation {operation}"
-            ),
+                expect_source_incarnation,
+            } => {
+                write!(
+                    f,
+                    "fork {source} as {target} rf {replication_factor} operation {operation}"
+                )?;
+                if let Some(incarnation) = expect_source_incarnation {
+                    write!(f, " expecting {incarnation}")?;
+                }
+                Ok(())
+            }
+            Self::Drop { database } => write!(f, "drop {database}"),
+            Self::Propose { action } => write!(f, "propose {action:?}"),
+            Self::SeedingProbe {
+                to,
+                as_node,
+                request,
+            } => write!(f, "seeding probe to {to} as {as_node}: {request}"),
+            Self::Pad { database, bytes } => write!(f, "pad {database} with {bytes} bytes"),
+            Self::Watch { database } => write!(f, "watch {database}"),
             Self::Leave { node } => write!(f, "leave {node}"),
             Self::Drain { node } => write!(f, "drain {node}"),
             Self::CreateDatabase {
@@ -493,6 +559,21 @@ pub enum Ack {
         /// The fork's incarnation.
         incarnation: Incarnation,
     },
+    /// The database was dropped.
+    Dropped,
+    /// The control node took a proposal: applied it, or refused it with a rejection that left
+    /// its state as it was.
+    Proposed {
+        /// Whether `apply` accepted it.
+        accepted: bool,
+    },
+    /// The padding was written.
+    Padded,
+    /// What a watch saw: the values of the rows it saw inserted into the [`WRITES_TABLE`].
+    Watched {
+        /// The values, in the order seen.
+        values: Vec<i64>,
+    },
 }
 
 impl fmt::Display for Ack {
@@ -546,6 +627,11 @@ impl fmt::Display for Ack {
             } => write!(f, "refused {code:?}"),
             Self::Served => f.write_str("served"),
             Self::Forked { incarnation } => write!(f, "forked at incarnation {incarnation}"),
+            Self::Dropped => f.write_str("dropped"),
+            Self::Proposed { accepted: true } => f.write_str("proposal accepted"),
+            Self::Proposed { accepted: false } => f.write_str("proposal refused"),
+            Self::Padded => f.write_str("padded"),
+            Self::Watched { values } => write!(f, "watched {} inserts", values.len()),
             Self::Read { values } => {
                 const SHOWN: usize = 6;
                 write!(f, "read {} values", values.len())?;
@@ -844,6 +930,9 @@ pub struct History {
     records: Vec<Record>,
     pending: BTreeMap<OperationId, Pending>,
     leases: Vec<LeaseObservation>,
+    fork_passes: Vec<ForkPass>,
+    fork_transitions: Vec<ForkTransition>,
+    clock_shifts: Vec<(Duration, u64)>,
 }
 
 impl History {
@@ -986,6 +1075,85 @@ impl History {
     #[must_use]
     pub fn lease_observations(&self) -> &[LeaseObservation] {
         &self.leases
+    }
+
+    /// Records that a data host's fork work passed a fault hook.
+    pub fn observe_fork_pass(&mut self, pass: ForkPass) {
+        self.fork_passes.push(pass);
+    }
+
+    /// Returns every pass of a data host's fork work through a fault hook the fleet saw, in the
+    /// order it saw them.
+    #[must_use]
+    pub fn fork_passes(&self) -> &[ForkPass] {
+        &self.fork_passes
+    }
+
+    /// Records that every host's clock was set ahead, at `at`, to `total` milliseconds ahead of
+    /// simulated time in all.
+    pub fn observe_clock_shift(&mut self, at: Duration, total: u64) {
+        self.clock_shifts.push((at, total));
+    }
+
+    /// Returns each time the hosts' clocks were set ahead, with how far ahead they were then.
+    #[must_use]
+    pub fn clock_shifts(&self) -> &[(Duration, u64)] {
+        &self.clock_shifts
+    }
+
+    /// Records that a fork's phase changed in control state.
+    pub fn observe_fork_transition(&mut self, transition: ForkTransition) {
+        self.fork_transitions.push(transition);
+    }
+
+    /// Returns every change of a fork's phase the fleet saw in control state, in order.
+    #[must_use]
+    pub fn fork_transitions(&self) -> &[ForkTransition] {
+        &self.fork_transitions
+    }
+
+    /// The databases a client asked to drop during the run, whatever the answer.
+    #[must_use]
+    pub fn dropped(&self) -> BTreeSet<DatabaseName> {
+        self.records
+            .iter()
+            .map(|record| &record.operation)
+            .chain(self.pending.values().map(|pending| &pending.operation))
+            .filter_map(|operation| match operation {
+                Operation::Drop { database } => Some(database.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// This history without any operation on the databases in `names`: for the checkers that
+    /// assume a name means one database for the whole run, when a scenario drops some.
+    #[must_use]
+    pub fn without_databases(&self, names: &BTreeSet<DatabaseName>) -> Self {
+        let kept = |operation: &Operation| {
+            operation
+                .database()
+                .is_none_or(|name| !names.contains(name))
+        };
+        Self {
+            next_id: self.next_id,
+            records: self
+                .records
+                .iter()
+                .filter(|record| kept(&record.operation))
+                .cloned()
+                .collect(),
+            pending: self
+                .pending
+                .iter()
+                .filter(|(_, pending)| kept(&pending.operation))
+                .map(|(id, pending)| (*id, pending.clone()))
+                .collect(),
+            leases: self.leases.clone(),
+            fork_passes: self.fork_passes.clone(),
+            fork_transitions: self.fork_transitions.clone(),
+            clock_shifts: self.clock_shifts.clone(),
+        }
     }
 
     /// Returns how many operations finished.
@@ -1480,6 +1648,241 @@ impl Workload for CreateAndWrite {
             }
             (Operation::Write { database, value }, Outcome::Acknowledged(_)) => {
                 self.last_acknowledged = Some((database.clone(), *value));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a [`Operation::SeedingProbe`] asks for: a fork's copy, from the source's primary, or,
+/// `staged`, from the attempt's seeder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedingProbe {
+    /// The fork identity the request names.
+    pub fork: ForkIdentity,
+    /// The attempt it names.
+    pub attempt: u32,
+    /// The database it asks for: the source, or the fork for a staged copy.
+    pub database: DatabaseName,
+    /// The source incarnation it names.
+    pub source_incarnation: Incarnation,
+    /// Whether it asks a seeder for its staged copy.
+    pub staged: bool,
+}
+
+impl fmt::Display for SeedingProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.staged { "staged copy" } else { "source" };
+        write!(
+            f,
+            "{kind} {} for {} attempt {}",
+            self.database, self.fork, self.attempt
+        )
+    }
+}
+
+/// A data host's fork work passing a fault hook, as the fleet saw it after a step: the hooks
+/// count passes, so `count` passes happened by `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkPass {
+    /// When the fleet saw it.
+    pub at: Duration,
+    /// The data host.
+    pub host: String,
+    /// The hook.
+    pub point: FaultPoint,
+    /// The fork operation the work belonged to, if any.
+    pub operation: Option<fleetring_control::fork::OperationId>,
+    /// How many passes the host's hooks had counted by then, for the point and operation.
+    pub count: u64,
+}
+
+/// A fork's phase in control state, as [`ForkTransition`] records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ForkPhaseKind {
+    /// Seeding.
+    Seeding,
+    /// Seeded: its holders are its replica set.
+    Seeded,
+    /// Ready, its holders kept as its replica set.
+    ReadyKept,
+    /// Ready, its holders released: it follows placement.
+    Released,
+    /// Failed.
+    Failed,
+}
+
+/// A change of a fork's phase in control state, as the fleet saw it after a step, with its
+/// replica set then and every data host's rows of it, read from disk then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkTransition {
+    /// When the fleet saw it.
+    pub at: Duration,
+    /// The fork.
+    pub identity: ForkIdentity,
+    /// The phase it moved to.
+    pub phase: ForkPhaseKind,
+    /// Its replica set in that phase: the holders, or placement once released.
+    pub replica_set: Vec<NodeId>,
+    /// Each data host's rows of the fork's writes table then.
+    pub rows: ReplicaRows,
+}
+
+/// How long a [`Traffic`] client waits between operations, at most, in milliseconds.
+const TRAFFIC_PAUSE_MS: u64 = 25;
+
+/// What a [`Traffic`] workload does, shared with its [`TrafficHandle`].
+#[derive(Debug, Default)]
+struct TrafficState {
+    /// Databases still to create through the data plane, with their replication factors.
+    creating: VecDeque<(DatabaseName, u32)>,
+    /// The databases it writes to and reads, in turn.
+    targets: Vec<DatabaseName>,
+    next_target: usize,
+    next_value: i64,
+    stopped: bool,
+    pause: bool,
+    /// The values acknowledged so far, by database.
+    acknowledged: BTreeMap<DatabaseName, usize>,
+}
+
+/// Writes continuously to a changing set of databases, with reads between: FR-087's workload,
+/// which writes to a fork's source, forks it, and keeps writing to both.
+///
+/// It creates the databases it is given through the data plane first, then writes the next
+/// value, unique across every database, to each target in turn, one operation in four a read of
+/// every value instead. A write is sent once, whatever its outcome. A [`TrafficHandle`] adds and
+/// removes targets while it runs, and stops it.
+#[derive(Debug, Clone, Default)]
+pub struct Traffic {
+    state: Arc<Mutex<TrafficState>>,
+}
+
+/// Steers a running [`Traffic`] workload.
+#[derive(Debug, Clone)]
+pub struct TrafficHandle {
+    state: Arc<Mutex<TrafficState>>,
+}
+
+impl Traffic {
+    /// Traffic that creates each of `databases` with its replication factor, then writes to
+    /// them, its values counting from `first_value`. Returns the handle that steers it too.
+    #[must_use]
+    pub fn new(
+        databases: impl IntoIterator<Item = (DatabaseName, u32)>,
+        first_value: i64,
+    ) -> (Self, TrafficHandle) {
+        let creating: VecDeque<(DatabaseName, u32)> = databases.into_iter().collect();
+        let state = Arc::new(Mutex::new(TrafficState {
+            targets: creating.iter().map(|(name, _)| name.clone()).collect(),
+            creating,
+            next_value: first_value,
+            ..TrafficState::default()
+        }));
+        (
+            Self {
+                state: Arc::clone(&state),
+            },
+            TrafficHandle { state },
+        )
+    }
+}
+
+impl TrafficHandle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TrafficState> {
+        self.state.lock().expect("traffic lock poisoned")
+    }
+
+    /// Writes to and reads `database` too from now on.
+    pub fn add(&self, database: DatabaseName) {
+        let mut state = self.lock();
+        if !state.targets.contains(&database) {
+            state.targets.push(database);
+        }
+    }
+
+    /// Stops writing to and reading `database`.
+    pub fn remove(&self, database: &DatabaseName) {
+        self.lock().targets.retain(|name| name != database);
+    }
+
+    /// Creates `database` through the data plane, then writes to it too.
+    pub fn create(&self, database: DatabaseName, replication_factor: u32) {
+        let mut state = self.lock();
+        state
+            .creating
+            .push_back((database.clone(), replication_factor));
+        if !state.targets.contains(&database) {
+            state.targets.push(database);
+        }
+    }
+
+    /// Counts values from `next` on.
+    pub fn count_from(&self, next: i64) {
+        self.lock().next_value = next;
+    }
+
+    /// Stops the workload after the operation in flight.
+    pub fn stop(&self) {
+        self.lock().stopped = true;
+    }
+
+    /// Whether every database it was given has been created.
+    #[must_use]
+    pub fn created(&self) -> bool {
+        self.lock().creating.is_empty()
+    }
+
+    /// How many writes to `database` were acknowledged so far.
+    #[must_use]
+    pub fn acknowledged(&self, database: &DatabaseName) -> usize {
+        self.lock().acknowledged.get(database).copied().unwrap_or(0)
+    }
+}
+
+impl Workload for Traffic {
+    fn next(&mut self, rng: &mut SimRng) -> Step {
+        let mut state = self.state.lock().expect("traffic lock poisoned");
+        if state.stopped {
+            return Step::Done;
+        }
+        if state.pause {
+            state.pause = false;
+            return Step::Sleep(Duration::from_millis(5 + rng.below(TRAFFIC_PAUSE_MS - 5)));
+        }
+        state.pause = true;
+        if let Some((database, replication_factor)) = state.creating.front().cloned() {
+            return Step::Run(Operation::Create {
+                database,
+                replication_factor,
+                durability: DurabilityMode::Quorum,
+            });
+        }
+        if state.targets.is_empty() {
+            return Step::Sleep(Duration::from_millis(TRAFFIC_PAUSE_MS));
+        }
+        let index = state.next_target % state.targets.len();
+        state.next_target = state.next_target.wrapping_add(1);
+        let database = state.targets[index].clone();
+        if rng.chance(1, 4) {
+            return Step::Run(Operation::Read {
+                database,
+                value: None,
+            });
+        }
+        let value = state.next_value;
+        state.next_value += 1;
+        Step::Run(Operation::Write { database, value })
+    }
+
+    fn observe(&mut self, operation: &Operation, outcome: &Outcome) {
+        let mut state = self.state.lock().expect("traffic lock poisoned");
+        match (operation, outcome) {
+            (Operation::Create { database, .. }, Outcome::Acknowledged(_)) => {
+                state.creating.retain(|(name, _)| name != database);
+            }
+            (Operation::Write { database, .. }, Outcome::Acknowledged(_)) => {
+                *state.acknowledged.entry(database.clone()).or_default() += 1;
             }
             _ => {}
         }

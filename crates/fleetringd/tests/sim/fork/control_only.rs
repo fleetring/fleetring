@@ -78,6 +78,7 @@ fn scenario(seed: u64) -> TestResult {
         target: target.clone(),
         operation,
         replication_factor: 3,
+        expect_source_incarnation: None,
     };
     // Sent twice: the resend answers with the same operation.
     operator.push(fork.clone());

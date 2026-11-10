@@ -65,7 +65,10 @@ pub(super) fn reset(
     marker: &ForkMarker,
     start: Option<fleetring_wal::Position>,
 ) -> Result<Outcome, EngineError> {
-    if table_exists(writer)? && holds(writer, marker)? {
+    if table_exists(writer)?
+        && holds(writer, marker)?
+        && !fleetring_control::mutation::Mutation::UnconditionalReset.is_active()
+    {
         return Ok(Outcome::Held);
     }
     changes::clear(writer, start)?;

@@ -1,6 +1,7 @@
 //! The fork driver: what the control node proposes to move each fork on (ADR-0046, point
 //! 3.11).
 
+use crate::mutation::Mutation;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fleetring::NodeId;
@@ -100,7 +101,10 @@ fn seeding(state: &State, now: Timestamp, db: &Database, fork: &Fork) -> Option<
     };
     match state.database(fork.source()) {
         None => return Some(fail(ForkFailure::SourceGone)),
-        Some(source) if source.incarnation() != fork.source_incarnation() => {
+        Some(source)
+            if source.incarnation() != fork.source_incarnation()
+                && !Mutation::SkipSourceIncarnation.is_active() =>
+        {
             return Some(fail(ForkFailure::SourceRecreated));
         }
         Some(_) => {}
@@ -208,7 +212,8 @@ fn completion(
         let Some(staged) = report.staged().filter(|staged| {
             *staged.fork() == *identity
                 && staged.attempt() == attempt
-                && staged.source_incarnation() == fork.source_incarnation()
+                && (Mutation::SkipSourceIncarnation.is_active()
+                    || staged.source_incarnation() == fork.source_incarnation())
         }) else {
             continue;
         };

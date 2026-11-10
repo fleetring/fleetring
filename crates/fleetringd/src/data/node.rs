@@ -946,7 +946,9 @@ impl DataNode {
         // until its primary has checked its copy and, if the copy lacks the fork's marker, run
         // the fork-reset write at its bootstrap quorum (ADR-0046, point 6.2).
         let gated = matches!(lease.fork, ForkGate::Pending | ForkGate::Ready);
-        if gated {
+        let serve_at_once = lease.fork == ForkGate::Pending
+            && fleetring_control::mutation::Mutation::ServeAtSeeded.is_active();
+        if gated && !serve_at_once {
             crate::data::fork::close_unless_open(self, name, lease.epoch);
         }
         if lease.fork == ForkGate::Pending {

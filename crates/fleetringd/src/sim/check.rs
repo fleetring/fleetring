@@ -87,6 +87,30 @@ pub enum Invariant {
     /// No node deletes a copy of a database the control log never dropped or expired: every
     /// node that served such a database still holds a copy of it (ADR-0042).
     CopiesKeptUntilDropped,
+    /// (a) No lease on a fork before it is seeded, its first lease only to a holder reporting
+    /// its staged copy, completion only on a completion quorum, and no client served before its
+    /// reset commits (ADR-0046, point 12).
+    ForkFencing,
+    /// (b) A fork's rows from its source are a prefix of the source's surviving history.
+    ForkAcknowledgedRows,
+    /// (c) No copy of a fork holds a row of another incarnation of its source.
+    ForkSourceIncarnation,
+    /// (d) No command, report, request, or copy of one fork identity changes another's state.
+    ForkIdentitiesApart,
+    /// (e) Writes to a fork never reach its source, nor later source writes the fork.
+    ForkIndependence,
+    /// (f) An operation ID names one fork, answered only to its requester's same request, and
+    /// its terminal outcome never changes.
+    ForkOperations,
+    /// (g) A fork leaves seeding by its deadline and ends as its scenario expects.
+    ForkTermination,
+    /// (h) Exactly one fork-reset write, before any client write.
+    ForkResetOnce,
+    /// (i) A fork's lease stays with its holders while they are its replica set, and every
+    /// acknowledged write is on a write quorum of the set a promotion fences.
+    ForkFrozenReplicaSet,
+    /// No node admits more concurrent forks' copies than its free disk holds.
+    ForkDiskAdmission,
 }
 
 impl fmt::Display for Invariant {
@@ -109,6 +133,16 @@ impl fmt::Display for Invariant {
             Self::NodeCallsBound => "node calls bound to placement",
             Self::ArchiveRestoresAcknowledgedPrefix => "archive restores an acknowledged prefix",
             Self::CopiesKeptUntilDropped => "copies kept until dropped",
+            Self::ForkFencing => "fork property (a): fencing",
+            Self::ForkAcknowledgedRows => "fork property (b): acknowledged rows only",
+            Self::ForkSourceIncarnation => "fork property (c): one source incarnation",
+            Self::ForkIdentitiesApart => "fork property (d): identities apart",
+            Self::ForkIndependence => "fork property (e): independence",
+            Self::ForkOperations => "fork property (f): unambiguous operations",
+            Self::ForkTermination => "fork property (g): termination",
+            Self::ForkResetOnce => "fork property (h): exactly one reset",
+            Self::ForkFrozenReplicaSet => "fork property (i): frozen replica set and hand-over",
+            Self::ForkDiskAdmission => "fork property: disk admission",
         })
     }
 }
@@ -269,6 +303,7 @@ pub fn copies_kept_until_dropped(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlLog {
     state: State,
+    genesis: State,
     commands: Vec<Command>,
     holders: LeaseHolders,
 }
@@ -278,6 +313,12 @@ impl ControlLog {
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Returns the state the log starts from.
+    #[must_use]
+    pub fn genesis(&self) -> &State {
+        &self.genesis
     }
 
     /// Returns every logged command, in log order.
@@ -323,7 +364,8 @@ pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
         .into_iter()
         .map(|(_, command)| command)
         .collect();
-    let mut replayed = State::new(log.genesis());
+    let genesis = State::new(log.genesis());
+    let mut replayed = genesis.clone();
     let mut holders = LeaseHolders::new();
     for command in &commands {
         // A rejected command changes nothing, in recovery as in the replay.
@@ -338,6 +380,7 @@ pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
     }
     Ok(ControlLog {
         state: recovered.state,
+        genesis,
         commands,
         holders,
     })
@@ -358,13 +401,16 @@ fn record_holders(state: &State, holders: &mut LeaseHolders) {
 /// Checks that `state` holds everything `history` says was acknowledged: every joined member
 /// that wasn't later asked to leave, every created database, and every granted or renewed lease,
 /// unless a later epoch replaced it. A database created with an expiry
-/// ([`Operation::CreateExpiring`]) may be gone, dropped once its expiry passed.
+/// ([`Operation::CreateExpiring`]) may be gone, dropped once its expiry passed, and so may a
+/// database a client asked to drop ([`Operation::Drop`]), which the fork properties follow
+/// through each life of its name.
 ///
 /// # Errors
 ///
 /// [`Invariant::AcknowledgedControlSurvives`] naming the first lost acknowledgement.
 pub fn acknowledged_control_survives(state: &State, history: &History) -> Result<(), Violation> {
     let violation = |detail: String| Violation::new(Invariant::AcknowledgedControlSurvives, detail);
+    let history = &history.without_databases(&history.dropped());
     let leaving: Vec<&NodeId> = history
         .records()
         .iter()

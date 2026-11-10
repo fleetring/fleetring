@@ -3,6 +3,7 @@
 //! Every function here checks everything first and changes the state only once nothing can be
 //! refused, so a rejection leaves the state exactly as it was.
 
+use crate::mutation::Mutation;
 use std::collections::BTreeSet;
 
 use fleetring::NodeId;
@@ -811,6 +812,7 @@ pub(crate) fn check_lease(state: &State, db: &Database, node: &NodeId) -> Result
         }
         // `AcquireLease` needs no lease, and a seeded fork has none only before its first:
         // completion records the epoch, and seeding again clears the lease.
+        ForkState::Seeded { .. } if Mutation::NonHolderFirstLease.is_active() => Ok(()),
         ForkState::Seeded { holders, .. } => {
             let shown = holders.contains(node)
                 && state
