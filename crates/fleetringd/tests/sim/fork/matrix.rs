@@ -522,6 +522,30 @@ impl Run {
         }
     }
 
+    /// What a fork may end as once `lost` are gone for good, judged once it leaves seeding:
+    /// ready, unless the holders it completed with, a lost node's durable copy among them
+    /// (ADR-0046, point 12), leave less than a bootstrap quorum live.
+    pub(super) fn expected_without(
+        &mut self,
+        target: &DatabaseName,
+        lost: &[String],
+    ) -> Result<Expected> {
+        let name = target.clone();
+        self.fleet
+            .run_until(LIMIT, "the fork leaving seeding", |fleet| {
+                fleet.control_state().is_some_and(|state| {
+                    state
+                        .database(&name)
+                        .and_then(|db| db.fork())
+                        .is_some_and(|fork| !matches!(fork.state(), ForkState::Seeding { .. }))
+                })
+            })?;
+        Ok(match self.holders(target) {
+            Ok(holders) => after_losing(&holders, lost),
+            Err(_) => Expected::Ready,
+        })
+    }
+
     /// Waits until `operation`'s outcome is `expected`. [`Expected::Seeded`] waits a while, then
     /// requires the fork still seeded.
     pub(super) fn await_outcome(
