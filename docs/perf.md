@@ -189,13 +189,22 @@ In every run the ring made the source's primary, `data-2`, the fork's seeder, so
 
 ### CI Linux runner
 
-**CI Linux runner: pending.** Label a pull request `measure-forks` to run `.github/workflows/fork-measurements.yml`, which runs the same bench on `ubuntu-latest` and prints the hardware and both tables in its summary, ready to paste here.
+Measured on 2026-11-10 by `.github/workflows/fork-measurements.yml` (run 42766193417, PR #167) on `ubuntu-latest`: an AMD EPYC 9V74 with 4 vCPUs, 15 GiB of RAM, and a 150 GB NVMe disk. The setup is the laptop's. In every run the source's primary, data-2, was also the seeder. Label a pull request `measure-forks` to measure again.
 
 | Source | Copy | To `Seeded` | `Seeded` to `Ready` | Pins, held | WAL held by the pin, peak; WAL file growth during the fork | Staged per node | Fleet disk: before, peak, after | Per-node peak |
 |---|---|---|---|---|---|---|---|---|
-| 10 MiB | pending | pending | pending | pending | pending | pending | pending | pending |
-| 100 MiB | pending | pending | pending | pending | pending | pending | pending | pending |
-| 1 GiB | pending | pending | pending | pending | pending | pending | pending | pending |
+| 10 MiB | 12.1 MiB | 1.6 s | 3.0 s | 1, 18 ms | 0.0 MiB; 2.7 MiB | 12.1 MiB ×3 | 38.0, 84.2, 75.5 MiB | 28.1 MiB |
+| 100 MiB | 103.9 MiB | 3.8 s | 3.0 s | 1, 234 ms | 0.6 MiB; 0.1 MiB | 103.9 MiB ×3 | 317.0, 630.4, 620.3 MiB | 210.1 MiB |
+| 1 GiB | 1.0 GiB | 20.0 s | 3.0 s | 1, 1.7 s | 6.7 MiB; 5.2 MiB | 1.0 GiB ×3 | 3.0, 6.1, 6.1 GiB | 2.0 GiB |
+
+| Source | Baseline writes: tx/s, p50, p99 | During the fork: tx/s, p50, p99 | Slowest write: baseline; during the fork, and when it began | Fork's control entries | All control entries during the fork (in the baseline's 10 s) |
+|---|---|---|---|---|---|
+| 10 MiB | 1935, 1.9 ms, 8.7 ms | 1882, 1.8 ms, 10.1 ms | 120.2 ms; 105.5 ms at 0.7 s | 5 | 35 (64) |
+| 100 MiB | 1561, 1.8 ms, 17.3 ms | 882, 1.9 ms, 72.6 ms | 197.4 ms; 740.7 ms at 1.7 s | 5 | 48 (62) |
+| 1 GiB | 1388, 1.8 ms, 17.9 ms | 460, 2.0 ms, 84.1 ms | 387.8 ms; 2240.1 ms at 2.7 s | 5 | 146 (69) |
+
+- **The runner was faster than ADR-0046 point 7 assumed.** It assumed 15 MiB/s; the runner reached `Seeded` at 1 GiB in 20 s, about 51 MiB/s end to end. So point 7's defaults have more headroom than its reasoning claimed.
+- **On an idle machine, a fork costs the source's writes throughput, not latency.** p50 stayed at about 2 ms. During a 1 GiB fork the source took a third of its baseline transactions, and its p99 rose to 84 ms, because the pinned stream and the copies share the disk with the writers.
 
 ### Reading it
 
