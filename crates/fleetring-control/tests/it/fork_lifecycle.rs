@@ -4,6 +4,8 @@
 
 use std::collections::BTreeSet;
 
+use fleetring::NodeId;
+
 use fleetring_control::fork::{
     CancelCause, ChainHash, ForkExpiry, ForkFailure, ForkState, OperationOutcome,
     PlacementCaughtUp, RetryCause, StagedCopy,
@@ -733,12 +735,13 @@ fn a_seeded_fork_whose_holders_all_left_before_a_lease_seeds_again() {
     );
 }
 
-/// Once a lease was issued since completion, the fork may hold acknowledged writes: holders
-/// that leave the fleet are dropped only while the completion quorum remains, and then the fork
-/// stays seeded on the holders it has, its lease kept, rather than seeding again from the
-/// source and discarding what it served (ADR-0046, point 3.6, as built).
+/// Once a lease was issued since completion, the fork may hold acknowledged writes, and its
+/// primary counts its write quorum over every holder: no holder is dropped, not even one that
+/// left the fleet while more than the completion quorum remain, so a promotion's quorum never
+/// shrinks under the primary. The fork stays seeded on its holders, its lease kept, rather than
+/// seeding again from the source and discarding what it served (ADR-0046, point 3.6, as built).
 #[test]
-fn a_leased_fork_never_seeds_again_when_its_holders_leave() {
+fn a_leased_fork_keeps_every_holder_that_leaves() {
     let mut state = fleet(&["n0", "n1", "n2", "n3", "n4"]);
     run(&mut state, 10, fork_request(1, "t")).expect("fork");
     let fork = identity(&state, "t");
@@ -749,56 +752,66 @@ fn a_leased_fork_never_seeds_again_when_its_holders_leave() {
     let named: Vec<&str> = holders.iter().map(String::as_str).collect();
     run(&mut state, 20, complete(&fork, 1, &named)).expect("complete");
     first_lease(&mut state, 30, &holders[0]).expect("lease");
-    for node in &holders[1..] {
-        run(&mut state, 40, Action::Leave { id: id(node) }).expect("leave");
-    }
-    // Three holders, a completion quorum of two: one that left is dropped.
-    let first = drive(&mut state, 50);
-    assert!(
-        matches!(
-            first.as_slice(),
-            [(
-                Action::DropForkHolder {
-                    cause: RetryCause::HoldersLeft,
-                    ..
-                },
-                Ok(Applied::ForkHolderDropped { .. })
-            )]
-        ),
-        "{first:?}"
-    );
-    // The other stays: dropping it would leave one.
-    assert!(fork::actions(&state, at(51)).is_empty());
-    let ForkState::Seeded { holders: kept, .. } = fork_state(&state, "t") else {
-        panic!("still seeded");
-    };
-    let left = kept
-        .iter()
-        .find(|node| node.as_str() != holders[0])
-        .expect("a holder that left")
-        .clone();
+    // Three holders, a completion quorum of two: one leaves, and dropping it would leave two.
+    run(
+        &mut state,
+        40,
+        Action::Leave {
+            id: id(&holders[1]),
+        },
+    )
+    .expect("leave");
+    assert!(fork::actions(&state, at(50)).is_empty());
     refused(
         &mut state,
-        52,
+        51,
         Action::DropForkHolder {
-            fork,
+            fork: fork.clone(),
             attempt: 1,
-            holder: left.clone(),
+            holder: id(&holders[1]),
             cause: RetryCause::HoldersLeft,
         },
         &Rejection::HolderNeededAfterLease {
-            id: left,
+            id: id(&holders[1]),
             database: db("t"),
-            needed: 2,
         },
     );
-    assert!(matches!(
-        fork_state(&state, "t"),
-        ForkState::Seeded { attempt: 1, .. }
-    ));
+    // A second leaves: it stays too.
+    run(
+        &mut state,
+        60,
+        Action::Leave {
+            id: id(&holders[2]),
+        },
+    )
+    .expect("leave");
+    assert!(fork::actions(&state, at(61)).is_empty());
+    refused(
+        &mut state,
+        62,
+        Action::DropForkHolder {
+            fork,
+            attempt: 1,
+            holder: id(&holders[2]),
+            cause: RetryCause::HoldersLeft,
+        },
+        &Rejection::HolderNeededAfterLease {
+            id: id(&holders[2]),
+            database: db("t"),
+        },
+    );
+    let ForkState::Seeded {
+        attempt: 1,
+        holders: kept,
+        ..
+    } = fork_state(&state, "t")
+    else {
+        panic!("still seeded at its first attempt");
+    };
+    let all: BTreeSet<NodeId> = holders.iter().map(|node| id(node)).collect();
+    assert_eq!(kept, all, "every holder is kept");
     let database = state.database(&db("t")).expect("t");
     assert!(database.lease().is_some(), "the lease is kept");
-    assert_eq!(kept.len(), 2);
 }
 
 // ---- Staged copies in promotions ----
