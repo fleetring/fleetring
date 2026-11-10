@@ -12,6 +12,10 @@ on:
         description: "How many random seeds to run"
         required: false
         default: "500"
+      fork_seeds:
+        description: "How many seeds the fork matrix sweeps per row"
+        required: false
+        default: "200"
 
 permissions:
   contents: read
@@ -67,3 +71,28 @@ jobs:
         with:
           name: simulation-sweep-logs
           path: seed-*.log
+
+  # FR-087's fork matrix: every row over its own seeds, each at the seeding step its seed picks
+  # (the ignored `sweep_row_*` tests), but the rows ignored for open bugs. It needs the fault hooks, which refuse a build without
+  # debug assertions, so it runs optimized with them kept. Run with `fork_seeds: 1000` for the
+  # acceptance sweep of #137.
+  fork-matrix:
+    name: fork matrix sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      FLEETRING_SIM_SWEEP_SEEDS: ${{ github.event.inputs.fork_seeds || '200' }}
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: |
+          FLEETRING_SIM_SWEEP_FROM=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+          echo "sweeping from seed $FLEETRING_SIM_SWEEP_FROM"
+          export FLEETRING_SIM_SWEEP_FROM
+          cargo test --release -p fleetringd --features simulation,fault-hooks --test sim \
+            -- --ignored sweep_row \
+            --skip sweep_row_13_lost_and_duplicated --skip sweep_row_17_partitions_while_seeding

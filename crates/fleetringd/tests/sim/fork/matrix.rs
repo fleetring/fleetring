@@ -597,7 +597,15 @@ impl Run {
     /// more if it is ready, stops the traffic, and finishes the run with every check.
     pub(super) fn finish(mut self, operation: OperationId, expected: Expected) -> Result<()> {
         self.fleet.fork_expectations().expect(operation, expected);
-        self.await_outcome(operation, expected)?;
+        if let Err(error) = self.await_outcome(operation, expected) {
+            // The invariants say why, if one broke on the way.
+            self.traffic.stop();
+            let _ = self.fleet.await_workloads(Duration::from_secs(5));
+            return Err(match self.fleet.finish() {
+                Err(violation) => format!("{violation}; and {error}").into(),
+                Ok(_) => error,
+            });
+        }
         if expected == Expected::Ready
             && let Some((target, _)) = self.forks.iter().find(|(_, id)| *id == operation).cloned()
         {

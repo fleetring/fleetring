@@ -223,7 +223,7 @@ pub fn check(
     let clock = Clock {
         shifts: history.clock_shifts(),
     };
-    let (learned, last) = replay(genesis, commands, clock, expectations)?;
+    let (learned, last) = replay(genesis, commands, clock)?;
     let fork_writes = fork_writes(history, &learned);
     fencing_of_clients(history, &learned)?;
     rows(history, &learned, &last, disk)?;
@@ -231,6 +231,9 @@ pub fn check(
     operations(history, &learned, expectations)?;
     reset_once(history, &learned, &last, disk, &fork_writes)?;
     handover(history, &learned, &last, disk, &fork_writes)?;
+    // What the scenario expects comes last, after the invariants that say why it went wrong.
+    copy_budgets(&learned, expectations)?;
+    outcomes(&last, expectations)?;
     Ok(())
 }
 
@@ -240,7 +243,6 @@ fn replay(
     genesis: &State,
     commands: &[Command],
     clock: Clock<'_>,
-    expectations: &ForkExpectations,
 ) -> Result<(Learned, State), Violation> {
     let mut state = genesis.clone();
     let mut learned = Learned::default();
@@ -356,8 +358,6 @@ fn replay(
             ));
         }
     }
-    outcomes(&state, expectations)?;
-    copy_budgets(&learned, expectations)?;
     Ok((learned, state))
 }
 
