@@ -203,7 +203,6 @@ impl Run {
             });
         }
         let mut fleet = builder.build()?;
-        fleet.allow_binding_refusals();
         fleet.await_ring(Duration::from_secs(10))?;
         let source: DatabaseName = "src".parse()?;
         let (traffic, handle) = Traffic::new([(source.clone(), 3)], 0);
@@ -230,6 +229,13 @@ impl Run {
             run.await_writes(&source, 30)?;
         }
         Ok(run)
+    }
+
+    /// Lets data hosts refuse peer calls for their bindings in this run, for a row whose late or
+    /// stale requests the binding refuses by design (ADR-0046, point 4.1). Every other row runs
+    /// with no refusal, as any fleet without impostors does.
+    pub(super) fn allow_binding_refusals(&mut self) {
+        self.fleet.allow_binding_refusals();
     }
 
     /// Runs `operations` on a client of their own, each until it is answered, and waits for
@@ -336,6 +342,28 @@ impl Run {
         let factor = ReplicationFactor::new(u8::try_from(replicas)?).ok_or("zero replicas")?;
         Ok(state
             .ring()?
+            .replicas_n(name, factor)
+            .to_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect())
+    }
+
+    /// The replica set the ring over the members `among` gives `name` with `replicas` replicas,
+    /// in preference order: where placement would put it if the fleet were those members.
+    pub(super) fn placement_among(
+        &self,
+        name: &str,
+        replicas: u32,
+        among: &[&str],
+    ) -> Result<Vec<String>> {
+        let state = self.state()?;
+        let factor = ReplicationFactor::new(u8::try_from(replicas)?).ok_or("zero replicas")?;
+        let members = state
+            .members()
+            .filter(|member| among.contains(&member.id().as_str()));
+        let ring = fleetring_control::membership_ring(members, state.membership_epoch())?;
+        Ok(ring
             .replicas_n(name, factor)
             .to_ids()
             .into_iter()
@@ -583,6 +611,13 @@ impl Run {
                             )
                     ) || (expected == Expected::Terminal
                         && outcome(fleet).is_some_and(|outcome| outcome.is_terminal()))
+                        || matches!(
+                            (expected, outcome(fleet)),
+                            (
+                                Expected::FailedWith(want),
+                                Some(OperationOutcome::Failed { reason })
+                            ) if reason == want
+                        )
                 });
         if let Err(error) = ended {
             let target = self
