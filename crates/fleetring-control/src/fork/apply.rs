@@ -734,6 +734,11 @@ pub(crate) fn release_fork_holders(
     };
     // The report must come from the primary serving now: a promotion in progress, or a lease
     // at another epoch, may have a primary that still counts the holders alone.
+    if db.promotion().is_some() && db.epoch() == epoch {
+        return Err(Rejection::PromotionInProgress {
+            database: identity.name.clone(),
+        });
+    }
     let Some(lease) = db
         .lease()
         .filter(|lease| lease.epoch() == epoch && db.epoch() == epoch && db.promotion().is_none())
