@@ -10,7 +10,7 @@
 //!   attempt ([`staged`]). Nothing reads a staged copy but a peer copying it and the node itself
 //!   opening it, after checking it again against what control state recorded.
 //! - **Admission.** A copy is admitted only with room for it and a tenth more beside the larger
-//!   of 1 GiB and 5% of the volume, less what other admitted copies reserved; a node refusing
+//!   of 1 GiB and 1% of the volume, less what other admitted copies reserved; a node refusing
 //!   reports it, and the control plane passes it over. Pins and downloads are bounded per node
 //!   and per database.
 //! - **Deletion** only on a positive signal for a staged copy's own identity (ADR-0042): a drop
@@ -177,7 +177,7 @@ impl DiskSpace {
 /// What a copy of `total_bytes` needs free on a volume of `volume` bytes, beyond what other
 /// copies reserved (ADR-0046, point 7): the copy and a tenth more, beside the larger of
 /// `[fork] admission_min_free_bytes` and `admission_min_free_percent` of the volume (1 GiB and
-/// 5% by default).
+/// 1% by default).
 pub(crate) fn admission_need(total_bytes: u64, volume: u64, config: &ForkConfig) -> u128 {
     let share = u128::from(volume) * u128::from(config.admission_min_free_percent) / 100;
     reservation(total_bytes) + share.max(u128::from(config.admission_min_free_bytes))
@@ -1099,11 +1099,15 @@ mod tests {
 
     #[test]
     fn admission_leaves_room_beside_the_copy() {
-        // A tenth more than the copy, beside 1 GiB on a small volume and 5% on a large one.
+        // A tenth more than the copy, beside 1 GiB on a small volume and 1% on a large one.
         let defaults = ForkConfig::default();
         assert_eq!(admission_need(1_000, 1 << 20, &defaults), 1_100 + (1 << 30));
         assert_eq!(
             admission_need(1_000, 100 << 30, &defaults),
+            1_100 + (1 << 30)
+        );
+        assert_eq!(
+            admission_need(1_000, 500 << 30, &defaults),
             1_100 + (5 << 30)
         );
         // A dev node's small margin: 64 MiB, whatever the volume.

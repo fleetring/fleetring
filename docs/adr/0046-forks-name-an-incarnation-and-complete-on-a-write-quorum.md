@@ -335,27 +335,40 @@ The fork inherits the source's logical change record (`_fleetring_cdc`, ADR-0024
 
 ### 7. Limits, budgets, and admission
 
-Every default marked *provisional* is a starting point. FR-087 measures it, and this record is amended with the measured numbers, and the reasoning, before it is accepted. The control rows `max_attempts`, `deadline`, `attempt_timeout`, `seeder_timeout`, and `operation_retention` travel in `ForkDatabase` as `ForkLimits` and are recorded with the fork (point 3.1): changing the configuration affects new forks only.
+FR-087 measured a fork on a three-node fleet (the note after the table, and `docs/perf.md`, "Forks"), and the defaults below are set from those measurements; a default *kept* is one no measurement bears on, and stays as first proposed. The control rows `max_attempts`, `deadline`, `attempt_timeout`, `seeder_timeout`, and `operation_retention` travel in `ForkDatabase` as `ForkLimits` and are recorded with the fork (point 3.1): changing the configuration affects new forks only.
 
 | Setting | Where | Default | What happens at the limit |
 |---|---|---|---|
-| `[fork] max_attempts` | control | 5, *provisional* | `Failed { RetriesExhausted { last } }` |
-| `[fork] deadline` | control | 1 h per seeding, *provisional* | `Failed { DeadlineExceeded { last } }` |
-| `[fork] attempt_timeout` | control | 30 min, *provisional* | `RetryForkSeed { AttemptTimedOut }` |
-| `[fork] seeder_timeout` | control | 2 min down, *provisional* | `RetryForkSeed { SeederDown }`, excluding the seeder from seeder selection |
-| `[fork] transfer_retries` | data | 3 per attempt, backoff from 1 s, *provisional* | the seeder reports a retryable failure |
-| `[fork] max_pin_ms` | data (source's primary) | 10 min, *provisional* | the stream ends `ABORTED`, and the pin, or the held checkpoint, is released |
-| `[fork] max_pin_wal_bytes` | data | 1 GiB of WAL growth while pinned, *provisional* | the same; source writes always win over a fork |
-| `[fork] max_pin_ms_per_hour` | data, per source database | 20 min of pins in any hour, *provisional* | `RESOURCE_EXHAUSTED` with a retry-after; not an attempt failure, but the deadline runs |
-| `[fork] max_pins_per_node` / `max_pins_per_database` | data | 2 / 1, *provisional* | `RESOURCE_EXHAUSTED` with a retry-after; not an attempt failure |
-| `[fork] max_seeds_per_node` | data | 2 concurrent staged downloads, *provisional* | the same |
-| disk admission | data | free − reserved ≥ `total_bytes` × 1.1 + max(1 GiB, 5% of the volume), *provisional* | `seed_failure { InsufficientDisk }` for this node only |
-| `[fork] admission_min_free_bytes`, `admission_min_free_percent` | data (the bytes also control) | 1 GiB and 5%: the margin of the row above | as above; the control plane's floor (point 7.3) uses the proposing node's bytes, recorded in `ForkLimits` |
+| `[fork] max_attempts` | control | 5, *kept* | `Failed { RetriesExhausted { last } }` |
+| `[fork] deadline` | control | 1 h per seeding, *measured*: two full attempts and their retries | `Failed { DeadlineExceeded { last } }` |
+| `[fork] attempt_timeout` | control | 20 min, *measured*: twice `max_pin_ms` | `RetryForkSeed { AttemptTimedOut }` |
+| `[fork] seeder_timeout` | control | 2 min down, *measured*: a restarted seeder is back in seconds | `RetryForkSeed { SeederDown }`, excluding the seeder from seeder selection |
+| `[fork] transfer_retries` | data | 3 per attempt, backoff from 1 s, *kept* | the seeder reports a retryable failure |
+| `[fork] max_pin_ms` | data (source's primary) | 10 min, *measured* | the stream ends `ABORTED`, and the pin, or the held checkpoint, is released |
+| `[fork] max_pin_wal_bytes` | data | 1 GiB of WAL growth while pinned, *measured* | the same; source writes always win over a fork |
+| `[fork] max_pin_ms_per_hour` | data, per source database | 20 min of pins in any hour, *measured*: two full pins | `RESOURCE_EXHAUSTED` with a retry-after; not an attempt failure, but the deadline runs |
+| `[fork] max_pins_per_node` / `max_pins_per_database` | data | 2 / 1, *kept* | `RESOURCE_EXHAUSTED` with a retry-after; not an attempt failure |
+| `[fork] max_seeds_per_node` | data | 2 concurrent staged downloads, *kept* | the same |
+| disk admission | data | free − reserved ≥ `total_bytes` × 1.1 + max(1 GiB, 1% of the volume), *measured* | `seed_failure { InsufficientDisk }` for this node only |
+| `[fork] admission_min_free_bytes`, `admission_min_free_percent` | data (the bytes also control) | 1 GiB and 1%: the margin of the row above | as above; the control plane's floor (point 7.3) uses the proposing node's bytes, recorded in `ForkLimits` |
 | `[fork] operation_retention` | control | 7 days after the terminal outcome | the operation record is pruned; deduplication ends |
 | `[fork] max_operations` | control | 10,000 records | `RESOURCE_EXHAUSTED` on new forks |
 | client resends | CLI and MCP | 5 within 60 s on `UNAVAILABLE` | the error, and the operation ID to resume with |
 
-*As built (2026-11-09):* the disk-admission margin is configurable, as the row above says, because max(1 GiB, 5% of the volume) refused a three-row fork on a developer's laptop with 50 GiB free of 926 GiB. The ×1.1 reservation is fixed. The configuration `fleetring dev` writes keeps 64 MiB and 0%. A fork made under the default bytes records none in `ForkLimits`, so its command encodes as before.
+*As built (2026-11-09):* the disk-admission margin is configurable, as the row above says, because max(1 GiB, 5% of the volume), as first proposed, refused a three-row fork on a developer's laptop with 50 GiB free of 926 GiB. The ×1.1 reservation is fixed. The configuration `fleetring dev` writes keeps 64 MiB and 0%. A fork made under the default bytes records none in `ForkLimits`, so its command encodes as before.
+
+*Measured (2026-11-09, FR-087):* `cargo bench -p fleetringd --bench fork` forked sources of 10 MiB, 100 MiB and 1 GiB on a three-node fleet in one process, over TLS on loopback (source R = 3 and W = 2; fork R = 3, so C = W_boot = 2), on an M1 Max laptop with an APFS SSD, under the load of other builds. `docs/perf.md`, "Forks", has the tables; the CI Linux runner's row is to come, from the `measure-forks` label. What set each default:
+
+- **The stream's rate.** The source's primary streamed the copy to the seeder at 59 MiB/s at 1 GiB (a 17.4 s pin) and 60 MiB/s at 100 MiB; the peers then copied the staged copy at about the same rate, so the seeding took about twice the pin, 36.9 s at 1 GiB. A shared CI runner, with a quarter of the cores and a network disk, is assumed four times slower, about 15 MiB/s: about 70 s to stream 1 GiB.
+- **`max_pin_ms`, 10 min, confirmed.** The bound is at least k × the time to stream 1 GiB at the slowest rate assumed, with k = 4 for scheduling, a disk shared with the source's own writes, and retries: 4 × 70 s ≈ 5 min. 10 min doubles that, and streams about 8 GiB at the assumed slowest rate and 34 GiB at the laptop's; a larger source fails explicitly with `SourceTooLarge`, as point 12 says.
+- **`max_pin_wal_bytes`, 1 GiB, confirmed.** A 17 s pin under four writers held 2.8 MiB of WAL. The fastest sustained write rate measured, the bench's own 1 MiB transactions at 1.1 MiB/s, would hold about 680 MiB over a full `max_pin_ms`, so 1 GiB lets a pin run its time on a write-heavy source and still bounds it.
+- **`max_pin_ms_per_hour`, 20 min, confirmed:** two full pins an hour, so a pin that expires can be tried once more within the hour.
+- **`attempt_timeout`, from 30 min to 20 min.** An attempt holds the seeder's stream, bounded by `max_pin_ms`, and then the peers' copies of the same bytes from the seeder, unpinned and measured at about the stream's rate, so at most another `max_pin_ms`: 2 × 10 min. Longer only delays the retry of an attempt that is stuck.
+- **`deadline`, 1 h, confirmed:** two full attempts, 40 min, and the backoff and seeder changes between them.
+- **`seeder_timeout`, 2 min, confirmed.** A seeder killed while it staged was back and fetching again within seconds (`tests/fork.rs`), and a daemon restart or upgrade fits well within 2 min, which is a tenth of an attempt.
+- **The admission margin, from max(1 GiB, 5%) to max(1 GiB, 1%).** Each node's disk peaked at its source replica and its fork copy, and the fleet's at the final state: a staged copy is renamed into the database's place, so a fork never needs room for two copies, and the ×1.1 reservation covers it. The 1 GiB floor is `max_pin_wal_bytes`, the WAL a pin may add on the source's primary, which in a fleet of three is one of the fork's replicas. Nothing measured grows with the volume's size, so the share is only headroom for the file system: 1% keeps 9 GiB on a 926 GiB disk, where 5% asked for 46 GiB and refused a fork with 50 GiB free.
+- **Not set by a measurement:** `max_attempts`, `transfer_retries`, the per-node and per-database pin and download counts, `operation_retention`, `max_operations`, and the client's resends, which bound retries and concurrency rather than a cost the bench measures.
+- **What a fork costs a source's writes** stayed within the shared laptop's noise: the p50 of 64-byte writes rose by 5 to 17 ms (5% to 19%), throughput stayed level from 100 MiB, and stalls of 1 to 2 s happened in the baseline too. **A fork takes five control-log commands** (`ForkDatabase`, `CompleteFork`, the first lease, its renewals, `MarkForkReady`); the heartbeats logged meanwhile are the fleet's usual.
 
 1. **Reservations.**
    - A data node keeps an in-memory **reservation ledger.** Admitting a seed reserves `total_bytes` × 1.1 until the copy is staged (the bytes are then on disk) or abandoned. Admission compares free disk *minus* outstanding reservations, so two concurrent seeds never count the same free bytes.
@@ -545,4 +558,4 @@ Every default marked *provisional* is a starting point. FR-087 measures it, and 
 
 ## Open questions
 
-None for the owner. FR-087's measurements set the provisional defaults of point 7 before acceptance.
+None for the owner. FR-087's measurements set the defaults of point 7 (2026-11-09); the CI Linux runner's measurement is to be added to `docs/perf.md`.

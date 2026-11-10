@@ -15,8 +15,9 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 /// How long a fork may stay seeding, by default: one hour.
 const DEFAULT_DEADLINE: Millis = Millis::new(60 * 60 * 1_000);
 
-/// How long one attempt may run before the driver starts another, by default: 30 minutes.
-const DEFAULT_ATTEMPT_TIMEOUT: Millis = Millis::new(30 * 60 * 1_000);
+/// How long one attempt may run before the driver starts another, by default: 20 minutes, twice
+/// the longest pin, so that a seeder's stream and its peers' copies both fit (ADR-0046, point 7).
+const DEFAULT_ATTEMPT_TIMEOUT: Millis = Millis::new(20 * 60 * 1_000);
 
 /// How long a seeder may be down before the driver starts another attempt without it, by
 /// default: 2 minutes.
@@ -65,7 +66,7 @@ pub struct ForkLimits {
 }
 
 impl ForkLimits {
-    /// The defaults of ADR-0046, point 7: 5 attempts within an hour, 30 minutes an attempt, a
+    /// The defaults of ADR-0046, point 7: 5 attempts within an hour, 20 minutes an attempt, a
     /// new seeder after 2 minutes down, and records kept for 7 days.
     #[must_use]
     pub const fn new() -> Self {
