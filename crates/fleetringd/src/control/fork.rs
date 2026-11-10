@@ -475,7 +475,7 @@ pub(crate) fn fork_status(
         } => {
             // Holders kept past readiness stay the replica set until they are released
             // (ADR-0046, point 3.10, as built); none once they are.
-            status.holders = holders.as_ref().map(names).unwrap_or_default();
+            status.kept_holders = holders.as_ref().map(names).unwrap_or_default();
             status.position = Some(at.as_bytes().to_vec());
             status.chain_hash = Some(chain_hash.as_bytes().to_vec());
             status.completed_at_ms = Some(completed_at.as_millis());
