@@ -189,19 +189,24 @@ row!(
 );
 
 /// Row 7: the seeder is lost for good at each step: the next attempt seeds from another replica,
-/// or, once seeded, the other holders go on, if a bootstrap quorum of them remains.
+/// or, once seeded, the other holders go on, if a bootstrap quorum of them remains. A seeder
+/// lost after it staged may still count toward completion with its durable copy (ADR-0046,
+/// point 12); the fork then stays seeded, unusable but safe, if too few holders are left.
 fn seeder_lost(seed: u64, point: Point) -> Result<()> {
     let mut run = Run::start(seed, &Setup::default())?;
     let target = "dst".parse()?;
     let (operation, _) = run.fork_to(&target, point)?;
     let seeder = run.seeder(operation)?;
-    let expected = if point.is_seeding() {
-        Expected::Ready
-    } else {
-        after_losing(&run.holders(&target)?, &[seeder.clone()])
-    };
+    let lost = [seeder.clone()];
+    let seeded = (!point.is_seeding())
+        .then(|| run.holders(&target))
+        .transpose()?;
     run.crash(&seeder)?;
     run.release(point.hook(), operation)?;
+    let expected = match seeded {
+        Some(holders) => after_losing(&holders, &lost),
+        None => run.expected_without(&target, &lost)?,
+    };
     run.finish(operation, expected)
 }
 
@@ -231,7 +236,8 @@ fn peer_lost(seed: u64, point: Point) -> Result<()> {
     };
     run.crash(&peer)?;
     run.release(point.hook(), operation)?;
-    run.finish(operation, Expected::Ready)
+    let expected = run.expected_without(&target, &[peer])?;
+    run.finish(operation, expected)
 }
 
 row!(
