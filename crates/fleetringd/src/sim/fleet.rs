@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
+use fleetring_control::fork::{ForkIdentity, ForkState, OperationId};
 use fleetring_control::{DatabaseName, State, Timestamp};
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -20,16 +21,19 @@ use crate::daemon::{CONTROL_DB, DATABASES_DIR};
 use crate::durability::{ArchiveConfig, ObjectStore};
 use crate::engine::{EngineConfig, Execution, Position};
 use crate::layout;
-use crate::replication::{Replication, ReplicationSettings};
+use crate::replication::{FaultPoint, ForkFaults, Replication, ReplicationSettings};
 use crate::sim::SimRng;
 use crate::sim::check::{self, ControlLog, ReplicaChains, ReplicaRows, Violation};
 use crate::sim::client::{Session, Via, WatcherSession, run_client, run_lease_watcher};
 use crate::sim::fault::{Fault, LossRate};
+use crate::sim::forks::{CopyOnDisk, ForkDisk, ForkExpectations};
 use crate::sim::history::{self, Guarantee, Replicated};
 use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
-use crate::sim::workload::{Ack, History, Operation, WRITES_TABLE, Workload};
+use crate::sim::workload::{
+    Ack, ForkPass, ForkPhaseKind, ForkTransition, History, Operation, WRITES_TABLE, Workload,
+};
 use crate::tls::{Authority, AuthorityError, FleetName, Identity, IdentityError, Validity};
 use crate::{
     Config, ControlSettings, Membership, MembershipSettings, NodeConfig, NodeRole,
@@ -73,6 +77,14 @@ fn host_seed(seed: u64, name: &str) -> u64 {
     });
     seed ^ HOST_SALT ^ hashed
 }
+
+/// The free bytes every data host's fork admission believes it has, by default, so that a run
+/// never depends on the disk of the machine running it: the fork tests' hooks stand in for it.
+const ROOMY_DISK: u64 = 1 << 40;
+
+/// A second principal every host knows, with the same scopes as [`WORKLOAD_PRINCIPAL`]: another
+/// requester for the same requests ([`Fleet::client_as`]).
+pub const OTHER_PRINCIPAL: &str = "other";
 
 /// The fleet name the test authority issues for.
 const FLEET: &str = "sim";
@@ -370,6 +382,12 @@ impl FleetBuilder {
             partitions: BTreeSet::new(),
             impostors: self.impostors,
             router: None,
+            fork_faults: BTreeMap::new(),
+            fork_seen: BTreeMap::new(),
+            fork_phases: BTreeMap::new(),
+            principals: BTreeMap::new(),
+            binding_refusals_allowed: false,
+            fork_expectations: ForkExpectations::default(),
             root,
         };
         for (name, role) in &self.hosts {
@@ -494,6 +512,31 @@ fn workload_principal() -> crate::PrincipalConfig {
     }
 }
 
+fn other_principal() -> crate::PrincipalConfig {
+    crate::PrincipalConfig {
+        name: OTHER_PRINCIPAL
+            .parse()
+            .unwrap_or_else(|error| panic!("'{OTHER_PRINCIPAL}' is not a principal: {error}")),
+        ..workload_principal()
+    }
+}
+
+/// Fork hooks for a data host: with the `fault-hooks` feature, ones the test can hold and
+/// release, with room for any fork; without it, inert ones.
+fn new_fork_faults() -> ForkFaults {
+    #[cfg(feature = "fault-hooks")]
+    {
+        let faults = ForkFaults::new();
+        faults.set_disk(ROOMY_DISK, 2 * ROOMY_DISK);
+        faults
+    }
+    #[cfg(not(feature = "fault-hooks"))]
+    {
+        let _ = ROOMY_DISK;
+        ForkFaults::default()
+    }
+}
+
 fn host_config(
     name: &str,
     role: NodeRole,
@@ -541,7 +584,7 @@ fn host_config(
         tls: None,
         insecure_plaintext: crate::Plaintext::Refused,
         dev: crate::dev::DevMode::Off,
-        principals: vec![workload_principal()],
+        principals: vec![workload_principal(), other_principal()],
         // The admin listener doesn't start on a simulated network; the sampler runs on its clock.
         admin: crate::AdminConfig::default(),
         log: crate::LogConfig::default(),
@@ -590,6 +633,19 @@ pub struct Fleet {
     impostors: BTreeMap<String, NodeId>,
     /// The router host, if the fleet has one.
     router: Option<String>,
+    /// Each data host's fork fault hooks, which survive its restarts: inert unless the
+    /// `fault-hooks` feature is on.
+    fork_faults: BTreeMap<String, ForkFaults>,
+    /// The passes of each host's fork work through each hook the fleet has recorded.
+    fork_seen: BTreeMap<(String, FaultPoint, Option<OperationId>), u64>,
+    /// Each fork's identity and phase as the fleet last saw it in control state.
+    fork_phases: BTreeMap<DatabaseName, (ForkIdentity, ForkPhaseKind)>,
+    /// The principal each client acts as, if not [`WORKLOAD_PRINCIPAL`].
+    principals: BTreeMap<String, String>,
+    /// Whether data hosts may refuse peer calls for their bindings in this run.
+    binding_refusals_allowed: bool,
+    /// What the scenario expects of its forks.
+    fork_expectations: ForkExpectations,
     root: TempDir,
 }
 
@@ -637,6 +693,10 @@ impl Fleet {
         let shared = self.shared.clone();
         let host = name.to_owned();
         let started = config.clone();
+        let faults = new_fork_faults();
+        if role.hosts_data() {
+            self.fork_faults.insert(name.to_owned(), faults.clone());
+        }
         // From the fleet's seed and the host's name, without drawing from the workloads'
         // generator, so that adding a host's randomness moves no workload.
         let seed = host_seed(self.seed, name);
@@ -647,6 +707,7 @@ impl Fleet {
                 identity.clone(),
                 seed,
                 shared.clone(),
+                faults.clone(),
             )
         });
         self.hosts.push(HostInfo {
@@ -856,6 +917,42 @@ impl Fleet {
         self.add_client(name, None, workload);
     }
 
+    /// Adds a client named `name` that runs `workload` as the principal `principal`, which every
+    /// host knows: [`OTHER_PRINCIPAL`], or the workload's own.
+    pub fn client_as(&mut self, name: &str, principal: &str, workload: impl Workload) {
+        self.principals
+            .insert(name.to_owned(), principal.to_owned());
+        self.fork_expectations.principal(name, principal);
+        self.add_client(name, None, workload);
+    }
+
+    /// Returns data host `name`'s fork fault hooks, which survive its restarts (FR-087).
+    #[cfg(feature = "fault-hooks")]
+    #[must_use]
+    pub fn fork_faults(&self, name: &str) -> Option<ForkFaults> {
+        self.fork_faults.get(name).cloned()
+    }
+
+    /// Sets every host's clock `by` ahead, as if that much time had passed in one step: how a
+    /// run reaches a boundary days away, such as a fork operation's retention, in simulated time.
+    pub fn shift_clocks(&mut self, by: Duration) {
+        let total = self.shared.shift_clocks(by);
+        self.note(format!("clocks set {} ms ahead", millis(by)));
+        let at = self.sim.elapsed();
+        self.shared.lock().history.observe_clock_shift(at, total);
+    }
+
+    /// Lets data hosts refuse peer calls for their bindings in this run, as a fork scenario's
+    /// late requests and retries legitimately are (ADR-0046, point 4.1).
+    pub fn allow_binding_refusals(&mut self) {
+        self.binding_refusals_allowed = true;
+    }
+
+    /// What the run's forks are expected to do; [`Fleet::finish`] checks it.
+    pub fn fork_expectations(&mut self) -> &mut ForkExpectations {
+        &mut self.fork_expectations
+    }
+
     /// Adds a client named `name` that runs `workload`, sending each database call to the data
     /// node `entry` first instead of locating the primary through the control plane, as
     /// `fleetringd db exec --address` does. It follows redirects from there, and reaches a primary
@@ -935,9 +1032,13 @@ impl Fleet {
                     panic!("can't load the certificate of node {node} for '{name}': {error}")
                 });
         }
-        let principal = WORKLOAD_PRINCIPAL
+        let principal = self
+            .principals
+            .get(name)
+            .map_or(WORKLOAD_PRINCIPAL, String::as_str);
+        let principal = principal
             .parse()
-            .unwrap_or_else(|error| panic!("'{WORKLOAD_PRINCIPAL}' is not a principal: {error}"));
+            .unwrap_or_else(|error| panic!("'{principal}' is not a principal: {error}"));
         let issued = self
             .authority
             .issue_client(&principal, certificate_validity())
@@ -1002,7 +1103,100 @@ impl Fleet {
         self.sim
             .step()
             .map(|_| ())
-            .map_err(|error| SimError::Simulation(error.to_string()))
+            .map_err(|error| SimError::Simulation(error.to_string()))?;
+        self.observe_forks();
+        Ok(())
+    }
+
+    /// The passes of each data host's fork work through its hooks since the last step.
+    #[cfg(feature = "fault-hooks")]
+    fn hook_passes(&mut self, at: Duration) -> Vec<ForkPass> {
+        let mut passes = Vec::new();
+        for (host, faults) in &self.fork_faults {
+            for ((point, operation), count) in faults.passes_by_operation() {
+                let seen = self
+                    .fork_seen
+                    .entry((host.clone(), point, operation))
+                    .or_default();
+                if count > *seen {
+                    *seen = count;
+                    passes.push(ForkPass {
+                        at,
+                        host: host.clone(),
+                        point,
+                        operation,
+                        count,
+                    });
+                }
+            }
+        }
+        passes
+    }
+
+    /// Without the `fault-hooks` feature, the hooks count nothing.
+    #[cfg(not(feature = "fault-hooks"))]
+    fn hook_passes(&mut self, at: Duration) -> Vec<ForkPass> {
+        let _ = (at, &self.fork_seen);
+        Vec::new()
+    }
+
+    /// Records what changed since the last step in each host's fork work at its hooks, and in
+    /// each fork's phase in control state, with every data host's rows of a fork that moved to a
+    /// new replica set (FR-087).
+    fn observe_forks(&mut self) {
+        let at = self.sim.elapsed();
+        let passes = self.hook_passes(at);
+        let mut transitions = Vec::new();
+        if let Some(state) = self.control_state() {
+            for db in state.databases() {
+                let Some(fork) = db.fork() else {
+                    continue;
+                };
+                let identity =
+                    ForkIdentity::new(db.name().clone(), db.incarnation(), fork.operation());
+                let phase = match fork.state() {
+                    ForkState::Seeding { .. } => ForkPhaseKind::Seeding,
+                    ForkState::Seeded { .. } => ForkPhaseKind::Seeded,
+                    ForkState::Ready {
+                        holders: Some(_), ..
+                    } => ForkPhaseKind::ReadyKept,
+                    ForkState::Ready { holders: None, .. } => ForkPhaseKind::Released,
+                    ForkState::Failed { .. } => ForkPhaseKind::Failed,
+                    _ => continue,
+                };
+                let now = (identity.clone(), phase);
+                if self.fork_phases.get(db.name()) == Some(&now) {
+                    continue;
+                }
+                self.fork_phases.insert(db.name().clone(), now);
+                let moved = matches!(
+                    phase,
+                    ForkPhaseKind::Seeded | ForkPhaseKind::ReadyKept | ForkPhaseKind::Released
+                );
+                let rows = if moved {
+                    self.replica_rows(db.name()).unwrap_or_default()
+                } else {
+                    check::ReplicaRows::new()
+                };
+                transitions.push(ForkTransition {
+                    at,
+                    replica_set: state.replica_set(db.name()).unwrap_or_default(),
+                    identity,
+                    phase,
+                    rows,
+                });
+            }
+        }
+        if passes.is_empty() && transitions.is_empty() {
+            return;
+        }
+        let mut shared = self.shared.lock();
+        for pass in passes {
+            shared.history.observe_fork_pass(pass);
+        }
+        for transition in transitions {
+            shared.history.observe_fork_transition(transition);
+        }
     }
 
     /// Advances the simulation by `duration`.
@@ -1318,6 +1512,9 @@ impl Fleet {
     /// be read.
     pub fn check_history(&self) -> Result<(), SimError> {
         let history = self.history();
+        // A name dropped during the run may name another database afterwards: the fork
+        // properties hold its lives apart ([`crate::sim::forks`]).
+        let history = history.without_databases(&history.dropped());
         let mut databases = BTreeMap::new();
         for (database, guarantee) in created(&history) {
             let rows = self.replica_rows(&database)?;
@@ -1633,7 +1830,7 @@ impl Fleet {
     pub fn finish(mut self) -> Result<Report, SimError> {
         self.check()?;
         // Only an impostor's calls are refused for their bindings.
-        if self.impostors.is_empty() {
+        if self.impostors.is_empty() && !self.binding_refusals_allowed {
             self.assert_no_binding_refusals()?;
         }
         self.check_chains()?;
@@ -1676,12 +1873,108 @@ impl Fleet {
         let trace = self.trace();
         let history = self.history();
         check::lease_events_match_control(&history, log.lease_holders())?;
+        let disk = self.fork_disk(&log);
+        crate::sim::forks::check(
+            log.genesis(),
+            log.commands(),
+            &history,
+            &disk,
+            &self.fork_expectations,
+        )?;
         Ok(Report {
             trace,
             history,
             log,
         })
     }
+}
+
+impl Fleet {
+    /// Every data host's copies of each database a fork in `log` involves, and its staged
+    /// copies, read from disk.
+    fn fork_disk(&self, log: &ControlLog) -> ForkDisk {
+        let mut names = BTreeSet::new();
+        for command in log.commands() {
+            if let fleetring_control::Action::ForkDatabase { intent, .. } = &command.action {
+                names.insert(intent.name.clone());
+                names.insert(intent.source.clone());
+            }
+        }
+        let mut disk = ForkDisk::default();
+        if names.is_empty() {
+            return disk;
+        }
+        for host in self.hosts.iter().filter(|host| host.role.hosts_data()) {
+            for name in &names {
+                let dir = host
+                    .data_dir
+                    .join(DATABASES_DIR)
+                    .join(layout::database_dir(name));
+                if let Ok(copy) = read_copy(&dir) {
+                    disk.copies.insert((name.clone(), host.name.clone()), copy);
+                }
+                let staged = host
+                    .data_dir
+                    .join("staged")
+                    .join(layout::database_dir(name));
+                for identity in std::fs::read_dir(&staged).into_iter().flatten().flatten() {
+                    let dir_name = identity.file_name().to_string_lossy().into_owned();
+                    for attempt in std::fs::read_dir(identity.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        let copy = attempt.path().join("copy");
+                        if let Ok(read) = read_copy(&copy) {
+                            disk.staged.push((
+                                host.name.clone(),
+                                name.clone(),
+                                dir_name.clone(),
+                                read.values,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        disk
+    }
+}
+
+/// Reads the writes table and the fork markers of the SQLite copy in `dir`, from a scratch copy
+/// of its files. A directory without a copy is an error.
+fn read_copy(dir: &Path) -> Result<CopyOnDisk, Box<dyn std::error::Error>> {
+    if !dir.join("data.db").try_exists()? {
+        return Err("no copy".into());
+    }
+    let values = written_values(dir)?;
+    let scratch = tempfile::tempdir()?;
+    for file in ["data.db", "data.db-wal"] {
+        if dir.join(file).try_exists()? {
+            std::fs::copy(dir.join(file), scratch.path().join(file))?;
+        }
+    }
+    let connection = rusqlite::Connection::open(scratch.path().join("data.db"))?;
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '_fleetring_fork'",
+        [],
+        |row| row.get(0),
+    )?;
+    let markers = if tables == 0 {
+        Vec::new()
+    } else {
+        let mut statement =
+            connection.prepare("SELECT fork_incarnation, operation FROM _fleetring_fork")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.cast_unsigned(),
+                    row.get::<_, Vec<u8>>(1)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(CopyOnDisk { values, markers })
 }
 
 /// The name of the client host that watches data host `node`'s leases.

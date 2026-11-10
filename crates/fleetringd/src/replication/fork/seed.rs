@@ -421,7 +421,9 @@ async fn finish(
     let stamp = stamp
         .map(Incarnation::new)
         .ok_or_else(|| failed("the copy's last chunk has no source incarnation".to_owned()))?;
-    if stamp != plan.source_incarnation {
+    if stamp != plan.source_incarnation
+        && !fleetring_control::mutation::Mutation::SkipSourceIncarnation.is_active()
+    {
         return Err(Fetch::Failed(Status::failed_precondition(format!(
             "the copy is of source incarnation {stamp}, not {}",
             plan.source_incarnation

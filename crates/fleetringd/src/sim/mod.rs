@@ -66,6 +66,7 @@ pub mod check;
 mod client;
 mod fault;
 mod fleet;
+pub mod forks;
 pub mod history;
 mod host;
 mod hrana;
@@ -77,14 +78,16 @@ mod workload;
 pub use check::{ControlLog, Invariant, ReplicaChains, ReplicaRows, Violation};
 pub use fault::{Fault, LossRate};
 pub use fleet::{
-    Fleet, FleetBuilder, PORT, ROUTER_PORT, Report, SimError, TRACE_VAR, Timings, lease_watcher,
-    written_values,
+    Fleet, FleetBuilder, OTHER_PRINCIPAL, PORT, ROUTER_PORT, Report, SimError, TRACE_VAR, Timings,
+    lease_watcher, written_values,
 };
+pub use forks::{CopyOnDisk, Expected, ForkDisk, ForkExpectations};
 pub use history::{DurabilityMode, Guarantee, Replicated};
 pub use rng::SimRng;
 pub use trace::{DRIVER, Divergence, Event, EventKind, Replay, Trace};
 pub use workload::{
-    Ack, CreateAndAcquire, CreateAndWrite, History, HistoryEvent, LeaseObservation, LeaseSeen,
-    Operation, OperationId, Operator, Outcome, OutcomeClass, Pending, Phase, Record, Script, Step,
+    Ack, CreateAndAcquire, CreateAndWrite, ForkPass, ForkPhaseKind, ForkTransition, History,
+    HistoryEvent, LeaseObservation, LeaseSeen, Operation, OperationId, Operator, Outcome,
+    OutcomeClass, Pending, Phase, Record, Script, SeedingProbe, Step, Traffic, TrafficHandle,
     WRITES_TABLE, Workload,
 };

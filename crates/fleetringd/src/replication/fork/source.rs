@@ -368,7 +368,9 @@ async fn serve_source(
         })?;
     // The open copy is checked too: it must be the source incarnation the request names.
     let recorded = inner.epochs.record(source).incarnation();
-    if recorded != Some(request.source_incarnation) {
+    if recorded != Some(request.source_incarnation)
+        && !fleetring_control::mutation::Mutation::SkipSourceIncarnation.is_active()
+    {
         return Err(Status::failed_precondition(format!(
             "this node's copy of {source} is incarnation {}, not {}",
             recorded.map_or_else(
@@ -386,6 +388,7 @@ async fn serve_source(
     };
     let published_from = primary.published_bytes();
     let acknowledged = match primary.committed() {
+        tip if fleetring_control::mutation::Mutation::PinAtTip.is_active() => tip,
         None => None,
         Some(_) => match primary.quorum_held(&inner.followers_of(&primary)) {
             Some(acknowledged) => Some(acknowledged),
@@ -472,6 +475,11 @@ async fn serve_source(
         stamp: request.source_incarnation,
         checksum: None,
     };
+    inner
+        .forks
+        .faults()
+        .pass(super::FaultPoint::Streaming, request.fork.operation)
+        .await;
     Ok(spawn_sender(inner, packer, ending, Some((pin, primary))))
 }
 

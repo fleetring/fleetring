@@ -1404,7 +1404,9 @@ fn acquire_lease(
     if state.is_draining(&node) {
         return Err(Rejection::MemberDraining { id: node });
     }
-    if !state.replica_set(&database)?.contains(&node) {
+    let mutated = crate::mutation::Mutation::NonHolderFirstLease.is_active()
+        && db.fork().is_some_and(crate::fork::Fork::is_seeded);
+    if !mutated && !state.replica_set(&database)?.contains(&node) {
         return Err(Rejection::NotInReplicaSet { id: node, database });
     }
     forks::check_lease(state, db, &node)?;

@@ -399,12 +399,17 @@ impl Forks {
         {
             let mut ledger = self.lock_ledger();
             if let Some(space) = space {
-                let reserved: u128 = ledger
-                    .reserved
-                    .iter()
-                    .filter(|(other, _)| *other != key)
-                    .map(|(_, bytes)| *bytes)
-                    .sum();
+                let reserved: u128 =
+                    if fleetring_control::mutation::Mutation::DiskWithoutReservations.is_active() {
+                        0
+                    } else {
+                        ledger
+                            .reserved
+                            .iter()
+                            .filter(|(other, _)| *other != key)
+                            .map(|(_, bytes)| *bytes)
+                            .sum()
+                    };
                 let available = u128::from(space.free).saturating_sub(reserved);
                 if available < admission_need(total_bytes, space.volume, &config) {
                     return Err(Refused::Disk);

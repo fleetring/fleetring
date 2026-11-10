@@ -1,6 +1,7 @@
 //! The checks `apply` and the fork driver share, so that the driver proposes only what `apply`
 //! would accept.
 
+use crate::mutation::Mutation;
 use std::collections::BTreeSet;
 
 use fleetring::{NodeId, ReplicationFactor};
@@ -30,11 +31,12 @@ pub(crate) fn current_fork<'s>(
     state: &'s State,
     identity: &ForkIdentity,
 ) -> Result<(&'s Database, &'s Fork), Rejection> {
+    let by_name_alone = Mutation::SkipTargetIdentityApply.is_active();
     state
         .database(&identity.name)
-        .filter(|db| db.incarnation() == identity.incarnation)
+        .filter(|db| by_name_alone || db.incarnation() == identity.incarnation)
         .and_then(|db| Some((db, db.fork()?)))
-        .filter(|(_, fork)| fork.operation() == identity.operation)
+        .filter(|(_, fork)| by_name_alone || fork.operation() == identity.operation)
         .ok_or_else(|| Rejection::StaleForkIdentity {
             fork: identity.clone(),
         })
@@ -75,6 +77,9 @@ pub(crate) fn bootstrap_quorum(
 /// ```
 #[must_use]
 pub fn completion_quorum(replication_factor: ReplicationFactor, durability: Durability) -> u8 {
+    if Mutation::CompleteOnOneHolder.is_active() {
+        return 1;
+    }
     bootstrap_quorum(replication_factor, durability).max(durability.min_replicas())
 }
 
@@ -110,7 +115,8 @@ pub(crate) fn next_seeder(
 /// it was dropped.
 pub(crate) fn check_source(state: &State, fork: &Fork) -> Result<(), Rejection> {
     let current = state.database(fork.source()).map(Database::incarnation);
-    if current == Some(fork.source_incarnation()) {
+    let unchecked = Mutation::SkipSourceIncarnation.is_active() && current.is_some();
+    if unchecked || current == Some(fork.source_incarnation()) {
         return Ok(());
     }
     Err(Rejection::SourceIncarnationMismatch {
@@ -142,7 +148,8 @@ impl Claim<'_> {
             && staged.attempt() == self.attempt
             && staged.position() == self.at
             && staged.chain_hash() == self.chain_hash
-            && staged.source_incarnation() == self.source_incarnation
+            && (Mutation::SkipSourceIncarnation.is_active()
+                || staged.source_incarnation() == self.source_incarnation)
     }
 }
 

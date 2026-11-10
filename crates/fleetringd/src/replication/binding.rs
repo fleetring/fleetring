@@ -652,10 +652,12 @@ async fn current_fork(
     let Some(fork) = view.fork.clone() else {
         return refused(SeedingMismatch::NoFork);
     };
-    if fork.identity.incarnation != request.fork.incarnation {
+    let by_name_alone =
+        fleetring_control::mutation::Mutation::SkipTargetIdentityBinding.is_active();
+    if !by_name_alone && fork.identity.incarnation != request.fork.incarnation {
         return refused(SeedingMismatch::ForkIncarnation);
     }
-    if fork.identity.operation != request.fork.operation {
+    if !by_name_alone && fork.identity.operation != request.fork.operation {
         return refused(SeedingMismatch::Operation);
     }
     Ok((view, fork))
@@ -742,7 +744,8 @@ pub(super) async fn check_seeding(
     if fork.source != request.database {
         return refused(SeedingMismatch::Source);
     }
-    if fork.source_incarnation != request.source_incarnation {
+    let unchecked = fleetring_control::mutation::Mutation::SkipSourceIncarnation.is_active();
+    if !unchecked && fork.source_incarnation != request.source_incarnation {
         return refused(SeedingMismatch::SourceIncarnation);
     }
     let seeder = seeding_attempt(inner, request, caller, &fork)?;
@@ -758,7 +761,7 @@ pub(super) async fn check_seeding(
         }
         Err(status) => return Err(status),
     };
-    if source.incarnation != request.source_incarnation {
+    if !unchecked && source.incarnation != request.source_incarnation {
         return refused(SeedingMismatch::SourceIncarnation);
     }
     let epoch = source.holders.epoch;

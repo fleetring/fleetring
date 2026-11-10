@@ -516,6 +516,10 @@ async fn try_open(
             // released (ADR-0046, point 3.10, as built).
             node.replication().forks().follow_view(name, Some(&fork));
             let held = handle.fork_marker().await.map_err(marker_status)?;
+            if fleetring_control::mutation::Mutation::UnconditionalReset.is_active() {
+                let at = held.map(|marker| marker.at).unwrap_or_default();
+                return reset(node, name, lease, &fork, &at, &handle).await;
+            }
             let ours = held.is_some_and(|marker| {
                 marker.fork_incarnation == fork.identity.incarnation.get()
                     && marker.operation == fork.identity.operation.to_bytes()
@@ -583,7 +587,8 @@ async fn reset(
         .pass(FaultPoint::BeforeReset, identity.operation)
         .await;
     let held = handle.fork_marker().await.map_err(failed)?;
-    let position = if held.as_ref().is_some_and(|held| held.same_fork(&marker)) {
+    let unconditional = fleetring_control::mutation::Mutation::UnconditionalReset.is_active();
+    let position = if !unconditional && held.as_ref().is_some_and(|held| held.same_fork(&marker)) {
         tracing::info!(target: "fleetringd::audit", fork = %identity, epoch = lease.epoch.get(), "the copy holds the fork's marker; the reset doesn't run again");
         handle.position().await.map_err(failed)?
     } else {
