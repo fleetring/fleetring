@@ -9,15 +9,18 @@
 //!
 //! - **(a) Fencing.** No lease on a fork before it is seeded; a seeded fork's first lease only to
 //!   a holder whose report showed the staged copy it completed with; completion only on a
-//!   completion quorum C = max(⌊R/2⌋ + 1, W, `min_replicas`) of holders that reported it; and no
-//!   client write, read, or watch acknowledged on a fork before its reset committed at its
-//!   bootstrap quorum, as its primary's hooks show.
+//!   completion quorum C = max(⌊R/2⌋ + 1, W, `min_replicas`) of holders that reported it;
+//!   readiness only once a bootstrap quorum W_boot of its holders' copies on disk hold its
+//!   marker; and no client write, read, or watch acknowledged on a fork before its reset
+//!   committed at W_boot: before W_boot of its holders' copies on disk held the marker, as the
+//!   fleet read them after each step, nor before its primary's hooks show the quorum commit.
 //! - **(b) Acknowledged rows only.** A fork's rows from its source are a prefix of the source's
 //!   surviving history, in order, and none was refused.
 //! - **(c) One source incarnation.** No copy of a fork, staged or final, holds a row written to
 //!   another incarnation of its source.
 //! - **(d) Identities apart.** No fork command `apply` accepts names another identity than the
-//!   current one; completion and readiness count only reports of the command's identity; no
+//!   current one; completion and readiness count only reports of the command's identity, and
+//!   readiness only its holders' reports; no
 //!   seeding request of a dropped identity is served; and no fork holds another fork's rows.
 //! - **(e) Independence.** No source holds a row written to its fork, and no fork a source row
 //!   after its own.
@@ -27,18 +30,22 @@
 //! - **(g) Termination.** A fork leaves `seeding` by its deadline, and ends as its scenario
 //!   expects.
 //! - **(h) One reset.** No fork-reset write runs once a client write to the fork was acknowledged;
-//!   every copy of a ready fork that holds its writes holds exactly its own marker; and no watch
-//!   of a fork sees a change it inherited.
-//! - **(i) Frozen replica set.** While a fork is seeded or ready with its holders kept, its lease
-//!   stays with a holder; and every write acknowledged before it became ready, or before its
-//!   holders were released, is on a write quorum of the replica set it moved to.
+//!   every copy of a ready fork that holds its writes, or any marker, holds exactly its own
+//!   marker; no watch of a fork sees a change it inherited; and every watch sees every write to
+//!   the fork acknowledged before it began: the change history recorded after readiness survives.
+//! - **(i) Frozen replica set.** While a fork is seeded or ready with its holders kept, its
+//!   replica set in control state is its recorded holders and its lease stays with one; and every
+//!   write acknowledged before it became ready, or before its holders were released, is on a
+//!   write quorum of the replica set it moved to. The replica set is worked out here: the
+//!   holders, or once they are released the ring's placement over the fleet's members, computed
+//!   with the placement crate, never asked of control state ([`expected_replica_set`]).
 //! - **Disk admission.** No node holds more concurrent forks' copies than its free disk admits.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use fleetring::NodeId;
-use fleetring_control::fork::{ForkIdentity, ForkState, OperationId};
+use fleetring::{NodeId, Ring};
+use fleetring_control::fork::{Fork, ForkIdentity, ForkState, OperationId};
 use fleetring_control::{
     Acks, Action, Command, Database, DatabaseName, Incarnation, Report, State, apply,
 };
@@ -46,8 +53,13 @@ use fleetring_control::{
 use crate::sim::check::{Invariant, Violation};
 use crate::sim::history::excerpt;
 use crate::sim::workload::{
-    Ack, ForkPhaseKind, History, Operation, OutcomeClass, Record, SeedingProbe,
+    Ack, ForkPhaseKind, ForkTransition, History, Operation, OutcomeClass, Record, SeedingProbe,
 };
+
+/// How long a watch may take to start following a database's changes after it is asked for,
+/// and a change to reach it after its write is acknowledged: a few of the simulated network's
+/// longest delays.
+const WATCH_SETTLED: Duration = Duration::from_millis(100);
 
 /// How long past a seeding fork's deadline the driver may take to fail it: a few ticks.
 const DEADLINE_SLACK_MS: u64 = 3_000;
@@ -60,6 +72,8 @@ pub enum Expected {
     Ready,
     /// Failed.
     Failed,
+    /// Failed for this reason.
+    FailedWith(fleetring_control::fork::ForkFailure),
     /// Cancelled, by a drop or an expiry.
     Cancelled,
     /// Seeded and never ready: unusable but safe, as invariant (g) allows while its quorums are
@@ -119,6 +133,8 @@ pub struct ForkDisk {
     /// Each host's staged copies: the host, the fork's name, its `incarnation-operation`
     /// directory, and the copy's values in commit order.
     pub staged: Vec<(String, DatabaseName, String, Vec<i64>)>,
+    /// Every data host of the fleet: the hosts whose disks were read.
+    pub hosts: BTreeSet<String>,
 }
 
 /// How each control time maps to simulated time: the fleet's clock shifts, in order.
@@ -150,6 +166,10 @@ struct Life {
     identity: ForkIdentity,
     source: DatabaseName,
     source_incarnation: Incarnation,
+    /// Its write quorum W and bootstrap quorum W_boot, from its replication factor and
+    /// durability when it was asked for: neither changes before it is ready.
+    write: usize,
+    bootstrap: usize,
     start: Duration,
     end: Option<Duration>,
 }
@@ -204,6 +224,48 @@ fn identity_of(db: &Database) -> Option<ForkIdentity> {
         .map(|fork| ForkIdentity::new(db.name().clone(), db.incarnation(), fork.operation()))
 }
 
+/// The replica set ADR-0046 gives `db`, worked out here rather than asked of control state: a
+/// seeded fork's recorded holders, and a ready one's while it keeps them (point 3.10, invariant
+/// (i)); otherwise the ring's placement over the fleet's members with its replication factor,
+/// computed with the placement crate itself.
+#[must_use]
+pub fn expected_replica_set(state: &State, db: &Database) -> Vec<NodeId> {
+    match db.fork().map(Fork::state) {
+        Some(
+            ForkState::Seeded { holders, .. }
+            | ForkState::Ready {
+                holders: Some(holders),
+                ..
+            },
+        ) => holders.iter().cloned().collect(),
+        _ => placement(state, db),
+    }
+}
+
+/// Where the ring over `state`'s members places `db`, in preference order: none if the fleet
+/// has no members.
+fn placement(state: &State, db: &Database) -> Vec<NodeId> {
+    let nodes = state.members().map(|member| {
+        let mut node = fleetring::Node::new(member.id().clone()).with_weight(member.weight());
+        if let Some(zone) = member.zone() {
+            node = node.with_zone(zone.clone());
+        }
+        if let Some(host) = member.host() {
+            node = node.with_host(host.clone());
+        }
+        node
+    });
+    Ring::builder()
+        .epoch(state.membership_epoch())
+        .nodes(nodes)
+        .build()
+        .map(|ring| {
+            ring.replicas_n(db.name().as_str(), db.replication_factor())
+                .to_ids()
+        })
+        .unwrap_or_default()
+}
+
 fn violation(invariant: Invariant, detail: String) -> Violation {
     Violation::new(invariant, detail)
 }
@@ -225,7 +287,9 @@ pub fn check(
     };
     let (learned, last) = replay(genesis, commands, clock)?;
     let fork_writes = fork_writes(history, &learned);
-    fencing_of_clients(history, &learned)?;
+    let markers = marker_quorums(history, &learned, disk);
+    readiness_on_disk(history, &learned, &markers)?;
+    fencing_of_clients(history, &learned, &markers)?;
     rows(history, &learned, &last, disk)?;
     probes(history, &learned)?;
     operations(history, &learned, expectations)?;
@@ -295,33 +359,7 @@ fn replay(
             clock,
             &mut learned,
         );
-        // The frozen replica set: a seeded fork's lease, or a ready one's whose holders are
-        // kept, is a holder's, whatever moved it.
-        if let Some(db) = &after
-            && let Some(fork) = db.fork()
-            && let Some(lease) = db.lease()
-        {
-            let holders = match fork.state() {
-                ForkState::Seeded { holders, .. }
-                | ForkState::Ready {
-                    holders: Some(holders),
-                    ..
-                } => Some(holders),
-                _ => None,
-            };
-            if let Some(holders) = holders
-                && !holders.contains(lease.holder())
-            {
-                return Err(violation(
-                    Invariant::ForkFrozenReplicaSet,
-                    format!(
-                        "{} holds the lease of fork {} at {at} ms, but isn't among its holders {holders:?}",
-                        lease.holder(),
-                        db.name()
-                    ),
-                ));
-            }
-        }
+        frozen(&state, at)?;
         // Seeding ends by its deadline.
         if let Some(db) = &before
             && let Some(ForkState::Seeding { deadline, .. }) = db.fork().map(|fork| fork.state())
@@ -359,6 +397,52 @@ fn replay(
         }
     }
     Ok((learned, state))
+}
+
+/// (i): every seeded fork's replica set, and every ready one's whose holders are kept, is its
+/// recorded holders in control state, whatever placement says, and its lease is a holder's,
+/// whatever moved it. Checked after every command, since a membership change moves placement.
+fn frozen(state: &State, at: u64) -> Result<(), Violation> {
+    for db in state.databases() {
+        let Some(
+            ForkState::Seeded { holders, .. }
+            | ForkState::Ready {
+                holders: Some(holders),
+                ..
+            },
+        ) = db.fork().map(Fork::state)
+        else {
+            continue;
+        };
+        let replicas: BTreeSet<NodeId> = state
+            .replica_set(db.name())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if replicas != *holders {
+            return Err(violation(
+                Invariant::ForkFrozenReplicaSet,
+                format!(
+                    "control state gives fork {} the replica set {replicas:?} at {at} ms, not its recorded holders {holders:?}; placement says {:?}",
+                    db.name(),
+                    placement(state, db)
+                ),
+            ));
+        }
+        if let Some(lease) = db.lease()
+            && !holders.contains(lease.holder())
+        {
+            return Err(violation(
+                Invariant::ForkFrozenReplicaSet,
+                format!(
+                    "{} holds the lease of fork {} at {at} ms, but isn't among its holders {holders:?}",
+                    lease.holder(),
+                    db.name()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The database name an action touches, for the replay's before-and-after views.
@@ -436,8 +520,15 @@ fn fork_command(
                 return Ok(());
             };
             let (_, bootstrap, _) = quorums(db);
+            // Only the holders' reports count: they are the replica set until the fork is ready.
+            let holders = match db.fork().map(Fork::state) {
+                Some(ForkState::Seeded { holders, .. }) => holders.clone(),
+                _ => BTreeSet::new(),
+            };
             let committed = reports
-                .values()
+                .iter()
+                .filter(|(node, _)| holders.contains(*node))
+                .map(|(_, report)| report)
                 .filter(|report| {
                     report.reset().is_some_and(|reset| {
                         reset.fork() == fork
@@ -451,7 +542,7 @@ fn fork_command(
                 return Err(violation(
                     Invariant::ForkIdentitiesApart,
                     format!(
-                        "fork {fork} was marked ready at {at} ms on {committed} reports of its reset, fewer than its bootstrap quorum of {bootstrap}"
+                        "fork {fork} was marked ready at {at} ms on {committed} of its holders' {holders:?} reports of its reset, fewer than its bootstrap quorum of {bootstrap}"
                     ),
                 ));
             }
@@ -564,10 +655,13 @@ fn lives(
                 end: None,
             });
             if let (Some(identity), Some(fork)) = (identity_of(db), db.fork()) {
+                let (write, bootstrap, _) = quorums(db);
                 learned.forks.push(Life {
                     identity,
                     source: fork.source().clone(),
                     source_incarnation: fork.source_incarnation(),
+                    write,
+                    bootstrap,
                     start: now,
                     end: None,
                 });
@@ -649,6 +743,9 @@ fn outcomes(state: &State, expectations: &ForkExpectations) -> Result<(), Violat
             | (Expected::Failed, Some(OperationOutcome::Failed { .. }))
             | (Expected::Cancelled, Some(OperationOutcome::Cancelled { .. }))
             | (Expected::Seeded, Some(OperationOutcome::Seeded)) => true,
+            (Expected::FailedWith(want), Some(OperationOutcome::Failed { reason })) => {
+                reason == want
+            }
             (Expected::Terminal, Some(outcome)) => outcome.is_terminal(),
             _ => false,
         };
@@ -729,13 +826,103 @@ fn first_pass(
     first
 }
 
-/// (a): no client data call acknowledged on a fork before its reset committed at its bootstrap
-/// quorum, as the first primary's hooks show.
-fn fencing_of_clients(history: &History, learned: &Learned) -> Result<(), Violation> {
-    if !cfg!(feature = "fault-hooks") {
-        return Ok(());
+/// When a bootstrap quorum of each fork identity's holders' copies on disk first held its
+/// marker, as the fleet read them after each step: the W_boot-th holder's first sighting, or
+/// `None` if none was seen. Only forks seeded on the fleet's data hosts are judged on disk: a
+/// fork driven by reports alone, with no data host among its holders, has no copies to read.
+fn marker_quorums(
+    history: &History,
+    learned: &Learned,
+    disk: &ForkDisk,
+) -> BTreeMap<ForkIdentity, Option<Duration>> {
+    let mut seen: BTreeMap<&ForkIdentity, Vec<Duration>> = BTreeMap::new();
+    for marker in history.fork_markers() {
+        seen.entry(&marker.identity).or_default().push(marker.at);
     }
-    let opened = first_pass(history, crate::replication::FaultPoint::AfterQuorumCommit);
+    let on_data_hosts = |identity: &ForkIdentity| {
+        history.fork_transitions().iter().any(|transition| {
+            transition.identity == *identity
+                && transition
+                    .replica_set
+                    .iter()
+                    .any(|node| disk.hosts.contains(node.as_str()))
+        })
+    };
+    let mut quorums = BTreeMap::new();
+    for life in learned
+        .forks
+        .iter()
+        .filter(|life| on_data_hosts(&life.identity))
+    {
+        let mut times = seen.remove(&life.identity).unwrap_or_default();
+        times.sort_unstable();
+        let at = life
+            .bootstrap
+            .checked_sub(1)
+            .and_then(|index| times.get(index))
+            .copied();
+        quorums.insert(life.identity.clone(), at);
+    }
+    quorums
+}
+
+/// (a): a fork becomes ready only once a bootstrap quorum of its holders' copies on disk hold
+/// its marker, whatever the replicas reported.
+fn readiness_on_disk(
+    history: &History,
+    learned: &Learned,
+    markers: &BTreeMap<ForkIdentity, Option<Duration>>,
+) -> Result<(), Violation> {
+    let mut judged = BTreeSet::new();
+    for ForkTransition {
+        at,
+        identity,
+        phase,
+        ..
+    } in history.fork_transitions()
+    {
+        let Some(quorum) = markers.get(identity) else {
+            continue;
+        };
+        if !matches!(phase, ForkPhaseKind::ReadyKept | ForkPhaseKind::Released)
+            || !judged.insert(identity)
+        {
+            continue;
+        }
+        let bootstrap = learned
+            .forks
+            .iter()
+            .find(|life| life.identity == *identity)
+            .map_or(0, |life| life.bootstrap);
+        let held = history
+            .fork_markers()
+            .iter()
+            .filter(|marker| marker.identity == *identity && marker.at <= *at)
+            .map(|marker| marker.host.as_str())
+            .collect::<BTreeSet<_>>();
+        if quorum.is_none_or(|quorum| quorum > *at) {
+            return Err(violation(
+                Invariant::ForkFencing,
+                format!(
+                    "fork {identity} became ready at {} ms while only {held:?} of its holders' copies on disk held its marker, fewer than its bootstrap quorum of {bootstrap}",
+                    at.as_millis()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// (a): no client data call acknowledged on a fork before its reset committed at its bootstrap
+/// quorum: before a bootstrap quorum of its holders' copies on disk held its marker, nor, with
+/// the hooks, before its primary passed its quorum commit.
+fn fencing_of_clients(
+    history: &History,
+    learned: &Learned,
+    markers: &BTreeMap<ForkIdentity, Option<Duration>>,
+) -> Result<(), Violation> {
+    let opened = cfg!(feature = "fault-hooks")
+        .then(|| first_pass(history, crate::replication::FaultPoint::AfterQuorumCommit));
     for record in history.records() {
         let served = matches!(
             (record.operation(), record.outcome().ack()),
@@ -752,12 +939,30 @@ fn fencing_of_clients(history: &History, learned: &Learned) -> Result<(), Violat
         let Some(life) = life_of(learned, database, record) else {
             continue;
         };
-        let open = opened.get(&life.identity.operation);
-        if open.is_none_or(|open| record.completed_at() < *open) {
+        if let Some(on_disk) = markers.get(&life.identity)
+            && on_disk.is_none_or(|on_disk| record.completed_at() < on_disk)
+        {
             return Err(violation(
                 Invariant::ForkFencing,
                 format!(
-                    "{} on fork {} was served at {} ms, before its reset committed at its bootstrap quorum ({open:?})",
+                    "{} on fork {} was served at {} ms, before a bootstrap quorum of its holders' copies on disk held its marker ({on_disk:?})",
+                    record.operation(),
+                    life.identity,
+                    record.completed_at().as_millis()
+                ),
+            )
+            .with_excerpt(excerpt(history, &[record.id()])));
+        }
+        let open = opened
+            .as_ref()
+            .map(|opened| opened.get(&life.identity.operation));
+        if let Some(open) = open
+            && open.is_none_or(|open| record.completed_at() < *open)
+        {
+            return Err(violation(
+                Invariant::ForkFencing,
+                format!(
+                    "{} on fork {} was served at {} ms, before its primary saw its reset committed at its bootstrap quorum ({open:?})",
                     record.operation(),
                     life.identity,
                     record.completed_at().as_millis()
@@ -1117,15 +1322,15 @@ fn reset_once(
             life.identity.operation.to_bytes().to_vec(),
         );
         for ((name, host), copy) in &disk.copies {
-            if *name != life.identity.name || !copy.values.iter().any(|value| ours.contains(value))
-            {
+            let holds_ours = copy.values.iter().any(|value| ours.contains(value));
+            if *name != life.identity.name || (!holds_ours && copy.markers.is_empty()) {
                 continue;
             }
             if copy.markers != [marker.clone()] {
                 return Err(violation(
                     Invariant::ForkResetOnce,
                     format!(
-                        "{host}'s copy of ready fork {} holds its writes and the markers {:?}, not exactly its own",
+                        "{host}'s copy of ready fork {} holds the markers {:?}, not exactly its own",
                         life.identity, copy.markers
                     ),
                 ));
@@ -1156,13 +1361,42 @@ fn reset_once(
             )
             .with_excerpt(excerpt(history, &[record.id()])));
         }
+        // A watch is a live tail: it sees every write to the fork made while it watched, none
+        // missed and an empty watch only if there were none.
+        let seen: BTreeSet<i64> = values.iter().copied().collect();
+        let watched = |write: &Record| {
+            write.invoked_at() >= record.invoked_at() + WATCH_SETTLED
+                && write.completed_at() + WATCH_SETTLED <= record.completed_at()
+        };
+        if let Some(write) = history.records().iter().find(|write| {
+            matches!(
+                (write.operation(), write.outcome().ack()),
+                (Operation::Write { database: to, value }, Some(Ack::Written { .. }))
+                    if to == database && !seen.contains(value)
+            ) && watched(write)
+                && life.contains(write)
+        }) {
+            return Err(violation(
+                Invariant::ForkResetOnce,
+                format!(
+                    "a watch of fork {} from {} to {} ms saw {} changes, and not {}, acknowledged while it watched",
+                    life.identity,
+                    record.invoked_at().as_millis(),
+                    record.completed_at().as_millis(),
+                    values.len(),
+                    write.operation()
+                ),
+            )
+            .with_excerpt(excerpt(history, &[record.id(), write.id()])));
+        }
     }
     Ok(())
 }
 
 /// (i): every write acknowledged before a fork became ready, or before its holders were
 /// released, is on a write quorum of the replica set it moved to, and every acknowledged write
-/// of a ready fork is on one of its final replica set.
+/// of a ready fork is on one of its final replica set: each set worked out here
+/// ([`expected_replica_set`]), the fleet's for its transitions.
 fn handover(
     history: &History,
     learned: &Learned,
@@ -1177,10 +1411,14 @@ fn handover(
         ) {
             continue;
         }
-        let Some(db) = state.database(&transition.identity.name) else {
+        let Some(write) = learned
+            .forks
+            .iter()
+            .find(|life| life.identity == transition.identity)
+            .map(|life| life.write)
+        else {
             continue;
         };
-        let (write, _, _) = quorums(db);
         let Some(writes) = fork_writes.get(&transition.identity.operation) else {
             continue;
         };
@@ -1224,9 +1462,7 @@ fn handover(
             continue;
         }
         let (write, _, _) = quorums(db);
-        let Ok(replicas) = state.replica_set(&life.identity.name) else {
-            continue;
-        };
+        let replicas = expected_replica_set(state, db);
         for (value, _) in fork_writes
             .get(&life.identity.operation)
             .into_iter()

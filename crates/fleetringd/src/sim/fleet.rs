@@ -26,13 +26,14 @@ use crate::sim::SimRng;
 use crate::sim::check::{self, ControlLog, ReplicaChains, ReplicaRows, Violation};
 use crate::sim::client::{Session, Via, WatcherSession, run_client, run_lease_watcher};
 use crate::sim::fault::{Fault, LossRate};
-use crate::sim::forks::{CopyOnDisk, ForkDisk, ForkExpectations};
+use crate::sim::forks::{CopyOnDisk, ForkDisk, ForkExpectations, expected_replica_set};
 use crate::sim::history::{self, Guarantee, Replicated};
 use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
 use crate::sim::workload::{
-    Ack, ForkPass, ForkPhaseKind, ForkTransition, History, Operation, WRITES_TABLE, Workload,
+    Ack, ForkMarkerSeen, ForkPass, ForkPhaseKind, ForkTransition, History, Operation, WRITES_TABLE,
+    Workload,
 };
 use crate::tls::{Authority, AuthorityError, FleetName, Identity, IdentityError, Validity};
 use crate::{
@@ -385,6 +386,8 @@ impl FleetBuilder {
             fork_faults: BTreeMap::new(),
             fork_seen: BTreeMap::new(),
             fork_phases: BTreeMap::new(),
+            fork_markers: BTreeSet::new(),
+            fork_stamps: BTreeMap::new(),
             principals: BTreeMap::new(),
             binding_refusals_allowed: false,
             fork_expectations: ForkExpectations::default(),
@@ -633,13 +636,18 @@ pub struct Fleet {
     impostors: BTreeMap<String, NodeId>,
     /// The router host, if the fleet has one.
     router: Option<String>,
-    /// Each data host's fork fault hooks, which survive its restarts: inert unless the
+    /// Each host's fork fault hooks, which survive its restarts: inert unless the
     /// `fault-hooks` feature is on.
     fork_faults: BTreeMap<String, ForkFaults>,
     /// The passes of each host's fork work through each hook the fleet has recorded.
     fork_seen: BTreeMap<(String, FaultPoint, Option<OperationId>), u64>,
     /// Each fork's identity and phase as the fleet last saw it in control state.
     fork_phases: BTreeMap<DatabaseName, (ForkIdentity, ForkPhaseKind)>,
+    /// Each fork's holders whose copy on disk the fleet has seen hold its marker.
+    fork_markers: BTreeSet<(ForkIdentity, String)>,
+    /// The size and modification time of each holder's copy files of each fork when the fleet
+    /// last read them, so that it reads a copy again only once it changed.
+    fork_stamps: BTreeMap<(DatabaseName, String), CopyStamp>,
     /// The principal each client acts as, if not [`WORKLOAD_PRINCIPAL`].
     principals: BTreeMap<String, String>,
     /// Whether data hosts may refuse peer calls for their bindings in this run.
@@ -694,9 +702,7 @@ impl Fleet {
         let host = name.to_owned();
         let started = config.clone();
         let faults = new_fork_faults();
-        if role.hosts_data() {
-            self.fork_faults.insert(name.to_owned(), faults.clone());
-        }
+        self.fork_faults.insert(name.to_owned(), faults.clone());
         // From the fleet's seed and the host's name, without drawing from the workloads'
         // generator, so that adding a host's randomness moves no workload.
         let seed = host_seed(self.seed, name);
@@ -926,7 +932,9 @@ impl Fleet {
         self.add_client(name, None, workload);
     }
 
-    /// Returns data host `name`'s fork fault hooks, which survive its restarts (FR-087).
+    /// Returns host `name`'s fork fault hooks, which survive its restarts (FR-087): a data
+    /// host's fork work passes them, and the control host's control service drops a fork
+    /// request's reply through them.
     #[cfg(feature = "fault-hooks")]
     #[must_use]
     pub fn fork_faults(&self, name: &str) -> Option<ForkFaults> {
@@ -1142,11 +1150,13 @@ impl Fleet {
 
     /// Records what changed since the last step in each host's fork work at its hooks, and in
     /// each fork's phase in control state, with every data host's rows of a fork that moved to a
-    /// new replica set (FR-087).
+    /// new replica set; and when each holder's copy on disk first holds its fork's marker
+    /// (FR-087).
     fn observe_forks(&mut self) {
         let at = self.sim.elapsed();
         let passes = self.hook_passes(at);
         let mut transitions = Vec::new();
+        let mut markers = Vec::new();
         if let Some(state) = self.control_state() {
             for db in state.databases() {
                 let Some(fork) = db.fork() else {
@@ -1164,6 +1174,14 @@ impl Fleet {
                     ForkState::Failed { .. } => ForkPhaseKind::Failed,
                     _ => continue,
                 };
+                if let ForkState::Seeded { holders, .. }
+                | ForkState::Ready {
+                    holders: Some(holders),
+                    ..
+                } = fork.state()
+                {
+                    markers.extend(self.markers_seen(at, &identity, holders));
+                }
                 let now = (identity.clone(), phase);
                 if self.fork_phases.get(db.name()) == Some(&now) {
                     continue;
@@ -1180,23 +1198,74 @@ impl Fleet {
                 };
                 transitions.push(ForkTransition {
                     at,
-                    replica_set: state.replica_set(db.name()).unwrap_or_default(),
+                    // Worked out from the holders and the ring, not asked of control state.
+                    replica_set: expected_replica_set(&state, db),
                     identity,
                     phase,
                     rows,
                 });
             }
         }
-        if passes.is_empty() && transitions.is_empty() {
+        if passes.is_empty() && transitions.is_empty() && markers.is_empty() {
             return;
         }
         let mut shared = self.shared.lock();
         for pass in passes {
             shared.history.observe_fork_pass(pass);
         }
+        for seen in markers {
+            shared.history.observe_fork_marker(seen);
+        }
         for transition in transitions {
             shared.history.observe_fork_transition(transition);
         }
+    }
+
+    /// The holders of `identity` whose copy on disk holds its marker for the first time now. A
+    /// copy is read again only once its files changed.
+    fn markers_seen(
+        &mut self,
+        at: Duration,
+        identity: &ForkIdentity,
+        holders: &BTreeSet<NodeId>,
+    ) -> Vec<ForkMarkerSeen> {
+        let marker = (
+            identity.incarnation.get(),
+            identity.operation.to_bytes().to_vec(),
+        );
+        let mut seen = Vec::new();
+        for holder in holders {
+            let host = holder.to_string();
+            let key = (identity.clone(), host.clone());
+            if self.fork_markers.contains(&key) {
+                continue;
+            }
+            let Some(info) = self.host(&host) else {
+                continue;
+            };
+            let dir = info
+                .data_dir
+                .join(DATABASES_DIR)
+                .join(layout::database_dir(&identity.name));
+            let stamp = CopyStamp::of(&dir);
+            let stamps = self
+                .fork_stamps
+                .entry((identity.name.clone(), host.clone()))
+                .or_default();
+            if *stamps == stamp {
+                continue;
+            }
+            *stamps = stamp;
+            if read_copy(&dir).is_ok_and(|copy| copy.markers.contains(&marker)) {
+                self.fork_markers.insert(key);
+                seen.push(ForkMarkerSeen {
+                    at,
+                    identity: identity.clone(),
+                    host,
+                });
+            }
+        }
+        seen
     }
 
     /// Advances the simulation by `duration`.
@@ -1437,6 +1506,55 @@ impl Fleet {
             rows.insert(host.name.clone(), held);
         }
         Ok(rows)
+    }
+
+    /// Returns the values of the writes-table rows every data host's file sinks delivered for
+    /// `database`, read from their files: by host, in the order each wrote them.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Simulation`] if a sink's file can't be read.
+    pub fn sink_values(
+        &self,
+        database: &DatabaseName,
+    ) -> Result<BTreeMap<String, Vec<i64>>, SimError> {
+        let mut delivered: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for host in self.hosts.iter().filter(|host| host.role.hosts_data()) {
+            for sink in &host.config.changes.sink {
+                let (SinkKind::File, Some(dir)) = (sink.kind, &sink.path) else {
+                    continue;
+                };
+                let path = database_file(dir, database);
+                let records = read_records(&path).map_err(|error| {
+                    SimError::Simulation(format!(
+                        "can't read {}'s sink file {}: {error}",
+                        host.name,
+                        path.display()
+                    ))
+                })?;
+                let values = delivered.entry(host.name.clone()).or_default();
+                for record in records {
+                    let crate::changes::RecordContent::Logical { rows } = record.content else {
+                        continue;
+                    };
+                    values.extend(
+                        rows.iter()
+                            .filter(|row| row.table == WRITES_TABLE)
+                            .filter_map(|row| {
+                                row.values().iter().find_map(|column| {
+                                    match (column.name.as_str(), &column.value) {
+                                        ("value", crate::engine::Value::Integer(value)) => {
+                                            Some(*value)
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            }),
+                    );
+                }
+            }
+        }
+        Ok(delivered)
     }
 
     /// Returns the hash chain each running replica of `database` holds, by host: the primary's,
@@ -1900,7 +2018,15 @@ impl Fleet {
                 names.insert(intent.source.clone());
             }
         }
-        let mut disk = ForkDisk::default();
+        let mut disk = ForkDisk {
+            hosts: self
+                .hosts
+                .iter()
+                .filter(|host| host.role.hosts_data())
+                .map(|host| host.name.clone())
+                .collect(),
+            ..ForkDisk::default()
+        };
         if names.is_empty() {
             return disk;
         }
@@ -1938,6 +2064,21 @@ impl Fleet {
             }
         }
         disk
+    }
+}
+
+/// The size and modification time of each file of a SQLite copy, or `None` for one that is
+/// missing: what tells the fleet a copy changed since it last read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CopyStamp([Option<(u64, std::time::SystemTime)>; 2]);
+
+impl CopyStamp {
+    fn of(dir: &Path) -> Self {
+        let stamp = |file: &str| {
+            let meta = std::fs::metadata(dir.join(file)).ok()?;
+            Some((meta.len(), meta.modified().ok()?))
+        };
+        Self([stamp("data.db"), stamp("data.db-wal")])
     }
 }
 
