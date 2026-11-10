@@ -1,6 +1,6 @@
 # ADR-0009: Toolchain, lint, dependency, and CI policy
 
-- **Status:** Accepted (2026-10-27); the `test` row of decision 6 amended by [ADR-0014](0014-os-test-matrix.md)
+- **Status:** Accepted (2026-10-27); the `test` row of decision 6 amended by [ADR-0014](0014-os-test-matrix.md); decision 6 amended on 2026-11-10 to skip the Rust jobs for a pull request that changes only documentation no test reads
 - **Date:** 2026-10-27
 - **Related:** ADR-0002, ADR-0003, ADR-0008; tickets FR-001, FR-002, FR-016, FR-017, FR-019
 
@@ -70,3 +70,9 @@ The workspace is a fresh skeleton: edition 2021, a placeholder `add()`, no lints
 
 - CI takes longer, since the cross-target jobs run tests under emulation. Vectors and property tests are sized so each job stays well under ten minutes. Heavy statistical runs happen only in a dedicated release-mode job.
 - A new Rust release may add clippy warnings that fail CI until they're fixed. That's accepted and intended.
+
+## Amendment, 2026-11-10: documentation-only pull requests
+
+A pull request whose changed files are all Markdown that no test, doctest or rustdoc reads runs CI's `changes` job and none of the Rust jobs. Crate READMEs, `docs/agents/` and `docs/spec/` count as code. The skipped jobs still report their names, so every check the `main` ruleset requires passes. The matrix `test` job skips its steps rather than the whole job, because a matrix job skipped as a whole reports one check whose name its matrix never filled in.
+
+A merge group, a manual run, or a failure of `changes` itself runs everything. A job is skipped only on a definite "no". The list of documentation that tests read lives in `changes` in `.github/workflows/ci.yml`; a test that starts reading another document must add it there.
