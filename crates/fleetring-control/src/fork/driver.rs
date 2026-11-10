@@ -31,9 +31,8 @@ use crate::{Action, Database, LeaseEpoch, Position, Report, State, Timestamp};
 /// - [`Action::RetryForkSeed`] when the seeder reports a failure worth retrying, has left the
 ///   replica set, or has been down for the fork's seeder timeout, or when the attempt has run
 ///   for its attempt timeout, with that cause;
-/// - [`Action::DropForkHolder`] for a holder of a seeded fork that is no longer a member, unless
-///   a lease was issued since completion and fewer than the completion quorum would remain, or,
-///   before the first lease, that reports its staged copy lost;
+/// - [`Action::DropForkHolder`] for a holder of a seeded fork that is no longer a member, or
+///   that reports its staged copy lost, only before the first lease since completion;
 /// - [`Action::MarkForkReady`] when the bootstrap quorum of a seeded fork's replica set reports
 ///   its reset committed;
 /// - [`Action::ReleaseForkHolders`] when a ready fork that keeps its holders has a lease holder
@@ -242,8 +241,8 @@ fn completion(
     })
 }
 
-/// What moves a seeded fork on: `DropForkHolder` for a holder that left the fleet, or that lost
-/// its copy before the first lease; otherwise `MarkForkReady` once the bootstrap quorum of its
+/// What moves a seeded fork on: before the first lease since completion, `DropForkHolder` for a
+/// holder that left the fleet or lost its copy; otherwise `MarkForkReady` once the bootstrap quorum of its
 /// replica set reports the same reset committed, at an epoch the database has issued.
 fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
     let identity = identity_of(db, fork);
@@ -256,20 +255,17 @@ fn seeded(state: &State, db: &Database, fork: &Fork) -> Option<Action> {
     else {
         return None;
     };
-    let first_lease_pending = db.epoch() == *lease_from;
+    // Holders are dropped only before the first lease since completion: after it, the primary
+    // counts its write quorum over every holder, and the fork may hold acknowledged writes.
     // Seeding again needs a fleet to place the fork on; with no members, nothing is proposed.
-    let placeable = state.ring().is_ok();
-    // After a lease, a holder that left stays once dropping it would leave fewer than the
-    // completion quorum: the fork may hold acknowledged writes that seeding again would discard.
-    let droppable = first_lease_pending || holders.len() > completion_quorum_of(db);
-    for holder in holders.iter().filter(|_| placeable) {
-        let cause = if state.member(holder).is_none() && droppable {
+    let droppable = db.epoch() == *lease_from && state.ring().is_ok();
+    for holder in holders.iter().filter(|_| droppable) {
+        let cause = if state.member(holder).is_none() {
             RetryCause::HoldersLeft
-        } else if first_lease_pending
-            && state
-                .report(holder, db.name())
-                .and_then(Report::copy_lost)
-                .is_some_and(|lost| *lost.fork() == identity && lost.attempt() == *attempt)
+        } else if state
+            .report(holder, db.name())
+            .and_then(Report::copy_lost)
+            .is_some_and(|lost| *lost.fork() == identity && lost.attempt() == *attempt)
         {
             RetryCause::HolderLost
         } else {

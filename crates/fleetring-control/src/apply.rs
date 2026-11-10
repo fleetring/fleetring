@@ -965,21 +965,19 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
-    /// A holder that left the fleet stays among a seeded fork's holders when dropping it would
-    /// leave fewer than the completion quorum after a lease was issued since completion: the
-    /// fork may have acknowledged writes, which seeding again from the source would discard
-    /// (ADR-0046, point 3.6).
+    /// A seeded fork keeps every holder once a lease was issued since completion, even one that
+    /// left the fleet: its primary counts its write quorum over those holders and may have
+    /// acknowledged writes, so dropping one would shrink the set a promotion fences, and seeding
+    /// again from the source would discard them (ADR-0046, point 3.6, as built).
     #[error(
         "fork '{database}' was leased since it was seeded and may hold acknowledged writes; \
-         dropping node '{id}' would leave fewer than {needed} holders, so it stays seeded"
+         node '{id}' stays among its holders"
     )]
     HolderNeededAfterLease {
         /// The holder.
         id: NodeId,
         /// The fork.
         database: DatabaseName,
-        /// The completion quorum.
-        needed: usize,
     },
 
     /// A ready fork's holders are released only while it keeps them, and only once its lease

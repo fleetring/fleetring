@@ -604,21 +604,22 @@ pub(crate) fn drop_fork_holder(
             database: identity.name.clone(),
         });
     }
-    let mut remaining = holders.clone();
-    remaining.remove(&holder);
-    let needed = completion_quorum_of(db);
-    if remaining.len() < needed && db.epoch() != *lease_from {
-        // A lease was issued since completion: its primary may have acknowledged writes once
-        // its reset committed, and seeding again from the source would discard them. The fork
-        // stays seeded on the holders it has, unusable but safe, until they return or an
-        // operator drops it (ADR-0046, point 3.6, as built).
+    if db.epoch() != *lease_from {
+        // A lease was issued since completion. Its primary counts W over the holders it was
+        // given and may have acknowledged writes once its reset committed: dropping a holder
+        // would shrink the set a promotion fences under it, and seeding again from the source
+        // would discard those writes. A holder that left stays, harmless: a promotion fences
+        // only members, and its quorum is over every holder. The fork stays seeded on the
+        // holders it has until they report the reset or an operator drops it (ADR-0046,
+        // point 3.6, as built).
         return Err(Rejection::HolderNeededAfterLease {
             id: holder,
             database: identity.name.clone(),
-            needed,
         });
     }
-    if remaining.len() < needed {
+    let mut remaining = holders.clone();
+    remaining.remove(&holder);
+    if remaining.len() < completion_quorum_of(db) {
         // Time spent seeded isn't spent seeding: the next attempt has a fresh deadline.
         let deadline = now.saturating_add(fork.limits().deadline);
         return next_attempt(

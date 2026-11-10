@@ -72,8 +72,8 @@ fn join(state: &mut State, millis: u64, node: &str) {
 
 // ---- Resets from an earlier attempt ----
 
-/// A leased fork whose holders leave below the completion quorum keeps the holders it needs and
-/// its lease, rather than seeding again: its primary may have acknowledged writes once the reset
+/// A leased fork whose holders leave below the completion quorum keeps every holder and its
+/// lease, rather than seeding again: its primary may have acknowledged writes once the reset
 /// committed, and the resets its holders committed under the lease still mark it ready
 /// (ADR-0046, point 3.6, as built). A fork seeds again only before any lease since completion,
 /// so its epoch is still the completion's, and a reset from an earlier attempt, written under an
@@ -109,24 +109,13 @@ fn a_leased_fork_whose_holders_leave_becomes_ready_on_its_resets() {
     for node in &first[3..] {
         run(&mut state, 50, Action::Leave { id: id(node) }).expect("leave");
     }
-    let dropped = drive(&mut state, 60);
-    assert!(
-        matches!(
-            dropped.as_slice(),
-            [(
-                Action::DropForkHolder { .. },
-                Ok(Applied::ForkHolderDropped { .. })
-            )]
-        ),
-        "{dropped:?}"
-    );
-    let ready = drive(&mut state, 61);
+    let ready = drive(&mut state, 60);
     assert!(
         matches!(ready.as_slice(), [(Action::MarkForkReady { epoch, .. }, Ok(_))] if *epoch == LeaseEpoch::new(1)),
         "{ready:?}"
     );
     assert!(
-        matches!(fork_state(&state, "t"), ForkState::Ready { .. }),
+        matches!(fork_state(&state, "t"), ForkState::Ready { holders: Some(kept), .. } if kept.len() == first.len()),
         "{:?}",
         fork_state(&state, "t")
     );

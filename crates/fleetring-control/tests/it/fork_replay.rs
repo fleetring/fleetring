@@ -356,9 +356,9 @@ fn a_log_with_every_fork_command_and_refusal_replays_identically() {
     log.check();
 }
 
-/// A log in which a leased fork's holders leave the fleet replays identically: the holder that
-/// would leave fewer than the completion quorum is refused, and the fork stays seeded with its
-/// lease (ADR-0046, point 3.6, as built).
+/// A log in which a leased fork's holders leave the fleet replays identically: every drop is
+/// refused, and the fork stays seeded on all its holders with its lease (ADR-0046, point 3.6,
+/// as built).
 #[test]
 fn a_log_where_a_leased_forks_holders_leave_replays_identically() {
     let mut log = Log::new();
@@ -403,10 +403,16 @@ fn a_log_where_a_leased_forks_holders_leave_replays_identically() {
             },
         );
     }
+    let refusals = log
+        .outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Err(Rejection::HolderNeededAfterLease { .. })))
+        .count();
+    assert_eq!(refusals, holders.len() - 1, "{:?}", log.outcomes);
     assert!(
-        log.outcomes
+        !log.outcomes
             .iter()
-            .any(|outcome| matches!(outcome, Err(Rejection::HolderNeededAfterLease { .. }))),
+            .any(|outcome| matches!(outcome, Ok(Applied::ForkHolderDropped { .. }))),
         "{:?}",
         log.outcomes
     );
@@ -415,7 +421,7 @@ fn a_log_where_a_leased_forks_holders_leave_replays_identically() {
             .database(&db("t"))
             .and_then(|d| d.fork())
             .map(|f| f.state()),
-        Some(ForkState::Seeded { attempt: 1, .. })
+        Some(ForkState::Seeded { attempt: 1, holders: kept, .. }) if kept.len() == holders.len()
     ));
     log.check();
 }
