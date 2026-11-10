@@ -586,6 +586,8 @@ pub struct ForkStatusReport {
     pub holders: Vec<String>,
     /// How many holders the fork needs.
     pub holders_needed: u32,
+    /// Once ready, the holders it stays on until placement catches up with them.
+    pub kept_holders: Vec<String>,
     /// While seeding, the bytes the seeder staged.
     pub bytes: Option<u64>,
     /// While seeding, the bytes in all.

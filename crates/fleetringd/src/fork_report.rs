@@ -110,6 +110,7 @@ pub fn status_report(fork: &proto::ForkStatus) -> ForkStatusReport {
         disk_refused: fork.disk_refused.clone(),
         holders: fork.holders.clone(),
         holders_needed: fork.holders_needed,
+        kept_holders: fork.kept_holders.clone(),
         bytes: fork.bytes,
         total_bytes: fork.total_bytes,
         position: fork.position.as_deref().map(hex),
