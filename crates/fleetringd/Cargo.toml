@@ -106,6 +106,10 @@ harness = false
 name = "observe"
 harness = false
 
+[[bench]]
+name = "fork"
+harness = false
+
 [dev-dependencies]
 # Renders the man pages checked in under `man/`, in a test (docs/cli.md, section 9).
 clap_mangen = "0.3.3"

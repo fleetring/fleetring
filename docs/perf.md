@@ -161,3 +161,48 @@ FR-063's trace layer, metrics, and request IDs on every RPC (ADR-0034), measured
 - **Reading it:** the layer's 1.35 µs is about 2% of the cheapest RPC's 60 µs and under 1% of a local write; against a replicated acknowledgement of about 3 ms ([fleetringd replication](#fleetringd-replication)) it is 0.05%. Streams (`Replicate`, `Snapshot`, `WatchMembership`, `WatchLeases`) pay it once per stream, not per batch, and a batch costs two counter increments. The sampler reads the replication state's locks once per `[admin] sample_interval_ms` (10 s), off the write path.
 - **The `capture` bench didn't move,** as nothing on its path changed (`cargo bench -p fleetringd --bench capture -- insert`, fastest of 40 samples, before → after): 1 row with capture off 67.9 → 70.1 µs, 100 rows 188.1 → 182.8 µs; in `after` 130.2 → 134.0 µs and 412.7 → 418.8 µs.
 - Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
+
+## Forks
+
+FR-087's measurements of a fork (ADR-0046, point 7), from `cargo bench -p fleetringd --bench fork`, which prints the tables below. They set the defaults of ADR-0046's point 7 and the daemon's `[fork]` table.
+
+- **Setup:** a control daemon and three data daemons in one process, over TLS on loopback, with the shipped defaults (heartbeats every second, `[fork]` as shipped) except a disk-admission margin of 64 MiB and 0%, so that the laptop's disk admits the copies. The source has three replicas, acknowledging at W = 2 (`acks = quorum`); the fork has three, so its completion quorum C and bootstrap quorum W_boot are 2. The source is filled with 1 MiB transactions of random 64 KiB blobs, then four writers write 64-byte rows to it for 10 seconds with no fork, the baseline, and again from the fork request until the fork is ready. Every data directory is on the same disk.
+- **Columns:** *to `Seeded`* and *`Seeded` to `Ready`* are the control node's own times (`requested_at`, `completed_at`, `ready_at`). *Pins, held* is the source primary's `fleetring_fork_pin_seconds` count and sum. *WAL held by the pin* is the peak of `fleetring_fork_pinned_wal_bytes`, sampled every 20 ms; *WAL file growth* is how far the source's `data.db-wal` grew during the fork. *Staged per node* is each node's `fleetring_fork_seed_bytes`: the bytes it wrote into its staged copy. *Fleet disk* sums every file under the three data directories, sampled every 20 ms; *after* is 3 s after readiness. *Fork's control entries* are the control-log commands that name the fork, and *all control entries* every command logged from its request to its readiness, nearly all heartbeats.
+
+### Laptop
+
+Measured 2026-11-09 on an Apple M1 Max (8 performance and 2 efficiency cores), 64 GiB of RAM, an Apple AP1024R SSD (1 TB, APFS), macOS 26.5.2, Rust 1.99.1, bench (release) profile. Another release build and a simulation sweep shared the machine, with load averages between 9 and 13 on its 10 cores, so the write latencies are well above [fleetringd replication](#fleetringd-replication)'s and their tails are the machine's, not the fork's.
+
+| Source | Copy | To `Seeded` | `Seeded` to `Ready` | Pins, held | WAL held by the pin, peak; WAL file growth during the fork | Staged per node | Fleet disk: before, peak, after | Per-node peak |
+|---|---|---|---|---|---|---|---|---|
+| 10 MiB | 11.8 MiB | 1.3 s | 3.0 s | 1, 120 ms | 0.0 MiB, 0.2 MiB | 11.8 MiB on each of the 3 | 35.5 MiB, 74.0 MiB, 66.8 MiB | 26.0 MiB, 25.0 MiB, 26.0 MiB |
+| 100 MiB | 102.3 MiB | 4.4 s | 2.0 s | 1, 1.7 s | 0.3 MiB, 1.0 MiB | 102.3 MiB on each of the 3 | 306.9 MiB, 617.1 MiB, 617.1 MiB | 205.7 MiB on each |
+| 1 GiB | 1.0 GiB | 36.9 s | 4.0 s | 1, 17.4 s | 2.8 MiB, 2.9 MiB | 1.0 GiB on each of the 3 | 3.0 GiB, 6.1 GiB, 6.1 GiB | 2.0 GiB on each |
+
+| Source | Baseline writes: tx/s, p50, p99 | During the fork: tx/s, p50, p99 | Slowest write: baseline; during the fork, and when it began | Fork's control entries | All control entries during the fork (in the baseline's 10 s) |
+|---|---|---|---|---|---|
+| 10 MiB | 41, 93.1 ms, 172.5 ms | 29, 97.7 ms, 1306.7 ms | 224.9 ms; 1307.5 ms, 1.4 s after the request | 5: `fork_database`, `complete_fork`, `acquire_lease`, `renew_lease`, `mark_fork_ready` | 34 (58) |
+| 100 MiB | 36, 94.4 ms, 1160.7 ms | 38, 102.5 ms, 157.6 ms | 1249.7 ms; 189.4 ms, 5.8 s after | 5: the same | 46 (60) |
+| 1 GiB | 35, 90.1 ms, 2023.8 ms | 35, 107.3 ms, 234.0 ms | 2103.7 ms; 968.5 ms, 18.2 s after | 6: the same, with 2 `renew_lease` | 244 (59) |
+
+In every run the ring made the source's primary, `data-2`, the fork's seeder, so the seeder's stream crossed loopback to its own process.
+
+### CI Linux runner
+
+**CI Linux runner: pending.** Label a pull request `measure-forks` to run `.github/workflows/fork-measurements.yml`, which runs the same bench on `ubuntu-latest` and prints the hardware and both tables in its summary, ready to paste here.
+
+| Source | Copy | To `Seeded` | `Seeded` to `Ready` | Pins, held | WAL held by the pin, peak; WAL file growth during the fork | Staged per node | Fleet disk: before, peak, after | Per-node peak |
+|---|---|---|---|---|---|---|---|---|
+| 10 MiB | pending | pending | pending | pending | pending | pending | pending | pending |
+| 100 MiB | pending | pending | pending | pending | pending | pending | pending | pending |
+| 1 GiB | pending | pending | pending | pending | pending | pending | pending | pending |
+
+### Reading it
+
+- **Streaming the copy is the cost.** The pin lasts as long as the source's primary takes to stream the copy to the seeder: 59 MiB/s at 1 GiB and 60 MiB/s at 100 MiB, with TLS, the stream's checksum, and the seeder's unpacking and fsync on the same disk. The peers then copy the seeder's staged copy at about the same rate, unpinned, so *to `Seeded`* is about twice the pin: 36.9 s at 1 GiB, 28 MiB/s end to end.
+- **`Seeded` to `Ready` doesn't grow with the size.** It is the first lease, the fork-reset write at W_boot, and the reset reports, which ride the next heartbeats: 2 to 4 s at one heartbeat a second, whatever the size.
+- **The disk holds one copy per holder, never two.** A staged copy is renamed into the database's place when its holder opens or follows the fork, so each node's peak is its source replica and its fork copy, and the fleet's peak is the final state. A copy is a little larger than its fill: SQLite's pages, and the WAL up to the pinned position.
+- **The source's WAL barely grows while pinned.** At 35 writes a second, each one 4 KiB frame, a 17 s pin held 2.8 MiB; even the fastest sustained rate measured on this laptop, the fill's 1.1 MiB/s, would hold about 680 MiB over a full 10-minute pin.
+- **What the fork does to the source's writes is within this machine's noise.** p50 rose by 5 to 17 ms (5% to 19%) and throughput stayed level at 100 MiB and 1 GiB. Stalls of 1 to 2 s happened with no fork as well, as other builds' fsyncs queued ahead of the writers'; the one at 10 MiB fell when the fork was seeded and its replicas opened it on the same disk. Re-measure on an idle machine before relying on the tails.
+- **A fork takes five control-log commands, plus a lease renewal for each lease period it outlasts.** Everything else logged meanwhile is the three nodes' heartbeats, at the baseline's rate.
+- Laptop numbers on a shared machine; re-measure on reference hardware before relying on them.
