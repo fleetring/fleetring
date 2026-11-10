@@ -61,6 +61,8 @@ struct Settings {
     stay: bool,
     /// Appended to every data daemon's `[replication]` table.
     replication: &'static str,
+    /// Appended to every daemon's `[fork]` table, the control daemon's too.
+    fork: &'static str,
 }
 
 fn config(
@@ -98,9 +100,11 @@ fn config(
         ""
     };
     let tls = tls.node_table(id)?;
+    let fork = settings.fork;
     Ok(format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"{role}\"\n\n[node]\nid = \"{id}\"\n\
-         {replication}\n[membership]\nheartbeat_interval_ms = 100\n{stay}{tls}{control_table}{FORK}{extra}",
+         {replication}\n[membership]\nheartbeat_interval_ms = 100\n{stay}{tls}{control_table}\
+         {FORK}{fork}{extra}",
         dir.join(id)
     ))
 }
@@ -1261,6 +1265,11 @@ impl Fleet {
     async fn restart(&mut self, config: Config) -> TestResult {
         let hooks = ForkFaults::new();
         hooks.set_disk(ROOMY, 2 * ROOMY);
+        self.restart_with(config, hooks).await
+    }
+
+    /// Starts data daemon `id` again from its configuration, passing through `hooks`.
+    async fn restart_with(&mut self, config: Config, hooks: ForkFaults) -> TestResult {
         let environment = Environment::production().with_fork_faults(hooks.clone());
         self.data
             .push(Daemon::start_with(config, environment).await?);
@@ -2177,5 +2186,375 @@ async fn a_dev_nodes_margin_admits_a_small_fork_the_default_refuses() -> TestRes
         }
     }
     daemon.run_until(async {}).await;
+    Ok(())
+}
+
+/// What a test does to a crashed seeder's staging directory before it restarts, standing in for
+/// what a crash can leave that a stopped task can't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leftover {
+    /// Nothing: the files are as the crash left them.
+    AsLeft,
+    /// Cuts the unpacked copy's first file in half, as a crash in the middle of writing it does.
+    Torn,
+    /// Renames the sidecar back to its temporary name, as a power loss before the directory's
+    /// sync may.
+    RenameUndone,
+}
+
+/// Every file under `root`, recursively.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// Kills a fork's seeder where staging its copy reaches `point`, between the temporary write, the
+/// renames and the directory's sync, and restarts it after `leftover`. The fork never counts a
+/// partial copy: while the seeder is down and after it restarts, no copy of it is reported unless
+/// its sidecar was committed; the restart removes every uncommitted file, and the seeder fetches
+/// again within the same attempt; and the fork becomes ready with the source's rows (ADR-0046,
+/// points 4.3 and 12, "a crash between the temporary write, the rename, and the directory
+/// fsync").
+async fn crash_while_staging(point: FaultPoint, leftover: Leftover, seed: u8) -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut fleet = Fleet::start(
+        dir.path(),
+        Settings {
+            stay: true,
+            ..Settings::default()
+        },
+    )
+    .await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    let source_primary = create_source(&client, &source, 1, 5).await?;
+    // Two replicas apart from the source: completion needs both, so the seeder's copy too.
+    let target = fleet.name_apart("dst", 2, &source_primary)?;
+    let id = operation(seed);
+    for faults in &fleet.faults {
+        faults.hold_operation(point, id);
+    }
+    client
+        .fork_database(&source, &target, &spec(id, 2)?)
+        .await?;
+    // Peers copy only from a staged copy the seeder reported, so the first to get here is it.
+    let seeder = await_held(&fleet, point).await?;
+    let holders = |status: &ForkOperationStatus| {
+        status
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.fork.as_ref())
+            .map_or(0, |fork| fork.holders.len())
+    };
+    let seeding = client.fork_operation(id).await?;
+    assert_eq!(seeding.state(), proto::ForkState::Seeding);
+    assert_eq!(holders(&seeding), 0, "nothing reported: {seeding:?}");
+
+    let config = fleet.daemon(&seeder)?.config().clone();
+    fleet.crash(&seeder).await?;
+    for faults in &fleet.faults {
+        faults.release_operation(point, id);
+    }
+    let [staged] = staged_dirs(dir.path(), &seeder, &target)
+        .try_into()
+        .map_err(|found| format!("one staging directory, not {found:?}"))?;
+    match leftover {
+        Leftover::AsLeft => {}
+        Leftover::Torn => {
+            let torn = files_under(&staged.join("copy.tmp"))
+                .into_iter()
+                .find(|path| path.is_file())
+                .ok_or("an unpacked file")?;
+            let file = std::fs::OpenOptions::new().write(true).open(&torn)?;
+            file.set_len(file.metadata()?.len() / 2)?;
+        }
+        Leftover::RenameUndone => {
+            std::fs::rename(staged.join("sidecar.json"), staged.join("sidecar.json.tmp"))?;
+        }
+    }
+    let committed = staged.join("sidecar.json").is_file();
+    assert_eq!(
+        committed,
+        point == FaultPoint::StagingUnsynced && leftover == Leftover::AsLeft,
+        "only the sidecar's rename commits a copy"
+    );
+
+    // Restarted, it holds before it fetches again: by then its start has read the disk.
+    let hooks = ForkFaults::new();
+    hooks.set_disk(ROOMY, 2 * ROOMY);
+    if !committed {
+        hooks.hold_operation(FaultPoint::Fetch, id);
+    }
+    fleet.restart_with(config, hooks.clone()).await?;
+    if !committed {
+        assert!(
+            hooks.await_arrivals(FaultPoint::Fetch, 1, HANG_GUARD).await,
+            "the restarted seeder fetches its copy again"
+        );
+        let left: Vec<PathBuf> = files_under(&staged);
+        assert!(
+            left.is_empty(),
+            "the restart removed every uncommitted file: {left:?}"
+        );
+        let refetching = client.fork_operation(id).await?;
+        assert_eq!(holders(&refetching), 0, "{refetching:?}");
+        hooks.release_operation(FaultPoint::Fetch, id);
+    }
+    let mut attempts = BTreeSet::from([seeding.attempt]);
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let status = client.fork_operation(id).await?;
+            if status.state() == proto::ForkState::Ready {
+                return Ok::<_, tonic::Status>(());
+            }
+            if status.state() == proto::ForkState::Seeding {
+                attempts.insert(status.attempt);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(attempts, BTreeSet::from([1]), "within the first attempt");
+    if committed {
+        assert_eq!(
+            hooks.passes(FaultPoint::Fetch),
+            0,
+            "the seeder reported its committed copy from disk, without fetching it again"
+        );
+    }
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeder_killed_while_writing_its_copy_refetches() -> TestResult {
+    crash_while_staging(FaultPoint::StagingWritten, Leftover::Torn, 70).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeder_killed_before_its_renames_refetches() -> TestResult {
+    crash_while_staging(FaultPoint::StagingWritten, Leftover::AsLeft, 71).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeder_killed_between_its_renames_refetches() -> TestResult {
+    crash_while_staging(FaultPoint::StagingRenamed, Leftover::AsLeft, 72).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeder_whose_commit_a_power_loss_undid_refetches() -> TestResult {
+    crash_while_staging(FaultPoint::StagingUnsynced, Leftover::RenameUndone, 73).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeder_killed_before_its_directory_sync_reports_its_copy_from_disk() -> TestResult {
+    crash_while_staging(FaultPoint::StagingUnsynced, Leftover::AsLeft, 74).await
+}
+
+/// The configured margin, not the default, decides each replica's admission (ADR-0046, point 7):
+/// with `admission_min_free_bytes` at 1 MiB, every node admits a small copy into 64 MiB free,
+/// which the default 1 GiB would refuse; with `admission_min_free_percent` at 10, the node whose
+/// volume is 1 GiB refuses it, since its 64 MiB free are less than a tenth, while the nodes
+/// whose volumes are 256 MiB admit it; and the fork becomes ready on those.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configured_margin_decides_each_replicas_admission() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(
+        dir.path(),
+        Settings {
+            fork: "admission_min_free_bytes = 1048576\nadmission_min_free_percent = 10\n",
+            ..Settings::default()
+        },
+    )
+    .await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 5).await?;
+    let target = name("dst")?;
+    let replicas = fleet.ring_replicas(target.as_str(), 3)?;
+    // The first attempt's seeder: its refusal can't be overtaken by completion on the others.
+    let large = replicas.first().ok_or("no replica")?.clone();
+    for node in &replicas {
+        let volume = if *node == large { 1 << 30 } else { 256 << 20 };
+        fleet.faults(node)?.set_disk(64 << 20, volume);
+    }
+    let id = operation(75);
+    client
+        .fork_database(&source, &target, &spec(id, 3)?)
+        .await?;
+    let mut refused = BTreeSet::new();
+    let ready = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let status = client.fork_operation(id).await?;
+            if let Some(fork) = status
+                .placement
+                .as_ref()
+                .and_then(|placement| placement.fork.as_ref())
+            {
+                refused.extend(fork.disk_refused.iter().cloned());
+            }
+            if status.state() == proto::ForkState::Ready {
+                return Ok::<_, tonic::Status>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(ready.state(), proto::ForkState::Ready);
+    assert_eq!(refused, BTreeSet::from([large.to_string()]));
+    for node in &replicas {
+        let refusals = metric(
+            fleet.daemon(node)?,
+            "fleetring_fork_attempts_total{outcome=\"insufficient_disk\"}",
+        );
+        assert_eq!(refusals, u64::from(*node == large), "{node}");
+    }
+    assert_eq!(notes(&client, &target).await?.len(), 5);
+    fleet.stop().await;
+    Ok(())
+}
+
+/// A pin held by a slow transfer while its source takes writes ends with `ABORTED` once the
+/// source's WAL grows past `[fork] max_pin_wal_bytes`, and is released: every write meanwhile
+/// is acknowledged, the source checkpoints again, and the fork then becomes ready from a fresh
+/// pin (ADR-0046, points 4.2 and 7.4: the source's writes always win over a fork).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_under_write_load_expires_and_the_sources_writes_win() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(
+        dir.path(),
+        Settings {
+            data: "max_pin_wal_bytes = 1048576\n".to_owned(),
+            ..Settings::default()
+        },
+    )
+    .await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    let source_primary = create_source(&client, &source, 1, 0).await?;
+    // Many more bytes than the stream's channel and connection buffer, so that a slow reader
+    // holds the pin for seconds.
+    for _ in 0..24 {
+        client
+            .execute(
+                &source,
+                Statement::new("INSERT INTO notes (body) VALUES (randomblob(400000))"),
+            )
+            .await?;
+    }
+    let target = fleet.name_apart("dst", 2, &source_primary)?;
+    // The seeder asks for nothing itself: the test asks in its name, and reads slowly.
+    for faults in &fleet.faults {
+        faults.hold(FaultPoint::Fetch);
+    }
+    let id = operation(76);
+    client
+        .fork_database(&source, &target, &spec(id, 2)?)
+        .await?;
+    await_held(&fleet, FaultPoint::Fetch).await?;
+    let status = client.fork_operation(id).await?;
+    let seeder: NodeId = status
+        .placement
+        .as_ref()
+        .and_then(|placement| placement.fork.as_ref())
+        .and_then(|fork| fork.seeder.as_deref())
+        .ok_or("no seeder")?
+        .parse()?;
+    let source_address = fleet.daemon(&source_primary)?.listen_address().to_string();
+    let as_seeder = fleet.tls.node_network(seeder.as_str())?;
+    let mut seeding = replication_client(as_seeder.channel(&source_address)?);
+    let mut stream = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match seeding
+                .snapshot(seeding_request(&source, &status, status.attempt, false))
+                .await
+            {
+                Err(status) if status.code() == Code::Unavailable => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                answer => return answer,
+            }
+        }
+    })
+    .await??
+    .into_inner();
+    let first = stream.message().await?.ok_or("an empty stream")?;
+    assert!(first.total_bytes.is_some());
+
+    // Writes land on the source while the pin holds, each of them about 64 KB of WAL, and go on
+    // until the stream ends.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let (count, mut counted) = tokio::sync::watch::channel(0_u64);
+    let writer = {
+        let client = client.clone();
+        let source = source.clone();
+        tokio::spawn(async move {
+            while !*stopped.borrow() {
+                client
+                    .execute(
+                        &source,
+                        Statement::new("INSERT INTO notes (body) VALUES (randomblob(64000))"),
+                    )
+                    .await?;
+                count.send_modify(|written| *written += 1);
+            }
+            Ok::<_, tonic::Status>(*count.borrow())
+        })
+    };
+    // The seeder takes nothing more until the WAL has grown past the bound, then reads on: the
+    // stream it stalled checks the pin before its next chunk.
+    tokio::time::timeout(HANG_GUARD, counted.wait_for(|written| *written >= 32)).await??;
+    let ended = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            match stream.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => break None,
+                Err(status) => break Some(status),
+            }
+        }
+    })
+    .await?;
+    stop.send(true)?;
+    let written = writer.await??;
+    let ended = ended.ok_or("the stalled stream finished before its pin expired")?;
+    assert_eq!(ended.code(), Code::Aborted, "{ended:?}");
+    assert!(
+        ended.message().contains("max_pin_wal_bytes"),
+        "the WAL bound ended it: {ended:?}"
+    );
+    assert!(written >= 32, "every write while pinned was acknowledged");
+    // The pin is released: the source checkpoints.
+    let replication = fleet
+        .daemon(&source_primary)?
+        .replication()
+        .ok_or("no replication")?;
+    wait_until("the source checkpoints", async || {
+        replication.checkpoint(&source).await.is_ok()
+    })
+    .await?;
+    // The seeder's own fetch pins afresh and seeds the fork.
+    for faults in &fleet.faults {
+        faults.release(FaultPoint::Fetch);
+    }
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
+    fleet.stop().await;
     Ok(())
 }

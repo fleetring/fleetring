@@ -28,7 +28,7 @@ use super::super::chain::ChainHash;
 use super::super::follower::blocking;
 use super::super::snapshot::check_copy;
 use super::faults::FaultPoint;
-use super::staged::{Sidecar, StagedFile, StagedKey};
+use super::staged::{CommitStep, Sidecar, StagedFile, StagedKey};
 use super::{ForkPhase, Refused, Reservation, retry_after};
 use crate::control::SeedProgress;
 use crate::control::fork::operation_to_proto;
@@ -455,17 +455,30 @@ async fn finish(
         checksum: checksum_bytes,
         files,
     };
-    let committed = {
-        let forks = Arc::clone(inner);
-        let sidecar = sidecar.clone();
-        blocking(inner.execution, move || {
-            forks.forks.store().commit(&sidecar)
-        })
-        .await?
-    };
-    committed.map_err(|error| {
-        Fetch::Failed(Status::internal(format!("can't stage the copy: {error}")))
-    })?;
+    for step in CommitStep::ALL {
+        let committed = {
+            let forks = Arc::clone(inner);
+            let sidecar = sidecar.clone();
+            blocking(inner.execution, move || {
+                forks.forks.store().commit_step(&sidecar, step)
+            })
+            .await?
+        };
+        committed.map_err(|error| {
+            Fetch::Failed(Status::internal(format!("can't stage the copy: {error}")))
+        })?;
+        let after = match step {
+            CommitStep::Write => FaultPoint::StagingWritten,
+            CommitStep::PlaceCopy => FaultPoint::StagingRenamed,
+            CommitStep::PlaceSidecar => FaultPoint::StagingUnsynced,
+            CommitStep::Sync => continue,
+        };
+        inner
+            .forks
+            .faults()
+            .pass(after, plan.key.fork.operation)
+            .await;
+    }
     Ok(sidecar)
 }
 

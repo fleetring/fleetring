@@ -10,12 +10,13 @@
 //!     installed        present once the copy was moved into the database's place
 //! ```
 //!
-//! A copy is staged in three durable steps: its files go into `copy.tmp/` and the sidecar into
-//! `sidecar.json.tmp`, each synced; `copy.tmp/` is renamed to `copy/`; then `sidecar.json.tmp`
-//! to `sidecar.json`, and the directory is synced. The sidecar's rename is the commit point: a
-//! directory without `sidecar.json` holds no staged copy and was never reported, so the scan at
-//! start removes it, with every `.tmp` entry. A sidecar whose `copy/` is gone, without
-//! `installed`, describes a lost copy, which the node reports as such and never opens.
+//! A copy is staged in durable steps ([`CommitStep`]): its files go into `copy.tmp/` and the
+//! sidecar into `sidecar.json.tmp`, each synced; `copy.tmp/` is renamed to `copy/`; then
+//! `sidecar.json.tmp` to `sidecar.json`, and the directory is synced. The sidecar's rename is
+//! the commit point: a directory without `sidecar.json` holds no staged copy and was never
+//! reported, so the scan at start removes it, with every `.tmp` entry. A sidecar whose `copy/`
+//! is gone, without `installed`, describes a lost copy, which the node reports as such and never
+//! opens.
 //!
 //! The store deletes a staged directory only when told to, on a positive signal for its own
 //! identity (ADR-0046, point 4.6, and ADR-0042), or at an operator's request for an orphan.
@@ -45,6 +46,27 @@ const SIDECAR: &str = "sidecar.json";
 const INSTALLED: &str = "installed";
 /// The suffix of everything not committed yet.
 const TEMPORARY: &str = ".tmp";
+
+/// The steps that commit a staged copy, in the order the [module documentation](self) gives. A
+/// crash between two leaves what the earlier ones did, which the scan at start removes, since
+/// nothing before [`PlaceSidecar`](Self::PlaceSidecar) commits anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitStep {
+    /// Writes and syncs the sidecar under its temporary name, beside the unpacked copy.
+    Write,
+    /// Renames the unpacked copy into place and syncs its directory.
+    PlaceCopy,
+    /// Renames the sidecar into place, which commits the copy.
+    PlaceSidecar,
+    /// Syncs the directory and its parent, so that the renames survive a power loss.
+    Sync,
+}
+
+impl CommitStep {
+    /// Every step, in the order they run.
+    pub(crate) const ALL: [Self; 4] =
+        [Self::Write, Self::PlaceCopy, Self::PlaceSidecar, Self::Sync];
+}
 
 /// A staged copy's name: the fork identity and the attempt that fetched it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -283,40 +305,57 @@ impl StagedStore {
             .collect()
     }
 
-    /// A fresh directory to unpack `key`'s copy into before [`commit`](Self::commit).
+    /// A fresh directory to unpack `key`'s copy into before [`commit_step`](Self::commit_step).
     pub(crate) fn incoming(&self, key: &StagedKey) -> PathBuf {
         key.dir(&self.root).join(format!("{COPY}{TEMPORARY}"))
     }
 
-    /// Commits the copy unpacked into [`incoming`](Self::incoming) as `sidecar` describes it:
-    /// writes and syncs the sidecar, renames the files into place, then the sidecar, and syncs
-    /// the directory. It blocks on the file system. The store doesn't know the copy until
-    /// [`publish`](Self::publish).
+    /// Commits the copy unpacked into [`incoming`](Self::incoming) as `sidecar` describes it,
+    /// with every [`CommitStep`] in order. It blocks on the file system. The store doesn't know
+    /// the copy until [`publish`](Self::publish).
     ///
     /// # Errors
     ///
     /// The I/O error if any step fails; nothing is committed then, and the scan at the next
     /// start removes what is left.
+    #[cfg(test)]
     pub(crate) fn commit(&self, sidecar: &Sidecar) -> io::Result<()> {
+        CommitStep::ALL
+            .into_iter()
+            .try_for_each(|step| self.commit_step(sidecar, step))
+    }
+
+    /// Runs one step of committing the copy unpacked into [`incoming`](Self::incoming) as
+    /// `sidecar` describes it; the steps must run in the order of [`CommitStep::ALL`]. It blocks
+    /// on the file system.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error if the step fails; nothing is committed then, and the scan at the next
+    /// start removes what is left.
+    pub(crate) fn commit_step(&self, sidecar: &Sidecar, step: CommitStep) -> io::Result<()> {
         let dir = sidecar.key.dir(&self.root);
-        let incoming = self.incoming(&sidecar.key);
-        let text = serde_json::to_string_pretty(&sidecar.to_file()).map_err(io::Error::other)?;
         let temporary = dir.join(format!("{SIDECAR}{TEMPORARY}"));
-        {
-            let mut file = File::create(&temporary)?;
-            io::Write::write_all(&mut file, text.as_bytes())?;
-            file.sync_all()?;
+        match step {
+            CommitStep::Write => {
+                let text =
+                    serde_json::to_string_pretty(&sidecar.to_file()).map_err(io::Error::other)?;
+                let mut file = File::create(&temporary)?;
+                io::Write::write_all(&mut file, text.as_bytes())?;
+                file.sync_all()
+            }
+            CommitStep::PlaceCopy => {
+                let copy = dir.join(COPY);
+                remove_dir_if_present(&copy)?;
+                fs::rename(self.incoming(&sidecar.key), &copy)?;
+                sync_dir(&dir)
+            }
+            CommitStep::PlaceSidecar => fs::rename(&temporary, dir.join(SIDECAR)),
+            CommitStep::Sync => {
+                sync_dir(&dir)?;
+                dir.parent().map_or(Ok(()), sync_dir)
+            }
         }
-        let copy = dir.join(COPY);
-        remove_dir_if_present(&copy)?;
-        fs::rename(&incoming, &copy)?;
-        sync_dir(&dir)?;
-        fs::rename(&temporary, dir.join(SIDECAR))?;
-        sync_dir(&dir)?;
-        if let Some(parent) = dir.parent() {
-            sync_dir(parent)?;
-        }
-        Ok(())
     }
 
     /// Makes a committed copy known, so that heartbeats report it and peers may fetch it.

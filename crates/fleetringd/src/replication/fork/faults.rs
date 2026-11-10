@@ -54,6 +54,16 @@ pub enum FaultPoint {
     /// the checkpoint yet: held, writes land in between, which the restarted log no longer
     /// holds once it runs. Held only for every database, with [`hold`](ForkFaults::hold).
     Checkpoint,
+    /// A node has written a fork's copy and its sidecar to temporary files and synced them, and
+    /// hasn't renamed either into place: a crash here leaves only temporary files.
+    StagingWritten,
+    /// A node has renamed a fork's copy into place and synced its directory, and hasn't renamed
+    /// the sidecar that commits it: a crash here leaves a copy without a sidecar.
+    StagingRenamed,
+    /// A node has renamed the sidecar that commits a fork's copy into place, and hasn't synced
+    /// the directory yet: a crash here leaves the copy committed, and a power loss may undo the
+    /// rename.
+    StagingUnsynced,
 }
 
 /// The fault hooks a daemon's fork work passes through.
