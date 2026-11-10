@@ -340,7 +340,7 @@ impl Environment {
     }
 
     /// Passes the node's fork work through `faults`, which a test holds and releases (FR-085).
-    /// Only with the `fault-hooks` feature, which release builds never enable.
+    /// Only with the `fault-hooks` feature, which a build without debug assertions refuses.
     #[cfg(feature = "fault-hooks")]
     #[must_use]
     pub fn with_fork_faults(mut self, faults: ForkFaults) -> Self {

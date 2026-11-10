@@ -3,19 +3,20 @@
 //!
 //! A mutation is chosen at compile time with the `FLEETRING_MUTATION` environment variable,
 //! which `scripts/fork-mutations.sh` sets to one [`Mutation`]'s name. It can never reach a
-//! build that ships: a build without debug assertions, such as `--release`, refuses to compile
-//! with the variable set, and [`Mutation::is_active`] is `false` in every such build whatever
-//! it says. Without the variable, every check is `false` and the code behaves as designed.
+//! build without debug assertions, which is what ships: such a build, `--release` by default,
+//! refuses to compile with the variable set, and [`Mutation::is_active`] is `false` in every
+//! such build whatever it says. Without the variable, every check is `false` and the code
+//! behaves as designed.
 
 /// The mutation this build carries, if `FLEETRING_MUTATION` was set when it was compiled.
 const CHOSEN: Option<&str> = option_env!("FLEETRING_MUTATION");
 
-// A mutation never reaches an optimized build, which is what ships.
+// A mutation never reaches a build without debug assertions, which is what ships.
 #[cfg(not(debug_assertions))]
 const _: () = assert!(
     CHOSEN.is_none(),
     "FLEETRING_MUTATION is for the fork mutation check only and can't be built without debug \
-     assertions: unset it for a release build"
+     assertions: unset it, or build with debug assertions"
 );
 
 /// One deliberate bug of the fork mutation check (FR-087, ADR-0046 point 12).
@@ -44,11 +45,20 @@ pub enum Mutation {
     ServeAtSeeded,
     /// Disk admission compares the free space alone, without the other copies' reservations.
     DiskWithoutReservations,
+    /// A seeded fork's replica set follows placement, not its recorded holders.
+    MoveSeededReplicaSet,
+    /// A fork's primary treats its reset as committed once it committed it itself, without
+    /// waiting for its bootstrap quorum.
+    ResetCommittedOnOne,
+    /// A follower of a fork's primary reports the fork's reset committed as soon as it learns
+    /// the reset's position, from the primary's report of it running, before the marker is
+    /// durable in its own log.
+    FollowerReportsResetEarly,
 }
 
 impl Mutation {
     /// Every mutation, in the order the mutation check runs them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::PinAtTip,
         Self::CompleteOnOneHolder,
         Self::NonHolderFirstLease,
@@ -58,6 +68,9 @@ impl Mutation {
         Self::UnconditionalReset,
         Self::ServeAtSeeded,
         Self::DiskWithoutReservations,
+        Self::MoveSeededReplicaSet,
+        Self::ResetCommittedOnOne,
+        Self::FollowerReportsResetEarly,
     ];
 
     /// The name `FLEETRING_MUTATION` gives it.
@@ -73,6 +86,9 @@ impl Mutation {
             Self::UnconditionalReset => "unconditional_reset",
             Self::ServeAtSeeded => "serve_at_seeded",
             Self::DiskWithoutReservations => "disk_without_reservations",
+            Self::MoveSeededReplicaSet => "move_seeded_replica_set",
+            Self::ResetCommittedOnOne => "reset_committed_on_one",
+            Self::FollowerReportsResetEarly => "follower_reports_reset_early",
         }
     }
 

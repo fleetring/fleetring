@@ -399,6 +399,11 @@ impl State {
     pub fn replica_set(&self, database: &DatabaseName) -> Result<Vec<NodeId>, Rejection> {
         let db = self.database_or_reject(database)?;
         match db.fork().map(|fork| fork.state()) {
+            Some(ForkState::Seeded { .. })
+                if crate::mutation::Mutation::MoveSeededReplicaSet.is_active() =>
+            {
+                self.placed_replicas(db)
+            }
             Some(
                 ForkState::Seeded { holders, .. }
                 | ForkState::Ready {

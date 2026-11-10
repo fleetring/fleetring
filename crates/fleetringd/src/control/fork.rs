@@ -457,7 +457,11 @@ pub(crate) fn fork_status(
                 .and_then(|lease| state.report(lease.holder(), db.name()))
                 .and_then(Report::reset)
                 .filter(|reset| {
-                    reset.is_committed() && *reset.fork() == identity && reset.epoch() == db.epoch()
+                    (reset.is_committed()
+                        || fleetring_control::mutation::Mutation::FollowerReportsResetEarly
+                            .is_active())
+                        && *reset.fork() == identity
+                        && reset.epoch() == db.epoch()
                 });
             if let Some(reset) = primary_reset {
                 status.reset_epoch = Some(reset.epoch().get());

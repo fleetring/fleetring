@@ -326,11 +326,12 @@ async fn report_follower_reset(
         .faults()
         .pass(FaultPoint::FollowerReset, fork.operation)
         .await;
-    let reached = replication.highest_epoch(&fork.name) == Some(*epoch)
-        && replication
-            .follower_status(&fork.name)
-            .and_then(|status| status.position)
-            .is_some_and(|at| at >= *position);
+    let reached = fleetring_control::mutation::Mutation::FollowerReportsResetEarly.is_active()
+        || (replication.highest_epoch(&fork.name) == Some(*epoch)
+            && replication
+                .follower_status(&fork.name)
+                .and_then(|status| status.position)
+                .is_some_and(|at| at >= *position));
     if !reached {
         return;
     }
@@ -616,7 +617,11 @@ async fn reset(
         ))
     })?;
     report(&position, false);
-    let need = bootstrap_quorum(lease);
+    let need = if fleetring_control::mutation::Mutation::ResetCommittedOnOne.is_active() {
+        1
+    } else {
+        bootstrap_quorum(lease)
+    };
     let poll = replication.settings().retry_interval;
     loop {
         if replication.serving(name).map(|role| role.epoch) != Some(lease.epoch) {
