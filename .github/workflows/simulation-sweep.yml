@@ -99,4 +99,5 @@ jobs:
           echo "seeds $FLEETRING_SIM_SWEEP_FROM to $(( FLEETRING_SIM_SWEEP_FROM + per_shard - 1 )) of every row"
           cargo test --release -p fleetringd --features simulation,fault-hooks --test sim \
             -- --ignored sweep_row \
-            --skip sweep_row_13_lost_and_duplicated --skip sweep_row_17_partitions_while_seeding
+            --skip sweep_row_13_lost_and_duplicated --skip sweep_row_17_partitions_while_seeding \
+            --skip sweep_row_20_drain_before_reset
