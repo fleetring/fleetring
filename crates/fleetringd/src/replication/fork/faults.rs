@@ -3,7 +3,7 @@
 //! of its disk.
 //!
 //! The hooks exist only with the `fault-hooks` feature, which the integration tests enable and
-//! release builds never do. Without it, [`ForkFaults`] is an empty value whose checks do
+//! a build without debug assertions refuses to compile. Without it, [`ForkFaults`] is an empty value whose checks do
 //! nothing, and a daemon can't be given one that does.
 
 #[cfg(feature = "fault-hooks")]
@@ -211,6 +211,15 @@ impl ForkFaults {
                 .drop_reply
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Whether the control service is still to drop the reply to a fork request: `false` once
+    /// it dropped the one [`drop_next_fork_reply`](Self::drop_next_fork_reply) asked for.
+    #[must_use]
+    pub fn drops_next_fork_reply(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.drop_reply.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Makes the node believe its data volume holds `volume` bytes, of which `free` are free
