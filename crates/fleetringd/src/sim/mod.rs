@@ -86,8 +86,8 @@ pub use history::{DurabilityMode, Guarantee, Replicated};
 pub use rng::SimRng;
 pub use trace::{DRIVER, Divergence, Event, EventKind, Replay, Trace};
 pub use workload::{
-    Ack, CreateAndAcquire, CreateAndWrite, ForkPass, ForkPhaseKind, ForkTransition, History,
-    HistoryEvent, LeaseObservation, LeaseSeen, Operation, OperationId, Operator, Outcome,
+    Ack, CreateAndAcquire, CreateAndWrite, ForkMarkerSeen, ForkPass, ForkPhaseKind, ForkTransition,
+    History, HistoryEvent, LeaseObservation, LeaseSeen, Operation, OperationId, Operator, Outcome,
     OutcomeClass, Pending, Phase, Record, Script, SeedingProbe, Step, Traffic, TrafficHandle,
     WRITES_TABLE, Workload,
 };

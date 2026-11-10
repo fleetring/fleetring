@@ -112,7 +112,7 @@ pub enum Operation {
         /// How many bytes.
         bytes: u32,
     },
-    /// Watches `database`'s recorded changes from the log's beginning, as `db watch` does, for a
+    /// Watches `database`'s changes as a live tail, as `db watch` without a position does, for a
     /// moment, and records the values of the [`WRITES_TABLE`] rows it saw inserted.
     Watch {
         /// The database.
@@ -932,6 +932,7 @@ pub struct History {
     leases: Vec<LeaseObservation>,
     fork_passes: Vec<ForkPass>,
     fork_transitions: Vec<ForkTransition>,
+    fork_markers: Vec<ForkMarkerSeen>,
     clock_shifts: Vec<(Duration, u64)>,
 }
 
@@ -1112,6 +1113,18 @@ impl History {
         &self.fork_transitions
     }
 
+    /// Records that a holder's copy of a fork was first seen holding the fork's marker on disk.
+    pub fn observe_fork_marker(&mut self, seen: ForkMarkerSeen) {
+        self.fork_markers.push(seen);
+    }
+
+    /// Returns, for each holder of each fork, when the fleet first saw its copy on disk hold the
+    /// fork's marker, in order.
+    #[must_use]
+    pub fn fork_markers(&self) -> &[ForkMarkerSeen] {
+        &self.fork_markers
+    }
+
     /// The databases a client asked to drop during the run, whatever the answer.
     #[must_use]
     pub fn dropped(&self) -> BTreeSet<DatabaseName> {
@@ -1152,6 +1165,7 @@ impl History {
             leases: self.leases.clone(),
             fork_passes: self.fork_passes.clone(),
             fork_transitions: self.fork_transitions.clone(),
+            fork_markers: self.fork_markers.clone(),
             clock_shifts: self.clock_shifts.clone(),
         }
     }
@@ -1726,6 +1740,18 @@ pub struct ForkTransition {
     pub replica_set: Vec<NodeId>,
     /// Each data host's rows of the fork's writes table then.
     pub rows: ReplicaRows,
+}
+
+/// A holder's copy of a fork on disk holding the fork's marker, its reset write, as the fleet
+/// first saw it after a step (FR-087): read from the copy's files, not from what any node says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkMarkerSeen {
+    /// When the fleet saw it.
+    pub at: Duration,
+    /// The fork.
+    pub identity: ForkIdentity,
+    /// The holder.
+    pub host: String,
 }
 
 /// How long a [`Traffic`] client waits between operations, at most, in milliseconds.
