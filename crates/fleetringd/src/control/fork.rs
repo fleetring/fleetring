@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use fleetring::NodeId;
+use fleetring::{Epoch, NodeId};
 use fleetring_control::fork::{
     CancelCause, ChainHash, CopyLossReason, CopyLost, Fork, ForkExpiry, ForkFailure, ForkIdentity,
     ForkIntent, ForkState, OperationId, OperationOutcome, OperationRecord, PlacementCaughtUp,
@@ -165,11 +165,16 @@ pub(crate) fn replica_from_proto(
             ResetReport::running(fork, epoch, position)
         });
     }
-    if let Some(caught_up) = status.placement_caught_up {
+    // A report that doesn't name the membership epoch it checked placement at binds to no ring,
+    // so it reads as absent.
+    if let Some(caught_up) = status.placement_caught_up
+        && let Some(membership_epoch) = caught_up.membership_epoch
+    {
         let fork = identity(caught_up.fork_incarnation, &caught_up.operation)?;
         replica = replica.with_placement_caught_up(PlacementCaughtUp::new(
             fork,
             LeaseEpoch::new(caught_up.epoch),
+            Epoch::new(membership_epoch),
         ));
     }
     let progress = status
@@ -272,6 +277,7 @@ pub(crate) fn replica_to_proto(
                 fork_incarnation: incarnation(caught_up.fork()),
                 operation: operation(caught_up.fork()),
                 epoch: caught_up.epoch().get(),
+                membership_epoch: Some(caught_up.membership_epoch().get()),
             }
         }),
     }
@@ -627,6 +633,11 @@ mod tests {
             fork.clone(),
             LeaseEpoch::new(3),
             Position::new([8]),
+        ))
+        .with_placement_caught_up(PlacementCaughtUp::new(
+            fork.clone(),
+            LeaseEpoch::new(3),
+            Epoch::new(11),
         ));
         let progress = SeedProgress {
             fork: fork.clone(),
@@ -670,6 +681,32 @@ mod tests {
         let plain = HostedReplica::new(fork.name, ReplicaRole::Primary, Position::new([1]));
         let (received, _) = replica_from_proto(replica_to_proto(&plain, None)).expect("valid");
         assert_eq!(received, plain);
+    }
+
+    /// A placement report that doesn't name the membership epoch it checked placement at binds
+    /// to no ring, so control state reads it as absent and releases nothing on it.
+    #[test]
+    fn a_placement_report_without_its_membership_epoch_reads_as_absent() {
+        let status = |membership_epoch| proto::DatabaseStatus {
+            database: "t".to_owned(),
+            role: proto::ReplicaRole::Primary.into(),
+            placement_caught_up: Some(proto::PlacementCaughtUp {
+                fork_incarnation: 1,
+                operation: vec![1; 16],
+                epoch: 2,
+                membership_epoch,
+            }),
+            ..proto::DatabaseStatus::default()
+        };
+        let (absent, _) = replica_from_proto(status(None)).expect("valid");
+        assert_eq!(absent.placement_caught_up(), None);
+        let (bound, _) = replica_from_proto(status(Some(5))).expect("valid");
+        assert_eq!(
+            bound
+                .placement_caught_up()
+                .map(PlacementCaughtUp::membership_epoch),
+            Some(Epoch::new(5))
+        );
     }
 
     #[test]

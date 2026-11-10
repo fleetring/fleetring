@@ -229,6 +229,9 @@ message PlacementCaughtUp {
   bytes operation = 2;
   // The lease epoch of the primary that reports it.
   uint64 epoch = 3;
+  // The membership epoch of the ring whose placement the primary checked. The control plane
+  // releases the holders only while it is the current one. A report without it is ignored.
+  optional uint64 membership_epoch = 4;
 }
 
 // A replica durably holds a staged copy of a fork: written, verified, synced, and renamed into

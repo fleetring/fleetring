@@ -205,12 +205,14 @@ fn report_placement_caught_up(node: &DataNode, fork: &ForkIdentity) {
     let replication = node.replication();
     let caught_up = replication
         .placement_caught_up(&fork.name)
-        .map(|epoch| PlacementCaughtUp::new(fork.clone(), epoch));
+        .map(|(epoch, membership_epoch)| {
+            PlacementCaughtUp::new(fork.clone(), epoch, membership_epoch)
+        });
     let forks = replication.forks();
     if let Some(caught_up) = &caught_up
         && forks.placement_caught_up(&fork.name).as_ref() != Some(caught_up)
     {
-        tracing::info!(target: "fleetringd::audit", %fork, epoch = caught_up.epoch().get(), "placement's write quorum holds the ready fork's log; its holders may be released");
+        tracing::info!(target: "fleetringd::audit", %fork, epoch = caught_up.epoch().get(), membership_epoch = caught_up.membership_epoch().get(), "placement's write quorum holds the ready fork's log; its holders may be released");
     }
     forks.report_placement_caught_up(&fork.name, caught_up);
 }

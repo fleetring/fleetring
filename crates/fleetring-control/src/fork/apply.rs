@@ -747,7 +747,13 @@ pub(crate) fn release_fork_holders(
     let reported = state
         .report(lease.holder(), &identity.name)
         .and_then(crate::Report::placement_caught_up)
-        .is_some_and(|caught_up| *caught_up.fork() == *identity && caught_up.epoch() == epoch);
+        .is_some_and(|caught_up| {
+            // Placement as the primary checked it is placement now: a ring that changed since
+            // may place the fork on nodes that don't hold its log.
+            *caught_up.fork() == *identity
+                && caught_up.epoch() == epoch
+                && caught_up.membership_epoch() == state.membership_epoch()
+        });
     if !reported {
         return Err(not_releasable());
     }
