@@ -1,0 +1,39 @@
+
+### A's limits as Docker set them, and as A's cgroup shows them
+memory=0 nanocpus=0 pids=2048
+memory.max: max
+pids.max: 2048
+cpu.max: max 100000
+Docker Desktop VM memory: MemTotal:       16356136 kB
+
+### memory: A allocates 1024 MiB with no limit, while B works
+allocated 256 MiB
+allocated 512 MiB
+allocated 768 MiB
+allocated 1024 MiB
+done: allocated 1024 MiB
+[python exit 0]
+probe: 50 processes ran
+probe: router HTTP 200 in 0.022094s
+
+### processes: A asks for 3000, while B works
+fork failed after 1993 children: [Errno 11] Resource temporarily unavailable
+killed 1993
+probe: 50 processes ran
+probe: router HTTP 200 in 0.026592s
+
+### disk: A writes 2048 MiB to its work volume (the Docker Desktop VM's disk, shared by every sandbox)
+/dev/vda1        79G   25G   50G  33% /sandbox/work
+wrote 2048 MiB
+/dev/vda1        79G   27G   48G  36% /sandbox/work
+removed
+
+### memory with --memory 256Mi: sandbox agent-m allocates 512 MiB
+[0.8s] Starting sandbox Container created
+memory=268435456 nanocpus=1000000000
+allocated 256 MiB
+[python exit 137]
+Killed
+[exec exit 0]
+  Phase: Ready
+✓ Sandbox agent-m deletion accepted; cleanup is pending

@@ -1,0 +1,12 @@
+
+### an interactive session in A: its terminal, other terminals, and TIOCSTI into its own
+(sandbox connect under a scripted pseudo-terminal printed nothing in an earlier attempt, so
+ the same commands run through sandbox exec --tty, which gives the command a real PTY)
+/dev/pts/0
+ls: cannot open directory '/dev/pts': Permission denied
+ls: cannot access '/dev/pts/1': No such file or directory
+crw--w---- 1 agent tty 136, 0 Nov 12 06:47 /dev/pts/0
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+PermissionError: [Errno 13] Permission denied: '/dev/pts/0'
+/dev/pts/[0-9]*: sh: 3: cannot create /dev/pts/[0-9]*: Permission denied

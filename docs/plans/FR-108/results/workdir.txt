@@ -1,0 +1,81 @@
+
+### W1: volumes. Positive control from the host: B's volume holds B's canaries
+/w/.fleetring/agents/b/token
+/w/.fleetring/agents/b/client.agent-b.key
+/w/b-local.sqlite
+
+### W1: from A
+total 16
+drwxr-xr-x 4 agent agent 4096 Nov 12 06:30 .
+drwx------ 1 agent agent 4096 Jan  1  1970 ..
+drwxr-xr-x 2 agent agent 4096 Nov 12 06:31 in
+drwxr-xr-x 3 agent agent 4096 Nov 12 06:18 pc
+cat: /sandbox/work/.fleetring/agents/b/client.agent-b.key: No such file or directory
+/dev/vda1 /sandbox/work ext4 rw,relatime,discard 0 0
+
+### W1: a sandbox create naming another agent's volume is the launcher's request; resource admission checks only labels
+{"openshell.ai/sandbox-attachable":"true","openshell.ai/sandbox-attachable-workspace":"default"}
+
+### W2: upload into A, download out of A
+✓ Upload complete: /sandbox/work/in
+/sandbox/work/in/task.txt
+task input for A
+/sandbox/work/in/result.txt
+A wrote this
+✓ Download complete
+<work>/copy/out/result.txt: A wrote this
+<work>/copy/out/task.txt: task input for A
+ls: cannot access '/sandbox/work/in': No such file or directory
+
+### W3: bind mounts. The gateway restarts with enable_bind_mounts = true and resource admission off
+[openshell.drivers.docker]
+socket_path = "/var/run/docker.sock"
+supervisor_network_mode = "bridge"
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.docker.resource_admission]
+enabled = false
+
+
+[openshell.supervisor.network]
+additional_ca_bundle = "<work>/os/fleet-ca.pem"
+  [0.0s] Requesting compute...
+  [0.0s] Requesting compute...
+uid=10001(agent) gid=10001(agent) groups=10001(agent)
+agent:agent 777 /sandbox/work
+sh: 1: cannot create /sandbox/work/canary: Permission denied
+ls: cannot open directory '/sandbox/work': Permission denied
+-- the same mount, seen with docker exec (no Landlock):
+/run/host_mark/Users /sandbox/work fakeowner rw,nosuid,nodev,relatime,fakeowner 0 0
+agent:agent 777 /sandbox/work
+total 4
+drwxrwxrwx 3 agent agent   96 Nov 12 06:32 .
+drwx------ 1 agent agent 4096 Jan  1  1970 ..
+-rw-r--r-- 1 agent agent    0 Nov 12 06:32 canary
+total 0
+drwxrwxrwx@ 3 <user>  staff   96 Nov 12 01:32 .
+drwxr-xr-x@ 4 <user>  staff  128 Nov 12 01:32 ..
+-rw-r--r--  1 <user>  staff    0 Nov 12 01:32 canary
+
+### W3: from A, inside its bind mount
+/run/host_mark/Users /sandbox/work fakeowner rw,nosuid,nodev,relatime,fakeowner 0 0
+ls: cannot open directory '/sandbox/work': Permission denied
+cat: /sandbox/work/../work/canary: No such file or directory
+ls: cannot access '/host_mnt': No such file or directory
+ls: cannot open directory '/sandbox/work': Permission denied
+cat: /sandbox/work/to-b: No such file or directory
+
+### W3: the same symlinks, followed on the host (as a launcher copying results out would)
+total 0
+drwxrwxrwx@ 4 <user>  staff  128 Nov 12 01:32 .
+drwxr-xr-x@ 4 <user>  staff  128 Nov 12 01:32 ..
+lrwxr-xr-x  1 <user>  staff   11 Nov 12 01:32 to-b -> ../b/canary
+lrwxr-xr-x  1 <user>  staff    1 Nov 12 01:32 to-root -> /
+host reads <hostwork>/a/to-b: 
+✓ Sandbox bind-a deletion accepted; cleanup is pending
+✓ Sandbox bind-b deletion accepted; cleanup is pending
+gateway back to its default configuration
+NAME     CREATED              PHASE
+agent-a  2026-11-12 06:15:23  Ready
+agent-b  2026-11-12 06:15:24  Ready

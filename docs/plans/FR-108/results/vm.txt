@@ -1,0 +1,68 @@
+
+### clocks: the Mac (gateway) and the guest
+mac      1794465689.536
+guest A  1794465689.562; kernel 6.12.109
+mac      1794465689.586
+
+### the VM gateway's own port, from A
+curl: (6) Could not resolve host: host.openshell.internal
+host.openshell.internal:17680 HTTP 000
+curl: (7) Failed to connect to 192.0.2.10 port 17680 after 0 ms: Couldn't connect to server
+192.0.2.10:17680 HTTP 000
+curl: (7) Failed to connect to 127.0.0.1 port 17680 after 0 ms: Couldn't connect to server
+127.0.0.1:17680 HTTP 000
+
+### the VM's channel to its supervisor is vsock: can A open a vsock socket, or see the guest's processes?
+vsock: PermissionError(1, 'Operation not permitted')
+ls: cannot open directory '/proc': Permission denied
+Error, do this: mount -t proc proc /proc
+
+### memory: mem_mib = 1024 per guest; a sandbox created with --memory 256Mi allocates 512 MiB, then 1500 MiB
+[1.2s] Waiting for VM supervisor
+grep: /proc/meminfo: Permission denied
+allocated 256 MiB
+allocated 512 MiB
+done: allocated 512 MiB
+[python exit 0]
+[exec exit 0]
+allocated 256 MiB
+allocated 512 MiB
+allocated 768 MiB
+[python exit 137]
+Killed
+[exec exit 0]
+  Phase: Ready
+✓ Deleted sandbox agent-m
+
+### the host alias on the VM driver: the router on 127.0.0.1:8444 through host.openshell.internal
+-- no-allowed-ips
+  router_via_alias:
+    endpoints:
+      - host: host.openshell.internal
+        port: 8444
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: POST, path: "/db/agent-a-*/v3/pipeline" }
+        credential_binding:
+          provider: fleetring-a
+    binaries:
+      - path: /usr/bin/curl
+✓ Policy version 7 loaded (active version: 7)
+198.18.0.5      host.openshell.internal
+placeholder: openshell:resolve:env:v16070830794889760626_FLEETRING_TOKEN
+{"baton":null,"base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}
+HTTP 200
+{"baton":null,"base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":"345"}}},{"type":"ok","response":{"type":"close"}}]}
+HTTP 200
+{"baton":null,"base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"id","decltype":"INTEGER"},{"name":"body","decltype":"TEXT"}],"rows":[[{"type":"integer","value":"1"},{"type":"text","value":"written from sandbox A"}],[{"type":"integer","value":"2"},{"type":"text","value":"written from sandbox A"}],[{"type":"integer","value":"3"},{"type":"text","value":"probe"}],[{"type":"integer","value":"4"},{"type":"text","value":"probe"}],[{"type":"integer","value":"5"},{"type":"text","value":"probe"}],[{"type":"integer","value":"6"},{"type":"text","value":"probe" … (23383 characters; truncated)
+HTTP 200
+curl: (7) Failed to connect to host.openshell.internal port 7410 after 1 ms: Couldn't connect to server
+dev node port: HTTP 000
+[1794465697.492] [sandbox] [OCSF ] [ocsf] CONFIG:PUBLISHED [INFO] Policy DNS mapped host.openshell.internal resolved=127.0.0.1 synthetic=198.18.0.5 ports=8444 mapping_id=75a001be-f83d-450d-8d9e-f253739065bd
+[1794465697.493] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(0) -> host.openshell.internal:8444 [policy:router_via_alias engine:opa]
+[1794465697.509] [sandbox] [OCSF ] [ocsf] HTTP:POST [INFO] ALLOWED POST https://host.openshell.internal:8444/db/agent-a-memory/v3/pipeline [policy:router_via_alias engine:l7]
+[1794465697.516] [sandbox] [OCSF ] [ocsf] CONFIG:PUBLISHED [INFO] Policy DNS mapped host.openshell.internal resolved=127.0.0.1 synthetic=198.18.0.5 ports=8444 mapping_id=5efb19a1-1585-420f-8fe2-c143b5206425
+[1794465697.518] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(0) -> host.openshell.internal:8444 [policy:router_via_alias engine:opa]
+[1794465697.533] [sandbox] [OCSF ] [ocsf] HTTP:POST [INFO] ALLOWED POST https://host.openshell.internal:8444/db/agent-a-memory/v3/pipeline [policy:router_via_alias engine:l7]
+✓ Policy version 8 loaded (active version: 8)

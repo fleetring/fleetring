@@ -1,0 +1,14 @@
+# The same credential as fleetring-router, with stable_placeholder: a process that already holds
+# the placeholder resolves the provider's current value after a value-only update.
+id: fleetring-router-stable
+display_name: FleetRing router (stable placeholder)
+description: A FleetRing token whose placeholder survives value-only updates.
+category: data
+credentials:
+  - name: fleetring_token
+    description: The agent's FleetRing token, sent as Authorization Bearer.
+    env_vars: [FLEETRING_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    stable_placeholder: true

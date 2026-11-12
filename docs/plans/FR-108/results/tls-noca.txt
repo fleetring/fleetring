@@ -1,0 +1,26 @@
+
+### the gateway configuration for this run
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "docker"
+
+[openshell.drivers.docker]
+socket_path = "/var/run/docker.sock"
+supervisor_network_mode = "bridge"
+allow_driver_config = true
+
+  [0.0s] Requesting compute...
+
+### agent-n calls the router, whose certificate only the fleet's authority signs
+curl: (52) Empty reply from server
+
+HTTP 000
+[1794465542.200] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(0) -> 192.0.2.10:8443 [policy:fleetring_router engine:opa]
+[1794465542.218] [sandbox] [OCSF ] [ocsf] NET:FAIL [LOW] 192.0.2.10:8443
+[1794465542.218] [sandbox] [OCSF ] [ocsf] NET:FAIL [LOW] 192.0.2.10:8443
+✓ Sandbox agent-n deletion accepted; cleanup is pending
+
+### with the authority back (A, created under the full configuration)
+HTTP 200

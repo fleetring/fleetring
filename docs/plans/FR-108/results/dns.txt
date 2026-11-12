@@ -1,0 +1,23 @@
+
+### queries from A (names unique to this run)
+a1794464911-fr108.example.org -> 198.18.0.6      a1794464911-fr108.example.org
+b1794464911-fr108.example.net -> 198.18.0.7      b1794464911-fr108.example.net
+TXT:
+MX:
+;; UDP setup with 1.1.1.1#53(1.1.1.1) for d1794464911-fr108.example.org failed: permission denied.
+;; no servers could be reached
+;; Connection to 8.8.8.8#53(8.8.8.8) for d1794464911-fr108.example.org failed: permission denied.
+;; no servers could be reached
+
+### positive control: a query sent from the supervisor's namespace itself
+
+### tcpdump in the supervisor's namespace (every packet except the gateway connection)
+(Promiscuous mode not supported on the "any" device)
+06:28:28.876293 eth0  In  IP 151.101.54.132.443 > 172.17.0.2.34768: Flags [P.], seq 1087627376:1087627400, ack 2988313433, win 4096, options [nop,nop,TS val 3751548455 ecr 4160814730], length 24
+06:28:28.876304 eth0  Out IP 172.17.0.2.34768 > 151.101.54.132.443: Flags [R], seq 2988313433, win 0, length 0
+06:28:31.420376 eth0  Out IP 172.17.0.2.56236 > 192.168.65.7.53: 50828+ A? control1794464911-fr108.example.org. (53)
+06:28:31.420420 eth0  Out IP 172.17.0.2.56236 > 192.168.65.7.53: 50829+ AAAA? control1794464911-fr108.example.org. (53)
+06:28:31.449102 eth0  In  IP 192.168.65.7.53 > 172.17.0.2.56236: 50829 NXDomain 0/0/0 (53)
+06:28:31.449152 eth0  In  IP 192.168.65.7.53 > 172.17.0.2.56236: 50828 NXDomain 0/0/0 (53)
+packets naming the agent's queries: 0
+packets naming the control query:   2
