@@ -1,4 +1,4 @@
-# ADR-0047: The agent launcher is designed against OpenShell as its first sandbox backend, with each agent's token injected by OpenShell's supervisor on one endpoint only
+# ADR-0048: The agent launcher is designed against OpenShell as its first sandbox backend, with each agent's token injected by OpenShell's supervisor on one endpoint only
 
 - **Status:** Proposed. Accepting it needs ADR-0044 point 11.5's test to pass on a Linux host first (see "Open questions for the owner").
 - **Date:** 2026-11-12
@@ -51,7 +51,7 @@ Five facts from the spike shape the decision:
 
 **A direction, not a decision: MCP under the launcher.** `fleetring mcp` would run outside the sandbox, one per agent, as the credential proxy, serving MCP's Streamable HTTP transport (new FleetRing work), reached as point 2's endpoint with `protocol: mcp` rules by tool name, and identifying the agent by an injected per-agent secret. None of this was tested, and it is outside FR-108's scope; the launcher's own design decides it. Tool-name rules never replace scopes: OpenShell doesn't see tool arguments.
 
-On acceptance, ADR-0044 gets a dated note under point 11.6 pointing here, like its existing note on S2 and ADR-0046, and its row in the index gains "point 11.6 amended by 0047". ADR-0044's text otherwise stays as written.
+On acceptance, ADR-0044 gets a dated note under point 11.6 pointing here, like its existing note on S2 and ADR-0046, and its row in the index gains "point 11.6 amended by 0048". ADR-0044's text otherwise stays as written.
 
 ## Alternatives considered
 
@@ -78,4 +78,4 @@ On acceptance, ADR-0044 gets a dated note under point 11.6 pointing here, like i
 - **O3. Work directories: volumes with copy in and out, or bind mounts?** Bind mounts need resource admission off, were unusable inside the sandbox on Docker Desktop, and let an agent plant symlinks the host follows. *Recommended: volumes, with bind mounts reconsidered only after a Linux run.*
 - **O4. Is disk without a quota acceptable for the first secure mode on Docker and Podman?** *Recommended: yes, documented as a limit, with the microVM backend (bounded overlay disk) for agents that must not share disk, and the quota asked upstream.*
 
-To unblock: "Run the Linux test; if it passes, accept ADR-0047 with O1 to O4 as recommended."
+To unblock: "Run the Linux test; if it passes, accept ADR-0048 with O1 to O4 as recommended."

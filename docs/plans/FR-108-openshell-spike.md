@@ -8,7 +8,7 @@ This spike asks one question: does ADR-0044 point 11.5's acceptance test pass wi
 
 **What doesn't fail the test but shapes the launcher:** a credential rotated with an ordinary placeholder never reaches a process that is already running; detaching a provider is refused while a policy binds it, and re-attaching revives the old placeholder; the authority that verifies the router is trusted gateway-wide; there are no memory, CPU or disk limits unless the launcher sets them, and no disk quota at all on Docker; OpenShell's own "auto" approval widens network access with no person; and a sandbox's terminal output isn't sanitized. "Gaps and risks" lists all eleven.
 
-**Recommendation: design the launcher against OpenShell as its first backend,** for both the `container` and `microvm` rows, with the upstream changes listed at the end, and accept that choice only after the same test passes on Linux. A draft amendment, [ADR-0047](../adr/0047-openshell-as-the-agent-launchers-sandbox-backend.md) (Proposed), records it. Nothing here makes any setup a secure multi-agent mode: that still needs the launcher and its credential proxy (ADR-0044 point 10).
+**Recommendation: design the launcher against OpenShell as its first backend,** for both the `container` and `microvm` rows, with the upstream changes listed at the end, and accept that choice only after the same test passes on Linux. A draft amendment, [ADR-0048](../adr/0048-openshell-as-the-agent-launchers-sandbox-backend.md) (Proposed), records it. Nothing here makes any setup a secure multi-agent mode: that still needs the launcher and its credential proxy (ADR-0044 point 10).
 
 ## Environment and versions
 
@@ -245,12 +245,12 @@ So, against processes already running: an expiry is enforced on the generation t
 |---|---|---|
 | macOS on Apple silicon, Docker Desktop (Linux VM, kernel 6.12.76) | Yes | Every row as above. Bridge networking unless Docker Desktop's host networking is on. Landlock and seccomp enforce in the Linux VM's kernel, not in macOS |
 | macOS on Apple silicon, microVM (libkrun on Hypervisor.framework, guest kernel 6.12.109) | Yes | Every row as above, with the differences listed. The driver needs e2fsprogs, an ad hoc signature with the hypervisor entitlement (the formula does this), and a short `state_dir`: a long path failed with "path must be shorter than SUN_LEN" (first pass; observed, transcript not kept) |
-| Linux 6.2 or later: Docker, Podman, microVM (KVM), Kubernetes | **No**: no Linux host here | Per the docs, the sandbox requires Landlock ABI 3 (Linux 6.2); Podman needs 5.x with cgroups v2; the microVM driver needs KVM; Kubernetes needs a CNI that enforces `NetworkPolicy`. **To be tested before ADR-0047 is accepted** |
+| Linux 6.2 or later: Docker, Podman, microVM (KVM), Kubernetes | **No**: no Linux host here | Per the docs, the sandbox requires Landlock ABI 3 (Linux 6.2); Podman needs 5.x with cgroups v2; the microVM driver needs KVM; Kubernetes needs a CNI that enforces `NetworkPolicy`. **To be tested before ADR-0048 is accepted** |
 | Windows (MXC) | No | OpenShell's Installation page calls it "Development; not production-qualified" |
 
 **The host alias reaches host loopback.** `host.openshell.internal` is how OpenShell sandboxes reach services on the gateway host (Gateway Configuration page), and on these drivers it lands on the host's loopback: Docker Desktop forwards 192.168.65.254 there, and the VM driver maps the name to 127.0.0.1. A rule for `host.openshell.internal:8444` reached a router listening only on `127.0.0.1:8444`; on Docker Desktop that took `allowed_ips: [192.168.65.254/32]`, and on the VM driver no `allowed_ips` at all (`endpoints.txt`, `vm.txt`). Ports the rule doesn't name stayed closed (the dev node's 7410 and the gateway's 17670 through the same alias were refused). So OpenShell's "never authorize loopback" concerns the address the policy sees, not where the connection lands.
 
-**Router placement: LAN address or host loopback.** The acceptance runs put the router on the Mac's LAN address, which exposes it, and every bearer token it accepts, to the local network. The alternative tested above keeps the router on `127.0.0.1` and lets each sandbox reach it only through the alias on one exact port; own-work passed that way on both drivers, and B's path was still refused. **Recommendation: loopback plus the alias**, with the alias allowed only on the router's (or credential proxy's) port, and otherwise a host firewall in front of a LAN listener. How the alias maps on native Linux, for Docker and for Podman, is the open question; ADR-0047 leaves the choice open until a Linux run.
+**Router placement: LAN address or host loopback.** The acceptance runs put the router on the Mac's LAN address, which exposes it, and every bearer token it accepts, to the local network. The alternative tested above keeps the router on `127.0.0.1` and lets each sandbox reach it only through the alias on one exact port; own-work passed that way on both drivers, and B's path was still refused. **Recommendation: loopback plus the alias**, with the alias allowed only on the router's (or credential proxy's) port, and otherwise a host firewall in front of a LAN listener. How the alias maps on native Linux, for Docker and for Podman, is the open question; ADR-0048 leaves the choice open until a Linux run.
 
 ### Work directories
 
@@ -306,7 +306,7 @@ So, against processes already running: an expiry is enforced on the generation t
 
 Rotation and expiry are covered by `stable_placeholder: true` (R5), so they need no upstream change; the launcher uses it.
 
-**What the launcher must configure,** whatever upstream does (ADR-0047 records these):
+**What the launcher must configure,** whatever upstream does (ADR-0048 records these):
 
 - `proposal_approval_mode = manual` gateway-wide; the policy advisor off.
 - One provider per agent from an endpointless FleetRing profile with `stable_placeholder: true`, bound by `credential_binding` to the router (or credential proxy) in that agent's own policy, with `protocol: rest`, `enforcement: enforce`, and the agent's own `/db/<prefix>*/` paths.
