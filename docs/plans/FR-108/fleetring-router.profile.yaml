@@ -1,0 +1,14 @@
+# A provider profile for a FleetRing token sent to a router (ADR-0037). It declares no
+# endpoints: each sandbox's own policy binds its provider instance to the router with
+# `credential_binding`, so each agent's endpoint rules (its own /db/ paths) live in its policy.
+id: fleetring-router
+display_name: FleetRing router
+description: A FleetRing token, resolved only on requests to the router a sandbox policy binds.
+category: data
+credentials:
+  - name: fleetring_token
+    description: The agent's FleetRing token, sent as Authorization Bearer.
+    env_vars: [FLEETRING_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization

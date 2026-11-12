@@ -1,0 +1,60 @@
+
+### no gateway-wide value; sandbox created with --approval-mode auto
+✓ Deleted global setting proposal_approval_mode (revision 2)
+[0.1s] Starting sandbox Container created
+1794464931 attempt: HTTP 000
+1794464936 attempt: HTTP 000
+1794464942 attempt: HTTP 000
+1794464947 attempt: HTTP 000
+1794464952 attempt: HTTP 200
+1794464957 attempt: HTTP 200
+  Status: approved
+  Rule: allow_example_com_443
+  Prover: prover: no new findings
+  Endpoints: example.com:443 [L4]
+  Binaries: /usr/bin/curl
+  proposal_approval_mode = auto (sandbox)
+✓ Sandbox agent-c deletion accepted; cleanup is pending
+
+### gateway-wide manual; sandbox created with --approval-mode auto
+✓ Set global setting proposal_approval_mode=manual (revision 3)
+[0.1s] Starting sandbox Container created
+1794464963 attempt: HTTP 000
+1794464968 attempt: HTTP 000
+1794464973 attempt: HTTP 000
+1794464978 attempt: HTTP 000
+1794464983 attempt: HTTP 000
+1794464989 attempt: HTTP 000
+  Status: pending
+  Rule: allow_example_com_443
+  Prover: prover: no new findings
+  Endpoints: example.com:443 [L4]
+  Binaries: /usr/bin/curl
+  proposal_approval_mode = manual (global)
+✓ Sandbox agent-c2 deletion accepted; cleanup is pending
+
+### drafts OpenShell made from A's denied connections during the other runs (manual: pending, never applied)
+  Status: pending
+  Rule: allow_8_8_8_8_53
+  Endpoints: 8.8.8.8:53 [L4]
+  Binaries: /usr/bin/dig
+  Status: pending
+  Rule: allow_1_1_1_1_53
+  Endpoints: 1.1.1.1:53 [L4]
+  Binaries: /usr/bin/nc.openbsd
+  Status: pending
+  Rule: allow_192_0_2_10_8443
+  Endpoints: 192.0.2.10:8443 [L7 rest, allow POST /db/**]
+  Binaries: /usr/bin/python3.12
+  Status: pending
+  Rule: allow_192_0_2_10_7410
+  Endpoints: 192.0.2.10:7410 [L4]
+  Binaries: /usr/bin/curl
+  Status: pending
+  Rule: allow_1_1_1_1_80
+  Endpoints: 1.1.1.1:80 [L4]
+  Binaries: /usr/bin/curl
+  Status: pending
+  Rule: allow_example_com_443
+  Endpoints: example.com:443 [L4]
+  Binaries: /usr/bin/curl

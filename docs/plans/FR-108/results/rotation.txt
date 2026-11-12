@@ -1,0 +1,117 @@
+
+### clocks: the Mac (gateway and CLI), the Docker Desktop VM, sandbox A
+mac            1794464469.735
+docker vm      1794464469
+sandbox A      1794464469.945
+mac            1794464469.952
+
+### R1: provider update to a read-only token, with a process already running
+loop r1-update started; its placeholder: openshell:resolve:env:v14151745310565576583_FLEETRING_TOKEN
+provider update fleetring-a --credential FLEETRING_TOKEN at 1794464477.024
+agent-a / fleetring-a: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464484.806
+new process placeholder: openshell:resolve:env:v3500012201347277435_FLEETRING_TOKEN
+"code":"PERMISSION_DENIED"  HTTP 200 
+loop r1-update: outcomes in order (count, HTTP status, outcome):
+  74 200 "affected_row_count":1
+loop r1-update: last success 1794464509.560, first failure 
+
+### R2: expiry set BEFORE the process starts, so the process holds the generation that carries it
+expiry 1794464554000 ms (1794464554 s)
+provider update fleetring-a --credential FLEETRING_TOKEN --credential-expires-at FLEETRING_TOKEN=1794464554000 at 1794464514.687
+agent-a / fleetring-a: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464524.777
+loop r2-expiry-before started; its placeholder: openshell:resolve:env:v13489460763747182920_FLEETRING_TOKEN
+waiting past the expiry: now 1794464526.861
+now 1794464586.876
+new process placeholder: openshell:resolve:env:v13489460763747182920_FLEETRING_TOKEN
+"error":"credential_unavailable"  HTTP 500 
+loop r2-expiry-before: outcomes in order (count, HTTP status, outcome):
+  54 200 "affected_row_count":1
+  62 500 "error":"credential_unavailable"
+loop r2-expiry-before: last success 1794464553.522, first failure 1794464554.068
+
+### R3: expiry set AFTER the process starts (value unchanged, only --credential-expires-at)
+loop r3-expiry-after started; its placeholder: openshell:resolve:env:v8449179858844908961_FLEETRING_TOKEN
+expiry 1794464624000 ms (1794464624 s)
+provider update fleetring-a --credential-expires-at FLEETRING_TOKEN=1794464624000 at 1794464599.916
+agent-a / fleetring-a: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464604.850
+now 1794464654.866
+new process placeholder: openshell:resolve:env:v708660459608725842_FLEETRING_TOKEN
+"error":"credential_unavailable"  HTTP 500 
+loop r3-expiry-after: outcomes in order (count, HTTP status, outcome):
+ 111 200 "affected_row_count":1
+loop r3-expiry-after: last success 1794464654.622, first failure 
+
+### R4: detach while the policy binds the provider; then unbind; then detach; then re-attach and re-bind
+loop r4-unbind started; its placeholder: openshell:resolve:env:v11274279195248550342_FLEETRING_TOKEN
+detach at 1794464670.060:
+Error:   × provider detachment failed (The system is not in a state required for the
+  │ operation's execution)
+
+unbind submitted at 1794464670.175
+✓ Policy version 9 loaded (active version: 9)
+loaded at 1794464675.268
+new process placeholder: 
+"code":"UNAUTHENTICATED"  HTTP 401 
+detach at 1794464680.387:
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+
+✓ Policy version 10 loaded (active version: 10)
+agent-a / fleetring-a: ready (unspecified)
+new process placeholder: openshell:resolve:env:v11274279195248550342_FLEETRING_TOKEN
+"affected_row_count":1  HTTP 200 
+loop r4-unbind: outcomes in order (count, HTTP status, outcome):
+  19 200 "affected_row_count":1
+  37 500 "error":"credential_unavailable"
+   6 200 "affected_row_count":1
+loop r4-unbind: last success 1794464697.988, first failure 1794464675.298
+
+### R5: stable_placeholder: true (profile fleetring-router-stable), in sandbox agent-s
+✓ Created provider fleetring-a-stable
+[0.1s] Starting sandbox Container created
+loop r5-stable started; its placeholder: openshell:resolve:env:sdd2d7c3c5587e330da402326512d27ba8494ef7902b6f082542f5e4725dc517c_FLEETRING_TOKEN
+provider update fleetring-a-stable --credential FLEETRING_TOKEN at 1794464706.424
+agent-s / fleetring-a-stable: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464709.338
+provider update fleetring-a-stable --credential FLEETRING_TOKEN at 1794464724.356
+agent-s / fleetring-a-stable: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464729.362
+provider update fleetring-a-stable --credential FLEETRING_TOKEN at 1794464744.378
+agent-s / fleetring-a-stable: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464749.400
+expiry 1794464779000 ms (1794464779 s)
+provider update fleetring-a-stable --credential-expires-at FLEETRING_TOKEN=1794464779000 at 1794464759.439
+agent-s / fleetring-a-stable: ready (unspecified)
+  Installed: credentials=true, policy=true, future process environment=true
+  Wait: complete
+returned at 1794464769.618
+now 1794464809.644
+loop r5-stable: outcomes in order (count, HTTP status, outcome):
+  19 200 "affected_row_count":1
+  37 200 "code":"PERMISSION_DENIED"
+  37 401 "code":"UNAUTHENTICATED"
+  55 200 "affected_row_count":1
+  57 500 "error":"credential_unavailable"
+loop r5-stable: last success 1794464778.797, first failure 1794464709.652
+✓ Sandbox agent-s deletion accepted; cleanup is pending
+✓ Deleted provider fleetring-a-stable
+
+### clocks again
+mac            1794464813.019
+docker vm      1794464813
+sandbox A      1794464813.286

@@ -1,0 +1,30 @@
+# The sandbox policy for agent @AGENT@; setup.sh replaces @AGENT@ and @ROUTER_IP@.
+# Network: only curl may reach only the router, only on this agent's own /db/ paths and the
+# version probes, with the agent's provider credential bound to that endpoint alone.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /bin, /etc]
+  read_write: [/tmp]
+landlock:
+  compatibility: hard_requirement
+network_policies:
+  fleetring_router:
+    endpoints:
+      - host: "@ROUTER_IP@"
+        port: 8443
+        allowed_ips: ["@ROUTER_IP@/32"]
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: /v2 }
+          - allow: { method: GET, path: /v3 }
+          - allow: { method: GET, path: "/db/agent-@AGENT@-*/v2" }
+          - allow: { method: GET, path: "/db/agent-@AGENT@-*/v3" }
+          - allow: { method: POST, path: "/db/agent-@AGENT@-*/v2/pipeline" }
+          - allow: { method: POST, path: "/db/agent-@AGENT@-*/v3/pipeline" }
+          - allow: { method: POST, path: "/db/agent-@AGENT@-*/v3/cursor" }
+        credential_binding:
+          provider: fleetring-@AGENT@
+    binaries:
+      - path: /usr/bin/curl

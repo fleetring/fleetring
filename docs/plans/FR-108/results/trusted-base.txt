@@ -1,0 +1,54 @@
+
+### files under the gateway's HOME (it was redirected to <work>/os/home)
+-rw-r--r--@ 619 <work>/os/home/.config/openshell/gateways/fr108/mtls/ca.crt
+-rw-------@ 241 <work>/os/home/.config/openshell/gateways/fr108/mtls/tls.key
+-rw-r--r--@ 591 <work>/os/home/.config/openshell/gateways/fr108/mtls/tls.crt
+-rw-r--r--@ 136 <work>/os/home/.config/openshell/gateways/fr108/metadata.json
+-rw-r--r--@ 15 <work>/os/home/.config/openshell/gateways/fr108/last_sandbox
+-rw-r--r--@ 619 <work>/os/home/.config/openshell/gateways/openshell/mtls/ca.crt
+-rw-------@ 241 <work>/os/home/.config/openshell/gateways/openshell/mtls/tls.key
+-rw-r--r--@ 591 <work>/os/home/.config/openshell/gateways/openshell/mtls/tls.crt
+-rw-r--r--@ 5 <work>/os/home/.config/openshell/active_gateway
+-rw-------@ 36 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/start-generation
+-rw-------@ 94 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/main-process.json
+-rw-------@ 8 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/workspace-root
+-rw-------@ 562 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/boundary-server.crt
+-rw-------@ 168 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/boundary-server.key
+-rw-------@ 2074 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/supervisor-auth.json
+-rw-------@ 1498 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/runtime-descriptor.json
+-rw-------@ 1260 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/boundary-bootstrap.json
+-rw-------@ 718 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/27d40484-5752-461b-8dc0-91a1b44d879f/sandbox.jwt
+-rw-------@ 36 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/start-generation
+-rw-------@ 94 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/main-process.json
+-rw-------@ 8 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/workspace-root
+-rw-------@ 562 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/boundary-server.crt
+-rw-------@ 168 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/boundary-server.key
+-rw-------@ 2074 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/supervisor-auth.json
+-rw-------@ 1498 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/runtime-descriptor.json
+-rw-------@ 1260 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/boundary-bootstrap.json
+-rw-------@ 718 <work>/os/home/.local/state/openshell/docker-sandbox-tokens/default/853e5c91-8616-442d-bf34-e326f7f24191/sandbox.jwt
+-r--r--r--@ 550 <work>/os/home/.local/state/openshell/network-supervisor/additional-ca-fd443d00942d4560abca57b6e95c4b17bdac04615251419ff572d86b9a0e56b7.crt
+-rw-------@ 180224 <work>/os/home/.local/state/openshell/gateway/openshell.db
+-rw-------@ 32768 <work>/os/home/.local/state/openshell/gateway/openshell.db-shm
+-rw-------@ 148352 <work>/os/home/.local/state/openshell/gateway/openshell.db-wal
+-rw-------@ 32 <work>/os/home/.local/state/openshell/gateway/credentials/key-encryption-key.bin
+
+### agent A's token, searched for in the clear in every one of those files
+not found in the clear
+
+### the operator's client credential the CLI uses (an administrator credential)
+<work>/os/home/.config/openshell/gateways/fr108/mtls: <work>/os/home/.config/openshell/gateways/fr108/mtls:
+total 24
+drwx------@ .
+drwx------@ ..
+-rw-r--r--@ ca.crt
+-rw-r--r--@ tls.crt
+-rw-------@ tls.key
+ 
+<work>/os/home/.config/openshell/gateways/openshell/mtls: <work>/os/home/.config/openshell/gateways/openshell/mtls:
+total 24
+drwx------@ .
+drwxr-xr-x@ ..
+-rw-r--r--@ ca.crt
+-rw-r--r--@ tls.crt
+-rw-------@ tls.key

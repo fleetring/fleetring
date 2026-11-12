@@ -1,0 +1,252 @@
+
+### A's policy for these experiments: its base policy, openssl added to the router rule, and these rules
+  echo_l4:
+    endpoints:
+      - host: host.openshell.internal
+        port: 8445
+        allowed_ips: ["192.168.65.254/32"]
+    binaries:
+      - path: /usr/bin/curl
+  echo_rest:
+    endpoints:
+      - host: host.openshell.internal
+        port: 8447
+        allowed_ips: ["192.168.65.254/32"]
+        protocol: rest
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+  echo_bound:
+    endpoints:
+      - host: host.openshell.internal
+        port: 8448
+        allowed_ips: ["192.168.65.254/32"]
+        protocol: rest
+        enforcement: enforce
+        access: full
+        credential_binding:
+          provider: fleetring-a
+    binaries:
+      - path: /usr/bin/curl
+  router_via_alias:
+    endpoints:
+      - host: host.openshell.internal
+        port: 8444
+        allowed_ips: ["192.168.65.254/32"]
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: POST, path: "/db/agent-a-*/v3/pipeline" }
+        credential_binding:
+          provider: fleetring-a
+    binaries:
+      - path: /usr/bin/curl
+  wrong_name:
+    endpoints:
+      - host: "192.0.2.10"
+        port: 8446
+        allowed_ips: ["192.0.2.10/32"]
+        protocol: rest
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+✓ Policy version 11 loaded (active version: 11)
+
+### S8: A's placeholder at an allowed endpoint that isn't bound: L4 (8445) and inspected REST (8447)
+-- port 8445
+{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"} HTTP 403
+{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"} HTTP 403
+echo received:
+POST /body
+Host: host.openshell.internal:8445
+User-Agent: curl/8.5.0
+Accept: */*
+Content-Length: 61
+Content-Type: application/x-www-form-urlencoded
+
+b't=openshell:resolve:env:v12730607507495398700_FLEETRING_TOKEN'
+ HTTP 200
+-- port 8447
+{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"} HTTP 403
+{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"} HTTP 403
+echo received:
+POST /body
+Host: host.openshell.internal:8447
+User-Agent: curl/8.5.0
+Accept: */*
+Content-Length: 61
+Content-Type: application/x-www-form-urlencoded
+
+b't=openshell:resolve:env:v12730607507495398700_FLEETRING_TOKEN'
+ HTTP 200
+--- what the echo servers received
+--- port 8445
+POST /body
+Host: host.openshell.internal:8445
+User-Agent: curl/8.5.0
+Accept: */*
+Content-Length: 61
+Content-Type: application/x-www-form-urlencoded
+
+b't=openshell:resolve:env:v12730607507495398700_FLEETRING_TOKEN'
+--- port 8447
+POST /body
+Host: host.openshell.internal:8447
+User-Agent: curl/8.5.0
+Accept: */*
+Content-Length: 61
+Content-Type: application/x-www-form-urlencoded
+
+b't=openshell:resolve:env:v12730607507495398700_FLEETRING_TOKEN'
+
+### reflection: an endpoint bound to A's provider (8448) that echoes the request back
+echo received:
+GET /reflect
+Host: host.openshell.internal:8448
+User-Agent: curl/8.5.0
+Accept: */*
+Authorization: Bearer <TOKEN-A>
+
+b''
+ HTTP 200
+--- what the echo server received
+--- port 8448
+GET /reflect
+Host: host.openshell.internal:8448
+User-Agent: curl/8.5.0
+Accept: */*
+Authorization: Bearer <TOKEN-A>
+
+b''
+
+### reflection: does any router response carry A's token back? (the token would show as <TOKEN-A>)
+HTTP/1.1 400 Bad Request
+content-type: application/json
+content-length: 107
+date: Thu, 12 Nov 2026 06:27:25 GMT
+
+{"message":"the request isn't valid Hrana JSON: expected ident at line 1 column 2","code":"PROTOCOL_ERROR"}
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 199
+date: Thu, 12 Nov 2026 06:27:25 GMT
+
+{"baton":"To_aXlhSFMfqOxUtcwbPxly7m9ac2ByzAAAAAQ","base_url":null,"results":[{"type":"error","error":{"message":"near \"SELEC\": syntax error in SELEC nonsense at offset 0","code":"SQLITE_MISUSE"}}]}
+HTTP/1.1 400 Bad Request
+content-type: application/json
+content-length: 105
+date: Thu, 12 Nov 2026 06:27:25 GMT
+
+{"message":"the stream expired or never existed; open a new one without a baton","code":"STREAM_EXPIRED"}
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 258
+date: Thu, 12 Nov 2026 06:27:25 GMT
+
+{"baton":"m2GSK1_nc0l5gXipw_jUUJGyTnpvQs_oAAAAAQ","base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"?","decltype":null}],"rows":[[{"type":"text","value":"x"}]],"affected_row_count":0,"last_insert_rowid":null}}}]}
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 175
+date: Thu, 12 Nov 2026 06:27:25 GMT
+
+{"baton":"7QgUTr-KcV9c7gGA-romFz-J5wOO9qIgAAAAAQ","base_url":null,"results":[{"type":"error","error":{"message":"database agent-a-missing doesn't exist","code":"NOT_FOUND"}}]}
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 0
+date: Thu, 12 Nov 2026 06:27:25 GMT
+
+
+token occurrences in router responses: 0
+
+### TLS as the agent sees it, and what it trusts
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / id-ecPublicKey
+*  subject: CN=192.0.2.10
+*  start date: Jan  1 00:00:00 1975 GMT
+*  expire date: Jan  1 00:00:00 4096 GMT
+*  subjectAltName: host "192.0.2.10" matched cert's IP address!
+*  issuer: CN=OpenShell Sandbox CA; O=OpenShell
+subject=CN = OpenShell Sandbox CA, O = OpenShell
+notBefore=Jan  1 00:00:00 1975 GMT
+notAfter=Jan  1 00:00:00 4096 GMT
+certificates in the agent's bundle: 152
+fleet authority in the agent bundle: 1
+
+### a router certificate from the fleet's authority for the wrong name (wrong-name.invalid) at 192.0.2.10:8446
+curl: (52) Empty reply from server
+
+HTTP 000
+host-side curl with the fleet CA: curl: (60) SSL: no alternative certificate subject name matches target IPv4 address '192.0.2.10'
+host-side curl with the fleet CA: More details here: https://curl.se/docs/sslcerts.html
+
+### raw HTTP framing on one TLS connection (http-layer.sh, openssl allowed for this run)
+
+### 7.1 keep-alive: A's request, then B's on the same connection
+[openssl exit 1]
+HTTP/1.1 200 OK
+{"error":"policy_denied","policy":"fleetring_router","rule":"POST /db/agent-b-memory/v3/pipeline","detail":"POST /db/agent-b-memory/v3/pipeline not permitted by policy","layer":"l7","protocol":"rest","method":"POST","path":"/db/agent-b-memory/v3/pipeline","host":"192.0.2.10","port":8443,"binary":"/usr/bin/openssl","rule_missing":{"type":"rest_allow","layer":"l7","method":"POST","path":"/db/agent-b-memory/v3/pipeline","host":"192.0.2.10","port":8443,"binary":"/usr/bin/openssl"},"next_steps":[]}
+no canary in the responses
+Can't use SSL_get_servername
+2060C1B3FFFF0000:error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading:../ssl/record/rec_layer_s3.c:316:
+
+### 7.2 CL.TE: Content-Length covers a smuggled request for B; chunked ends the body first
+[openssl exit 1]
+no canary in the responses
+Can't use SSL_get_servername
+20B0FAACFFFF0000:error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading:../ssl/record/rec_layer_s3.c:316:
+
+### 7.3 TE.CL: chunked body, a short Content-Length, B's request after it
+[openssl exit 1]
+no canary in the responses
+Can't use SSL_get_servername
+204037A3FFFF0000:error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading:../ssl/record/rec_layer_s3.c:316:
+
+### 7.4 obfuscated Transfer-Encoding
+[openssl exit 1]
+no canary in the responses
+Can't use SSL_get_servername
+20405A93FFFF0000:error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading:../ssl/record/rec_layer_s3.c:316:
+
+### 7.5 two Content-Length headers
+[openssl exit 1]
+no canary in the responses
+Can't use SSL_get_servername
+20506B97FFFF0000:error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading:../ssl/record/rec_layer_s3.c:316:
+[1794464845.480] [sandbox] [OCSF ] [ocsf] HTTP:GET [HIGH] DENIED GET  [policy:echo_l4 engine:credential-binding] [reason:credential_endpoint_mismatch]
+[1794464845.490] [sandbox] [OCSF ] [ocsf] HTTP:GET [HIGH] DENIED GET  [policy:echo_l4 engine:credential-binding] [reason:credential_endpoint_mismatch]
+[1794464845.567] [sandbox] [OCSF ] [ocsf] HTTP:GET [HIGH] DENIED GET  [policy:echo_rest engine:credential-binding] [reason:credential_endpoint_mismatch]
+[1794464845.576] [sandbox] [OCSF ] [ocsf] HTTP:GET [HIGH] DENIED GET  [policy:echo_rest engine:credential-binding] [reason:credential_endpoint_mismatch]
+
+### the host-alias topology: own-work.sh against the router on 127.0.0.1:8444, through host.openshell.internal
+placeholder: openshell:resolve:env:v12730607507495398700_FLEETRING_TOKEN
+{"baton":null,"base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}
+HTTP 200
+{"baton":null,"base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":1,"last_insert_rowid":"342"}}},{"type":"ok","response":{"type":"close"}}]}
+HTTP 200
+{"baton":null,"base_url":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"id","decltype":"INTEGER"},{"name":"body","decltype":"TEXT"}],"rows":[[{"type":"integer","value":"1"},{"type":"text","value":"written from sandbox A"}],[{"type":"integer","value":"2"},{"type":"text","value":"written from sandbox A"}],[{"type":"integer","value":"3"},{"type":"text","value":"probe"}],[{"type":"integer","value":"4"},{"type":"text","value":"probe"}],[{"type":"integer","value":"5"},{"type":"text","value":"probe"}],[{"type":"integer","value":"6"},{"type":"text","value":"probe" … (23131 characters; truncated)
+HTTP 200
+{"error":"policy_denied","policy":"router_via_alias","rule":"POST /db/agent-b-memory/v3/pipeline","detail":"POST /db/agent-b-memory/v3/pipeline not permitted by policy","layer":"l7","protocol":"rest","method":"POST","path":"/db/agent-b-memory/v3/pipeline","host":"host.openshell.internal","port":8444,"binary":"/usr/bin/curl","rule_missing":{"type":"rest_allow","layer":"l7","method":"POST","path":"/db/agent-b-memory/v3/pipeline","host":"host.openshell.internal","port":8444,"binary":"/usr/bin/curl"},"next_steps":[]}
+HTTP 403
+curl: (7) Failed to connect to host.openshell.internal port 7410 after 1 ms: Couldn't connect to server
+dev node port: HTTP 000
+curl: (7) Failed to connect to host.openshell.internal port 17670 after 1 ms: Couldn't connect to server
+gateway port: HTTP 000
+listening sockets of the routers on the Mac:
+fleetring 127.0.0.1:8444
+fleetring 192.0.2.10:8443
+✓ Policy version 12 loaded (active version: 12)
+./lib.sh: line 32: 20965 Terminated: 15          nohup python3 -I "$HERE/echo.py" $p "$WORK/raw/echo.log" > /dev/null 2>&1
+./lib.sh: line 32: 20966 Terminated: 15          nohup python3 -I "$HERE/echo.py" $p "$WORK/raw/echo.log" > /dev/null 2>&1
+./lib.sh: line 32: 20967 Terminated: 15          nohup python3 -I "$HERE/echo.py" $p "$WORK/raw/echo.log" > /dev/null 2>&1
+
+### the supervisor log for the http-layer.sh cases (taken right after the run; the run's own filter missed these lines and is fixed in ex-endpoints.sh)
+[1794464847.471] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/openssl(0) -> 192.0.2.10:8443 [policy:fleetring_router engine:opa]
+[1794464847.502] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/openssl(0) -> 192.0.2.10:8443 [policy:fleetring_router engine:opa]
+[1794464847.505] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED 192.0.2.10:8443 [policy:fleetring_router engine:l7] [reason:Request contains both Transfer-Encoding and Content-Length headers]
+[1794464847.530] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/openssl(0) -> 192.0.2.10:8443 [policy:fleetring_router engine:opa]
+[1794464847.533] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED 192.0.2.10:8443 [policy:fleetring_router engine:l7] [reason:Request contains both Transfer-Encoding and Content-Length headers]
+[1794464847.559] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/openssl(0) -> 192.0.2.10:8443 [policy:fleetring_router engine:opa]
+[1794464847.562] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED 192.0.2.10:8443 [policy:fleetring_router engine:l7] [reason:Request contains both Transfer-Encoding and Content-Length headers]
+[1794464847.589] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/openssl(0) -> 192.0.2.10:8443 [policy:fleetring_router engine:opa]
+[1794464847.591] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED 192.0.2.10:8443 [policy:fleetring_router engine:l7] [reason:Request contains multiple Content-Length headers with differing values (76 vs 0)]
