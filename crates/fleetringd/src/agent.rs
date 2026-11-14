@@ -64,6 +64,10 @@ pub(crate) const TOKEN_FILE: &str = "token";
 /// The lock every write to an identity's directory holds.
 const LOCK_FILE: &str = ".lock";
 
+/// What starts the name of the file `agent remove` leaves in the agents directory, beside the
+/// removed identity's, to say when a replacement token may be minted (`AgentDir::replacement_file`).
+const REPLACEMENT_FILE_PREFIX: &str = ".mint-after-";
+
 /// The operation ID `agent delegate` asks under, in a delegated agent's directory until its
 /// record is written (ADR-0047, point 10).
 const OPERATION_FILE: &str = "operation";
@@ -455,6 +459,10 @@ pub(crate) struct AgentRecord {
     /// The operation ID a delegated agent's token was asked for under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) operation: Option<String>,
+    /// The lifetime in milliseconds a delegated agent's token was asked for with `--ttl`, which
+    /// `agent renew` asks for again; absent when the control plane's default applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lifetime_ms: Option<u64>,
 }
 
 impl AgentRecord {
@@ -486,6 +494,12 @@ impl AgentRecord {
         self.issued_by == IssuedBy::Delegation
     }
 
+    /// The ID of a root agent's token, which `token revoke --token-id` takes; `None` for a
+    /// delegated agent, whose token ID is its delegation ID, or for a record that holds none.
+    pub(crate) fn root_token_id(&self) -> Option<&str> {
+        (!self.is_delegated() && !self.token_id.is_empty()).then_some(self.token_id.as_str())
+    }
+
     /// Why this record can't be the identity of `principal`, an agent of `kind`, at its
     /// version, or `None` if it can: it names another principal, it says `scopes_from` at
     /// version 1, or it holds the fields of the other kind of identity.
@@ -513,6 +527,7 @@ impl AgentRecord {
                     ("root", self.root.is_some()),
                     ("issuer_key_id", self.issuer_key_id.is_some()),
                     ("operation", self.operation.is_some()),
+                    ("lifetime_ms", self.lifetime_ms.is_some()),
                 ];
                 if let Some((field, _)) = delegated.iter().find(|(_, set)| *set) {
                     return Some(format!(
@@ -1182,6 +1197,54 @@ impl AgentDir {
         })
     }
 
+    /// The file, beside the directory and so outliving it, that holds when a replacement token
+    /// may first be signed. `agent list` and the lineage scans skip it: no agent ID starts with
+    /// a dot.
+    fn replacement_file(&self) -> PathBuf {
+        let name = format!("{REPLACEMENT_FILE_PREFIX}{}", self.id);
+        self.dir.with_file_name(name)
+    }
+
+    /// Records that the control plane revoked this agent as a principal, so a token signed
+    /// before `from` is refused by every node (see `revoke::replacement_from`). `agent remove`
+    /// writes it as it deletes the directory, and [`replacement_wait`](Self::replacement_wait)
+    /// reads it, so that `agent add`, `agent renew` and a `mcp --agent` mint can refuse before
+    /// then instead of minting a token that no node accepts. It is advisory: it lives on this
+    /// machine, and its time is this host's clock against the signing host's.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::File`] if it can't be written.
+    pub(crate) fn record_replacement_from(&self, from: Timestamp) -> Result<(), AgentError> {
+        let path = self.replacement_file();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AgentError::File {
+                    action: "remove",
+                    path,
+                    source,
+                });
+            }
+        }
+        write_new_private(&path, &format!("{}\n", from.as_millis()))
+    }
+
+    /// When a replacement token may first be signed, if that is still ahead of `now`; `None` once
+    /// it has passed, which also deletes the record, and when there is none or it can't be read.
+    pub(crate) fn replacement_wait(&self, now: Timestamp) -> Option<Timestamp> {
+        let path = self.replacement_file();
+        let text = fs::read_to_string(&path).ok()?;
+        let from = Timestamp::from_millis(text.trim().parse().ok()?);
+        if from > now {
+            return Some(from);
+        }
+        // Best effort: a record left behind only repeats this check.
+        let _ = fs::remove_file(&path);
+        None
+    }
+
     /// Refuses an identity of another fleet than `authority`'s, which a mint from it would
     /// silently replace.
     fn check_fleet(&self, record: &AgentRecord, authority: &Authority) -> Result<(), AgentError> {
@@ -1248,6 +1311,7 @@ impl AgentDir {
             issued_by: issuer.issued_by(),
             issuer_key_id: None,
             operation: None,
+            lifetime_ms: None,
         };
         self.write_record(&record)?;
         Ok(record)
@@ -1452,6 +1516,8 @@ pub(crate) struct Delegation {
     pub(crate) expires_at: Timestamp,
     /// The ID of the issuer key that signed it.
     pub(crate) issuer_key_id: String,
+    /// The lifetime asked for, which a renewal asks for again.
+    pub(crate) lifetime_ms: Option<u64>,
     /// The parent's record, whose owner and fleet the child's are.
     pub(crate) parent: AgentRecord,
 }
@@ -1702,6 +1768,7 @@ impl DelegatedDir {
             issued_by: IssuedBy::Delegation,
             issuer_key_id: Some(delegation.issuer_key_id),
             operation: Some(pending.operation.to_string()),
+            lifetime_ms: delegation.lifetime_ms,
         };
         write_record(&self.dir, &self.record_file(), self.id.as_str(), &record)?;
         match fs::remove_file(self.operation_file()) {
@@ -2345,6 +2412,7 @@ mod tests {
             issued_by: IssuedBy::Dev,
             issuer_key_id: None,
             operation: None,
+            lifetime_ms: None,
         }
     }
 
@@ -2705,6 +2773,35 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_time_outlives_the_directory_and_ends_when_it_passes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let agents = root.path().join("agents");
+        fs::create_dir(&agents)?;
+        let dir = AgentDir::new(&agents, id("42"));
+        let from = Timestamp::from_millis(1_800_000_031_000);
+        assert_eq!(dir.replacement_wait(from), None, "nothing was recorded");
+
+        dir.record_replacement_from(from)?;
+        // Recording again replaces the time.
+        let later = Timestamp::from_millis(1_800_000_061_000);
+        dir.record_replacement_from(later)?;
+        assert_eq!(
+            dir.replacement_wait(Timestamp::from_millis(1_800_000_000_000)),
+            Some(later)
+        );
+        assert_eq!(fs::read_dir(&agents)?.count(), 1, "one file for the agent");
+        // Another agent has its own.
+        assert_eq!(
+            AgentDir::new(&agents, id("43")).replacement_wait(from),
+            None
+        );
+        assert_eq!(dir.replacement_wait(later), None, "the time has come");
+        assert_eq!(fs::read_dir(&agents)?.count(), 0, "and the record is gone");
+        Ok(())
+    }
+
+    #[test]
     fn renewing_a_missing_identity_creates_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let dir = AgentDir::new(&root.path().join("agents"), id("9"));
@@ -2871,6 +2968,7 @@ mod tests {
             read_only: false,
             expires_at: Timestamp::from_millis(1_800_007_200_000),
             issuer_key_id: "issuer-key".to_owned(),
+            lifetime_ms: Some(1_200_000),
             parent,
         }
     }

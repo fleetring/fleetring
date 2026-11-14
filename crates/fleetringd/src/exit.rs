@@ -16,6 +16,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::OnceLock;
 
 use fleetring_client::output::printable;
 use fleetringd::control::missing_database;
@@ -119,9 +120,60 @@ impl fmt::Display for Failed {
 
 impl Error for Failed {}
 
+/// The agent this process acts as (`--agent`, `FLEETRING_AGENT`), once the command line has said.
+static AGENT: OnceLock<String> = OnceLock::new();
+
+/// Says that the command acts as agent `id`, so that its refusals say to ask the parent or the
+/// operator instead of pointing at other credentials, which an agent mustn't look for
+/// (`docs/agents/SKILL.md`).
+pub(crate) fn acting_as_agent(id: &str) {
+    let _ = AGENT.set(id.to_owned());
+}
+
+/// The agent the command acts as, if it acts as one.
+pub(crate) fn agent() -> Option<&'static str> {
+    AGENT.get().map(String::as_str)
+}
+
+/// The next step after a refusal of the scope an agent's token lacks.
+fn agent_scope_hint(id: &str) -> String {
+    if id.contains('.') {
+        format!(
+            "agent {id}'s token doesn't allow it: ask your parent to delegate it with \
+             `fleetring agent delegate {id} --scope <action>:<database>`, or an operator; don't \
+             look for other credentials"
+        )
+    } else {
+        format!(
+            "agent {id}'s token doesn't allow it: ask the operator who added it for the scope; \
+             don't look for other credentials"
+        )
+    }
+}
+
+/// The next step after the nodes refused an agent's token.
+fn agent_token_hint(id: &str) -> String {
+    format!(
+        "agent {id}'s token was revoked, replaced, or has expired: ask {} for a new one, \
+         `fleetring agent renew {id}`; don't look for other credentials",
+        if id.contains('.') {
+            "your parent"
+        } else {
+            "the operator"
+        }
+    )
+}
+
 /// The next step after the failures people meet most (`docs/cli.md`, section 6): an unknown
 /// database, a refusal, and an unavailable fleet.
 pub(crate) fn hint(status: &Status) -> Option<String> {
+    if let Some(id) = agent() {
+        match status.code() {
+            Code::PermissionDenied => return Some(agent_scope_hint(id)),
+            Code::Unauthenticated => return Some(agent_token_hint(id)),
+            _ => {}
+        }
+    }
     match status.code() {
         Code::NotFound => missing_database(status).map(|name| {
             let name = printable(name);

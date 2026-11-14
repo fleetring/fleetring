@@ -134,6 +134,12 @@ pub(crate) enum AgentCommand {
         /// Dev mode's own in dev mode, and required elsewhere.
         #[arg(long, value_name = "DIR")]
         authority: Option<PathBuf>,
+        /// The new token's lifetime, for a delegated agent
+        ///
+        /// Defaults to the lifetime the agent was delegated with, or the control plane's default
+        /// if it was delegated with none. The parent's token still caps it.
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<Duration>,
         #[command(flatten)]
         target: Target,
     },
@@ -544,7 +550,9 @@ pub(crate) async fn prepare_agent(
     let checked = dev::check_dev_dir(dev_dir)?;
     let support = delegation_support(dev_admin(&checked).ok().as_ref()).await;
     let spec = dev_spec(dir.id(), Vec::new(), access, None, support.minting());
-    let acquired = dir.acquire(Issuer::Dev(&checked), &spec, SystemClock.now())?;
+    let now = SystemClock.now();
+    refuse_before_replacement(&dir, now)?;
+    let acquired = dir.acquire(Issuer::Dev(&checked), &spec, now)?;
     match &acquired {
         Acquired::Minted(record) => {
             note(format!(
@@ -616,14 +624,25 @@ pub(crate) async fn run(command: AgentCommand) -> Result<String, Box<dyn Error>>
         }
         AgentCommand::Renew {
             id: AgentRef::Root(id),
+            ttl: Some(_),
+            ..
+        } => Err(exit::Usage(format!(
+            "agent {id} is a root agent, whose certificate and token last as long as `agent add \
+             --ttl` gave them; --ttl on `agent renew` is for delegated agents"
+        ))
+        .into()),
+        AgentCommand::Renew {
+            id: AgentRef::Root(id),
             authority,
+            ttl: None,
             target,
         } => renew(id, authority.as_deref(), &target).await,
         AgentCommand::Renew {
             id: AgentRef::Delegated(id),
             authority,
+            ttl,
             target,
-        } => renew_delegated(id, authority.as_deref(), &target).await,
+        } => renew_delegated(id, authority.as_deref(), ttl, &target).await,
         AgentCommand::Remove {
             id,
             yes,
@@ -671,6 +690,7 @@ async fn add(args: AgentAddArgs) -> Result<String, Box<dyn Error>> {
         .into());
     }
     let now = SystemClock.now();
+    refuse_before_replacement(&dir, now)?;
     let (record, support) = match (&args.authority, &situation.dev_dir) {
         (Some(authority_dir), _) => {
             if situation.context.is_none() && situation.dev_dir.is_none() {
@@ -886,6 +906,13 @@ async fn revoke(client: &Client, token: &OldToken) -> Result<Revocation, Unanswe
     Ok(Revocation::Until(Timestamp::from_millis(answer.until_ms)))
 }
 
+/// What `agent renew` says, before it revokes the token it replaced as the agent itself: the
+/// ancestor rule's first use on a fleet enables `delegation` for good (ADR-0038, ADR-0047).
+const ANCESTOR_RULE_WARNING: &str = "warning: no identity holding `fleet` revokes the old \
+token, so it is revoked as the agent itself, under the ancestor rule, which enables the `delegation` \
+fleet feature on this fleet if it isn't already and closes rollback to 0.7; to avoid that, run \
+with an identity that holds `fleet`";
+
 /// Revokes a root agent's replaced token, and warns rather than fails if it can't (ADR-0043,
 /// point 8.2): with `fleet` through `fleet_client` when there is one, and otherwise, or if that
 /// lacks `fleet`, as the agent itself with the old token, `old_token`, under the ancestor rule,
@@ -907,12 +934,18 @@ async fn revoke_replaced(
     };
     let outcome = match outcome {
         Some(outcome) => outcome,
-        None => match as_itself() {
-            Ok(client) => revoke(&client, old)
-                .await
-                .map_err(|unanswered| revoke::describe(&unanswered)),
-            Err(error) => Err(error.to_string()),
-        },
+        None => {
+            // An expired token needs no request, so nothing is enabled.
+            if old.until > SystemClock.now() {
+                note(ANCESTOR_RULE_WARNING);
+            }
+            match as_itself() {
+                Ok(client) => revoke(&client, old)
+                    .await
+                    .map_err(|unanswered| revoke::describe(&unanswered)),
+                Err(error) => Err(error.to_string()),
+            }
+        }
     };
     match outcome {
         Ok(revocation) => {
@@ -950,6 +983,7 @@ async fn renew(
     let situation = situation(target)?;
     let dir = AgentDir::new(&situation.agents_dir, id);
     let now = SystemClock.now();
+    refuse_before_replacement(&dir, now)?;
     // Read before the renewal replaces it: the agent presents it to revoke it without `fleet`.
     let old_token = dir.token().ok();
     let (renewed, client, support) = match (authority, &situation.dev_dir) {
@@ -1042,6 +1076,7 @@ async fn renew(
 async fn renew_delegated(
     id: DelegatedId,
     authority: Option<&Path>,
+    ttl: Option<Duration>,
     target: &Target,
 ) -> Result<String, Box<dyn Error>> {
     if authority.is_some() {
@@ -1080,7 +1115,10 @@ async fn renew_delegated(
         operation_id: operation.to_bytes().to_vec(),
         segment: id.segment().to_owned(),
         scopes: record.scopes.clone(),
-        lifetime_ms: None,
+        // The lifetime it was delegated with, unless `--ttl` gives another.
+        lifetime_ms: ttl
+            .map(|ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+            .or(record.lifetime_ms),
         not_before_ms: None,
     };
     // This command resends; the client mustn't as well.
@@ -1128,6 +1166,7 @@ async fn renew_delegated(
         read_only,
         expires_at: Timestamp::from_millis(expires_at_ms),
         issuer_key_id,
+        lifetime_ms: request.lifetime_ms,
         parent: parent_record,
     };
     let renewed = dir.finish(pending, delegation)?;
@@ -1247,6 +1286,8 @@ async fn remove_root(
     let now = SystemClock.now();
     let token = dir.old_token(&record, now);
     let until = format_time(token.until.as_millis());
+    // When a replacement token may first be signed, if the control plane revoked the principal.
+    let mut mint_from = None;
     let (revoked, replacement) = match revoke_token {
         Revoke::Skip => {
             note(format!(
@@ -1292,14 +1333,14 @@ async fn remove_root(
                     )
                 }
                 Ok(answer) => {
-                    let replacement = answer.before_ms.map_or_else(String::new, |before| {
+                    mint_from = answer
+                        .before_ms
+                        .map(|before| revoke::replacement_from(Timestamp::from_millis(before)));
+                    let replacement = mint_from.map_or_else(String::new, |from| {
                         format!(
                             "  a new token for {principal} may be minted from {}; one signed \
                              sooner is refused too\n",
-                            format_time(
-                                revoke::replacement_from(Timestamp::from_millis(before))
-                                    .as_millis()
-                            )
+                            format_time(from.as_millis())
                         )
                     });
                     (
@@ -1332,12 +1373,78 @@ async fn remove_root(
             }
         }
     };
+    // Kept beside the directory, so that `agent add` and `agent renew` can refuse before then.
+    if let Some(from) = mint_from
+        && let Err(error) = dir.record_replacement_from(from)
+    {
+        note(format!(
+            "warning: couldn't record when agent {} may be added again: {error}",
+            dir.id()
+        ));
+    }
     dir.remove()?;
+    // What the revocation ended can't be used any more, and a child's own `agent remove` can
+    // only say so, since no ancestor with an identity is left to revoke it as. Without a
+    // revocation (`--no-revoke`) the descendants' tokens still work elsewhere, so they stay.
+    let ended = if revoked.is_empty() {
+        String::new()
+    } else {
+        let removed = remove_local_descendants(&situation.agents_dir, dir.id().as_str());
+        if removed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  also deleted the directories of the agents it ended: {}\n",
+                removed.join(", ")
+            )
+        }
+    };
     Ok(format!(
-        "removed agent {}: {revoked}deleted {}\n{replacement}",
+        "removed agent {}: {revoked}deleted {}\n{replacement}{ended}",
         dir.id(),
         dir.tls_dir().display()
     ))
+}
+
+/// Deletes the directories of the delegated agents below root agent `id`, whose revocation
+/// ended them, and returns their IDs. A directory that can't be deleted is warned about and
+/// left.
+fn remove_local_descendants(agents_dir: &Path, id: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    for name in revoke::local_descendants(agents_dir, id) {
+        let Ok(child) = name.parse::<DelegatedId>() else {
+            continue;
+        };
+        match DelegatedDir::new(agents_dir, child).remove() {
+            Ok(()) => removed.push(name),
+            Err(error) => note(format!(
+                "warning: couldn't delete the directory of agent {name}, which ended with its \
+                 root: {error}"
+            )),
+        }
+    }
+    removed
+}
+
+/// Refuses to mint a token for `dir`'s agent while the one `agent remove` revoked is still in
+/// the window in which every node refuses a new one: it would be a token no node accepts, for up
+/// to 30 days. Exit 2, with the time to try again.
+fn refuse_before_replacement(dir: &AgentDir, now: Timestamp) -> Result<(), Box<dyn Error>> {
+    let Some(from) = dir.replacement_wait(now) else {
+        return Ok(());
+    };
+    let from = format_time(from.as_millis());
+    Err(exit::Coded {
+        code: exit::USAGE,
+        message: format!(
+            "agent {id} was removed and its principal {principal} revoked, so every node \
+             refuses a token signed before {from}, for up to 30 days\n  hint: run this again \
+             at or after {from}",
+            id = dir.id(),
+            principal = dir.id().principal(),
+        ),
+    }
+    .into())
 }
 
 /// The client that revokes with `fleet`: dev mode's administrator, or the target's own
@@ -1396,10 +1503,13 @@ async fn remove_delegated(
             let Some((ancestor, ancestor_token)) =
                 revoke::nearest_ancestor(&situation.agents_dir, &id, now)?
             else {
-                return Err(refused(format!(
-                    "no ancestor of agent {id} has a usable identity here to revoke it as; an \
-                     operator can, with `fleetring token revoke --principal {principal}`"
-                ))
+                return Err(format!(
+                    "can't revoke {principal} (no ancestor of agent {id} has a usable identity \
+                     here to revoke it as), so nothing was removed\n  hint: if its root agent \
+                     was removed with revocation, it ended with it: delete the directory with \
+                     --no-revoke. Otherwise its token stays valid until {until}, and an operator \
+                     can end it with `fleetring token revoke --principal {principal}`"
+                )
                 .into());
             };
             let client = target.client_as(
@@ -1625,6 +1735,7 @@ fn agent_json(listed: &Listed, record: &AgentRecord) -> serde_json::Value {
         "cert_expires_at": record.cert_expires_at,
         "token_expires_at": record.token_expires_at,
         "issued_by": record.issued_by.to_string(),
+        "token_id": record.root_token_id(),
         "delegation_id": record.is_delegated().then_some(&record.token_id),
         "issuer_key_id": record.issuer_key_id,
         "operation_id": record.operation,
@@ -1670,9 +1781,8 @@ fn describe(
         ),
         Detail::Full => format!("agent {id}\n"),
     };
-    let mut line = |key: &str, value: &str| {
-        let _ = writeln!(text, "  {key:<13}{value}");
-    };
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    let mut line = |key: &'static str, value: &str| rows.push((key, value.to_owned()));
     line("principal", &record.principal);
     line("owner", &record.owner);
     if let Some(parent) = &record.parent {
@@ -1690,6 +1800,9 @@ fn describe(
     line("token expires", &record.token_expires_at);
     if record.is_delegated() {
         line("delegation", &record.token_id);
+    }
+    if let Some(token_id) = record.root_token_id() {
+        line("token id", token_id);
     }
     if let Some(issuer_key_id) = &record.issuer_key_id {
         line("issuer key", issuer_key_id);
@@ -1730,6 +1843,12 @@ fn describe(
         line("record", &listed.record_file().display().to_string());
     }
     line("mcp command", &invocation.shell_words());
+    // The key column is as wide as the longest label plus one space, so a label never runs into
+    // its value.
+    let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0) + 1;
+    for (key, value) in &rows {
+        let _ = writeln!(text, "  {key:<width$}{value}");
+    }
     text.push_str(TRUSTED_LOCAL);
     text.push('\n');
     text
@@ -1916,11 +2035,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn agent_list_json_pins_its_fields() -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
-        let dir = AgentDir::new(root.path(), "42".parse()?);
-        let record = AgentRecord {
+    fn root_record() -> AgentRecord {
+        AgentRecord {
             version: 1,
             principal: "agent-42".to_owned(),
             owner: "admin".to_owned(),
@@ -1936,7 +2052,35 @@ mod tests {
             issued_by: IssuedBy::Dev,
             issuer_key_id: None,
             operation: None,
+            lifetime_ms: None,
+        }
+    }
+
+    #[test]
+    fn describe_leaves_a_space_after_every_label() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let listed = Listed::Root(AgentDir::new(root.path(), "42".parse()?));
+        let record = root_record();
+        let text = describe(&listed, &record, "dev", &invocation(), Detail::Full);
+        assert!(text.contains("\n  token expires 2026-12-01"), "{text}");
+        // Every value starts in the same column.
+        let value_at = |label: &str| {
+            text.lines().find_map(|line| {
+                let rest = line.strip_prefix("  ")?.strip_prefix(label)?;
+                Some(line.len() - rest.trim_start().len())
+            })
         };
+        assert!(value_at("token expires").is_some(), "{text}");
+        assert_eq!(value_at("token expires"), value_at("principal"), "{text}");
+        assert_eq!(value_at("token expires"), value_at("mcp command"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_list_json_pins_its_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let dir = AgentDir::new(root.path(), "42".parse()?);
+        let record = root_record();
         let child_dir = DelegatedDir::new(root.path(), "42.c7".parse()?);
         let child = AgentRecord {
             version: 2,
@@ -1976,10 +2120,12 @@ mod tests {
                 "read_only",
                 "root",
                 "scopes",
-                "token_expires_at"
+                "token_expires_at",
+                "token_id"
             ]
         );
         assert_eq!(item["id"], "42");
+        assert_eq!(item["token_id"], "t1");
         assert_eq!(item["read_only"], false);
         for field in [
             "parent",
@@ -1998,6 +2144,7 @@ mod tests {
         assert_eq!(child["root"], "42");
         assert_eq!(child["owner"], "admin");
         assert_eq!(child["delegation_id"], "d1");
+        assert_eq!(child["token_id"], serde_json::Value::Null);
         assert_eq!(child["issuer_key_id"], "k1");
         assert_eq!(child["operation_id"], "op");
         assert_eq!(child["cert_expires_at"], serde_json::Value::Null);

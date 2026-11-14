@@ -39,7 +39,7 @@ Examples:
   fleetring agent delegate 42.c7                                   a child with the parent's actions on agent-42.c7-*
   fleetring agent delegate 42.c7 --scope admin:agent-42.c7-* \\
       --scope fork:agent-42-memory                                 a child that may fork the parent's memory
-  fleetring --agent 42.c7 db create agent-42.c7-scratch            act as the child
+  fleetring db create agent-42.c7-scratch --agent 42.c7            act as the child
   fleetring agent remove 42.c7                                     revoke the child and every agent below it
 
 The command writes the operation ID into the child's directory before it asks, and sends the
@@ -207,6 +207,7 @@ pub(super) async fn run(args: AgentDelegateArgs) -> Result<String, Box<dyn Error
         read_only,
         expires_at: Timestamp::from_millis(expires_at_ms),
         issuer_key_id,
+        lifetime_ms: request.lifetime_ms,
         parent: parent_record,
     };
     let record = dir.finish(pending, delegation)?;

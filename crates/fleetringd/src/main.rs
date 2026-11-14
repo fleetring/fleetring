@@ -9,7 +9,7 @@ use std::io::{IsTerminal as _, Read, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use clap::{Args, FromArgMatches as _, Parser, Subcommand};
@@ -1433,6 +1433,7 @@ impl Target {
             for warning in warnings {
                 note(warning);
             }
+            exit::acting_as_agent(&id.to_string());
             let principal = Some(principal);
             let label = Some(id.to_string());
             match from {
@@ -2291,7 +2292,22 @@ async fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
                 max_result_bytes,
                 principal,
             };
-            mcp::serve(client, settings).await?;
+            // The token file is read again when a call is refused as unauthenticated, so that a
+            // token the agent's parent replaced while the server runs is used from then on.
+            let target = Arc::new(target);
+            let fallback = ready.as_ref().and_then(|ready| ready.fallback_control());
+            let sent = Mutex::new(target.token().ok().flatten());
+            let reload = mcp::Reload(Arc::new(move || {
+                let token = target.token().ok().flatten()?;
+                let mut sent = sent.lock().ok()?;
+                if sent.as_deref() == Some(token.as_str()) {
+                    return None;
+                }
+                let client = target.client_or(fallback.clone()).ok()?;
+                *sent = Some(token);
+                Some(client)
+            }));
+            mcp::serve_reloading(client, settings, reload).await?;
             String::new()
         }
         Command::Agent(command) => agent_cmd::run(command).await?,

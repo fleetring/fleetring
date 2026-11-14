@@ -1008,10 +1008,22 @@ async fn db_list_with_agent_uses_its_scopes() -> TestResult {
     assert_eq!(json["agents"][0]["scopes"], json!(defaults));
     let shown = machine.ok(&["agent", "show", "42"])?;
     assert!(
-        shown.contains(&format!("scopes       {}\n", defaults.join(", "))),
+        shown.contains(&format!("scopes        {}\n", defaults.join(", "))),
         "{shown}"
     );
     assert!(shown.contains("renew by"), "{shown}");
+    // A root agent's token ID, which `token revoke --token-id` takes, is shown and is the token's.
+    let root_token_id = token_id(&machine.token("42")?)?;
+    assert!(
+        shown.contains(&format!("  token id      {root_token_id}\n")),
+        "{shown}"
+    );
+    assert_eq!(
+        json["agents"][0]["token_id"],
+        root_token_id.as_str(),
+        "{json}"
+    );
+    assert_eq!(json["agents"][0]["delegation_id"], Value::Null, "{json}");
     assert!(shown.contains("mcp --agent 42 --context dev"), "{shown}");
     assert!(shown.contains(TRUSTED_LOCAL), "{shown}");
     assert!(!shown.contains(&machine.token("42")?), "{shown}");
@@ -2194,19 +2206,21 @@ async fn delegate_then_act_as_the_child_creates_agent_42_c7_scratch() -> TestRes
     assert_eq!(child["delegation_id"], shown["delegation"].as_str());
     assert_eq!(child["operation_id"], operation);
     assert_eq!(child["cert_expires_at"], Value::Null);
+    assert_eq!(child["token_id"], Value::Null);
     assert_eq!(json["agents"][0]["parent"], Value::Null);
     let show = machine.ok(&["agent", "show", "42.c7"])?;
     for line in [
-        "  parent       42\n".to_owned(),
-        "  root         42\n".to_owned(),
-        format!("  delegation   {}\n", shown["delegation"]),
-        format!("  operation    {operation}\n"),
+        "  parent        42\n".to_owned(),
+        "  root          42\n".to_owned(),
+        format!("  delegation    {}\n", shown["delegation"]),
+        format!("  operation     {operation}\n"),
         "mcp --agent 42.c7 --context dev".to_owned(),
     ] {
         assert!(show.contains(&line), "{line:?} in {show}");
     }
-    assert!(show.contains("  issuer key   "), "{show}");
+    assert!(show.contains("  issuer key    "), "{show}");
     assert!(!show.contains("cert expires"), "{show}");
+    assert!(!show.contains("token id"), "{show}");
     assert!(!show.contains(&token), "{show}");
 
     // Delegating the same child again is refused, naming the way out.
@@ -2342,7 +2356,7 @@ async fn read_only_parents_child_shows_read_only() -> TestResult {
     );
     assert_eq!(machine.record("43.r")?["read_only"].as_bool(), Some(true));
     let show = machine.ok(&["agent", "show", "43.r"])?;
-    assert!(show.contains("  read-only    yes\n"), "{show}");
+    assert!(show.contains("  read-only     yes\n"), "{show}");
     let mut session = machine.mcp(&["--agent", "43.r"]).await?;
     assert_eq!(tool_names(&mut session).await?, READING_TOOLS);
     session.close().await?;
@@ -2680,6 +2694,164 @@ async fn mcp_as_child_serves_only_its_prefix() -> TestResult {
     Ok(())
 }
 
+// FR-093 (B2): `agent renew <child>` revokes the old token at once; a running `mcp --agent
+// <child>` reads the new one from its token file, so its next call works without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_child_server_uses_the_token_its_parent_renews() -> TestResult {
+    let machine = Machine::new()?;
+    machine.ok(&["agent", "add", "42"])?;
+    let output = delegate(&machine, "42.c7", &[])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    let certificate = copy_certificate(&machine, "42")?;
+    let old = machine.token("42.c7")?;
+    let mut session = machine.mcp(&["--agent", "42.c7"]).await?;
+    session
+        .ok("db_create", json!({"name": "agent-42.c7-before"}))
+        .await?;
+
+    machine.ok(&["agent", "renew", "42.c7"])?;
+    let new = machine.token("42.c7")?;
+    assert_ne!(new, old);
+    wait_until_revoked(&machine, certificate.path(), &old)?;
+
+    let after = session
+        .ok("db_create", json!({"name": "agent-42.c7-after"}))
+        .await?;
+    assert_eq!(after["database"], "agent-42.c7-after", "{after}");
+    session.ok("db_list", json!({})).await?;
+    session.close().await?;
+    Ok(())
+}
+
+// FR-092 (B3): an agent's refusal says to ask its parent or the operator, never to look for
+// other credentials, and the fork refusal no longer speaks of a fork action yet to ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_refusals_say_to_ask_and_never_to_find_other_credentials() -> TestResult {
+    let machine = Machine::new()?;
+    machine.ok(&["agent", "add", "42"])?;
+    let output = delegate(&machine, "42.c7", &[])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    for (agent, asks) in [("42", "the operator"), ("42.c7", "your parent")] {
+        let refused = machine.run(&["db", "create", "agent-43-x", "--agent", agent])?;
+        assert_eq!(refused.status.code(), Some(3), "{}", printed(&refused));
+        let text = stderr(&refused);
+        assert!(text.contains(asks), "{agent}: {text}");
+        assert!(text.contains("don't look for other credentials"), "{text}");
+        for other in ["--as", "--token-file", "--context", "token issue"] {
+            assert!(!text.contains(other), "{agent} {other}: {text}");
+        }
+    }
+    // Acting as no agent, the hint still points at other identities.
+    let person = machine.run(&["db", "create", "agent-43-x", "--as", "nobody"])?;
+    assert!(!stderr(&person).contains("don't look for other credentials"));
+
+    // A fork the agent may not make: the hint is the agent's, and names no fork action to come.
+    machine.ok(&["db", "create", "agent-42-memory", "--agent", "42"])?;
+    let forked = machine.run(&[
+        "db",
+        "fork",
+        "agent-42-memory",
+        "agent-43-copy",
+        "--agent",
+        "42.c7",
+    ])?;
+    assert_eq!(forked.status.code(), Some(3), "{}", printed(&forked));
+    let text = stderr(&forked);
+    assert!(!text.contains("fork action ships"), "{text}");
+    assert!(text.contains("ask your parent"), "{text}");
+    Ok(())
+}
+
+// FR-093 (B4): removing a root agent, which revokes everything below it, deletes the directories of
+// those agents too, and a child orphaned any other way is told what is already true of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_root_deletes_the_directories_of_the_agents_it_ended() -> TestResult {
+    let machine = Machine::new()?;
+    machine.ok(&["agent", "add", "42"])?;
+    delegate_delegating(&machine, "42.c")?;
+    let grandchild = delegate(&machine, "42.c.r1", &[])?;
+    assert!(grandchild.status.success(), "{}", printed(&grandchild));
+
+    let removed = machine.ok(&["agent", "remove", "42", "--yes"])?;
+    assert!(
+        removed.contains("also deleted the directories of the agents it ended: 42.c, 42.c.r1"),
+        "{removed}"
+    );
+    for id in ["42", "42.c", "42.c.r1"] {
+        assert!(!machine.agent_dir(id).exists(), "{id}");
+    }
+    let list: Value = serde_json::from_str(&machine.ok(&["agent", "list", "-o", "json"])?)?;
+    assert_eq!(list["agents"], json!([]), "{list}");
+
+    // Without a revocation the children's tokens still work elsewhere, so they stay.
+    machine.ok(&["agent", "add", "43"])?;
+    let child = delegate(&machine, "43.c", &[])?;
+    assert!(child.status.success(), "{}", printed(&child));
+    let kept = machine.ok(&["agent", "remove", "43", "--yes", "--no-revoke"])?;
+    assert!(!kept.contains("also deleted"), "{kept}");
+    assert!(machine.agent_dir("43.c").exists());
+    // And the child that stayed is refused with what is true of it, not "stays valid until".
+    let refused = machine.run(&["agent", "remove", "43.c", "--yes"])?;
+    assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
+    let text = stderr(&refused);
+    assert!(
+        text.contains("if its root agent was removed with revocation, it ended with it"),
+        "{text}"
+    );
+    assert!(text.contains("--no-revoke"), "{text}");
+    Ok(())
+}
+
+// FR-093 (B5): `agent renew <child>` asks for the lifetime the child was delegated with, and
+// `--ttl` changes it; a root agent has no `--ttl` to renew with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renewing_a_child_keeps_its_lifetime_unless_ttl_says_another() -> TestResult {
+    let machine = Machine::new()?;
+    machine.ok(&["agent", "add", "42"])?;
+    let lifetime = |id: &str| -> TestResult<i64> {
+        let token = machine.token(id)?;
+        let claimed = claims(&token)?;
+        let exp = claimed["exp"].as_i64().ok_or("no exp")?;
+        let iat = claimed["iat"].as_i64().ok_or("no iat")?;
+        Ok(exp - iat)
+    };
+    let output = delegate(&machine, "42.c2", &["--ttl", "20m"])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    assert_eq!(lifetime("42.c2")?, 20 * 60);
+    assert_eq!(
+        machine.record("42.c2")?["lifetime_ms"].as_integer(),
+        Some(20 * 60 * 1000)
+    );
+
+    machine.ok(&["agent", "renew", "42.c2"])?;
+    assert_eq!(
+        lifetime("42.c2")?,
+        20 * 60,
+        "renewed with the same lifetime"
+    );
+
+    machine.ok(&["agent", "renew", "42.c2", "--ttl", "30m"])?;
+    assert_eq!(lifetime("42.c2")?, 30 * 60);
+    machine.ok(&["agent", "renew", "42.c2"])?;
+    assert_eq!(
+        lifetime("42.c2")?,
+        30 * 60,
+        "the new lifetime is the one kept"
+    );
+
+    // One delegated with no `--ttl` records none, and keeps the default.
+    let output = delegate(&machine, "42.c3", &[])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    assert!(machine.record("42.c3")?.get("lifetime_ms").is_none());
+    let before = lifetime("42.c3")?;
+    machine.ok(&["agent", "renew", "42.c3"])?;
+    assert_eq!(lifetime("42.c3")?, before);
+
+    let root = machine.run(&["agent", "renew", "42", "--ttl", "1h"])?;
+    assert_eq!(root.status.code(), Some(2), "{}", printed(&root));
+    Ok(())
+}
+
 /// What a child needs to delegate a grandchild: its own databases, and `grant` below itself.
 fn delegating_child_scopes(child: &str) -> Vec<String> {
     let name = format!("agent-{child}");
@@ -2817,6 +2989,32 @@ async fn new_root_token_minted_31s_after_self_revocation_works() -> TestResult {
     let removed = machine.ok(&["agent", "remove", "42", "--yes"])?;
     let from = time_after(&removed, "a new token for agent-42 may be minted from ")?;
 
+    // `agent add` and `agent renew` refuse before then, naming the time, and mint nothing.
+    let from_text = removed
+        .split("may be minted from ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .ok_or("no time")?;
+    let early = machine.run(&["agent", "add", "42"])?;
+    assert_eq!(early.status.code(), Some(2), "{}", printed(&early));
+    assert!(
+        stderr(&early).contains(&format!("run this again at or after {from_text}")),
+        "{}",
+        printed(&early)
+    );
+    assert!(!machine.agent_dir("42").exists());
+    let early = machine.run(&["agent", "renew", "42"])?;
+    assert_eq!(early.status.code(), Some(2), "{}", printed(&early));
+    assert!(!machine.agent_dir("42").exists());
+    // `agent list` ignores the record.
+    let listed = machine.run(&["agent", "list"])?;
+    assert!(listed.status.success(), "{}", printed(&listed));
+    assert!(!stderr(&listed).contains("warning"), "{}", printed(&listed));
+
+    // The record is advisory and local: without it, the nodes still refuse the early token.
+    let marker = machine.dev_dir().join("agents").join(".mint-after-42");
+    assert!(marker.is_file(), "{marker:?}");
+    fs::remove_file(&marker)?;
     machine.ok(&["agent", "add", "42"])?;
     let soon = machine.token("42")?;
     let certificate = copy_certificate(&machine, "42")?;
@@ -2838,6 +3036,46 @@ async fn new_root_token_minted_31s_after_self_revocation_works() -> TestResult {
     let certificate = copy_certificate(&machine, "42")?;
     assert!(works(&machine, certificate.path(), &later)?);
     machine.ok(&["db", "list", "--agent", "42"])?;
+    Ok(())
+}
+
+// FR-093: `agent renew <root>` says, before it falls back to the ancestor rule, that the rule
+// enables the `delegation` fleet feature, and says nothing of it when `fleet` revokes the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renew_warns_before_using_the_ancestor_rule_and_only_then() -> TestResult {
+    let machine = Machine::new()?;
+    machine.ok(&["agent", "add", "42"])?;
+    let with_fleet = machine.run(&["agent", "renew", "42"])?;
+    assert!(with_fleet.status.success(), "{}", printed(&with_fleet));
+    assert!(
+        !stderr(&with_fleet).contains("ancestor rule"),
+        "{}",
+        printed(&with_fleet)
+    );
+
+    // Without an identity that holds `fleet`: dev mode's administrator can't be loaded.
+    let admin_key = machine.dev_dir().join("tls").join("client.admin.key");
+    fs::write(&admin_key, "not a key")?;
+    let old = machine.token("42")?;
+    let without = machine.run(&["agent", "renew", "42"])?;
+    assert!(without.status.success(), "{}", printed(&without));
+    let text = stderr(&without);
+    let warning: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("ancestor rule"))
+        .collect();
+    assert_eq!(warning.len(), 1, "{text}");
+    assert!(
+        warning[0].starts_with("warning: ")
+            && warning[0].contains("`delegation`")
+            && warning[0].contains("an identity that holds `fleet`"),
+        "{text}"
+    );
+    // The behavior is unchanged: the old token is revoked, as the agent itself.
+    assert!(
+        text.contains(&format!("revoked token {}", token_id(&old)?)),
+        "{text}"
+    );
     Ok(())
 }
 

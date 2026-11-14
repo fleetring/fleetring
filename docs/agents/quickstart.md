@@ -140,7 +140,7 @@ A request outside the parent's scopes or its `grant`, or outside agent 42's data
 **Renew and remove.**
 
 - `fleetring agent renew 42.c7` delegates again as the parent, with the scopes the child records, then revokes the old token. Renewing an agent never renews the agents below it, and revoking its old token ends them: renew each in turn.
-- `fleetring agent remove 42.c7` revokes `agent-42.c7` as a principal, as its nearest ancestor with an identity here, which ends it and every agent below it at once, and deletes its directory. Directories of agents below it stay, unusable: remove each with `--no-revoke`.
+- `fleetring agent remove 42.c7` revokes `agent-42.c7` as a principal, as its nearest ancestor with an identity here, which ends it and every agent below it at once, and deletes its directory. Directories of agents below it stay, unusable: remove each with `--no-revoke`. (`agent remove 42` deletes its descendants' directories too.)
 - `fleetring agent remove 42` removes the root agent: it revokes its own principal and its own token ID, ending every agent below it, without the `fleet` scope. It prints when a new token for agent 42 may be minted, 30 seconds later; a token minted sooner is refused for 30 days, so wait for that time before `agent add 42`, or run `agent renew 42` after it.
 - From the shell, as an agent, `fleetring token revoke --principal agent-42.c7 --agent 42` and `--token-id <delegation ID> --agent 42` revoke under the same rule: an agent revokes itself, the token it presented, or what it or its children delegated, and nothing else. A child can't revoke its parent or a sibling.
 
