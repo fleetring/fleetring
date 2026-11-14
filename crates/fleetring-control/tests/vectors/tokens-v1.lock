@@ -1,0 +1,30 @@
+# Freeze guard for tokens-v1.json: the golden vectors are append-only (docs/spec/tokens-v1.md,
+# section 9).
+#
+# Each line `<section> <count> <digest>` is a checkpoint that freezes the first <count> cases of
+# that section. <digest> is the 64-bit FNV-1a of their canonical form (each case as compact JSON
+# with object keys sorted bytewise, followed by a newline; see tests/it/tokens_vectors.rs), as 16
+# lowercase hex digits. The test checks every line, so editing, reordering, or removing a frozen
+# case fails. Every case must be frozen: after appending cases, the test prints the lines to
+# append here.
+#
+# This file is append-only too: never edit or remove a line.
+
+scope_texts 31 f923ca668cf64e4f
+pattern_matches 16 04156d5e4c0b3c4a
+scope_sets 14 a78a5a4ab119eb4f
+action_meets 21 70a11bb1895282a7
+covers 70 c90ce3795f984056
+meets 17 d60071b339daf54e
+narrowing 19 0ca93c03d224b34e
+agent_names 27 c08fad226f1f0d7a
+at_or_below 15 e8cf27ce2ce201be
+tier 30 757d7e601c6a6966
+claims_bases 2 2c8d8b1d9e4472e2
+issuer_signed_claims 34 c565ade0616b4332
+delegation_ids 20 51142b52a243b77b
+token_claims_json 3 79d44a904bb87cf8
+revocations 15 ff39b37f55cb6ad2
+principal_revocations 18 80b762dcd6a60bfc
+signed_tokens 3 fa7381e988f0c352
+refused_tokens 7 7ba33fec8c1f5a45

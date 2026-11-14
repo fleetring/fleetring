@@ -10,17 +10,18 @@ use fleetring_proto::v1::control_client::ControlClient as GrpcControlClient;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
-    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
-    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
-    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
+    DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
+    ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
     LocateRequest, LocateResponse, MembershipUpdate, PromotionResponse, RecordFencedRequest,
     RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse,
     StartPromotionRequest, TransferLeaseRequest, UndrainRequest, UndrainResponse,
     UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
 };
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Response, Status, Streaming};
+use tonic::{Code, Response, Status, Streaming};
 
 use crate::transport::{
     Backoff, CredentialedChannel, Credentials, TransportConfig, control_client_with, retry,
@@ -38,8 +39,10 @@ type Connect = dyn Fn(&str) -> Result<Channel, tonic::transport::Error> + Send +
 ///   the call there, so callers never see it. Later calls go straight to X.
 /// - **Retries:** idempotent calls (`join`, `heartbeat`, `locate`, `list_databases`,
 ///   `renew_lease`, `record_fenced`, `drain`, `fork_database`, whose operation ID makes a resend
-///   return the same operation, `get_fork_operation`, and opening `watch_membership`) retry
-///   transient failures with [`retry`]. `create_database`, `create_database_with_metadata`,
+///   return the same operation, `get_fork_operation`, `list_delegations`, and opening
+///   `watch_membership`) retry transient failures with [`retry`]. `delegate_token` resends on
+///   `UNAVAILABLE` or a lost reply alone, under the same operation ID, so a resend returns the delegation the
+///   first attempt recorded. `create_database`, `create_database_with_metadata`,
 ///   `update_database`, `drop_database`, `acquire_lease`, `leave`, `start_promotion`,
 ///   `complete_promotion`, and `transfer_lease` are sent once per leader, because a lost reply
 ///   would make a retry fail as already done, or apply a patch twice.
@@ -488,6 +491,61 @@ impl ControlClient {
         self.following(&|mut client: GrpcControlClient<CredentialedChannel>| {
             let request = request.clone();
             async move { client.revoke_token(request).await }
+        })
+        .await
+    }
+
+    /// Asks for a delegated agent's token (ADR-0047, point 5). The request's operation ID makes a
+    /// resend safe: an attempt that ends in `UNAVAILABLE` or `DEADLINE_EXCEEDED`, a lost reply
+    /// or a refusal that says to retry, is sent again unchanged, and returns the delegation the
+    /// first attempt recorded, signed again, or records it now. Any other refusal is returned at
+    /// once: `RESOURCE_EXHAUSTED`, a limit, waits for the caller to decide.
+    ///
+    /// The reply holds the child's token: keep it out of logs.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt. A control node that predates delegation answers
+    /// `UNIMPLEMENTED`.
+    pub async fn delegate_token(
+        &self,
+        request: DelegateTokenRequest,
+    ) -> Result<DelegateTokenResponse, Status> {
+        let call = |mut client: GrpcControlClient<CredentialedChannel>| {
+            let request = request.clone();
+            async move { client.delegate_token(request).await }
+        };
+        let mut wait = self.backoff.initial;
+        let mut attempt = 1;
+        loop {
+            match self.following(&call).await {
+                Err(status)
+                    if attempt < self.backoff.attempts
+                        && matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded) =>
+                {
+                    tracing::debug!(attempt, code = ?status.code(), "resending a delegation after {wait:?}");
+                    tokio::time::sleep(wait).await;
+                    wait = wait.saturating_mul(2).min(self.backoff.max);
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Lists the live delegation records the request's filters select, never tokens (ADR-0047,
+    /// point 6.4). Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt: `PERMISSION_DENIED` without `fleet`.
+    pub async fn list_delegations(
+        &self,
+        request: ListDelegationsRequest,
+    ) -> Result<ListDelegationsResponse, Status> {
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.list_delegations(request).await }
         })
         .await
     }

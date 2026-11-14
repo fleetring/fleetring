@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 mod common;
+mod features;
 mod rolling;
 #[path = "../support/mod.rs"]
 mod support;
@@ -23,10 +24,10 @@ use fleetring_control::Release;
 use fleetringd::upgrade::ProcessFile;
 
 use crate::common::{
-    ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, check_history,
-    create_history_database, current, fake_binary, fake_cosign, line_behind, lines_ahead,
-    node_command, path_with, printed, refusing_release, release_of, wait_for, wait_for_members,
-    write_release, write_releases_list, write_until,
+    ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, before_the_rename,
+    check_history, create_history_database, current, fake_binary, fake_cosign, line_behind,
+    lines_ahead, node_command, path_with, printed, refusing_release, release_of, wait_for,
+    wait_for_members, write_release, write_releases_list, write_until,
 };
 
 /// A scratch install of this build, a release server, and a stand-in cosign.
@@ -404,6 +405,12 @@ fn upgrading_a_running_node_drains_restarts_and_rejoins_it() -> TestResult {
         None,
     ))?;
     let name = runtime.block_on(create_history_database(&client))?;
+    // A database nobody wrote: its primary reports the empty position and its followers report
+    // none, and the node has nothing to catch up on in it.
+    runtime.block_on(client.create_database(
+        &"never-written".parse()?,
+        fleetring::ReplicationFactor::new(3).ok_or("zero")?,
+    ))?;
     // The node to upgrade is the database's primary, so the drain has a lease to hand over.
     let primary = runtime
         .block_on(client.locate(&name))?
@@ -852,7 +859,7 @@ fn removing_a_member_that_is_gone_unblocks_the_fleet() -> TestResult {
 #[test]
 fn a_downgrade_to_a_release_before_the_rename_needs_yes() -> TestResult {
     let bench = Bench::new()?;
-    let older = line_behind();
+    let older = before_the_rename();
     let url = bench.publish_as(
         &older,
         &fake_binary(&older),
@@ -909,7 +916,7 @@ fn a_rollback_past_the_rename_is_refused_for_a_running_node_started_with_serve()
     wait_for("the node writes its process file", || {
         ProcessFile::read(&node.data_dir).ok().flatten()
     })?;
-    let older = line_behind();
+    let older = before_the_rename();
     let previous = node.bin.with_file_name("fleetring.previous");
     fs::write(&previous, fake_binary(&older))?;
     fs::set_permissions(&previous, fs::Permissions::from_mode(0o755))?;

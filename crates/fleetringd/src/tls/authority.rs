@@ -1,4 +1,5 @@
-//! The fleet certificate authority: it creates itself and issues node and client certificates.
+//! The fleet certificate authority: it creates itself and issues node, client, and delegation
+//! issuer certificates.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -18,7 +19,7 @@ use rustls_pki_types::pem::PemObject;
 use time::OffsetDateTime;
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
-use crate::auth::{IssueError, TokenSigner};
+use crate::auth::{IssueError, NOT_BEFORE_LEEWAY_SECS, TokenSigner};
 use crate::tls::names::{FleetName, Principal, SubjectUri};
 
 /// The authority's certificate, in the directory `cert init` writes.
@@ -33,10 +34,27 @@ pub const DEFAULT_NODE_LIFETIME: Duration = Duration::from_secs(30 * SECONDS_PER
 /// How long a client certificate lasts unless `cert client --ttl` says otherwise.
 pub const DEFAULT_CLIENT_LIFETIME: Duration = Duration::from_secs(7 * SECONDS_PER_DAY);
 
+/// How long a delegation issuer certificate lasts unless `cert issuer --ttl` says otherwise, as
+/// long as a node certificate (ADR-0047, point 1.2).
+pub const DEFAULT_ISSUER_LIFETIME: Duration = Duration::from_secs(30 * SECONDS_PER_DAY);
+
+/// The longest a delegation issuer certificate may last, from its start to its end (ADR-0047,
+/// point 1.2). A start set in the past counts: a certificate backdated by a day may run 89 days
+/// ahead. It bounds how long a stolen issuer key reaches when nobody notices.
+pub const MAX_ISSUER_LIFETIME: Duration = Duration::from_secs(90 * SECONDS_PER_DAY);
+
+/// How far beyond [`MAX_ISSUER_LIFETIME`] nodes accept an issuer certificate's validity, for one
+/// that another authority tool backdated (ADR-0047, point 1.4.5). FleetRing's own issuing never
+/// uses it.
+pub const ISSUER_LIFETIME_SLACK: Duration = Duration::from_secs(SECONDS_PER_DAY);
+
 /// How long the authority's own certificate lasts unless `cert init --ttl` says otherwise.
 pub const DEFAULT_AUTHORITY_LIFETIME: Duration = Duration::from_secs(3_650 * SECONDS_PER_DAY);
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// How far [`Validity::issued_at`] sets a certificate's start back: a token's `nbf` leeway.
+const BACKDATE_MILLIS: u64 = NOT_BEFORE_LEEWAY_SECS * 1_000;
 
 /// The error returned when the authority can't be created, loaded, or used to issue.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +100,16 @@ pub enum AuthorityError {
     /// Certificate generation failed.
     #[error("can't generate the certificate: {0}")]
     Generate(#[from] rcgen::Error),
+    /// A delegation issuer certificate would last longer than [`MAX_ISSUER_LIFETIME`] from its
+    /// start, counting any backdating.
+    #[error(
+        "an issuer certificate lasts at most 90 days from its start, counting any backdating; \
+         asked for {seconds} s"
+    )]
+    IssuerLifetime {
+        /// The lifetime asked for, in seconds.
+        seconds: u64,
+    },
 }
 
 /// When a certificate starts being valid, and for how long.
@@ -98,6 +126,22 @@ impl Validity {
         Self {
             not_before,
             lifetime,
+        }
+    }
+
+    /// A certificate issued at `now` that lasts `lifetime` from then, with its start set back by
+    /// the 30 seconds of clock skew a token's `nbf` allows (ADR-0026, point 5). A node or a
+    /// client whose clock is behind the issuer's then accepts it as soon as it is written,
+    /// instead of failing the TLS handshake until its clock catches up. It still ends `lifetime`
+    /// after `now`. A delegation issuer certificate takes [`Validity::new`]: its start already
+    /// has that leeway where nodes check it, and its 90 days count any backdating (ADR-0047,
+    /// point 1.2).
+    #[must_use]
+    pub fn issued_at(now: Timestamp, lifetime: Duration) -> Self {
+        let backdate = now.as_millis().min(BACKDATE_MILLIS);
+        Self {
+            not_before: Timestamp::from_millis(now.as_millis() - backdate),
+            lifetime: lifetime.saturating_add(Duration::from_millis(backdate)),
         }
     }
 
@@ -147,7 +191,7 @@ impl fmt::Debug for Issued {
 }
 
 impl Issued {
-    /// Returns what the certificate names: the node, or the principal.
+    /// Returns what the certificate names: the node, the principal, or the issuer.
     #[must_use]
     pub fn subject(&self) -> &SubjectUri {
         &self.subject
@@ -211,6 +255,9 @@ impl fmt::Debug for Authority {
 enum Purpose {
     Node,
     Client,
+    /// A delegation issuer: no extended key usage, so no TLS stack takes it for a client or a
+    /// server (ADR-0047, point 1.2).
+    Issuer,
 }
 
 impl Authority {
@@ -375,6 +422,48 @@ impl Authority {
         self.issue(subject, names, Purpose::Client, validity)
     }
 
+    /// Issues a delegation issuer certificate for `name` (ADR-0047, point 1.2), with a new Ed25519
+    /// key and the URI `fleetring://<fleet>/issuer/<name>` as its only subject alternative name.
+    ///
+    /// The certificate isn't an authority (basic constraints say so), its key usage is digital
+    /// signature alone, and it has no extended key usage, so no TLS stack accepts it as a client
+    /// or a server certificate. Each call makes a new key, so renewing rotates the key.
+    ///
+    /// `validity` runs from its start, so a start set in the past counts against
+    /// [`MAX_ISSUER_LIFETIME`]: a caller that backdates must add the backdating to the lifetime.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityError::IssuerLifetime`] if `validity` lasts longer than
+    /// [`MAX_ISSUER_LIFETIME`]; otherwise [`AuthorityError`] if the dates don't fit or generation
+    /// fails.
+    pub fn issue_issuer(
+        &self,
+        name: &NodeId,
+        validity: Validity,
+    ) -> Result<Issued, AuthorityError> {
+        if validity.lifetime > MAX_ISSUER_LIFETIME {
+            return Err(AuthorityError::IssuerLifetime {
+                seconds: validity.lifetime.as_secs(),
+            });
+        }
+        let subject = SubjectUri::issuer(&self.fleet, name);
+        let names = vec![SanType::URI(subject.to_string().try_into()?)];
+        self.issue(subject, names, Purpose::Issuer, validity)
+    }
+
+    /// Signs `params` for `key` with the authority's key, whatever they hold: for tests that need
+    /// a certificate the issuing methods refuse to make.
+    #[cfg(test)]
+    pub(crate) fn sign_for_test(
+        &self,
+        params: &CertificateParams,
+        key: &KeyPair,
+    ) -> Result<rcgen::Certificate, rcgen::Error> {
+        let issuer = Issuer::from_params(&self.params, &self.key);
+        params.signed_by(key, &issuer)
+    }
+
     fn issue(
         &self,
         subject: SubjectUri,
@@ -396,6 +485,7 @@ impl Authority {
                 ExtendedKeyUsagePurpose::ClientAuth,
             ],
             Purpose::Client => vec![ExtendedKeyUsagePurpose::ClientAuth],
+            Purpose::Issuer => Vec::new(),
         };
         params.use_authority_key_identifier_extension = true;
         let mut serial_input: Vec<&[u8]> = vec![b"issued"];
@@ -557,6 +647,27 @@ mod tests {
         assert!(matches!(again, AuthorityError::Exists { .. }), "{again}");
         let debug = format!("{authority:?}");
         assert!(!debug.contains("PRIVATE KEY"), "{debug}");
+    }
+
+    #[test]
+    fn issued_at_starts_30_seconds_early_and_ends_lifetime_after_now() {
+        let lifetime = Duration::from_secs(SECONDS_PER_DAY);
+        let now = Timestamp::from_millis(1_800_000_000_250);
+        let validity = Validity::issued_at(now, lifetime);
+        assert_eq!(
+            validity.not_before(),
+            Timestamp::from_millis(1_799_999_970_250)
+        );
+        let (start, end) = validity.dates().expect("dates");
+        assert_eq!(start.unix_timestamp(), 1_799_999_970);
+        assert_eq!(end.unix_timestamp(), 1_800_000_000 + 86_400);
+        // Near the epoch it starts at the epoch, still ending `lifetime` after `now`.
+        let early = Validity::issued_at(Timestamp::from_millis(10_000), lifetime);
+        assert_eq!(early.not_before(), Timestamp::ZERO);
+        assert_eq!(
+            early.dates().expect("dates").1.unix_timestamp(),
+            10 + 86_400
+        );
     }
 
     #[test]

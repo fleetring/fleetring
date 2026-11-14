@@ -626,7 +626,9 @@ pub(crate) fn resolve(
     let kept = unit.map_or(layers.len(), |unit| unit + 1);
     let mut token = layers[..kept].iter().find_map(|layer| layer.token.clone());
     // Flags that name an identity are often used with a token from the environment, which is
-    // theirs to pair; a context's own token is not, and stays with its context.
+    // theirs to pair; a context's own token is not, and stays with its context. Nor is an
+    // agent's, which `FLEETRING_AGENT` names: it belongs with the agent's certificate, never
+    // with one the flags name.
     if token.is_none()
         && let Some(unit) = unit
         && layers[unit].kind == Kind::Flags
@@ -634,6 +636,7 @@ pub(crate) fn resolve(
         token = layers[kept..]
             .iter()
             .find(|layer| layer.kind == Kind::Variables)
+            .filter(|layer| layer.agent.is_none())
             .and_then(|layer| layer.token.clone());
     }
 
@@ -1718,6 +1721,37 @@ mod tests {
                 "warning: the identity from the environment ({AGENT_VAR}) replaces the identity \
                  from context 'dev' (tls_dir, as)"
             )]
+        );
+    }
+
+    #[test]
+    fn an_agents_token_from_the_environment_never_rides_a_certificate_the_flags_name() {
+        let agent = tls_dir(&["agent-42"]);
+        let other = tls_dir(&["ops"]);
+        let flags = TargetFlags {
+            tls_dir: Some(other.path().to_owned()),
+            principal: Some("ops".to_owned()),
+            ..TargetFlags::default()
+        };
+        let env = EnvSnapshot {
+            tls_dir: Some(agent.path().to_owned()),
+            principal: Some("agent-42".to_owned()),
+            token_file: Some(agent.path().join("token")),
+            agent: Some("42".to_owned()),
+            ..EnvSnapshot::default()
+        };
+        let resolved = run(&flags, &env, None);
+        assert_eq!(tls(&resolved).cert, other.path().join("client.ops.crt"));
+        assert_eq!(resolved.token, None);
+        // A plain token variable still pairs with the flags' identity.
+        let env = EnvSnapshot {
+            token_file: Some(agent.path().join("token")),
+            ..EnvSnapshot::default()
+        };
+        let resolved = run(&flags, &env, None);
+        assert_eq!(
+            resolved.token,
+            Some(TokenSource::File(agent.path().join("token")))
         );
     }
 

@@ -41,6 +41,8 @@ pub use limits::{
     STATEMENT_TIMEOUT,
 };
 
+pub use server::Reload;
+
 use crate::data::Client;
 
 /// Which tools the server offers.
@@ -98,13 +100,41 @@ pub enum McpError {
 /// [`McpError::Initialize`] if the client doesn't open a session, and [`McpError::Session`] if
 /// the session's task fails.
 pub async fn serve(client: Client, settings: McpSettings) -> Result<(), McpError> {
+    serve_with(client, settings, None).await
+}
+
+/// Serves MCP as [`serve`] does, and when the nodes refuse a call as unauthenticated, asks
+/// `reload` for a client made with the credentials now on disk, and sends the call once more
+/// with it if there is one. A delegated agent's parent may replace its token while this server
+/// runs, and the model can't restart it.
+///
+/// # Errors
+///
+/// As [`serve`].
+pub async fn serve_reloading(
+    client: Client,
+    settings: McpSettings,
+    reload: Reload,
+) -> Result<(), McpError> {
+    serve_with(client, settings, Some(reload)).await
+}
+
+async fn serve_with(
+    client: Client,
+    settings: McpSettings,
+    reload: Option<Reload>,
+) -> Result<(), McpError> {
     let settings = McpSettings {
         max_result_bytes: settings
             .max_result_bytes
             .clamp(MIN_MAX_RESULT_BYTES, MAX_MAX_RESULT_BYTES),
         ..settings
     };
-    let service = server::FleetringMcp::new(client, settings)
+    let mut server = server::FleetringMcp::new(client, settings);
+    if let Some(reload) = reload {
+        server = server.with_reload(reload);
+    }
+    let service = server
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|error| McpError::Initialize(error.into()))?;

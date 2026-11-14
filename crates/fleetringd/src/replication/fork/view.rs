@@ -23,6 +23,9 @@ pub struct DatabaseView {
     pub incarnation: Incarnation,
     /// The fork that made it, if one did.
     pub fork: Option<ForkView>,
+    /// The replica set promotions fence and placement, at one membership epoch (ADR-0031,
+    /// amendment 2); `None` from a control node that predates showing them.
+    pub sets: Option<crate::replication::ReplicaSets>,
 }
 
 /// A fork's record, as a placement carries it.
@@ -188,6 +191,7 @@ pub(crate) fn view_from_placement(placement: &proto::Placement) -> Result<Databa
             .as_ref()
             .map(|fork| fork_from_proto(&name, incarnation, fork))
             .transpose()?,
+        sets: crate::replication::ReplicaSets::from_placement(placement)?,
     })
 }
 

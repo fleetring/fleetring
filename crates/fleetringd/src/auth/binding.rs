@@ -130,6 +130,12 @@ pub enum Unbound {
 
 /// What in a seeding request doesn't match the fork, its source, or the receiving node
 /// (ADR-0046, points 4.1 and 4.4).
+///
+/// Most variants are reasons for a `seeding` binding refusal. [`NotSeeding`](Self::NotSeeding),
+/// [`Attempt`](Self::Attempt), and [`NotSourcePrimary`](Self::NotSourcePrimary) aren't: they
+/// describe a request whose identity and caller match, made from a view a moment older or newer
+/// than the receiver's, which is answered `UNAVAILABLE` with a retry-after and not counted as a
+/// refusal (ADR-0046, points 4.1 and 4.4, as amended).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SeedingMismatch {
@@ -139,9 +145,11 @@ pub enum SeedingMismatch {
     ForkIncarnation,
     /// The fork's operation isn't the one the request names.
     Operation,
-    /// The fork isn't seeding.
+    /// The fork isn't seeding: it is past seeding, or not yet seeding in the receiver's view.
+    /// Answered with a retry-after, not refused.
     NotSeeding,
-    /// The fork is seeding another attempt.
+    /// The fork is seeding another attempt than the request's. Answered with a retry-after, not
+    /// refused.
     Attempt {
         /// The attempt the request names.
         requested: u32,
@@ -152,7 +160,8 @@ pub enum SeedingMismatch {
     Source,
     /// The source's incarnation isn't the one the request, or the fork, names.
     SourceIncarnation,
-    /// The receiving node doesn't hold the source's lease.
+    /// The receiving node doesn't hold the source's lease now. Answered with a retry-after, not
+    /// refused: the seeder asks control state where the source's primary is before it retries.
     NotSourcePrimary,
     /// The caller isn't the attempt's seeder.
     NotSeeder,

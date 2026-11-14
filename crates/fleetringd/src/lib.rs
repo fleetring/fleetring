@@ -86,7 +86,10 @@ const _: () = {
     assert_debug_send_sync::<auth::Binding>();
     assert_debug_send_sync::<auth::BindingDenied>();
     assert_debug_send_sync::<auth::Caller>();
+    assert_debug_send_sync::<auth::Carriage>();
+    assert_debug_send_sync::<auth::ControlFreshness>();
     assert_debug_send_sync::<auth::Credential>();
+    assert_debug_send_sync::<auth::DelegationSigner>();
     assert_debug_send_sync::<auth::Denied>();
     assert_debug_send_sync::<auth::ForNodes>();
     assert_debug_send_sync::<auth::GrantStepError>();
@@ -94,6 +97,9 @@ const _: () = {
     assert_debug_send_sync::<auth::Requirement>();
     assert_debug_send_sync::<auth::Rpc>();
     assert_debug_send_sync::<auth::IssueError>();
+    assert_debug_send_sync::<auth::IssuerError>();
+    assert_debug_send_sync::<auth::LastAcknowledged>();
+    assert_debug_send_sync::<auth::Lineage>();
     assert_debug_send_sync::<auth::ParseScopeError>();
     assert_debug_send_sync::<auth::Scope>();
     assert_debug_send_sync::<auth::Scopes>();
@@ -105,8 +111,10 @@ const _: () = {
     assert_debug_send_sync::<auth::TokenVerifier>();
     assert_debug_send_sync::<auth::Unbound>();
     assert_debug_send_sync::<auth::SeedingMismatch>();
+    assert_debug_send_sync::<auth::Signer>();
     assert_debug_send_sync::<auth::Verified>();
     assert_debug_send_sync::<auth::VerifyingKey>();
+    assert_debug_send_sync::<auth::X5cError>();
     assert_debug_send_sync::<changes::ChangeStreams>();
     assert_debug_send_sync::<clock::SimClock>();
     assert_debug_send_sync::<clock::SystemClock>();
@@ -219,6 +227,13 @@ const _: () = {
     assert_debug_send_sync::<tls::Identity>();
     assert_debug_send_sync::<tls::IdentityError>();
     assert_debug_send_sync::<tls::Issued>();
+    assert_debug_send_sync::<tls::IssuerCertError>();
+    assert_debug_send_sync::<tls::IssuerCertificate>();
+    assert_debug_send_sync::<tls::DevIssuerOutcome>();
+    assert_debug_send_sync::<tls::IssuerFileProblem>();
+    assert_debug_send_sync::<tls::IssuerFiles>();
+    assert_debug_send_sync::<tls::IssuerFilesError>();
+    assert_debug_send_sync::<tls::IssuerPair>();
     assert_debug_send_sync::<tls::NameError>();
     assert_debug_send_sync::<tls::Peer>();
     assert_debug_send_sync::<tls::Principal>();

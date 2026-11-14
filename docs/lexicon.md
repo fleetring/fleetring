@@ -62,7 +62,7 @@ database "notes" ──(name is the key)──▶ ring ──▶ replica set [n3
 | API key, password | [token](#token) or [certificate](#certificate) | |
 | health (for a member's liveness) | [liveness](#liveness) | `/healthz` is about the process; liveness is the control plane's view. |
 | tag | [label](#label) | ADR-0041. |
-| owner (of a database) | [creator](#creator) | Being the creator grants nothing; scopes decide. "Owner" is refused for a lease holder and a primary too; it is kept for an agent's [owner](#owner) (planned). |
+| owner (of a database) | [creator](#creator) | Being the creator grants nothing; scopes decide. "Owner" is refused for a lease holder and a primary too; it is kept for an agent's [owner](#owner). |
 | TTL (as a field or flag) | [expiry](#expiry) | "TTL" is fine in prose for the duration. |
 | connection, stream (alone, for a Hrana stream) | [Hrana stream](#hrana-stream) | A [change stream](#change-stream) and a replication stream are other things. |
 
@@ -118,10 +118,10 @@ The HTTP listener a daemon serves `/metrics`, `/healthz`, and `/readyz` on, apar
 
 ### Agent
 
-An AI agent's identity in a fleet: the [principal](#principal) `agent-<id>`, with a client [certificate](#certificate) and a [token](#token) scoped to its own databases (`admin:agent-<id>-*` and `stream:agent-<id>-*` by default, or `read:agent-<id>-*` and `stream:agent-<id>-*` for a read-only agent, from 0.8; `admin:` alone before), kept in a directory of its own, `<agents dir>/<id>/` (ADR-0043, point 8; FR-081). The *agent ID* is 1 to 32 lowercase letters, digits, and `_`, so the `-` after it in `agent-<id>-*` always ends it, and `.` is left for [delegation](#delegation). The directory, created `0700`, holds `ca.crt`, the certificate and its key, the token, and `identity.toml`, the *identity record*, which holds no secret: the principal, scopes (with `scopes_from = "flags"` when `--scope` chose them, so `agent renew` never widens them), expiries, `issued_by`, the [owner](#owner), and the [parent](#parent). The *agents directory* is `<dev_dir>/agents` for the `dev` context, a context's `agents_dir` if it sets one, and `$XDG_DATA_HOME/fleetring/agents/<context>/` for any other. In [dev mode](#dev-mode), `fleetring mcp --agent <id>` mints the identity on first use and renews it at start; elsewhere `agent add --authority` mints it where the [authority](#authority) is. A name that starts with `agent-` and holds `.` is a *reserved dotted agent name*, which no command issues and no node accepts in 0.7 (ADR-0044, point 1.8). Without an [agent launcher](#agent-launcher), agents run in [trusted local development](#trusted-local-development).
+An AI agent's identity in a fleet: the [principal](#principal) `agent-<id>`, with a client [certificate](#certificate) and a [token](#token) scoped to its own databases (`admin:agent-<id>-*` and `stream:agent-<id>-*` by default, or `read:agent-<id>-*` and `stream:agent-<id>-*` for a read-only agent, from 0.8; `admin:` alone before), kept in a directory of its own, `<agents dir>/<id>/` (ADR-0043, point 8; FR-081). The *agent ID* is 1 to 32 lowercase letters, digits, and `_`, so the `-` after it in `agent-<id>-*` always ends it, and `.` is left for [delegation](#delegation). The directory, created `0700`, holds `ca.crt`, the certificate and its key, the token, and `identity.toml`, the *identity record*, which holds no secret: the principal, scopes (with `scopes_from = "flags"` when `--scope` chose them, so `agent renew` never widens them), expiries, `issued_by`, the [owner](#owner), and the [parent](#parent). The *agents directory* is `<dev_dir>/agents` for the `dev` context, a context's `agents_dir` if it sets one, and `$XDG_DATA_HOME/fleetring/agents/<context>/` for any other. In [dev mode](#dev-mode), `fleetring mcp --agent <id>` mints the identity on first use and renews it at start; elsewhere `agent add --authority` mints it where the [authority](#authority) is. A name that starts with `agent-` and holds `.` is a *reserved dotted agent name*, which only a [delegation](#delegation) makes, from 0.8.0 (ADR-0044, point 1.8; ADR-0047): no command issues a certificate for one, and no node accepts one from a `[[principal]]` entry or in a token the authority signed. An agent that `agent add` or `mcp --agent` creates is a *root agent*; one that `agent delegate` creates is a [delegated agent](#delegated-agent). Once every member reports the `delegation` [fleet feature](#fleet-feature), a root agent's token also holds `admin:agent-<id>.*` (or `read:`), `stream:agent-<id>.*`, and `grant` on both prefixes, and carries `fleetring.kind = "agent"` and its [owner](#owner), so it can delegate. Without an [agent launcher](#agent-launcher), agents run in [trusted local development](#trusted-local-development).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `AgentId`, `AgentDir`, `AgentRecord` in the CLI; `Principal::is_reserved_agent_name`. **CLI:** `fleetring agent add|list|show|renew|remove`, `--agent <id>` and `FLEETRING_AGENT` on every client command, `mcp --agent`.
+- **Code:** `AgentId`, `AgentDir`, `AgentRecord` in the CLI; `Principal::is_reserved_agent_name`; `fleetring_control::AgentName`; `TokenSpec::agent`. **CLI:** `fleetring agent add|delegate|list|show|renew|remove`, `--agent <id>` and `FLEETRING_AGENT` on every client command, `mcp --agent`.
 - **Not:** bot, assistant, robot, service account, agent user.
 
 ### Agent launcher
@@ -208,10 +208,10 @@ A partition of the key space with its own ring. A directory, a ring over the cel
 
 ### Certificate
 
-An X.509 certificate from the fleet's [authority](#authority). A *node certificate* names a node, `fleetring://<fleet>/node/<id>`; a *client certificate* names a [principal](#principal), `fleetring://<fleet>/principal/<name>` (ADR-0025). Every connection is mutual TLS with them.
+An X.509 certificate from the fleet's [authority](#authority). A *node certificate* names a node, `fleetring://<fleet>/node/<id>`; a *client certificate* names a [principal](#principal), `fleetring://<fleet>/principal/<name>` (ADR-0025). Every connection is mutual TLS with them. From 0.8.0 (ADR-0047), an *issuer certificate* names a [delegation issuer](#delegation-issuer), `fleetring://<fleet>/issuer/<name>`, travels inside the tokens it signed, and never opens a connection.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `tls::Identity` (a certificate, its private key, and the trusted authorities), `SubjectUri`. **CLI:** `fleetring cert node`, `fleetring cert client`; files `node.<id>.crt`, `client.<principal>.crt`; flags `--cert`, and `--key` for the certificate's private key.
+- **Code:** `tls::Identity` (a certificate, its private key, and the trusted authorities), `SubjectUri`, `IssuerCertificate`. **CLI:** `fleetring cert node`, `fleetring cert client`, `fleetring cert issuer`; files `node.<id>.crt`, `client.<principal>.crt`; flags `--cert`, and `--key` for the certificate's private key.
 - **Not:** cert (fine in commands and files, not in prose), key pair (the certificate and its private key together are an *identity*), credential (a credential is a certificate *or* a token).
 
 ### Change stream
@@ -303,20 +303,38 @@ One SQLite database (later libSQL, Turso, or Postgres) that FleetRing places, re
 - **Code:** `fleetring_control::Database`, `DatabaseName`. **CLI:** the noun `db` (`fleetring db create`), the argument `<database>`; "database" in output headers.
 - **Not:** shard, partition, tenant, keyspace, namespace, table, instance.
 
-### Delegation
+### Delegated agent
 
-*Planned* (ADR-0044). An agent handing a narrower copy of its token to a child, offline and without the authority: it appends a block to its biscuit token that names the child's principal (its own, `.`, one segment), itself as parent, and the child's holder key, with scopes and an expiry that can only narrow, and signs the block with its own holder key as a biscuit third-party block, so copied token bytes can't delegate. It needs the `grant` action, and FleetRing's own verifier, not biscuit's Datalog, enforces it. A *delegated token* is one with such a block; *attenuation* is appending a block that narrows without naming a new holder.
+Since 0.8.0 (ADR-0047). An [agent](#agent) another agent created by delegation; in prose, a *child*. Its ID extends its parent's with `.` and one segment (`42.c7`, principal `agent-42.c7`), at most 8 levels below its *root agent*, the one `agent add` created, and within 64 bytes. It has a token of its own, which the control plane minted, and no certificate: it connects with its root's certificate, since no certificate is ever issued for a dotted name. Its directory, `<agents dir>/42.c7/`, holds its token and its identity record, with its [parent](#parent), root, [owner](#owner), [delegation ID](#delegation), and operation ID.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** none yet; the token vocabulary is specified in `docs/spec/tokens-v1.md` when built. **CLI:** none yet.
-- **Not:** impersonation, sub-token, child token, token exchange (an online protocol FleetRing doesn't use for this).
+- **Code:** `fleetring_control::AgentName`, `IssuedBy::Delegation`, `identity.toml` version 2 with `issued_by = "delegation"`. **CLI:** `agent delegate <child-id>`; `mcp --agent 42.c7`; `--agent 42.c7`; `agent list`, `show`, `renew` and `remove` with a child's ID.
+- **Not:** sub-agent (fine in prose about a harness), child token, clone, worker.
+
+### Delegation
+
+Since 0.8.0 (ADR-0047). A parent agent asking the control plane for a [delegated agent](#delegated-agent)'s token: the control plane checks the parent's live token, narrows exactly with the strict grant step (needing the `grant` action), caps the lifetime at the parent's and at 24 hours, records the delegation and its [lineage](#lineage) in control state, and only then signs a JWT for the child with its [delegation issuer](#delegation-issuer) key. A *delegated token* is one such JWT; its `jti` is the *delegation ID*, which every copy of the delegation shares, since a retry re-signs the recorded claims, possibly with another control node's key. Revoking the delegation ID ends every copy and everything delegated below it. The *ancestor rule* lets an agent revoke, without the [fleet scope](#fleet-scope), the token it presented, itself as a principal, and the delegations recorded below it and their principals, and nothing else.
+
+*Deferred after 0.8* (ADR-0044's S1): offline delegation by appending a block to a biscuit token, signed by a holder key, and *attenuation*, appending a block that only narrows. FR-094's evidence decides whether they come back.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `Control.DelegateToken`, `Control.ListDelegations`, `Action::RecordDelegation`, `Delegation`, `DelegationId`, `TokenClaims`, `Feature::Delegation`; for the ancestor rule, `Action::RevokeAsAncestor`, `AncestorTarget`, and `Added::Ancestor`. **CLI:** `agent delegate`; the delegation ID in `agent show`; `agent list --fleet`; `token revoke --token-id` and `--principal` with `--agent`.
+- **Not:** impersonation, sub-token, child token, token exchange (RFC 8693, which FleetRing doesn't speak), minting (fine in prose for signing).
+
+### Delegation issuer
+
+Since 0.8.0 (ADR-0047). An [issuer](#issuer) scoped to delegation: a control node's own Ed25519 key, which signs delegated tokens, certified by the [authority](#authority) with an *issuer certificate*, `fleetring://<fleet>/issuer/<name>`, 30 days by default and 90 at most. Every delegated token carries the certificate in its `x5c` header, so nodes trust it through the authority they already trust, with no configuration of their own. Nodes hold what it signs to the agent tier: delegated agents' names, scopes inside their root agent's databases, no `fleet`, 24 hours at most. Revoked with `Revoked::Key`.
+
+- **Applies to:** daemon, CLI.
+- **Code:** `SubjectUri::Issuer`, `IssuerCertificate`, `IssuerPair`, `DelegationSigner`. **CLI:** `cert issuer --name <name>`; dev mode's `tls/issuer.dev.crt` and `.key`; files `issuer.<name>.crt` and `issuer.<name>.key`; `[control] issuer_cert` and `issuer_key`.
+- **Not:** authority, issuer (alone, which is the planned login service), signer (alone), CA.
 
 ### Denylist
 
-The set of revoked tokens and signing keys the control plane keeps and publishes to data nodes with every heartbeat reply. A node refuses a token on it. *Planned* (ADR-0044): it also holds [revocation IDs](#revocation-id) of token blocks, and principals whose earlier tokens are revoked.
+The set of revoked tokens and signing keys the control plane keeps and publishes to data nodes with every heartbeat reply. A node refuses a token on it. Since 0.8.0 (ADR-0047), a node also refuses a [delegated token](#delegation) whose [lineage](#lineage) names a token or key on it, and the list also holds principals whose tokens issued until a moment the control node set, and every delegated agent's below them, are revoked (`Revoked::Principal`). Each entry records whether it was added with the [fleet scope](#fleet-scope) or under the ancestor rule. A node that meets an entry it can't read treats the whole list as *unusable*, and refuses every token until a list it reads wholly arrives. *Deferred after 0.8* (ADR-0044): [revocation IDs](#revocation-id) of token blocks.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Revocations`, `Revoked`, protocol `Revocation`. **CLI:** `fleetring token revoke`.
+- **Code:** `Revocations`, `Revoked`, `Revoked::Principal`, `Added`, `auth::Denylist`, `Unusable`, `UnreadableEntry`, protocol `Revocation`; metric `fleetring_denylist_unusable`. **CLI:** `fleetring token revoke`.
 - **Not:** blocklist, blacklist, revocation list, CRL.
 
 ### Description
@@ -429,7 +447,7 @@ The set of nodes that one control plane and one certificate authority govern, un
 
 ### Fleet feature
 
-A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (a command that sets or changes an expiry, and the one that expires a database), ADR-0041, and `fork`, for the fork commands, which enabling also starts assigning [incarnations](#incarnation) (ADR-0046), and which releases report since data nodes seed and open forks.
+A control command that not every member can read or act on, refused until every member, live or down, reports it in its [software](#software). The first such command the fleet accepts enables the feature for good, and from then on a member that lacks it can't join (ADR-0038). The features are `undrain`, `metadata` (a creation with a description or labels, and every metadata update), and `expiry` (a command that sets or changes an expiry, and the one that expires a database), ADR-0041, and `fork`, for the fork commands, which enabling also starts assigning [incarnations](#incarnation) (ADR-0046), and which releases report since data nodes seed and open forks. `handover` is enabled by `EnableHandover`, which the control node logs just before the first membership change that would keep a [replica set](#replica-set), once every member supports it (ADR-0031, amendment 2). `delegation` covers recording a [delegation](#delegation), `Revoked::Principal`, and the ancestor rule's revocations, and every node reports it from 0.8.0 (ADR-0047).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `fleetring_control::Feature`, `Action::features`, `State::features`, `State::check_features`, `State::check_admission`, `Rejection::FeatureUnsupported`, `Rejection::MissingFeature`; protocol `Software.features`.
@@ -445,10 +463,10 @@ The name `cert init --fleet` gives the authority. Every certificate it issues ca
 
 ### Fleet scope
 
-The scope for operations that name no database: membership, draining, removing members, revoking tokens. A principal without it sees only the databases its other scopes cover.
+The scope for operations that name no database: membership, draining, removing members, revoking tokens. A principal without it sees only the databases its other scopes cover. Since 0.8.0 (ADR-0047), an agent may also revoke without it, under the ancestor rule ([delegation](#delegation)): the token it presented, the delegations recorded below it, and itself and every name below it.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `Scope::fleet()`, `auth::Target::Fleet`, `Requirement::Fleet`. **CLI:** `--scope fleet`, `scopes = ["fleet"]`.
+- **Code:** `Scope::fleet()`, `auth::Target::Fleet`, `Requirement::Fleet`, `Requirement::FleetOrAncestor`. **CLI:** `--scope fleet`, `scopes = ["fleet"]`.
 - **Not:** cluster (0.2's spelling; refused since 0.3.0), operator, superuser, root, global.
 
 ### Follower
@@ -461,7 +479,7 @@ A replica that isn't the primary: it applies the primary's batches and can be pr
 
 ### Fork
 
-*Planned* (ADR-0044, ADR-0046). A new database seeded from a source database's snapshot at a position its source's write quorum acknowledged, independent afterwards, that records its source in `forked_from`: the source, the source's [incarnation](#incarnation), the position, its chain hash, and the time (a signed head or a package manifest, later). Needs `fork` on the source and `admin` on the target. Also the [action](#action) `fork`, which implies `read` and which scopes accept since 0.8.0.
+Since 0.8.0 (ADR-0044, ADR-0046). A new database seeded from a source database's snapshot at a position its source's write quorum acknowledged, independent afterwards, that records its source in `forked_from`: the source, the source's [incarnation](#incarnation), the position, its chain hash, and the time (a signed head or a package manifest, later). Needs `fork` on the source and `admin` on the target. Also the [action](#action) `fork`, which implies `read` and which scopes accept since 0.8.0.
 
 - ***Fork identity:*** the triple (name, incarnation, operation): the fork's database name, its own incarnation, and its [operation ID](#operation-id). Every command, report, `Snapshot` request, and staging directory about a fork carries it, so nothing meant for a dropped fork can act on a fork created again under the same name.
 - ***Fork states:***
@@ -511,7 +529,7 @@ Who holds a lease: for a database lease, the primary; for a keyed lease, the nam
 
 ### Holder key
 
-*Planned* (ADR-0044). The Ed25519 key a token is bound to: a root agent's is its certificate's key; a child generates its own on its machine, its parent's delegation block names the public key, and the child presents it as a self-signed client certificate, which a node accepts only with `[tls] accept_holder_keys` on and never reads a name from. A node accepts the token only on a connection that proves that key, or, for a bearer delegation, through a relay with `forward_tokens`. Delegating from a token needs a signature by its holder key.
+*Deferred after 0.8* (ADR-0044, ADR-0047). The Ed25519 key a token is bound to: a root agent's is its certificate's key; a child generates its own on its machine, its parent's delegation block names the public key, and the child presents it as a self-signed client certificate, which a node accepts only with `[tls] accept_holder_keys` on and never reads a name from. A node accepts the token only on a connection that proves that key, or, for a bearer delegation, through a relay with `forward_tokens`. Delegating from a token needs a signature by its holder key.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet.
@@ -543,7 +561,7 @@ A placement label for the machine a node runs on, when several nodes share one; 
 
 ### Incarnation
 
-*Planned* (ADR-0046). One life of a database name: `(name, incarnation)` identifies one database. Each new database, a [fork](#fork) included, gets 64 random bits, never 0, drawn by the control node that proposes its creation and carried in the command, as time is; so a name dropped and created again has a different incarnation, even where its [lease epochs](#epoch) start again, and even if `control.db` was replaced. No rule rests on a counter. A database created before the `fork` [fleet feature](#fleet-feature) was enabled has incarnation 0. A fork records its source's incarnation, so it never copies a database created again under the source's name. Printed as 16 lowercase hex digits, and a string of them in JSON.
+Since 0.8.0 (ADR-0046). One life of a database name: `(name, incarnation)` identifies one database. Each new database, a [fork](#fork) included, gets 64 random bits, never 0, drawn by the control node that proposes its creation and carried in the command, as time is; so a name dropped and created again has a different incarnation, even where its [lease epochs](#epoch) start again, and even if `control.db` was replaced. No rule rests on a counter. A database created before the `fork` [fleet feature](#fleet-feature) was enabled has incarnation 0. A fork records its source's incarnation, so it never copies a database created again under the source's name. Printed as 16 lowercase hex digits, and a string of them in JSON.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Incarnation`, `Database::incarnation`, the `incarnation` of `CreateDatabase` and `ForkDatabase`, protocol `Placement.incarnation`. **CLI:** `incarnation` in the JSON of `db show`, `db locate`, `db list` and `db fork`, and `<name> (incarnation 3f9a0c6e21d4b870)` in `db fork` and `db show`.
@@ -551,7 +569,7 @@ A placement label for the machine a node runs on, when several nodes share one; 
 
 ### Issuer
 
-*Planned* (ADR-0044). The service that turns a login (OIDC, later passkeys or a wallet) into a FleetRing token, signing it with an issuer key that the authority certifies as a constrained trust anchor. It runs in the router first. The token claim `iss` names the fleet, not the issuer.
+*Planned* (ADR-0044). The service that turns a login (OIDC, later passkeys or a wallet) into a FleetRing token, signing it with an issuer key that the authority certifies as a constrained trust anchor. It runs in the router first. The token claim `iss` names the fleet, not the issuer. A [delegation issuer](#delegation-issuer) (ADR-0047) is narrower: a control node's key that signs delegated tokens only.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet (`fleetring login`).
@@ -613,6 +631,14 @@ A member removing itself from the fleet's membership, as a node does when it shu
 - **Code:** `Control.Leave`, `Client::remove_node`. **CLI:** `on_shutdown = "leave"`; "left the fleet" in logs; `fleetring node remove <node-id>` removes another member, refusing a live one unless `--force`.
 - **Not:** depart, departure (FR-038's title keeps it), decommission, deregister, kick.
 
+### Lineage
+
+Since 0.8.0 (ADR-0047). The chain of a [delegated agent](#delegated-agent)'s ancestors, root first. A delegated token records it in `fleetring.chain`, one entry per ancestor, each its token ID (the root token's `jti`, or a delegation ID) and the key ID that signed the copy of that ancestor's token the child was minted from; control state records it with each delegation. A node refuses a token if any entry's token ID or key ID, or any ancestor's name, is revoked, so revoking an ancestor ends everything below it, whichever control node signed what.
+
+- **Applies to:** daemon, CLI.
+- **Code:** the `fleetring.chain` claim, `ChainLink`, `TokenClaims::chain`, `auth::Lineage`. **CLI:** the parent and root in `agent list` and `agent show`; `chain` in `agent list --fleet --json`.
+- **Not:** ancestry, provenance (a fork's), path, hierarchy.
+
 ### Liveness
 
 Whether a member is `live` (its last heartbeat is within the heartbeat timeout) or `down`. A down node isn't removed: placement filters it out and traffic fails over around it, but its data doesn't move (ADR-0006, point 6).
@@ -671,14 +697,14 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 
 ### Operation ID
 
-*Planned* (ADR-0046). The identifier of one *operation*: one fork request, from its first call until it is `ready`, `failed`, or `cancelled`, across every retry. It is 16 random bytes the client chooses, printed as 26 lowercase base32 characters, and the CLI prints it before it calls.
+Since 0.8.0 (ADR-0046). The identifier of one *operation*: one fork request, from its first call until it is `ready`, `failed`, or `cancelled`, across every retry; and (ADR-0047) one `agent delegate` request, whose record control state keeps until its delegation expires, plus 1 hour (or for 1 hour after the delegation is revoked), so a retry returns the same [delegation](#delegation). It is 16 random bytes the client chooses, printed as 26 lowercase base32 characters, and the CLI prints it before it calls.
 
 - ***Caller intent*** is the request as given, a relative expiry included; the ***resolved state*** is what the first request settled: the source's incarnation, the fork's incarnation, the absolute expiry. Neither is decided twice.
 - ***Resuming*** reads the operation by its ID and follows it; nothing is sent or resolved again.
 - ***Resubmitting*** sends the request again under a known ID, and compares the caller intent only: from the same principal and unchanged, it returns the existing operation; from another principal, it is refused without revealing the operation; changed, it is refused, naming the field.
 - **Retention.** Control state keeps the operation's record, and with it the ID, while the fork is pending and for 7 days after its terminal outcome; after that the ID is unknown, and the same request starts a new fork.
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `OperationId`, `ForkIntent`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation` and `ForkOperationStatus`, `Rejection::OperationConflict`, `Rejection::OperationNotYours`. **CLI:** `--operation-id` on `db fork`, `operation_id` in its JSON, and MCP `operation_id` (*planned:* `--operation-id` on `orphan remove` for a staged copy).
+- **Code:** `OperationId`, `ForkIntent`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation` and `ForkOperationStatus`, `Rejection::OperationConflict`, `Rejection::OperationNotYours`. **CLI:** `--operation-id` on `db fork` and `agent delegate`, `operation_id` in their JSON and in `agent show`, and MCP `operation_id` (*planned:* `--operation-id` on `orphan remove` for a staged copy).
 - **Not:** [request ID](#request-id) (one call, for tracing), job ID, task ID, idempotency key, transaction ID.
 
 ### Organization
@@ -707,10 +733,10 @@ A copy of a database that a data node keeps on disk, closed, because the control
 
 ### Owner
 
-*Planned* (ADR-0044). The principal an agent acts for and answers to: the principal the command that created the root agent ran as, or `authority` when only the authority's key was used (ADR-0043). A child agent inherits its parent's owner. Recorded in the agent's identity record and its token; it grants nothing. Only agents have owners: a database has a [creator](#creator), a lease a [holder](#holder).
+(ADR-0044.) The principal an agent acts for and answers to: the principal the command that created the root agent ran as, or `authority` when only the authority's key was used (ADR-0043). A child agent inherits its parent's owner. Recorded in the agent's identity record and, from 0.8, in its token's `fleetring.owner` claim (ADR-0047); it grants nothing. Only agents have owners: a database has a [creator](#creator), a lease a [holder](#holder).
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `AgentRecord::owner`, `owner` in `identity.toml` (ADR-0043); none yet in tokens. **CLI:** `agent show`.
+- **Code:** `AgentRecord::owner`, `owner` in `identity.toml` (ADR-0043); `TokenSpec::owner`, `TokenClaims::owner`. **CLI:** `agent show`.
 - **Not:** creator, sponsor, user (as a field).
 
 ### Package
@@ -723,10 +749,10 @@ A copy of a database that a data node keeps on disk, closed, because the control
 
 ### Parent
 
-*Planned* (ADR-0044). The agent that spawned an agent, recorded by agent ID in the child's `identity.toml` and by principal in the delegation block that created its token. A child's ID extends its parent's with `.` (`42.c7`), so its databases, `agent-42.c7-…`, fall under its parent's subtree scope `agent-42.*`. It grants nothing by itself.
+(ADR-0044.) The agent that spawned an agent, recorded by agent ID in the child's `identity.toml` and by principal in its token's `fleetring.parent` claim (ADR-0047). A child's ID extends its parent's with `.` (`42.c7`), so its databases, `agent-42.c7-…`, fall under its parent's subtree scope `agent-42.*`. It grants nothing by itself.
 
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `AgentRecord::parent`, `parent` in `identity.toml` as the parent's agent ID (ADR-0043), always absent in 0.7. **CLI:** `agent show`.
+- **Code:** `AgentRecord::parent`, `parent` in `identity.toml` as the parent's agent ID (ADR-0043), absent for a root agent; `TokenClaims::parent`. **CLI:** `agent show`, and the `PARENT` column of `agent list`.
 - **Not:** creator, owner, ancestor (fine in prose for any agent above).
 
 ### Placement
@@ -843,10 +869,10 @@ Whether a replica is its database's primary or a follower, as the node hosting i
 
 ### Replica set
 
-The ordered list of distinct nodes that hold a key's replicas: the first R nodes of its preference list (ADR-0006).
+The ordered list of distinct nodes that hold a key's replicas: the first R nodes of its preference list (ADR-0006). In the daemon, the replica set is the one promotions fence, and it is *placement*, the ring's list, except while a fork's holders are its replica set (ADR-0046, point 3.10) or a membership change *keeps* the replica set it moved a leased database off: the *kept replica set* stays the one promotions fence, and its primary counts both its write quorum and placement's, until the primary reports that placement's holds its log and the control plane *releases* it (ADR-0031, amendment 2).
 
 - **Applies to:** crate, daemon, CLI, UI.
-- **Code:** `ReplicaSet`. **CLI:** "replicas" in output.
+- **Code:** `ReplicaSet`; in control state `State::replica_set`, `State::placed_replica_set`, `Database::kept_replicas`, `Action::ReleaseKeptReplicas`, `Action::EnableHandover`, `ReplicasCaughtUp`, `Feature::Handover`; protocol `Placement.placed_replicas`, `DatabaseStatus.replicas_caught_up`; metric `fleetring_control_kept_replica_sets`. **CLI:** "replicas" in output; `db locate` adds "placed on" (`placed_replicas` in JSON) while the replica set is kept.
 - **Not:** quorum (a subset), replica group, shard group, cohort.
 
 ### Replication factor
@@ -877,7 +903,7 @@ A restore also returns the [metadata](#metadata) the archive holds for the snaps
 
 ### Revocation ID
 
-*Planned* (ADR-0044). The SHA-256 of one block's signature in a biscuit token, base64url. Putting it on the denylist refuses every token that contains the block, so revoking a parent's token, or the block that delegated to a child, revokes everything derived from it.
+*Deferred after 0.8* (ADR-0044, ADR-0047). The SHA-256 of one block's signature in a biscuit token, base64url. Putting it on the denylist refuses every token that contains the block, so revoking a parent's token, or the block that delegated to a child, revokes everything derived from it.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet (`Revoked::Block`). **CLI:** none yet.
@@ -1037,7 +1063,7 @@ Not a FleetRing object. A tenant is a naming convention for keys, `tenant:<name>
 
 ### Token
 
-A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`. *Planned* (ADR-0044): a token may also be a biscuit in FleetRing's fixed vocabulary, which a holder can narrow and [delegate](#delegation) without the authority.
+A bearer credential: an Ed25519-signed JWT from the authority that names a principal, its scopes, and its lifetime. Its ID is `jti`; the signing key's ID is `kid`; from 0.8.0, `iat` is when it was signed. Since 0.8.0 (ADR-0047), a *delegated token* is a JWT a [delegation issuer](#delegation-issuer) signed, carrying its issuer certificate (`x5c`) and its [lineage](#lineage), and accepted only on a connection whose certificate names its principal or an ancestor. *Deferred after 0.8* (ADR-0044): a biscuit token, which a holder could narrow and delegate without the control plane.
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::BearerToken`, `TokenSpec` (what a token says: principal, scopes, ID, lifetime), `TokenId`, `KeyId`. **CLI:** `fleetring token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
@@ -1053,7 +1079,7 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 
 ### Trust anchor
 
-*Planned* (ADR-0044). A public key a fleet or a reader trusts, with a purpose and a constraint. Authorization anchors sign tokens: the fleet's authority (unconstrained), issuer keys, and other fleets' authorities (each limited to the patterns and actions it may vouch for). Provenance anchors, publisher keys, only verify content and never authorize.
+*Planned* (ADR-0044). A public key a fleet or a reader trusts, with a purpose and a constraint. Authorization anchors sign tokens: the fleet's authority (unconstrained), issuer keys, and other fleets' authorities (each limited to the patterns and actions it may vouch for). A [delegation issuer](#delegation-issuer) (ADR-0047) is the first issuer key, its constraint fixed in code. Provenance anchors, publisher keys, only verify content and never authorize.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet.
@@ -1062,10 +1088,10 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 
 ### Trusted local development
 
-Running agents without an [agent launcher](#agent-launcher) (ADR-0044, point 11): each agent's FleetRing requests are scoped, but agents running as the same OS user can read each other's credential files and database files, so it isn't secure separation between agents. 0.7's `fleetring mcp --agent` runs in this mode, and says so.
+Running agents without an [agent launcher](#agent-launcher) (ADR-0044, point 11): each agent's FleetRing requests are scoped, but agents running as the same OS user can read each other's credential files and database files, so it isn't secure separation between agents. `fleetring mcp --agent` runs in this mode, and says so, as does every delegated agent in 0.8, which runs with its root agent's certificate under the same account.
 
 - **Applies to:** docs, CLI.
-- **Code:** none. **CLI:** the line `trusted local development: agents on this machine can read each other's credentials`, which `mcp --agent` prints at start and `agent add` and `agent show` print; the help of `mcp` and `agent`.
+- **Code:** none. **CLI:** the line `trusted local development: agents on this machine can read each other's credentials`, which `mcp --agent` prints at start and `agent add`, `agent delegate`, and `agent show` print; the help of `mcp` and `agent`.
 - **Not:** sandbox, secure mode, isolated mode.
 ### Upgrade
 

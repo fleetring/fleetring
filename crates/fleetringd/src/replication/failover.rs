@@ -487,9 +487,61 @@ impl Replication {
         self.inner.epochs.highest(database).map(LeaseEpoch::new)
     }
 
+    /// Whether a drop of `database` at `epoch`, naming `incarnation` if it names one, names this
+    /// node's copy (ADR-0042, point 2): `None` if it has none. See
+    /// [`highest_epoch`](Self::highest_epoch) and [`copy_incarnation`](Self::copy_incarnation)
+    /// for what the copy records; a copy of the dropped incarnation at a lower epoch is named
+    /// too.
+    #[must_use]
+    pub fn drop_names_copy(
+        &self,
+        database: &DatabaseName,
+        epoch: LeaseEpoch,
+        incarnation: Option<Incarnation>,
+    ) -> Option<bool> {
+        self.inner
+            .epochs
+            .names_copy(database, epoch.get(), incarnation.map(Incarnation::get))
+    }
+
+    /// The highest epoch this node has seen for the database of `database` at `incarnation`:
+    /// as [`highest_epoch`](Self::highest_epoch), but `None` when the copy records another
+    /// incarnation, whose epochs belong to an earlier database of the name. A copy that records
+    /// none, or an `incarnation` of `None`, is judged by the epoch alone.
+    #[must_use]
+    pub fn highest_epoch_of(
+        &self,
+        database: &DatabaseName,
+        incarnation: Option<Incarnation>,
+    ) -> Option<LeaseEpoch> {
+        self.inner
+            .epochs
+            .highest_of(database, incarnation.map(Incarnation::get))
+            .map(LeaseEpoch::new)
+    }
+
+    /// The highest epoch of this node's copy of `database`, if it has one: as
+    /// [`highest_epoch`](Self::highest_epoch), and epoch 0 for a fork holder's installed copy
+    /// that records its incarnation before any epoch reaches it.
+    #[must_use]
+    pub fn copy_epoch(&self, database: &DatabaseName) -> Option<LeaseEpoch> {
+        self.highest_epoch(database)
+            .or_else(|| self.copy_incarnation(database).map(|_| LeaseEpoch::ZERO))
+    }
+
+    /// The incarnation of the database this node's copy of `database` belongs to, once recorded:
+    /// a copy records it when this node first leads it (ADR-0046, point 1.3). `None` for a copy
+    /// this node only ever followed, and for one recorded before incarnations.
+    #[must_use]
+    pub fn copy_incarnation(&self, database: &DatabaseName) -> Option<Incarnation> {
+        self.inner.epochs.record(database).incarnation()
+    }
+
     /// The members of `database`'s replica set in this node's membership view, in preference
     /// order: a seeded fork's recorded holders, in node-ID order, while this node sees it seeded,
-    /// whatever the ring says (ADR-0046, point 3.10).
+    /// whatever the ring says (ADR-0046, point 3.10); otherwise the replica set promotions fence
+    /// as control state last showed it, the set a membership change kept while it keeps one
+    /// (ADR-0031, amendment 2); and the ring's, from a control node that predates showing it.
     #[must_use]
     pub fn replica_set(
         &self,
@@ -498,6 +550,9 @@ impl Replication {
     ) -> Vec<NodeId> {
         if let Some(holders) = self.inner.forks.frozen(database) {
             return holders;
+        }
+        if let Some(sets) = self.inner.sets.shown(database) {
+            return sets.fenced;
         }
         self.inner
             .membership
@@ -510,26 +565,38 @@ impl Replication {
     }
 
     /// Learns from control state whether `database` is a fork whose replica set is its
-    /// recorded holders, seeded or ready with them kept, as [`replica_set`](Self::replica_set)
-    /// answers from then on.
+    /// recorded holders, seeded or ready with them kept, and which replica set its promotions
+    /// fence, a set a membership change kept included (ADR-0031, amendment 2), as
+    /// [`replica_set`](Self::replica_set) answers from then on.
     ///
     /// # Errors
     ///
     /// `UNAVAILABLE` when control state can't be reached: a promotion that doesn't know which
     /// replica set control state fences mustn't guess the ring, so it stops and is tried again.
     pub(crate) async fn learn_fork_replicas(&self, database: &DatabaseName) -> Result<(), Status> {
-        let view = self
-            .inner
-            .authority
-            .view(database)
-            .await
-            .map_err(|status| {
-                Status::unavailable(format!(
-                    "can't learn the replica set of {database} from control state: {}",
-                    status.message()
-                ))
-            })?;
-        self.inner.forks.follow_view(database, view.fork.as_ref());
+        let inner = &self.inner;
+        // Asked under this ring, before any sets followed meanwhile.
+        let asked = inner.sets.generation(database);
+        let ring = inner.membership.view();
+        let view = inner.authority.view(database).await.map_err(|status| {
+            Status::unavailable(format!(
+                "can't learn the replica set of {database} from control state: {}",
+                status.message()
+            ))
+        })?;
+        if view.sets.is_none() {
+            // A control node that shows no sets fences placement by its ring: sets this node
+            // followed under an earlier one mustn't answer for it (ADR-0031, amendment 2).
+            let placed = ring.ring().map_or_else(Vec::new, |ring| {
+                ring.replicas_n(database.as_str(), view.holders.replication_factor)
+                    .to_ids()
+            });
+            inner
+                .sets
+                .follow_ring(database, ring.epoch(), placed, asked);
+        }
+        // The candidate serves the incarnation this placement names, if it completes.
+        inner.follow_view(database, &view, super::handover::Origin::Serving);
         Ok(())
     }
 
@@ -835,8 +902,34 @@ impl Replication {
         drop(exclusive);
         inner.lock_followers().remove(database);
         inner.lock_orphans().remove(database);
+        inner.sets.forget(database);
+        inner.forks.forget_opening(database);
         tracing::info!(database = %database, "discarded the database's copy");
         deleted.and(forgotten)
+    }
+
+    /// Deletes this node's copy of `database` only if nothing has recorded it yet: no epoch and
+    /// no incarnation, as a copy just built here that no lease was ever confirmed for. It
+    /// decides with the copy held exclusively, so no stream or fence applies to it meanwhile; a
+    /// copy that a fence or a stream has recorded since is kept, known to drop notices and the
+    /// orphan check, since it may hold frames a primary counted. Returns whether it deleted it.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error if the copy's files can't be deleted.
+    pub async fn discard_unrecorded(&self, database: &DatabaseName) -> io::Result<bool> {
+        let inner = &self.inner;
+        let slot = inner.slot(database);
+        let Ok(exclusive) = exclusive(inner, &slot).await else {
+            // Something holds the copy: it is in use, so it stays.
+            return Ok(false);
+        };
+        if self.copy_epoch(database).is_some() {
+            return Ok(false);
+        }
+        let deleted = inner.registry().remove(database).await;
+        drop(exclusive);
+        deleted.map(|()| true)
     }
 
     /// Keeps this node's copy of `database` as an orphan (ADR-0042): stops serving it as
@@ -848,7 +941,7 @@ impl Replication {
     /// if it was one already, or if this node has no record of the database.
     pub(crate) async fn orphan(&self, database: &DatabaseName) -> Option<LeaseEpoch> {
         let inner = &self.inner;
-        let epoch = self.highest_epoch(database)?;
+        let epoch = self.copy_epoch(database)?;
         {
             let mut orphans = inner.lock_orphans();
             if orphans.contains_key(database) {

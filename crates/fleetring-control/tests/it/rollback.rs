@@ -267,3 +267,174 @@ fn screening_ignores_unknown_feature_names() {
         .collect();
     assert_eq!(members.get(&id("b")), Some(&0));
 }
+
+/// What a 0.7 control node decodes of this build's log and snapshots, as the
+/// `fleetringd-v0.7.0` tag defines it. 0.7 ignores fields it doesn't know, so what refuses a log
+/// or a snapshot is a name its enums lack: a feature that isn't `undrain`, `metadata` or
+/// `expiry`, an action it doesn't have, and a denylist key that is neither a token nor a key.
+pub(crate) mod v0_7 {
+    use std::collections::BTreeSet;
+
+    use fleetring_control::Timestamp;
+    use serde::Deserialize;
+    use serde::de::IgnoredAny;
+
+    /// 0.7.0's `Feature`: no `fork`, `delegation` or `handover`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum Feature {
+        Undrain,
+        Metadata,
+        Expiry,
+    }
+
+    /// The part of 0.7's state that decodes strictly: the enabled features.
+    #[derive(Debug, Deserialize)]
+    #[expect(
+        dead_code,
+        reason = "decoding the features is the test; nothing reads them"
+    )]
+    pub(crate) struct State {
+        #[serde(default)]
+        pub(crate) features: BTreeSet<Feature>,
+    }
+
+    /// 0.7's command: no `recorded_by`, which it ignores.
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct Command {
+        pub(crate) at: Timestamp,
+        pub(crate) action: Action,
+    }
+
+    /// 0.7.0's actions, every one of them, by name. The payloads 0.8 left unchanged, or only
+    /// added fields to, are skipped; `RevokeToken`'s, whose key 0.8 extended, decodes as 0.7's.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[expect(
+        dead_code,
+        reason = "decoding the action's name is the test; nothing reads the payloads"
+    )]
+    pub(crate) enum Action {
+        Join(IgnoredAny),
+        Leave(IgnoredAny),
+        Heartbeat(IgnoredAny),
+        CreateDatabase(IgnoredAny),
+        UpdateDatabase(IgnoredAny),
+        ExpireDatabase(IgnoredAny),
+        ChangeDurability(IgnoredAny),
+        DropDatabase(IgnoredAny),
+        AcquireLease(IgnoredAny),
+        RenewLease(IgnoredAny),
+        StartPromotion(IgnoredAny),
+        RecordFenced(IgnoredAny),
+        CompletePromotion(IgnoredAny),
+        Tick,
+        Drain(IgnoredAny),
+        Undrain(IgnoredAny),
+        TransferLease(IgnoredAny),
+        RevokeToken { revoked: Revoked, until: Timestamp },
+    }
+
+    /// 0.7's denylist key: a token or a key.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[expect(
+        dead_code,
+        reason = "decoding the keys is the test; nothing reads them"
+    )]
+    pub(crate) enum Revoked {
+        Token(String),
+        Key(String),
+    }
+
+    /// 0.7's denylist: `[revoked, until]` pairs.
+    #[derive(Debug, Deserialize)]
+    #[expect(
+        dead_code,
+        reason = "decoding the entries is the test; nothing reads them"
+    )]
+    pub(crate) struct Revocations(pub(crate) Vec<(Revoked, Timestamp)>);
+
+    /// Whether a 0.7 control node decodes `command` from this build's log, or why not.
+    pub(crate) fn decodes_command(
+        command: &fleetring_control::Command,
+    ) -> Result<(), serde_json::Error> {
+        let logged = serde_json::to_string(command).expect("serializes");
+        serde_json::from_str::<Command>(&logged).map(drop)
+    }
+
+    /// Whether a 0.7 control node decodes `state` as a snapshot, or why not.
+    pub(crate) fn decodes_state(state: &fleetring_control::State) -> Result<(), serde_json::Error> {
+        let snapshot = serde_json::to_string(state).expect("serializes");
+        serde_json::from_str::<State>(&snapshot).map(drop)
+    }
+}
+
+/// Rollback to 0.7 is refused once a principal revocation is applied: the command that enabled
+/// `delegation` with it, the snapshot that records the feature, and the denylist entry, which
+/// 0.7 can't read, are each refused; until then the denylist decodes (ADR-0047, points 6.6 and
+/// 12.5).
+#[test]
+fn a_log_with_a_principal_entry_cant_load_on_0_7() {
+    use crate::common::delegation::{principal, stamped};
+
+    let mut state = crate::common::delegation::fleet();
+    let revoke_token = Action::RevokeToken {
+        revoked: fleetring_control::Revoked::Token("t1".parse().expect("an id")),
+        until: at(60_000),
+    };
+    stamped(&mut state, 1_000, revoke_token).expect("revoked");
+    let denylist = serde_json::to_string(state.revocations()).expect("serializes");
+    assert!(serde_json::from_str::<v0_7::Revocations>(&denylist).is_ok());
+
+    let action = Action::RevokePrincipal {
+        principal: principal("agent-42"),
+    };
+    stamped(&mut state, 2_000, action.clone()).expect("revoked");
+    assert!(state.is_enabled(Feature::Delegation));
+    let snapshot = serde_json::to_string(&state).expect("serializes");
+    let refused = serde_json::from_str::<v0_7::State>(&snapshot).expect_err("0.7 refuses it");
+    assert!(refused.to_string().contains("delegation"), "{refused}");
+    let denylist = serde_json::to_string(state.revocations()).expect("serializes");
+    assert!(serde_json::from_str::<v0_7::Revocations>(&denylist).is_err());
+    let logged = serde_json::to_string(&fleetring_control::Command::stamped(
+        at(2_000),
+        id("c1"),
+        action,
+    ))
+    .expect("serializes");
+    assert!(serde_json::from_str::<v0_7::Command>(&logged).is_err());
+}
+
+/// Rollback to 0.7 is allowed until the first `RecordDelegation`, and refused after: 0.7 reads
+/// stamped commands, ignoring `recorded_by`, and a snapshot without `delegation`, but not one
+/// that has enabled it, nor the command that did (ADR-0047, point 6.6).
+#[test]
+fn a_log_with_delegation_enabled_cant_load_without_it() {
+    use crate::common::delegation::{Ask, fleet, leaf, recorded, root_token, stamped};
+
+    let mut state = fleet();
+    let tick = fleetring_control::Command::stamped(at(1), id("c1"), Action::Tick);
+    apply(&mut state, tick.clone()).expect("tick");
+    let logged = serde_json::to_string(&tick).expect("serializes");
+    let decoded: v0_7::Command = serde_json::from_str(&logged).expect("0.7 decodes a stamped tick");
+    assert_eq!(decoded.at, at(1));
+    assert!(matches!(decoded.action, v0_7::Action::Tick));
+    let snapshot = serde_json::to_string(&state).expect("serializes");
+    assert!(serde_json::from_str::<v0_7::State>(&snapshot).is_ok());
+
+    let ask = Ask::new(1, "c7", leaf("agent-42.c7"), 7_200_000);
+    let action = ask.action(&root_token("agent-42", "root-jti"));
+    recorded(stamped(&mut state, 1_000, action.clone()));
+    assert!(state.is_enabled(Feature::Delegation));
+    let snapshot = serde_json::to_string(&state).expect("serializes");
+    let refused = serde_json::from_str::<v0_7::State>(&snapshot).expect_err("0.7 refuses it");
+    assert!(refused.to_string().contains("delegation"), "{refused}");
+    let logged = serde_json::to_string(&fleetring_control::Command::stamped(
+        at(1_000),
+        id("c1"),
+        action,
+    ))
+    .expect("serializes");
+    assert!(serde_json::from_str::<v0_7::Command>(&logged).is_err());
+}

@@ -233,7 +233,9 @@ fn an_impostor_node_is_refused_on_databases_it_does_not_host() {
     });
 }
 
-/// The databases whose replica set differs between `before` and `after`, two control states.
+/// The databases whose placement differs between `before` and `after`, two control states. A
+/// membership change moves placement at once; the replica set promotions fence follows once the
+/// primary reports that placement's write quorum holds its log (ADR-0031, amendment 2).
 fn moved(
     before: &fleetring_control::State,
     after: &fleetring_control::State,
@@ -241,7 +243,7 @@ fn moved(
     let mut moved = BTreeSet::new();
     for database in before.databases() {
         let name = database.name();
-        if before.replica_set(name)? != after.replica_set(name)? {
+        if before.placed_replica_set(name)? != after.placed_replica_set(name)? {
             moved.insert(name.clone());
         }
     }
@@ -289,7 +291,7 @@ fn joined(seed: u64) -> Result<Report, Box<dyn Error>> {
         .iter()
         .find(|name| {
             after
-                .replica_set(name)
+                .placed_replica_set(name)
                 .is_ok_and(|set| set.contains(&joining))
         })
         .ok_or("the join moved no replica")?
@@ -300,7 +302,19 @@ fn joined(seed: u64) -> Result<Report, Box<dyn Error>> {
     fleet.await_ring(Duration::from_secs(5))?;
     // The replica the join moved away keeps the copy it had; only the new replica set must
     // agree.
-    await_placed_converged(&mut fleet, &database, &after.replica_set(&database)?)?;
+    let placed = after.placed_replica_set(&database)?;
+    await_placed_converged(&mut fleet, &database, &placed)?;
+    // Placement's write quorum holds the log, so the control plane releases the old set.
+    let released = database.clone();
+    fleet.run_until(
+        Duration::from_secs(30),
+        "the kept replica set released",
+        |fleet| {
+            fleet
+                .control_state()
+                .is_some_and(|state| state.replica_set(&released).ok().as_ref() == Some(&placed))
+        },
+    )?;
     let copy = fleet
         .replication(JOINING)
         .and_then(|replication| replication.follower_status(&database))

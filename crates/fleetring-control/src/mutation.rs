@@ -1,5 +1,6 @@
-//! Deliberate bugs for FR-087's mutation check: the fork simulation matrix runs once with each,
-//! and a history-checker property must fail every time, or the matrix has a gap.
+//! Deliberate bugs for FR-087's mutation check: the fork simulation matrix, and the hand-over
+//! scenarios of FR-102, run once with each, and a history-checker property must fail every
+//! time, or the matrix has a gap.
 //!
 //! A mutation is chosen at compile time with the `FLEETRING_MUTATION` environment variable,
 //! which `scripts/fork-mutations.sh` sets to one [`Mutation`]'s name. It can never reach a
@@ -54,11 +55,17 @@ pub enum Mutation {
     /// the reset's position, from the primary's report of it running, before the marker is
     /// durable in its own log.
     FollowerReportsResetEarly,
+    /// A membership change moves a leased database's replica set at once: control state keeps
+    /// no replica set (FR-102; ADR-0031, amendment 2).
+    MoveKeptReplicaSet,
+    /// A primary counts placement's write quorum alone toward a write, not the kept replica
+    /// set's beside it (FR-102; ADR-0031, amendment 2).
+    CountPlacementAlone,
 }
 
 impl Mutation {
     /// Every mutation, in the order the mutation check runs them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::PinAtTip,
         Self::CompleteOnOneHolder,
         Self::NonHolderFirstLease,
@@ -71,6 +78,8 @@ impl Mutation {
         Self::MoveSeededReplicaSet,
         Self::ResetCommittedOnOne,
         Self::FollowerReportsResetEarly,
+        Self::MoveKeptReplicaSet,
+        Self::CountPlacementAlone,
     ];
 
     /// The name `FLEETRING_MUTATION` gives it.
@@ -89,6 +98,8 @@ impl Mutation {
             Self::MoveSeededReplicaSet => "move_seeded_replica_set",
             Self::ResetCommittedOnOne => "reset_committed_on_one",
             Self::FollowerReportsResetEarly => "follower_reports_reset_early",
+            Self::MoveKeptReplicaSet => "move_kept_replica_set",
+            Self::CountPlacementAlone => "count_placement_alone",
         }
     }
 

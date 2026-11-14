@@ -6,20 +6,26 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
+use fleetring_control::delegation::{
+    AgentName, CallerToken, CanonicalRequest, ClaimField, Delegation, DelegationId, Forgery,
+    Resent, TokenClaims, TokenKind,
+};
 use fleetring_control::fork::{ForkExpiry, ForkIntent, ForkLimits, OperationId, OperationRecord};
+use fleetring_control::scope::Scopes;
 use fleetring_control::{
     Acks, Action, Applied, DatabaseName, Durability, Engine, ExpiryChange, Feature, Incarnation,
-    Lease, LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName, Rejection,
-    Revoked, Software, State, Timestamp,
+    KeyId, Lease, LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName,
+    Rejection, Revoked, Software, State, Timestamp,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     self as proto, AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
-    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
-    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
-    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
+    DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
+    ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
     LocateRequest, LocateResponse, MembershipUpdate, Placement, PromotionResponse,
     RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest,
     RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest, UndrainRequest,
@@ -32,10 +38,11 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{
-    Action as AuthAction, BindingDenied, Caller, Unbound, authorized, require_database,
+    Action as AuthAction, Authorized, BearerToken, BindingDenied, Caller, Carriage, Credential,
+    DelegationSigner, IssueError, Signer, Unbound, authorized, require_database,
 };
-use crate::auth::{MAX_TOKEN_LIFETIME, NOT_BEFORE_LEEWAY_SECS};
 use crate::clock::{Clock, SystemClock};
+use crate::control::delegation::{self, Times};
 use crate::control::fork::{
     SeedProgressBoard, fork_status, operation_from_proto, operation_status, replica_from_proto,
     role_to_proto,
@@ -44,7 +51,7 @@ use crate::control::node::{ControlHandle, SubmitError};
 use crate::control::notices::DropNotices;
 use crate::data::convert::{
     acks_from_proto, acks_to_proto, change_from_proto, description_from_proto, labels_from_proto,
-    metadata_to_proto, revocation_from_proto, revocations_to_proto, spec_expiry_from_proto,
+    metadata_to_proto, revocations_to_proto, spec_expiry_from_proto,
 };
 use crate::data::{Descriptions, Expiry, ExpiryRequest, LabelRequirement, is_invisible};
 use crate::dev::DevMode;
@@ -52,7 +59,9 @@ use crate::environment::Network;
 use crate::replication::ForkFaults;
 use crate::router::{Entropy, SystemEntropy};
 use crate::software::{software_from_proto, software_to_proto};
-use crate::tls::Peer;
+use crate::tls::{IssuerCertError, IssuerPair, Peer};
+
+mod revoke;
 
 /// The stream `WatchMembership` returns.
 pub type MembershipStream = Pin<Box<dyn Stream<Item = Result<MembershipUpdate, Status>> + Send>>;
@@ -105,6 +114,14 @@ pub const MIN_EXPIRY: Millis = Millis::new(60_000);
 /// broken.
 const INCARNATION_DRAWS: usize = 4;
 
+/// How many delegation IDs a delegation draws before it gives up: `apply` refuses one a kept
+/// record already has, and the service draws again (ADR-0047, point 2.4). Drawing more than
+/// twice means the generator is broken.
+const DELEGATION_ID_DRAWS: usize = 4;
+
+/// The log target of audit lines, as the request boundary writes them.
+const AUDIT: &str = "fleetringd::audit";
+
 /// The `Control` service: every mutation goes through the control node's single writer, and
 /// reads come from its published state.
 #[derive(Debug, Clone)]
@@ -123,6 +140,9 @@ pub struct ControlService {
     fork_faults: ForkFaults,
     /// The progress of the copies replicas stream, for forks' status.
     progress: SeedProgressBoard,
+    /// The control node's delegation issuer pair, which signs delegated agents' tokens
+    /// (ADR-0047, point 1); `None` refuses every delegation.
+    issuer: Option<IssuerPair>,
 }
 
 impl ControlService {
@@ -141,7 +161,17 @@ impl ControlService {
             fork_limits: ForkLimits::new(),
             fork_faults: ForkFaults::default(),
             progress: SeedProgressBoard::default(),
+            issuer: None,
         }
+    }
+
+    /// Signs delegated agents' tokens with `pair`, the control node's `[control] issuer_cert`
+    /// and `issuer_key` (ADR-0047, point 1.3). Without one, `DelegateToken` answers
+    /// `FAILED_PRECONDITION`.
+    #[must_use]
+    pub fn with_issuer(mut self, pair: IssuerPair) -> Self {
+        self.issuer = Some(pair);
+        self
     }
 
     /// Draws incarnations from `entropy`, the operating system's randomness by default, and a
@@ -422,17 +452,498 @@ impl ControlService {
     }
 }
 
+impl ControlService {
+    /// Mints a delegated agent's token for `caller` (ADR-0047, point 5), in the order the plan
+    /// gives. Every refusal comes before anything is logged, `apply`'s too, which the writer
+    /// answers unlogged (`control/node.rs`), and the token reaches no log,
+    /// error, or metric: it travels only in the reply.
+    async fn delegate(
+        &self,
+        caller: &Delegator,
+        request: DelegateTokenRequest,
+    ) -> Result<Delegated, Status> {
+        let operation = operation_from_proto(&request.operation_id)?;
+        let child = delegation::child_name(&caller.name, &request.segment)?;
+        let asked = delegation::parse_scopes(&request.scopes)?;
+        let lifetime = request.lifetime_ms.map(Millis::new);
+        let not_before = request.not_before_ms.map(Timestamp::from_millis);
+
+        // The feature: a fleet with a member that lacks it never delegates.
+        let state = self.node.state();
+        state
+            .check_feature(Feature::Delegation)
+            .map_err(|rejection| rejection_status(&rejection))?;
+
+        // The time every check below judges by.
+        let now = delegation::resolve_now(self.clock.now(), state.now())?;
+
+        // The issuer: one signer for the whole request, so its certificate, key ID, and expiry
+        // come from one pair even if a rotation lands meanwhile.
+        let signer = self.issuer_signer(&state, now)?;
+
+        // The caller, against this state: its lineage recorded as presented, and nothing in it
+        // revoked, the authority key that certified its issuer included.
+        check_lineage(&state, caller, now)?;
+        if let Some(by) = caller
+            .signer
+            .refusal_in(state.revocations(), &caller.claims, &caller.key)
+        {
+            return Err(rejection_status(&Rejection::CallerRevoked { by }));
+        }
+
+        let presented = CallerToken {
+            claims: (*caller.claims).clone(),
+            kid: caller.key.clone(),
+        };
+        let canonical = CanonicalRequest {
+            segment: request.segment.into(),
+            scopes: asked.as_ref().map(Scopes::normalized),
+            lifetime,
+            not_before,
+            caller_token: caller.claims.id.clone(),
+        };
+        // Resolved below for a new delegation; a resend's are ignored.
+        let mut action = Action::RecordDelegation {
+            operation,
+            requested_by: caller.name.as_principal().clone(),
+            request: canonical,
+            caller: presented.clone(),
+            id: DelegationId::from_bytes([0; 16]),
+            scopes: Scopes::none(),
+            not_before: Timestamp::from_millis(0),
+            expires_at: Timestamp::from_millis(0),
+        };
+
+        // A resend from state, answered without logging.
+        if let Some(resent) = state.delegation_resend(&action, now) {
+            let (id, record) = resent.map_err(|rejection| rejection_status(&rejection))?;
+            let recorded = Recorded {
+                id: id.clone(),
+                claims: record.claims.clone(),
+                origin: Origin::Resent,
+            };
+            return self.sign_recorded(&signer, caller, lifetime, recorded);
+        }
+
+        let scopes = delegation::resolve_scopes(&caller.scopes, &child, asked.as_ref())?;
+        let times = delegation::resolve_times(now, caller.claims.expires_at, not_before, lifetime)?;
+        if times.expires_at > signer.expires_at() {
+            return Err(issuer_refusal(
+                self.issuer.as_ref(),
+                "expires before the token would",
+            ));
+        }
+
+        // A token every node would refuse is refused before anything is recorded (P13).
+        let mut id = self.draw_delegation_id();
+        let trial = delegation::child_claims(&presented, &child, &id, scopes.clone(), times, now);
+        signer.sign(&trial).map_err(|error| sign_status(&error))?;
+
+        fill(&mut action, &id, scopes, times);
+        for draw in 1..=DELEGATION_ID_DRAWS {
+            // The writer answers `apply`'s refusal of this command without logging it.
+            let outcome = match self.node.submit(action.clone()).await {
+                Ok(committed) => committed.into_outcome(),
+                Err(SubmitError::Refused(rejection)) => Err(rejection),
+                Err(error) => return Err(submit_status(error)),
+            };
+            match outcome {
+                Ok(Applied::DelegationRecorded { id, claims, resent }) => {
+                    let origin = match resent {
+                        Resent::No => Origin::Recorded,
+                        Resent::Yes => Origin::Resent,
+                    };
+                    let recorded = Recorded { id, claims, origin };
+                    return self.sign_recorded(&signer, caller, lifetime, recorded);
+                }
+                Ok(other) => return Err(unexpected(&other)),
+                Err(Rejection::DelegationIdTaken { .. }) if draw < DELEGATION_ID_DRAWS => {
+                    tracing::warn!("the delegation ID drawn is taken; drawing again");
+                    id = self.draw_delegation_id();
+                    if let Action::RecordDelegation { id: drawn, .. } = &mut action {
+                        *drawn = id.clone();
+                    }
+                }
+                Err(rejection) => return Err(rejection_status(&rejection)),
+            }
+        }
+        Err(Status::unavailable(
+            "every delegation ID drawn was taken; retry with the same operation ID",
+        ))
+    }
+
+    /// Signs `recorded`, a recorded delegation's claims, with `signer`, the one pair this
+    /// request took, and answers with the token.
+    fn sign_recorded(
+        &self,
+        signer: &DelegationSigner,
+        caller: &Delegator,
+        lifetime: Option<Millis>,
+        recorded: Recorded,
+    ) -> Result<Delegated, Status> {
+        let Recorded { id, claims, origin } = recorded;
+        if claims.expires_at > signer.expires_at() {
+            return Err(issuer_refusal(
+                self.issuer.as_ref(),
+                "expires before the token would",
+            ));
+        }
+        let token = signer.sign(&claims).map_err(|error| {
+            tracing::error!(%error, delegation = %id, "a recorded delegation couldn't be signed");
+            Status::unavailable(
+                "the delegation is recorded but couldn't be signed; retry with the same operation \
+                 ID",
+            )
+        })?;
+        Ok(Delegated {
+            capped: delegation::capped(lifetime, claims.expires_at, caller.claims.expires_at),
+            token,
+            id,
+            issuer_key: signer.key_id().clone(),
+            claims,
+            origin,
+        })
+    }
+
+    /// The signer of the issuer pair in use, if it may sign now (ADR-0047, point 1.6): the pair
+    /// is configured, its key and the authority key that certified it aren't revoked, and its
+    /// certificate is valid at `now`. The signer reads no clock, so this is where the time is
+    /// checked; a pair that has expired, or isn't valid yet, loads by design.
+    fn issuer_signer(&self, state: &State, now: Timestamp) -> Result<DelegationSigner, Status> {
+        let Some(pair) = &self.issuer else {
+            return Err(Status::failed_precondition(
+                "this fleet has no delegation issuer; run `fleetring cert issuer`",
+            ));
+        };
+        let refuse = |why: &str| issuer_refusal(Some(pair), why);
+        let signer = pair.signer().map_err(|error| {
+            tracing::error!(%error, "the delegation issuer pair can't sign");
+            refuse("can't be used")
+        })?;
+        let certificate = signer.certificate();
+        let revocations = state.revocations();
+        if revocations.contains(&Revoked::Key(signer.key_id().clone())) {
+            return Err(refuse("has a revoked key"));
+        }
+        if revocations.contains(&Revoked::Key(certificate.authority_key_id().clone())) {
+            return Err(refuse("was certified by a revoked authority key"));
+        }
+        match certificate.valid_at(now) {
+            Ok(()) => Ok(signer),
+            Err(IssuerCertError::NotYetValid) => Err(refuse("isn't valid yet")),
+            Err(_) => Err(refuse("has expired")),
+        }
+    }
+
+    /// A delegation ID: 16 bytes from the injected generator (ADR-0047, point 2.4).
+    fn draw_delegation_id(&self) -> DelegationId {
+        let mut bytes = [0_u8; 16];
+        self.entropy.fill(&mut bytes);
+        DelegationId::from_bytes(bytes)
+    }
+}
+
+/// Fills a `RecordDelegation`'s resolved fields: the drawn ID, the scopes, and the times.
+fn fill(action: &mut Action, drawn: &DelegationId, resolved: Scopes, times: Times) {
+    if let Action::RecordDelegation {
+        id,
+        scopes,
+        not_before,
+        expires_at,
+        ..
+    } = action
+    {
+        *id = drawn.clone();
+        *scopes = resolved;
+        *not_before = times.not_before;
+        *expires_at = times.expires_at;
+    }
+}
+
+/// A caller that may ask for a delegation, as the request boundary authenticated it: an agent,
+/// by its own token, carried directly.
+#[derive(Debug)]
+struct Delegator {
+    /// The caller's name, `P`.
+    name: AgentName,
+    /// Every claim of the token it presented.
+    claims: Arc<TokenClaims>,
+    /// The key that signed the copy it presented.
+    key: KeyId,
+    /// Who signed that copy.
+    signer: Signer,
+    /// Its effective scopes: its token's.
+    scopes: Scopes,
+}
+
+impl Delegator {
+    /// The caller of `request`, if it may ask for a delegation at all (ADR-0047, points 4.5 and
+    /// 5.2): a principal authenticated by its token, never a certificate alone; its token not
+    /// relay-carried; an agent's token, naming an agent and an owner.
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED` naming which of these the caller isn't.
+    fn of<T>(request: &Request<T>) -> Result<Self, Status> {
+        let (name, scopes, credential) = match authorized(request)?.caller() {
+            Caller::Principal {
+                name,
+                scopes,
+                credential,
+            } => (name, scopes, credential),
+            Caller::Node(_) | Caller::Anonymous => {
+                return Err(Status::permission_denied(
+                    "delegation needs an agent's bearer token",
+                ));
+            }
+        };
+        let (claims, key, signer, carriage) = match credential {
+            Credential::Token {
+                claims,
+                key,
+                signer,
+                carriage,
+                ..
+            } => (claims, key, signer, *carriage),
+            Credential::Certificate => {
+                return Err(Status::permission_denied(
+                    "delegation needs an agent's bearer token; a certificate alone can't delegate",
+                ));
+            }
+        };
+        match carriage {
+            Carriage::Direct => {}
+            Carriage::Relayed => {
+                return Err(Status::permission_denied(
+                    "delegation needs a direct connection with the certificate of the caller or \
+                     an ancestor",
+                ));
+            }
+        }
+        if claims.kind != Some(TokenKind::Agent) {
+            return Err(Status::permission_denied(
+                "only an agent's token can delegate, and this token doesn't say it is one",
+            ));
+        }
+        let agent = AgentName::try_from(claims.principal.clone()).map_err(|_| {
+            Status::permission_denied(format!(
+                "only an agent can delegate, and '{name}' isn't one"
+            ))
+        })?;
+        if claims.owner.is_none() {
+            return Err(Status::permission_denied(
+                "an agent's token without an owner can't delegate",
+            ));
+        }
+        Ok(Self {
+            name: agent,
+            claims: Arc::clone(claims),
+            key: key.clone(),
+            signer: signer.clone(),
+            scopes: scopes.clone(),
+        })
+    }
+}
+
+/// Whether a delegation was recorded by this request or answered a resend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Recorded,
+    Resent,
+}
+
+impl Origin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Resent => "resent",
+        }
+    }
+}
+
+/// A recorded delegation, to sign: its ID, its claims, and whether this request recorded it.
+struct Recorded {
+    id: DelegationId,
+    claims: TokenClaims,
+    origin: Origin,
+}
+
+/// A signed delegation, for the reply and the audit line.
+struct Delegated {
+    token: BearerToken,
+    id: DelegationId,
+    claims: TokenClaims,
+    issuer_key: KeyId,
+    capped: bool,
+    origin: Origin,
+}
+
+impl Delegated {
+    fn into_response(self) -> DelegateTokenResponse {
+        DelegateTokenResponse {
+            token: self.token.expose().to_owned(),
+            delegation_id: self.id.to_string(),
+            principal: self.claims.principal.to_string(),
+            scopes: scope_texts(&self.claims.scopes),
+            not_before_ms: self.claims.not_before.as_millis(),
+            expires_at_ms: self.claims.expires_at.as_millis(),
+            capped: self.capped,
+            issuer_key_id: self.issuer_key.to_string(),
+        }
+    }
+}
+
+/// Each scope's canonical text, in order.
+fn scope_texts(scopes: &Scopes) -> Vec<String> {
+    scopes.as_slice().iter().map(ToString::to_string).collect()
+}
+
+/// Checks a delegated caller's lineage against `state` (ADR-0047, point 5.9, I6): its
+/// delegation is recorded and live, and the claims it presented are the recorded ones, field by
+/// field. A root caller has no record. `apply` checks the same before it records; checking here
+/// too refuses a forged caller's resend, which `apply` never sees.
+fn check_lineage(state: &State, caller: &Delegator, now: Timestamp) -> Result<(), Status> {
+    if !caller.name.is_delegated() {
+        return Ok(());
+    }
+    let forged = |reason| rejection_status(&Rejection::ForgedLineage { reason });
+    let record = DelegationId::try_from(caller.claims.id.clone())
+        .ok()
+        .and_then(|id| state.delegation(&id, now))
+        .ok_or_else(|| forged(Forgery::Unrecorded))?;
+    if !record.is_live(now, now) {
+        return Err(forged(Forgery::NotLive));
+    }
+    if let Some(field) = ClaimField::first_difference(&record.claims, &caller.claims) {
+        return Err(forged(Forgery::Differs { field }));
+    }
+    Ok(())
+}
+
+/// The `FAILED_PRECONDITION` a delegation answers when the issuer pair can't sign it, naming
+/// the certificate file and the command that makes a new pair (ADR-0047, point 1.6).
+fn issuer_refusal(pair: Option<&IssuerPair>, why: &str) -> Status {
+    let cert = pair.map_or_else(
+        || "certificate".to_owned(),
+        |pair| format!("certificate {}", pair.files().cert.display()),
+    );
+    Status::failed_precondition(format!(
+        "the delegation issuer {cert} {why}; issue a new pair with `fleetring cert issuer` and \
+         replace [control] issuer_cert and issuer_key"
+    ))
+}
+
+/// The status a trial signature's refusal answers, before anything is recorded.
+fn sign_status(error: &IssueError) -> Status {
+    match error {
+        IssueError::TooLarge { .. } => {
+            Status::invalid_argument("the child's token would exceed 8 KiB; ask for fewer scopes")
+        }
+        IssueError::OutlivesCertificate => Status::failed_precondition(
+            "the delegation issuer certificate expires before the token would; issue a new pair \
+             with `fleetring cert issuer`",
+        ),
+        other => Status::invalid_argument(format!("can't delegate: {other}")),
+    }
+}
+
+/// Writes the audit line of a delegation (ADR-0047, point 5.12): the caller, the child, the
+/// scopes, the expiry, the operation, the delegation ID, the issuer key's ID, and the result;
+/// never the token.
+fn audit_delegation(
+    caller: &Delegator,
+    request: &AuditedRequest,
+    result: &Result<Delegated, Status>,
+) {
+    let credential = format!("token:{}", caller.claims.id);
+    match result {
+        Ok(delegated) => tracing::info!(
+            target: AUDIT,
+            principal = %caller.name,
+            credential,
+            child = %delegated.claims.principal,
+            scopes = %scope_texts(&delegated.claims.scopes).join(","),
+            expires_at = delegated.claims.expires_at.as_millis(),
+            operation = %request.operation,
+            delegation = %delegated.id,
+            issuer_key = %delegated.issuer_key,
+            result = delegated.origin.as_str(),
+            rpc = "DelegateToken",
+            "delegated a token",
+        ),
+        Err(status) => tracing::warn!(
+            target: AUDIT,
+            principal = %caller.name,
+            credential,
+            segment = %request.segment,
+            operation = %request.operation,
+            result = "refused",
+            code = ?status.code(),
+            reason = status.message(),
+            rpc = "DelegateToken",
+            "refused a delegation",
+        ),
+    }
+}
+
+/// What an audit line names of the request itself.
+struct AuditedRequest {
+    operation: String,
+    segment: String,
+}
+
+impl AuditedRequest {
+    fn of(request: &DelegateTokenRequest) -> Self {
+        Self {
+            operation: operation_from_proto(&request.operation_id)
+                .map_or_else(|_| "invalid".to_owned(), |operation| operation.to_string()),
+            segment: request.segment.escape_debug().to_string(),
+        }
+    }
+}
+
+/// A live delegation record as `ListDelegations` returns it: never its token.
+fn delegation_record(id: &DelegationId, record: &Delegation) -> proto::DelegationRecord {
+    let claims = &record.claims;
+    proto::DelegationRecord {
+        principal: claims.principal.to_string(),
+        delegation_id: id.to_string(),
+        parent: claims
+            .parent
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        chain: claims
+            .chain
+            .iter()
+            .map(|link| proto::ChainLink {
+                id: link.id.to_string(),
+                kid: link.kid.to_string(),
+            })
+            .collect(),
+        issued_at_ms: claims.issued_at.map_or(0, Timestamp::as_millis),
+        expires_at_ms: claims.expires_at.as_millis(),
+        recorded_by: record.recorded_by.to_string(),
+        recorded_at_ms: record.recorded_at.as_millis(),
+    }
+}
+
 /// Maps a rejection to the gRPC status a caller receives, with the rejection's message.
 ///
-/// - `NOT_FOUND`: an unknown member or database. An unknown database also names itself in the
+/// - `NOT_FOUND`: an unknown member or database, or, under the ancestor rule, a token ID that
+///   is neither the caller's nor a live delegation's below it. An unknown database also names
+///   itself in the
 ///   [`MISSING_DATABASE_KEY`] metadata, so that a caller can tell the two apart
 ///   ([`missing_database`]).
 /// - `ALREADY_EXISTS`: the database exists, the member is already fenced, or a fork operation
 ///   ID was reused with a different request.
-/// - `PERMISSION_DENIED`: a fork operation ID that another principal requested.
-/// - `RESOURCE_EXHAUSTED`: too few replicas have room for a fork, or too many fork operations
-///   are kept.
-/// - `UNAVAILABLE`: an incarnation that turned out to be in use, which a retry draws again.
+/// - `PERMISSION_DENIED`: a fork operation ID that another principal requested; a delegation
+///   wider than its parent's record, by a revoked or forged caller; a revocation outside the
+///   ancestor rule's reach.
+/// - `RESOURCE_EXHAUSTED`: too few replicas have room for a fork, too many fork operations are
+///   kept, or a delegation's or an ancestor-rule revocation's limit is reached.
+/// - `UNAVAILABLE`: an incarnation or delegation ID that turned out to be in use, which a retry
+///   draws again, or a delegation of a name revoked less than a second ago.
 /// - `INVALID_ARGUMENT`: the request itself is malformed: a duplicate report, a join that
 ///   would make an invalid ring, durability settings that don't fit the replication factor, or
 ///   an update that would leave too many labels.
@@ -445,6 +956,9 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
     let message = rejection.to_string();
     match rejection {
         Rejection::UnknownMember { .. } => Status::not_found(message),
+        // Says nothing more, so nobody can probe for another principal's tokens (ADR-0047,
+        // point 11.3).
+        Rejection::NoLiveDelegation { .. } => Status::not_found(message),
         Rejection::UnknownDatabase { database } => {
             let mut status = Status::not_found(message);
             if let Ok(value) = MetadataValue::try_from(database.as_str()) {
@@ -454,7 +968,8 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
         }
         Rejection::DatabaseExists { .. }
         | Rejection::AlreadyFenced { .. }
-        | Rejection::OperationConflict { .. } => Status::already_exists(message),
+        | Rejection::OperationConflict { .. }
+        | Rejection::DelegationConflict { .. } => Status::already_exists(message),
         // Says nothing about the operation beyond that it isn't the caller's (ADR-0046,
         // point 5.2).
         Rejection::OperationNotYours { .. } => Status::permission_denied(message),
@@ -462,6 +977,21 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
         Rejection::InsufficientDisk { .. } | Rejection::TooManyOperations { .. } => {
             Status::resource_exhausted(message)
         }
+        // A delegation's limits (ADR-0047, point 5.10): a window may reopen, a slot free.
+        Rejection::DelegationLimit { .. } => Status::resource_exhausted(message),
+        // A delegation the request itself makes invalid, whoever proposed it.
+        Rejection::DelegationStructure { .. }
+        | Rejection::DelegationClaims { .. }
+        | Rejection::NonCanonicalScopes => Status::invalid_argument(message),
+        // The caller may not have it: wider than its parent's record, revoked, or forged.
+        Rejection::NotNarrowed { .. }
+        | Rejection::CallerRevoked { .. }
+        | Rejection::ForgedLineage { .. } => Status::permission_denied(message),
+        // Outside the caller's reach under the ancestor rule (ADR-0047, point 11.3).
+        Rejection::NotAncestor { .. } => Status::permission_denied(message),
+        // The ancestor rule's cap and rates (ADR-0047, point 11.6): a window may reopen, and
+        // revoking the busiest child frees entries.
+        Rejection::RevocationLimit { .. } => Status::resource_exhausted(message),
         Rejection::InvalidTopology { .. }
         | Rejection::DuplicateReport { .. }
         | Rejection::InvalidDurability { .. }
@@ -474,7 +1004,12 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
             Status::unavailable("the control plane's time moved past the requested expiry; retry")
         }
         // The service draws again before it answers; a caller who still sees it retries.
-        Rejection::IncarnationUnavailable { .. } => Status::unavailable(message),
+        Rejection::IncarnationUnavailable { .. } | Rejection::DelegationIdTaken { .. } => {
+            Status::unavailable(message)
+        }
+        // A delegation of a name revoked in the same second, which a retry a second later
+        // records (ADR-0047, points 5.9 and 11.5).
+        Rejection::RevokedThisSecond { .. } => Status::unavailable(message),
         _ => Status::failed_precondition(message),
     }
 }
@@ -575,7 +1110,9 @@ fn lease_response(database: &DatabaseName, lease: &Lease) -> LeaseResponse {
 ///
 /// The placement carries the database's metadata, if it has any, with its description text as
 /// `descriptions` says, its incarnation, and, for a fork, the fork's state, with the seeder's
-/// progress from `progress`.
+/// progress from `progress`. It also names where the ring places the database and the
+/// membership epoch it was read at, so that a primary counts the write quorums of both the
+/// replica set promotions fence and placement while they differ (ADR-0031, amendment 2).
 fn placement(
     state: &State,
     name: &DatabaseName,
@@ -643,6 +1180,13 @@ fn placement(
         fork: database
             .fork()
             .map(|fork| fork_status(state, database, fork, progress)),
+        placed_replicas: state
+            .placed_replica_set(name)
+            .map_err(|rejection| rejection_status(&rejection))?
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        membership_epoch: Some(state.membership_epoch().get()),
     })
 }
 
@@ -1308,13 +1852,14 @@ impl Control for ControlService {
         let name: DatabaseName = parse("database name", &request.get_ref().database)?;
         require_database(&request, &name)?;
         let state = self.node.state();
+        let mut placement = placement(&state, &name, Descriptions::Include, &self.progress)?;
+        if self.fork_faults.hides_replica_sets() {
+            // As a control node from before replica sets were shown (0.7) answers.
+            placement.placed_replicas.clear();
+            placement.membership_epoch = None;
+        }
         Ok(Response::new(LocateResponse {
-            placement: Some(placement(
-                &state,
-                &name,
-                Descriptions::Include,
-                &self.progress,
-            )?),
+            placement: Some(placement),
         }))
     }
 
@@ -1599,32 +2144,73 @@ impl Control for ControlService {
         &self,
         request: Request<RevokeTokenRequest>,
     ) -> Result<Response<RevokeTokenResponse>, Status> {
-        let revocation = request
-            .into_inner()
-            .revocation
-            .ok_or_else(|| Status::invalid_argument("missing revocation"))?;
-        let (revoked, until) = revocation_from_proto(revocation)?;
-        // No token outlives this, so keeping a token's entry longer only grows the list. A key's
-        // entry may last forever.
-        let until = match revoked {
-            Revoked::Token(_) => until.min(
-                self.clock.now().saturating_add(Millis::new(
-                    u64::try_from(MAX_TOKEN_LIFETIME.as_millis())
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(NOT_BEFORE_LEEWAY_SECS * 1_000),
-                )),
-            ),
-            Revoked::Key(_) => until,
+        let caller = revoke::who(&request);
+        let revoker = revoke::Revoker::of(&request);
+        let targets = revoke::Targets::from_request(request.into_inner());
+        let (described, authority) =
+            revoke::described(revoker.as_ref().ok(), targets.as_ref().ok());
+        let result = match (revoker, targets) {
+            (Ok(revoker), Ok(targets)) => self.revoke(&revoker, targets).await,
+            (Err(status), _) | (_, Err(status)) => Err(status),
         };
-        match self.submit(Action::RevokeToken { revoked, until }).await? {
-            (Applied::TokenRevoked { revoked, until }, _) => {
-                tracing::info!(%revoked, until = until.as_millis(), "revoked");
-                Ok(Response::new(RevokeTokenResponse {
-                    until_ms: until.as_millis(),
-                }))
-            }
-            (other, _) => Err(unexpected(&other)),
-        }
+        revoke::audit(&caller, &described, authority, &result);
+        result.map(Response::new)
+    }
+
+    async fn delegate_token(
+        &self,
+        request: Request<DelegateTokenRequest>,
+    ) -> Result<Response<DelegateTokenResponse>, Status> {
+        let caller = Delegator::of(&request).inspect_err(|status| {
+            let principal = match authorized(&request).map(Authorized::caller) {
+                Ok(Caller::Principal { name, .. }) => name.to_string(),
+                Ok(Caller::Node(id)) => format!("node:{id}"),
+                Ok(Caller::Anonymous) | Err(_) => "anonymous".to_owned(),
+            };
+            tracing::warn!(
+                target: AUDIT,
+                principal,
+                result = "refused",
+                code = ?status.code(),
+                reason = status.message(),
+                rpc = "DelegateToken",
+                "refused a delegation",
+            );
+        })?;
+        let request = request.into_inner();
+        let audited = AuditedRequest::of(&request);
+        let result = self.delegate(&caller, request).await;
+        audit_delegation(&caller, &audited, &result);
+        result.map(|delegated| Response::new(delegated.into_response()))
+    }
+
+    async fn list_delegations(
+        &self,
+        request: Request<ListDelegationsRequest>,
+    ) -> Result<Response<ListDelegationsResponse>, Status> {
+        let request = request.into_inner();
+        let recorded_by: Option<NodeId> = request
+            .recorded_by
+            .as_deref()
+            .map(|text| parse("recorded_by", text))
+            .transpose()?;
+        let from = request.recorded_from_ms.map(Timestamp::from_millis);
+        let to = request.recorded_to_ms.map(Timestamp::from_millis);
+        let state = self.node.state();
+        let now = self.clock.now().max(state.now());
+        let delegations = state
+            .delegations()
+            .filter(|(_, record)| record.is_live(now, now))
+            .filter(|(_, record)| {
+                recorded_by
+                    .as_ref()
+                    .is_none_or(|by| record.recorded_by == *by)
+            })
+            .filter(|(_, record)| from.is_none_or(|from| record.recorded_at >= from))
+            .filter(|(_, record)| to.is_none_or(|to| record.recorded_at <= to))
+            .map(|(id, record)| delegation_record(id, record))
+            .collect();
+        Ok(Response::new(ListDelegationsResponse { delegations }))
     }
 }
 
@@ -1650,5 +2236,281 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    use std::time::Duration;
+
+    use crate::clock::SimClock;
+    use crate::control::node::{ControlNode, ControlOptions, StorageIo};
+    use crate::control::test_support::{member_with_every_feature, root_delegation};
+    use crate::tls::{Authority, Identity, IssuerFiles, IssuerPair, Validity};
+
+    /// A control node with one member that reports every feature, and its service, which signs
+    /// with an issuer pair the test's authority certified, on a clock the test advances.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        node: ControlNode,
+        clock: SimClock,
+        service: ControlService,
+        /// The ID of the authority key that certified the service's issuer pair.
+        certifier: KeyId,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().expect("a directory");
+            let clock = SimClock::new(Timestamp::from_millis(1_000_000));
+            let options = ControlOptions::default()
+                .with_storage_io(StorageIo::Inline)
+                .with_recorder("control".parse().expect("an id"));
+            let node = ControlNode::open(dir.path().join("control.db"), options, clock)
+                .await
+                .expect("opens");
+            let handle = node.handle();
+            handle
+                .submit(Action::Join {
+                    member: member_with_every_feature("data-1"),
+                })
+                .await
+                .expect("the join commits");
+            let year = Validity::new(Timestamp::ZERO, Duration::from_secs(365 * 24 * 3_600));
+            let authority =
+                Authority::create("prod".parse().expect("a fleet"), year).expect("an authority");
+            let control: NodeId = "control".parse().expect("an id");
+            let certificate = authority
+                .issue_node(&control, &["127.0.0.1".to_owned()], year)
+                .expect("a node certificate");
+            let identity = Identity::from_issued(authority.certificate_pem(), &certificate)
+                .expect("an identity");
+            let issued = authority
+                .issue_issuer(
+                    &control,
+                    Validity::new(Timestamp::ZERO, Duration::from_secs(30 * 24 * 3_600)),
+                )
+                .expect("an issuer pair");
+            let files = IssuerFiles {
+                cert: dir.path().join("issuer.crt"),
+                key: dir.path().join("issuer.key"),
+            };
+            std::fs::write(&files.cert, issued.certificate_pem()).expect("written");
+            std::fs::write(&files.key, issued.key_pem()).expect("written");
+            let pair = IssuerPair::load(&files, &identity, Arc::new(clock)).expect("loads");
+            let certifier = pair
+                .signer()
+                .expect("a signer")
+                .certificate()
+                .authority_key_id()
+                .clone();
+            let service = ControlService::new(handle)
+                .with_clock(Arc::new(clock))
+                .with_issuer(pair);
+            Self {
+                _dir: dir,
+                node,
+                clock,
+                service,
+                certifier,
+            }
+        }
+
+        async fn submit(&self, action: Action) -> Applied {
+            self.node
+                .handle()
+                .submit(action)
+                .await
+                .expect("commits")
+                .into_outcome()
+                .expect("applied")
+        }
+
+        async fn revoke(&self, key: &str) {
+            self.submit(Action::RevokeToken {
+                revoked: Revoked::Key(key.parse().expect("a key id")),
+                until: Timestamp::MAX,
+            })
+            .await;
+        }
+    }
+
+    /// `ListDelegations` returns live records only: one kept past its token's `exp`, as every
+    /// record is for an hour and a half, is left out (ADR-0047, point 6.4).
+    #[tokio::test(start_paused = true)]
+    async fn list_delegations_leaves_out_records_kept_past_their_tokens() {
+        let fixture = Fixture::new().await;
+        fixture
+            .submit(root_delegation(fixture.clock.now(), 1, 60_000))
+            .await;
+        let listed = || async {
+            Control::list_delegations(
+                &fixture.service,
+                Request::new(ListDelegationsRequest::default()),
+            )
+            .await
+            .expect("lists")
+            .into_inner()
+            .delegations
+            .len()
+        };
+        assert_eq!(listed().await, 1);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(
+            fixture.node.handle().state().delegations().len(),
+            1,
+            "kept past its token"
+        );
+        assert_eq!(listed().await, 0);
+        fixture.node.shutdown().await;
+    }
+
+    /// The control node never signs with an issuer pair whose certifying authority key is
+    /// revoked, since every node refuses the tokens it would sign (ADR-0047, point 1.6).
+    #[tokio::test(start_paused = true)]
+    async fn issuer_certified_by_a_revoked_authority_key_is_failed_precondition() {
+        let fixture = Fixture::new().await;
+        let now = fixture.clock.now();
+        assert!(
+            fixture
+                .service
+                .issuer_signer(&fixture.node.handle().state(), now)
+                .is_ok()
+        );
+        fixture.revoke(&fixture.certifier.to_string()).await;
+        match fixture
+            .service
+            .issuer_signer(&fixture.node.handle().state(), now)
+        {
+            Ok(_) => panic!("signed with a pair whose authority key is revoked"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+                assert!(
+                    status
+                        .message()
+                        .contains("was certified by a revoked authority key"),
+                    "{status:?}"
+                );
+            }
+        }
+        fixture.node.shutdown().await;
+    }
+
+    /// The handler checks the caller against the denylist in control state, not only the one
+    /// the request boundary read: a caller the boundary admitted before a revocation reached it
+    /// is refused, here by the authority key that certified its copy's issuer, which only the
+    /// handler knows and `apply` never sees (ADR-0047, point 5.9).
+    #[tokio::test(start_paused = true)]
+    async fn caller_revoked_after_the_boundary_admitted_it_is_refused() {
+        use crate::control::test_support::delegation_from_root;
+
+        let fixture = Fixture::new().await;
+        let now = fixture.clock.now();
+        let Applied::DelegationRecorded { claims, .. } = fixture
+            .submit(delegation_from_root(
+                now,
+                1,
+                &["admin:agent-42.c7.*", "grant:agent-42.c7.*"],
+                3_600_000,
+            ))
+            .await
+        else {
+            panic!("expected a delegation");
+        };
+        let caller = Delegator {
+            name: AgentName::try_from(claims.principal.clone()).expect("an agent"),
+            scopes: claims.scopes.clone(),
+            claims: Arc::new(claims),
+            key: "issuer-c7".parse().expect("a key id"),
+            signer: Signer::Issuer {
+                name: "control-old".parse().expect("an id"),
+                authority: "other-authority".parse().expect("a key id"),
+            },
+        };
+        let request = |operation: u8| DelegateTokenRequest {
+            operation_id: vec![operation; 16],
+            segment: "r1".to_owned(),
+            ..DelegateTokenRequest::default()
+        };
+        assert!(fixture.service.delegate(&caller, request(8)).await.is_ok());
+        fixture.revoke("other-authority").await;
+        match fixture.service.delegate(&caller, request(9)).await {
+            Ok(_) => panic!("delegated from a revoked caller"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+                assert!(status.message().contains("other-authority"), "{status:?}");
+            }
+        }
+        assert_eq!(fixture.node.handle().state().delegations().len(), 2);
+        fixture.node.shutdown().await;
+    }
+
+    /// `agent-42.c7`, recorded, presenting a copy whose issuer `other-authority` certified, as
+    /// the request boundary would have admitted it under the ancestor rule.
+    async fn recorded_ancestor(fixture: &Fixture) -> revoke::AncestorCaller {
+        use crate::control::test_support::delegation_from_root;
+
+        let Applied::DelegationRecorded { claims, .. } = fixture
+            .submit(delegation_from_root(
+                fixture.clock.now(),
+                1,
+                &["admin:agent-42.c7.*", "grant:agent-42.c7.*"],
+                3_600_000,
+            ))
+            .await
+        else {
+            panic!("expected a delegation");
+        };
+        revoke::AncestorCaller {
+            claims: Arc::new(claims),
+            key: "issuer-c7".parse().expect("a key id"),
+            signer: Signer::Issuer {
+                name: "control-old".parse().expect("an id"),
+                authority: "other-authority".parse().expect("a key id"),
+            },
+            carriage: crate::auth::Carriage::Direct,
+        }
+    }
+
+    /// A request revoking the token with ID `id`.
+    fn own_token(id: &fleetring_control::TokenId) -> revoke::Targets {
+        use fleetring_proto::v1::{Revocation, RevokeTokenRequest, revocation};
+
+        revoke::Targets::from_request(RevokeTokenRequest {
+            revocation: Some(Revocation {
+                revoked: Some(revocation::Revoked::TokenId(id.to_string())),
+                until_ms: 0,
+            }),
+            principal: String::new(),
+        })
+        .expect("a valid request")
+    }
+
+    /// The revocation handler, like `delegate`, checks the caller against the denylist in
+    /// control state, which here revokes the authority key that certified its copy's issuer:
+    /// only the handler knows that key, and `apply` would accept the revocation.
+    #[tokio::test(start_paused = true)]
+    async fn ancestor_caller_revoked_after_the_boundary_admitted_it_is_refused() {
+        let fixture = Fixture::new().await;
+        let caller = recorded_ancestor(&fixture).await;
+        let id = caller.claims.id.clone();
+        fixture.revoke("other-authority").await;
+        match fixture
+            .service
+            .revoke(&revoke::Revoker::Ancestor(caller), own_token(&id))
+            .await
+        {
+            Ok(response) => panic!("a revoked caller revoked: {response:?}"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+                assert!(status.message().contains("other-authority"), "{status:?}");
+            }
+        }
+        assert!(
+            !fixture
+                .node
+                .handle()
+                .state()
+                .revocations()
+                .contains(&Revoked::Token(id))
+        );
+        fixture.node.shutdown().await;
     }
 }

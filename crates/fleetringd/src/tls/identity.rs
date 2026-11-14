@@ -6,10 +6,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use rustls::crypto::CryptoProvider;
+use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject as _;
@@ -19,7 +20,7 @@ use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::auth::{TokenVerifier, VerifyingKey};
 use crate::tls::names::{FleetName, NameError, SubjectUri};
-use crate::tls::{Issued, Peer};
+use crate::tls::{Issued, IssuerCache, Peer};
 
 /// How long after one check of the files the next connection may check them again.
 const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -56,6 +57,10 @@ pub enum IdentityError {
     /// The certificate names the authority, not a node or a principal.
     #[error("the certificate names an authority, not a node or a principal")]
     Authority,
+    /// The certificate names a delegation issuer, which never opens a connection (ADR-0047,
+    /// point 1.5).
+    #[error("the certificate names a delegation issuer, which can't open a connection")]
+    Issuer,
     /// The certificate and key don't form a usable identity.
     #[error("the certificate and key can't be used")]
     Rustls(#[from] rustls::Error),
@@ -77,9 +82,15 @@ enum Source {
     Memory,
 }
 
-/// The modification times and sizes of the files, to notice a change without reading them.
+/// A digest of each file's contents, to notice a change.
+///
+/// Modification times and sizes aren't enough: a replacement of the same size written within
+/// the file system's timestamp granularity would go unnoticed, and the authority bundle decides
+/// which issuer certificates, and so which delegated tokens, the node trusts. The files are a
+/// few kilobytes and checked at most once a second, so reading them is cheap. The digest of the
+/// key file reveals nothing about the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Stamp(Vec<Option<(SystemTime, u64)>>);
+struct Stamp(Vec<Option<[u8; 32]>>);
 
 impl Stamp {
     fn of(paths: &[&Path]) -> Self {
@@ -87,8 +98,9 @@ impl Stamp {
             paths
                 .iter()
                 .map(|path| {
-                    let metadata = fs::metadata(path).ok()?;
-                    Some((metadata.modified().ok()?, metadata.len()))
+                    fs::read(path)
+                        .ok()
+                        .map(|bytes| *blake3::hash(&bytes).as_bytes())
                 })
                 .collect(),
         )
@@ -110,6 +122,10 @@ pub(crate) struct Loaded {
     client: Arc<ClientConfig>,
     /// The trusted authorities' Ed25519 keys, which sign the bearer tokens nodes accept.
     token_keys: Vec<VerifyingKey>,
+    /// The issuer certificates delegated tokens carried that passed their checks against
+    /// `token_keys` (ADR-0047 point 1.4, the plan's P11). Each generation has its own, so a
+    /// reload that changes the authorities starts with none.
+    issuer_certificates: Arc<IssuerCache>,
     /// The fleets the trusted authorities name; empty for an authority from outside.
     authority_fleets: Vec<FleetName>,
     stamp: Stamp,
@@ -140,14 +156,20 @@ impl Loaded {
         let peer = match &subject {
             SubjectUri::Node { id, .. } => Peer::Node(id.clone()),
             SubjectUri::Principal { name, .. } => Peer::Principal(name.clone()),
-            _ => return Err(IdentityError::Authority),
+            SubjectUri::Authority { .. } => return Err(IdentityError::Authority),
+            SubjectUri::Issuer { .. } => return Err(IdentityError::Issuer),
         };
         let token_keys = authorities.iter().filter_map(token_key).collect();
         let authority_fleets = authorities
             .iter()
             .filter_map(|authority| match SubjectUri::of_certificate(authority) {
                 Ok(SubjectUri::Authority { fleet }) => Some(fleet),
-                _ => None,
+                Ok(
+                    SubjectUri::Node { .. }
+                    | SubjectUri::Principal { .. }
+                    | SubjectUri::Issuer { .. },
+                )
+                | Err(_) => None,
             })
             .collect();
         let mut roots = RootCertStore::empty();
@@ -155,8 +177,7 @@ impl Loaded {
             roots.add(authority)?;
         }
         let roots = Arc::new(roots);
-        let verifier =
-            WebPkiClientVerifier::builder_with_provider(Arc::clone(&roots), provider()).build()?;
+        let verifier = client_verifier(&roots)?;
         let mut server = ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(verifier)
@@ -183,6 +204,7 @@ impl Loaded {
             admin_server: Arc::new(admin_server),
             client: Arc::new(client),
             token_keys,
+            issuer_certificates: Arc::new(IssuerCache::new()),
             authority_fleets,
             stamp,
         })
@@ -230,6 +252,14 @@ fn token_key(certificate: &CertificateDer<'_>) -> Option<VerifyingKey> {
     VerifyingKey::from_raw(key.subject_public_key.as_ref())
 }
 
+/// How the node's listener checks a client's certificate: against `roots`, at the node's own
+/// time, with no leeway of its own.
+fn client_verifier(
+    roots: &Arc<RootCertStore>,
+) -> Result<Arc<dyn ClientCertVerifier>, VerifierBuilderError> {
+    WebPkiClientVerifier::builder_with_provider(Arc::clone(roots), provider()).build()
+}
+
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -237,7 +267,7 @@ fn provider() -> Arc<CryptoProvider> {
 /// A certificate chain, its private key, and the trusted authority certificates, as a node or
 /// a client presents them.
 ///
-/// An identity loaded from files re-reads them when their modification time or size changes.
+/// An identity loaded from files re-reads them when their contents change.
 /// The check runs when a connection is opened, at most once per second;
 /// a reload that fails keeps the material in use and logs a warning. The authority file may
 /// hold several certificates, so two authorities are trusted while a rotation overlaps.
@@ -342,11 +372,17 @@ impl Identity {
 
     /// Returns what bearer tokens are checked against: this fleet, and the Ed25519 keys of
     /// the trusted authorities, as of the last reload (ADR-0025). During an authority rotation
-    /// both authorities' tokens verify.
+    /// both authorities' tokens verify. Delegated tokens verify through the issuer certificates
+    /// those authorities signed (ADR-0047, point 1.4), which the verifiers of one reload share a
+    /// cache of.
     #[must_use]
     pub fn token_verifier(&self) -> TokenVerifier {
         let loaded = self.current();
-        TokenVerifier::new(loaded.fleet().as_str(), loaded.token_keys.iter().cloned())
+        TokenVerifier::with_cache(
+            loaded.fleet(),
+            loaded.token_keys.iter().cloned(),
+            Arc::clone(&loaded.issuer_certificates),
+        )
     }
 
     /// The material in use, after checking the files for a change if a check is due.
@@ -383,10 +419,140 @@ impl Identity {
         let mut checked = self.inner.checked.lock().expect("identity lock poisoned");
         match *checked {
             Some(at) if now.duration_since(at) < RELOAD_CHECK_INTERVAL => false,
-            _ => {
+            Some(_) | None => {
                 *checked = Some(now);
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fleetring_control::Timestamp;
+
+    use super::*;
+    use crate::tls::{Authority, Validity};
+
+    const CENTURY: Duration = Duration::from_secs(36_500 * 24 * 60 * 60);
+
+    /// A client certificate issued with [`Validity::issued_at`] passes the node's check at once
+    /// on a node whose clock is up to 30 seconds behind the issuer's, as after a wall clock
+    /// steps back; one that starts at its issuing is refused there until the node's clock
+    /// reaches it.
+    #[test]
+    fn a_client_certificate_is_accepted_by_a_node_whose_clock_is_behind() {
+        use rustls_pki_types::UnixTime;
+
+        let fleet: FleetName = "test".parse().expect("a fleet");
+        let authority =
+            Authority::create(fleet, Validity::new(Timestamp::ZERO, CENTURY)).expect("authority");
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::from_pem_slice(authority.certificate_pem().as_bytes())
+                    .expect("the authority's PEM"),
+            )
+            .expect("a root");
+        let verifier = client_verifier(&Arc::new(roots)).expect("a verifier");
+        let issued_ms: u64 = 1_800_000_000_250;
+        let issued = Timestamp::from_millis(issued_ms);
+        let principal = "agent-42".parse().expect("a principal");
+        let lifetime = Duration::from_secs(24 * 60 * 60);
+        let check = |validity: Validity, behind: Duration| {
+            let certificate = authority
+                .issue_client(&principal, validity)
+                .expect("a client certificate");
+            let der = CertificateDer::from_pem_slice(certificate.certificate_pem().as_bytes())
+                .expect("the certificate's PEM");
+            let node_time = Duration::from_millis(issued_ms) - behind;
+            verifier
+                .verify_client_cert(&der, &[], UnixTime::since_unix_epoch(node_time))
+                .map(|_| ())
+        };
+        for behind in [
+            Duration::ZERO,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        ] {
+            assert_eq!(
+                check(Validity::issued_at(issued, lifetime), behind),
+                Ok(()),
+                "{behind:?} behind"
+            );
+        }
+        assert!(
+            check(
+                Validity::issued_at(issued, lifetime),
+                Duration::from_secs(31)
+            )
+            .is_err(),
+            "accepted 31 s behind"
+        );
+        assert!(
+            check(Validity::new(issued, lifetime), Duration::from_secs(2)).is_err(),
+            "a certificate that starts at its issuing was accepted 2 s before it"
+        );
+    }
+
+    /// A replacement authority bundle of the same size, written with the same modification time,
+    /// is still noticed: the stamp is the files' contents, and the bundle decides which issuer
+    /// certificates the node trusts.
+    #[tokio::test(start_paused = true)]
+    async fn a_same_size_bundle_with_the_same_mtime_is_reloaded() {
+        let fleet: FleetName = "test".parse().expect("a fleet");
+        let validity = Validity::new(Timestamp::ZERO, CENTURY);
+        let first = Authority::create(fleet.clone(), validity).expect("an authority");
+        let second = Authority::create(fleet, validity).expect("an authority");
+        assert_eq!(
+            first.certificate_pem().len(),
+            second.certificate_pem().len(),
+            "the two bundles are the same size"
+        );
+        let node = first
+            .issue_node(
+                &"n1".parse().expect("a node id"),
+                &["127.0.0.1".to_owned()],
+                validity,
+            )
+            .expect("a node certificate");
+        let dir = tempfile::tempdir().expect("a directory");
+        let (ca, cert, key) = (
+            dir.path().join("ca.crt"),
+            dir.path().join("node.crt"),
+            dir.path().join("node.key"),
+        );
+        fs::write(&ca, first.certificate_pem()).expect("the bundle");
+        fs::write(&cert, node.certificate_pem()).expect("the certificate");
+        fs::write(&key, node.key_pem()).expect("the key");
+        let identity = Identity::load(&ca, &cert, &key).expect("an identity");
+        let key_id = |authority: &Authority| {
+            authority
+                .token_signer()
+                .expect("an Ed25519 authority")
+                .key_id()
+                .clone()
+        };
+        let trusted = |identity: &Identity| {
+            identity
+                .token_verifier()
+                .keys()
+                .iter()
+                .map(|key| key.id().clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(trusted(&identity), [key_id(&first)]);
+
+        let modified = fs::metadata(&ca)
+            .and_then(|metadata| metadata.modified())
+            .expect("a modification time");
+        fs::write(&ca, second.certificate_pem()).expect("the new bundle");
+        fs::File::options()
+            .write(true)
+            .open(&ca)
+            .and_then(|file| file.set_modified(modified))
+            .expect("the old modification time");
+        tokio::time::advance(RELOAD_CHECK_INTERVAL).await;
+        assert_eq!(trusted(&identity), [key_id(&second)]);
     }
 }

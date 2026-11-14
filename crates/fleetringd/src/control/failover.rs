@@ -4,7 +4,10 @@
 //! the state machine notices nothing while no command arrives. The timer keeps it moving:
 //!
 //! 1. **Ticks.** When no command has arrived for a whole tick interval, it submits
-//!    [`Action::Tick`], which only moves the state's time on.
+//!    [`Action::Tick`], which only moves the state's time on. It also submits one, however busy
+//!    the control plane is, once a delegation record's, operation's, or tombstone's `kept_until`
+//!    has passed ([`delegation::tick_due`]), so an idle lineage's records go too (ADR-0047,
+//!    point 6.2).
 //! 2. **Expired leases.** It asks the state which promotions a `StartPromotion` would start now
 //!    ([`State::promotions_due`]) and submits one for each. The state machine decides; the timer
 //!    only triggers commands, and the control node stamps them as usual, so a replay gives the
@@ -25,6 +28,9 @@
 //! 5. **Forks.** After the settling below, on every tick it submits what the fork driver
 //!    proposes ([`fork::actions`]): completions, retries, failures, readiness, and a tick when
 //!    a fork's deadline or an operation's retention has passed (ADR-0046, point 3.11).
+//! 6. **Kept replica sets.** After the forks, it releases every replica set a membership change
+//!    kept whose primary reports that placement's write quorum holds its log
+//!    ([`State::releases_due`]; ADR-0031, amendment 2).
 //!
 //! A control node that has just started gives primaries one lease duration plus the failover
 //! margin to renew before it starts any promotion: leases look expired after an outage only
@@ -36,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetring_control::{
-    Action, Applied, DatabaseName, LeaseEpoch, Millis, State, Timestamp, fork,
+    Action, Applied, DatabaseName, LeaseEpoch, Millis, State, Timestamp, delegation, fork,
 };
 use fleetring_proto::v1::PromoteRequest;
 use tokio::task::{JoinHandle, JoinSet};
@@ -257,10 +263,9 @@ async fn run(
     loop {
         ticks.tick().await;
         let now = clock.now();
-        if now
-            .as_millis()
-            .saturating_sub(handle.state().now().as_millis())
-            >= tick.get()
+        let current = handle.state();
+        let idle = now.as_millis().saturating_sub(current.now().as_millis()) >= tick.get();
+        if (idle || delegation::tick_due(&current, now))
             && handle.submit(Action::Tick).await.is_err()
         {
             return;
@@ -294,6 +299,9 @@ async fn run(
             if drive_forks(&handle, now).await == Sweep::Stop {
                 return;
             }
+            if release_kept_replicas(&handle).await == Sweep::Stop {
+                return;
+            }
         }
         notify_candidates(
             &handle.state(),
@@ -324,6 +332,50 @@ async fn drive_forks(handle: &ControlHandle, now: Timestamp) -> Sweep {
         }
     }
     Sweep::Continue
+}
+
+/// The most releases of kept replica sets one tick submits: a join that moves many databases
+/// releases them over several ticks rather than holding up the promotions the timer drives.
+const RELEASES_PER_TICK: usize = 64;
+
+/// Submits a release for every database whose replica set a membership change kept, once its
+/// primary reports that placement's write quorum holds its log ([`State::releases_due`];
+/// ADR-0031, amendment 2), up to [`RELEASES_PER_TICK`] at once, so that the writer logs them
+/// together, and logs what became of each. `apply` checks each one again, so one made stale
+/// meanwhile is refused and changes nothing; the rest wait for the next tick. Says whether the
+/// timer goes on.
+async fn release_kept_replicas(handle: &ControlHandle) -> Sweep {
+    let mut releases = JoinSet::new();
+    for action in handle
+        .state()
+        .releases_due()
+        .into_iter()
+        .take(RELEASES_PER_TICK)
+    {
+        let handle = handle.clone();
+        releases.spawn(async move { handle.submit(action).await });
+    }
+    let mut sweep = Sweep::Continue;
+    while let Some(joined) = releases.join_next().await {
+        match joined {
+            Ok(Ok(committed)) => match committed.outcome() {
+                Ok(applied) => {
+                    tracing::info!(target: "fleetringd::audit", ?applied, "a kept replica set was released");
+                }
+                Err(rejection) => {
+                    tracing::debug!(%rejection, "a kept replica set's release was refused");
+                }
+            },
+            Ok(Err(SubmitError::Stopped)) => sweep = Sweep::Stop,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "can't log a release; the next tick proposes again");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "a release's submission ended early; the next tick proposes again");
+            }
+        }
+    }
+    sweep
 }
 
 /// Tells the candidate of every promotion in progress, unless it was told less than
@@ -497,5 +549,113 @@ mod tests {
             sweep(&handle, vec!["b".parse().expect("a name")], None).await,
             Sweep::Stop
         );
+    }
+
+    /// A `RecordDelegation` from root `agent-42`'s token, for a child that lasts a minute from
+    /// `now`.
+    fn delegation(now: Timestamp) -> Action {
+        use fleetring_control::delegation::{
+            CallerToken, CanonicalRequest, DelegationId, TokenClaims, TokenKind,
+        };
+        let scopes: fleetring_control::scope::Scopes = ["admin:agent-42.c7-*"]
+            .iter()
+            .map(|text| text.parse().expect("a scope"))
+            .collect();
+        let start = now.as_millis() - now.as_millis() % 1_000;
+        let caller = CallerToken {
+            claims: TokenClaims {
+                fleet: "prod".into(),
+                principal: "agent-42".parse().expect("a name"),
+                id: "root-jti".parse().expect("an id"),
+                issued_at: Some(Timestamp::ZERO),
+                not_before: Timestamp::ZERO,
+                expires_at: Timestamp::MAX,
+                scopes: scopes.clone(),
+                kind: Some(TokenKind::Agent),
+                owner: Some("sam".parse().expect("a name")),
+                parent: None,
+                chain: Vec::new(),
+            },
+            kid: "authority".parse().expect("a key id"),
+        };
+        Action::RecordDelegation {
+            operation: fork::OperationId::from_bytes([1; 16]),
+            requested_by: caller.claims.principal.clone(),
+            request: CanonicalRequest {
+                segment: "c7".into(),
+                scopes: Some(scopes.clone()),
+                lifetime: None,
+                not_before: None,
+                caller_token: caller.claims.id.clone(),
+            },
+            caller,
+            id: DelegationId::from_bytes([7; 16]),
+            scopes,
+            not_before: Timestamp::from_millis(start),
+            expires_at: Timestamp::from_millis(start + 60_000),
+        }
+    }
+
+    /// The timer proposes a `Tick` once a delegation record's `kept_until` passes, though a
+    /// command arrives more often than the tick interval and so the idle tick never comes
+    /// (ADR-0047, point 6.2).
+    #[tokio::test(start_paused = true)]
+    async fn timer_ticks_when_a_kept_until_passes_on_a_busy_control_plane() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let options = ControlOptions::new(ControlConfig::new())
+            .with_storage_io(StorageIo::Inline)
+            .with_recorder("control-1".parse().expect("an id"));
+        let clock = SimClock::new(BASE);
+        let node = ControlNode::open(dir.path().join("control.db"), options, clock)
+            .await
+            .expect("a new log opens");
+        let handle = node.handle();
+        let software = Feature::ALL.into_iter().fold(
+            fleetring_control::Software::new(Release::new(0, 8, 0), 1),
+            fleetring_control::Software::with_feature,
+        );
+        let member = Member::new("data-1".parse().expect("an id")).with_software(software);
+        handle
+            .submit(Action::Join { member })
+            .await
+            .expect("the join commits");
+        let recorded = handle
+            .submit(delegation(clock.now()))
+            .await
+            .expect("the delegation commits");
+        assert!(recorded.outcome().is_ok(), "{:?}", recorded.outcome());
+        assert_eq!(handle.state().delegations().len(), 1);
+        let kept_until = handle
+            .state()
+            .delegations()
+            .map(|(_, record)| record.kept_until)
+            .next()
+            .expect("a record");
+
+        let hour = Duration::from_secs(3_600);
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new().with_tick_interval(hour),
+        );
+        // A heartbeat every half hour keeps the control plane busier than the tick interval.
+        while clock.now() <= kept_until.saturating_add(Millis::new(3_600_000)) {
+            let heartbeat = Action::Heartbeat {
+                id: "data-1".parse().expect("an id"),
+                replicas: Vec::new(),
+                unknown_reports: fleetring_control::UnknownReports::Skip,
+                software: None,
+                disk_free_bytes: None,
+            };
+            handle
+                .submit(heartbeat)
+                .await
+                .expect("the heartbeat commits");
+            tokio::time::sleep(hour / 2).await;
+        }
+        assert_eq!(handle.state().delegations().len(), 0);
+        timer.stop().await;
+        node.shutdown().await;
     }
 }

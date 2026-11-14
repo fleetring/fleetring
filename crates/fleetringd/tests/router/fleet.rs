@@ -307,16 +307,16 @@ pub(crate) fn issue(
     id: &str,
 ) -> Result<String, Box<dyn Error>> {
     let now = SystemClock.now();
-    let token: BearerToken = signer.issue(&TokenSpec {
-        principal: principal.parse()?,
-        scopes: scopes
+    let token: BearerToken = signer.issue(&TokenSpec::new(
+        principal.parse()?,
+        scopes
             .iter()
             .map(|scope| scope.parse::<Scope>())
             .collect::<Result<_, _>>()?,
-        id: id.parse()?,
-        not_before: now,
-        expires_at: now.saturating_add(Millis::new(3_600_000)),
-    })?;
+        id.parse()?,
+        now,
+        now.saturating_add(Millis::new(3_600_000)),
+    ))?;
     Ok(token.expose().to_owned())
 }
 

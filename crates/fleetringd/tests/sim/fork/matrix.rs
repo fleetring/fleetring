@@ -747,9 +747,20 @@ pub(super) fn fixed(points: &[Point], scenario: impl Fn(u64, Point) -> Result<()
     });
 }
 
+/// Runs `scenario` at `point` on each of `seeds`: seeds a sweep found failing, kept as
+/// regression tests. A blocking pool runs the engine's work, so a seed replays its run closely
+/// but not always exactly.
+pub(super) fn pinned(seeds: &[u64], point: Point, scenario: impl Fn(u64, Point) -> Result<()>) {
+    logs();
+    seeds::run(BINARY, seeds, |seed| {
+        scenario(seed, point).map_err(|error| format!("at {point:?}: {error}"))
+    });
+}
+
 /// Runs `scenario` over [`SWEEP_SEEDS`] seeds (1 000 by default) from [`SWEEP_FROM`], each at
 /// the point its seed picks, and fails listing every failing seed and point.
 pub(super) fn sweep(points: &[Point], scenario: impl Fn(u64, Point) -> Result<()>) {
+    logs();
     let count: u64 = std::env::var(SWEEP_SEEDS)
         .ok()
         .and_then(|text| text.parse().ok())

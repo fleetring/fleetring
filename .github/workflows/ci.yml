@@ -208,6 +208,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test -p fleetring --all-features --release --no-fail-fast -- --ignored
+      # The control crate's heavy delegation and revocation tests, about 9 s.
+      - run: cargo test -p fleetring-control --release --no-fail-fast -- --ignored
 
   # The simulation harness's fixed seeds (FR-024, ADR-0020). `--cfg tokio_unstable` lets turmoil
   # seed Tokio's scheduler, so each seed must replay its trace exactly, simulated times included.

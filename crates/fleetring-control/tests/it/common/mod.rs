@@ -5,11 +5,12 @@ use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
     Acks, Action, Command, ControlConfig, DatabaseName, DescriptionChange, Durability, Engine,
     ExpiryChange, Feature, HostedReplica, LeaseEpoch, Member, MetadataChange, MetadataSpec, Millis,
-    Outcome, Position, Release, ReplicaRole, Revoked, Software, State, Timestamp, apply,
-    parse_label,
+    Outcome, Position, Release, ReplicaRole, ReplicasCaughtUp, Revoked, Software, State, Timestamp,
+    apply, parse_label,
 };
 use proptest::prelude::*;
 
+pub(crate) mod delegation;
 pub(crate) mod fork;
 
 /// Node IDs the generator draws from.
@@ -151,7 +152,16 @@ impl Generator {
         } else {
             self.clock
         };
-        Command::new(at(stamp), action(state, op, self.mix))
+        let action = action(state, op, self.mix);
+        // Among current members, the first membership change that would keep a replica set is
+        // preceded by the command that enables `handover`, as the control node's writer logs it
+        // (ADR-0031, amendment 2): this op enables it, and a later one makes the change.
+        let action = if self.mix == SoftwareMix::Current && state.handover_due(&action) {
+            Action::EnableHandover
+        } else {
+            action
+        };
+        Command::new(at(stamp), action)
     }
 }
 
@@ -183,6 +193,14 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
         SoftwareMix::Mixed => software_for(b),
         SoftwareMix::Current => current_software(),
     };
+    // Among current members, a release the control node's timer would propose comes now and
+    // then while one is due, as the timer proposes it (ADR-0031, amendment 2).
+    if mix == SoftwareMix::Current
+        && b.is_multiple_of(4)
+        && let Some(due) = state.releases_due().into_iter().next()
+    {
+        return due;
+    }
     match op.kind % 16 {
         0 => {
             let mut joining = member(a % NODES.len());
@@ -228,6 +246,10 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
                 .find(|_| a.is_multiple_of(2))
                 .unwrap_or(database),
         },
+        // Releases of kept replica sets among current members at the database's incarnation
+        // and epoch as they stand, due or not, which `apply` refuses unless its holder reported
+        // at both (ADR-0031, amendment 2).
+        8 if b % 10 == 2 && mix == SoftwareMix::Current => release(state, database),
         8 if b % 10 == 7 => Action::TransferLease {
             database,
             target: (b % 4 == 3).then(|| id(NODES[(a + 1) % NODES.len()])),
@@ -260,8 +282,16 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
                     let position = vec![op.b.rotate_left(u32::try_from(i).expect("small")), op.a];
                     // Some replicas report the epoch their log came from, as newer nodes do.
                     let log_epoch = LeaseEpoch::new(u64::from(op.a % 3));
-                    HostedReplica::new(db(name), ReplicaRole::Follower, Position::new(position))
-                        .with_log_epoch(log_epoch)
+                    let replica = HostedReplica::new(
+                        db(name),
+                        ReplicaRole::Follower,
+                        Position::new(position),
+                    )
+                    .with_log_epoch(log_epoch);
+                    match mix {
+                        SoftwareMix::Current => caught_up(state, op, node, replica),
+                        SoftwareMix::Mixed => replica,
+                    }
                 })
                 .collect();
             if b.is_multiple_of(11) {
@@ -376,6 +406,57 @@ fn update(state: &State, op: Op, database: DatabaseName) -> Action {
         change,
         by: Some("agent-2".parse().expect("a valid principal name")),
         if_version: a.is_multiple_of(3).then(|| version + u64::from(op.b % 2)),
+    }
+}
+
+/// `replica` as `node` reports it among current members: the primary of a database whose
+/// replica set a membership change kept reports, most of the time, that placement caught up,
+/// at its lease's epoch and the current membership epoch, and now and then at a stale one of
+/// either, which a release must ignore (ADR-0031, amendment 2).
+fn caught_up(state: &State, op: Op, node: &str, replica: HostedReplica) -> HostedReplica {
+    let Some(database) = state.database(replica.database()) else {
+        return replica;
+    };
+    let Some(lease) = database
+        .lease()
+        .filter(|lease| lease.holder().as_str() == node)
+    else {
+        return replica;
+    };
+    if database.kept_replicas().is_none() || op.a.is_multiple_of(5) {
+        return replica;
+    }
+    let epoch = if op.b % 6 == 1 {
+        LeaseEpoch::new(lease.epoch().get().saturating_sub(1))
+    } else {
+        lease.epoch()
+    };
+    let membership_epoch = if op.b % 6 == 2 {
+        fleetring::Epoch::new(state.membership_epoch().get().saturating_sub(1))
+    } else {
+        state.membership_epoch()
+    };
+    let position = replica.position().clone();
+    HostedReplica::new(replica.database().clone(), ReplicaRole::Primary, position)
+        .with_log_epoch(replica.log_epoch())
+        .with_replicas_caught_up(ReplicasCaughtUp::new(
+            database.incarnation(),
+            epoch,
+            membership_epoch,
+        ))
+}
+
+/// A release of a kept replica set for `database` at its incarnation and epoch as they stand,
+/// whether or not one is due.
+fn release(state: &State, database: DatabaseName) -> Action {
+    let (incarnation, epoch) = state.database(&database).map_or(
+        (fleetring_control::Incarnation::LEGACY, LeaseEpoch::new(1)),
+        |db| (db.incarnation(), db.epoch()),
+    );
+    Action::ReleaseKeptReplicas {
+        database,
+        incarnation,
+        epoch,
     }
 }
 

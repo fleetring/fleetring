@@ -2,13 +2,13 @@
 .el .ds Aq '
 .TH fleetring-agent-remove 1  FleetRing "FleetRing manual"
 .SH NAME
-fleetring\-agent\-remove \- Revokes an agent\*(Aqs token and deletes its directory
+fleetring\-agent\-remove \- Revokes an agent and every agent below it, and deletes its directory
 .SH SYNOPSIS
 \fBfleetring agent remove\fR [\fB\-\-yes\fR] [\fB\-\-no\-revoke\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
 .SH DESCRIPTION
-Revokes an agent\*(Aqs token and deletes its directory
+Revokes an agent and every agent below it, and deletes its directory
 .PP
-Asks for the ID to be typed on a terminal first. Refuses if the fleet can\*(Aqt be reached to revoke the token.
+A root agent revokes itself, as a principal and by its own token ID, without the fleet scope, and the command says when a new token for it may be minted. A delegated agent, such as `42.c7`, is revoked as a principal by its nearest ancestor with an identity here. Asks for the ID to be typed on a terminal first. Refuses if the fleet can\*(Aqt be reached to revoke it.
 .SH OPTIONS
 .TP
 \fB\-\-yes\fR
@@ -73,7 +73,7 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 \fB\-\-agent\fR \fI<ID>\fR
 Acts as the agent with this ID, with the identity minted for it
 
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`
@@ -106,4 +106,4 @@ never: Never
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fIID\fR>
-The agent\*(Aqs ID
+The agent\*(Aqs ID, such as `42`, or a delegated agent\*(Aqs, such as `42.c7`

@@ -101,8 +101,13 @@ pub struct PlacementReport {
     pub candidate: Option<String>,
     /// The replicas other than the primary, in preference order.
     pub followers: Vec<String>,
-    /// The whole replica set, in preference order.
+    /// The whole replica set, in preference order: the one promotions fence.
     pub replicas: Vec<ReplicaReport>,
+    /// Where the ring places the database, in preference order, while that differs from
+    /// `replicas`: a membership change kept the replica set, or a ready fork keeps its holders,
+    /// until the primary hands it over (ADR-0031, amendment 2; ADR-0046, point 3.10). `null`
+    /// otherwise.
+    pub placed_replicas: Option<Vec<String>>,
 }
 
 /// One replica of a database.
@@ -265,6 +270,46 @@ pub struct OrphanReport {
 pub struct OrphanList {
     /// The orphans.
     pub orphans: Vec<OrphanReport>,
+}
+
+/// One live delegation record, never its token: an item of `agent list --fleet` (ADR-0047,
+/// point 6.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DelegationReport {
+    /// The delegated agent's principal.
+    pub principal: String,
+    /// The delegation ID, the token's `jti`, which revokes it.
+    pub delegation_id: String,
+    /// The principal that delegated it.
+    pub parent: String,
+    /// Its ancestors' tokens, root first, ending with the parent's.
+    pub chain: Vec<ChainLinkReport>,
+    /// The token's `iat`.
+    pub issued_at: String,
+    /// The token's `exp`.
+    pub expires_at: String,
+    /// The control node that recorded it, as the leader stamped it: advisory after a
+    /// compromise.
+    pub recorded_by: String,
+    /// When it was recorded.
+    pub recorded_at: String,
+}
+
+/// One link of a delegated token's lineage: an ancestor's token ID, and the ID of the key that
+/// signed the copy of its token the delegation was made from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChainLinkReport {
+    /// The ancestor's token ID.
+    pub id: String,
+    /// The key that signed that copy.
+    pub kid: String,
+}
+
+/// `agent list --fleet`'s result: the fleet's live delegation records, in delegation ID order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DelegationList {
+    /// The records.
+    pub delegations: Vec<DelegationReport>,
 }
 
 /// One database and where it lives: `db locate`'s result, and each item of `db list`.

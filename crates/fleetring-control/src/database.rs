@@ -684,6 +684,7 @@ pub struct Database {
     metadata: Option<Metadata>,
     incarnation: Incarnation,
     fork: Option<Fork>,
+    kept_replicas: Option<Vec<NodeId>>,
 }
 
 /// A database as it is stored: the durability fields are optional, so records written before
@@ -710,6 +711,9 @@ struct DatabaseRecord {
     incarnation: Incarnation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fork: Option<Fork>,
+    // Absent from states written before membership changes kept replica sets (FR-102).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kept_replicas: Option<Vec<NodeId>>,
 }
 
 impl From<DatabaseRecord> for Database {
@@ -732,6 +736,7 @@ impl From<DatabaseRecord> for Database {
             metadata: record.metadata,
             incarnation: record.incarnation,
             fork: record.fork,
+            kept_replicas: record.kept_replicas,
         }
     }
 }
@@ -751,6 +756,7 @@ impl From<Database> for DatabaseRecord {
             metadata: database.metadata,
             incarnation: database.incarnation,
             fork: database.fork,
+            kept_replicas: database.kept_replicas,
         }
     }
 }
@@ -775,6 +781,7 @@ impl Database {
             metadata,
             incarnation: Incarnation::LEGACY,
             fork: None,
+            kept_replicas: None,
         }
     }
 
@@ -925,6 +932,20 @@ impl Database {
 
     pub(crate) fn set_metadata(&mut self, metadata: Metadata) {
         self.metadata = Some(metadata);
+    }
+
+    /// Returns the replica set a membership change moved the database off, in the preference
+    /// order it had, while control state keeps it as the replica set promotions fence: until
+    /// the primary reports that placement's write quorum holds its log and
+    /// [`Action::ReleaseKeptReplicas`](crate::Action::ReleaseKeptReplicas) releases it
+    /// (ADR-0031, amendment 2). `None` when the database follows placement.
+    #[must_use]
+    pub fn kept_replicas(&self) -> Option<&[NodeId]> {
+        self.kept_replicas.as_deref()
+    }
+
+    pub(crate) fn set_kept_replicas(&mut self, kept: Option<Vec<NodeId>>) {
+        self.kept_replicas = kept;
     }
 }
 

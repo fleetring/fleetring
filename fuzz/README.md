@@ -1,12 +1,13 @@
 # Fuzzing `fleetring`
 
-Three libFuzzer targets check that no input reaching `fleetring` from outside can cause a panic, and that every ring keeps its placement invariants (FR-017).
+Four libFuzzer targets check that no input reaching `fleetring` from outside can cause a panic, and that every ring keeps its placement invariants (FR-017); the fourth, `token`, checks that no bearer token or issuer certificate panics a node (FR-090).
 
 | Target | Input | Checks |
 |---|---|---|
 | `spec_json` | arbitrary bytes, parsed as a JSON `RingSpec` and as a `CellsSpec` | `Ring::from_spec` and `Cells::from_spec` never panic; every spec that loads round-trips to the same fingerprint |
 | `builder` | arbitrary memberships and keys | `build()` returns `Ok` or `Err`, never panics; replica sets are distinct, sized `min(R, N)`, and a prefix of the preference list; filters exclude rejected nodes |
 | `lookup` | an arbitrary ring, key, liveness bitmap, and loads | filters exclude down nodes; bounded placements are full, distinct, and never over capacity unless flagged as saturated |
+| `token` | arbitrary bytes, as a whole token, as an issuer certificate's DER, as the certificate in a delegated token's `x5c`, and as the claims JSON of a token a fixed issuer key signed | `TokenVerifier::verify` and `IssuerCertificate::check` return `Ok` or `Err`, never panic, through the claims checks and the agent tier as well as the header and certificate |
 
 ## Run
 
@@ -17,6 +18,7 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run spec_json fuzz/corpus/spec_json fuzz/seeds/spec_json -- -max_total_time=300
 cargo +nightly fuzz run builder -- -max_total_time=300
 cargo +nightly fuzz run lookup -- -max_total_time=300
+cargo +nightly fuzz run token fuzz/corpus/token fuzz/seeds/token -- -max_total_time=300
 ```
 
 `fuzz/seeds/` holds committed seed inputs. `fuzz/corpus/` is where the fuzzer saves what it discovers; it is gitignored.

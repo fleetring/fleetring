@@ -12,15 +12,26 @@
 //! The policy is pure: [`Scopes::allows`] decides from the scopes and the request alone. So is
 //! the lattice that narrows scopes ([`Scopes::intersect`], [`Scopes::grant_step`]), which lives
 //! in a submodule of its own.
+//!
+//! # Consensus code
+//!
+//! [`apply`](crate::apply) decides with this module, so the grammar and the lattice are part of
+//! what every control replica must compute identically (ADR-0047, point 6.5). A scope's canonical
+//! text, `<action>:<pattern>` or `fleet`, is normative, and `apply` refuses text that isn't the
+//! canonical form of what it parses to. Any change to the grammar, the canonical text, or the
+//! lattice that changes whether `apply` accepts a command needs a fleet feature (ADR-0038,
+//! point 4), so that a mixed control group never applies the same command two ways.
+
+#![deny(clippy::wildcard_enum_match_arm)]
 
 use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
-use fleetring_control::DatabaseName;
+use crate::DatabaseName;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::changes::{DatabaseMatcher, Pattern};
+use crate::matcher::{DatabaseMatcher, Pattern};
 
 mod lattice;
 
@@ -143,7 +154,7 @@ impl fmt::Display for Target<'_> {
 /// One rule: an action over the databases a pattern names, or `fleet`.
 ///
 /// ```
-/// use fleetringd::auth::{Action, Scope, Target};
+/// use fleetring_control::scope::{Action, Scope, Target};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let scope: Scope = "write:tenant:acme/*".parse()?;
@@ -227,7 +238,7 @@ impl Scope {
     /// letter or digit, an exact name, `*` alone, and `fleet` draw none.
     ///
     /// ```
-    /// use fleetringd::auth::Scope;
+    /// use fleetring_control::scope::Scope;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let loose: Scope = "admin:agent-42*".parse()?;
@@ -358,7 +369,7 @@ impl<'de> Deserialize<'de> for Scope {
 /// A principal's scopes: a request is allowed if any of them allows it, and denied otherwise.
 ///
 /// ```
-/// use fleetringd::auth::{Action, Scopes, Target};
+/// use fleetring_control::scope::{Action, Scopes, Target};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let scopes: Scopes = ["read:tenant:*", "stream:ledger"].iter().map(|s| s.parse()).collect::<Result<_, _>>()?;
@@ -742,5 +753,44 @@ mod tests {
         let back: Scopes = serde_json::from_str(&json).expect("scopes deserialize");
         assert_eq!(back, set);
         assert!(serde_json::from_str::<Scopes>(r#"["nope"]"#).is_err());
+    }
+
+    /// Scope text the property tests draw: actions, near-actions, and pattern bytes that include
+    /// the `*` and `:` the grammar reads, with arbitrary strings mixed in.
+    fn arb_scope_text() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let action = prop::sample::select(
+            &[
+                "read", "write", "fork", "admin", "stream", "grant", "fleet", "READ", "rea",
+                " read", "",
+            ][..],
+        );
+        prop_oneof![
+            4 => (action, prop::sample::select(&[":", "", "::"][..]), "[ab.*:é -]{0,6}")
+                .prop_map(|(action, colon, pattern)| format!("{action}{colon}{pattern}")),
+            1 => any::<String>(),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// ADR-0047 §6.5 refuses scope text that isn't the canonical form of what it parses to,
+        /// by comparing the text with what it parses to, printed. That is sound only if every
+        /// text that parses prints back as itself, so that no two texts parse to one scope.
+        #[test]
+        fn prop_scope_text_that_parses_prints_back_as_itself(text in arb_scope_text()) {
+            if let Ok(scope) = text.parse::<Scope>() {
+                proptest::prop_assert_eq!(scope.to_string(), text);
+            }
+        }
+
+        /// Two texts parse to equal scopes only if they are the same text.
+        #[test]
+        fn prop_scope_parsing_is_injective(a in arb_scope_text(), b in arb_scope_text()) {
+            if let (Ok(left), Ok(right)) = (a.parse::<Scope>(), b.parse::<Scope>()) {
+                proptest::prop_assert_eq!(left == right, a == b, "{:?} and {:?}", a, b);
+            }
+        }
     }
 }

@@ -24,7 +24,13 @@ use v1::ProtocolVersion;
 /// and the filters and pages of `ListDatabases`. Minor 3 adds the `Database.Session` stream
 /// (ADR-0037), and forks (ADR-0046): the `ForkDatabase` and `GetForkOperation` calls,
 /// `Placement.incarnation` and `Placement.fork`, the fork fields of heartbeats, and the fork
-/// identity on `Snapshot` and `DropCopy`.
+/// identity on `Snapshot` and `DropCopy`. Minor 3 also holds the rest of 0.8's additions, all
+/// new calls or optional fields that an older peer ignores: the `DelegateToken` and
+/// `ListDelegations` calls (ADR-0047); the principal case of `Revocation`, which only the control
+/// plane writes, and the principal fields of `RevokeToken`; `Placement.placed_replicas`, and
+/// `replicas_caught_up` in heartbeats, for membership changes that hand replica sets over on
+/// joint quorums (ADR-0031, amendment 2); and `ReplicateOpen.epoch_start_chain` (FR-044).
+/// Peers need only share the major version (`check_protocol`), so these changed no version.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 /// The largest message a node sends or accepts: a replication batch or a snapshot chunk.

@@ -23,7 +23,7 @@ use crate::dev::{self, DevMode};
 use crate::durability::ArchiveConfig;
 use crate::engine::EngineConfig;
 use crate::replication::ReplicationSettings;
-use crate::tls::Principal;
+use crate::tls::{IssuerFiles, Principal};
 
 /// Everything a daemon needs to start.
 ///
@@ -974,12 +974,20 @@ impl Default for ReplicationConfig {
 /// heartbeat_timeout_ms = 5000
 /// tick_interval_ms = 250      # how often the control node looks for expired leases
 /// snapshot_every = 1000       # commands between snapshots
+/// issuer_cert = "/etc/fleetring/tls/issuer.control-1.crt"  # the delegation issuer pair, from
+/// issuer_key = "/etc/fleetring/tls/issuer.control-1.key"   # `fleetring cert issuer`
 /// ```
 ///
 /// The defaults suit a local network: a primary that dies is replaced about
 /// `lease_duration_ms + failover_margin_ms` after its last renewal. A data node checks that
 /// [`LEASE_RENEWALS_PER_DURATION`] renewals fit in the lease duration, against its own
 /// `[control]` table, so keep that table's timings equal to the control node's.
+///
+/// `issuer_cert` and `issuer_key` name the control node's delegation issuer pair (ADR-0047,
+/// point 1.3): both or neither, and only on a node that runs the control role. The pair is
+/// checked when the node starts, which refuses one that can't be used, and reloaded when the
+/// files change. With `dev = true` and neither set, they default to `issuer.dev.crt` and
+/// `issuer.dev.key` beside `[tls] ca`; see [`Config::issuer_files`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControlSettings {
@@ -1000,6 +1008,11 @@ pub struct ControlSettings {
     pub tick_interval_ms: NonZeroU64,
     /// How many commands the control node applies between snapshots.
     pub snapshot_every: NonZeroU64,
+    /// The PEM file with the delegation issuer certificate (ADR-0047, point 1.3). Set with
+    /// `issuer_key`, on a node that runs the control role.
+    pub issuer_cert: Option<PathBuf>,
+    /// The PEM file with the delegation issuer's private key. Set with `issuer_cert`.
+    pub issuer_key: Option<PathBuf>,
 }
 
 impl ControlSettings {
@@ -1042,6 +1055,8 @@ impl Default for ControlSettings {
             heartbeat_timeout_ms: nonzero(config.heartbeat_timeout()),
             tick_interval_ms: nonzero(DEFAULT_TICK_INTERVAL),
             snapshot_every: crate::control::ControlOptions::default().snapshot_every(),
+            issuer_cert: None,
+            issuer_key: None,
         }
     }
 }
@@ -1117,6 +1132,29 @@ impl Config {
         })
     }
 
+    /// The delegation issuer pair this node loads (ADR-0047, points 1.3 and 1.7):
+    /// `[control] issuer_cert` and `issuer_key` if set; otherwise, with `dev = true` and a
+    /// `[tls]` table, `issuer.dev.crt` and `issuer.dev.key` in the directory of `[tls] ca`, which
+    /// is dev mode's TLS directory, so a dev directory 0.7 wrote needs no new lines; otherwise
+    /// none. Only a node that runs the control role loads one.
+    #[must_use]
+    pub fn issuer_files(&self) -> Option<IssuerFiles> {
+        if !self.role.runs_control() {
+            return None;
+        }
+        match (&self.control.issuer_cert, &self.control.issuer_key) {
+            (Some(cert), Some(key)) => Some(IssuerFiles {
+                cert: cert.clone(),
+                key: key.clone(),
+            }),
+            (None, None) if self.dev == DevMode::On => {
+                let tls = self.tls.as_ref()?;
+                Some(IssuerFiles::dev(tls.ca.parent().unwrap_or(Path::new(""))))
+            }
+            (Some(_) | None, Some(_) | None) => None,
+        }
+    }
+
     /// Reads and validates a configuration file.
     ///
     /// # Errors
@@ -1146,8 +1184,10 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Missing`] if a field this role needs is absent, and
-    /// [`ConfigError::Invalid`] if `replication.retry_interval_ms` is 0, or a data node's heartbeat
+    /// [`ConfigError::Missing`] if a field this role needs is absent, or one of
+    /// `control.issuer_cert` and `control.issuer_key` is set without the other, and
+    /// [`ConfigError::Invalid`] if either is set on a data-only node, if
+    /// `replication.retry_interval_ms` is 0, or a data node's heartbeat
     /// interval isn't well below the heartbeat timeout, or its lease renewal interval isn't well
     /// below the lease duration, or a `[[changes.sink]]` or `[[archive]]` entry is invalid, or two
     /// share a name, or `[admin] listen` isn't a loopback address while neither `admin.tls` nor
@@ -1164,6 +1204,7 @@ impl Config {
                 reason: "a data-only node must know the control node's address",
             });
         }
+        self.validate_issuer()?;
         let interval = self.membership.heartbeat_interval_ms.get();
         let timeout = self.control.heartbeat_timeout_ms.get();
         if self.role.hosts_data() && interval.saturating_mul(HEARTBEATS_PER_TIMEOUT) > timeout {
@@ -1241,6 +1282,33 @@ impl Config {
         Ok(())
     }
 
+    /// `[control] issuer_cert` and `issuer_key`: both or neither, and only on a node that runs
+    /// the control role (ADR-0047, point 1.3).
+    fn validate_issuer(&self) -> Result<(), ConfigError> {
+        let control = &self.control;
+        let (set, missing) = match (&control.issuer_cert, &control.issuer_key) {
+            (None, None) => return Ok(()),
+            (Some(_), None) => ("control.issuer_cert", Some("control.issuer_key")),
+            (None, Some(_)) => ("control.issuer_key", Some("control.issuer_cert")),
+            (Some(_), Some(_)) => ("control.issuer_cert", None),
+        };
+        if !self.role.runs_control() {
+            return Err(ConfigError::Invalid {
+                field: set,
+                reason: "only a node that runs the control role signs delegated tokens; remove \
+                         the delegation issuer pair from this data-only node"
+                    .to_owned(),
+            });
+        }
+        match missing {
+            Some(field) => Err(ConfigError::Missing {
+                field,
+                reason: ISSUER_PAIR,
+            }),
+            None => Ok(()),
+        }
+    }
+
     fn validate_admin(&self) -> Result<(), ConfigError> {
         let admin = &self.admin;
         if admin.enabled == AdminListener::Enabled
@@ -1275,6 +1343,10 @@ impl Config {
         Ok(())
     }
 }
+
+/// Why one of `[control] issuer_cert` and `issuer_key` needs the other (ADR-0047, point 1.3).
+const ISSUER_PAIR: &str = "control.issuer_cert and control.issuer_key name the delegation \
+                           issuer's certificate and key, so set both or neither";
 
 /// Why a `[[principal]]` entry may not hold a `grant` scope (ADR-0044, point 2).
 const GRANT_IN_PRINCIPAL: &str =
@@ -1548,6 +1620,87 @@ mod tests {
         }
         let unknown = with("\n[fork]\ndeadline = \"1h\"\n");
         assert!(unknown.is_err(), "unknown fields are refused: {unknown:?}");
+    }
+
+    const DATA_ONLY: &str = "role = \"data\"\n";
+
+    #[test]
+    fn issuer_cert_without_key_is_a_config_error() {
+        for (table, missing) in [
+            ("issuer_cert = \"/tls/issuer.c.crt\"", "control.issuer_key"),
+            ("issuer_key = \"/tls/issuer.c.key\"", "control.issuer_cert"),
+        ] {
+            let refused = with(&format!("\n[control]\n{table}\n")).expect_err(table);
+            let ConfigError::Missing { field, reason } = &refused else {
+                panic!("{table}: {refused}");
+            };
+            assert_eq!(*field, missing, "{refused}");
+            assert!(reason.contains("both or neither"), "{reason}");
+        }
+        let both = with(
+            "\n[control]\nissuer_cert = \"/tls/issuer.c.crt\"\nissuer_key = \"/tls/issuer.c.key\"\n",
+        )
+        .expect("both");
+        assert_eq!(
+            both.issuer_files(),
+            Some(IssuerFiles {
+                cert: "/tls/issuer.c.crt".into(),
+                key: "/tls/issuer.c.key".into(),
+            })
+        );
+        assert_eq!(with("").expect("neither").issuer_files(), None);
+    }
+
+    #[test]
+    fn issuer_on_a_data_only_node_is_a_config_error() {
+        for (table, named) in [
+            (
+                "issuer_cert = \"/tls/i.crt\"\nissuer_key = \"/tls/i.key\"",
+                "control.issuer_cert",
+            ),
+            ("issuer_cert = \"/tls/i.crt\"", "control.issuer_cert"),
+            ("issuer_key = \"/tls/i.key\"", "control.issuer_key"),
+        ] {
+            let text =
+                format!("{DATA_ONLY}{MINIMAL}\n[control]\naddress = \"10.0.0.1:7400\"\n{table}\n");
+            let refused = Config::from_toml(&text).expect_err(table);
+            let ConfigError::Invalid { field, reason } = &refused else {
+                panic!("{table}: {refused}");
+            };
+            assert_eq!(*field, named, "{refused}");
+            assert!(reason.contains("control role"), "{reason}");
+        }
+        // The control role alone may hold one.
+        let control = Config::from_toml(&format!(
+            "role = \"control\"\n{MINIMAL}\n[control]\nissuer_cert = \"/i.crt\"\n\
+             issuer_key = \"/i.key\"\n"
+        ))
+        .expect("a control node");
+        assert!(control.issuer_files().is_some());
+    }
+
+    #[test]
+    fn a_dev_node_defaults_to_the_dev_issuer_files_beside_its_authority() {
+        let dev = |extra: &str| {
+            Config::from_toml(&format!(
+                "dev = true\n{MINIMAL}\n[tls]\nca = \"/d/tls/ca.crt\"\ncert = \"/d/tls/n.crt\"\n\
+                 key = \"/d/tls/n.key\"\n{extra}"
+            ))
+            .expect("a dev config")
+        };
+        assert_eq!(
+            dev("").issuer_files(),
+            Some(IssuerFiles {
+                cert: "/d/tls/issuer.dev.crt".into(),
+                key: "/d/tls/issuer.dev.key".into(),
+            })
+        );
+        let named =
+            dev("\n[control]\nissuer_cert = \"/o/issuer.crt\"\nissuer_key = \"/o/issuer.key\"\n");
+        assert_eq!(
+            named.issuer_files().map(|files| files.cert),
+            Some(PathBuf::from("/o/issuer.crt"))
+        );
     }
 
     #[test]

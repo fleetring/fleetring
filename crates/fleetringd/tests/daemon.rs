@@ -172,6 +172,28 @@ fn a_locked_data_directory_refuses_a_second_daemon() -> TestResult {
     Err("the data directory stayed locked after the first lock was dropped".into())
 }
 
+/// A daemon that stopped has freed its port by the time it returns, so a node started again on
+/// it in the same process binds it at once, while a connection to the old one lingers.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_daemon_frees_its_port_before_it_returns() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let tls = support::Tls::create(dir.path())?;
+    let text = format!(
+        "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n{}",
+        dir.path().join("data"),
+        tls.node_table("control-1")?
+    );
+    let daemon = fleetringd::Daemon::start(Config::from_toml(&text)?).await?;
+    let address = daemon.listen_address();
+    // A connection that is still open when the daemon stops.
+    let lingering = tokio::net::TcpStream::connect(address).await?;
+    daemon.run_until(async {}).await;
+    let rebound = tokio::net::TcpListener::bind(address).await;
+    assert!(rebound.is_ok(), "{address}: {rebound:?}");
+    drop(lingering);
+    Ok(())
+}
+
 /// `fleetring serve --check` (#95): whether a node would start with a configuration and its
 /// flags, without starting anything.
 mod check {

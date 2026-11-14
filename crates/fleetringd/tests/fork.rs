@@ -16,7 +16,7 @@ use fleetring_proto::v1::{self as proto, ForkOperationStatus, SnapshotRequest};
 use fleetringd::auth::refused_binding;
 use fleetringd::data::{Client, DatabaseSpec, ForkSpec};
 use fleetringd::engine::{Statement, Value};
-use fleetringd::replication::{FORK_NOT_READY, FaultPoint, ForkFaults};
+use fleetringd::replication::{FORK_NOT_READY, FaultPoint, ForkFaults, RETRY_AFTER_KEY};
 use fleetringd::transport::{database_client, replication_client};
 use fleetringd::{Config, Daemon, Environment, Network};
 use tonic::Code;
@@ -378,6 +378,66 @@ fn staged_dirs(dir: &Path, id: &NodeId, database: &DatabaseName) -> Vec<PathBuf>
     found
 }
 
+/// The FR-106 review's probe, on a fork, whose incarnation is random: a drop notice naming the
+/// live fork's own incarnation, at an epoch past control state's, as a stolen node key would
+/// send, is refused for its binding on every node, and no copy is deleted (ADR-0042, point 2,
+/// as amended; ADR-0046's amendment, item 9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_notice_naming_a_live_forks_own_incarnation_deletes_nothing() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(dir.path(), Settings::default()).await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    create_source(&client, &source, 1, 5).await?;
+    let target = name("dst")?;
+    let id = operation(9);
+    client
+        .fork_database(&source, &target, &spec(id, 2)?)
+        .await?;
+    let ready = await_state(&client, id, proto::ForkState::Ready).await?;
+    let held = |dir: &Path| -> Result<Vec<String>, Box<dyn Error>> {
+        let mut held = Vec::new();
+        for node in DATA {
+            if database_dir(dir, &node.parse()?, &target)
+                .join("data.db")
+                .try_exists()?
+            {
+                held.push(node.to_owned());
+            }
+        }
+        Ok(held)
+    };
+    let before = held(dir.path())?;
+    assert!(!before.is_empty(), "the fork has copies");
+    let sender = fleet.tls.node_network("data-1")?;
+    for daemon in &fleet.data {
+        let address = daemon.listen_address().to_string();
+        for epoch in [2, u64::MAX] {
+            let refused = replication_client(sender.channel(&address)?)
+                .drop_copy(proto::DropCopyRequest {
+                    database: target.to_string(),
+                    epoch,
+                    incarnation: Some(ready.incarnation),
+                    operation: None,
+                })
+                .await
+                .expect_err("control state holds the incarnation the notice names");
+            assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+            assert_eq!(refused_binding(&refused), Some("dropped"));
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(held(dir.path())?, before, "no copy was deleted");
+    client
+        .execute(
+            &target,
+            Statement::new("INSERT INTO notes (body) VALUES ('still here')"),
+        )
+        .await?;
+    fleet.stop().await;
+    Ok(())
+}
+
 /// What the reserved tables of a copy of a database hold: the change record's rows, the sink
 /// marks, and the fork markers, each as `(incarnation, operation)`.
 struct Reserved {
@@ -698,10 +758,11 @@ fn refused_seeding(answer: &Result<proto::SnapshotChunk, tonic::Status>) -> bool
     matches!(answer, Err(status) if refused_binding(status) == Some("seeding"))
 }
 
-/// The seeding binding refuses a request from a non-seeder, for a stale attempt, with a
-/// mismatched source or fork incarnation or operation, naming a source that isn't the fork's,
-/// to a node that isn't the seeder for a staged copy, and from a client certificate (ADR-0046,
-/// points 4.1 and 4.4; #135).
+/// The seeding binding refuses a request from a non-seeder, with a mismatched source or fork
+/// incarnation or operation, naming a source that isn't the fork's, to a node that isn't the
+/// seeder for a staged copy, and from a client certificate; it answers one for an attempt that
+/// isn't seeding, or to a node that doesn't hold the source's lease, `UNAVAILABLE` (ADR-0046,
+/// points 4.1 and 4.4, as amended; #135).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_seeding_binding_refuses_every_mismatch() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -748,20 +809,12 @@ async fn the_seeding_binding_refuses_every_mismatch() -> TestResult {
         "{served:?}"
     );
 
-    let mut cases: Vec<(&str, Network, String, SnapshotRequest)> = vec![
-        (
-            "a non-seeder",
-            as_peer.clone(),
-            source_address.clone(),
-            valid.clone(),
-        ),
-        (
-            "a stale attempt",
-            as_seeder.clone(),
-            source_address.clone(),
-            seeding_request(&source, &status, attempt + 1, false),
-        ),
-    ];
+    let mut cases: Vec<(&str, Network, String, SnapshotRequest)> = vec![(
+        "a non-seeder",
+        as_peer.clone(),
+        source_address.clone(),
+        valid.clone(),
+    )];
     let mut wrong = valid.clone();
     wrong.fork_incarnation ^= 1;
     cases.push((
@@ -803,6 +856,31 @@ async fn the_seeding_binding_refuses_every_mismatch() -> TestResult {
     for (case, network, address, request) in cases {
         let answer = ask(&network, &address, request).await?;
         assert!(refused_seeding(&answer), "{case}: {answer:?}");
+    }
+    // The fork's own identity at an attempt that isn't seeding, and the seeder's request to a
+    // node that doesn't hold the source's lease, are requests made at another moment, not
+    // mismatches: answered `UNAVAILABLE` with a retry-after, and not refused for their binding
+    // (ADR-0046, points 4.1 and 4.4, as amended).
+    let later = [
+        (
+            "another attempt",
+            source_address.clone(),
+            seeding_request(&source, &status, attempt + 1, false),
+        ),
+        (
+            "a node that doesn't hold the source's lease",
+            peer_address.clone(),
+            valid.clone(),
+        ),
+    ];
+    for (case, address, request) in later {
+        let answer = ask(&as_seeder, &address, request).await?;
+        assert!(
+            matches!(&answer, Err(status) if status.code() == Code::Unavailable
+                && refused_binding(status).is_none()
+                && status.metadata().get(RETRY_AFTER_KEY).is_some()),
+            "{case}: {answer:?}"
+        );
     }
     // A client certificate never gets a seeding stream, however well it names the fork.
     let as_client = client_network(&fleet.tls)?;
@@ -1047,6 +1125,22 @@ async fn two_forks_never_count_the_same_free_bytes() -> TestResult {
     );
     let (first, second) = (operation(6), operation(7));
     let (a, b) = (name("dst-a")?, name("dst-b")?);
+    // Neither fork may complete before the tight node has tried it, or the tight node never
+    // asks for its copy: every other replica but the fork's seeder (its first replica) keeps
+    // its staged copy unreported until the tight node has admitted one copy and refused the
+    // other. The seeder isn't held, so a tight node that copies from it isn't kept waiting.
+    let mut held = Vec::new();
+    for (fork, id) in [(&a, first), (&b, second)] {
+        let replicas = fleet.ring_replicas(fork.as_str(), 3)?;
+        let seeder = replicas.first().ok_or("no replica")?;
+        for node in replicas
+            .iter()
+            .filter(|node| **node != tight && *node != seeder)
+        {
+            fleet.faults(node)?.hold_operation(FaultPoint::Staged, id);
+            held.push((node.clone(), id));
+        }
+    }
     let (spec_a, spec_b) = (spec(first, 3)?, spec(second, 3)?);
     let (forked_a, forked_b) = tokio::join!(
         client.fork_database(&source, &a, &spec_a),
@@ -1054,9 +1148,22 @@ async fn two_forks_never_count_the_same_free_bytes() -> TestResult {
     );
     forked_a?;
     forked_b?;
+    let daemon = fleet.daemon(&tight)?;
+    wait_until("the tight node tries both forks", async || {
+        metric(daemon, "fleetring_fork_attempts_total{outcome=\"staged\"}") > staged_before
+            && metric(
+                daemon,
+                "fleetring_fork_attempts_total{outcome=\"insufficient_disk\"}",
+            ) > 0
+    })
+    .await?;
+    for (node, id) in held {
+        fleet
+            .faults(&node)?
+            .release_operation(FaultPoint::Staged, id);
+    }
     await_state(&client, first, proto::ForkState::Ready).await?;
     await_state(&client, second, proto::ForkState::Ready).await?;
-    let daemon = fleet.daemon(&tight)?;
     assert_eq!(
         metric(daemon, "fleetring_fork_attempts_total{outcome=\"staged\"}") - staged_before,
         1,
@@ -1098,6 +1205,18 @@ async fn dev_node_with_faults(
     extra: &str,
     faults: ForkFaults,
 ) -> Result<(Daemon, Client), Box<dyn Error>> {
+    let (daemon, client, _) = dev_node_with_tls(dir, extra, faults).await?;
+    Ok((daemon, client))
+}
+
+/// A dev node as [`dev_node_with_faults`] makes it, with the authority that issued its
+/// certificate, which issues others for the node `dev`.
+async fn dev_node_with_tls(
+    dir: &Path,
+    extra: &str,
+    faults: ForkFaults,
+) -> Result<(Daemon, Client, Tls), Box<dyn Error>> {
+    logs();
     let tls = Tls::create(dir)?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\n\n[node]\nid = \"dev\"\n\n[membership]\n\
@@ -1119,7 +1238,7 @@ async fn dev_node_with_faults(
     .await?
     .ok_or("membership stopped")?;
     let client = Client::new(address.to_string(), client_network(&tls)?);
-    Ok((daemon, client))
+    Ok((daemon, client, tls))
 }
 
 /// A dev node, R = 1 and W = 1, forks and its fork becomes ready through the same path
@@ -1186,6 +1305,113 @@ async fn a_dev_node_forks_a_database_that_checkpointed() -> TestResult {
         notes(&client, &target).await?,
         notes(&client, &source).await?
     );
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
+/// A lone primary, R = 1, whose first hash-chain build fails, as one a checkpoint raced did,
+/// builds its chain again with nothing written after, so a fork of it becomes ready (#156).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lone_primary_builds_its_chain_again_after_a_build_fails() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let faults = ForkFaults::new();
+    faults.set_disk(ROOMY, 2 * ROOMY);
+    let (daemon, client) = dev_node_with_faults(dir.path(), "", faults.clone()).await?;
+    faults.fail_next_chain_build();
+    let source = name("src")?;
+    create_source(&client, &source, 1, 3).await?;
+    wait_until("the source's first chain build fails", async || {
+        !faults.fails_next_chain_build()
+    })
+    .await?;
+    let target = name("dst")?;
+    let id = operation(44);
+    client
+        .fork_database(&source, &target, &spec(id, 1)?)
+        .await?;
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
+/// A seeding request that finds its source's hash chain lost builds it again, and a build
+/// whose request is dropped meanwhile, as one the seeder's idle limit gives up on is, still ends
+/// with the chain built rather than loading for good, so a later request is served (#156).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_seeding_request_still_builds_the_chain() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let faults = ForkFaults::new();
+    faults.set_disk(ROOMY, 2 * ROOMY);
+    let (daemon, client, tls) = dev_node_with_tls(dir.path(), "", faults.clone()).await?;
+    // Every build fails until the request below holds one, so the chain stays lost.
+    faults.fail_next_chain_builds(u32::MAX);
+    let source = name("src")?;
+    create_source(&client, &source, 1, 3).await?;
+    // The seeder never asks, so the requests below are the only ones.
+    faults.hold(FaultPoint::Fetch);
+    faults.hold(FaultPoint::ChainRebuild);
+    let id = operation(45);
+    client
+        .fork_database(&source, &name("dst")?, &spec(id, 1)?)
+        .await?;
+    if !faults
+        .await_arrivals(FaultPoint::Fetch, 1, HANG_GUARD)
+        .await
+    {
+        return Err("the seeder never got to ask".into());
+    }
+    let status = client.fork_operation(id).await?;
+    let request = seeding_request(&source, &status, status.attempt, false);
+    let as_seeder = tls.node_network("dev")?;
+    let address = daemon.listen_address().to_string();
+    // A request that finds a failed build under way is told to ask again, and does.
+    let asking = loop {
+        let mut asking = tokio::spawn({
+            let (network, address, request) = (as_seeder.clone(), address.clone(), request.clone());
+            async move {
+                ask(&network, &address, request)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        });
+        tokio::select! {
+            arrived = faults.await_arrivals(FaultPoint::ChainRebuild, 1, HANG_GUARD) => {
+                if !arrived {
+                    return Err("no seeding request built the chain".into());
+                }
+                break asking;
+            }
+            answer = &mut asking => {
+                let answer = answer??;
+                assert!(
+                    answer.as_ref().is_err_and(|status| status.code() == Code::Unavailable),
+                    "{answer:?}"
+                );
+            }
+        }
+    };
+    faults.fail_next_chain_builds(0);
+    asking.abort();
+    let _ = asking.await;
+    // The source's server drops the request's call once it sees the stream reset.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    faults.release(FaultPoint::ChainRebuild);
+    wait_until("the source's chain is built", async || {
+        client.verify(&address, &source, None).await.is_ok()
+    })
+    .await?;
+    let served = ask(&as_seeder, &address, request).await?;
+    assert!(
+        served
+            .as_ref()
+            .is_ok_and(|chunk| chunk.total_bytes.is_some()),
+        "{served:?}"
+    );
+    faults.release(FaultPoint::Fetch);
     daemon.run_until(async {}).await;
     Ok(())
 }
@@ -1348,13 +1574,10 @@ async fn crash_during_the_reset(point: FaultPoint, seed: u8) -> TestResult {
         vec![marker.clone()]
     );
 
-    // A change written after readiness survives the next failover: no reset runs again.
-    client
-        .execute(
-            &target,
-            Statement::new("INSERT INTO notes (body) VALUES ('after')"),
-        )
-        .await?;
+    // A change written after readiness survives the next failover: no reset runs again. The
+    // restarted node may not follow the fork's primary yet, which refuses the write as
+    // unavailable, with nothing committed, until it does.
+    write_once_served(&client, &target, "after").await?;
     wait_until("the fork's primary records the change", async || {
         reserved(dir.path(), &fork_primary, &target).is_ok_and(|held| held.changes > 0)
     })
@@ -1679,8 +1902,13 @@ async fn seeded_then_moved(
     for faults in &fleet.faults {
         faults.hold_operation(FaultPoint::FollowerReset, id);
     }
+    // The fork completes once a completion quorum has staged its copy, and its holders are the
+    // replicas that had then, so a slow third replica would be left out. A floor of three
+    // replicas makes the completion quorum three: every data daemon holds the fork.
+    let mut three_holders = spec(id, 3)?;
+    three_holders.database.min_replicas = Some(3);
     client
-        .fork_database(&source, &target, &spec(id, 3)?)
+        .fork_database(&source, &target, &three_holders)
         .await?;
     await_state(&client, id, proto::ForkState::Seeded).await?;
     let primary = write_once_served(&client, &target, "served while seeded").await?;
@@ -1695,6 +1923,14 @@ async fn seeded_then_moved(
         .iter()
         .map(|id| id.parse::<NodeId>())
         .collect::<Result<_, _>>()?;
+    let recorded: BTreeSet<NodeId> = seeded
+        .placement
+        .as_ref()
+        .and_then(|placement| placement.fork.as_ref())
+        .map(|fork| fork.holders.iter().map(|id| id.parse()).collect())
+        .transpose()?
+        .unwrap_or_default();
+    assert_eq!(recorded, holders, "every data daemon holds the fork");
     fleet.join(dir, JOINER, &settings()).await?;
     let ring: BTreeSet<NodeId> = fleet
         .ring_replicas(target.as_str(), 3)?

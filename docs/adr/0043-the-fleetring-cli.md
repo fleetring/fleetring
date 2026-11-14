@@ -4,6 +4,8 @@
 - **Date:** 2026-11-05
 - **Related:** ADR-0025 and ADR-0026 (principals, scopes, tokens; the scope grammar's reserved words, point 8.11), ADR-0032 (renames are clean breaks; amended here by points 2 and 6), ADR-0033 (surfaces and the client crate; point 2 amended by point 1), ADR-0034 (admin listener, `/readyz`), ADR-0038 (upgrades; points 6 and 7 amended by point 3), ADR-0039 (dev mode; points 1, 3 and 6 amended by points 5 and 7), ADR-0041 (`mcp`); tickets FR-075 (#103), FR-056 (#59), FR-079 (#114), FR-054 (#57), FR-060 (#62); [CLI style guide](../cli.md)
 
+*Note (2026-11-11):* [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12) proposes, for *delegated agents* (children created by `agent delegate`), that point 8.5's agent IDs gain a dotted form, `42.c7`, which only a delegation creates (`agent add 42.c7` is refused); that point 8.3's `--agent 42.c7` resolve to the root's TLS directory, `<agents_dir>/42/`, as `agent-42`, with the child's token from `<agents_dir>/42.c7/token`; and that point 8.7's `agent remove` revoke a child, and every agent below it, by `Revoked::Principal` as its nearest local ancestor, and a root agent itself without `fleet`, while `agent renew <child-id>` delegates again as the parent (ADR-0047, points 4, 10, and 11; [CLI style guide](../cli.md) §16). It is proposed, not part of this decision, until ADR-0047 is accepted. The text below is unchanged.
+
 ## Context
 
 The CLI grew one feature at a time inside the daemon's binary, `fleetringd`. 0.7.0 is the release that makes it pleasant to use. The owner decided its shape on 2026-11-05 (#103, #59, #114); this ADR records those decisions and the ones they left to design.

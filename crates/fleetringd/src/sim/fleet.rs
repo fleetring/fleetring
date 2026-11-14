@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::fork::{ForkIdentity, ForkState, OperationId};
-use fleetring_control::{DatabaseName, State, Timestamp};
+use fleetring_control::{DatabaseName, Feature, LeaseEpoch, State, Timestamp};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -32,8 +32,8 @@ use crate::sim::host::{Shared, WorkloadState, run_host};
 use crate::sim::seeds::millis;
 use crate::sim::trace::{DRIVER, Divergence, Event, EventKind, Trace};
 use crate::sim::workload::{
-    Ack, ForkMarkerSeen, ForkPass, ForkPhaseKind, ForkTransition, History, Operation, WRITES_TABLE,
-    Workload,
+    Ack, FencedSeen, ForkMarkerSeen, ForkPass, ForkPhaseKind, ForkTransition, History, Operation,
+    WRITES_TABLE, Workload,
 };
 use crate::tls::{Authority, AuthorityError, FleetName, Identity, IdentityError, Validity};
 use crate::{
@@ -213,6 +213,8 @@ pub struct FleetBuilder {
     archives: Vec<ArchiveSetup>,
     /// The router host, if the fleet has one.
     router: Option<String>,
+    /// The name of the control host's delegation issuer, if it has one.
+    control_issuer: Option<String>,
 }
 
 impl fmt::Debug for FleetBuilder {
@@ -340,6 +342,16 @@ impl FleetBuilder {
         self
     }
 
+    /// Gives the control host a delegation issuer pair named `name`, from the fleet's authority,
+    /// valid for 30 days from the epoch the simulated clocks start at, in files beside its data
+    /// directory that its `[control] issuer_cert` and `issuer_key` name (ADR-0047, point 1.3).
+    /// [`Fleet::rotate_issuer`] and [`Fleet::replace_issuer`] write another pair there.
+    #[must_use]
+    pub fn control_issuer(mut self, name: &str) -> Self {
+        self.control_issuer = Some(name.to_owned());
+        self
+    }
+
     /// Changes the configuration of host `name` with `configure`, after the harness fills it in.
     #[must_use]
     pub fn configure(mut self, name: &str, configure: impl Fn(&mut Config) + 'static) -> Self {
@@ -387,10 +399,14 @@ impl FleetBuilder {
             fork_seen: BTreeMap::new(),
             fork_phases: BTreeMap::new(),
             fork_markers: BTreeSet::new(),
+            promotions_seen: BTreeMap::new(),
+            sets_seen: BTreeMap::new(),
+            fenced_state: None,
             fork_stamps: BTreeMap::new(),
             principals: BTreeMap::new(),
             binding_refusals_allowed: false,
             fork_expectations: ForkExpectations::default(),
+            issuers: BTreeMap::new(),
             root,
         };
         for (name, role) in &self.hosts {
@@ -420,6 +436,20 @@ impl FleetBuilder {
                     configure(&mut entry);
                     config.archive.push(entry);
                 }
+            }
+            if let Some(issuer) = self.control_issuer.as_ref().filter(|_| role.runs_control()) {
+                let issuer: NodeId = issuer
+                    .parse()
+                    .map_err(|error| SimError::Invalid(format!("issuer '{issuer}': {error}")))?;
+                let files = issuer_files(fleet.root.path(), name);
+                fleet.write_issuer(
+                    &files,
+                    &issuer,
+                    Validity::new(Timestamp::ZERO, ISSUER_LIFETIME),
+                )?;
+                config.control.issuer_cert = Some(files.cert.clone());
+                config.control.issuer_key = Some(files.key.clone());
+                fleet.issuers.insert(name.clone(), (issuer, files));
             }
             for (_, configure) in self.configure.iter().filter(|(host, _)| host == name) {
                 configure(&mut config);
@@ -474,6 +504,17 @@ impl FleetBuilder {
             [] => invalid("no host runs the control plane".into()),
             many => invalid(format!("several hosts run the control plane: {many:?}")),
         }
+    }
+}
+
+/// How long an issuer pair the harness writes lasts: 30 days, as `fleetring cert issuer`'s do.
+const ISSUER_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The files of host `host`'s delegation issuer pair, beside its data directory under `root`.
+fn issuer_files(root: &Path, host: &str) -> crate::tls::IssuerFiles {
+    crate::tls::IssuerFiles {
+        cert: root.join(format!("issuer.{host}.crt")),
+        key: root.join(format!("issuer.{host}.key")),
     }
 }
 
@@ -571,6 +612,8 @@ fn host_config(
             heartbeat_timeout_ms: nonzero("the heartbeat timeout", timings.heartbeat_timeout)?,
             tick_interval_ms: nonzero("the tick interval", timings.tick_interval)?,
             snapshot_every: timings.snapshot_every,
+            issuer_cert: None,
+            issuer_key: None,
         },
         role,
         engine: EngineConfig {
@@ -645,6 +688,12 @@ pub struct Fleet {
     fork_phases: BTreeMap<DatabaseName, (ForkIdentity, ForkPhaseKind)>,
     /// Each fork's holders whose copy on disk the fleet has seen hold its marker.
     fork_markers: BTreeSet<(ForkIdentity, String)>,
+    /// The epoch of the latest promotion the fleet has seen start, by database.
+    promotions_seen: BTreeMap<DatabaseName, LeaseEpoch>,
+    /// The replica set promotions fence the fleet last saw, by database.
+    sets_seen: BTreeMap<DatabaseName, BTreeSet<NodeId>>,
+    /// The control state the fleet last looked at for promotions and replica sets.
+    fenced_state: Option<Arc<State>>,
     /// The size and modification time of each holder's copy files of each fork when the fleet
     /// last read them, so that it reads a copy again only once it changed.
     fork_stamps: BTreeMap<(DatabaseName, String), CopyStamp>,
@@ -654,6 +703,8 @@ pub struct Fleet {
     binding_refusals_allowed: bool,
     /// What the scenario expects of its forks.
     fork_expectations: ForkExpectations,
+    /// Each host's delegation issuer's name and files, if it has one.
+    issuers: BTreeMap<String, (NodeId, crate::tls::IssuerFiles)>,
     root: TempDir,
 }
 
@@ -685,6 +736,7 @@ impl Fleet {
             impostors: BTreeMap::new(),
             archives: Vec::new(),
             router: None,
+            control_issuer: None,
         }
     }
 
@@ -950,6 +1002,113 @@ impl Fleet {
         self.shared.lock().history.observe_clock_shift(at, total);
     }
 
+    /// Sets every host's clock `by` back, undoing part of [`Fleet::shift_clocks`]: as if a
+    /// control node whose clock ran ahead were replaced by one whose clock didn't, so that the
+    /// control plane's time, its last applied stamp, leads the clocks (ADR-0047, point 5.4).
+    pub fn set_clocks_back(&mut self, by: Duration) {
+        let total = self.shared.set_clocks_back(by);
+        self.note(format!("clocks set {} ms back", millis(by)));
+        let at = self.sim.elapsed();
+        self.shared.lock().history.observe_clock_shift(at, total);
+    }
+
+    /// The time the hosts' clocks read now: simulated time, plus the clocks' shift.
+    #[must_use]
+    pub fn host_time(&self) -> Timestamp {
+        Timestamp::from_millis(millis(self.sim.elapsed()).saturating_add(self.shared.clock_shift()))
+    }
+
+    /// A root agent's token for `agent`, signed by the fleet's authority as `agent add` signs it
+    /// once every member reports `delegation` (ADR-0047, point 2.6): `fleetring.kind` is agent,
+    /// its owner is the workload principal, `workload`, and it lasts `lifetime` from the hosts' time, rounded
+    /// down to the second. A client carries it on a certificate for `agent`, as
+    /// [`Operation::Delegate`](crate::sim::Operation::Delegate) does.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Invalid`] for an invalid name, ID, or scope, or a token the authority won't
+    /// sign.
+    pub fn agent_token(
+        &self,
+        agent: &str,
+        id: &str,
+        scopes: &[&str],
+        lifetime: Duration,
+    ) -> Result<crate::auth::BearerToken, SimError> {
+        let invalid = |error: &dyn fmt::Display| SimError::Invalid(error.to_string());
+        let signer = self
+            .authority
+            .token_signer()
+            .map_err(|error| invalid(&error))?;
+        let scopes: crate::auth::Scopes = scopes
+            .iter()
+            .map(|scope| scope.parse())
+            .collect::<Result<_, crate::auth::ParseScopeError>>()
+            .map_err(|error| invalid(&error))?;
+        let now = self.host_time().as_millis();
+        let start = Timestamp::from_millis(now - now % 1_000);
+        let spec = crate::auth::TokenSpec::new(
+            agent.parse().map_err(|error| invalid(&error))?,
+            scopes,
+            id.parse().map_err(|error| invalid(&error))?,
+            start,
+            start.saturating_add(fleetring_control::Millis::new(millis(lifetime))),
+        )
+        .signed_at(self.host_time())
+        .agent(
+            WORKLOAD_PRINCIPAL
+                .parse()
+                .map_err(|error| invalid(&error))?,
+        );
+        signer.issue(&spec).map_err(|error| invalid(&error))
+    }
+
+    /// Writes a new delegation issuer pair for host `name`, valid for 30 days from an hour before
+    /// the hosts' time, in place of the files it was started with: a key rotation, which the
+    /// running daemon picks up at its next check of the files, within about a second, or a
+    /// restart (ADR-0047, point 1.3).
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Invalid`] if host `name` has no issuer; an error if the pair can't be issued
+    /// or written.
+    pub fn rotate_issuer(&mut self, name: &str) -> Result<(), SimError> {
+        let start = Timestamp::from_millis(self.host_time().as_millis().saturating_sub(3_600_000));
+        self.replace_issuer(name, Validity::new(start, ISSUER_LIFETIME))
+    }
+
+    /// Writes a new delegation issuer pair for host `name`, valid for `validity`, in place of
+    /// the files it was started with, as [`Fleet::rotate_issuer`] does: an expired one, one not
+    /// yet valid, or one that expires soon.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fleet::rotate_issuer`].
+    pub fn replace_issuer(&mut self, name: &str, validity: Validity) -> Result<(), SimError> {
+        let (issuer, files) = self
+            .issuers
+            .get(name)
+            .cloned()
+            .ok_or_else(|| SimError::Invalid(format!("host '{name}' has no issuer")))?;
+        self.write_issuer(&files, &issuer, validity)?;
+        self.note(format!("new issuer pair for {name}"));
+        Ok(())
+    }
+
+    /// Issues an issuer pair named `issuer`, valid for `validity`, and writes it to `files`: the
+    /// key first, so that a reader between the two writes finds a mismatch and keeps its pair.
+    fn write_issuer(
+        &self,
+        files: &crate::tls::IssuerFiles,
+        issuer: &NodeId,
+        validity: Validity,
+    ) -> Result<(), SimError> {
+        let pair = self.authority.issue_issuer(issuer, validity)?;
+        std::fs::write(&files.key, pair.key_pem())?;
+        std::fs::write(&files.cert, pair.certificate_pem())?;
+        Ok(())
+    }
+
     /// Lets data hosts refuse peer calls for their bindings in this run, as a fork scenario's
     /// late requests and retries legitimately are (ADR-0046, point 4.1).
     pub fn allow_binding_refusals(&mut self) {
@@ -998,20 +1157,20 @@ impl Fleet {
             .map_err(|error: crate::auth::ParseScopeError| SimError::Invalid(error.to_string()))?;
         // Tokens are judged by the hosts' simulated clocks, which start near the epoch.
         let token = signer
-            .issue(&crate::auth::TokenSpec {
-                principal: WORKLOAD_PRINCIPAL
+            .issue(&crate::auth::TokenSpec::new(
+                WORKLOAD_PRINCIPAL
                     .parse()
                     .map_err(|error: crate::tls::NameError| SimError::Invalid(error.to_string()))?,
                 scopes,
-                id: format!("sim-{name}").parse().map_err(
+                format!("sim-{name}").parse().map_err(
                     |error: fleetring_control::ParseCredentialIdError| {
                         SimError::Invalid(error.to_string())
                     },
                 )?,
-                not_before: Timestamp::ZERO,
-                expires_at: Timestamp::ZERO
+                Timestamp::ZERO,
+                Timestamp::ZERO
                     .saturating_add(fleetring_control::Millis::new(29 * 24 * 60 * 60 * 1000)),
-            })
+            ))
             .map_err(|error| SimError::Invalid(error.to_string()))?;
         let via = Via {
             address: format!("{router}:{ROUTER_PORT}"),
@@ -1108,12 +1267,87 @@ impl Fleet {
     ///
     /// [`SimError::Simulation`] if a host's software failed or the run went past its duration.
     pub fn step(&mut self) -> Result<(), SimError> {
+        let started = self.sim.elapsed();
         self.sim
             .step()
             .map(|_| ())
             .map_err(|error| SimError::Simulation(error.to_string()))?;
-        self.observe_forks();
+        self.observe_forks(started);
+        self.observe_fenced();
         Ok(())
+    }
+
+    /// Whether `db` is a fork whose recorded holders are its replica set, seeded or ready with
+    /// them kept: the fork properties check those ([`crate::sim::forks`]).
+    fn frozen(db: &fleetring_control::Database) -> bool {
+        db.fork().is_some_and(|fork| {
+            matches!(
+                fork.state(),
+                ForkState::Seeded { .. }
+                    | ForkState::Ready {
+                        holders: Some(_),
+                        ..
+                    }
+            )
+        })
+    }
+
+    /// Records each promotion that started in control state since the last step, and, while
+    /// the `handover` feature is enabled, each change of a database's replica set, with the
+    /// replica set promotions fence and every data host's rows of the database then (FR-102). A
+    /// fork's replica set changes while its holders are its replica set are left to the fork
+    /// properties ([`crate::sim::forks`]).
+    fn observe_fenced(&mut self) {
+        let Some(state) = self.control_state() else {
+            return;
+        };
+        if self
+            .fenced_state
+            .as_ref()
+            .is_some_and(|seen| Arc::ptr_eq(seen, &state))
+        {
+            return;
+        }
+        self.fenced_state = Some(Arc::clone(&state));
+        let handover = state.is_enabled(Feature::Handover);
+        let mut seen = Vec::new();
+        for db in state.databases() {
+            let replica_set = state.replica_set(db.name()).unwrap_or_default();
+            let members: BTreeSet<NodeId> = replica_set.iter().cloned().collect();
+            let previous = self.sets_seen.insert(db.name().clone(), members.clone());
+            let changed = handover
+                && !Self::frozen(db)
+                && previous.is_some_and(|previous| previous != members);
+            let promotion = db
+                .promotion()
+                .map(|promotion| promotion.epoch())
+                .filter(|epoch| self.promotions_seen.get(db.name()) != Some(epoch));
+            if let Some(epoch) = promotion {
+                self.promotions_seen.insert(db.name().clone(), epoch);
+            }
+            if promotion.is_none() && !changed {
+                continue;
+            }
+            let write_quorum = u8::try_from(replica_set.len())
+                .ok()
+                .and_then(ReplicationFactor::new)
+                .map_or(0, |size| usize::from(db.durability().quorums(size).write()));
+            seen.push(FencedSeen {
+                at: self.sim.elapsed(),
+                database: db.name().clone(),
+                promotion,
+                replica_set,
+                write_quorum,
+                rows: self.replica_rows(db.name()).unwrap_or_default(),
+            });
+        }
+        if seen.is_empty() {
+            return;
+        }
+        let mut shared = self.shared.lock();
+        for fenced in seen {
+            shared.history.observe_fenced(fenced);
+        }
     }
 
     /// The passes of each data host's fork work through its hooks since the last step.
@@ -1152,9 +1386,14 @@ impl Fleet {
     /// each fork's phase in control state, with every data host's rows of a fork that moved to a
     /// new replica set; and when each holder's copy on disk first holds its fork's marker
     /// (FR-087).
-    fn observe_forks(&mut self) {
+    ///
+    /// A hook pass and a marker's first sighting are stamped with `started`, the time the step
+    /// began: they happened somewhere in the step, as a client's answer in it did, which its host
+    /// clock stamps from the step's start on. Stamped with the step's end, a read answered in the
+    /// same step as its fork's reset committed would look a tick early (fork property (a)).
+    fn observe_forks(&mut self, started: Duration) {
         let at = self.sim.elapsed();
-        let passes = self.hook_passes(at);
+        let passes = self.hook_passes(started);
         let mut transitions = Vec::new();
         let mut markers = Vec::new();
         if let Some(state) = self.control_state() {
@@ -1180,7 +1419,7 @@ impl Fleet {
                     ..
                 } = fork.state()
                 {
-                    markers.extend(self.markers_seen(at, &identity, holders));
+                    markers.extend(self.markers_seen(started, &identity, holders));
                 }
                 let now = (identity.clone(), phase);
                 if self.fork_phases.get(db.name()) == Some(&now) {
@@ -1633,12 +1872,44 @@ impl Fleet {
         // A name dropped during the run may name another database afterwards: the fork
         // properties hold its lives apart ([`crate::sim::forks`]).
         let history = history.without_databases(&history.dropped());
+        let mut history = history;
+        let state = self.control_state();
+        let handover = state
+            .as_ref()
+            .is_some_and(|state| state.is_enabled(Feature::Handover));
         let mut databases = BTreeMap::new();
         for (database, guarantee) in created(&history) {
             let rows = self.replica_rows(&database)?;
+            // Once `handover` is enabled the replica set promotions fence holds every write
+            // acknowledged so far at any moment, not only when it changes: check it now too,
+            // after the last write.
+            if let Some(state) = state.as_ref().filter(|_| handover)
+                && let Some(db) = state.database(&database)
+                && !Self::frozen(db)
+            {
+                let replica_set = state.replica_set(&database).unwrap_or_default();
+                let write_quorum = u8::try_from(replica_set.len())
+                    .ok()
+                    .and_then(ReplicationFactor::new)
+                    .map_or(0, |size| usize::from(db.durability().quorums(size).write()));
+                history.observe_fenced(FencedSeen {
+                    at: self.sim.elapsed(),
+                    database: database.clone(),
+                    promotion: None,
+                    replica_set,
+                    write_quorum,
+                    rows: rows.clone(),
+                });
+            }
             databases.insert(database, Replicated::new(guarantee, rows));
         }
         history::check(&history, &databases)?;
+        let fenced: BTreeSet<DatabaseName> = created(&history)
+            .into_iter()
+            .filter(|(_, guarantee)| guarantee.mode().acknowledged_writes_survive())
+            .map(|(database, _)| database)
+            .collect();
+        check::acknowledged_writes_fenced(&history, &fenced)?;
         Ok(())
     }
 

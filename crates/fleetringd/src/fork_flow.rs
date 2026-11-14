@@ -338,8 +338,8 @@ pub fn refusal_hint(
     let message = status.message();
     match status.code() {
         Code::PermissionDenied => Some(
-            "until 0.8's fork action ships, forking needs admin on the source, and admin on the \
-             target; act as a principal that has both (`--as`, `--token-file`, `--context`)"
+            "forking needs `fork` on the source, and `admin` on the target; act as a principal \
+             that has both (`--as`, `--token-file`, `--context`)"
                 .to_owned(),
         ),
         Code::AlreadyExists if message.contains("operation") => Some(format!(
@@ -590,7 +590,7 @@ mod tests {
         let hint = |status| refusal_hint(&status, "notes", "notes-exp", "abc");
         assert!(
             hint(Status::permission_denied("no"))
-                .is_some_and(|h| h.contains("admin on the source"))
+                .is_some_and(|h| h.contains("`fork` on the source"))
         );
         assert!(
             hint(Status::already_exists("database exists"))

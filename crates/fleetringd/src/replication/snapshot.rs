@@ -91,7 +91,7 @@ pub(super) async fn serve(
         .map_err(|error| Status::unavailable(format!("can't pin a snapshot: {error}")))?;
     let packer = Packer::new(pinned).map_err(|error| Status::internal(error.to_string()))?;
     // The follower continues the chain from the snapshot's position, so the chain must reach it.
-    primary::chain_to(inner, &primary, &handle, packer.position()).await;
+    primary::chain_to_rebuilt(inner, &primary, &handle, packer.position()).await;
     let chain = primary.hash_at(packer.position());
     let (chunks, stream) = mpsc::channel(2);
     tokio::spawn(send_chunks(

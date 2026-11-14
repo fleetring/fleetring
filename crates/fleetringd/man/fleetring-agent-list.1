@@ -4,12 +4,23 @@
 .SH NAME
 fleetring\-agent\-list \- Lists the context\*(Aqs agents, with their scopes and expiries
 .SH SYNOPSIS
-\fBfleetring agent list\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBfleetring agent list\fR [\fB\-\-fleet\fR] [\fB\-\-recorded\-by\fR] [\fB\-\-since\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Lists the context\*(Aqs agents, with their scopes and expiries
 .PP
-Their principals, scopes, and when their credentials expire.
+Their principals, parents, scopes, and when their credentials expire, each delegated agent after its parent. With `\-\-fleet`, the fleet\*(Aqs live delegation records instead.
 .SH OPTIONS
+.TP
+\fB\-\-fleet\fR
+Lists the fleet\*(Aqs live delegation records instead of this machine\*(Aqs identities
+
+Records only, never tokens. Needs the fleet scope. The control node that recorded each is stamped by the leader, so after a compromise, list with `\-\-since` over the whole time the node may have led, not only `\-\-recorded\-by`.
+.TP
+\fB\-\-recorded\-by\fR \fI<NODE_ID>\fR
+Only the records this control node recorded
+.TP
+\fB\-\-since\fR \fI<TIME>\fR
+Only the records recorded at or after this time, RFC 3339
 .TP
 \fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: table]
 The output format: `table`, `json`, or `jsonl`
@@ -85,7 +96,7 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 \fB\-\-agent\fR \fI<ID>\fR
 Acts as the agent with this ID, with the identity minted for it
 
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`

@@ -8,7 +8,7 @@ fleetring\-agent \- Adds, lists, shows, renews, and removes agents\*(Aq identiti
 .SH DESCRIPTION
 Adds, lists, shows, renews, and removes agents\*(Aq identities
 .PP
-An identity is a principal `agent\-<id>` with a certificate and a scoped token, kept in a directory per agent (ADR\-0043, point 8). In dev mode, `fleetring mcp \-\-agent <id>` adds one by itself. Trusted local development: agents running as the same user can read each other\*(Aqs credentials.
+An identity is a principal `agent\-<id>` with a certificate and a scoped token, kept in a directory per agent (ADR\-0043, point 8). In dev mode, `fleetring mcp \-\-agent <id>` adds one by itself. A delegated agent, such as `42.c7`, holds only a narrower token, which its parent asks the control plane for with `agent delegate`, and connects with its root\*(Aqs certificate (ADR\-0047). Trusted local development: agents running as the same user can read each other\*(Aqs credentials.
 .SH OPTIONS
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
@@ -45,6 +45,9 @@ Print help (see a summary with \*(Aq\-h\*(Aq)
 fleetring\-agent\-add(1)
 Mints an agent\*(Aqs identity: a certificate and a scoped token
 .TP
+fleetring\-agent\-delegate(1)
+Asks the control plane for a delegated agent\*(Aqs token, as its parent
+.TP
 fleetring\-agent\-list(1)
 Lists the context\*(Aqs agents, with their scopes and expiries
 .TP
@@ -55,4 +58,4 @@ fleetring\-agent\-renew(1)
 Reissues an agent\*(Aqs certificate and token now, and revokes the old token
 .TP
 fleetring\-agent\-remove(1)
-Revokes an agent\*(Aqs token and deletes its directory
+Revokes an agent and every agent below it, and deletes its directory

@@ -81,9 +81,9 @@ pub(crate) fn authenticate(
         Refusal::Unauthenticated(format!("the token can't be forwarded: {error}"))
     })?;
     Ok(Caller {
-        principal: verified.spec.principal,
-        token_id: verified.spec.id,
-        scopes: verified.spec.scopes,
+        principal: verified.principal,
+        token_id: verified.claims.id,
+        scopes: verified.claims.scopes,
         credentials,
     })
 }
@@ -148,15 +148,15 @@ mod tests {
         let (signer, verifier) = signer_and_verifier();
         let now = Timestamp::from_millis(1_000_000);
         let token = signer
-            .issue(&TokenSpec {
-                principal: "app".parse().expect("principal"),
-                scopes: ["read:notes".parse::<Scope>().expect("a scope")]
+            .issue(&TokenSpec::new(
+                "app".parse().expect("principal"),
+                ["read:notes".parse::<Scope>().expect("a scope")]
                     .into_iter()
                     .collect(),
-                id: "t1".parse().expect("token id"),
-                not_before: now,
-                expires_at: now.saturating_add(Millis::new(60_000)),
-            })
+                "t1".parse().expect("token id"),
+                now,
+                now.saturating_add(Millis::new(60_000)),
+            ))
             .expect("issued");
         let missing = authenticate(&HeaderMap::new(), &verifier, now).expect_err("no token");
         assert!(matches!(missing, Refusal::Unauthenticated(_)));
@@ -189,6 +189,104 @@ mod tests {
         assert_eq!(
             denied,
             Refusal::PermissionDenied("this token can't read database 'other'".to_owned())
+        );
+    }
+
+    /// A delegation signer for `name`, certified by `authority` for 30 days from 0.
+    fn delegation_signer(authority: &Authority, name: &str) -> crate::auth::DelegationSigner {
+        use rustls_pki_types::pem::PemObject as _;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+        let issued = authority
+            .issue_issuer(
+                &name.parse().expect("a node id"),
+                Validity::new(Timestamp::ZERO, Duration::from_secs(30 * 24 * 3600)),
+            )
+            .expect("an issuer pair");
+        let cert =
+            CertificateDer::from_pem_slice(issued.certificate_pem().as_bytes()).expect("a cert");
+        let PrivateKeyDer::Pkcs8(key) =
+            PrivateKeyDer::from_pem_slice(issued.key_pem().as_bytes()).expect("a key")
+        else {
+            panic!("an issuer key is PKCS#8");
+        };
+        let authorities = [authority.token_signer().expect("a signer").verifying_key()];
+        crate::auth::DelegationSigner::new(
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+            authority.fleet(),
+            &authorities,
+        )
+        .expect("a delegation signer")
+    }
+
+    /// The router's HTTP clients present no certificate, by design (ADR-0037): it verifies a
+    /// delegated agent's token through the issuer certificate the token carries, and forwards it
+    /// unchanged, so the nodes it calls see it relay-carried on the router's certificate and
+    /// apply the connection rule and the revocation checks themselves (ADR-0047, point 4.1).
+    #[test]
+    fn a_delegated_token_is_verified_through_its_issuer_and_forwarded() {
+        use fleetring_control::delegation::{ChainLink, DelegationId, TokenClaims, TokenKind};
+
+        let validity = Validity::new(Timestamp::ZERO, Duration::from_secs(100 * 365 * 24 * 3600));
+        let authority =
+            Authority::create("test".parse().expect("a fleet"), validity).expect("an authority");
+        let issued = authority
+            .issue_client(&"router".parse().expect("a principal"), validity)
+            .expect("a client certificate");
+        let verifier = Identity::from_issued(authority.certificate_pem(), &issued)
+            .expect("an identity")
+            .token_verifier();
+        let claims = TokenClaims {
+            fleet: "test".into(),
+            principal: "agent-42.c7".parse().expect("a principal"),
+            id: DelegationId::from_bytes([7; 16]).into(),
+            issued_at: Some(Timestamp::ZERO),
+            not_before: Timestamp::ZERO,
+            expires_at: Timestamp::from_millis(3_600_000),
+            scopes: ["admin:agent-42.c7-*".parse::<Scope>().expect("a scope")]
+                .into_iter()
+                .collect(),
+            kind: Some(TokenKind::Agent),
+            owner: Some("alice".parse().expect("a principal")),
+            parent: Some("agent-42".parse().expect("a principal")),
+            chain: vec![ChainLink {
+                id: "root-42".parse().expect("a token id"),
+                kid: authority.token_signer().expect("a signer").key_id().clone(),
+            }],
+        };
+        let token = delegation_signer(&authority, "control-1")
+            .sign(&claims)
+            .expect("signed");
+        let now = Timestamp::from_millis(60_000);
+        let caller = authenticate(
+            &headers(&format!("Bearer {}", token.expose())),
+            &verifier,
+            now,
+        )
+        .expect("verified");
+        assert_eq!(caller.principal.as_str(), "agent-42.c7");
+        assert_eq!(caller.token_id, claims.id);
+        assert!(caller.credentials.has_token(), "forwarded unchanged");
+        assert!(!format!("{caller:?}").contains(token.expose()));
+        require_read(&caller, &"agent-42.c7-notes".parse().expect("name")).expect("may read");
+        assert!(require_read(&caller, &"agent-43-notes".parse().expect("name")).is_err());
+
+        // An issuer certified by an authority the router doesn't trust is no issuer here.
+        let other =
+            Authority::create("test".parse().expect("a fleet"), validity).expect("an authority");
+        let foreign = delegation_signer(&other, "control-1")
+            .sign(&claims)
+            .expect("signed");
+        let refused = authenticate(
+            &headers(&format!("Bearer {}", foreign.expose())),
+            &verifier,
+            now,
+        )
+        .expect_err("an untrusted issuer");
+        assert!(
+            matches!(refused, Refusal::Unauthenticated(_)),
+            "{refused:?}"
         );
     }
 }

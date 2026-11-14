@@ -3,11 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fleetring_control::{
-    Applied, Command, DatabaseName, JoinKind, LeaseEpoch, Liveness, Millis, Outcome, State, apply,
+    Action, Applied, Command, DatabaseName, Feature, JoinKind, LeaseEpoch, Liveness, Millis,
+    Outcome, State, apply,
 };
 use proptest::prelude::*;
 
-use crate::common::{Generator, NODES, Op, arb_op, config, id, member};
+use crate::common::{Generator, NODES, Op, SoftwareMix, arb_op, config, id, member};
 
 /// Runs `ops` through the generator and calls `check` with the state before each command, the
 /// command, its outcome, and the state after it.
@@ -30,8 +31,46 @@ fn lease_epoch(state: &State, database: &DatabaseName) -> Option<LeaseEpoch> {
         .map(|lease| lease.epoch())
 }
 
+/// The members of `database`'s replica set in `state`, if it is a database with a lease.
+fn leased_set(state: &State, database: &DatabaseName) -> Option<BTreeSet<fleetring::NodeId>> {
+    state.database(database)?.lease()?;
+    Some(state.replica_set(database).ok()?.into_iter().collect())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// FR-102: once every member supports the hand-over, a join or a leave never changes the
+    /// replica set a leased database's promotions fence; only a release does (ADR-0031,
+    /// amendment 2).
+    #[test]
+    fn a_membership_change_never_moves_a_leased_databases_fenced_set(
+        ops in prop::collection::vec(arb_op(), 1..300),
+    ) {
+        let mut state = State::new(config());
+        let mut generator = Generator::with_mix(SoftwareMix::Current);
+        for &op in &ops {
+            let command = generator.command(&state, op);
+            let before = state.clone();
+            let outcome = apply(&mut state, command.clone());
+            let membership = matches!(command.action, Action::Join { .. } | Action::Leave { .. });
+            if outcome.is_err() || !membership || !state.is_enabled(Feature::Handover) {
+                continue;
+            }
+            for db in before.databases() {
+                let Some(fenced) = leased_set(&before, db.name()) else {
+                    continue;
+                };
+                prop_assert_eq!(
+                    leased_set(&state, db.name()),
+                    Some(fenced),
+                    "{:?} moved {}'s replica set",
+                    command.action,
+                    db.name()
+                );
+            }
+        }
+    }
 
     #[test]
     fn no_lease_or_epoch_is_issued_at_or_below_the_current_one(

@@ -8,9 +8,10 @@ use fleetring::{NodeId, ReplicationFactor};
 use fleetring_control::{Action, DatabaseName, Incarnation, LeaseEpoch};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
-    AcquireLeaseRequest, CreateDatabaseRequest, Engine, FenceRequest, HeartbeatRequest,
-    JoinRequest, LeaseResponse, LocateRequest, LocateResponse, Node, RenewLeaseRequest,
-    ReplicateMessage, ReplicateOpen, SnapshotRequest, replicate_message,
+    AcquireLeaseRequest, CreateDatabaseRequest, DelegateTokenRequest, DelegateTokenResponse,
+    Engine, FenceRequest, HeartbeatRequest, JoinRequest, LeaseResponse, LocateRequest,
+    LocateResponse, Node, RenewLeaseRequest, ReplicateMessage, ReplicateOpen, Revocation,
+    RevokeTokenRequest, SnapshotRequest, replicate_message, revocation,
 };
 
 use crate::auth::refused_binding;
@@ -152,6 +153,32 @@ pub(super) async fn run_client(
     Ok(())
 }
 
+/// One attempt per call: a workload's resends are operations of their own, in the history.
+const ONE_ATTEMPT: Backoff = Backoff {
+    initial: Duration::from_millis(10),
+    max: Duration::from_millis(10),
+    attempts: 1,
+};
+
+/// What a `DelegateToken` reply acknowledges.
+fn delegated(response: DelegateTokenResponse) -> Result<Ack, tonic::Status> {
+    let invalid = |what: &str| tonic::Status::internal(format!("the reply's {what} is invalid"));
+    Ok(Ack::Delegated {
+        delegation: response
+            .delegation_id
+            .parse()
+            .map_err(|_| invalid("delegation ID"))?,
+        principal: response.principal,
+        scopes: response.scopes,
+        expires_at: fleetring_control::Timestamp::from_millis(response.expires_at_ms),
+        issuer_key: response
+            .issuer_key_id
+            .parse()
+            .map_err(|_| invalid("issuer key ID"))?,
+        token: crate::auth::BearerToken::new(response.token),
+    })
+}
+
 /// The control clients a workload acts as nodes through, one per node, each with a certificate
 /// for its node.
 struct NodeClients {
@@ -172,11 +199,32 @@ impl NodeClients {
         Network::simulated().with_security(Security::Tls(identity))
     }
 
+    /// A network whose connections present a client certificate for `principal` from the
+    /// fleet's authority, and whose calls carry `token`: an agent's.
+    fn agent_network(
+        &self,
+        principal: &crate::tls::Principal,
+        token: &crate::auth::BearerToken,
+    ) -> Result<Network, tonic::Status> {
+        let issued = self
+            .authority
+            .issue_client(principal, certificate_validity())
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        let identity = Identity::from_issued(self.authority.certificate_pem(), &issued)
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        let credentials = crate::transport::Credentials::bearer(token)
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        Ok(Network::simulated()
+            .with_security(Security::Tls(identity))
+            .with_credentials(credentials))
+    }
+
     /// The client for the node `operation` acts as, if it is a node's call.
     fn for_operation(&mut self, operation: &Operation) -> Option<ControlClient> {
         let node = match operation {
             Operation::Join { node }
             | Operation::JoinWith { node, .. }
+            | Operation::JoinWithout { node, .. }
             | Operation::Report { node, .. }
             | Operation::Heartbeat { node }
             | Operation::AcquireLease { node, .. }
@@ -264,6 +312,22 @@ async fn execute(
             .map(|response| Ack::Joined {
                 membership_epoch: response.membership_epoch,
             }),
+        Operation::JoinWithout { node, features } => client
+            .join(JoinRequest {
+                protocol: Some(PROTOCOL_VERSION),
+                node: Some(Node {
+                    id: node.to_string(),
+                    zone: None,
+                    host: None,
+                    weight: 1,
+                    address: None,
+                }),
+                software: Some(software_to_proto(&without_features(features))),
+            })
+            .await
+            .map(|response| Ack::Joined {
+                membership_epoch: response.membership_epoch,
+            }),
         Operation::Report {
             node,
             replicas,
@@ -322,6 +386,94 @@ async fn execute(
         Operation::Drain { node } => {
             return submit(shared, Action::Drain { id: node.clone() }, Ack::Draining).await;
         }
+        Operation::Revoke { revoked, until } => {
+            let action = Action::RevokeToken {
+                revoked: revoked.clone(),
+                until: *until,
+            };
+            return submit(shared, action, Ack::Revoked).await;
+        }
+        Operation::RevokePrincipal { principal } => {
+            let action = Action::RevokePrincipal {
+                principal: principal.clone(),
+            };
+            return submit(shared, action, Ack::Revoked).await;
+        }
+        Operation::RevokeAs {
+            certificate,
+            token,
+            principal,
+            token_id,
+        } => {
+            let request = RevokeTokenRequest {
+                revocation: token_id.as_ref().map(|id| Revocation {
+                    revoked: Some(revocation::Revoked::TokenId(id.to_string())),
+                    until_ms: 0,
+                }),
+                principal: principal
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            };
+            match nodes.agent_network(certificate, token) {
+                Ok(network) => network
+                    .control_client(nodes.control.clone())
+                    .with_backoff(ONE_ATTEMPT)
+                    .revoke_token(request)
+                    .await
+                    .map(|_| Ack::Revoked),
+                Err(status) => Err(status),
+            }
+        }
+        Operation::Delegate {
+            certificate,
+            token,
+            operation,
+            segment,
+            scopes,
+            lifetime,
+        } => {
+            let request = DelegateTokenRequest {
+                operation_id: operation.to_bytes().to_vec(),
+                segment: segment.clone(),
+                scopes: scopes.clone(),
+                lifetime_ms: lifetime.map(fleetring_control::Millis::get),
+                not_before_ms: None,
+            };
+            match nodes.agent_network(certificate, token) {
+                Ok(network) => network
+                    .control_client(nodes.control.clone())
+                    .with_backoff(ONE_ATTEMPT)
+                    .delegate_token(request)
+                    .await
+                    .and_then(delegated),
+                Err(status) => Err(status),
+            }
+        }
+        Operation::QueryAs {
+            certificate,
+            token,
+            database,
+        } => match nodes.agent_network(certificate, token) {
+            Ok(network) => Client::new(nodes.control.clone(), network)
+                .with_backoff(ONE_ATTEMPT)
+                .query(database, Statement::new("SELECT 1"))
+                .await
+                .map(|_| Ack::Queried),
+            Err(status) => Err(status),
+        },
+        Operation::CreateAs {
+            certificate,
+            token,
+            database,
+        } => match nodes.agent_network(certificate, token) {
+            Ok(network) => Client::new(nodes.control.clone(), network)
+                .with_backoff(ONE_ATTEMPT)
+                .create_database_with(database, DatabaseSpec::new(ReplicationFactor::ONE))
+                .await
+                .map(|_| Ack::Created),
+            Err(status) => Err(status),
+        },
         Operation::CreateDatabase {
             database,
             replication_factor,
@@ -656,6 +808,7 @@ async fn impostor(network: &Network, operation: &Operation) -> Ack {
                     database: database.to_string(),
                     epoch: epoch.get(),
                     epoch_start: None,
+                    epoch_start_chain: None,
                 })),
             };
             // No metadata names the sender: the certificate does.
@@ -828,4 +981,16 @@ async fn watch(client: &Client, database: &DatabaseName) -> Result<Ack, tonic::S
         }
     }
     Ok(Ack::Watched { values })
+}
+
+/// This build's software without `features`, as a node of the previous release reports it.
+fn without_features(features: &[fleetring_control::Feature]) -> fleetring_control::Software {
+    let running = running();
+    fleetring_control::Feature::ALL
+        .into_iter()
+        .filter(|feature| running.supports(*feature) && !features.contains(feature))
+        .fold(
+            fleetring_control::Software::new(running.release().clone(), running.control_format()),
+            fleetring_control::Software::with_feature,
+        )
 }

@@ -8,7 +8,9 @@
 //!   publishes the new state. [`ControlHandle`] submits commands and reads the published state.
 //! - [`ControlService`] serves the `Control` gRPC service over a handle, forks included
 //!   (ADR-0046): what replicas report about forks, a fork's status in a placement, and a fork
-//!   operation's status cross the protocol in `fork`.
+//!   operation's status cross the protocol in `fork`. It also delegates agents' tokens
+//!   (ADR-0047): `delegation` resolves a request's child, scopes, and times, and the service
+//!   records the delegation before it signs with the control node's issuer pair.
 //! - [`ControlClient`] calls the service, retrying and following leader redirects
 //!   ([`not_leader`](fleetring_client::redirect::not_leader)).
 //! - [`Failover`] ticks the state machine on a timer, starts promotions for expired leases, and
@@ -21,12 +23,15 @@
 
 mod absent;
 mod client;
+mod delegation;
 mod failover;
 pub(crate) mod fork;
 mod log;
 mod node;
 mod notices;
 mod service;
+#[cfg(test)]
+mod test_support;
 
 pub use absent::NoControl;
 pub use client::ControlClient;

@@ -5,10 +5,11 @@ use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
     AcquireLeaseRequest, ChangeDurabilityRequest, ChangeDurabilityResponse,
     CompletePromotionRequest, CompletePromotionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DrainRequest, DrainResponse,
-    DropDatabaseRequest, DropDatabaseResponse, ForkDatabaseRequest, ForkOperationStatus,
-    GetForkOperationRequest, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
-    LeaseResponse, LeaveRequest, LeaveResponse, ListDatabasesRequest, ListDatabasesResponse,
+    CreateDatabaseResponse, CreateDatabaseWithMetadataRequest, DelegateTokenRequest,
+    DelegateTokenResponse, DrainRequest, DrainResponse, DropDatabaseRequest, DropDatabaseResponse,
+    ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
+    HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
+    ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
     LocateRequest, LocateResponse, PromotionResponse, RecordFencedRequest, RecordFencedResponse,
     RenewLeaseRequest, RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest,
     TransferLeaseRequest, UndrainRequest, UndrainResponse, UpdateDatabaseRequest,
@@ -185,6 +186,20 @@ impl Control for NoControl {
         &self,
         _: Request<RevokeTokenRequest>,
     ) -> Result<Response<RevokeTokenResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn delegate_token(
+        &self,
+        _: Request<DelegateTokenRequest>,
+    ) -> Result<Response<DelegateTokenResponse>, Status> {
+        self.refuse()
+    }
+
+    async fn list_delegations(
+        &self,
+        _: Request<ListDelegationsRequest>,
+    ) -> Result<Response<ListDelegationsResponse>, Status> {
         self.refuse()
     }
 }

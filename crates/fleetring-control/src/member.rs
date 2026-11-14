@@ -3,6 +3,7 @@
 use fleetring::{Host, Node, NodeId, Weight, Zone};
 use serde::{Deserialize, Serialize};
 
+use crate::ReplicasCaughtUp;
 use crate::fork::{CopyLost, PlacementCaughtUp, ResetReport, SeedFailure, StagedCopy};
 use crate::{DatabaseName, LeaseEpoch, Position, Software, Timestamp};
 
@@ -229,6 +230,9 @@ pub struct HostedReplica {
     // Absent from logs and states written before ready forks released their holders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     placement_caught_up: Option<PlacementCaughtUp>,
+    // Absent from logs and states written before membership changes kept replica sets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replicas_caught_up: Option<ReplicasCaughtUp>,
 }
 
 fn is_zero(epoch: &LeaseEpoch) -> bool {
@@ -251,6 +255,7 @@ impl HostedReplica {
             seed_failure: None,
             reset: None,
             placement_caught_up: None,
+            replicas_caught_up: None,
         }
     }
 
@@ -309,10 +314,25 @@ impl HostedReplica {
         self
     }
 
+    /// Says that the replica, the primary of a database whose replica set a membership change
+    /// kept, has placement's write quorum holding its log (ADR-0031, amendment 2).
+    #[must_use]
+    pub fn with_replicas_caught_up(mut self, caught_up: ReplicasCaughtUp) -> Self {
+        self.replicas_caught_up = Some(caught_up);
+        self
+    }
+
     /// Returns the epoch of the primary that wrote the last frames of the replica's log.
     #[must_use]
     pub fn log_epoch(&self) -> LeaseEpoch {
         self.log_epoch
+    }
+
+    /// Returns whether placement's write quorum holds the log of the database the replica
+    /// leads, while a membership change keeps its old replica set, if it reported it.
+    #[must_use]
+    pub fn replicas_caught_up(&self) -> Option<&ReplicasCaughtUp> {
+        self.replicas_caught_up.as_ref()
     }
 
     /// Returns the database.
@@ -371,8 +391,14 @@ impl HostedReplica {
     }
 
     /// Returns the report, keeping what it says about forks only if `forks` says so: before the
-    /// `fork` feature is enabled those fields are dropped, so control state stays as it was.
-    pub(crate) fn into_report(self, at: Timestamp, forks: ForkReports) -> (DatabaseName, Report) {
+    /// `fork` feature is enabled those fields are dropped, so control state stays as it was. The
+    /// same holds of a hand-over report before the `handover` feature is enabled.
+    pub(crate) fn into_report(
+        self,
+        at: Timestamp,
+        forks: ForkReports,
+        handover: HandoverReports,
+    ) -> (DatabaseName, Report) {
         let report = Report {
             role: self.role,
             position: self.position,
@@ -384,6 +410,10 @@ impl HostedReplica {
             seed_failure: self.seed_failure,
             reset: self.reset,
             placement_caught_up: self.placement_caught_up,
+            replicas_caught_up: match handover {
+                HandoverReports::Record => self.replicas_caught_up,
+                HandoverReports::Drop => None,
+            },
         };
         let report = match forks {
             ForkReports::Record => report,
@@ -410,6 +440,15 @@ pub(crate) enum ForkReports {
     Drop,
 }
 
+/// Whether a heartbeat records what primaries report about a hand-over (ADR-0031, amendment 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoverReports {
+    /// The `handover` feature is enabled: record them.
+    Record,
+    /// It isn't: drop them, so control state stays as it was before hand-overs existed.
+    Drop,
+}
+
 /// What a member last reported about one database it hosts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
@@ -433,6 +472,9 @@ pub struct Report {
     // Absent from logs and states written before ready forks released their holders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     placement_caught_up: Option<PlacementCaughtUp>,
+    // Absent from logs and states written before membership changes kept replica sets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replicas_caught_up: Option<ReplicasCaughtUp>,
 }
 
 impl Report {
@@ -496,5 +538,12 @@ impl Report {
     #[must_use]
     pub fn placement_caught_up(&self) -> Option<&PlacementCaughtUp> {
         self.placement_caught_up.as_ref()
+    }
+
+    /// Returns whether placement's write quorum holds the log of the database the member
+    /// leads, while a membership change keeps its old replica set, if it reported it.
+    #[must_use]
+    pub fn replicas_caught_up(&self) -> Option<&ReplicasCaughtUp> {
+        self.replicas_caught_up.as_ref()
     }
 }

@@ -209,12 +209,15 @@ impl Security {
     }
 }
 
+/// Why [`peer_of`] refuses an issuer certificate, on every listener (ADR-0047, point 1.5).
+pub(crate) const ISSUER_REFUSED: &str = "an issuer certificate can't open a connection";
+
 /// The node or principal a peer's verified certificate chain names, if it is one of `fleet`'s.
 ///
 /// # Errors
 ///
 /// [`HandshakeError::Subject`] if there is no certificate, or its subject isn't a node or a
-/// principal of `fleet`.
+/// principal of `fleet`: an authority's or an issuer's certificate is refused.
 pub(crate) fn peer_of(
     certificates: &[CertificateDer<'_>],
     fleet: &FleetName,
@@ -236,8 +239,14 @@ pub(crate) fn peer_of(
     match subject {
         SubjectUri::Node { id, .. } => Ok(Peer::Node(id)),
         SubjectUri::Principal { name, .. } => Ok(Peer::Principal(name)),
-        other => Err(HandshakeError::Subject {
-            reason: format!("{other} is an authority"),
+        authority @ SubjectUri::Authority { .. } => Err(HandshakeError::Subject {
+            reason: format!("{authority} is an authority"),
+        }),
+        // An issuer certificate has no extended key usage, which rustls-webpki reads as any
+        // use, so the handshake admits it; its subject kind is what refuses it (ADR-0047,
+        // point 1.5).
+        SubjectUri::Issuer { .. } => Err(HandshakeError::Subject {
+            reason: ISSUER_REFUSED.to_owned(),
         }),
     }
 }
@@ -273,5 +282,49 @@ mod tests {
         let name = server_name("node-1:7400").expect("dns");
         assert!(matches!(name, rustls_pki_types::ServerName::DnsName(_)));
         assert!(server_name("bad host:7400").is_err());
+    }
+
+    #[test]
+    fn peer_of_judges_every_subject_kind() {
+        use fleetring_control::Timestamp;
+        use rustls_pki_types::pem::PemObject as _;
+
+        use crate::tls::{Authority, Validity};
+
+        let fleet: FleetName = "lab".parse().expect("fleet name");
+        let validity = Validity::new(Timestamp::ZERO, Duration::from_secs(24 * 60 * 60));
+        let authority = Authority::create(fleet.clone(), validity).expect("authority");
+        let der =
+            |pem: &str| CertificateDer::from_pem_slice(pem.as_bytes()).expect("a PEM certificate");
+        let id = "n1".parse().expect("node id");
+
+        let node = authority.issue_node(&id, &[], validity).expect("node");
+        assert_eq!(
+            peer_of(&[der(node.certificate_pem())], &fleet).expect("a node"),
+            Peer::Node(id.clone())
+        );
+        let principal = "alice".parse().expect("principal");
+        let client = authority
+            .issue_client(&principal, validity)
+            .expect("client");
+        assert_eq!(
+            peer_of(&[der(client.certificate_pem())], &fleet).expect("a principal"),
+            Peer::Principal(principal)
+        );
+
+        let refusal = |certificate: CertificateDer<'_>| match peer_of(&[certificate], &fleet) {
+            Err(HandshakeError::Subject { reason }) => reason,
+            other => panic!("expected a subject refusal, got {other:?}"),
+        };
+        let issuer = authority.issue_issuer(&id, validity).expect("issuer");
+        assert_eq!(refusal(der(issuer.certificate_pem())), ISSUER_REFUSED);
+        assert_eq!(
+            ISSUER_REFUSED,
+            "an issuer certificate can't open a connection"
+        );
+        assert!(
+            refusal(der(authority.certificate_pem())).ends_with("is an authority"),
+            "the authority's own certificate"
+        );
     }
 }

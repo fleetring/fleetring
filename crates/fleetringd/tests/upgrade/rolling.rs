@@ -11,6 +11,11 @@
 //! the heartbeat interval these nodes use, and leaves the node running; this build's own
 //! release, which accepts it, then restarts the node in place.
 //!
+//! From a release without forks and delegation, the 0.7 line, it checks those features too
+//! (FR-096, `features.rs`): the previous release's credentials keep working, nothing is enabled
+//! by the upgrade alone, a node rolls back and returns while nothing is, each feature is enabled
+//! by its first command, and rollback is refused after.
+//!
 //! The previous release comes from one of:
 //!
 //! - `FLEETRINGD_BASELINE_VERSION`, such as `0.6.0`: this build's own `fleetring upgrade
@@ -33,6 +38,7 @@ use crate::common::{
     create_history_database, current, fake_cosign, path_with, printed, progress, refusing_release,
     release_of, wait_for_members, wait_for_reported, write_release, write_until,
 };
+use crate::features::Features;
 
 /// The previous release's binary, from the environment, or `None` to skip.
 fn baseline(scratch: &Path) -> TestResult<Option<PathBuf>> {
@@ -125,6 +131,8 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     fake_cosign(&cosign, "2.4.3")?;
     let path = path_with(&cosign);
     let this_build = PathBuf::from(env!("CARGO_BIN_EXE_fleetring"));
+    // From a release without forks and delegation (0.7), the checks of FR-096 run too.
+    let features = Features::on_previous_release(&fleet, &baseline, scratch.path(), &path)?;
 
     // The data nodes first, then the control node.
     for index in [2, 1, 0] {
@@ -188,6 +196,12 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         );
         progress(&format!("{id} runs {}", current()));
 
+        if index != 0
+            && let Some(features) = &features
+        {
+            features.while_the_control_node_is_previous()?;
+        }
+
         if index == 2 && baseline_lacks_undrain {
             // A mixed fleet refuses a command a member doesn't support, whichever release its
             // control node runs: the old one doesn't know it, the new one gates it.
@@ -207,6 +221,10 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
         .args(["node", "undrain", "node-3", "--control", &fleet.control])
         .output()?;
     assert!(undrained.status.success(), "{}", printed(&undrained));
+
+    if let Some(features) = &features {
+        runtime.block_on(features.after_the_upgrade(&mut fleet, &client, &url))?;
+    }
 
     // A next release that refuses the node's configuration is refused before it is swapped in,
     // and the node runs on under the writes.

@@ -1011,9 +1011,12 @@ async fn catch_up(fleet: &Client, node: &NodeId, limit: Duration) -> Result<Stri
             .iter()
             .any(|replica| &replica.node == node)
             && location.primary.as_ref() != Some(node);
+        // A primary that has committed nothing reports the empty position, and its followers,
+        // which hold nothing either, report none: there is nothing to catch up on.
         let primary = location
             .primary_replica()
-            .and_then(|primary| primary.position.clone());
+            .and_then(|primary| primary.position.clone())
+            .filter(|position| !position.as_bytes().is_empty());
         if let (true, Some(position)) = (follows, primary) {
             targets.push((location.database, position));
         }

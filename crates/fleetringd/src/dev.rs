@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::config::{AdminListener, AdminTls, Config, ConfigError, NodeRole, Plaintext};
-use crate::tls::{Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME, Validity};
+use crate::tls::{
+    Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME, DEV_ISSUER_FILES, DevIssuerOutcome,
+    IssuerFiles, IssuerFilesError, Validity, ensure_dev_pair,
+};
 use crate::upgrade::{PROCESS_FILE, ProcessFile, Running, running};
 
 /// The port dev mode serves gRPC on unless `--port` says otherwise; the admin listener takes the
@@ -287,6 +290,9 @@ pub enum DevError {
     /// The authority can't be created, loaded, or used.
     #[error(transparent)]
     Authority(#[from] AuthorityError),
+    /// The delegation issuer pair can't be written (ADR-0047, point 1.7).
+    #[error(transparent)]
+    Issuer(#[from] IssuerFilesError),
     /// The configuration file is invalid.
     #[error("invalid dev mode configuration {path}")]
     Config {
@@ -371,8 +377,17 @@ pub enum Created {
     NodeCertificate,
     /// `tls/client.admin.crt` and `tls/client.admin.key`.
     AdminCertificate,
+    /// `tls/issuer.dev.crt` and `tls/issuer.dev.key`: the delegation issuer pair, written when
+    /// missing and replaced when it can't be used or has fewer than 30 days left (ADR-0047,
+    /// point 1.7).
+    Issuer,
     /// `fleetringd.toml`.
     Config,
+}
+
+impl Created {
+    /// How many things a first run creates: one of each.
+    const KINDS: usize = 5;
 }
 
 impl fmt::Display for Created {
@@ -381,6 +396,7 @@ impl fmt::Display for Created {
             Self::Authority => "the authority",
             Self::NodeCertificate => "the node certificate",
             Self::AdminCertificate => "the admin certificate",
+            Self::Issuer => "the delegation issuer pair",
             Self::Config => CONFIG_FILE,
         })
     }
@@ -512,7 +528,7 @@ impl Prepared {
             [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
             [] => String::new(),
         };
-        if self.created.len() == 4 {
+        if self.created.len() == Created::KINDS {
             format!("created {created}")
         } else {
             format!("created {created}; reused the rest")
@@ -618,11 +634,15 @@ pub fn check_dev_dir(dir: &Path) -> Result<DevChecked, DevError> {
 /// Creates whatever `dir` lacks for a dev node, then loads its configuration.
 ///
 /// On a first run it creates, under `dir`: an authority for the fleet [`FLEET`], a certificate
-/// for the node [`NODE`] at loopback, one for the principal [`PRINCIPAL`], and a configuration
-/// that listens on `127.0.0.1:<port>`, [`DEFAULT_PORT`] unless `port` is given. Certificates
-/// are valid from `now`. Later runs reuse every file and never overwrite one; a pair with a
-/// file missing is completed only where that is safe. The CLI's environment file is rewritten
-/// from the configuration every time, so it follows an edited port.
+/// for the node [`NODE`] at loopback, one for the principal [`PRINCIPAL`], the delegation issuer
+/// pair (valid for 90 days), and a configuration that listens on `127.0.0.1:<port>`,
+/// [`DEFAULT_PORT`] unless `port` is given, and names the issuer pair. Certificates are valid
+/// from `now`. Later runs reuse every file and never overwrite one, but for the issuer pair,
+/// which is replaced when it can't be used or has fewer than 30 days left (ADR-0047,
+/// point 1.7); a pair with a file missing is completed only where that is safe. A configuration
+/// 0.7 wrote, which names no issuer pair, is never rewritten: its issuer files default to
+/// `tls/issuer.dev.crt` and `tls/issuer.dev.key`. The CLI's environment file is rewritten from
+/// the configuration every time, so it follows an edited port.
 ///
 /// It refuses a directory that isn't dev mode's before it writes anything: one whose
 /// `fleetringd.toml` lacks `dev = true`, one without that file that holds anything but `tls/`,
@@ -691,14 +711,16 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
     let authority = match loaded {
         Some(authority) => authority,
         None => {
-            let authority =
-                Authority::create(name(FLEET)?, Validity::new(now, DEFAULT_AUTHORITY_LIFETIME))?;
+            let authority = Authority::create(
+                name(FLEET)?,
+                Validity::issued_at(now, DEFAULT_AUTHORITY_LIFETIME),
+            )?;
             authority.write(&tls)?;
             created.push(Created::Authority);
             authority
         }
     };
-    let leaf = Validity::new(now, LEAF_LIFETIME);
+    let leaf = Validity::issued_at(now, LEAF_LIFETIME);
     if node == Pair::Absent {
         let names: Vec<String> = LOOPBACK_NAMES.iter().map(|&name| name.to_owned()).collect();
         authority
@@ -711,6 +733,19 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
             .issue_client(&name(PRINCIPAL)?, leaf)?
             .write(&tls, &client_stem)?;
         created.push(Created::AdminCertificate);
+    }
+    // The issuer pair the configuration names, or, for a new directory or one 0.7 wrote, the
+    // defaults beside the authority (ADR-0047, point 1.7).
+    let issuer_files = existing
+        .as_ref()
+        .and_then(Config::issuer_files)
+        .unwrap_or_else(|| IssuerFiles::dev(&tls));
+    let issuer_name = match &existing {
+        Some(config) => config.node.id.clone(),
+        None => name(NODE)?,
+    };
+    if ensure_dev_pair(&issuer_files, &authority, &issuer_name, now)? == DevIssuerOutcome::Written {
+        created.push(Created::Issuer);
     }
     let config = match existing {
         Some(config) => config,
@@ -750,14 +785,20 @@ const PARTIAL_ENTRIES: [&str; 8] = [
     AGENTS_DIR,
 ];
 
-/// The files dev mode writes into its TLS directory, and the only ones it may hold.
-const TLS_FILES: [&str; 6] = [
+/// The files dev mode writes into its TLS directory, and the only ones it may hold: the
+/// delegation issuer pair's temporary names included, which a replacement interrupted between
+/// its writes leaves (ADR-0047, point 1.7).
+const TLS_FILES: [&str; 10] = [
     "ca.crt",
     "ca.key",
     "node.dev.crt",
     "node.dev.key",
     "client.admin.crt",
     "client.admin.key",
+    DEV_ISSUER_FILES[0],
+    DEV_ISSUER_FILES[1],
+    DEV_ISSUER_FILES[2],
+    DEV_ISSUER_FILES[3],
 ];
 
 /// Checks, without writing anything, that `dir` is dev mode's: its configuration, if it has
@@ -1007,6 +1048,12 @@ fn config_text(dir: &Path, port: u16) -> Result<String, DevError> {
          [node]\n\
          id = \"{NODE}\"\n\
          \n\
+         [control]\n\
+         # The delegation issuer pair, which signs delegated agents' tokens. `fleetring dev`\n\
+         # replaces it from the authority before it expires.\n\
+         issuer_cert = {issuer_cert}\n\
+         issuer_key = {issuer_key}\n\
+         \n\
          [membership]\n\
          # A stop keeps the node's databases placed on it, for the next start.\n\
          on_shutdown = \"stay\"\n\
@@ -1043,6 +1090,8 @@ fn config_text(dir: &Path, port: u16) -> Result<String, DevError> {
         ca = in_tls("ca.crt".to_owned())?,
         cert = in_tls(format!("{}.crt", node_stem()))?,
         key = in_tls(format!("{}.key", node_stem()))?,
+        issuer_cert = in_tls(DEV_ISSUER_FILES[0].to_owned())?,
+        issuer_key = in_tls(DEV_ISSUER_FILES[1].to_owned())?,
         changes = path(CHANGES_DIR)?,
     ))
 }
@@ -1469,6 +1518,7 @@ pub fn status(dir: &Path) -> Result<DevStatus, DevError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::IssuerCertificate;
 
     const NOW: Timestamp = Timestamp::from_millis(1_790_000_000_000);
 
@@ -1487,8 +1537,14 @@ mod tests {
                 Created::Authority,
                 Created::NodeCertificate,
                 Created::AdminCertificate,
+                Created::Issuer,
                 Created::Config
             ]
+        );
+        assert_eq!(
+            first.config().issuer_files(),
+            Some(IssuerFiles::dev(&dir.join(TLS_DIR))),
+            "the generated configuration names the issuer pair"
         );
         assert_eq!(first.config().dev, DevMode::On);
         assert_eq!(first.config().listen.to_string(), "127.0.0.1:17400");
@@ -1519,7 +1575,12 @@ mod tests {
         for sub in ["", TLS_DIR, DATA_DIR, CHANGES_DIR] {
             assert_eq!(mode(dir.join(sub)), 0o700, "{sub}");
         }
-        for key in ["ca.key", "node.dev.key", "client.admin.key"] {
+        for key in [
+            "ca.key",
+            "node.dev.key",
+            "client.admin.key",
+            "issuer.dev.key",
+        ] {
             assert_eq!(mode(dir.join(TLS_DIR).join(key)), 0o600, "{key}");
         }
     }
@@ -1537,6 +1598,133 @@ mod tests {
         let again = prepare(&dir, None, NOW).expect("completed");
         assert_eq!(again.created(), [Created::NodeCertificate]);
         assert_eq!(fs::read(tls.join("ca.crt")).expect("ca.crt"), authority);
+    }
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+
+    fn days_after_now(days: u64) -> Timestamp {
+        Timestamp::from_millis(NOW.as_millis() + days * DAY_MS)
+    }
+
+    /// The issuer pair's two files, certificate first.
+    fn issuer_bytes(dir: &Path) -> [Vec<u8>; 2] {
+        let files = IssuerFiles::dev(&dir.join(TLS_DIR));
+        [
+            fs::read(&files.cert).expect("the issuer certificate"),
+            fs::read(&files.key).expect("the issuer key"),
+        ]
+    }
+
+    #[test]
+    fn dev_writes_issuer_pair_and_replaces_it_under_30_days_expired_or_mismatched() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("dev");
+        prepared(&dir);
+        let first = issuer_bytes(&dir);
+        let tls = dir.join(TLS_DIR);
+        let authority = Authority::load(&tls).expect("the dev authority");
+        let fleet = authority.fleet().clone();
+        let trusted = [authority.token_signer().expect("a signer").verifying_key()];
+        let check = |when: &str| {
+            let [cert, _] = issuer_bytes(&dir);
+            let der = CertificateDer::from_pem_slice(&cert).expect("PEM");
+            IssuerCertificate::check(der.as_ref(), &fleet, &trusted)
+                .unwrap_or_else(|error| panic!("{when}: {error}"))
+        };
+        let written = check("first");
+        assert_eq!(
+            written.not_after().as_millis() - written.not_before().as_millis(),
+            90 * DAY_MS,
+            "90 days"
+        );
+
+        // 60 days later, 30 remain: kept.
+        let kept = prepare(&dir, None, days_after_now(60)).expect("kept");
+        assert!(kept.created().is_empty(), "{:?}", kept.created());
+        assert_eq!(issuer_bytes(&dir), first);
+
+        // A day later, fewer than 30 remain: replaced, with a new key.
+        let renewed = prepare(&dir, None, days_after_now(61)).expect("renewed");
+        assert_eq!(renewed.created(), [Created::Issuer]);
+        let second = issuer_bytes(&dir);
+        assert_ne!(second[0], first[0]);
+        assert_ne!(second[1], first[1]);
+        assert_ne!(check("renewed").key_id(), written.key_id());
+
+        // Expired: replaced.
+        let expired = prepare(&dir, None, days_after_now(200)).expect("expired");
+        assert_eq!(expired.created(), [Created::Issuer]);
+        let third = issuer_bytes(&dir);
+        assert_ne!(third, second);
+
+        // A key that isn't the certificate's: replaced.
+        fs::write(tls.join(DEV_ISSUER_FILES[1]), &first[1]).expect("a stale key");
+        let mismatched = prepare(&dir, None, days_after_now(200)).expect("mismatched");
+        assert_eq!(mismatched.created(), [Created::Issuer]);
+        let fourth = issuer_bytes(&dir);
+        assert_ne!(fourth[1], first[1]);
+        check("matched again");
+        // No temporary name is left behind, and a replaced key is still private.
+        for leftover in &DEV_ISSUER_FILES[2..] {
+            assert!(!tls.join(leftover).exists(), "{leftover}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(tls.join(DEV_ISSUER_FILES[1]))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn dev_dir_from_0_7_uses_default_issuer_paths_without_rewriting_config() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("dev");
+        prepared(&dir);
+        // What 0.7 wrote: the same configuration without the `[control]` table, and no issuer
+        // pair.
+        let path = dir.join(CONFIG_FILE);
+        let text = fs::read_to_string(&path).expect("the configuration");
+        let start = text.find("[control]\n").expect("a [control] table");
+        let end = start + text[start..].find("\n\n").expect("its end") + 2;
+        let old = format!("{}{}", &text[..start], &text[end..]);
+        assert!(!old.contains("issuer"), "{old}");
+        fs::write(&path, &old).expect("the 0.7 configuration");
+        let tls = dir.join(TLS_DIR);
+        for name in &DEV_ISSUER_FILES[..2] {
+            fs::remove_file(tls.join(name)).expect("removed");
+        }
+        let again = prepare(&dir, None, NOW).expect("a 0.7 directory");
+        assert_eq!(again.created(), [Created::Issuer]);
+        assert_eq!(fs::read_to_string(&path).expect("the configuration"), old);
+        assert_eq!(
+            again.config().issuer_files(),
+            Some(IssuerFiles::dev(&tls)),
+            "the defaults"
+        );
+        for name in &DEV_ISSUER_FILES[..2] {
+            assert!(tls.join(name).exists(), "{name}");
+        }
+        check_dev_dir(&dir).expect("still a dev directory");
+    }
+
+    #[test]
+    fn the_issuer_pairs_temporary_names_are_allowed_and_nothing_else_new() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("dev");
+        prepared(&dir);
+        let tls = dir.join(TLS_DIR);
+        for leftover in &DEV_ISSUER_FILES[2..] {
+            fs::write(tls.join(leftover), "half written").expect("a leftover");
+        }
+        check_dev_dir(&dir).expect("temporary names are dev mode's");
+        prepare(&dir, None, NOW).expect("still a dev directory");
+        fs::write(tls.join("issuer.other.crt"), "x").expect("a stranger");
+        let error = check_dev_dir(&dir).expect_err("not dev mode's");
+        assert!(matches!(error, DevError::NotDevDir { .. }), "{error}");
     }
 
     #[test]
@@ -1687,7 +1875,7 @@ mod tests {
         }
         fs::write(dir.join(ENV_FILE), "").expect("a file");
         let completed = prepare(&dir, Some(17_400), NOW).expect("a partial dev state");
-        assert_eq!(completed.created().len(), 4);
+        assert_eq!(completed.created().len(), Created::KINDS);
     }
 
     #[test]
@@ -1699,7 +1887,7 @@ mod tests {
             fs::write(dir.join(file), "").expect("a file");
         }
         let completed = prepare(&dir, Some(17_400), NOW).expect("a partial dev state");
-        assert_eq!(completed.created().len(), 4);
+        assert_eq!(completed.created().len(), Created::KINDS);
         // Anything else is still refused.
         let other = root.path().join("other");
         fs::create_dir_all(&other).expect("a directory");
@@ -1820,10 +2008,8 @@ mod tests {
             ),
             (
                 "role",
-                base.replace(
-                    "role = \"both\"",
-                    "role = \"data\"\n\n[control]\naddress = \"127.0.0.1:1\"",
-                ),
+                base.replace("role = \"both\"", "role = \"data\"")
+                    .replace("[control]\n", "[control]\naddress = \"127.0.0.1:1\"\n"),
             ),
         ];
         for (field, text) in cases {
@@ -1891,7 +2077,8 @@ mod tests {
         assert!(!banner.contains("env"), "{banner}");
         assert!(
             banner.contains(
-                "created the authority, the node certificate, the admin certificate, and \
+                "created the authority, the node certificate, the admin certificate, the \
+                 delegation issuer pair, and \
                  fleetringd.toml\n"
             ),
             "{banner}"

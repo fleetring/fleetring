@@ -572,6 +572,7 @@ impl ChangeMetrics {
 pub(crate) struct SampledMetrics {
     denylist_age: Gauge<f64, AtomicU64>,
     denylist_entries: Gauge,
+    denylist_unusable: Gauge,
     membership_epoch: Gauge,
     members: Family<LivenessLabels, Gauge>,
     members_draining: Gauge,
@@ -583,6 +584,7 @@ pub(crate) struct SampledMetrics {
     followers: Family<StateLabels, Gauge>,
     mailbox_depth: Gauge,
     promotions_in_progress: Gauge,
+    kept_replica_sets: Gauge,
     control_databases: Gauge,
     control_leader: Gauge,
     change_backlog: Family<SinkLabels, Gauge>,
@@ -594,7 +596,11 @@ pub(crate) struct SampledMetrics {
 pub(crate) struct DataSample {
     /// Seconds since the denylist arrived; `None` before it did.
     pub(crate) denylist_age: Option<f64>,
+    /// Entries on the denylist; 0 while it is unusable.
     pub(crate) denylist_entries: usize,
+    /// Whether the denylist holds an entry this node can't read, so every token is refused
+    /// (ADR-0047, point 3).
+    pub(crate) denylist_unusable: bool,
     pub(crate) membership_epoch: u64,
     pub(crate) primaries: usize,
     pub(crate) followers: usize,
@@ -617,6 +623,8 @@ pub(crate) struct ControlSample {
     pub(crate) draining: usize,
     pub(crate) databases: usize,
     pub(crate) promotions_in_progress: usize,
+    /// Databases whose replica set a membership change kept (ADR-0031, amendment 2).
+    pub(crate) kept_replica_sets: usize,
     pub(crate) mailbox_depth: usize,
     pub(crate) leader: bool,
 }
@@ -627,6 +635,8 @@ impl SampledMetrics {
             .set(sample.denylist_age.unwrap_or(f64::INFINITY));
         self.denylist_entries
             .set(gauge_value(sample.denylist_entries));
+        self.denylist_unusable
+            .set(i64::from(sample.denylist_unusable));
         self.membership_epoch
             .set(gauge_value_u64(sample.membership_epoch));
         for (replica_role, count) in names::REPLICA_ROLES
@@ -668,6 +678,8 @@ impl SampledMetrics {
         self.control_databases.set(gauge_value(sample.databases));
         self.promotions_in_progress
             .set(gauge_value(sample.promotions_in_progress));
+        self.kept_replica_sets
+            .set(gauge_value(sample.kept_replica_sets));
         self.mailbox_depth.set(gauge_value(sample.mailbox_depth));
         self.control_leader.set(i64::from(sample.leader));
     }
@@ -778,6 +790,10 @@ impl Metrics {
             sampled.denylist_entries.clone(),
         );
         r.add(
+            "fleetring_denylist_unusable",
+            sampled.denylist_unusable.clone(),
+        );
+        r.add(
             "fleetring_membership_epoch",
             sampled.membership_epoch.clone(),
         );
@@ -851,6 +867,10 @@ impl Metrics {
         r.add(
             "fleetring_control_promotions_in_progress",
             sampled.promotions_in_progress.clone(),
+        );
+        r.add(
+            "fleetring_control_kept_replica_sets",
+            sampled.kept_replica_sets.clone(),
         );
         r.add(
             "fleetring_control_databases",

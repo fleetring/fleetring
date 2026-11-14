@@ -95,7 +95,7 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 \fB\-\-agent\fR \fI<ID>\fR
 Acts as the agent with this ID, with the identity minted for it
 
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`

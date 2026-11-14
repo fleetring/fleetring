@@ -223,8 +223,12 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
                 Ok(status) => status,
                 Err(SubmitError::Refused(status)) => {
                     let mut failure = Failed::new(&status);
-                    if let Some(hint) =
-                        refusal_hint(&status, &shown(&source), &shown(&target_name), &id)
+                    // An agent's refusal keeps the hint that says to ask its parent.
+                    let agent_scope =
+                        exit::agent().is_some() && status.code() == Code::PermissionDenied;
+                    if !agent_scope
+                        && let Some(hint) =
+                            refusal_hint(&status, &shown(&source), &shown(&target_name), &id)
                     {
                         failure = failure.with_hint(hint);
                     }

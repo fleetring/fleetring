@@ -26,8 +26,12 @@
 //!   no marker refuses to serve and logs an error.
 //! - **Followers** report the reset once their durable log reaches the position the fork's
 //!   primary reported it committed at, at that primary's epoch.
+//! - **Control calls** wait at most [`CONTROL_CALL_LIMIT`] each. One that times out drops the
+//!   control client's connections, so the next call dials again rather than queue behind a
+//!   connection that stalled.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::time::Duration;
 
 use fleetring::NodeId;
@@ -42,10 +46,11 @@ use crate::control::missing_database;
 use crate::data::node::{DataNode, HeldLease};
 use crate::engine::{ForkMarker, ForkReset, Position};
 use crate::replication::FaultPoint;
+use crate::replication::fork::CONTROL_CALL_LIMIT;
 use crate::replication::fork::seed::{SeedFrom, SeedPlan};
 use crate::replication::fork::staged::{Held, StagedKey};
 use crate::replication::fork::view::view_from_placement;
-use crate::replication::fork::{ForkPhase, ForkView, InstallAs};
+use crate::replication::fork::{ForkPhase, ForkView, GateLease, InstallAs};
 
 /// The longest the opening of a fork's primary waits between two tries.
 const OPEN_BACKOFF_CAP: Duration = Duration::from_secs(5);
@@ -103,7 +108,7 @@ async fn run(node: DataNode, poll: Duration) {
 async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
     let replication = node.replication();
     let forks = replication.forks();
-    let placement = match node.locate(name).await {
+    let placement = match locate(node, name).await {
         Ok(placement) => placement,
         Err(status) if missing_database(&status).is_some() => {
             // A name control state doesn't know: its staged copies are orphans (ADR-0042).
@@ -128,8 +133,9 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
     }
     // A seeded fork's replica set is its recorded holders until this node sees it ready, its
     // gate open or not, and a ready fork's until control state releases them (ADR-0046, point
-    // 3.10).
-    forks.follow_view(name, view.fork.as_ref());
+    // 3.10); the replica sets control state shows beside them are followed first, from the same
+    // placement (ADR-0031, amendment 2).
+    replication.follow_view(name, &view);
     let Some(fork) = view.fork else {
         forks.observe(name, None);
         forks.abandon_seeds(name, None);
@@ -178,7 +184,7 @@ async fn tend(node: &DataNode, name: &DatabaseName) -> Result<(), Status> {
                 None if placement.candidate.is_none()
                     && first_live_holder(&placement).as_ref() == Some(me) =>
                 {
-                    open_first(node, &placement, &key, at, chain_hash).await?;
+                    open_first(node, &key, at, chain_hash).await?;
                 }
                 Some(primary) if primary != me.as_str() => {
                     report_follower_reset(node, &fork.identity, reset.as_ref()).await;
@@ -215,6 +221,29 @@ fn report_placement_caught_up(node: &DataNode, fork: &ForkIdentity) {
         tracing::info!(target: "fleetringd::audit", %fork, epoch = caught_up.epoch().get(), membership_epoch = caught_up.membership_epoch().get(), "placement's write quorum holds the ready fork's log; its holders may be released");
     }
     forks.report_placement_caught_up(&fork.name, caught_up);
+}
+
+/// Asks control state for `name`'s placement, within [`CONTROL_CALL_LIMIT`].
+async fn locate(node: &DataNode, name: &DatabaseName) -> Result<Placement, Status> {
+    bounded(node, node.locate(name)).await
+}
+
+/// Runs `call` to the control plane for at most [`CONTROL_CALL_LIMIT`]. If it takes longer, it
+/// fails with `UNAVAILABLE`, and the control client's connections are dropped so the next call
+/// dials again: a connection can stall without failing, and every call on it would wait too.
+async fn bounded<T>(
+    node: &DataNode,
+    call: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    match tokio::time::timeout(CONTROL_CALL_LIMIT, call).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            node.inner.control.reconnect();
+            Err(Status::unavailable(format!(
+                "the control plane didn't answer within {CONTROL_CALL_LIMIT:?}; dialing it again"
+            )))
+        }
+    }
 }
 
 /// The first holder the placement shows live, in its order: the one that takes a seeded fork's
@@ -351,10 +380,10 @@ async fn report_follower_reset(
 /// 6.2): checks the staged copy against what control state recorded, and reports it lost
 /// without asking if it fails; takes the lease; moves the copy into place; and serves it,
 /// gated. A copy that fails after the lease is reported lost and nothing is served: the lease
-/// isn't renewed, so it expires and another holder takes over.
+/// isn't renewed, so it expires and another holder takes over. Nor is anything served unless
+/// control state, asked after the lease, shows this node leading at the lease's epoch.
 async fn open_first(
     node: &DataNode,
-    placement: &Placement,
     key: &StagedKey,
     at: &Position,
     chain_hash: &crate::replication::ChainHash,
@@ -388,17 +417,20 @@ async fn open_first(
         .faults()
         .pass(FaultPoint::FirstLease, key.fork.operation)
         .await;
-    let lease = node
-        .inner
-        .control
-        .acquire_lease(AcquireLeaseRequest {
-            database: name.to_string(),
-            node_id: node.id().to_string(),
-        })
-        .await?;
+    let request = AcquireLeaseRequest {
+        database: name.to_string(),
+        node_id: node.id().to_string(),
+    };
+    let lease = bounded(node, node.inner.control.acquire_lease(request)).await?;
     tracing::info!(target: "fleetringd::audit", fork = %key.fork, attempt = key.attempt, epoch = lease.epoch, "took the fork's first lease");
     if let Err(status) = replication
-        .install_staged(key, &sidecar, InstallAs::Primary)
+        .install_staged(
+            key,
+            &sidecar,
+            InstallAs::Primary {
+                epoch: LeaseEpoch::new(lease.epoch),
+            },
+        )
         .await
     {
         tracing::error!(fork = %key.fork, %status, "can't open the staged copy after taking the lease; serving nothing, so the lease expires");
@@ -409,46 +441,92 @@ async fn open_first(
         ));
         return Ok(());
     }
-    let placement = node
-        .locate(name)
-        .await
-        .unwrap_or_else(|_| placement.clone());
+    let epoch = LeaseEpoch::new(lease.epoch);
+    forks
+        .faults()
+        .pass(FaultPoint::ConfirmFirstLease, key.fork.operation)
+        .await;
+    // Only control state says whether the lease is still the database's: a node cut off from a
+    // promotion never sees its epoch, and a lease's expiry is a time on another clock. One that
+    // can't be confirmed isn't served; it isn't renewed either, so it expires and a promotion
+    // opens the fork, as after a copy that fails to install.
+    let placement = match locate(node, name).await {
+        Ok(placement) => placement,
+        Err(status) => {
+            tracing::info!(fork = %key.fork, epoch = epoch.get(), %status, "can't confirm the fork's first lease with control state; serving nothing, so the lease expires");
+            return Ok(());
+        }
+    };
+    let superseded = replication
+        .highest_epoch_of(name, Some(key.fork.incarnation))
+        .is_some_and(|highest| highest > epoch);
+    if !leads_at(node, &placement, epoch) || superseded {
+        // The lease expired while this node waited for control state, and a promotion took
+        // over: serving at the lease's epoch now would close the gate the promotion opened.
+        tracing::info!(fork = %key.fork, epoch = epoch.get(), now = placement.epoch, "the fork's first lease was superseded before it was served");
+        return Ok(());
+    }
+    if placement.incarnation != key.fork.incarnation.get() {
+        // The fork was dropped and the name created again: its first lease may have this
+        // epoch and this holder, but this copy isn't its (#165).
+        tracing::info!(fork = %key.fork, now = placement.incarnation, "the fork was dropped before its first lease was served");
+        return Ok(());
+    }
     node.serve_at(name, &placement, Some(at.clone())).await?;
     Ok(())
+}
+
+/// Whether `placement` shows this node as the database's primary at `epoch`.
+fn leads_at(node: &DataNode, placement: &Placement, epoch: LeaseEpoch) -> bool {
+    placement.epoch == epoch.get() && placement.primary.as_deref() == Some(node.id().as_str())
 }
 
 /// Freezes the replica set of `name`, a seeded fork that isn't ready, at its recorded holders,
 /// as control state shows them now, before its primary here starts streaming (ADR-0046, point
 /// 3.10). A placement it can't learn leaves the replica set as this node last saw it.
 pub(crate) async fn freeze_holders(node: &DataNode, name: &DatabaseName) {
-    let Ok(placement) = node.locate(name).await else {
+    let Ok(placement) = locate(node, name).await else {
         return;
     };
     let Ok(view) = view_from_placement(&placement) else {
         return;
     };
-    node.replication()
-        .forks()
-        .follow_view(name, view.fork.as_ref());
+    node.replication().follow_view(name, &view);
 }
 
-/// Closes `name`'s readiness gate before its primary here serves at `epoch`, unless the gate
-/// was opened at that epoch already.
-pub(crate) fn close_unless_open(node: &DataNode, name: &DatabaseName, epoch: LeaseEpoch) {
+/// The lease `lease`'s gate opens under: its database's incarnation and its epoch.
+fn gate_lease(lease: HeldLease) -> GateLease {
+    GateLease {
+        incarnation: lease.incarnation,
+        epoch: lease.epoch,
+    }
+}
+
+/// Closes `name`'s readiness gate before its primary here serves under `lease`, unless the gate
+/// was opened under that lease already, or this node has seen a higher epoch. The same lease is
+/// the same incarnation at the same epoch: a gate opened for a dropped database of the name
+/// doesn't count, though the new one's first lease has the same epoch (#165). A start at a
+/// superseded epoch leaves the gate as the newer primary set it; only an epoch seen for the
+/// lease's incarnation supersedes it, so a dropped database's epochs left on record never keep
+/// the gate open.
+pub(crate) fn close_unless_open(node: &DataNode, name: &DatabaseName, lease: HeldLease) {
     let replication = node.replication();
-    if !replication.forks().opened_at(name, epoch) {
-        replication.close_gate(name);
+    let superseded = replication
+        .highest_epoch_of(name, lease.incarnation)
+        .is_some_and(|highest| highest > lease.epoch);
+    if !superseded {
+        replication.close_gate_unless_opened(name, gate_lease(lease));
     }
 }
 
 /// Opens `name`'s gate for its primary here under `lease`, in a task of its own, once the fork
-/// is ready to serve, unless that runs, or ran, at the lease's epoch already.
+/// is ready to serve, unless that runs, or ran, under the same lease already.
 pub(crate) fn open_when_ready(node: &DataNode, name: &DatabaseName, lease: HeldLease) {
     let task_node = node.clone();
     let task_name = name.clone();
     node.replication()
         .forks()
-        .start_opening(name, lease.epoch, move || {
+        .start_opening(name, gate_lease(lease), move || {
             tokio::spawn(async move { open(task_node, task_name, lease).await })
         });
 }
@@ -461,6 +539,9 @@ enum Opened {
     /// It may not, for good: control state says the fork is ready, but the copy holds no
     /// marker.
     Refused,
+    /// It never will: the database the lease was on is gone, and control state holds another
+    /// database of the name, whose own primary opens its gate.
+    Superseded,
 }
 
 /// Opens `name`'s gate once its primary here may serve under `lease`, trying again while it
@@ -476,12 +557,11 @@ async fn open(node: DataNode, name: DatabaseName, lease: HeldLease) {
             Ok(Opened::Open) => {
                 // The replica set stays frozen at the holders until the fork is seen ready: a
                 // write served from here on counts only them, as a promotion fences only them.
-                replication.forks().mark_opened(&name, lease.epoch);
-                replication.open_gate(&name);
+                replication.mark_opened_and_open(&name, gate_lease(lease));
                 tracing::info!(target: "fleetringd::audit", database = %name, epoch = lease.epoch.get(), "the fork serves clients");
                 return;
             }
-            Ok(Opened::Refused) => return,
+            Ok(Opened::Refused | Opened::Superseded) => return,
             Err(status) => {
                 tracing::debug!(database = %name, %status, "the fork can't open yet");
                 tokio::time::sleep(backoff).await;
@@ -497,9 +577,27 @@ async fn try_open(
     name: &DatabaseName,
     lease: HeldLease,
 ) -> Result<Opened, Status> {
-    let placement = node.locate(name).await?;
+    let placement = locate(node, name).await?;
     let view = view_from_placement(&placement)?;
-    let Some(fork) = view.fork else {
+    if lease
+        .incarnation
+        .is_some_and(|incarnation| incarnation != view.incarnation)
+    {
+        // Checked before who leads: a lease on a dropped database of the name never opens, and
+        // the new one's first lease may have its epoch and its first holder (#165).
+        return Ok(Opened::Superseded);
+    }
+    if !leads_at(node, &placement, lease.epoch) {
+        // A primary whose lease was superseded, unbeknown to it, runs no reset: the promoted
+        // primary may have opened the fork and acknowledged writes (ADR-0046, point 6.2).
+        return Err(Status::unavailable(format!(
+            "control state shows {name} led by {} at epoch {}, not by this node at epoch {}",
+            placement.primary.as_deref().unwrap_or("no node"),
+            placement.epoch,
+            lease.epoch.get()
+        )));
+    }
+    let Some(fork) = view.fork.clone() else {
         return Ok(Opened::Open);
     };
     let handle = node
@@ -514,8 +612,9 @@ async fn try_open(
         ForkPhase::Ready { .. } => {
             // A primary that may serve clients counts every replica set a promotion may fence
             // for their writes: the holders a ready fork keeps, with placement, until they are
-            // released (ADR-0046, point 3.10, as built).
-            node.replication().forks().follow_view(name, Some(&fork));
+            // released (ADR-0046, point 3.10, as built), and the replica sets control state
+            // shows beside them (ADR-0031, amendment 2).
+            node.replication().follow_view(name, &view);
             let held = handle.fork_marker().await.map_err(marker_status)?;
             if fleetring_control::mutation::Mutation::UnconditionalReset.is_active() {
                 let at = held.map(|marker| marker.at).unwrap_or_default();
@@ -533,7 +632,7 @@ async fn try_open(
             }
         }
         ForkPhase::Seeded { at, .. } => {
-            node.replication().forks().follow_view(name, Some(&fork));
+            node.replication().follow_view(name, &view);
             reset(node, name, lease, &fork, at, &handle).await
         }
         _ => Err(Status::failed_precondition(format!(

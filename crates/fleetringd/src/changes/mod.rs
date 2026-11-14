@@ -98,14 +98,14 @@ use crate::replication::{ChainHash, Replication};
 
 pub use self::config::{ChangesConfig, Format, SinkConfig, SinkKind};
 pub use self::file::{FileSink, database_file};
-pub(crate) use self::matcher::Pattern;
-pub use self::matcher::{CaptureRules, DatabaseMatcher, DatabaseMatchers, ParseMatcherError};
+pub use self::matcher::CaptureRules;
 pub use self::memory::MemorySink;
 pub use self::record::{ChangeRecord, NotHex, ParseRecordError, RecordContent, hex, unhex};
 pub use self::webhook::{
     ClientCertificate, InvalidUrlError, TokenSource, WebhookConfigError, WebhookSecurity,
     WebhookSettings, WebhookSink,
 };
+pub use fleetring_control::matcher::{DatabaseMatcher, DatabaseMatchers, ParseMatcherError};
 
 /// Where a sink's delivered position is kept (ADR-0028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

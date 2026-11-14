@@ -1,6 +1,8 @@
 # ADR-0018: Leases, epochs, and quorums: one writer per database, no acknowledged write lost
 
-- **Status:** Accepted (2026-10-28); points 4, 5, and 7 amended by [ADR-0022](0022-failover-protocol.md)
+- **Status:** Accepted (2026-10-28); points 4, 5, and 7 amended by [ADR-0022](0022-failover-protocol.md); which replica set point 4's quorums are taken over after a membership change amended by [ADR-0031, amendment 2](0031-node-calls-bound-to-placement.md#amendment-2-2026-11-11-fr-102-a-membership-change-hands-a-replica-set-over-on-joint-quorums) (accepted 2026-11-12)
+
+*Note (2026-11-12):* [ADR-0031, amendment 2](0031-node-calls-bound-to-placement.md#amendment-2-2026-11-11-fr-102-a-membership-change-hands-a-replica-set-over-on-joint-quorums) (accepted 2026-11-12) says which replica set the write and promotion quorums of point 4 are counted over while membership changes: a membership change never changes the replica set a promotion fences; control state keeps the old set until the primary reports that the new set's write quorum holds its log, and the primary counts the write quorums of both meanwhile. W + Q > R holds over each set, unchanged.
 - **Date:** 2026-10-28
 - **Related:** ADR-0006, ADR-0016, ADR-0017, ADR-0020, ADR-0021
 

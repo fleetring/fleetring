@@ -4,6 +4,13 @@
 - **Date:** 2026-11-02
 - **Related:** amends ADR-0025 (§4); ADR-0017 (control state), ADR-0020 (simulation); tickets FR-047, FR-050
 
+*Note (2026-11-11):* [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12) proposes four amendments, in force since ADR-0047 was accepted. The text below is unchanged.
+
+- **Point 2:** `RevokeToken` needs `fleet`, *or the ancestor rule*: an agent, authenticated by its token on a direct connection, whose own delegation, if it has one, is recorded with the claims it presents, may revoke the token it presented, any delegation recorded below it, and `Revoked::Principal` for itself or the principal of any delegation recorded below it, within caps and rates on the entries it adds; `Revoked::Key` stays `fleet`-only (ADR-0047, point 11).
+- **Point 3:** a delegated token, one an issuer key signed for a dotted agent name such as `agent-42.c7`, is also accepted on a connection whose client certificate names an *ancestor* of its principal: the certificate's principal followed by `.` is a prefix of the token's. An authority-signed token still needs a certificate naming its own subject, and a token on a connection with no client certificate is refused. A relay with `forward_tokens` carries it as any token, except to `DelegateToken` and ancestor-rule revocations, which need a direct connection, apart from a token revoking its own `jti` (ADR-0047, point 4).
+- **Point 5:** the header may carry `x5c`, exactly one issuer certificate issued by an authority in the bundle, whose key is the token's `kid`; the claims may carry `fleetring.kind`, `fleetring.owner`, `fleetring.parent`, and `fleetring.chain`, and unknown fields are still refused; an issuer-signed token lasts at most 24 hours and is held to the agent tier; and FleetRing's signers write `iat` as the signing time, and nodes refuse a token whose `iat` is more than 30 seconds in their future (ADR-0047, points 1 to 3).
+- **Point 6:** the denylist gains `Revoked::Principal`, one entry per principal, sent with the rest, and every entry records whether it was added with `fleet` or under the ancestor rule, so the control node can cap the latter; a delegated token is refused if its own ID or key, or any ancestor's ID, key, or name, is listed; a data node that meets an entry it can't read refuses every token, as for a stale list, rather than skipping the entry; and a control node bounds the age of its own applied state the same way (ADR-0047, points 3, 11, and 13).
+
 ## Context
 
 ADR-0025 decides principals, scopes, bearer tokens, and enforcement at the request boundary. Implementing it in FR-047 raised questions it leaves open:

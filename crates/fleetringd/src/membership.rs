@@ -35,7 +35,7 @@ use fleetring_control::{Liveness, Member, membership_ring};
 use fleetring_proto::PROTOCOL_VERSION;
 use fleetring_proto::v1::{
     DatabaseStatus, HeartbeatRequest, HeartbeatResponse, JoinRequest, LeaveRequest,
-    MembershipUpdate, WatchMembershipRequest,
+    MembershipUpdate, Software as ProtoSoftware, WatchMembershipRequest,
 };
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
@@ -218,7 +218,8 @@ impl Membership {
     }
 
     /// Starts membership as [`Membership::start_reporting`] does, counting and timing every
-    /// heartbeat in `metrics`.
+    /// heartbeat in `metrics`, and reporting this build's [`running`] software in every join
+    /// and heartbeat.
     pub(crate) fn start_observed(
         member: Member,
         client: ControlClient,
@@ -241,6 +242,7 @@ impl Membership {
                 denylist: membership.denylist.clone(),
                 forks: Arc::clone(&membership.forks),
                 metrics,
+                software: software_to_proto(&running()),
             },
             Arc::clone(&resubscribe),
             membership.updates.clone(),
@@ -727,6 +729,8 @@ struct Heartbeats {
     forks: Arc<watch::Sender<std::collections::BTreeSet<fleetring_control::DatabaseName>>>,
     /// Where heartbeats are counted and timed.
     metrics: MembershipMetrics,
+    /// The software every join and heartbeat reports.
+    software: ProtoSoftware,
 }
 
 impl Heartbeats {
@@ -736,7 +740,7 @@ impl Heartbeats {
         let request = HeartbeatRequest {
             node_id: id.to_owned(),
             databases: self.databases.statuses(),
-            software: Some(software_to_proto(&running())),
+            software: Some(self.software.clone()),
             disk_free_bytes: self.databases.disk_free_bytes(),
         };
         let sent = tokio::time::Instant::now();
@@ -753,7 +757,7 @@ impl Heartbeats {
             }
             self.unknown = unknown;
             self.denylist
-                .replace(revocations_from_proto(response.revocations.clone()));
+                .receive(revocations_from_proto(response.revocations.clone()));
             let forks: std::collections::BTreeSet<fleetring_control::DatabaseName> = response
                 .forks
                 .iter()
@@ -783,7 +787,7 @@ async fn heartbeat_loop(
     let join = JoinRequest {
         protocol: Some(PROTOCOL_VERSION),
         node: Some(node_to_proto(&heartbeats.member)),
-        software: Some(software_to_proto(&running())),
+        software: Some(heartbeats.software.clone()),
     };
     let mut joined = false;
     let mut failing = false;
@@ -800,7 +804,7 @@ async fn heartbeat_loop(
                     tracing::info!(node = %id, epoch = response.membership_epoch, "joined the fleet");
                     heartbeats
                         .denylist
-                        .replace(revocations_from_proto(response.revocations));
+                        .receive(revocations_from_proto(response.revocations));
                     joined = true;
                     timeouts = 0;
                 }

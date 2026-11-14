@@ -164,9 +164,25 @@ async fn a_chain_derived_from_where_the_log_begins_agrees_with_verify() -> TestR
         PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(2)),
     )?;
     node.registry().execute(&db, put(3, 100)).await?;
+    // The chain is rebuilt on a task of its own, and a primary with no follower chains a batch it
+    // publishes only when a checkpoint or a snapshot reaches for it, so the chain may stop short
+    // of the write, or reach it, depending on which the rebuild read first. Either way it is
+    // derived from the log's start, so it is compared with `verify` at the last position it
+    // holds, once it holds more than its anchor.
+    eventually("the derived chain", || {
+        node.replication
+            .chain_history(&db)
+            .is_some_and(|chain| chain.len() > 1)
+    })
+    .await?;
+    let chain = node
+        .replication
+        .chain_history(&db)
+        .ok_or("the chain is built")?;
+    let (tip, held) = chain.last_key_value().ok_or("a position")?;
     let verified = guarded("verifying", async {
         loop {
-            match node.replication.verify(&db, None).await {
+            match node.replication.verify(&db, Some(tip.clone())).await {
                 Err(status) if status.code() == Code::Unavailable => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
@@ -175,14 +191,13 @@ async fn a_chain_derived_from_where_the_log_begins_agrees_with_verify() -> TestR
         }
     })
     .await??;
-    let position = verified.position.clone().ok_or("a position")?;
-    let held = node
-        .replication
-        .chain_history(&db)
-        .and_then(|chain| chain.get(&position).copied());
     assert_eq!(
-        held,
-        Some(verified.hash),
+        verified.position.as_ref(),
+        Some(tip),
+        "verified where asked"
+    );
+    assert_eq!(
+        *held, verified.hash,
         "the chain holds what the log reads back to"
     );
     Ok(())
@@ -290,6 +305,7 @@ async fn a_batch_whose_hash_differs_is_refused_and_the_follower_reseeded() -> Te
             database: db.to_string(),
             epoch: 1,
             epoch_start: None,
+            epoch_start_chain: None,
         },
     )
     .await?;

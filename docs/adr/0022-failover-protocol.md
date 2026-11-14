@@ -1,6 +1,8 @@
 # ADR-0022: Failover: the candidate drives the promotion, and logs are ranked by log epoch
 
-- **Status:** Accepted (2026-10-28)
+- **Status:** Accepted (2026-10-28); the replica set a promotion fences after a membership change amended by [ADR-0031, amendment 2](0031-node-calls-bound-to-placement.md#amendment-2-2026-11-11-fr-102-a-membership-change-hands-a-replica-set-over-on-joint-quorums) (accepted 2026-11-12)
+
+*Note (2026-11-12):* the replica set point 1's promotion fences and its candidate is drawn from is `State::replica_set`, which, by [ADR-0031, amendment 2](0031-node-calls-bound-to-placement.md#amendment-2-2026-11-11-fr-102-a-membership-change-hands-a-replica-set-over-on-joint-quorums) (accepted 2026-11-12), is the set a membership change kept until a release, not the ring's placement. A candidate learns it from control state before it fences, and hands over the same way once it leads. Nothing else in this record changes.
 - **Date:** 2026-10-28
 - **Amends:** ADR-0018, points 4, 5, and 7
 - **Related:** ADR-0016, ADR-0017, ADR-0019, ADR-0020; tickets FR-029, FR-031

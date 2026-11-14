@@ -419,10 +419,44 @@ pub fn incoming(
     listener: Listener,
     security: Security,
 ) -> impl Stream<Item = io::Result<Accepted>> {
+    incoming_and_accept_loop(listener, security).0
+}
+
+/// The task behind [`incoming`]'s connections that accepts them and owns the listener. It ends,
+/// closing the listener, once the connections' stream is dropped, as a server drops it when it
+/// stops accepting.
+#[derive(Debug)]
+pub(crate) struct AcceptLoop(tokio::task::JoinHandle<()>);
+
+impl AcceptLoop {
+    /// Waits until the accept loop has ended and its listener is closed, so that the port is
+    /// free. Call it once the connections' stream is dropped; until then the loop goes on.
+    pub(crate) async fn closed(self) {
+        // The loop only ends, never fails; a panic in it has been reported already.
+        let _ended = self.0.await;
+    }
+}
+
+/// The connections [`incoming`] returns, with the accept loop that owns `listener`, which a
+/// caller awaits to know the port is free.
+///
+/// # Panics
+///
+/// If called outside a Tokio runtime.
+pub(crate) fn incoming_and_accept_loop(
+    listener: Listener,
+    security: Security,
+) -> (impl Stream<Item = io::Result<Accepted>>, AcceptLoop) {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
-            let raw = match listener.accept().await {
+            // Once the server stops, the listener closes with this task, so the port comes free
+            // for a node started again in the same process.
+            let accepted = tokio::select! {
+                () = sender.closed() => break,
+                accepted = listener.accept() => accepted,
+            };
+            let raw = match accepted {
                 Ok(raw) => raw,
                 Err(error) => {
                     if sender.send(Err(error)).await.is_err() {
@@ -445,5 +479,28 @@ pub fn incoming(
             });
         }
     });
-    tokio_stream::wrappers::ReceiverStream::new(receiver)
+    (
+        tokio_stream::wrappers::ReceiverStream::new(receiver),
+        AcceptLoop(accepting),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Once the connections' stream is dropped, the accept loop's end means the port is free:
+    /// a listener binds it at once, with no turn of the runtime in between.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_port_is_free_once_the_accept_loop_ends() -> io::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (connections, accepting) =
+            incoming_and_accept_loop(Listener::Tcp(listener), Security::Plaintext);
+        // The loop has started, and waits for a connection.
+        tokio::task::yield_now().await;
+        drop(connections);
+        accepting.closed().await;
+        std::net::TcpListener::bind(address).map(drop)
+    }
 }

@@ -144,10 +144,15 @@ service Control {
   // Scope: admin on the database.
   // Binding: holder.
   rpc TransferLease(TransferLeaseRequest) returns (PromotionResponse);
-  // Adds a bearer token, or every token a signing key issued, to the denylist every node checks
-  // before it trusts a token (ADR-0025). Data nodes learn the list from their heartbeat replies,
-  // so a revocation reaches every live node within one heartbeat interval.
-  // Scope: fleet.
+  // Adds a bearer token, every token a signing key issued, or every token naming a principal or
+  // a name below it, to the denylist every node checks before it trusts a token (ADR-0025,
+  // ADR-0047 point 11). Data nodes learn the list from their heartbeat replies, so a revocation
+  // reaches every live node within one heartbeat interval. With `fleet` the caller revokes
+  // anything. Without it, an agent revokes under the ancestor rule, on a direct connection:
+  // the token it presented, itself, or a delegation recorded below it or that delegation's
+  // principal, never a key; a relay-carried token may revoke only its own ID. A principal, and
+  // any revocation under the ancestor rule, needs the `delegation` fleet feature.
+  // Scope: fleet, or the ancestor rule.
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
   // Creates a database with a description, labels, or an expiry (ADR-0041); needs the
   // `metadata` fleet feature, and `expiry` too for an expiry, and refuses a request without
@@ -172,6 +177,19 @@ service Control {
   // an unknown one does.
   // Scope: the requesting principal, or admin on the target.
   rpc GetForkOperation(GetForkOperationRequest) returns (ForkOperationStatus);
+  // Mints a delegated agent's token (ADR-0047, point 5): the control plane records the
+  // delegation, the child's complete claims and its lineage, then signs exactly those claims
+  // with its delegation issuer's key. The caller is an agent whose token reached the control
+  // node directly, on a connection whose certificate names the caller or an ancestor of it,
+  // never through a relay. The operation ID the caller chose makes a resend safe: the same
+  // principal sending the same request again gets the same delegation, signed again, and
+  // nothing new is recorded. Needs the `delegation` fleet feature. The token never reaches a
+  // log. A control node that predates it answers UNIMPLEMENTED.
+  // Scope: an agent's token whose grant covers the child (checked in the handler).
+  rpc DelegateToken(DelegateTokenRequest) returns (DelegateTokenResponse);
+  // Lists live delegation records, never tokens, for incident response (ADR-0047, point 6.4).
+  // Scope: fleet.
+  rpc ListDelegations(ListDelegationsRequest) returns (ListDelegationsResponse);
 }
 
 message JoinRequest {
@@ -221,6 +239,24 @@ message DatabaseStatus {
   // write quorum holds its whole log, and it counts both write quorums toward every write from
   // now on (ADR-0046, point 3.10, as built). The control plane then releases the holders.
   PlacementCaughtUp placement_caught_up = 11;
+  // On a primary whose database's replica set a membership change kept: placement's write
+  // quorum holds its whole log, and it counts both write quorums toward every write from now on
+  // (ADR-0031, amendment 2). The control plane then releases the kept set. Unset by nodes that
+  // predate it, and recorded only once the fleet has enabled `handover`.
+  ReplicasCaughtUp replicas_caught_up = 12;
+}
+
+// A database's primary at `epoch` has placement's write quorum holding its log, while a
+// membership change keeps the database's old replica set.
+message ReplicasCaughtUp {
+  // The database's incarnation.
+  fixed64 incarnation = 1;
+  // The lease epoch of the primary that reports it.
+  uint64 epoch = 2;
+  // The membership epoch of the ring whose placement the primary checked: the one `Placement`
+  // named beside the placed replicas it counts. The control plane releases the kept set only
+  // while it is the current one. A report without it is ignored.
+  optional uint64 membership_epoch = 3;
 }
 
 // A ready fork's primary at `epoch` has placement's write quorum holding its log.
@@ -341,25 +377,137 @@ message HeartbeatResponse {
   repeated string forks = 4;
 }
 
-// A token or signing key on the denylist, and when the entry may be forgotten.
+// A token, signing key, or principal on the denylist, and when the entry may be forgotten.
+//
+// From 0.8 a node that meets an entry it can't read, whose case is absent, unknown to it, or
+// malformed, treats the whole list as unusable and refuses every token until it reads one
+// wholly (ADR-0047, point 3).
 message Revocation {
   oneof revoked {
     // A token's `jti`.
     string token_id = 1;
     // A signing key's `kid`: every token it signed.
     string key_id = 2;
+    // Every token naming a principal or a name below it, issued until a time. Only the
+    // control plane writes one: a `RevokeTokenRequest` holding it is refused.
+    PrincipalRevocation principal = 4;
   }
   // Milliseconds since the Unix epoch; the maximum value means never.
   uint64 until_ms = 3;
 }
 
+// A principal's revocation (ADR-0047, point 11.1): it refuses every token whose subject is
+// `principal` or a name below it (`agent-42` and `agent-42.c7`, never `agent-420`) and whose
+// `iat` is at or before `before_ms`, with 30 seconds of leeway for a token the authority signed.
+message PrincipalRevocation {
+  // Another fleet's name; never set in 0.8, and a node treats an entry that sets it as
+  // unreadable.
+  optional string fleet = 1;
+  string principal = 2;
+  // The control time of the revocation, in milliseconds since the Unix epoch.
+  uint64 before_ms = 3;
+}
+
+// What to revoke: a token or a key in `revocation`, a principal in `principal`, or a token
+// and a principal at once, which an agent removing itself needs, since its token no longer
+// authenticates a second request once either lands. The control plane revokes the principal
+// first, then the token. `revocation` never holds a principal, whose `before` only the control
+// plane sets, and its `until_ms` counts only with `fleet`.
 message RevokeTokenRequest {
   Revocation revocation = 1;
+  // A principal to revoke, or empty for none: every token naming it or a name below it, issued
+  // until now. Under the ancestor rule, an agent name at or below the caller's.
+  string principal = 2;
 }
 
 message RevokeTokenResponse {
-  // When the entry will be forgotten: the later of this request's and any earlier revocation's.
+  // When the entry of `revocation` will be forgotten: the later of this request's and any
+  // earlier revocation's. For a request naming only a principal, its entry's.
   uint64 until_ms = 1;
+  // For a request naming a principal: the control time, in milliseconds since the Unix epoch,
+  // its entry refuses tokens issued at or before. A new root token may be minted 30 seconds
+  // after it, by its signer's clock.
+  optional uint64 before_ms = 2;
+  // For a request naming a principal: when its entry will be forgotten.
+  optional uint64 principal_until_ms = 3;
+}
+
+message DelegateTokenRequest {
+  // 16 random bytes the caller chooses before it asks, printed as 26 lowercase base32
+  // characters, as a fork's are. A resend repeats them.
+  bytes operation_id = 1;
+  // The child's last segment, 1 to 32 of `a-z`, `0-9`, and `_`: the child is the caller's name
+  // followed by `.<segment>`.
+  string segment = 2;
+  // The scopes asked for, each wholly within the caller's scopes and its `grant` patterns, or
+  // none for the defaults: `admin` and `stream` on `<child>-*`, narrowed to what the caller
+  // holds.
+  repeated string scopes = 3;
+  // How long the token lasts from `not_before`: 60 seconds to 24 hours, and never past the
+  // caller's token. Unset for the default, 2 hours, capped at the caller's token's expiry.
+  optional uint64 lifetime_ms = 4;
+  // When the token starts, in milliseconds since the Unix epoch: at most 30 seconds ago, at most
+  // 24 hours ahead, and before the caller's token expires. Unset for now.
+  optional uint64 not_before_ms = 5;
+}
+
+message DelegateTokenResponse {
+  // The child's token. Keep it out of logs.
+  string token = 1;
+  // The delegation ID, the token's `jti`: 22 base64url characters. Every copy of the token, a
+  // resend's included, has it, and revoking it ends them all.
+  string delegation_id = 2;
+  // The child's principal.
+  string principal = 3;
+  // The child's scopes, in canonical form.
+  repeated string scopes = 4;
+  // When the token starts and expires, in milliseconds since the Unix epoch, in whole seconds.
+  uint64 not_before_ms = 5;
+  uint64 expires_at_ms = 6;
+  // Set when the default lifetime was cut short by the caller's token's expiry.
+  bool capped = 7;
+  // The ID of the delegation issuer key that signed this copy, the token's `kid`.
+  string issuer_key_id = 8;
+}
+
+message ListDelegationsRequest {
+  // Only the records this control node logged; unset for every control node's. A compromised
+  // control node can stamp another's ID, so after a compromise list by time as well.
+  optional string recorded_by = 1;
+  // Only the records logged at or after this time, in milliseconds since the Unix epoch.
+  optional uint64 recorded_from_ms = 2;
+  // Only the records logged at or before this time, in milliseconds since the Unix epoch.
+  optional uint64 recorded_to_ms = 3;
+}
+
+// One link of a delegated token's lineage: an ancestor's token ID, and the ID of the key that
+// signed the copy of its token the delegation was made from.
+message ChainLink {
+  string id = 1;
+  string kid = 2;
+}
+
+// A live delegation record (ADR-0047, point 6.1), never its token.
+message DelegationRecord {
+  string principal = 1;
+  string delegation_id = 2;
+  // The principal that delegated it.
+  string parent = 3;
+  // Its ancestors, root first, ending with the parent.
+  repeated ChainLink chain = 4;
+  // The token's `iat` and `exp`, in milliseconds since the Unix epoch.
+  uint64 issued_at_ms = 5;
+  uint64 expires_at_ms = 6;
+  // The control node that logged the record, as it stamped itself: advisory after a compromise.
+  string recorded_by = 7;
+  // When the record was logged: the command's effective time, in milliseconds since the Unix
+  // epoch.
+  uint64 recorded_at_ms = 8;
+}
+
+message ListDelegationsResponse {
+  // In delegation ID order.
+  repeated DelegationRecord delegations = 1;
 }
 
 message WatchMembershipRequest {
@@ -489,6 +637,15 @@ message Placement {
   // The fork that made the database, its state and provenance. Unset for a database no fork
   // made, and from a control node that predates forks.
   ForkStatus fork = 13;
+  // Where the ring at `membership_epoch` places the database, in preference order. It differs
+  // from `replicas` while a seeded fork's recorded holders, a ready fork's kept holders, or a
+  // replica set a membership change kept are the replica set promotions fence (ADR-0031,
+  // amendment 2): a primary then counts the write quorums of both. Empty from a control node
+  // that predates the field.
+  repeated string placed_replicas = 14;
+  // The membership epoch of the control state this placement was read from. Unset from a
+  // control node that predates it, whose primaries count placement by their own ring.
+  optional uint64 membership_epoch = 15;
 }
 
 // How far a fork has got (ADR-0046, point 2). `cancelled` appears only in an operation's
@@ -884,6 +1041,11 @@ message ReplicateOpen {
   // follower whose log came from an earlier epoch and runs past it truncates back to it first.
   // Unset for an epoch that started with the database.
   optional bytes epoch_start = 3;
+  // The primary's hash chain at `epoch_start` (FR-044). A follower at `epoch_start` whose chain
+  // no record fits, as after it truncated a tail back there, takes this hash, so its chain
+  // agrees with the primary's before the next batch. Unset with `epoch_start`, when the
+  // primary's chain doesn't hold it, or by a primary that predates the field.
+  optional bytes epoch_start_chain = 4;
 }
 
 // One or more committed transactions, as the engine encodes them.

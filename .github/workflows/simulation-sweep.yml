@@ -69,9 +69,11 @@ jobs:
           path: seed-*.log
 
   # FR-087's fork matrix: every row over the same number of seeds as `seeds`, each seed at the
-  # seeding step it picks (the ignored `sweep_row_*` tests), but the rows ignored for open bugs.
-  # Eight shards split each row's seeds, all from one base seed per run. It needs the fault
-  # hooks, which refuse a build without debug assertions, so it runs optimized with them kept.
+  # seeding step it picks (the ignored `sweep_row_*` tests), and FR-102's hand-over sweep
+  # (`sweep_handover`) over as many. A row ignored for an open bug is ignored as a whole, so no
+  # filter skips it. Eight shards split each sweep's seeds, all from one base seed per run. It
+  # needs the fault hooks, which refuse a build without debug assertions, so it runs optimized
+  # with them kept.
   # #137's acceptance sweep: `gh workflow run simulation-sweep.yml --ref <branch> -f seeds=1000`.
   fork-matrix:
     name: fork matrix sweep (shard ${{ matrix.shard }})
@@ -90,14 +92,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: sweep this shard's seeds of every row
+      - name: sweep this shard's seeds of every row and hand-over scenario
         run: |
           per_shard=$(( (SEEDS + 7) / 8 ))
           base=$(( ${{ github.run_id }} % 1000000000 ))
           export FLEETRING_SIM_SWEEP_SEEDS=$per_shard
           export FLEETRING_SIM_SWEEP_FROM=$(( base + ${{ matrix.shard }} * per_shard ))
-          echo "seeds $FLEETRING_SIM_SWEEP_FROM to $(( FLEETRING_SIM_SWEEP_FROM + per_shard - 1 )) of every row"
+          echo "seeds $FLEETRING_SIM_SWEEP_FROM to $(( FLEETRING_SIM_SWEEP_FROM + per_shard - 1 )) of every sweep"
           cargo test --release -p fleetringd --features simulation,fault-hooks --test sim \
-            -- --ignored sweep_row \
-            --skip sweep_row_13_lost_and_duplicated --skip sweep_row_17_partitions_while_seeding \
-            --skip sweep_row_20_drain_before_reset
+            -- --ignored sweep_row sweep_handover

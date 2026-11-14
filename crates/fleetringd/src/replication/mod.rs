@@ -118,14 +118,15 @@ mod epochs;
 mod failover;
 mod follower;
 pub(crate) mod fork;
+mod handover;
 mod primary;
 mod snapshot;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
@@ -165,6 +166,8 @@ pub use self::fork::faults::ForkFaults;
 pub use self::fork::{
     DatabaseView, FORK_NOT_READY, FaultPoint, ForkPhase, ForkView, RETRY_AFTER_KEY,
 };
+pub use self::handover::ReplicaSets;
+use self::handover::{Counting, Origin, Staleness};
 
 /// The metadata key on a `Replicate` stream that names the primary, so that a follower without a
 /// copy knows whom to fetch one from.
@@ -468,6 +471,9 @@ struct Inner {
     /// The node's fork state: staged copies, seeds, pins, reservations, reports, and the
     /// readiness gate (ADR-0046).
     forks: Arc<fork::Forks>,
+    /// The replica sets each database this node leads counts, as control state last showed
+    /// them (ADR-0031, amendment 2).
+    sets: handover::Counted,
     /// How many streams have ended, by the database they followed. A stream that ends may mean
     /// the database was dropped; the node asks the control plane (see [`ended_streams`]).
     ///
@@ -486,6 +492,8 @@ struct Inner {
     followers: Mutex<BTreeMap<DatabaseName, Arc<FollowerSlot>>>,
     /// Numbers staging directories, so that two transfers never share one.
     transfers: AtomicU64,
+    /// Set once [`Replication::stop`] ran: replication calls are refused from then on.
+    stopped: AtomicBool,
     metrics: ReplicationMetrics,
 }
 
@@ -533,6 +541,7 @@ impl Replication {
         forks.store().scan();
         let inner = Arc::new(Inner {
             forks,
+            sets: handover::Counted::default(),
             node,
             engine,
             membership,
@@ -554,6 +563,7 @@ impl Replication {
             primaries: Mutex::default(),
             followers: Mutex::default(),
             transfers: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
             metrics,
         });
         let built = registry(ReplicatingPublisher {
@@ -562,6 +572,7 @@ impl Replication {
         // `inner` is new, so nothing else can have set the registry.
         let _set = inner.registry.set(built);
         snapshot::sweep(inner.registry().root());
+        fork::record_installed_copies(&inner);
         Self { inner }
     }
 
@@ -673,18 +684,32 @@ impl Replication {
         drop(removed);
     }
 
-    /// Stops every primary's streams.
+    /// Stops replication on this node: every primary's streams, and every stream following a
+    /// database here, and refuses every replication call from then on.
+    ///
+    /// A call can outlive the server that accepted it: a connection the server had to drop at
+    /// its grace keeps running in a runtime that goes on, as an in-process daemon's does. A
+    /// stream following a database there would keep applying a primary's batches to this node's
+    /// copy and acknowledging them, after the node stopped, and a node started again on the same
+    /// directory would never get a stream of its own.
     ///
     /// # Panics
     ///
     /// If the replication state's lock was poisoned by a panic in another thread.
     pub fn stop(&self) {
+        // Set before the streams end, so that a stream admitted from here on finds it (see
+        // `Inner::check_running`).
+        self.inner.stopped.store(true, Ordering::SeqCst);
         let primaries = {
             let mut primaries = self.inner.lock_primaries();
             self.inner.served.send_modify(BTreeMap::clear);
             std::mem::take(&mut *primaries)
         };
         drop(primaries);
+        for slot in self.inner.lock_followers().values() {
+            // A new session ends every stream following the database.
+            slot.begin();
+        }
     }
 
     /// Takes `database` out of the leases this node reports holding, ahead of the step down
@@ -777,15 +802,18 @@ impl Replication {
         .await
     }
 
-    /// The epoch of this node's primary of `database`, and the membership epoch of the ring it
-    /// checked placement under, once that placement's write quorum holds everything the primary
-    /// has committed, while the database is a ready fork whose recorded holders are still its
+    /// The epoch of this node's primary of `database`, and the membership epoch of the
+    /// placement it checked, once that placement's write quorum holds everything the primary has
+    /// committed, while the database is a ready fork whose recorded holders are still its
     /// replica set: the primary then counts both write quorums toward every write (ADR-0046,
     /// point 3.10, as built). `None` otherwise.
     ///
-    /// The caller follows the fork's view first: every write committed after the check counted
-    /// placement's write quorum, and every write before it is in the log placement now holds.
-    /// Control state releases the holders only while the membership epoch is still its own.
+    /// The placement checked is one the primary counts: the one control state last showed it,
+    /// at the membership epoch it was read at (ADR-0031, amendment 2), or, from a control node
+    /// that shows none, its current ring's. The caller follows the fork's view first: every
+    /// write committed after the check counted that placement's write quorum, and every write
+    /// before it is in the log placement now holds. Control state releases the holders only
+    /// while the membership epoch is still its own.
     pub(crate) fn placement_caught_up(
         &self,
         database: &DatabaseName,
@@ -798,15 +826,99 @@ impl Replication {
         ) {
             return None;
         }
-        // One view: the ring checked is the ring the membership epoch names.
-        let view = inner.membership.view();
-        let ring = view.ring()?;
-        // A primary that knows of nothing committed hasn't learned what placement must hold.
-        let committed = primary.committed()?;
-        let placed = inner.write_quorum(&primary, placed_on(ring, &primary));
-        let floor = usize::from(primary.role().durability.min_replicas());
-        let held = primary.quorum_held(&Quorum::over(vec![placed], floor))?;
-        (held >= committed).then_some((primary.role().epoch, view.epoch()))
+        let (membership_epoch, placed) = match inner.sets.shown(database) {
+            Some(sets) => (sets.membership_epoch, sets.placed),
+            None => {
+                // One view: the ring checked is the ring the membership epoch names.
+                let view = inner.membership.view();
+                (view.epoch(), placed_on(view.ring()?, &primary))
+            }
+        };
+        inner
+            .holds_log(&primary, placed)
+            .then_some((primary.role().epoch, membership_epoch))
+    }
+
+    /// The report that placement's write quorum holds everything this node's primary of
+    /// `database` has committed, while control state keeps the replica set a membership change
+    /// moved it off: the primary then counts both write quorums toward every write, so once
+    /// placement's holds the log, every write it acknowledged reaches a quorum of either
+    /// (ADR-0031, amendment 2). It names the membership epoch of the placement the primary
+    /// counts, which control state releases the kept set at only while it is still its own.
+    /// `None` otherwise, and for a fork whose recorded holders are its replica set.
+    pub(crate) fn replicas_caught_up(
+        &self,
+        database: &DatabaseName,
+    ) -> Option<fleetring_control::ReplicasCaughtUp> {
+        let inner = &self.inner;
+        if inner.forks.frozen_set(database).is_some() {
+            return None;
+        }
+        let primary = inner.primary(database)?;
+        let sets = inner.sets.shown(database).filter(ReplicaSets::hands_over)?;
+        inner.holds_log(&primary, sets.placed).then(|| {
+            fleetring_control::ReplicasCaughtUp::new(
+                sets.incarnation,
+                primary.role().epoch,
+                sets.membership_epoch,
+            )
+        })
+    }
+
+    /// Whether a primary of `database` here knows what to count: the replica sets control
+    /// state showed, or placement by the ring pinned under a control node that shows none
+    /// (ADR-0031, amendment 2).
+    pub(crate) fn knows_replica_sets(&self, database: &DatabaseName) -> bool {
+        self.inner.sets.get(database).is_some()
+    }
+
+    /// Follows the replica sets `placement`, just read from control state, shows for
+    /// `database`, for a primary on this node to serve from (ADR-0031, amendment 2): a
+    /// placement older than the one followed already changes nothing, and one of another
+    /// incarnation than the sets followed replaces them, since the primary serves the
+    /// incarnation this placement names. A placement from a control node that shows no sets
+    /// pins placement by this node's ring, unless this node counts something for the database
+    /// already, and the primary confirms the pin with a read of its own.
+    ///
+    /// # Errors
+    ///
+    /// `INTERNAL` if the placement is malformed.
+    pub(crate) fn follow_replica_sets(
+        &self,
+        database: &DatabaseName,
+        placement: &fleetring_proto::v1::Placement,
+    ) -> Result<(), Status> {
+        match ReplicaSets::from_placement(placement)? {
+            Some(sets) => {
+                self.inner.sets.follow(database, sets, Origin::Serving);
+            }
+            None => {
+                let factor = u8::try_from(placement.replication_factor)
+                    .ok()
+                    .and_then(ReplicationFactor::new)
+                    .unwrap_or(ReplicationFactor::ONE);
+                let placed = self
+                    .inner
+                    .membership
+                    .view()
+                    .ring()
+                    .map_or_else(Vec::new, |ring| {
+                        ring.replicas_n(database.as_str(), factor).to_ids()
+                    });
+                self.inner.sets.seed_ring(database, placed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Follows what `view`, just read from control state, shows of `database`: its replica sets
+    /// first, then its fork (ADR-0031, amendment 2; ADR-0046, point 3.10). In that order, a
+    /// primary here never counts a fork's view newer than the sets it counts beside it: while
+    /// it still sees the fork's holders kept, it counts them with every set control state
+    /// showed, so a release it hasn't seen yet, and a membership change after it, are both
+    /// covered.
+    pub(crate) fn follow_view(&self, database: &DatabaseName, view: &DatabaseView) {
+        self.inner.follow_view(database, view, Origin::Asked);
     }
 
     /// Whether `database`'s primary has enough followers connected, live, and reporting for a
@@ -1084,6 +1196,18 @@ impl DatabaseStatuses for Replication {
                     ..DatabaseStatus::default()
                 },
             );
+        }
+        // Outside the primaries' lock, which the report takes again.
+        for (name, status) in &mut statuses {
+            if status.role == i32::from(ReplicaRole::Primary) {
+                status.replicas_caught_up = self.replicas_caught_up(name).map(|caught_up| {
+                    fleetring_proto::v1::ReplicasCaughtUp {
+                        incarnation: caught_up.incarnation().get(),
+                        epoch: caught_up.epoch().get(),
+                        membership_epoch: Some(caught_up.membership_epoch().get()),
+                    }
+                });
+            }
         }
         self.inner.forks.decorate(&mut statuses, |name| {
             self.inner.epochs.record(name).log_epoch()
@@ -1401,6 +1525,24 @@ impl Inner {
         self.orphans.lock().expect("replication lock poisoned")
     }
 
+    /// Refuses a replication call once [`Replication::stop`] ran.
+    ///
+    /// A stream whose slot was created before the stop sees the new session it began; one
+    /// created after it, under the followers lock that the stop iterates under, sees this.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE`, which a caller retries, against the node once it runs again.
+    fn check_running(&self) -> Result<(), Status> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(Status::unavailable(format!(
+                "replication on node {} has stopped",
+                self.node
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuses a call that would open, follow, fence, or promote `database` while this node
     /// keeps its copy as an orphan: the copy stays as it is until an operator removes it.
     ///
@@ -1455,22 +1597,61 @@ impl Inner {
         });
     }
 
-    /// The replica set of `primary`'s database in the current membership view: a seeded fork's
-    /// recorded holders until this node sees it ready, whatever the ring says (ADR-0046, point
-    /// 3.10), so that no write counts a node the control plane wouldn't fence for it. While a
-    /// ready fork keeps its holders, a write needs both their write quorum and placement's: the
-    /// control plane fences the holders until it releases them, and placement from then on.
+    /// The replica sets whose write quorums `primary`'s database needs toward each write.
+    ///
+    /// A seeded fork's recorded holders alone, until this node sees it ready, whatever the ring
+    /// says (ADR-0046, point 3.10), so that no write counts a node the control plane wouldn't
+    /// fence for it.
+    ///
+    /// Otherwise the replica sets control state last showed: the set promotions fence and
+    /// placement, which differ while a membership change keeps the old set (ADR-0031, amendment
+    /// 2); and, while a ready fork keeps its holders, those holders beside them, since the
+    /// control plane fences the holders until it releases them. Under a control node that
+    /// shows no sets, placement by the ring pinned at its last answer, beside the current
+    /// ring's. Each set's write quorum counts once.
     fn followers_of(&self, primary: &Primary) -> Quorum {
         let floor = usize::from(primary.role().durability.min_replicas());
-        let groups = match self.forks.frozen_set(primary.name()) {
-            Some(FrozenSet::Seeded(holders)) => vec![self.write_quorum(primary, holders)],
-            Some(FrozenSet::Handover(holders)) => vec![
-                self.write_quorum(primary, holders),
-                self.write_quorum(primary, self.placed(primary)),
-            ],
-            None => vec![self.write_quorum(primary, self.placed(primary))],
+        let mut sets: Vec<Vec<NodeId>> = match self.forks.frozen_set(primary.name()) {
+            Some(FrozenSet::Seeded(holders)) => vec![holders],
+            Some(FrozenSet::Handover(holders)) => {
+                let mut sets = vec![holders];
+                sets.extend(self.counted(primary));
+                sets
+            }
+            None => self.counted(primary),
         };
+        let mut seen: Vec<BTreeSet<NodeId>> = Vec::with_capacity(sets.len());
+        sets.retain(|set| {
+            let members: BTreeSet<NodeId> = set.iter().cloned().collect();
+            let new = !seen.contains(&members);
+            seen.push(members);
+            new
+        });
+        let groups = sets
+            .into_iter()
+            .map(|set| self.write_quorum(primary, set))
+            .collect();
         Quorum::over(groups, floor)
+    }
+
+    /// The replica sets `primary` counts besides a fork's holders: the set promotions fence
+    /// first, then placement.
+    fn counted(&self, primary: &Primary) -> Vec<Vec<NodeId>> {
+        if fleetring_control::mutation::Mutation::CountPlacementAlone.is_active() {
+            return vec![self.placed(primary)];
+        }
+        match self.sets.get(primary.name()) {
+            // A ring newer than the shown sets may be one a control node moved the replica set
+            // to at once, before `handover` was enabled: count it too until the read answers.
+            Some(Counting::Shown(sets))
+                if self.membership.view().epoch() > sets.membership_epoch =>
+            {
+                vec![sets.fenced, sets.placed, self.placed(primary)]
+            }
+            Some(Counting::Shown(sets)) => vec![sets.fenced, sets.placed],
+            Some(Counting::Ring { placed, .. }) => vec![placed, self.placed(primary)],
+            None => vec![self.placed(primary)],
+        }
     }
 
     /// The replica set the ring in the current membership view places `primary`'s database on.
@@ -1479,6 +1660,35 @@ impl Inner {
             .view()
             .ring()
             .map_or_else(Vec::new, |ring| placed_on(ring, primary))
+    }
+
+    /// Follows what `view` shows of `database`, its replica sets before its fork, as
+    /// [`Replication::follow_view`] says, the sets as `origin` lets them.
+    fn follow_view(&self, database: &DatabaseName, view: &DatabaseView, origin: Origin) {
+        if let Some(sets) = &view.sets {
+            self.sets.follow(database, sets.clone(), origin);
+        }
+        self.forks.follow_view(database, view.fork.as_ref());
+    }
+
+    /// Whether `database`'s primary should read its replica sets from control state again
+    /// (ADR-0031, amendment 2).
+    fn replica_sets_staleness(&self, database: &DatabaseName) -> Staleness {
+        self.sets
+            .staleness(database, self.membership.view().epoch())
+    }
+
+    /// Whether the write quorum of `members` holds everything `primary` has committed. A
+    /// primary that knows of nothing committed hasn't learned what they must hold.
+    fn holds_log(&self, primary: &Primary, members: Vec<NodeId>) -> bool {
+        let Some(committed) = primary.committed() else {
+            return false;
+        };
+        let placed = self.write_quorum(primary, members);
+        let floor = usize::from(primary.role().durability.min_replicas());
+        primary
+            .quorum_held(&Quorum::over(vec![placed], floor))
+            .is_some_and(|held| held >= committed)
     }
 
     /// The write quorum of `primary`'s database over the replica set `members`.

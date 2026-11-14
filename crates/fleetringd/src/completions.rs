@@ -15,7 +15,7 @@ use clap_complete::engine::CompletionCandidate;
 use clap_complete::env::{Bash, CompleteEnv, EnvCompleter, Fish, Powershell, Zsh};
 use fleetring_client::context::{Contexts, select};
 
-use crate::agent::{self, AgentId};
+use crate::agent::{self, AgentRef};
 use crate::compat::ProgramName;
 use crate::{context_cmd, help};
 
@@ -142,7 +142,7 @@ pub(crate) fn agent_ids() -> Vec<CompletionCandidate> {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .filter(|name| name.parse::<AgentId>().is_ok())
+        .filter(|name| name.parse::<AgentRef>().is_ok())
         .collect();
     ids.sort();
     ids.into_iter().map(CompletionCandidate::new).collect()

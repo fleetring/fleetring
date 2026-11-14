@@ -1,0 +1,58 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-cert-issuer 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-cert\-issuer \- Issues a delegation issuer pair: `issuer.<name>.crt` and `issuer.<name>.key`
+.SH SYNOPSIS
+\fBfleetring cert issuer\fR [\fB\-\-out\fR] [\fB\-\-ttl\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-name\fR> <\fB\-\-dir\fR> 
+.SH DESCRIPTION
+Issues a delegation issuer pair: `issuer.<name>.crt` and `issuer.<name>.key`
+.PP
+The control node signs delegated agents\*(Aq tokens with the key, and they carry the certificate. Each run makes a new key; name the files in the control node\*(Aqs `[control] issuer_cert` and `issuer_key`.
+.SH OPTIONS
+.TP
+\fB\-\-name\fR \fI<NAME>\fR
+The issuer\*(Aqs name: by convention, the control node\*(Aqs ID
+.TP
+\fB\-\-dir\fR \fI<DIR>\fR
+The directory with `ca.crt` and `ca.key`
+
+The new files go into it unless `\-\-out` names another.
+.TP
+\fB\-\-out\fR \fI<DIR>\fR
+Writes the files into this directory instead, created private to you
+.TP
+\fB\-\-ttl\fR \fI<TTL>\fR
+How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+
+30 days by default, and at most 90.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

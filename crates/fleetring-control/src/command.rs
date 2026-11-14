@@ -5,9 +5,11 @@ use std::collections::BTreeSet;
 use fleetring::{NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
+use crate::delegation::{AncestorTarget, CallerToken, CanonicalRequest, DelegationId};
 use crate::fork::{
     ChainHash, ForkFailure, ForkIdentity, ForkIntent, ForkLimits, OperationId, RetryCause,
 };
+use crate::scope::Scopes;
 use crate::{
     DatabaseName, Durability, Engine, Feature, HostedReplica, Incarnation, LeaseEpoch, Member,
     MetadataChange, MetadataSpec, Position, PrincipalName, Revoked, Software, Timestamp,
@@ -21,6 +23,7 @@ const METADATA_AND_EXPIRY: &[Feature] = &[Feature::Metadata, Feature::Expiry];
 
 /// The features of a command that drives a fork.
 const FORK: &[Feature] = &[Feature::Fork];
+const HANDOVER: &[Feature] = &[Feature::Handover];
 
 /// The features of a fork request, which records metadata.
 const FORK_AND_METADATA: &[Feature] = &[Feature::Fork, Feature::Metadata];
@@ -28,10 +31,18 @@ const FORK_AND_METADATA: &[Feature] = &[Feature::Fork, Feature::Metadata];
 /// The features of a fork request that sets an expiry.
 const FORK_METADATA_AND_EXPIRY: &[Feature] = &[Feature::Fork, Feature::Metadata, Feature::Expiry];
 
-/// One change to control state, stamped with the control node's time.
+/// The features of a command that records a delegation, revokes a principal, or revokes under
+/// the ancestor rule.
+const DELEGATION: &[Feature] = &[Feature::Delegation];
+
+/// The features of a command every member reads.
+const NONE: &[Feature] = &[];
+
+/// One change to control state, stamped with the control node's time and, from 0.8, its ID.
 ///
 /// The control node stamps each command before it logs it, and [`apply`](crate::apply) reads
-/// time only from that stamp, so replaying the log gives the same result anywhere.
+/// time only from that stamp, so replaying the log gives the same result anywhere. The log layer
+/// stamps `recorded_by` the same way, never from what a client sends (ADR-0047, point 6.1).
 ///
 /// # Examples
 ///
@@ -49,15 +60,46 @@ const FORK_METADATA_AND_EXPIRY: &[Feature] = &[Feature::Fork, Feature::Metadata,
 pub struct Command {
     /// When the control node stamped the command.
     pub at: Timestamp,
+    /// The control node that logged the command, as the log layer stamped it beside `at`
+    /// (ADR-0047, point 6.1). [`Action::RecordDelegation`] is refused without it.
+    ///
+    /// Commands logged before the field existed, and by a control node that stamps none, carry
+    /// none, and are written exactly as before; a release that doesn't know the field ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_by: Option<NodeId>,
     /// What the command does.
     pub action: Action,
 }
 
 impl Command {
-    /// Returns the command that performs `action`, stamped `at`.
+    /// Returns the command that performs `action`, stamped `at`, with no recorder.
     #[must_use]
     pub fn new(at: Timestamp, action: Action) -> Self {
-        Self { at, action }
+        Self {
+            at,
+            recorded_by: None,
+            action,
+        }
+    }
+
+    /// Returns the command that performs `action`, stamped `at` by the control node `by`, as
+    /// the log layer stamps every command it logs (ADR-0047, point 6.1).
+    ///
+    /// ```
+    /// use fleetring_control::{Action, Command, Timestamp};
+    ///
+    /// let tick = Command::stamped(Timestamp::from_millis(5), "c1".parse()?, Action::Tick);
+    /// assert_eq!(tick.recorded_by.as_ref().map(|by| by.as_str()), Some("c1"));
+    /// # Ok::<(), fleetring::ParseLabelError>(())
+    /// ```
+    #[must_use]
+    pub fn stamped(at: Timestamp, by: NodeId, action: Action) -> Self {
+        Self {
+            at,
+            recorded_by: Some(by),
+            action,
+        }
     }
 }
 
@@ -239,11 +281,13 @@ pub enum Action {
         epoch: LeaseEpoch,
     },
 
-    /// Changes nothing but the time.
+    /// Changes nothing but the time, and forgets what the time has passed: revocations, fork
+    /// operations, and delegation records, operations, tombstones, and rate-window times.
     ///
     /// The control node submits one when no other command has arrived for a while, so that
     /// liveness and lease expiry, which are judged at the time of the last command, move on
-    /// without traffic.
+    /// without traffic, and when a delegation's `kept_until` has passed
+    /// ([`delegation::tick_due`](crate::delegation::tick_due)).
     Tick,
 
     /// Marks a member as draining: it gets no new lease and is never a promotion's candidate,
@@ -288,6 +332,16 @@ pub enum Action {
     /// refuse it anyway, or [`Timestamp::MAX`] for a key. Revoking an entry again keeps the later
     /// time. The state records identifiers only, never a token or a key. Logs written before this
     /// action existed never contain it.
+    ///
+    /// A token's revocation also prunes every recorded delegation whose ID or chain names it,
+    /// tombstoning each one's operation for an hour, and keeps its entry at least 30 seconds
+    /// past the longest `kept_until` among them, so no token it refused revives once the entry
+    /// is forgotten (ADR-0047, points 11.4 and 11.5). A key's prunes nothing. Either forgets
+    /// delegation state past its `kept_until`, as `Tick` does.
+    ///
+    /// A [`Revoked::Principal`] target needs [`Feature::Delegation`] and is always refused:
+    /// a principal is revoked by [`Action::RevokePrincipal`], or by [`Action::RevokeAsAncestor`],
+    /// which set its `before` themselves.
     RevokeToken {
         /// The token or key.
         revoked: Revoked,
@@ -452,6 +506,107 @@ pub enum Action {
         /// The epoch of the primary that reported placement caught up.
         epoch: LeaseEpoch,
     },
+
+    /// Records a delegated agent's token before the control node signs it (ADR-0047, points
+    /// 5.5, 5.9, and 6.1): the child of the caller named by the request's segment, with the
+    /// scopes and times the control node resolved, under the delegation ID it drew.
+    ///
+    /// `apply` derives the child's subject, parent, chain, and owner from the caller's presented
+    /// claims, sets `iat` to the command's effective time rounded down to the second, and raises
+    /// `nbf` to it. It refuses a command without [`Command::recorded_by`]; a child whose claims
+    /// fail [`TokenClaims::check_recordable`](crate::delegation::TokenClaims::check_recordable),
+    /// whose scopes aren't canonical, or whose times aren't whole seconds; one that outlives the
+    /// caller's token; for a delegated caller, one that isn't a strict narrowing of the parent's
+    /// record, or whose owner, chain, or expiry disagree with it; a caller the denylist refuses;
+    /// a delegated caller whose delegation isn't recorded and live, or whose presented claims
+    /// differ from its record; and one past the limits of point 5.10. A known operation from the
+    /// same requester with the same request records nothing and returns its delegation.
+    ///
+    /// Needs [`Feature::Delegation`].
+    RecordDelegation {
+        /// The operation's ID, chosen by the parent.
+        operation: OperationId,
+        /// The parent principal asking, as the control node authenticated it.
+        requested_by: PrincipalName,
+        /// What the parent asked for, exactly as given.
+        request: CanonicalRequest,
+        /// The parent's token as it presented it.
+        caller: CallerToken,
+        /// The delegation ID the control node drew: 16 random bytes. A resend's is ignored.
+        id: DelegationId,
+        /// The child's scopes, resolved by the control node, in canonical form.
+        scopes: Scopes,
+        /// The child's `nbf`, resolved by the control node, in whole seconds.
+        not_before: Timestamp,
+        /// The child's `exp`, resolved by the control node, in whole seconds.
+        expires_at: Timestamp,
+    },
+
+    /// Revokes a principal with the `fleet` scope (ADR-0047, points 11.1 to 11.5): every token
+    /// whose subject is `principal` or a name below it, issued at or before the command's
+    /// effective time, which the entry keeps as its `before`. A later revocation of the same
+    /// principal raises the one entry in place.
+    ///
+    /// It prunes every recorded delegation whose principal is at or below `principal`,
+    /// tombstoning each one's operation for an hour, and replaces the ancestor-rule entries it
+    /// covers. Its entry is kept 30 days, 30 seconds, and an hour, and at least 30 seconds past
+    /// every record it pruned and as long as every entry it replaced.
+    ///
+    /// Needs [`Feature::Delegation`].
+    RevokePrincipal {
+        /// The principal.
+        principal: PrincipalName,
+    },
+
+    /// Revokes under the ancestor rule (ADR-0047, points 11.3 to 11.7): `caller`, an agent,
+    /// revokes the token it presented, itself, or a delegation recorded below it or its
+    /// principal, ending the whole subtree below; or a principal and a token at once, both or
+    /// neither.
+    ///
+    /// `apply` checks that a delegated caller's delegation is recorded and live and that its
+    /// presented claims are the record's (I6), and that each target is within the caller's
+    /// reach (I10); it then counts the command against the rates and the lineage's cap of point
+    /// 11.6. Neither ever refuses nor counts a root agent's revocation of its own principal or of
+    /// the root token it presented, and the cap never refuses one that replaces as many entries
+    /// as it adds or raises one in place. It chooses `before` and `until` itself, prunes the
+    /// records the revocation ends, and replaces the entries a principal's revocation covers.
+    ///
+    /// Needs [`Feature::Delegation`].
+    RevokeAsAncestor {
+        /// What the caller revokes.
+        target: AncestorTarget,
+        /// The caller's token as it presented it.
+        caller: CallerToken,
+    },
+
+    /// Moves a database's replica set from the set a membership change kept onto placement
+    /// (ADR-0031, amendment 2), once its primary reports that placement's write quorum holds its
+    /// log and that it counts both the kept set's and placement's write quorums toward every
+    /// write. Until then a promotion fences a quorum of the kept set, which every write the
+    /// primary acknowledged reached; from then on one of placement, which every write did too.
+    ///
+    /// Accepted only for the database's current incarnation, while it keeps a replica set, at
+    /// the epoch of its lease when no promotion is in progress, and only when the lease holder's
+    /// latest report says placement, at the current membership epoch, caught up at that epoch.
+    /// Proposed by the control node's timer only ([`State::releases_due`](crate::State::releases_due)).
+    /// Needs [`Feature::Handover`].
+    ReleaseKeptReplicas {
+        /// The database.
+        database: DatabaseName,
+        /// Its incarnation.
+        incarnation: Incarnation,
+        /// The epoch of the primary that reported placement caught up.
+        epoch: LeaseEpoch,
+    },
+
+    /// Enables [`Feature::Handover`] for good, so that from then on a membership change keeps
+    /// the replica set it moves a leased database off (ADR-0031, amendment 2). It changes
+    /// nothing else. The control node's writer logs it just before the first membership change
+    /// that would keep a set once every member supports the feature
+    /// ([`State::handover_due`](crate::State::handover_due)), so that whether a membership change
+    /// keeps a set depends on the log alone, never on which features the replaying binary knows.
+    /// Needs [`Feature::Handover`].
+    EnableHandover,
 }
 
 impl Action {
@@ -481,6 +636,26 @@ impl Action {
     #[must_use]
     pub fn features(&self) -> &'static [Feature] {
         match self {
+            Self::Join { .. }
+            | Self::Leave { .. }
+            | Self::Heartbeat { .. }
+            | Self::CreateDatabase { metadata: None, .. }
+            | Self::ChangeDurability { .. }
+            | Self::DropDatabase { .. }
+            | Self::AcquireLease { .. }
+            | Self::RenewLease { .. }
+            | Self::StartPromotion { .. }
+            | Self::RecordFenced { .. }
+            | Self::CompletePromotion { .. }
+            | Self::Tick
+            | Self::Drain { .. }
+            | Self::TransferLease { .. } => NONE,
+            // Every target a 0.7 member reads needs nothing; a principal needs `delegation`, so a
+            // mixed fleet refuses it before `apply` refuses it for its own action.
+            Self::RevokeToken { revoked, .. } => match revoked {
+                Revoked::Token(_) | Revoked::Key(_) => NONE,
+                Revoked::Principal { .. } => DELEGATION,
+            },
             Self::Undrain { .. } => &[Feature::Undrain],
             Self::CreateDatabase {
                 metadata: Some(spec),
@@ -514,7 +689,10 @@ impl Action {
             | Self::DropForkHolder { .. }
             | Self::MarkForkReady { .. }
             | Self::ReleaseForkHolders { .. } => FORK,
-            _ => &[],
+            Self::RecordDelegation { .. }
+            | Self::RevokePrincipal { .. }
+            | Self::RevokeAsAncestor { .. } => DELEGATION,
+            Self::ReleaseKeptReplicas { .. } | Self::EnableHandover => HANDOVER,
         }
     }
 

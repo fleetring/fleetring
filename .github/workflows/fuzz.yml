@@ -1,4 +1,5 @@
-# Nightly fuzzing (FR-017). Untrusted ring specs and arbitrary memberships must never panic, and
+# Nightly fuzzing (FR-017, FR-090). Untrusted ring specs, arbitrary memberships, bearer tokens, and
+# issuer certificates must never panic, and
 # every ring must keep its placement invariants (ADR-0006, ADR-0007, ADR-0008).
 name: Fuzz
 
@@ -17,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [spec_json, builder, lookup]
+        target: [spec_json, builder, lookup, token]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

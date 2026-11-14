@@ -12,10 +12,21 @@
 //! when they change, so rotation needs no restart. [`Security`] is the choice between an
 //! identity and plaintext, which exists for the simulation harness and local experiments
 //! only.
+//!
+//! A control node may also hold a delegation issuer pair (ADR-0047, point 1): an
+//! [`IssuerPair`], whose [`IssuerCertificate`] the authority issued and which never opens a
+//! connection. It too reloads when its files change.
+
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    reason = "a new subject kind, such as the issuer's, must be handled wherever a subject is judged"
+)]
 
 mod authority;
 mod conn;
 mod identity;
+mod issuer;
+mod issuer_files;
 mod names;
 
 use fleetring::NodeId;
@@ -25,11 +36,20 @@ use crate::auth::Binding;
 
 pub use authority::{
     AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE, Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME,
-    DEFAULT_CLIENT_LIFETIME, DEFAULT_NODE_LIFETIME, Issued, Validity,
+    DEFAULT_CLIENT_LIFETIME, DEFAULT_ISSUER_LIFETIME, DEFAULT_NODE_LIFETIME, ISSUER_LIFETIME_SLACK,
+    Issued, MAX_ISSUER_LIFETIME, Validity,
 };
 pub use conn::{Accepted, Conn, HandshakeError, Raw};
 pub(crate) use conn::{HANDSHAKE_TIMEOUT, peer_of};
 pub use identity::{Identity, IdentityError};
+pub(crate) use issuer::IssuerCache;
+pub use issuer::{IssuerCertError, IssuerCertificate};
+pub use issuer_files::{
+    DEV_ISSUER_CERT_FILE, DEV_ISSUER_KEY_FILE, DEV_ISSUER_LIFETIME, DEV_RENEW_BEFORE,
+    DevIssuerOutcome, EXPIRY_WARNING_WINDOW, IssuerFileProblem, IssuerFiles, IssuerFilesError,
+    IssuerPair, ensure_dev_pair, write_issuer_pair,
+};
+pub(crate) use issuer_files::{DEV_ISSUER_FILES, IssuerWatch};
 pub use names::{AGENT_PREFIX, FleetName, NameError, Principal, SubjectUri};
 
 /// Who a connection authenticated as.
@@ -92,7 +112,7 @@ impl Peer {
                 );
                 Err(status)
             }
-            _ => Ok(()),
+            Self::Node(_) | Self::Principal(_) | Self::Plaintext => Ok(()),
         }
     }
 
@@ -110,7 +130,7 @@ impl Peer {
                     "{call} is for nodes; '{name}' is a principal"
                 )))
             }
-            _ => Ok(()),
+            Self::Node(_) | Self::Plaintext => Ok(()),
         }
     }
 }

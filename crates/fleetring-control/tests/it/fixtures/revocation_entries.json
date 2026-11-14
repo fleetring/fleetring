@@ -1,0 +1,72 @@
+[
+  [
+    {
+      "token": "AgAAAFpaWlpaWlpaWlpaWg"
+    },
+    10861000,
+    {
+      "added": {
+        "ancestor": {
+          "root": "agent-42",
+          "by": "agent-42.c7"
+        }
+      },
+      "of": "agent-42.c7.r1"
+    }
+  ],
+  [
+    {
+      "token": "fleet-token"
+    },
+    3610000
+  ],
+  [
+    {
+      "token": "root-jti"
+    },
+    2595630000,
+    {
+      "added": {
+        "ancestor": {
+          "root": "agent-42",
+          "by": "agent-42"
+        }
+      }
+    }
+  ],
+  [
+    {
+      "key": "fleet-key"
+    },
+    18446744073709551615
+  ],
+  [
+    {
+      "principal": {
+        "principal": "agent-42.c7.r2"
+      }
+    },
+    10861000,
+    {
+      "added": {
+        "ancestor": {
+          "root": "agent-42",
+          "by": "agent-42.c7"
+        }
+      },
+      "before": 12000
+    }
+  ],
+  [
+    {
+      "principal": {
+        "principal": "workload"
+      }
+    },
+    2595641000,
+    {
+      "added": "fleet",
+      "before": 11000
+    }
+  ]
+]

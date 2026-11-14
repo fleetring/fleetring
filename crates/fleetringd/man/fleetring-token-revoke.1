@@ -2,13 +2,13 @@
 .el .ds Aq '
 .TH fleetring-token-revoke 1  FleetRing "FleetRing manual"
 .SH NAME
-fleetring\-token\-revoke \- Revokes a token by its ID, or every token a signing key issued
+fleetring\-token\-revoke \- Revokes a token by its ID, a signing key\*(Aqs tokens, or a principal\*(Aqs
 .SH SYNOPSIS
-\fBfleetring token revoke\fR [\fB\-\-token\-id\fR] [\fB\-\-key\-id\fR] [\fB\-\-ttl\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBfleetring token revoke\fR [\fB\-\-token\-id\fR] [\fB\-\-key\-id\fR] [\fB\-\-principal\fR] [\fB\-\-ttl\fR] [\fB\-\-yes\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Revokes a token by its ID, or every token a signing key issued
+Revokes a token by its ID, a signing key\*(Aqs tokens, or a principal\*(Aqs
 .PP
-Every node refuses it within one heartbeat interval.
+Every node refuses it within one heartbeat interval. Without the fleet scope, run as an agent (`\-\-agent <id>`), `\-\-token\-id` and `\-\-principal` follow the ancestor rule: the agent\*(Aqs own token or principal, or a delegated agent\*(Aqs below it.
 .SH OPTIONS
 .TP
 \fB\-\-token\-id\fR \fI<TOKEN_ID>\fR
@@ -21,15 +21,20 @@ A signing key\*(Aqs ID, to revoke every token it signed, for good
 
 The ID is the token header\*(Aqs `kid`.
 .TP
+\fB\-\-principal\fR \fI<NAME>\fR
+Revokes the tokens of this principal and every name below it issued until now
+
+`agent\-42` ends `agent\-42` and `agent\-42.*`, never `agent\-420`. The control node sets the moment. A new token for a root agent signed within 30 seconds of it is refused too; a delegated agent may be delegated again a second later. A root agent\*(Aqs entry lasts 30 days and an hour, so a token signed before it but valid from later than that works once the entry is forgotten. Asks for the name to be typed on a terminal first.
+.TP
 \fB\-\-ttl\fR \fI<TTL>\fR
 How long to keep a token\*(Aqs revocation; 30 days by default
 
 At least what remains of the token\*(Aqs lifetime. 30 days is the longest a token lasts.
 .TP
 \fB\-\-yes\fR
-Revokes a signing key without asking
+Revokes a signing key or a principal without asking
 
-Without it, `\-\-key\-id` asks first on a terminal, and refuses elsewhere; `\-\-token\-id` never asks.
+Without it, `\-\-key\-id` and `\-\-principal` ask first on a terminal, and refuse elsewhere; `\-\-token\-id` never asks.
 .TP
 \fB\-\-control\fR \fI<CONTROL>\fR
 The control node\*(Aqs address, `host:port`
@@ -85,7 +90,7 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 \fB\-\-agent\fR \fI<ID>\fR
 Acts as the agent with this ID, with the identity minted for it
 
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`

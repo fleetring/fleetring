@@ -450,14 +450,22 @@ async fn serve_source(
         max_wal: config.max_pin_wal_bytes.get(),
     };
     let packer = Packer::new(pinned).map_err(|error| Status::internal(error.to_string()))?;
-    primary::chain_to(inner, &primary, &handle, packer.position()).await;
+    primary::chain_to_rebuilt(inner, &primary, &handle, packer.position()).await;
+    // While a build of the chain is under way, asking again soon costs the seeder no retry. A
+    // chain that still can't reach the position, as when the build this request ran failed, is
+    // a broken transfer, which `transfer_retries` bounds; the seeder's next request builds it
+    // again.
     let chain = primary.hash_at(packer.position()).ok_or_else(|| {
-        with_retry_after(
+        if primary.chain_loading() {
+            with_retry_after(
+                Status::unavailable(format!("the hash chain of {source} is being built; retry")),
+                RETRY_SOON,
+            )
+        } else {
             Status::unavailable(format!(
-                "the hash chain of {source} doesn't reach the pinned position yet; retry"
-            )),
-            RETRY_SOON,
-        )
+                "the hash chain of {source} doesn't reach the pinned position"
+            ))
+        }
     })?;
     tracing::info!(
         target: "fleetringd::audit",

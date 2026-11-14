@@ -9,8 +9,17 @@
 //!   attempt failed. A refusal that carries a retry-after, a source whose acknowledged position
 //!   isn't in its log yet, or one holding as many pins as it may, costs no retry. A pin that
 //!   expires ends the attempt at once, reported as such. A peer waits for the seeder for as long
-//!   as the attempt lasts.
+//!   as the attempt lasts. A sender whose view shows another attempt, or the fork past seeding,
+//!   or that no longer leads the source, answers with a retry-after too; the fetch asks control
+//!   state again before it retries, and stops once its own view agrees.
+//! - **Stalls.** A stream that sends no chunk, the first included, for [`SNAPSHOT_IDLE_LIMIT`]
+//!   is a broken transfer, and its channel is dropped, so that the next try dials a new
+//!   connection rather than wait on one that stalled behind a partition.
 //! - Every fetch stops as soon as control state no longer shows its attempt for this node.
+//! - **Control calls** wait at most [`CONTROL_CALL_LIMIT`] each. One that times out is tried
+//!   again after a retry-after, at no cost to `transfer_retries`, and so is a sender's binding
+//!   check that timed out on its own control calls; the node's fork keeper and its heartbeats
+//!   drop a stalled connection to the control plane.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +37,12 @@ use super::super::chain::ChainHash;
 use super::super::follower::blocking;
 use super::super::snapshot::check_copy;
 use super::faults::FaultPoint;
+use super::source::RETRY_SOON;
 use super::staged::{CommitStep, Sidecar, StagedFile, StagedKey};
-use super::{ForkPhase, Refused, Reservation, retry_after};
+use super::{
+    CONTROL_CALL_LIMIT, DatabaseView, ForkPhase, Refused, Reservation, retry_after,
+    with_retry_after,
+};
 use crate::control::SeedProgress;
 use crate::control::fork::operation_to_proto;
 use crate::engine::Position;
@@ -40,6 +53,17 @@ pub(crate) const PIN_EXPIRED_KEY: &str = "fleetring-pin-expired";
 
 /// The longest a peer waits between two requests to a seeder that isn't ready.
 const PEER_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// The longest a fetch waits for the next chunk of a copy, the first included, before it drops
+/// its channel and counts the transfer broken (ADR-0046, points 4 and 12).
+///
+/// A chunk is 1 MiB, about 70 ms at the slowest rate ADR-0046 point 7 assumes (15 MiB/s), and the
+/// first also waits for the sender's binding check, whose `Locate` may spend about 1.6 s in
+/// retries, and for its pin; 10 s is well beyond both. A seeder that stalls on its first try and
+/// on all `[fork] transfer_retries` (3) more spends under a minute, backoff included, a small
+/// part of an attempt (20 min), so it relocates the source's primary and fetches again within
+/// the attempt.
+const SNAPSHOT_IDLE_LIMIT: Duration = Duration::from_secs(10);
 
 /// Where a node fetches a fork's copy from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +81,25 @@ pub(crate) struct SeedPlan {
     pub(crate) source: DatabaseName,
     pub(crate) source_incarnation: Incarnation,
     pub(crate) from: SeedFrom,
+}
+
+/// The node a fetch streams a copy from, and the address its channel was dialed at.
+#[derive(Debug)]
+struct Upstream {
+    node: NodeId,
+    address: String,
+}
+
+impl Upstream {
+    /// The stream sent no chunk for [`SNAPSHOT_IDLE_LIMIT`]: drops the channel, so the next try
+    /// dials a new connection, and counts the transfer broken.
+    fn stalled(&self, inner: &Inner) -> Fetch {
+        inner.peers.forget(&self.address);
+        Fetch::Failed(Status::deadline_exceeded(format!(
+            "{} sent no chunk of the copy within {SNAPSHOT_IDLE_LIMIT:?}; dropped the connection",
+            self.node
+        )))
+    }
 }
 
 /// How one fetch ended, when it didn't stage the copy.
@@ -170,7 +213,7 @@ pub(in crate::replication) async fn run(inner: Arc<Inner>, plan: SeedPlan) {
 /// Whether control state still shows `plan`'s attempt seeding, with this node in its replica
 /// set and not refused for want of disk, and the seeder `plan` fetches from as its seeder.
 async fn still_current(inner: &Inner, plan: &SeedPlan) -> Result<bool, Status> {
-    let view = match inner.authority.view(&plan.key.fork.name).await {
+    let view = match view(inner, &plan.key.fork.name).await {
         Ok(view) => view,
         Err(status) if status.code() == Code::NotFound => return Ok(false),
         Err(status) => return Err(status),
@@ -197,6 +240,24 @@ async fn still_current(inner: &Inner, plan: &SeedPlan) -> Result<bool, Status> {
         && !disk_refused.contains(&inner.node))
 }
 
+/// What control state shows of `database`, asked within [`CONTROL_CALL_LIMIT`].
+///
+/// A call that runs out of time fails `UNAVAILABLE` with a retry-after: a stalled control
+/// connection says nothing about the transfer, so it costs a fetch none of its retries.
+async fn view(inner: &Inner, database: &DatabaseName) -> Result<DatabaseView, Status> {
+    time::timeout(CONTROL_CALL_LIMIT, inner.authority.view(database))
+        .await
+        .unwrap_or_else(|_| {
+            Err(with_retry_after(
+                Status::unavailable(format!(
+                    "the control plane didn't say where {database} stands within \
+                     {CONTROL_CALL_LIMIT:?}"
+                )),
+                RETRY_SOON,
+            ))
+        })
+}
+
 /// The node to ask, and the request.
 async fn request_for(inner: &Inner, plan: &SeedPlan) -> Result<(NodeId, SnapshotRequest), Fetch> {
     let fork = &plan.key.fork;
@@ -210,7 +271,7 @@ async fn request_for(inner: &Inner, plan: &SeedPlan) -> Result<(NodeId, Snapshot
     };
     match &plan.from {
         SeedFrom::Source => {
-            let source = inner.authority.view(&plan.source).await?;
+            let source = view(inner, &plan.source).await?;
             let primary = source.holders.holder.clone().ok_or_else(|| {
                 Fetch::Failed(Status::unavailable(format!(
                     "{} has no primary now",
@@ -237,29 +298,11 @@ async fn fetch(inner: &Arc<Inner>, plan: &SeedPlan) -> Result<(Sidecar, Reservat
         .addresses
         .address(&from)
         .ok_or_else(|| Fetch::Failed(Status::unavailable(format!("no address for {from}"))))?;
-    let channel = inner
-        .peers
-        .channel_to(&address)
-        .map_err(|error| Fetch::Failed(Status::unavailable(error.to_string())))?;
-    let mut chunks = replication_client(channel)
-        .snapshot(request)
-        .await
-        .map_err(Fetch::from)?
-        .into_inner();
-    let first = match time::timeout(inner.settings.open_timeout, chunks.message()).await {
-        Ok(Ok(Some(first))) => first,
-        Ok(Ok(None)) => {
-            return Err(Fetch::Failed(Status::data_loss(
-                "the copy's stream was empty",
-            )));
-        }
-        Ok(Err(status)) => return Err(Fetch::from(status)),
-        Err(_) => {
-            return Err(Fetch::Failed(Status::deadline_exceeded(
-                "the copy's stream stalled",
-            )));
-        }
+    let upstream = Upstream {
+        node: from,
+        address,
     };
+    let (mut chunks, first) = open(inner, &upstream, request).await?;
     let total = first.total_bytes.ok_or_else(|| {
         Fetch::Failed(Status::failed_precondition(
             "the copy's stream doesn't say its size; the sender predates forks",
@@ -275,7 +318,7 @@ async fn fetch(inner: &Arc<Inner>, plan: &SeedPlan) -> Result<(Sidecar, Reservat
         .pass(FaultPoint::Admitted, plan.key.fork.operation)
         .await;
     let incoming = inner.forks.store().incoming(&plan.key);
-    let staged = receive(inner, plan, &from, first, &mut chunks, total, &incoming).await;
+    let staged = receive(inner, plan, &upstream, first, &mut chunks, total, &incoming).await;
     if staged.is_err() {
         let incoming = incoming.clone();
         let removed = blocking(inner.execution, move || {
@@ -289,12 +332,42 @@ async fn fetch(inner: &Arc<Inner>, plan: &SeedPlan) -> Result<(Sidecar, Reservat
     staged.map(|sidecar| (sidecar, reservation))
 }
 
+/// Asks `upstream` for the copy, and waits for the stream's first chunk, within
+/// [`SNAPSHOT_IDLE_LIMIT`].
+async fn open(
+    inner: &Inner,
+    upstream: &Upstream,
+    request: SnapshotRequest,
+) -> Result<(tonic::Streaming<SnapshotChunk>, SnapshotChunk), Fetch> {
+    let channel = inner
+        .peers
+        .channel_to(&upstream.address)
+        .map_err(|error| Fetch::Failed(Status::unavailable(error.to_string())))?;
+    let opened = time::timeout(SNAPSHOT_IDLE_LIMIT, async {
+        let mut chunks = replication_client(channel)
+            .snapshot(request)
+            .await?
+            .into_inner();
+        let first = chunks.message().await?;
+        Ok::<_, Status>((chunks, first))
+    })
+    .await;
+    match opened {
+        Ok(Ok((chunks, Some(first)))) => Ok((chunks, first)),
+        Ok(Ok((_, None))) => Err(Fetch::Failed(Status::data_loss(
+            "the copy's stream was empty",
+        ))),
+        Ok(Err(status)) => Err(Fetch::from(status)),
+        Err(_) => Err(upstream.stalled(inner)),
+    }
+}
+
 /// Unpacks the stream that starts with `first` into `incoming`, checks it, and commits it as
 /// a staged copy.
 async fn receive(
     inner: &Arc<Inner>,
     plan: &SeedPlan,
-    from: &NodeId,
+    upstream: &Upstream,
     first: SnapshotChunk,
     chunks: &mut tonic::Streaming<SnapshotChunk>,
     total: u64,
@@ -322,12 +395,11 @@ async fn receive(
                 Fetch::Failed(Status::internal(format!("can't stage the copy: {error}")))
             })?
     };
-    let limit = inner.settings.open_timeout;
     let mut chunk = Some(first);
     loop {
         let current = match chunk.take() {
             Some(current) => current,
-            None => match time::timeout(limit, chunks.message()).await {
+            None => match time::timeout(SNAPSHOT_IDLE_LIMIT, chunks.message()).await {
                 Ok(Ok(Some(current))) => current,
                 Ok(Ok(None)) => {
                     return Err(Fetch::Failed(Status::data_loss(
@@ -335,11 +407,7 @@ async fn receive(
                     )));
                 }
                 Ok(Err(status)) => return Err(Fetch::from(status)),
-                Err(_) => {
-                    return Err(Fetch::Failed(Status::deadline_exceeded(
-                        "the copy's stream stalled",
-                    )));
-                }
+                Err(_) => return Err(upstream.stalled(inner)),
             },
         };
         if current.offset != unpacker.offset() {
@@ -360,7 +428,7 @@ async fn receive(
             return finish(
                 inner,
                 plan,
-                from,
+                &upstream.node,
                 unpacker,
                 current.checksum,
                 current.chain,

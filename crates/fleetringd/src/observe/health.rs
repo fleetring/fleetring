@@ -78,14 +78,24 @@ impl Probes {
         }
     }
 
-    /// Why the node refuses tokens for want of a fresh denylist, if it does. The check reads the
-    /// list the request boundary checks tokens against: on a node that runs control, the control
-    /// state's, which is always current; otherwise the copy `membership`'s heartbeats bring.
+    /// Why the node refuses tokens for want of a fresh, readable denylist, if it does. The check
+    /// reads the list the request boundary checks tokens against: on a node that runs control,
+    /// the control state's, which is always current; otherwise the copy `membership`'s
+    /// heartbeats bring, which an entry this node can't read makes unusable (ADR-0047, point 3).
     fn stale_denylist(&self, membership: &Membership) -> Option<String> {
         if self.control.is_some() {
             return None;
         }
-        match membership.denylist().age() {
+        let denylist = membership.denylist();
+        if let Err(unusable) = denylist.load() {
+            let entry = unusable.entry();
+            return Some(format!(
+                "denylist entry {} is unreadable ({}); tokens are refused",
+                entry.index(),
+                entry.reason()
+            ));
+        }
+        match denylist.age() {
             None => Some("no denylist yet".to_owned()),
             Some(age) if age > self.denylist_max_age => Some(format!(
                 "denylist is {} ms old; tokens are refused",
@@ -202,6 +212,43 @@ mod tests {
             .expect("a denylist check");
         assert_eq!(denylist.detail, "no denylist yet");
         node.shutdown().await;
+    }
+
+    /// A denylist holding an entry the node can't read refuses every token however fresh it is,
+    /// so the node isn't ready, and the check says which entry (ADR-0047, point 3).
+    #[test]
+    fn an_unusable_denylist_is_not_ready() {
+        let membership = Membership::detached();
+        let probes = Probes {
+            node: "n1".parse().expect("a node id"),
+            membership: Some(membership.clone()),
+            denylist_max_age: Duration::from_secs(5),
+            control: None,
+        };
+        membership
+            .denylist()
+            .receive(Err(crate::auth::UnreadableEntry::new(3, "unknown case")));
+        let denylist = probes
+            .readiness()
+            .checks
+            .into_iter()
+            .find(|check| check.name == "denylist")
+            .expect("a denylist check");
+        assert!(!denylist.ok);
+        assert_eq!(
+            denylist.detail,
+            "denylist entry 3 is unreadable (unknown case); tokens are refused"
+        );
+        membership
+            .denylist()
+            .replace(fleetring_control::Revocations::default());
+        let denylist = probes
+            .readiness()
+            .checks
+            .into_iter()
+            .find(|check| check.name == "denylist")
+            .expect("a denylist check");
+        assert!(denylist.ok, "{denylist:?}");
     }
 
     #[test]
