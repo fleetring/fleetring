@@ -201,6 +201,20 @@ impl Control for StubControl {
     ) -> Result<Response<RevokeTokenResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
+
+    async fn delegate_token(
+        &self,
+        _: Request<fleetring_proto::v1::DelegateTokenRequest>,
+    ) -> Result<Response<fleetring_proto::v1::DelegateTokenResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn list_delegations(
+        &self,
+        _: Request<fleetring_proto::v1::ListDelegationsRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListDelegationsResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
 }
 
 /// Acknowledges every batch with its end position.
@@ -348,6 +362,7 @@ async fn a_four_mib_batch_round_trips_as_one_message() -> TestResult {
                 database: "tenant:acme".into(),
                 epoch: 1,
                 epoch_start: None,
+                epoch_start_chain: None,
             })),
         },
         ReplicateMessage {

@@ -53,7 +53,8 @@ use fleetringd::report::{
 use fleetringd::router::{Router, RouterConfig};
 use fleetringd::tls::{
     AUTHORITY_CERT_FILE, Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
-    DEFAULT_NODE_LIFETIME, FleetName, Identity, Peer, Principal, Security, Validity,
+    DEFAULT_ISSUER_LIFETIME, DEFAULT_NODE_LIFETIME, FleetName, Identity, IssuerFiles, Peer,
+    Principal, Security, Validity, write_issuer_pair,
 };
 use fleetringd::transport::Credentials;
 #[cfg(unix)]
@@ -86,7 +87,7 @@ mod serve_check;
 mod stop;
 mod watch_cmd;
 
-use agent::{AgentDir, AgentId};
+use agent::{AgentDir, AgentRef, DelegatedDir};
 use agent_cmd::AgentCommand;
 use clap_complete::engine::ArgValueCandidates;
 use compat::{Invocation, ProgramName};
@@ -309,8 +310,10 @@ enum Command {
     ///
     /// An identity is a principal `agent-<id>` with a certificate and a scoped token, kept in a
     /// directory per agent (ADR-0043, point 8). In dev mode, `fleetring mcp --agent <id>` adds
-    /// one by itself. Trusted local development: agents running as the same user can read each
-    /// other's credentials.
+    /// one by itself. A delegated agent, such as `42.c7`, holds only a narrower token, which its
+    /// parent asks the control plane for with `agent delegate`, and connects with its root's
+    /// certificate (ADR-0047). Trusted local development: agents running as the same user can
+    /// read each other's credentials.
     #[command(subcommand)]
     Agent(AgentCommand),
     /// Shows the fleet's members and ring, or one data node's view
@@ -371,6 +374,10 @@ The configuration holds no secret (Claude Code's .mcp.json, Cursor's mcp.json):
 `claude mcp add fleetring -- fleetring mcp --agent 42 --context dev` registers it with
 Claude Code. For a fleet that isn't dev mode's, `fleetring agent add 42 --context <name>
 --authority <dir>` mints the identity where the authority is.
+
+`--agent 42.c7` serves as a delegated agent that `fleetring agent delegate 42.c7` made: with
+its own token and its root agent's certificate. A start never mints or renews its token; its
+parent delegates a new one.
 
 This is trusted local development: agents on this machine can read each other's
 credentials, so separate identities don't isolate agents from each other.";
@@ -656,9 +663,11 @@ enum TokenCommand {
         #[arg(long)]
         dir: PathBuf,
     },
-    /// Revokes a token by its ID, or every token a signing key issued
+    /// Revokes a token by its ID, a signing key's tokens, or a principal's
     ///
-    /// Every node refuses it within one heartbeat interval.
+    /// Every node refuses it within one heartbeat interval. Without the fleet scope, run as an
+    /// agent (`--agent <id>`), `--token-id` and `--principal` follow the ancestor rule: the
+    /// agent's own token or principal, or a delegated agent's below it.
     Revoke {
         /// The token's ID, as `token issue` printed it (its `jti` claim).
         ///
@@ -666,24 +675,38 @@ enum TokenCommand {
         #[arg(
             long,
             allow_hyphen_values = true,
-            required_unless_present = "key_id",
-            conflicts_with = "key_id"
+            required_unless_present_any = ["key_id", "revoked_principal"],
+            conflicts_with_all = ["key_id", "revoked_principal"]
         )]
         token_id: Option<TokenId>,
         /// A signing key's ID, to revoke every token it signed, for good
         ///
         /// The ID is the token header's `kid`.
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "revoked_principal")]
         key_id: Option<KeyId>,
+        /// Revokes the tokens of this principal and every name below it issued until now
+        ///
+        /// `agent-42` ends `agent-42` and `agent-42.*`, never `agent-420`. The control node sets
+        /// the moment. A new token for a root agent signed within 30 seconds of it is refused
+        /// too; a delegated agent may be delegated again a second later. A root agent's entry
+        /// lasts 30 days and an hour, so a token signed before it but valid from later than that
+        /// works once the entry is forgotten. Asks for the name to be typed on a terminal first.
+        #[arg(
+            long = "principal",
+            id = "revoked_principal",
+            value_name = "NAME",
+            conflicts_with = "ttl"
+        )]
+        revoked_principal: Option<Principal>,
         /// How long to keep a token's revocation; 30 days by default
         ///
         /// At least what remains of the token's lifetime. 30 days is the longest a token lasts.
         #[arg(long, value_parser = parse_ttl, conflicts_with = "key_id")]
         ttl: Option<Duration>,
-        /// Revokes a signing key without asking
+        /// Revokes a signing key or a principal without asking
         ///
-        /// Without it, `--key-id` asks first on a terminal, and refuses elsewhere; `--token-id`
-        /// never asks.
+        /// Without it, `--key-id` and `--principal` ask first on a terminal, and refuse
+        /// elsewhere; `--token-id` never asks.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -754,6 +777,29 @@ enum CertCommand {
         /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
         ///
         /// 7 days by default.
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<Duration>,
+    },
+    /// Issues a delegation issuer pair: `issuer.<name>.crt` and `issuer.<name>.key`
+    ///
+    /// The control node signs delegated agents' tokens with the key, and they carry the
+    /// certificate. Each run makes a new key; name the files in the control node's `[control]
+    /// issuer_cert` and `issuer_key`.
+    Issuer {
+        /// The issuer's name: by convention, the control node's ID
+        #[arg(long)]
+        name: NodeId,
+        /// The directory with `ca.crt` and `ca.key`
+        ///
+        /// The new files go into it unless `--out` names another.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Writes the files into this directory instead, created private to you
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
+        ///
+        /// 30 days by default, and at most 90.
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<Duration>,
     },
@@ -1227,8 +1273,9 @@ struct TlsArgs {
     /// Acts as the agent with this ID, with the identity minted for it
     ///
     /// The identity `fleetring agent add` or `fleetring mcp --agent` minted: `agent-<id>`, its
-    /// certificate, and its token, from its directory under the context's agents directory.
-    /// Defaults to `FLEETRING_AGENT`.
+    /// certificate, and its token, from its directory under the context's agents directory. A
+    /// delegated agent's ID, such as `42.c7`, uses its root agent's certificate, `agent-42`'s,
+    /// with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
     #[arg(
         long,
         value_name = "ID",
@@ -1237,7 +1284,7 @@ struct TlsArgs {
         ],
         add = ArgValueCandidates::new(completions::agent_ids)
     )]
-    agent: Option<AgentId>,
+    agent: Option<AgentRef>,
 }
 
 /// Where the agent a command acts as was named.
@@ -1353,25 +1400,46 @@ impl Target {
                 selected.map(|(name, context, _)| (name, context)),
                 &|name| std::env::var_os(name),
             )?;
-            let dir = AgentDir::new(&agents_dir, id);
-            if dir.record()?.is_none() {
-                return Err(agent_cmd::no_identity(
-                    &dir,
-                    selected.map(|(name, context, _)| (name, context)),
-                )
-                .into());
-            }
-            for warning in dir.loose_files() {
+            // A root agent's own directory; a delegated agent's root's certificate and key, with
+            // its own token (ADR-0047, point 4.2).
+            let (tls_dir, principal, token_file, warnings) = match &id {
+                AgentRef::Root(root) => {
+                    let dir = AgentDir::new(&agents_dir, root.clone());
+                    if dir.record()?.is_none() {
+                        return Err(agent_cmd::no_identity(
+                            &dir,
+                            selected.map(|(name, context, _)| (name, context)),
+                        )
+                        .into());
+                    }
+                    (
+                        dir.tls_dir().to_owned(),
+                        root.principal().to_string(),
+                        dir.token_file(),
+                        dir.loose_files(),
+                    )
+                }
+                AgentRef::Delegated(delegated) => {
+                    let dir = DelegatedDir::new(&agents_dir, delegated.clone());
+                    dir.usable()?;
+                    (
+                        dir.root().tls_dir().to_owned(),
+                        delegated.root().principal().to_string(),
+                        dir.token_file(),
+                        dir.loose_files(),
+                    )
+                }
+            };
+            for warning in warnings {
                 note(warning);
             }
-            let principal = Some(dir.id().principal().to_string());
-            let token = Some(TokenSource::File(dir.token_file()));
-            let label = Some(dir.id().to_string());
+            let principal = Some(principal);
+            let label = Some(id.to_string());
             match from {
                 AgentFrom::Flag => {
-                    flags.tls_dir = Some(dir.tls_dir().to_owned());
+                    flags.tls_dir = Some(tls_dir);
                     flags.principal = principal;
-                    flags.token = token;
+                    flags.token = Some(TokenSource::File(token_file));
                     flags.agent = label;
                     env.agent = None;
                 }
@@ -1394,9 +1462,9 @@ impl Target {
                         )
                         .into());
                     }
-                    env.tls_dir = Some(dir.tls_dir().to_owned());
+                    env.tls_dir = Some(tls_dir);
                     env.principal = principal;
-                    env.token_file = Some(dir.token_file());
+                    env.token_file = Some(token_file);
                 }
             }
         }
@@ -1432,7 +1500,7 @@ impl Target {
     }
 
     /// The agent `--agent` or else `FLEETRING_AGENT` names, and which.
-    fn agent(&self, env: &EnvSnapshot) -> Result<Option<(AgentId, AgentFrom)>, Box<dyn Error>> {
+    fn agent(&self, env: &EnvSnapshot) -> Result<Option<(AgentRef, AgentFrom)>, Box<dyn Error>> {
         if let Some(id) = &self.tls.agent {
             return Ok(Some((id.clone(), AgentFrom::Flag)));
         }
@@ -1478,6 +1546,28 @@ impl Target {
         };
         let security = self.security()?;
         Ok(Client::new(control, self.network_with(security)?))
+    }
+
+    /// A client for the control node this target names, or `fallback` when it names none, that
+    /// connects as `identity` with `token` instead of the target's own credentials: an `agent`
+    /// command acting as an identity of the agents directory, which may present a token other
+    /// than the one its directory holds.
+    fn client_as(
+        &self,
+        identity: Identity,
+        token: &BearerToken,
+        fallback: Option<String>,
+    ) -> Result<Client, Box<dyn Error>> {
+        let resolved = self.resolved()?;
+        let control = if resolved.control.is_empty() {
+            fallback.ok_or(NO_CONTROL)?
+        } else {
+            first_reachable(&resolved.control)
+        };
+        let network = Network::default()
+            .with_security(Security::Tls(identity))
+            .with_credentials(Credentials::bearer(token)?);
+        Ok(Client::new(control, network))
     }
 
     /// The identity the command connects with, loaded and checked: its certificate must name
@@ -3127,15 +3217,17 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             }
             let signer = agent::load_authority(&dir)?.token_signer()?;
             let id = agent::new_token_id()?;
+            // Signed now, and valid from now.
             let not_before = SystemClock.now();
             let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-            let spec = TokenSpec {
-                principal: principal.clone(),
-                scopes: scopes.into_iter().collect(),
-                id: id.clone(),
+            let spec = TokenSpec::new(
+                principal.clone(),
+                scopes.into_iter().collect(),
+                id.clone(),
                 not_before,
-                expires_at: not_before.saturating_add(Millis::new(ttl_millis)),
-            };
+                not_before.saturating_add(Millis::new(ttl_millis)),
+            )
+            .signed_at(not_before);
             let token = signer.issue(&spec)?;
             note(format!(
                 "issued token {id} for {principal}, signed by key {}, for {}s",
@@ -3148,11 +3240,18 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             Ok(format!("{}\n", token.expose()))
         }
         TokenCommand::Revoke {
+            revoked_principal: Some(principal),
+            yes,
+            target,
+            ..
+        } => revoke_principal(&principal, yes, &target).await,
+        TokenCommand::Revoke {
             token_id,
             key_id,
             ttl,
             yes,
             target,
+            revoked_principal: None,
         } => {
             let (revoked, until) = match (token_id, key_id) {
                 (Some(id), _) => {
@@ -3164,11 +3263,12 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                     )
                 }
                 (None, Some(id)) => (Revoked::KeyId(id.to_string()), Timestamp::MAX),
-                (None, None) => return Err("pass --token-id or --key-id".into()),
+                (None, None) => return Err("pass --token-id, --key-id, or --principal".into()),
             };
             let what = match &revoked {
                 Revoked::TokenId(id) => format!("token {id}"),
                 Revoked::KeyId(id) => format!("signing key {id}"),
+                Revoked::Principal(revocation) => format!("principal {}", revocation.principal),
             };
             let place = target.place()?;
             match &revoked {
@@ -3183,6 +3283,7 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
                         revoked: Some(revoked),
                         until_ms: until.as_millis(),
                     }),
+                    principal: String::new(),
                 })
                 .await
                 .map_err(failed)?;
@@ -3191,6 +3292,45 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             ))
         }
     }
+}
+
+/// `token revoke --principal`: revokes every token of `principal` and of every name below it
+/// issued until now, with `fleet` or, run as an agent, under the ancestor rule (ADR-0047, point
+/// 11), and says when a new root token may be minted.
+async fn revoke_principal(
+    principal: &Principal,
+    yes: bool,
+    target: &Target,
+) -> Result<String, Box<dyn Error>> {
+    let place = target.place()?;
+    if yes {
+        note(format!("revoking principal {principal} {}", place.on()));
+    } else {
+        confirm::confirm(&confirm::revoke_principal(principal.as_str(), &place))?;
+    }
+    let answer = target
+        .client()?
+        .control()
+        .revoke_token(RevokeTokenRequest {
+            revocation: None,
+            principal: principal.to_string(),
+        })
+        .await
+        .map_err(failed)?;
+    let mut text = format!(
+        "revoked {principal} and every name below it, for tokens issued until now; every node \
+         refuses them within one heartbeat interval\n"
+    );
+    if let Some(before) = answer.before_ms {
+        let from = agent_cmd::revoke::replacement_from(Timestamp::from_millis(before)).as_millis();
+        let _ = writeln!(
+            text,
+            "  a new root token for it may be minted from {}; a delegated agent may be delegated \
+             again a second after the revocation",
+            format_time(from)
+        );
+    }
+    Ok(text)
 }
 
 /// Runs a `cert` command and returns what it wrote.
@@ -3261,7 +3401,64 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
                 out.display()
             ))
         }
+        CertCommand::Issuer {
+            name,
+            dir,
+            out,
+            ttl,
+        } => {
+            let authority = agent::load_authority(&dir)?;
+            // The certificate starts now, with no backdating, so its lifetime is the whole of
+            // what the 90-day cap counts (ADR-0047, point 1.2).
+            let issued =
+                authority.issue_issuer(&name, validity(ttl.unwrap_or(DEFAULT_ISSUER_LIFETIME)))?;
+            let into = match out {
+                Some(out) => {
+                    if let Some(warning) = agent::prepare_out_dir(&out)? {
+                        note(warning);
+                    }
+                    out
+                }
+                None => dir,
+            };
+            let stem = format!("issuer.{name}");
+            // A new key every run: written over an existing pair, key first, so running it again
+            // renews the certificate and rotates the key while the control node reloads them.
+            write_issuer_pair(
+                &IssuerFiles {
+                    cert: into.join(format!("{stem}.crt")),
+                    key: into.join(format!("{stem}.key")),
+                },
+                &issued,
+            )?;
+            Ok(format!(
+                "issued {} in {}: {stem}.crt and {stem}.key (keep the key on that control node \
+                 alone)\n\nName them in the control node's configuration:\n\n  [control]\n  \
+                 issuer_cert = {}\n  issuer_key = {}\n",
+                issued.subject(),
+                into.display(),
+                toml_path(&into.join(format!("{stem}.crt"))),
+                toml_path(&into.join(format!("{stem}.key"))),
+            ))
+        }
     }
+}
+
+/// `path` as a TOML basic string, for a line the user pastes into a configuration file.
+fn toml_path(path: &Path) -> String {
+    let mut quoted = String::from('"');
+    for character in path.display().to_string().chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            control if control.is_control() => {
+                quoted.push_str(&format!("\\u{:04X}", u32::from(control)));
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 impl SqlArgs {
@@ -3649,6 +3846,15 @@ fn format_location(location: &Location) -> String {
             "  {}: {position} ({})",
             replica.node,
             liveness(replica.liveness)
+        );
+    }
+    if let Some(placed) = &location.placed {
+        let placed: Vec<String> = placed.iter().map(ToString::to_string).collect();
+        let _ = writeln!(
+            output,
+            "placed on: {}\nhand-over: the replicas above are kept until the primary reports that \
+             the placed ones hold its log",
+            placed.join(", ")
         );
     }
     output

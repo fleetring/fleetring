@@ -201,6 +201,12 @@ pub const FAMILIES: &[FamilySpec] = &[
         "Revoked tokens and signing keys on the denylist",
     ),
     family(
+        "fleetring_denylist_unusable",
+        Gauge,
+        &[],
+        "1 while the token denylist holds an entry this node can't read, so it refuses every token",
+    ),
+    family(
         "fleetring_membership_epoch",
         Gauge,
         &[],
@@ -381,6 +387,12 @@ pub const FAMILIES: &[FamilySpec] = &[
         Gauge,
         &[],
         "Databases with a promotion in progress",
+    ),
+    family(
+        "fleetring_control_kept_replica_sets",
+        Gauge,
+        &[],
+        "Databases whose replica set a membership change kept until their primary hands it over",
     ),
     family(
         "fleetring_control_databases",

@@ -50,6 +50,9 @@ fn code_for(code: Code) -> u8 {
 pub(crate) fn code_of(error: &(dyn Error + 'static)) -> u8 {
     let mut next = Some(error);
     while let Some(error) = next {
+        if let Some(coded) = error.downcast_ref::<Coded>() {
+            return coded.code;
+        }
         if let Some(failed) = error.downcast_ref::<Failed>() {
             return code_for(failed.code);
         }
@@ -183,6 +186,25 @@ impl fmt::Display for Usage {
 }
 
 impl Error for Usage {}
+
+/// A failure whose exit code the command chose, for a command whose own section of
+/// `docs/cli.md` maps its refusals otherwise than [`exit_code`] does (`agent delegate`, section
+/// 16). Its message is printed as any error's.
+#[derive(Debug)]
+pub(crate) struct Coded {
+    /// The exit code.
+    pub(crate) code: u8,
+    /// What the command failed with, hint included.
+    pub(crate) message: String,
+}
+
+impl fmt::Display for Coded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for Coded {}
 
 /// An outcome the command has already reported, such as a restore that printed why it couldn't
 /// set its expiry, or a watch ended with Ctrl-C: it only chooses the exit code.

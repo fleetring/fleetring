@@ -232,11 +232,33 @@ pub enum Feature {
     /// Forks (ADR-0046): [`Action::ForkDatabase`](crate::Action::ForkDatabase) and the commands
     /// that drive a fork. Enabling it also starts database incarnations.
     Fork,
+    /// Online delegation (ADR-0047, point 6.6):
+    /// [`Action::RecordDelegation`](crate::Action::RecordDelegation), and from FR-093 the
+    /// principal revocations and the ancestor rule's. A member reports it only once it enforces
+    /// every rule of ADR-0047 points 3 and 11.
+    Delegation,
+    /// Replica-set hand-over (ADR-0031, amendment 2; FR-102): a membership change that moves a
+    /// leased database's replica set keeps the old set as the one promotions fence, and
+    /// [`Action::ReleaseKeptReplicas`](crate::Action::ReleaseKeptReplicas) moves it onto
+    /// placement once its primary reports that placement's write quorum holds its log.
+    /// [`Action::EnableHandover`](crate::Action::EnableHandover) enables it, which the control
+    /// node's writer logs just before the first membership change that would keep a set once
+    /// every member supports it, since a primary that doesn't count both write quorums would
+    /// leave the old set short of a write a promotion of it must find. Members' software alone
+    /// never decides it, so a log replays the same whatever features the replaying binary knows.
+    Handover,
 }
 
 impl Feature {
     /// Every feature this release knows, in order.
-    pub const ALL: [Self; 4] = [Self::Undrain, Self::Metadata, Self::Expiry, Self::Fork];
+    pub const ALL: [Self; 6] = [
+        Self::Undrain,
+        Self::Metadata,
+        Self::Expiry,
+        Self::Fork,
+        Self::Delegation,
+        Self::Handover,
+    ];
 
     /// Returns the feature's name, as members report it and errors print it.
     #[must_use]
@@ -246,6 +268,8 @@ impl Feature {
             Self::Metadata => "metadata",
             Self::Expiry => "expiry",
             Self::Fork => "fork",
+            Self::Delegation => "delegation",
+            Self::Handover => "handover",
         }
     }
 }
@@ -512,7 +536,7 @@ mod tests {
         let stored = serde_json::to_string(&software).expect("serializes");
         assert_eq!(
             stored,
-            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["expiry","fork","metadata"]}"#
+            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["delegation","expiry","fork","handover","metadata"]}"#
         );
         assert_eq!(
             serde_json::from_str::<Software>(&stored).expect("decodes"),

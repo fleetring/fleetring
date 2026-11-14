@@ -91,16 +91,16 @@ fn token(
 ) -> Result<BearerToken, Box<dyn Error>> {
     let now = SystemClock.now();
     let lifetime = Millis::new(u64::try_from(lifetime.as_millis())?);
-    Ok(signer.issue(&TokenSpec {
-        principal: principal.parse()?,
-        scopes: scopes
+    Ok(signer.issue(&TokenSpec::new(
+        principal.parse()?,
+        scopes
             .iter()
             .map(|scope| scope.parse())
             .collect::<Result<_, _>>()?,
-        id: id.parse()?,
-        not_before: now,
-        expires_at: now.saturating_add(lifetime),
-    })?)
+        id.parse()?,
+        now,
+        now.saturating_add(lifetime),
+    ))?)
 }
 
 fn read_one() -> Statement {
@@ -563,6 +563,7 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
     assert_eq!(status.code(), Code::PermissionDenied, "{status}");
 
     // Expired and tampered tokens are unauthenticated.
+    let issued = SystemClock.now();
     let expired = token(
         &signer,
         "app",
@@ -570,7 +571,12 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
         "app-2",
         Duration::from_secs(1),
     )?;
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    // The daemon checks expiry against the wall clock, which can step back on a loaded machine,
+    // so the test waits until the wall clock is well past the token's end, not for a fixed time.
+    let past = issued.saturating_add(Millis::new(2_100));
+    while SystemClock.now() < past {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let late = Client::new(
         control_target.clone(),
         with_token(network(&tls, "app")?, &expired)?,
@@ -616,6 +622,7 @@ async fn scopes_hold_through_certificates_and_tokens() -> TestResult {
                     .saturating_add(Millis::new(3_600_000))
                     .as_millis(),
             }),
+            principal: String::new(),
         })
         .await?;
     let status = app

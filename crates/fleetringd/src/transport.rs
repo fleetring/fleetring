@@ -422,7 +422,13 @@ pub fn incoming(
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
         loop {
-            let raw = match listener.accept().await {
+            // Once the server stops, the listener closes with this task, so the port comes free
+            // for a node started again in the same process.
+            let accepted = tokio::select! {
+                () = sender.closed() => break,
+                accepted = listener.accept() => accepted,
+            };
+            let raw = match accepted {
                 Ok(raw) => raw,
                 Err(error) => {
                     if sender.send(Err(error)).await.is_err() {

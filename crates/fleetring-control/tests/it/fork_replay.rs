@@ -439,8 +439,10 @@ fn a_log_where_a_leased_forks_holders_leave_replays_identically() {
 /// The fixtures were written by unmodified `main` at commit a0d51f2, from the generated logs
 /// `record_with(&fixed_ops(0x08F0, 400), SoftwareMix::Current)` and
 /// `record_with(&fixed_ops(0x08F1, 400), SoftwareMix::Mixed)` in `common`, serialized with
-/// `serde_json::to_string` as the control log and its snapshots are. They must never be
-/// regenerated: they stand for what a release before forks wrote.
+/// `serde_json::to_string` as the control log and its snapshots are. That commit's
+/// `fleetring-control` sources are the `fleetringd-v0.7.0` tag's, so the fixtures are what 0.7.0
+/// writes, and this is the replay rule for a 0.7 log and snapshot under 0.8 (FR-096). They must
+/// never be regenerated: they stand for what a release before forks wrote.
 #[test]
 fn a_state_and_log_from_before_forks_load_and_reserialize_byte_for_byte() {
     for (log, snapshot) in [

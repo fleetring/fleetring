@@ -8,18 +8,21 @@ mod binding;
 mod changes;
 mod control;
 mod database;
+mod delegation;
 mod drain;
 mod durability;
 mod expiry;
 mod failover;
 mod fleet;
 mod fork;
+mod handover;
 mod history;
 mod membership;
 mod membership_lag;
 mod observe;
 mod replication;
 mod router;
+mod snapshot_chain;
 
 use std::error::Error;
 

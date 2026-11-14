@@ -66,6 +66,11 @@ Where the two ADRs differ, ADR-0040 wins. This plan follows both and lands in se
   - `control add` refuses a node with Raft state, a node outside the window, and a node without a `Raft` service.
 - [ ] `fleetringd node remove` refuses a control group member and names the commands that take it out first.
 - [ ] `/readyz` reports `leader` and `control_group` with their ADR-0040 meanings; the control metric families of ADR-0040 point 10 are listed from the first scrape.
+- [ ] Delegation under a group (added 2026-11-13 by FR-090 to FR-093's S10; ADR-0047 points 6.1 and 13, I5):
+  - the state machine sets each command's `recorded_by` from the entry's leader ID before `apply`, never from the payload, so `RecordDelegation` replays the same on every voter (the single writer stamps its own node ID today, `Command::stamped`);
+  - every control node verifies tokens against `Source::Control` with `ControlFreshness::Acknowledged`, never `SoleWriter`: a leader counts its freshness from the last quorum acknowledgement, a follower from the last append or heartbeat it accepted from the current leader, and past the heartbeat timeout either refuses every token with `UNAVAILABLE` while certificates keep working;
+  - each control node that may lead holds its own delegation issuer pair (`[control] issuer_cert` and `issuer_key`), and a test delegates, rotates, and revokes across a leader change of a three-node group, as `tests/release_blocker.rs` does with a restart;
+  - ADR-0040 point 4 (the feature gate covers the control group) is accepted, so a voter without `delegation` holds its first use back.
 - [ ] The docs are updated: the daemon README ("Control group"), `deploy/fleetringd.toml`, `docs/cli.md`, the lexicon, `SECURITY.md`, and `docs/roadmap.md` (E5, and E2's compaction line).
 
 ## Conventions for every phase

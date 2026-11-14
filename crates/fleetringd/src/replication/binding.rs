@@ -9,10 +9,11 @@
 //!
 //! Membership changes publish the new ring on each node at a different moment. A stream's
 //! receiver counts as a replica under its current ring, the ring before it ([`replicas_of`]), or
-//! the replica set control state names now; a seeded fork's receiver only under the last, its
-//! recorded holders (ADR-0046, point 3.10). A snapshot goes only to a follower on the primary's
-//! current ring or in control state's replica set: the ring before lingers until the next
-//! change, and must not keep a node a follower that long (ADR-0031, amendment).
+//! the replica set or placement control state names now; a seeded fork's receiver only under its
+//! recorded holders (ADR-0046, point 3.10; ADR-0031, amendment 2). A snapshot goes only to a
+//! follower on the primary's current ring or in control state's replica set: the ring before
+//! lingers until the next change, and must not keep a node a follower that long (ADR-0031,
+//! amendment).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -24,12 +25,14 @@ use fleetring::{NodeId, ReplicationFactor, Ring};
 use fleetring_control::fork::ForkIdentity;
 use fleetring_control::{DatabaseName, Incarnation, LeaseEpoch};
 use fleetring_proto::v1::{LocateRequest, SnapshotRequest};
+use tokio::time::Instant;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
 
 use super::Inner;
+use super::fork::source::RETRY_SOON;
 use super::fork::view::{holders_from_placement, view_from_placement};
-use super::fork::{DatabaseView, ForkPhase, ForkView};
+use super::fork::{CONTROL_CALL_LIMIT, DatabaseView, ForkPhase, ForkView, with_retry_after};
 use crate::MembershipView;
 use crate::auth::{BINDING_KEY, Binding, BindingDenied, SeedingMismatch, Unbound};
 use crate::control::ControlClient;
@@ -89,6 +92,7 @@ pub trait EpochAuthority: fmt::Debug + Send + Sync + 'static {
                 holders: holders.await?,
                 incarnation: Incarnation::LEGACY,
                 fork: None,
+                sets: None,
             })
         })
     }
@@ -180,6 +184,32 @@ fn superseded(database: &DatabaseName, epoch: u64, current: LeaseEpoch) -> Statu
     ))
 }
 
+/// Refuses a stream or a fence of `database` for a database that control state holds at
+/// `placed` when this node's copy records another incarnation: the copy is an earlier
+/// database's of the name, whose drop this node missed, and following the new database from it
+/// would mix the two, or let a late notice for the old one delete the new one's copy later. The
+/// copy is kept as an orphan: counting the refusal as an ended stream sends the lease keeper to
+/// ask control state, and it finds the copy's incarnation gone. A view with the legacy
+/// incarnation, from a control node that predates forks, says nothing either way.
+fn other_incarnation(
+    inner: &Inner,
+    database: &DatabaseName,
+    record: &super::epochs::Record,
+    placed: Incarnation,
+) -> Result<(), Status> {
+    let Some(recorded) = record.incarnation() else {
+        return Ok(());
+    };
+    if placed == Incarnation::LEGACY || recorded == placed {
+        return Ok(());
+    }
+    inner.stream_ended(database);
+    Err(Status::failed_precondition(format!(
+        "this node's copy of {database} belongs to incarnation {recorded}, not {placed}, the \
+         database control state holds; it keeps the copy as an orphan"
+    )))
+}
+
 /// Checks a `Replicate` stream that `caller` opens for `database` at `epoch` against its binding,
 /// before anything is recorded: `caller` holds the epoch or is promoting to it, and this node is
 /// a replica of the database: one of a seeded fork's recorded holders, whatever the rings say.
@@ -224,8 +254,11 @@ pub(super) async fn check_stream(
     let DatabaseView {
         holders,
         fork: placed,
+        sets,
+        incarnation,
         ..
     } = inner.authority.view(database).await?;
+    other_incarnation(inner, database, &record, incarnation)?;
     if holders.epoch > lease_epoch {
         return Err(superseded(database, epoch, holders.epoch));
     }
@@ -251,6 +284,12 @@ pub(super) async fn check_stream(
         )
     };
     replicas.extend(holders.replicas);
+    // While a membership change keeps the old replica set, control state names placement
+    // beside it, and the primary streams to both (ADR-0031, amendment 2): a new member it
+    // reaches before publishing the new ring is a replica by control state.
+    if !seeded {
+        replicas.extend(sets.into_iter().flat_map(|sets| sets.placed));
+    }
     if !replicas.contains(&inner.node) {
         let denied = BindingDenied::new(
             "Replicate",
@@ -316,8 +355,10 @@ pub(super) async fn check_fence(
     let DatabaseView {
         holders,
         fork: placed,
+        incarnation,
         ..
     } = inner.authority.view(database).await?;
+    other_incarnation(inner, database, &record, incarnation)?;
     if holders.epoch > lease_epoch {
         return Err(superseded(database, epoch, holders.epoch));
     }
@@ -407,19 +448,23 @@ pub(super) async fn check_promote(
 }
 
 /// Checks a `DropCopy` naming `database` at `epoch`, whoever made it (ADR-0042). The drop
-/// stands only if control state no longer holds the database, or holds a newer one of the name at
-/// a lower epoch or, when the notice names one, at another incarnation (ADR-0046, point 4.6),
-/// and `epoch` is exactly the highest epoch this node's copy recorded, so the notice names this
-/// copy's incarnation. A live database's control epoch equals its copies' highest, and a
-/// database created again under the name restarts its epochs and draws a new incarnation, so
-/// neither a forged notice nor a late one for an earlier incarnation deletes anything.
+/// stands only if control state no longer holds the database the notice names: it holds no
+/// database of the name, or, when the notice names a random incarnation, one of another
+/// incarnation, whatever its epoch; or, for a notice that names none or the legacy one, a
+/// database of the name at a lower epoch (ADR-0046, points 4.6 and the amendment's item 9).
+/// And the notice must name this node's copy: `epoch` is exactly the highest epoch the copy
+/// recorded, or the notice and the copy name the same random incarnation and the copy is at a
+/// lower epoch, a copy of the dropped database that missed its later epochs. A live database's
+/// control epoch equals its copies' highest, and a database created again under the name
+/// restarts its epochs and draws a new incarnation, so neither a forged notice, naming the live
+/// incarnation at whatever epoch, nor a late one for an earlier incarnation deletes anything.
 ///
 /// # Errors
 ///
-/// - A notice for a database control state still holds at `epoch` or later, at the notice's
-///   incarnation, fails the binding: `PERMISSION_DENIED` for a node certificate,
+/// - A notice for a database control state still holds, at the notice's random incarnation or,
+///   for one without, at `epoch` or later, fails the binding: `PERMISSION_DENIED` for a node certificate,
 ///   `FAILED_PRECONDITION` for a plaintext caller.
-/// - One whose epoch isn't this node's copy's gets `FAILED_PRECONDITION`, and changes nothing: a
+/// - One that names neither gets `FAILED_PRECONDITION`, and changes nothing: a
 ///   replica that missed a promotion is told of the drop honestly, and keeps its copy as an
 ///   orphan. A node with no copy of the name accepts it, and has nothing to delete.
 pub(super) async fn check_drop(
@@ -431,10 +476,14 @@ pub(super) async fn check_drop(
 ) -> Result<(), Status> {
     let lease_epoch = LeaseEpoch::new(epoch);
     let dropped = match inner.authority.view(database).await {
-        Ok(view) => {
-            view.holders.epoch < lease_epoch
-                || incarnation.is_some_and(|dropped| dropped != view.incarnation)
-        }
+        Ok(view) => match incarnation.filter(|named| *named != Incarnation::LEGACY) {
+            // A random incarnation names one database: while control state holds it, it stands.
+            Some(named) => named != view.incarnation,
+            None => {
+                view.holders.epoch < lease_epoch
+                    || incarnation.is_some_and(|dropped| dropped != view.incarnation)
+            }
+        },
         Err(status) if status.code() == tonic::Code::NotFound => true,
         Err(status) => return Err(status),
     };
@@ -451,23 +500,34 @@ pub(super) async fn check_drop(
             None => Err(Status::failed_precondition(reason.to_string())),
         };
     }
-    match inner.epochs.highest(database) {
-        None => Ok(()),
-        Some(highest) if highest == epoch => Ok(()),
-        // A notice that names a seeding fork's identity is about its staged copies, which the
-        // node judges again under the name's lock; its copy of the name, if any, stays.
-        Some(_) if epoch == 0 && incarnation.is_some() => Ok(()),
-        Some(highest) => Err(Status::failed_precondition(format!(
-            "this node's copy of {database} is at epoch {highest}, not the dropped epoch {epoch}; \
-             it keeps the copy"
-        ))),
+    // A notice that names a seeding fork's identity is about its staged copies, which the node
+    // judges again under the name's lock; its copy of the name, if any, stays.
+    if epoch == 0 && incarnation.is_some() {
+        return Ok(());
+    }
+    match inner
+        .epochs
+        .names_copy(database, epoch, incarnation.map(Incarnation::get))
+    {
+        None | Some(true) => Ok(()),
+        // At the copy's own epoch the notice is answered, as before incarnations: the lease
+        // keeper judges its incarnation under the name's lock, and keeps a copy it doesn't name.
+        Some(false) if inner.epochs.highest(database) == Some(epoch) => Ok(()),
+        Some(false) => {
+            let highest = inner.epochs.highest(database).unwrap_or_default();
+            Err(Status::failed_precondition(format!(
+                "this node's copy of {database} is at epoch {highest}, not the dropped epoch \
+                 {epoch}; it keeps the copy"
+            )))
+        }
     }
 }
 
 /// Checks a `Snapshot` that `caller` asks this node for, of `database` at `epoch`: this node
 /// serves the database at `epoch`, and the caller is a follower it streams the database to
-/// under its current ring, or a replica control state places the database on now, which a
-/// primary that hasn't published the newest ring yet will stream to next.
+/// under its current ring, or a replica control state places the database on now, in its
+/// replica set or in the placement it names beside a kept set, which a primary that hasn't
+/// read the newest placement yet will stream to next.
 ///
 /// The ring before the current one doesn't count here, unlike for a stream's receiver: it stays
 /// in the view until the next membership change, so a node it named would stay a follower long
@@ -502,8 +562,21 @@ pub(super) async fn check_snapshot(
     {
         return Ok(());
     }
-    let holders = inner.authority.holders(database).await?;
-    let placed = holders.replicas.contains(caller);
+    let DatabaseView {
+        holders,
+        fork,
+        sets,
+        ..
+    } = inner.authority.view(database).await?;
+    // Control state's replica set, and, as for a stream's receiver, the placement it names
+    // beside a kept set, unless the database is a seeded fork, whose replica set is its holders
+    // alone (ADR-0031, amendment 2; ADR-0046, point 3.10).
+    let seeded = matches!(
+        fork.as_ref().map(|fork| &fork.phase),
+        Some(ForkPhase::Seeded { .. })
+    );
+    let placed = holders.replicas.contains(caller)
+        || (!seeded && sets.is_some_and(|sets| sets.placed.contains(caller)));
     match served {
         Some(_) if placed => Ok(()),
         Some(_) => Err(refuse(
@@ -634,15 +707,40 @@ fn refuse_seeding(
     }
 }
 
-/// The fork `request` names, as control state shows it, if its whole identity matches; a
-/// refusal otherwise.
+/// What control state shows of `database`, asked for a seeding check that must answer by
+/// `deadline`; `UNAVAILABLE`, with a retry-after, once it passes.
+///
+/// The check runs before a seeding stream sends its first chunk, which the caller waits for
+/// only so long: a check that waits on a stalled control connection would cost the caller a
+/// transfer retry for the sender's link, not its own (ADR-0046, point 12).
+async fn view_by(
+    inner: &Inner,
+    database: &DatabaseName,
+    deadline: Instant,
+) -> Result<DatabaseView, Status> {
+    tokio::time::timeout_at(deadline, inner.authority.view(database))
+        .await
+        .unwrap_or_else(|_| {
+            Err(with_retry_after(
+                Status::unavailable(format!(
+                    "the control plane didn't say where {database} stands within \
+                     {CONTROL_CALL_LIMIT:?}; retry"
+                )),
+                RETRY_SOON,
+            ))
+        })
+}
+
+/// The fork `request` names, as control state shows it by `deadline`, if its whole identity
+/// matches; a refusal otherwise.
 async fn current_fork(
     inner: &Inner,
     request: &SeedingRequest,
     caller: Option<&NodeId>,
+    deadline: Instant,
 ) -> Result<(DatabaseView, ForkView), Status> {
     let refused = |mismatch| Err(refuse_seeding(inner, request, caller, mismatch));
-    let view = match inner.authority.view(&request.fork.name).await {
+    let view = match view_by(inner, &request.fork.name, deadline).await {
         Ok(view) => view,
         Err(status) if status.code() == tonic::Code::NotFound => {
             return refused(SeedingMismatch::NoFork);
@@ -663,33 +761,46 @@ async fn current_fork(
     Ok((view, fork))
 }
 
-/// The attempt's seeder, if `fork` is seeding exactly `attempt`; a refusal otherwise.
-fn seeding_attempt(
-    inner: &Inner,
-    request: &SeedingRequest,
-    caller: Option<&NodeId>,
-    fork: &ForkView,
-) -> Result<Option<NodeId>, Status> {
+/// The attempt's seeder, if `fork` is seeding exactly the request's attempt; if it isn't, the
+/// answer to a request made at another moment ([`answer_later`]).
+///
+/// The fork's identity was compared first, so the request names this fork: one that is no longer
+/// seeding, or seeding another attempt, is a request made from a view a moment older or newer
+/// than this node's, which a peer or a seeder makes legitimately (ADR-0046, point 4.4, as
+/// amended).
+fn seeding_attempt(request: &SeedingRequest, fork: &ForkView) -> Result<Option<NodeId>, Status> {
     match &fork.phase {
         ForkPhase::Seeding {
             attempt, seeder, ..
         } if *attempt == request.attempt => Ok(seeder.clone()),
-        ForkPhase::Seeding { attempt, .. } => Err(refuse_seeding(
-            inner,
+        ForkPhase::Seeding { attempt, .. } => Err(answer_later(
             request,
-            caller,
             SeedingMismatch::Attempt {
                 requested: request.attempt,
                 current: *attempt,
             },
         )),
-        _ => Err(refuse_seeding(
-            inner,
-            request,
-            caller,
-            SeedingMismatch::NotSeeding,
-        )),
+        _ => Err(answer_later(request, SeedingMismatch::NotSeeding)),
     }
+}
+
+/// `UNAVAILABLE`, with a retry-after, for a seeding request whose identity, and whose caller's
+/// role, match this node's control-state view, but that was made at another moment: for an
+/// attempt that isn't the one seeding now, or to a node that doesn't lead the source now
+/// (ADR-0046, points 4.1 and 4.4, as amended).
+///
+/// It isn't a binding refusal, and isn't counted or audited as one: the caller asked from a
+/// view a moment older or newer than this node's, and gets nothing. A caller asks control state
+/// again before it retries, and stops once its own view no longer shows the attempt.
+fn answer_later(request: &SeedingRequest, why: SeedingMismatch) -> Status {
+    tracing::debug!(fork = %request.fork, attempt = request.attempt, %why, "answered a seeding request made at another moment");
+    with_retry_after(
+        Status::unavailable(format!(
+            "attempt {} of fork '{}' can't be served here now: {why}; retry",
+            request.attempt, request.fork.name
+        )),
+        RETRY_SOON,
+    )
 }
 
 /// Checks a seeding `Snapshot` that `caller` asks this node for (ADR-0046, points 4.1 and 4.4),
@@ -703,12 +814,19 @@ fn seeding_attempt(
 ///   this node is its seeder; and the caller is in the fork's replica set.
 ///
 /// The identity checks run for every caller; the caller's own role is checked only for a node
-/// certificate, since a plaintext peer carries no identity (ADR-0031).
+/// certificate, since a plaintext peer carries no identity (ADR-0031). A request whose identity
+/// matches but whose attempt isn't the one seeding now is answered, not refused: the caller's
+/// role is checked only against the attempt it names, once that attempt is seeding. So is the
+/// seeder's request to a node that doesn't lead the source now: the source's lease moved after
+/// the seeder looked.
+///
+/// The control-state views the check takes answer within [`CONTROL_CALL_LIMIT`], all told.
 ///
 /// # Errors
 ///
-/// A `seeding` binding refusal, and the authority's error as it is, `UNAVAILABLE` while control
-/// state can't be reached.
+/// A `seeding` binding refusal; `UNAVAILABLE` with a retry-after for a request made at another
+/// moment ([`answer_later`]), or once [`CONTROL_CALL_LIMIT`] passes; and the authority's error
+/// as it is, `UNAVAILABLE` while control state can't be reached.
 pub(super) async fn check_seeding(
     inner: &Inner,
     request: &SeedingRequest,
@@ -720,7 +838,8 @@ pub(super) async fn check_seeding(
     if request.staged && caller == Some(&inner.node) {
         return refused(SeedingMismatch::NotReplica);
     }
-    let (view, fork) = current_fork(inner, request, caller).await?;
+    let deadline = Instant::now() + CONTROL_CALL_LIMIT;
+    let (view, fork) = current_fork(inner, request, caller, deadline).await?;
     if request.staged {
         // A peer may leave the source incarnation unset; one it sets must be the fork's.
         if !request.source_incarnation.is_legacy()
@@ -728,7 +847,7 @@ pub(super) async fn check_seeding(
         {
             return refused(SeedingMismatch::SourceIncarnation);
         }
-        let seeder = seeding_attempt(inner, request, caller, &fork)?;
+        let seeder = seeding_attempt(request, &fork)?;
         if seeder.as_ref() != Some(&inner.node) {
             return refused(SeedingMismatch::NotTheSeeder);
         }
@@ -748,13 +867,13 @@ pub(super) async fn check_seeding(
     if !unchecked && fork.source_incarnation != request.source_incarnation {
         return refused(SeedingMismatch::SourceIncarnation);
     }
-    let seeder = seeding_attempt(inner, request, caller, &fork)?;
+    let seeder = seeding_attempt(request, &fork)?;
     if let Some(caller) = caller
         && seeder.as_ref() != Some(caller)
     {
         return refused(SeedingMismatch::NotSeeder);
     }
-    let source = match inner.authority.view(&request.database).await {
+    let source = match view_by(inner, &request.database, deadline).await {
         Ok(source) => source,
         Err(status) if status.code() == tonic::Code::NotFound => {
             return refused(SeedingMismatch::SourceIncarnation);
@@ -770,7 +889,7 @@ pub(super) async fn check_seeding(
             .primary(&request.database)
             .is_some_and(|primary| primary.role().epoch == epoch);
     if !leads {
-        return refused(SeedingMismatch::NotSourcePrimary);
+        return Err(answer_later(request, SeedingMismatch::NotSourcePrimary));
     }
     Ok(SeedingGrant {
         source_epoch: epoch,

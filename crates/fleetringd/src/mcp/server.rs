@@ -992,9 +992,32 @@ impl ServerHandler for FleetringMcp {
         match outcome {
             Ok(value) => Ok(success(value)?.into()),
             Err(Failed::Input(message)) => Err(ErrorData::invalid_params(message, None)),
-            Err(failed) => Ok(failure(&failed.body())?.into()),
+            Err(failed) => Ok(failure(&parent_renews(self.me(), failed.body()))?.into()),
         }
     }
+}
+
+/// `body`, with the next step for a delegated agent whose credentials were refused: a restart
+/// mints no token for it, so its parent delegates a new one (ADR-0047, point 10). The hint names
+/// only the principal the server's own credentials name.
+fn parent_renews(me: Option<&PrincipalName>, mut body: ErrorBody) -> ErrorBody {
+    if body.code != code_name(Code::Unauthenticated) {
+        return body;
+    }
+    let delegated = me
+        .and_then(|me| fleetring_control::delegation::AgentName::try_from(me.clone()).ok())
+        .filter(fleetring_control::delegation::AgentName::is_delegated);
+    if let Some(name) = delegated {
+        let id = name
+            .as_str()
+            .strip_prefix("agent-")
+            .unwrap_or(name.as_str());
+        body.hint = Some(format!(
+            "the server's credentials were refused; if this delegated agent's token expired, ask \
+             the parent: fleetring agent renew {id}, then restart the MCP server"
+        ));
+    }
+    body
 }
 
 /// Why a tool call failed.
@@ -1487,6 +1510,29 @@ mod tests {
         );
     }
 
+    /// ADR-0047, point 7: credentials stay out of model context, so no tool delegates, renews or
+    /// revokes, and none returns or takes a token.
+    #[test]
+    fn mcp_tool_list_has_no_delegate_or_token_tool() -> Result<(), serde_json::Error> {
+        for access in [Access::ReadWrite, Access::ReadOnly] {
+            for tool in tools(access) {
+                for word in ["delegat", "token", "renew", "revoke", "credential"] {
+                    assert!(!tool.name.contains(word), "{} names {word}", tool.name);
+                }
+                let schema = serde_json::to_string(&tool.input_schema)?.to_lowercase();
+                assert!(
+                    !schema.contains("\"token\"") && !schema.contains("delegat"),
+                    "{} takes a credential: {schema}",
+                    tool.name
+                );
+            }
+        }
+        for tool in ToolName::ALL {
+            assert!(!tool.name().contains("delegate") && !tool.name().contains("token"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn statement_errors_are_fielded_and_internal_errors_say_nothing_of_paths() {
         let statement = Failed::Statement(Status::invalid_argument(
@@ -1668,6 +1714,28 @@ mod tests {
                 .is_some_and(|hint| hint.contains("restart the MCP server")),
             "{expired:?}"
         );
+    }
+
+    #[test]
+    fn a_refused_child_says_to_ask_its_parent() -> Result<(), Box<dyn std::error::Error>> {
+        let expired = || Failed::Status(Status::unauthenticated("the token has expired")).body();
+        let child: PrincipalName = "agent-42.c7".parse()?;
+        let hint = parent_renews(Some(&child), expired()).hint;
+        assert!(
+            hint.as_deref()
+                .is_some_and(|hint| hint.contains("ask the parent: fleetring agent renew 42.c7")),
+            "{hint:?}"
+        );
+        // A root agent, or any other principal, restarts the server as before.
+        let root: PrincipalName = "agent-42".parse()?;
+        assert_eq!(parent_renews(Some(&root), expired()).hint, expired().hint);
+        assert_eq!(parent_renews(None, expired()).hint, expired().hint);
+        let denied = Failed::Status(Status::permission_denied("no")).body();
+        assert_eq!(
+            parent_renews(Some(&child), denied).hint,
+            Failed::Status(Status::permission_denied("no")).body().hint
+        );
+        Ok(())
     }
 
     #[test]

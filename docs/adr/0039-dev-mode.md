@@ -4,6 +4,8 @@
 - **Date:** 2026-11-04
 - **Related:** ADR-0025 (principals and scopes), ADR-0034 (admin listener), ADR-0038 (upgrades); tickets FR-068, FR-056, FR-060
 
+*Note (2026-11-11):* [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12) amends point 1 ("nothing in the daemon branches on dev mode"), since a running dev node mints its own issuer certificate from `ca.key`, and proposes that dev mode also write a delegation issuer, `tls/issuer.dev.crt` and `tls/issuer.dev.key`, from the dev authority when they are missing, valid for 90 days (point 2); that `[control] issuer_cert` and `issuer_key` default to those files when `dev = true`, so a directory an earlier release wrote needs no rewritten configuration; that the directory check of point 3 allow both files; and, as an exception to point 5's "never overwritten", that a dev node replace both, at start and at its checks for changed certificates, when fewer than 30 days remain, the certificate has expired, or the pair doesn't match, writing temporary files and renaming them into place; that invalidates no token, since each carries the certificate it was signed under (ADR-0047, point 1.7). It is proposed, not part of this decision, until ADR-0047 is accepted. The text below is unchanged.
+
 ## Context
 
 A first run of `fleetringd` needs an authority, a node certificate, a client certificate, a configuration file, and a `[[principal]]` entry before a single statement runs. That is the right ceremony for a fleet and the wrong one for a laptop: the first contact should take minutes, as `brew services start postgresql` does, and the code written against it should run unchanged against a fleet.

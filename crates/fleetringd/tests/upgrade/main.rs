@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 mod common;
+mod features;
 mod rolling;
 #[path = "../support/mod.rs"]
 mod support;
@@ -404,6 +405,12 @@ fn upgrading_a_running_node_drains_restarts_and_rejoins_it() -> TestResult {
         None,
     ))?;
     let name = runtime.block_on(create_history_database(&client))?;
+    // A database nobody wrote: its primary reports the empty position and its followers report
+    // none, and the node has nothing to catch up on in it.
+    runtime.block_on(client.create_database(
+        &"never-written".parse()?,
+        fleetring::ReplicationFactor::new(3).ok_or("zero")?,
+    ))?;
     // The node to upgrade is the database's primary, so the drain has a lease to hand over.
     let primary = runtime
         .block_on(client.locate(&name))?

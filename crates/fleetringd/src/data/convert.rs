@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use fleetring::{Epoch, Fingerprint, NodeId, ReplicationFactor};
 use fleetring_control::Incarnation;
 use fleetring_control::{
-    Acks, DatabaseName, Description, DescriptionChange, Durability, Engine, LabelKey, LabelValue,
-    Labels, LeaseEpoch, Liveness, Metadata, MetadataChange, ReplicaRole, Revocations, Revoked,
-    Timestamp,
+    Acks, DatabaseName, Description, DescriptionChange, Durability, Engine, Entry, LabelKey,
+    LabelValue, Labels, LeaseEpoch, Liveness, Metadata, MetadataChange, ReplicaRole, Revocations,
+    Revoked, Timestamp,
 };
 use fleetring_proto::v1::change_update::Update as ChangeUpdateKind;
 use fleetring_proto::v1::metadata_spec::Expiry as SpecExpiry;
@@ -20,6 +20,7 @@ use fleetring_proto::v1::update_database_request::Expiry as ExpiryUpdate;
 use fleetring_proto::v1::{self as proto, lease_update::Update, value::Value as Kind};
 use tonic::Status;
 
+use crate::auth::UnreadableEntry;
 use crate::changes::{MarkHome, SinkStatus};
 use crate::data::client::{
     ChangeUpdate, ChangedTransaction, LeaseUpdate, Location, NodeStatus, Orphan, ReplicaInfo,
@@ -585,6 +586,11 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         })
         .unwrap_or(ReplicationFactor::ONE);
     let durability = durability_of(&placement, replication_factor);
+    let placed = placement
+        .placed_replicas
+        .iter()
+        .map(|node| parse_reply::<NodeId>("node id", node))
+        .collect::<Result<Vec<_>, Status>>()?;
     let replicas = placement
         .replicas
         .into_iter()
@@ -613,6 +619,13 @@ pub(crate) fn location(placement: proto::Placement) -> Result<Location, Status> 
         epoch: LeaseEpoch::new(placement.epoch),
         primary,
         candidate,
+        placed: (!placed.is_empty()
+            && placed.iter().collect::<std::collections::BTreeSet<_>>()
+                != replicas
+                    .iter()
+                    .map(|replica: &ReplicaInfo| &replica.node)
+                    .collect())
+        .then_some(placed),
         replicas,
         replication_factor,
         durability,
@@ -708,56 +721,107 @@ pub(crate) fn node_status(response: proto::NodeStatusResponse) -> Result<NodeSta
     })
 }
 
-/// A denylist entry as the protocol carries it.
-pub(crate) fn revocation_to_proto(revoked: &Revoked, until: Timestamp) -> proto::Revocation {
+/// A denylist entry as the protocol carries it: its key, when it may be forgotten, and a
+/// principal's `before`. How it was added stays in control state; nodes don't need it.
+pub(crate) fn revocation_to_proto(revoked: &Revoked, entry: &Entry) -> proto::Revocation {
     let revoked = match revoked {
         Revoked::Token(id) => proto::revocation::Revoked::TokenId(id.to_string()),
         Revoked::Key(id) => proto::revocation::Revoked::KeyId(id.to_string()),
+        Revoked::Principal { fleet, principal } => {
+            proto::revocation::Revoked::Principal(proto::PrincipalRevocation {
+                fleet: fleet.as_ref().map(ToString::to_string),
+                principal: principal.to_string(),
+                // Every principal entry holds `before`; one without would refuse every token
+                // it covers, closed.
+                before_ms: entry.before.unwrap_or(Timestamp::MAX).as_millis(),
+            })
+        }
     };
     proto::Revocation {
         revoked: Some(revoked),
-        until_ms: until.as_millis(),
+        until_ms: entry.until.as_millis(),
     }
 }
 
-/// A denylist entry from the protocol, or `INVALID_ARGUMENT` if it names nothing valid.
+/// A denylist entry from the control plane, or `INVALID_ARGUMENT` if this node can't read it: it
+/// names nothing, names nothing valid, or revokes another fleet's principal, which no 0.8 node
+/// reads (ADR-0047, point 11.1).
 pub(crate) fn revocation_from_proto(
     revocation: proto::Revocation,
-) -> Result<(Revoked, Timestamp), Status> {
-    let revoked = match revocation.revoked {
-        Some(proto::revocation::Revoked::TokenId(id)) => Revoked::Token(parse("token id", &id)?),
-        Some(proto::revocation::Revoked::KeyId(id)) => Revoked::Key(parse("key id", &id)?),
+) -> Result<(Revoked, Entry), Status> {
+    let until = Timestamp::from_millis(revocation.until_ms);
+    let entry = match revocation.revoked {
+        Some(proto::revocation::Revoked::TokenId(id)) => {
+            (Revoked::Token(parse("token id", &id)?), Entry::fleet(until))
+        }
+        Some(proto::revocation::Revoked::KeyId(id)) => {
+            (Revoked::Key(parse("key id", &id)?), Entry::fleet(until))
+        }
+        Some(proto::revocation::Revoked::Principal(principal)) => {
+            if principal.fleet.is_some() {
+                return Err(Status::invalid_argument(
+                    "this release reads no revocation of another fleet's principal",
+                ));
+            }
+            (
+                Revoked::principal(parse("principal", &principal.principal)?),
+                Entry::fleet_principal(until, Timestamp::from_millis(principal.before_ms)),
+            )
+        }
         None => {
             return Err(Status::invalid_argument(
-                "a revocation names a token or a key",
+                "a revocation names a token, a key, or a principal",
             ));
         }
     };
-    Ok((revoked, Timestamp::from_millis(revocation.until_ms)))
+    Ok(entry)
+}
+
+/// The revocation a `RevokeTokenRequest` asks for, a token or a key with when to forget it, or
+/// `INVALID_ARGUMENT`. A principal's revocation is refused: the control plane chooses its
+/// `before`, so a caller never sends one (ADR-0047, point 11.5).
+pub(crate) fn revocation_request_from_proto(
+    revocation: proto::Revocation,
+) -> Result<(Revoked, Timestamp), Status> {
+    if matches!(
+        revocation.revoked,
+        Some(proto::revocation::Revoked::Principal(_))
+    ) {
+        return Err(Status::invalid_argument(
+            "a revocation request names a token or a key; the control plane sets a principal's \
+             revocation time itself",
+        ));
+    }
+    let (revoked, entry) = revocation_from_proto(revocation)?;
+    Ok((revoked, entry.until))
 }
 
 /// The denylist as the protocol carries it, in order.
 pub(crate) fn revocations_to_proto(revocations: &Revocations) -> Vec<proto::Revocation> {
     revocations
         .iter()
-        .map(|(revoked, until)| revocation_to_proto(revoked, until))
+        .map(|(revoked, entry)| revocation_to_proto(revoked, entry))
         .collect()
 }
 
-/// The denylist a heartbeat reply carries. An entry the node can't read is skipped with a
-/// warning: the rest still apply, and a token whose ID can't be parsed is refused anyway.
-pub(crate) fn revocations_from_proto(revocations: Vec<proto::Revocation>) -> Revocations {
+/// The denylist a join or heartbeat reply carries, or the first entry of it this node can't
+/// read (ADR-0047, point 3): a case absent or unknown to this release (prost reads both as
+/// none), a malformed one, or another fleet's principal. One such entry makes the whole list
+/// unusable, so the node refuses every token instead of skipping the entry, which would let a
+/// node that can't read a principal's revocation accept the tokens it refuses.
+///
+/// # Errors
+///
+/// [`UnreadableEntry`] naming the first entry this node can't read, and why.
+pub(crate) fn revocations_from_proto(
+    revocations: Vec<proto::Revocation>,
+) -> Result<Revocations, UnreadableEntry> {
     revocations
         .into_iter()
-        .filter_map(|revocation| match revocation_from_proto(revocation) {
-            Ok(entry) => Some(entry),
-            Err(status) => {
-                tracing::warn!(
-                    reason = status.message(),
-                    "skipped an unreadable revocation"
-                );
-                None
-            }
+        .enumerate()
+        .map(|(index, revocation)| {
+            revocation_from_proto(revocation)
+                .map_err(|status| UnreadableEntry::new(index, status.message()))
         })
         .collect()
 }
@@ -1312,5 +1376,135 @@ mod tests {
         };
         let refused = schema_from_proto(reply).expect_err("an unknown kind");
         assert_eq!(refused.code(), tonic::Code::Internal);
+    }
+
+    /// Every denylist key round-trips through the heartbeat's form, a principal's with its
+    /// `before`, so a node judges exactly what the control plane holds (ADR-0047, point 11.1).
+    #[test]
+    fn every_revoked_variant_round_trips_proto() {
+        let principal = Revoked::principal("agent-42.c7".parse().expect("a principal"));
+        let list: Revocations = [
+            (
+                Revoked::Token("t1".parse().expect("an id")),
+                Entry::fleet(Timestamp::from_millis(5_000)),
+            ),
+            (
+                Revoked::Key("k1".parse().expect("an id")),
+                Entry::fleet(Timestamp::MAX),
+            ),
+            (
+                principal.clone(),
+                Entry::fleet_principal(
+                    Timestamp::from_millis(9_000),
+                    Timestamp::from_millis(2_500),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let wire = revocations_to_proto(&list);
+        assert_eq!(
+            wire[2].revoked,
+            Some(proto::revocation::Revoked::Principal(
+                proto::PrincipalRevocation {
+                    fleet: None,
+                    principal: "agent-42.c7".to_owned(),
+                    before_ms: 2_500,
+                }
+            ))
+        );
+        assert_eq!(revocations_from_proto(wire), Ok(list));
+    }
+
+    /// One entry a node can't read makes the whole list unreadable, wherever it sits: a case
+    /// absent or unknown to this release (prost reads both as none), a malformed one, or another
+    /// fleet's principal (ADR-0047, point 3). Nothing of the list is kept.
+    #[test]
+    fn an_unreadable_entry_anywhere_makes_the_whole_list_unreadable() {
+        let token = |id: &str| proto::Revocation {
+            revoked: Some(proto::revocation::Revoked::TokenId(id.to_owned())),
+            until_ms: 2_000,
+        };
+        let unreadable = [
+            (
+                proto::Revocation {
+                    revoked: None,
+                    until_ms: 2_000,
+                },
+                "a revocation names a token, a key, or a principal",
+            ),
+            (token("not a token id!"), "token id"),
+            (
+                proto::Revocation {
+                    revoked: Some(proto::revocation::Revoked::Principal(
+                        proto::PrincipalRevocation {
+                            fleet: Some("other".to_owned()),
+                            principal: "agent-42".to_owned(),
+                            before_ms: 1_000,
+                        },
+                    )),
+                    until_ms: 2_000,
+                },
+                "another fleet's principal",
+            ),
+            (
+                proto::Revocation {
+                    revoked: Some(proto::revocation::Revoked::Principal(
+                        proto::PrincipalRevocation {
+                            fleet: None,
+                            principal: "Not A Principal".to_owned(),
+                            before_ms: 1_000,
+                        },
+                    )),
+                    until_ms: 2_000,
+                },
+                "principal",
+            ),
+        ];
+        for (entry, says) in unreadable {
+            for index in 0..3 {
+                let mut list = vec![token("t1"), token("t2")];
+                list.insert(index, entry.clone());
+                let refused = revocations_from_proto(list).expect_err("unreadable");
+                assert_eq!(refused.index(), index, "{entry:?}");
+                assert!(refused.reason().contains(says), "{refused}");
+            }
+        }
+        assert_eq!(
+            revocations_from_proto(vec![token("t1")]).map(|list| list.len()),
+            Ok(1)
+        );
+    }
+
+    /// A node can't read another fleet's principal revocation, and a request may never carry a
+    /// principal's, whose `before` only the control plane sets.
+    #[test]
+    fn another_fleets_principal_is_unreadable_and_a_request_cant_carry_a_principal() {
+        let principal = |fleet: Option<&str>| proto::Revocation {
+            revoked: Some(proto::revocation::Revoked::Principal(
+                proto::PrincipalRevocation {
+                    fleet: fleet.map(str::to_owned),
+                    principal: "agent-42".to_owned(),
+                    before_ms: 1_000,
+                },
+            )),
+            until_ms: 2_000,
+        };
+        let refused = revocation_from_proto(principal(Some("other"))).expect_err("unreadable");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(revocation_from_proto(principal(None)).is_ok());
+        let refused = revocation_request_from_proto(principal(None)).expect_err("refused");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        let token = proto::Revocation {
+            revoked: Some(proto::revocation::Revoked::TokenId("t1".to_owned())),
+            until_ms: 2_000,
+        };
+        assert_eq!(
+            revocation_request_from_proto(token).expect("a token"),
+            (
+                Revoked::Token("t1".parse().expect("an id")),
+                Timestamp::from_millis(2_000)
+            )
+        );
     }
 }

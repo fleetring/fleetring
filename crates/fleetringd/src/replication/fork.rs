@@ -37,7 +37,7 @@ use std::time::Duration;
 use fleetring_control::fork::{
     CopyLossReason, CopyLost, ForkIdentity, PlacementCaughtUp, ResetReport, SeedFailure, StagedCopy,
 };
-use fleetring_control::{DatabaseName, HostedReplica, LeaseEpoch, ReplicaRole};
+use fleetring_control::{DatabaseName, HostedReplica, Incarnation, LeaseEpoch, ReplicaRole};
 use fleetring_proto::v1::DatabaseStatus;
 use tokio::task::JoinHandle;
 use tonic::Status;
@@ -64,6 +64,18 @@ pub const FORK_NOT_READY: &str = "fork not ready";
 
 /// How long a client should wait before it retries a data call to a fork that isn't ready.
 const FORK_NOT_READY_RETRY: Duration = Duration::from_millis(500);
+
+/// The longest a data node's fork work waits for one answer from the control plane: the
+/// `Locate` of a fork or its source, or a seeded fork's first lease (ADR-0046, point 12).
+///
+/// A call on a connection that stalled, behind link loss or a partition, would otherwise wait
+/// for ever, and the node's fork work with it. A `Locate` is a read and the first lease one
+/// logged command; the control client rides out a leader change within a `Locate`'s own
+/// retries, about 1.6 s of backoff, which 5 s leaves room for. It is shorter than the 10 s
+/// request timeout that bounds one try over TCP, so the node gives up on a stalled connection
+/// first, and a twenty-fourth of `[fork] seeder_timeout` (2 min), so a seeder that hit one is
+/// back long before the control plane passes it over.
+pub(crate) const CONTROL_CALL_LIMIT: Duration = Duration::from_secs(5);
 
 /// `UNAVAILABLE` "fork not ready", with a retry-after, for a data call against `name`, a fork
 /// that isn't ready, `why` saying where it stands.
@@ -228,13 +240,41 @@ struct NameReports {
     current: Option<ForkIdentity>,
 }
 
-/// Where opening a fork's primary stands on this node, at one epoch.
+/// The lease a fork's primary on this node opens its readiness gate under: the database's
+/// incarnation and the lease's epoch. An epoch alone doesn't name a lease: a database created
+/// again under the name, a fork made again after a drop among them, starts its epochs over
+/// (ADR-0046, point 1), so its first lease has the epoch the dropped database's first lease had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GateLease {
+    /// The incarnation of the database the lease is on, if the lease named one.
+    pub(crate) incarnation: Option<Incarnation>,
+    /// The lease's epoch.
+    pub(crate) epoch: LeaseEpoch,
+}
+
+/// Where opening a fork's primary stands on this node, under one lease.
 #[derive(Debug)]
 enum Opening {
-    /// The gate is open at the epoch.
-    Open(LeaseEpoch),
-    /// A task is opening it at the epoch.
-    Running(LeaseEpoch, JoinHandle<()>),
+    /// The gate is open under the lease.
+    Open(GateLease),
+    /// A task is opening it under the lease.
+    Running(GateLease, JoinHandle<()>),
+}
+
+impl Opening {
+    /// The lease the gate opened, or is opening, under.
+    fn lease(&self) -> GateLease {
+        match self {
+            Self::Open(lease) | Self::Running(lease, _) => *lease,
+        }
+    }
+
+    /// Stops the task opening the gate, if one runs.
+    fn abort(&self) {
+        if let Self::Running(_, handle) = self {
+            handle.abort();
+        }
+    }
 }
 
 /// The reservation ledger and the downloads under way (ADR-0046, point 7.1). It isn't
@@ -658,41 +698,86 @@ impl Forks {
                 .is_some_and(|reports| reports.current.is_some())
     }
 
-    /// Whether `name`'s gate was opened at `epoch` on this node.
-    pub(crate) fn opened_at(&self, name: &DatabaseName, epoch: LeaseEpoch) -> bool {
+    /// Whether `name`'s gate was opened under `lease` on this node: the same incarnation at the
+    /// same epoch. A gate opened for an earlier database of the name, at whatever epoch, doesn't
+    /// count.
+    #[cfg(test)]
+    pub(crate) fn opened_at(&self, name: &DatabaseName, lease: GateLease) -> bool {
         matches!(
             self.opening.lock().expect("fork opening lock poisoned").get(name),
-            Some(Opening::Open(opened)) if *opened == epoch
+            Some(Opening::Open(opened)) if *opened == lease
         )
     }
 
-    /// Records that `name`'s gate opened at `epoch`.
-    pub(crate) fn mark_opened(&self, name: &DatabaseName, epoch: LeaseEpoch) {
+    /// Records that `name`'s gate opened under `lease`.
+    #[cfg(test)]
+    pub(crate) fn mark_opened(&self, name: &DatabaseName, lease: GateLease) {
         self.opening
             .lock()
             .expect("fork opening lock poisoned")
-            .insert(name.clone(), Opening::Open(epoch));
+            .insert(name.clone(), Opening::Open(lease));
     }
 
-    /// Starts `task` opening `name` at `epoch`, unless one runs at that epoch or the gate opened
-    /// at it already.
+    /// Starts `task` opening `name` under `lease`, unless one runs under that lease or the gate
+    /// opened under it already. A task opening it under another lease, one on an earlier
+    /// database of the name included, is aborted.
     pub(crate) fn start_opening(
         &self,
         name: &DatabaseName,
-        epoch: LeaseEpoch,
+        lease: GateLease,
         task: impl FnOnce() -> JoinHandle<()>,
     ) {
         let mut opening = self.opening.lock().expect("fork opening lock poisoned");
         let busy = match opening.get(name) {
-            Some(Opening::Open(opened)) => *opened == epoch,
-            Some(Opening::Running(running, handle)) => *running == epoch && !handle.is_finished(),
+            Some(Opening::Open(opened)) => *opened == lease,
+            Some(Opening::Running(running, handle)) => *running == lease && !handle.is_finished(),
             None => false,
         };
         if !busy {
-            if let Some(Opening::Running(_, handle)) = opening.get(name) {
-                handle.abort();
+            if let Some(previous) = opening.get(name) {
+                previous.abort();
             }
-            opening.insert(name.clone(), Opening::Running(epoch, task()));
+            opening.insert(name.clone(), Opening::Running(lease, task()));
+        }
+    }
+
+    /// Forgets how opening `name`'s gate stands, and stops a task opening it: this node's copy
+    /// of the name is gone, so no lease on it opens the gate again, and a fork made again under
+    /// the name starts with none.
+    pub(crate) fn forget_opening(&self, name: &DatabaseName) {
+        let removed = self
+            .opening
+            .lock()
+            .expect("fork opening lock poisoned")
+            .remove(name);
+        if let Some(removed) = removed {
+            removed.abort();
+        }
+        // A gate closed for the copy goes with it: a later database of the name that no fork
+        // made would otherwise refuse every client as a fork that isn't ready.
+        self.lock_gated().remove(name);
+    }
+
+    /// Forgets how opening `name`'s gate stands if that is for another database of the name than
+    /// `incarnation`'s, and stops a task opening it: no lease on the database this node now
+    /// serves can match it. A lease that names no incarnation changes nothing.
+    pub(crate) fn forget_other_incarnation(
+        &self,
+        name: &DatabaseName,
+        incarnation: Option<Incarnation>,
+    ) {
+        let Some(incarnation) = incarnation else {
+            return;
+        };
+        let mut opening = self.opening.lock().expect("fork opening lock poisoned");
+        if opening
+            .get(name)
+            .is_some_and(|entry| entry.lease().incarnation != Some(incarnation))
+            && let Some(removed) = opening.remove(name)
+        {
+            removed.abort();
+            // The gate it was opening was the other database's.
+            self.lock_gated().remove(name);
         }
     }
 
@@ -859,11 +944,52 @@ pub(super) async fn install_holder(
     }
 }
 
+/// Records, at start, every staged copy that was moved into its database's place but whose
+/// incarnation the node never recorded: a crash or a failed write between the move and the
+/// record (`install_staged`) leaves such a copy, which a drop notice, the orphan check, and
+/// `orphan remove` would otherwise not know. It blocks on the file system.
+pub(super) fn record_installed_copies(inner: &super::Inner) {
+    record_installed(&inner.epochs, inner.forks.store(), |name| {
+        inner.registry().location(name)
+    });
+}
+
+/// [`record_installed_copies`] over `epochs` and `store`, with `location` naming each
+/// database's place. Only a copy whose epoch record was never written is the install's: a
+/// record that exists, however it reads, belongs to a copy this node already knows, or to a
+/// later database's copy, here since, and an unreadable one is left for an operator. Nothing
+/// is moved or deleted here: a copy whose record can't be written is left in place and
+/// logged, since the node can't tell, at start, what else the record's failure hides.
+pub(super) fn record_installed(
+    epochs: &super::epochs::Epochs,
+    store: &staged::StagedStore,
+    location: impl Fn(&DatabaseName) -> std::path::PathBuf,
+) {
+    for key in store.installed_keys() {
+        let name = &key.fork.name;
+        if !epochs.never_recorded(name) || !location(name).exists() {
+            continue;
+        }
+        match epochs.record_install(name, key.fork.incarnation.get(), None) {
+            Ok(()) => {
+                tracing::warn!(target: "fleetringd::audit", fork = %key.fork, attempt = key.attempt, "recorded an installed staged copy a crash left unrecorded");
+            }
+            Err(error) => {
+                tracing::error!(fork = %key.fork, %error, "can't record an installed staged copy a crash left unrecorded; left it in place");
+            }
+        }
+    }
+}
+
 /// How a node installs a staged copy as its copy of the fork.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstallAs {
-    /// As the fork's first primary, which opens it at its position.
-    Primary,
+    /// As the fork's first primary, under its first lease at `epoch`, which opens it at its
+    /// position.
+    Primary {
+        /// The first lease's epoch.
+        epoch: LeaseEpoch,
+    },
     /// As a follower of the fork's primary, which streams the fork's own epoch on from there.
     Follower,
 }
@@ -921,6 +1047,39 @@ impl super::Replication {
         self.inner.served.send_modify(|served| {
             served.remove(database);
         });
+    }
+
+    /// Closes `database`'s readiness gate unless it was opened under `lease` already, deciding
+    /// and closing under the lock an opening marks itself open under: an opening under `lease`
+    /// that finishes meanwhile either is seen open, or opens the gate after it was closed.
+    pub(crate) fn close_gate_unless_opened(&self, database: &DatabaseName, lease: GateLease) {
+        let opening = self
+            .inner
+            .forks
+            .opening
+            .lock()
+            .expect("fork opening lock poisoned");
+        if matches!(opening.get(database), Some(Opening::Open(opened)) if *opened == lease) {
+            return;
+        }
+        self.close_gate(database);
+        drop(opening);
+    }
+
+    /// Records that `database`'s gate opened under `lease`, and opens it, under the lock
+    /// [`close_gate_unless_opened`](Self::close_gate_unless_opened) decides under: a start under
+    /// another lease either closes the gate after this opened it, or sees it open under `lease`
+    /// and leaves it.
+    pub(crate) fn mark_opened_and_open(&self, database: &DatabaseName, lease: GateLease) {
+        let mut opening = self
+            .inner
+            .forks
+            .opening
+            .lock()
+            .expect("fork opening lock poisoned");
+        opening.insert(database.clone(), Opening::Open(lease));
+        self.open_gate(database);
+        drop(opening);
     }
 
     /// Opens `database`'s readiness gate: its primary here, if it has one, joins the databases
@@ -1010,6 +1169,53 @@ impl super::Replication {
             )),
             _ => Status::internal(format!("can't move the staged copy into place: {error}")),
         })?;
+        // Recorded at once, before anything is served: a copy in place that no record names
+        // would be unknown to a drop notice, an orphan check, and `orphan remove`, and a new
+        // database of the name would open it as its own.
+        let lease = match install {
+            InstallAs::Primary { epoch } => Some(epoch.get()),
+            InstallAs::Follower => None,
+        };
+        let recorded = {
+            let inner = Arc::clone(inner);
+            let database = database.clone();
+            let incarnation = key.fork.incarnation.get();
+            super::follower::blocking(inner.execution, move || {
+                inner.epochs.record_install(
+                    &database,
+                    incarnation,
+                    lease.map(|epoch| (epoch, &inner.node)),
+                )
+            })
+            .await?
+        };
+        match recorded {
+            Ok(()) => {}
+            Err(
+                error @ (super::epochs::EpochError::Stale { .. }
+                | super::epochs::EpochError::OtherHolder { .. }),
+            ) => {
+                // The record names an epoch at least the lease's, so the copy is known; the
+                // opening finds the lease superseded and serves nothing.
+                tracing::info!(fork = %key.fork, %error, "the installed copy's record names a newer lease already");
+            }
+            Err(error) => {
+                tracing::error!(fork = %key.fork, %error, "can't record the installed copy's incarnation and first lease; moving it back");
+                let location = inner.registry().location(database);
+                let undone = {
+                    let inner = Arc::clone(inner);
+                    let key = key.clone();
+                    super::follower::blocking(inner.execution, move || {
+                        inner.forks.store().uninstall(&key, &location)
+                    })
+                    .await?
+                };
+                if let Err(undo) = undone {
+                    tracing::error!(fork = %key.fork, %undo, "can't move an unrecorded installed copy back");
+                }
+                return Err(super::failover::epoch_status(error));
+            }
+        }
         let position = super::primary::held(sidecar.position.as_bytes().to_vec());
         let anchor = super::chain::Anchor::new(
             position.as_ref(),
@@ -1122,6 +1328,94 @@ mod tests {
             ..ForkConfig::default()
         };
         assert_eq!(admission_need(1_000, 926 << 30, &dev), 1_100 + (64 << 20));
+    }
+
+    /// #165: a fork made again under a dropped fork's name has its first lease at the epoch the
+    /// dropped fork's had. Its primary must not take the dropped fork's open gate for its own.
+    #[tokio::test]
+    async fn a_gate_opened_for_a_dropped_database_of_the_name_does_not_count() {
+        let forks = Forks::new(
+            Path::new("/nonexistent/state"),
+            crate::observe::ReplicationMetrics::default(),
+        );
+        let name: DatabaseName = "dst".parse().expect("a name");
+        let epoch = LeaseEpoch::new(1);
+        let dropped = GateLease {
+            incarnation: Some(Incarnation::new(0xd5d6)),
+            epoch,
+        };
+        let again = GateLease {
+            incarnation: Some(Incarnation::new(0xfd4c)),
+            epoch,
+        };
+        forks.mark_opened(&name, dropped);
+        assert!(forks.opened_at(&name, dropped));
+        assert!(
+            !forks.opened_at(&name, again),
+            "the same epoch of another incarnation"
+        );
+        let mut started = false;
+        forks.start_opening(&name, again, || {
+            started = true;
+            tokio::spawn(std::future::pending())
+        });
+        assert!(started, "the new incarnation's opening runs");
+        let mut twice = false;
+        forks.start_opening(&name, again, || {
+            twice = true;
+            tokio::spawn(async {})
+        });
+        assert!(!twice, "one opening per lease at a time");
+    }
+
+    /// A dropped name's gate state goes with its copy, and a lease on another database of the
+    /// name clears what an earlier one left: neither leaks, nor makes the name look like a fork's.
+    #[tokio::test]
+    async fn gate_state_goes_with_the_copy_or_another_incarnation() {
+        let forks = Forks::new(
+            Path::new("/nonexistent/state"),
+            crate::observe::ReplicationMetrics::default(),
+        );
+        let name: DatabaseName = "dst".parse().expect("a name");
+        let dropped = GateLease {
+            incarnation: Some(Incarnation::new(0xd5d6)),
+            epoch: LeaseEpoch::new(1),
+        };
+        let again = Incarnation::new(0xfd4c);
+
+        // The copy is dropped while a task opens its gate: the task stops, and nothing stays.
+        let (_keep, held) = tokio::sync::oneshot::channel::<()>();
+        let (running_tx, running) = tokio::sync::oneshot::channel::<()>();
+        forks.start_opening(&name, dropped, || {
+            tokio::spawn(async move {
+                let _running = running_tx;
+                let _never = held.await;
+            })
+        });
+        assert!(forks.tracks(&name));
+        forks.forget_opening(&name);
+        assert!(!forks.tracks(&name), "the dropped name's entry stays");
+        assert!(running.await.is_err(), "the opening task was stopped");
+
+        // A lease on the same database keeps the open gate; one on another database clears it.
+        forks.mark_opened(&name, dropped);
+        forks.close_gate(&name);
+        forks.forget_other_incarnation(&name, None);
+        forks.forget_other_incarnation(&name, dropped.incarnation);
+        assert!(forks.opened_at(&name, dropped), "the same incarnation");
+        assert!(forks.is_gated(&name), "the same incarnation keeps its gate");
+        forks.forget_other_incarnation(&name, Some(again));
+        assert!(!forks.is_gated(&name), "another incarnation's gate goes");
+        assert!(
+            !forks.tracks(&name),
+            "another incarnation's lease leaves it"
+        );
+
+        // A copy dropped before its reset leaves no closed gate behind.
+        forks.close_gate(&name);
+        forks.forget_opening(&name);
+        assert!(!forks.is_gated(&name));
+        assert!(!forks.tracks(&name));
     }
 
     #[test]

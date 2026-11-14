@@ -30,13 +30,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::{Action, Command, ControlConfig, DatabaseName, LeaseEpoch, State, apply};
+use fleetring_control::{
+    Action, Command, ControlConfig, DatabaseName, Incarnation, LeaseEpoch, State, apply,
+};
 
 use crate::MembershipView;
 use crate::changes::{ChangeRecord, RecordContent, unhex};
 use crate::control::CommandLog;
 use crate::engine::{Position, Value};
 use crate::replication::ChainHash;
+use crate::sim::history::excerpt;
 use crate::sim::workload::{Ack, History, Operation, OutcomeClass, Record, WRITES_TABLE};
 
 /// An invariant the checker enforces.
@@ -55,6 +58,11 @@ pub enum Invariant {
     AcknowledgedWritesReplicated,
     /// Every acknowledged write is in every read that began after it was acknowledged.
     AcknowledgedWritesRead,
+    /// Every write acknowledged before a promotion starts, or before a database's replica set
+    /// changes, is on a write quorum of the replica set a promotion fences then, so that a
+    /// quorum of that set holds it: a membership change that moves a replica set never leaves a
+    /// write acknowledged on the old set out of the new one's promotions (FR-102).
+    AcknowledgedWritesFenced,
     /// A refused write is on no replica and in no read.
     NoPhantomWrites,
     /// A read sees every write its own client had acknowledged when the read began.
@@ -122,6 +130,9 @@ impl fmt::Display for Invariant {
             Self::OnePrimaryPerEpoch => "one primary per epoch",
             Self::AcknowledgedWritesReplicated => "acknowledged writes are on a write quorum",
             Self::AcknowledgedWritesRead => "acknowledged writes are in every later read",
+            Self::AcknowledgedWritesFenced => {
+                "acknowledged writes are on a write quorum of every later replica set promotions fence"
+            }
             Self::NoPhantomWrites => "no phantom writes",
             Self::ReadYourWrites => "read your writes",
             Self::MonotonicReads => "monotonic reads",
@@ -254,8 +265,48 @@ pub fn ring_converged<'a>(
     Ok(())
 }
 
-/// Who held each database's lease at each epoch: what control granted, by database and epoch.
-pub type LeaseHolders = BTreeMap<(DatabaseName, LeaseEpoch), NodeId>;
+/// Who held each database's lease at each epoch: what control granted, by database name, the
+/// database's incarnation, and epoch. A database created again under a dropped one's name starts
+/// its epochs over (ADR-0046, point 1), so one name's epoch names a holder per incarnation.
+pub type LeaseHolders = BTreeMap<(DatabaseName, Incarnation, LeaseEpoch), NodeId>;
+
+/// When each drop of a name was acknowledged, from a [`History`]: what separates one database of
+/// the name from another created again under it, which starts its epochs over (ADR-0046, point
+/// 1). The history doesn't say which database of a name an operation or a lease event was for, so
+/// the checks that hold an epoch to one node hold it only among those sent, or seen, between the
+/// same two acknowledged drops of the name. A drop whose answer was lost separates nothing, so
+/// the checks stay strict where they can't tell.
+#[derive(Debug, Default)]
+struct Drops<'h> {
+    acknowledged: BTreeMap<&'h DatabaseName, Vec<Duration>>,
+}
+
+impl<'h> Drops<'h> {
+    /// The acknowledged drops in `history`.
+    fn new(history: &'h History) -> Self {
+        let mut drops = Self::default();
+        for record in history.records() {
+            if let (Operation::Drop { database }, Some(Ack::Dropped)) =
+                (record.operation(), record.outcome().ack())
+            {
+                drops
+                    .acknowledged
+                    .entry(database)
+                    .or_default()
+                    .push(record.completed_at());
+            }
+        }
+        drops
+    }
+
+    /// How many drops of `database` were acknowledged before `at`: which database of the name
+    /// something sent or seen at `at` can be for, counting from the first.
+    fn before(&self, database: &DatabaseName, at: Duration) -> usize {
+        self.acknowledged.get(database).map_or(0, |dropped| {
+            dropped.iter().filter(|dropped| **dropped < at).count()
+        })
+    }
+}
 
 /// Checks that no node deleted a copy of a database the control log never dropped or expired
 /// (ADR-0042): every node its lease watcher in `history` saw serving such a database still holds
@@ -392,7 +443,11 @@ fn record_holders(state: &State, holders: &mut LeaseHolders) {
     for database in state.databases() {
         if let Some(lease) = database.lease() {
             holders
-                .entry((database.name().clone(), lease.epoch()))
+                .entry((
+                    database.name().clone(),
+                    database.incarnation(),
+                    lease.epoch(),
+                ))
                 .or_insert_with(|| lease.holder().clone());
         }
     }
@@ -421,7 +476,12 @@ pub fn acknowledged_control_survives(state: &State, history: &History) -> Result
         .collect();
     for (operation, ack) in history.acknowledged() {
         match (operation, ack) {
-            (Operation::Join { node } | Operation::JoinWith { node, .. }, Ack::Joined { .. }) => {
+            (
+                Operation::Join { node }
+                | Operation::JoinWith { node, .. }
+                | Operation::JoinWithout { node, .. },
+                Ack::Joined { .. },
+            ) => {
                 if state.member(node).is_none() && !leaving.contains(&node) {
                     return Err(violation(format!("acknowledged member {node} is lost")));
                 }
@@ -488,6 +548,11 @@ fn check_lease(
 /// Lease holders come from granted and renewed leases and from data-plane creations; primaries
 /// from the node and epoch each acknowledged write reports.
 ///
+/// An epoch names one primary only within one database of the name: a database created again
+/// under a dropped one's name, a fork made again among them, starts its epochs over (ADR-0046,
+/// point 1). So an operation sent after a drop of the name was acknowledged is held only against
+/// the others sent after it.
+///
 /// # Errors
 ///
 /// [`Invariant::OnePrimaryPerEpoch`] naming the database, the epoch, and both holders.
@@ -524,9 +589,12 @@ impl PrimaryConflict<'_> {
     }
 }
 
-/// Finds the first pair of acknowledgements that name different primaries at one epoch.
+/// Finds the first pair of acknowledgements that name different primaries at one epoch of one
+/// database of the name: of those sent between the same two acknowledged drops of it.
 pub(crate) fn conflicting_primaries(history: &History) -> Option<PrimaryConflict<'_>> {
-    let mut holders: BTreeMap<(&DatabaseName, LeaseEpoch), (&NodeId, &Record)> = BTreeMap::new();
+    let drops = Drops::new(history);
+    let mut holders: BTreeMap<(&DatabaseName, usize, LeaseEpoch), (&NodeId, &Record)> =
+        BTreeMap::new();
     for record in history.records() {
         let Some(ack) = record.outcome().ack() else {
             continue;
@@ -555,7 +623,10 @@ pub(crate) fn conflicting_primaries(history: &History) -> Option<PrimaryConflict
             ) => (database, node, *epoch),
             _ => continue,
         };
-        let (holder, first) = *holders.entry((database, epoch)).or_insert((node, record));
+        let incarnation = drops.before(database, record.invoked_at());
+        let (holder, first) = *holders
+            .entry((database, incarnation, epoch))
+            .or_insert((node, record));
         if holder != node {
             return Some(PrimaryConflict {
                 database,
@@ -574,12 +645,16 @@ pub(crate) fn conflicting_primaries(history: &History) -> Option<PrimaryConflict
 /// control granted, `holders` (FR-042):
 ///
 /// - a node reports holding a database, in a snapshot or as gained, only at an epoch control
-///   leased to that node;
+///   leased to that node, in some database of the name;
 /// - no two nodes report holding a database at one epoch;
 /// - each node's events for a database arrive in epoch order;
 /// - every epoch a node acknowledged writes under, as the history records them, was reported
 ///   held or gained by that node, since a node reports a lease before it acknowledges a write
 ///   under it.
+///
+/// The second and third hold within one database of the name: among the events seen between the
+/// same two acknowledged drops of it, since a database created again under the name starts its
+/// epochs over (ADR-0046, point 1).
 ///
 /// # Errors
 ///
@@ -590,16 +665,28 @@ pub fn lease_events_match_control(
 ) -> Result<(), Violation> {
     let violation = |detail: String| Violation::new(Invariant::LeaseEventsMatchControl, detail);
     let observations = history.lease_observations();
-    let mut reported: BTreeMap<(&DatabaseName, LeaseEpoch), &str> = BTreeMap::new();
-    let mut last_epoch: BTreeMap<(&str, &DatabaseName), LeaseEpoch> = BTreeMap::new();
+    let drops = Drops::new(history);
+    // Each name's holders at each epoch, one per database of the name that leased it.
+    let mut leased: BTreeMap<(&DatabaseName, LeaseEpoch), BTreeSet<&NodeId>> = BTreeMap::new();
+    for ((database, _, epoch), holder) in holders {
+        leased.entry((database, *epoch)).or_default().insert(holder);
+    }
+    let mut reported: BTreeMap<(&DatabaseName, usize, LeaseEpoch), &str> = BTreeMap::new();
+    let mut last_epoch: BTreeMap<(&str, &DatabaseName, usize), LeaseEpoch> = BTreeMap::new();
     for observation in observations {
-        let key = (observation.database(), observation.epoch());
+        let incarnation = drops.before(observation.database(), observation.at());
+        let key = (observation.database(), incarnation, observation.epoch());
         if observation.is_holding() {
-            match holders.get(&(observation.database().clone(), observation.epoch())) {
-                Some(holder) if holder.as_str() == observation.node() => {}
-                Some(holder) => {
+            match leased.get(&(observation.database(), observation.epoch())) {
+                Some(leased)
+                    if leased
+                        .iter()
+                        .any(|holder| holder.as_str() == observation.node()) => {}
+                Some(leased) => {
+                    let leased: Vec<String> = leased.iter().map(ToString::to_string).collect();
                     return Err(violation(format!(
-                        "{observation}: control leased that epoch to {holder}"
+                        "{observation}: control leased that epoch to {}",
+                        leased.join(", ")
                     )));
                 }
                 None => {
@@ -619,7 +706,7 @@ pub fn lease_events_match_control(
                 }
             }
         }
-        let order = (observation.node(), observation.database());
+        let order = (observation.node(), observation.database(), incarnation);
         if let Some(last) = last_epoch.get(&order)
             && observation.epoch() < *last
         {
@@ -775,6 +862,77 @@ pub fn acknowledged_writes_replicated(
                     "acknowledged write {value} to {database} is on {holders:?}, fewer than {required} replicas"
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that every write to one of `databases` that `history` says was acknowledged, at or
+/// before a moment the fleet saw a promotion of its database start, or its replica set change
+/// in control state, was then held by at least the write quorum of the replica set promotions
+/// fence from then on. A promotion fences a quorum Q of that set and adopts the most advanced
+/// log among it, and W + Q > R, so such a write reaches a fenced member; a write held by fewer
+/// may be lost (ADR-0018, point 4; FR-102). A replica set changes only when control state
+/// releases a kept set, once placement's write quorum holds the log, so the check holds at
+/// every change too; the caller records changes only while the `handover` feature is enabled,
+/// since before it a membership change moves a replica set at once (ADR-0031, amendment 2).
+///
+/// Databases whose acknowledged writes may be lost by design (`local` acknowledgements) are left
+/// out by the caller.
+///
+/// # Errors
+///
+/// [`Invariant::AcknowledgedWritesFenced`] naming the first write held by too few members of a
+/// replica set, with the write's record as the excerpt.
+pub fn acknowledged_writes_fenced(
+    history: &History,
+    databases: &BTreeSet<DatabaseName>,
+) -> Result<(), Violation> {
+    for seen in history.fenced() {
+        if !databases.contains(&seen.database) {
+            continue;
+        }
+        for record in history.records() {
+            let (Operation::Write { database, value }, Some(Ack::Written { .. })) =
+                (record.operation(), record.outcome().ack())
+            else {
+                continue;
+            };
+            if *database != seen.database || record.completed_at() > seen.at {
+                continue;
+            }
+            let holders: Vec<&NodeId> = seen
+                .replica_set
+                .iter()
+                .filter(|node| {
+                    seen.rows
+                        .get(node.as_str())
+                        .is_some_and(|rows| rows.contains(value))
+                })
+                .collect();
+            if holders.len() < seen.write_quorum {
+                let everywhere: Vec<&str> = seen
+                    .rows
+                    .iter()
+                    .filter(|(_, rows)| rows.contains(value))
+                    .map(|(host, _)| host.as_str())
+                    .collect();
+                let what = match seen.promotion {
+                    Some(epoch) => format!("that the promotion to epoch {epoch} fences"),
+                    None => "that control state changed to".to_owned(),
+                };
+                return Err(Violation::new(
+                    Invariant::AcknowledgedWritesFenced,
+                    format!(
+                        "write {value} to {database}, acknowledged at {} ms, is on {holders:?} of the replica set {:?} {what}, seen at {} ms: fewer than its write quorum of {}; the hosts holding it are {everywhere:?}",
+                        record.completed_at().as_millis(),
+                        seen.replica_set,
+                        seen.at.as_millis(),
+                        seen.write_quorum,
+                    ),
+                )
+                .with_excerpt(excerpt(history, &[record.id()])));
+            }
         }
     }
     Ok(())
@@ -1109,8 +1267,10 @@ mod tests {
 
     use fleetring::ReplicationFactor;
     use fleetring_control::{Action, Command, Member, Millis, Timestamp};
+    use tonic::Code;
 
     use super::*;
+
     use crate::sim::workload::{LeaseObservation, LeaseSeen, Outcome};
 
     fn acknowledged(operation: Operation, ack: Ack) -> (Operation, Outcome) {
@@ -1209,9 +1369,18 @@ mod tests {
     }
 
     fn written_by(value: i64, primary: &str, epoch: u64) -> (Operation, Outcome) {
+        written_by_on("db", value, primary, epoch)
+    }
+
+    fn written_by_on(
+        database: &str,
+        value: i64,
+        primary: &str,
+        epoch: u64,
+    ) -> (Operation, Outcome) {
         acknowledged(
             Operation::Write {
-                database: "db".parse().expect("name"),
+                database: database.parse().expect("name"),
                 value,
             },
             Ack::Written {
@@ -1269,6 +1438,43 @@ mod tests {
         assert_eq!(violation.invariant(), Invariant::ReplicasConverged);
     }
 
+    /// #157's history: a write acknowledged by n1 and n3 on the replica set {n1, n2, n3}, then a
+    /// promotion that fences {n1, n2, n5}, which only n1 of holds it.
+    #[test]
+    fn a_write_on_too_few_members_of_a_promotions_replica_set_is_a_violation() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let node = |id: &str| -> NodeId { id.parse().expect("id") };
+        let mut history = History::default();
+        history.push(written(157));
+        let mut rows = ReplicaRows::new();
+        rows.insert("n1".into(), BTreeSet::from([157]));
+        rows.insert("n2".into(), BTreeSet::new());
+        rows.insert("n3".into(), BTreeSet::from([157]));
+        rows.insert("n5".into(), BTreeSet::new());
+        let promotion = |replica_set: &[&str]| crate::sim::workload::FencedSeen {
+            at: Duration::from_millis(5),
+            database: db.clone(),
+            promotion: Some(LeaseEpoch::new(2)),
+            replica_set: replica_set.iter().map(|id| node(id)).collect(),
+            write_quorum: 2,
+            rows: rows.clone(),
+        };
+        let databases = BTreeSet::from([db.clone()]);
+        let mut kept = history.clone();
+        kept.observe_fenced(promotion(&["n1", "n2", "n3"]));
+        assert_eq!(acknowledged_writes_fenced(&kept, &databases), Ok(()));
+        history.observe_fenced(promotion(&["n1", "n2", "n5"]));
+        let violation = acknowledged_writes_fenced(&history, &databases)
+            .expect_err("the write is out of reach");
+        assert_eq!(violation.invariant(), Invariant::AcknowledgedWritesFenced);
+        assert!(violation.detail().contains("write 157"), "{violation}");
+        // A database the caller leaves out, as one with `local` acknowledgements, isn't held to it.
+        assert_eq!(
+            acknowledged_writes_fenced(&history, &BTreeSet::new()),
+            Ok(())
+        );
+    }
+
     fn seen(node: &str, at: u64, epoch: u64, seen: LeaseSeen) -> LeaseObservation {
         LeaseObservation::new(
             node,
@@ -1283,8 +1489,14 @@ mod tests {
     fn lease_observations_are_held_to_the_leases_control_granted() {
         let db: DatabaseName = "db".parse().expect("name");
         let holders = LeaseHolders::from([
-            ((db.clone(), LeaseEpoch::new(1)), "a".parse().expect("id")),
-            ((db.clone(), LeaseEpoch::new(2)), "b".parse().expect("id")),
+            (
+                (db.clone(), Incarnation::LEGACY, LeaseEpoch::new(1)),
+                "a".parse().expect("id"),
+            ),
+            (
+                (db.clone(), Incarnation::LEGACY, LeaseEpoch::new(2)),
+                "b".parse().expect("id"),
+            ),
         ]);
         let mut history = History::default();
         history.observe_lease(seen("a", 1, 1, LeaseSeen::Held));
@@ -1327,6 +1539,74 @@ mod tests {
         );
     }
 
+    /// A database created again under a dropped one's name starts its epochs over: its watchers
+    /// may see another node hold its epoch 1 than the dropped database's. Within one database of
+    /// the name, an epoch still names one holder.
+    #[test]
+    fn lease_observations_of_a_name_created_again_restart_their_epochs() {
+        let db: DatabaseName = "db".parse().expect("name");
+        let holders = LeaseHolders::from([
+            (
+                (db.clone(), Incarnation::new(1), LeaseEpoch::new(1)),
+                "a".parse().expect("id"),
+            ),
+            (
+                (db.clone(), Incarnation::new(1), LeaseEpoch::new(2)),
+                "c".parse().expect("id"),
+            ),
+            (
+                (db.clone(), Incarnation::new(2), LeaseEpoch::new(1)),
+                "b".parse().expect("id"),
+            ),
+        ]);
+        let refused = (
+            Operation::Drop { database: db },
+            Outcome::Rejected {
+                code: Code::FailedPrecondition,
+                message: "refused".to_owned(),
+            },
+        );
+        let mut before = History::default();
+        before.observe_lease(seen("a", 1, 1, LeaseSeen::Held));
+        before.observe_lease(seen("c", 10, 2, LeaseSeen::Gained));
+        before.observe_lease(seen("c", 20, 2, LeaseSeen::Lost));
+
+        let mut history = before.clone();
+        record_at(&mut history, 40, 50, dropped("db"));
+        history.observe_lease(seen("b", 60, 1, LeaseSeen::Gained));
+        assert_eq!(lease_events_match_control(&history, &holders), Ok(()));
+
+        let mut stranger = history.clone();
+        stranger.observe_lease(seen("c", 70, 1, LeaseSeen::Gained));
+        let violation =
+            lease_events_match_control(&stranger, &holders).expect_err("c never held epoch 1");
+        assert!(
+            violation.detail().contains("leased that epoch to a, b"),
+            "{violation}"
+        );
+
+        // The dropped database's epoch-1 holder, seen holding the new one's epoch 1.
+        let mut twice = history.clone();
+        twice.observe_lease(seen("a", 70, 1, LeaseSeen::Gained));
+        let violation =
+            lease_events_match_control(&twice, &holders).expect_err("two holders of epoch 1");
+        assert!(
+            violation.detail().contains("b reported holding it too"),
+            "{violation}"
+        );
+
+        // A drop that wasn't acknowledged separates nothing.
+        let mut unseparated = before;
+        record_at(&mut unseparated, 40, 50, refused);
+        unseparated.observe_lease(seen("b", 60, 1, LeaseSeen::Gained));
+        let violation = lease_events_match_control(&unseparated, &holders)
+            .expect_err("two holders of epoch 1 without a drop");
+        assert!(
+            violation.detail().contains("a reported holding it too"),
+            "{violation}"
+        );
+    }
+
     #[test]
     fn chains_that_differ_at_a_common_position_are_a_violation() {
         let db: DatabaseName = "db".parse().expect("name");
@@ -1347,6 +1627,80 @@ mod tests {
         assert_eq!(violation.invariant(), Invariant::ChainAgrees);
         assert!(violation.detail().contains("a holds"), "{violation}");
         assert!(violation.detail().contains("d holds"), "{violation}");
+    }
+
+    /// Records `operation`, sent at `invoked_ms` and answered with `outcome` at `completed_ms`.
+    fn record_at(
+        history: &mut History,
+        invoked_ms: u64,
+        completed_ms: u64,
+        (operation, outcome): (Operation, Outcome),
+    ) {
+        history.record(
+            "client",
+            Duration::from_millis(invoked_ms),
+            Duration::from_millis(completed_ms),
+            operation,
+            outcome,
+        );
+    }
+
+    fn dropped(database: &str) -> (Operation, Outcome) {
+        acknowledged(
+            Operation::Drop {
+                database: database.parse().expect("name"),
+            },
+            Ack::Dropped,
+        )
+    }
+
+    /// A database created again under a dropped one's name, a fork made again among them, starts
+    /// its epochs over: its epoch 1 may be another node's than the dropped database's was.
+    #[test]
+    fn a_name_created_again_after_a_drop_restarts_its_epochs() {
+        let mut history = History::default();
+        record_at(&mut history, 0, 10, lease("dst", "a", 1, 100));
+        record_at(&mut history, 20, 30, written_by_on("dst", 1, "a", 1));
+        record_at(&mut history, 40, 50, dropped("dst"));
+        record_at(&mut history, 60, 70, lease("dst", "b", 1, 200));
+        record_at(&mut history, 80, 90, written_by_on("dst", 2, "b", 1));
+        assert_eq!(one_primary_per_epoch(&history), Ok(()));
+
+        // Within the new database of the name, its epoch 1 still names one primary.
+        record_at(&mut history, 100, 110, written_by_on("dst", 3, "c", 1));
+        let violation = one_primary_per_epoch(&history).expect_err("two primaries");
+        assert!(violation.detail().contains("b and c"), "{violation}");
+    }
+
+    /// A drop separates only what was sent after it was acknowledged: two primaries at one epoch
+    /// on either side of a drop that wasn't acknowledged, of another name, or not yet answered
+    /// when the second was sent, are two primaries of one database.
+    #[test]
+    fn two_primaries_in_one_database_of_the_name_is_a_violation() {
+        let refused = (
+            Operation::Drop {
+                database: "dst".parse().expect("name"),
+            },
+            Outcome::Rejected {
+                code: Code::FailedPrecondition,
+                message: "refused".to_owned(),
+            },
+        );
+        let separators = [
+            (40, 50, refused),
+            (40, 50, dropped("other")),
+            (40, 75, dropped("dst")),
+        ];
+        for (invoked_ms, completed_ms, drop) in separators {
+            let mut history = History::default();
+            record_at(&mut history, 0, 10, lease("dst", "a", 1, 100));
+            record_at(&mut history, invoked_ms, completed_ms, drop.clone());
+            record_at(&mut history, 60, 80, written_by_on("dst", 1, "b", 1));
+            let violation = one_primary_per_epoch(&history)
+                .expect_err(&format!("two primaries across {drop:?}"));
+            assert_eq!(violation.invariant(), Invariant::OnePrimaryPerEpoch);
+            assert!(violation.detail().contains("a and b"), "{violation}");
+        }
     }
 
     #[test]

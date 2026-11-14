@@ -217,11 +217,29 @@ pub(crate) fn revoke_key(key_id: &str, place: &Place) -> Prompt {
     }
 }
 
+/// What `token revoke --principal` asks: it ends tokens nobody listed, so the name is typed.
+pub(crate) fn revoke_principal(principal: &str, place: &Place) -> Prompt {
+    Prompt {
+        question: format!(
+            "revoke every token of '{principal}' and of every name below it ('{principal}.*') \
+             issued until now, {}?",
+            place.on()
+        ),
+        expect: Expect::Typed {
+            what: "the principal",
+            value: principal.to_owned(),
+        },
+        refusal: format!("pass --yes to revoke principal {principal} without a prompt"),
+        declined: format!("not revoking principal {principal}"),
+    }
+}
+
 /// What `agent remove` asks.
 pub(crate) fn remove_agent(id: &str, principal: &str, dir: &str, place: &Place) -> Prompt {
     Prompt {
         question: format!(
-            "remove agent '{id}' ({principal}) {}: revoke its token and delete {dir}?",
+            "remove agent '{id}' ({principal}) {}: revoke it and every agent below it, and delete \
+             {dir}?",
             place.on()
         ),
         expect: Expect::Typed {

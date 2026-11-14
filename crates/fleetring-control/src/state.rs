@@ -1,11 +1,13 @@
 //! Control state and the queries the control plane answers from it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fleetring::{BuildRingError, Epoch, Node, NodeId, ReplicationFactor, Ring};
 use serde::{Deserialize, Serialize};
 
 use crate::apply::{check_join_software, plan_promotion};
+use crate::delegation::apply::{self as delegations, Resend, Times};
+use crate::delegation::{Delegation, DelegationId, DelegationOperation, RateKey};
 use crate::fork::apply::{live_operation, resend};
 use crate::fork::{ForkState, OperationId, OperationRecord};
 use crate::{
@@ -53,6 +55,47 @@ pub struct State {
     /// until the first fork.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) fork_operations: BTreeMap<OperationId, OperationRecord>,
+    /// Recorded delegations, by delegation ID, until each is forgotten or revoked (ADR-0047,
+    /// point 6.1). Absent until the first delegation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) delegations: BTreeMap<DelegationId, Delegation>,
+    /// Delegation operations, by ID, separate from fork operations (ADR-0047, point 6.2).
+    /// Absent until the first delegation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) delegation_operations: BTreeMap<OperationId, DelegationOperation>,
+    /// The effective times of the commands each rate window counts, oldest first (ADR-0047,
+    /// point 6.2). Absent until the first delegation.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "rate_windows_as_pairs"
+    )]
+    pub(crate) rate_windows: BTreeMap<RateKey, VecDeque<Timestamp>>,
+}
+
+/// The rate windows as `[key, times]` pairs in key order: JSON map keys must be strings, and a
+/// [`RateKey`] is a structure.
+mod rate_windows_as_pairs {
+    use std::collections::{BTreeMap, VecDeque};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::Timestamp;
+    use crate::delegation::RateKey;
+
+    pub(super) fn serialize<S: Serializer>(
+        windows: &BTreeMap<RateKey, VecDeque<Timestamp>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(windows.iter())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<RateKey, VecDeque<Timestamp>>, D::Error> {
+        let pairs = Vec::<(RateKey, VecDeque<Timestamp>)>::deserialize(deserializer)?;
+        Ok(pairs.into_iter().collect())
+    }
 }
 
 /// A member with its liveness and its latest reports.
@@ -84,6 +127,9 @@ impl State {
             revocations: Revocations::new(),
             features: BTreeSet::new(),
             fork_operations: BTreeMap::new(),
+            delegations: BTreeMap::new(),
+            delegation_operations: BTreeMap::new(),
+            rate_windows: BTreeMap::new(),
         }
     }
 
@@ -192,7 +238,20 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn check_feature(&self, feature: Feature) -> Result<(), Rejection> {
+    /// Checks one fleet feature against the gate, as [`State::check_features`] checks each
+    /// feature an action needs: it passes if `feature` is enabled, or supported by every member,
+    /// live or down, of a fleet that has at least one.
+    ///
+    /// A control node asks it before it has built the command a request would propose, so that
+    /// a request for a feature the fleet can't use yet is refused before anything else is
+    /// resolved (ADR-0047, point 5.11).
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::FeatureUnsupported`] naming the first member, in ID order, that lacks the
+    /// feature while it isn't enabled; [`Rejection::FeatureWithoutMembers`] while it isn't
+    /// enabled and the fleet has no members.
+    pub fn check_feature(&self, feature: Feature) -> Result<(), Rejection> {
         if self.is_enabled(feature) {
             return Ok(());
         }
@@ -357,6 +416,102 @@ impl State {
         Some(resend(record, *operation, intent))
     }
 
+    /// Returns every recorded delegation, in ID order, including any past its `kept_until` that
+    /// nothing has pruned yet; [`Delegation::is_live`] tells which are live (ADR-0047, point
+    /// 6.1).
+    pub fn delegations(&self) -> impl ExactSizeIterator<Item = (&DelegationId, &Delegation)> {
+        self.delegations.iter()
+    }
+
+    /// Returns the delegation recorded as `id`, unless it is unknown or past its `kept_until` at
+    /// `at`, or at [`State::now`] if `at` is earlier.
+    #[must_use]
+    pub fn delegation(&self, id: &DelegationId, at: Timestamp) -> Option<&Delegation> {
+        let now = at.max(self.now);
+        self.delegations
+            .get(id)
+            .filter(|record| record.is_kept(now))
+    }
+
+    /// Returns delegation operation `operation`, unless it is unknown or past its `kept_until`
+    /// at `at`, or at [`State::now`] if `at` is earlier (ADR-0047, point 6.2).
+    #[must_use]
+    pub fn delegation_operation(
+        &self,
+        operation: &OperationId,
+        at: Timestamp,
+    ) -> Option<&DelegationOperation> {
+        let now = at.max(self.now);
+        self.delegation_operations
+            .get(operation)
+            .filter(|record| record.is_kept(now))
+    }
+
+    /// Returns every delegation operation, in ID order, including any past its `kept_until`
+    /// that nothing has pruned yet (ADR-0047, point 6.2).
+    pub fn delegation_operations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&OperationId, &DelegationOperation)> {
+        self.delegation_operations.iter()
+    }
+
+    /// Returns every rate window with the effective times it holds, oldest first, including
+    /// times out of their window that nothing has pruned yet (ADR-0047, point 6.2).
+    pub fn rate_windows(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&RateKey, impl ExactSizeIterator<Item = Timestamp> + '_)>
+    {
+        self.rate_windows
+            .iter()
+            .map(|(key, times)| (key, times.iter().copied()))
+    }
+
+    /// Answers `action` without applying it if it resends a known delegation operation: `None`
+    /// for any other action, including a `RecordDelegation` whose operation is unknown or past
+    /// its `kept_until`; otherwise the live delegation it recorded, with its ID, or why the
+    /// resend is refused. `at` is the stamp the command would carry.
+    ///
+    /// [`apply`](crate::apply) answers a resend the same way and changes nothing but the time.
+    /// The control node may ask first, so that it signs a resend without logging it (ADR-0047,
+    /// point 5.7).
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::OperationNotYours`] for another requester, revealing nothing about the
+    /// operation; [`Rejection::DelegationConflict`] for another canonical request with the
+    /// same ID, or for a copy of the caller's token signed by another key than the one the
+    /// delegation was minted from; [`Rejection::DelegationRevoked`] once a revocation tombstoned the operation or
+    /// the denylist refuses its delegation; and [`Rejection::DelegationExpired`] once the
+    /// delegation is no longer live.
+    #[must_use]
+    pub fn delegation_resend(
+        &self,
+        action: &Action,
+        at: Timestamp,
+    ) -> Option<Result<(&DelegationId, &Delegation), Rejection>> {
+        let Action::RecordDelegation {
+            operation,
+            requested_by,
+            request,
+            caller,
+            ..
+        } = action
+        else {
+            return None;
+        };
+        let times = Times {
+            at,
+            now: at.max(self.now),
+        };
+        let asked = Resend {
+            operation: *operation,
+            requested_by,
+            request,
+            caller_key: &caller.kid,
+        };
+        delegations::resend(self, times, &asked)
+    }
+
     /// Returns every database, in name order.
     pub fn databases(&self) -> impl ExactSizeIterator<Item = &Database> {
         self.databases.values()
@@ -392,6 +547,11 @@ impl State {
     /// fork keeps them until they are released, once its primary reports that placement's write
     /// quorum holds its log, and from then on it follows the ring like any database.
     ///
+    /// Any other database whose replica set a membership change moved while it had a lease
+    /// keeps the set it moved off, in its preference order ([`Database::kept_replicas`]), until
+    /// its primary reports that placement's write quorum holds its log (ADR-0031, amendment 2):
+    /// a membership change never changes the replica set promotions fence, only a release does.
+    ///
     /// # Errors
     ///
     /// Returns [`Rejection::UnknownDatabase`] if there is no such database, and
@@ -411,12 +571,15 @@ impl State {
                     ..
                 },
             ) => Ok(holders.iter().cloned().collect()),
-            _ => self.placed_replicas(db),
+            _ => match db.kept_replicas() {
+                Some(kept) => Ok(kept.to_vec()),
+                None => self.placed_replicas(db),
+            },
         }
     }
 
     /// Returns where placement puts `db`: the ring's replica set over all members, ignoring a
-    /// seeded fork's frozen holders.
+    /// seeded fork's frozen holders and a replica set a membership change kept.
     pub(crate) fn placed_replicas(&self, db: &Database) -> Result<Vec<NodeId>, Rejection> {
         let ring = self.ring().map_err(|_| Rejection::NoMembers)?;
         Ok(ring

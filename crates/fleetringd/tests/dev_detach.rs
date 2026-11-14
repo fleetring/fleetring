@@ -116,6 +116,24 @@ impl Machine {
         })
     }
 
+    /// A machine whose dev node finds its port taken, and the listener that takes it. The system
+    /// picks the port and the listener holds it from then on, so no other process can have it
+    /// between its being chosen and the node starting, as one [`port_pair`] only checked could.
+    fn with_port_taken() -> TestResult<(Self, TcpListener)> {
+        let taken = loop {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            // The admin listener takes the next port, so the last one leaves no room for it.
+            if listener.local_addr()?.port() < u16::MAX {
+                break listener;
+            }
+        };
+        let machine = Self {
+            root: tempfile::tempdir()?,
+            port: taken.local_addr()?.port(),
+        };
+        Ok((machine, taken))
+    }
+
     /// A machine whose dev node `dev -d` has started, with `env` in `dev -d`'s environment.
     /// A start that loses its port to another process begins again on another.
     fn started(env: &[(&str, &str)]) -> TestResult<(Self, Output)> {
@@ -311,9 +329,8 @@ fn the_log_has_no_colour_and_holds_the_banner() -> TestResult {
 
 #[test]
 fn a_child_that_fails_reports_the_log_tail() -> TestResult {
-    let machine = Machine::new()?;
-    // Taken, so the node can't serve on it.
-    let _taken = TcpListener::bind(("127.0.0.1", machine.port))?;
+    // The port is taken, so the node can't serve on it.
+    let (machine, _taken) = Machine::with_port_taken()?;
     let failed = machine.detach(&[])?;
     assert_eq!(failed.status.code(), Some(1), "{}", printed(&failed));
     let error = String::from_utf8_lossy(&failed.stderr);

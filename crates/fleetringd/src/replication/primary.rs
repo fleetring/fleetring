@@ -18,9 +18,10 @@ use tonic::metadata::MetadataValue;
 
 use super::chain::{Anchor, Chain, ChainHash, Links, LogRead};
 use super::follower::blocking;
+use super::handover::{Origin, RingFollowed, Staleness};
 use super::{
     FaultPoint, FollowerProgress, Inner, PRIMARY_METADATA_KEY, PrimaryRole, PrimaryStatus, Quorum,
-    Verified, chain, failed, refused,
+    Verified, chain, failed, placed_on, refused,
 };
 use crate::engine::{
     CheckpointMarker, EngineCapability, EngineError, FrameBatch, FrameSourceEngine, Position,
@@ -88,12 +89,26 @@ struct Shipped {
 /// Where the primary's chain stands.
 #[derive(Debug, Default)]
 enum ChainState {
-    /// [`drive`] is rebuilding it from the record and the log; batches ship without a hash.
+    /// A build from the record and the log is under way; batches ship without a hash.
     #[default]
     Loading,
     Ready(Chain),
-    /// A batch was published that the chain couldn't continue from; it is being rebuilt.
+    /// A batch was published that the chain couldn't continue from, or the last build failed:
+    /// the next stream batch, checkpoint, pass of [`drive`], snapshot, or seeding request
+    /// builds it again.
     Lost,
+}
+
+/// How one build of the chain from the record and the log ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// The chain is built.
+    Built,
+    /// The reads are stale, so the build reads again: a batch was published that the chain
+    /// they built doesn't reach, or a checkpoint started meanwhile.
+    Again,
+    /// The build failed, and the chain is lost, so that it is built again when next asked.
+    Failed,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -218,19 +233,40 @@ impl Primary {
         }
     }
 
-    /// Takes the rebuilt chain, unless a batch was published meanwhile that it doesn't reach:
-    /// then the rebuild starts over.
-    fn chain_built(&self, chain: Chain) -> Result<(), ()> {
+    /// Takes what a build read from the record and the log, which it began reading when
+    /// `checkpoints` checkpoints had started or ended and none ran.
+    ///
+    /// A checkpoint that started since may have restarted the log between the build's reads,
+    /// which then don't describe one log: neither the chain they built nor their failure counts,
+    /// and the build reads again. A build that failed otherwise leaves the chain lost, never
+    /// loading, so that it is built again when next asked, with no write needed to set it off
+    /// (#156).
+    fn chain_built(&self, built: Result<Chain, String>, checkpoints: u64) -> Rebuild {
         let mut state = self.lock();
-        if chain.tip().0 == state.committed.as_ref()
-            || state.chain_can_reach(&chain, state.committed.as_ref())
-        {
-            state.chain = ChainState::Ready(chain);
-            Ok(())
-        } else {
-            state.chain = ChainState::Lost;
-            Err(())
+        if state.checkpoints != checkpoints {
+            tracing::debug!(database = %self.name, "a checkpoint started while the chain was being built; reading the log again");
+            return Rebuild::Again;
         }
+        match built {
+            Ok(chain)
+                if chain.tip().0 == state.committed.as_ref()
+                    || state.chain_can_reach(&chain, state.committed.as_ref()) =>
+            {
+                state.chain = ChainState::Ready(chain);
+                Rebuild::Built
+            }
+            Ok(_) => Rebuild::Again,
+            Err(error) => {
+                tracing::warn!(database = %self.name, %error, "can't build the log's hash chain; building it again when next asked");
+                state.chain = ChainState::Lost;
+                Rebuild::Failed
+            }
+        }
+    }
+
+    /// Whether a build of the chain is under way, which ends with the chain built or lost.
+    pub(super) fn chain_loading(&self) -> bool {
+        matches!(self.lock().chain, ChainState::Loading)
     }
 
     /// Chains `batch`, which continues the log from `from`, and returns the hash at its end, or
@@ -321,12 +357,15 @@ impl Primary {
         }
     }
 
-    /// Marks the chain lost, so that it is rebuilt from its record and the log.
-    fn lose_chain(&self) {
+    /// Marks the chain lost, so that it is rebuilt from its record and the log. Returns whether
+    /// it was built: a chain that is loading or lost already is left as it is.
+    fn lose_chain(&self) -> bool {
         let mut state = self.lock();
-        if matches!(state.chain, ChainState::Ready(_)) {
+        let built = matches!(state.chain, ChainState::Ready(_));
+        if built {
             state.chain = ChainState::Lost;
         }
+        built
     }
 
     /// Whether the chain was lost and needs rebuilding; sets it loading if so.
@@ -950,9 +989,9 @@ pub(super) async fn checkpoint(
             // retained meanwhile, or never (#156).
             if let Some(engine) = frame_source(inner)
                 && !primary.link_retained(engine, Some(&marker.position))
+                && primary.lose_chain()
             {
                 tracing::warn!(database = %primary.name, position = %marker.position, "the chain doesn't reach the checkpoint; rebuilding it from the restarted log");
-                primary.lose_chain();
             }
             if !excluded.is_empty() {
                 tracing::warn!(
@@ -967,9 +1006,7 @@ pub(super) async fn checkpoint(
             }
             // A lost chain is rebuilt from the log the checkpoint restarted, whether or not a
             // stream runs to notice: a lone primary has none (#156).
-            if primary.take_lost() {
-                tokio::spawn(rebuild_chain(Arc::clone(inner), Arc::clone(primary)));
-            }
+            rebuild_lost_chain(inner, primary);
             Ok(marker)
         }
         Err(error) => {
@@ -1044,24 +1081,52 @@ pub(super) async fn chain_to(
     }
 }
 
+/// Brings the chain up to `target` as [`chain_to`] does, rebuilding it first, here, if it is
+/// lost. A snapshot or a fork's seeding request calls this, since it needs the hash at its
+/// position now, and the next pass of [`drive`] would only have it asked again.
+pub(super) async fn chain_to_rebuilt(
+    inner: &Inner,
+    primary: &Primary,
+    handle: &DatabaseHandle,
+    target: Option<&Position>,
+) -> bool {
+    if primary.take_lost() {
+        rebuild_chain(inner, primary).await;
+    }
+    chain_to(inner, primary, handle, target).await
+}
+
+/// Rebuilds the chain in a task of its own if it is lost.
+fn rebuild_lost_chain(inner: &Arc<Inner>, primary: &Arc<Primary>) {
+    if primary.take_lost() {
+        let inner = Arc::clone(inner);
+        let primary = Arc::clone(primary);
+        tokio::spawn(async move { rebuild_chain(&inner, &primary).await });
+    }
+}
+
 /// Rebuilds the primary's chain from its record and the log, as [`drive`] does when serving
-/// starts and [`publish`] does after a batch the chain couldn't reach.
-async fn rebuild_chain(inner: Arc<Inner>, primary: Arc<Primary>) {
-    let Ok(handle) = inner.registry().open(&primary.name).await else {
-        return;
-    };
+/// starts, and as a lost chain is when next asked for. Ends with the chain built, or lost if the
+/// build failed.
+///
+/// A checkpoint restarts the log, so the build reads only while none runs, and reads again if
+/// one started meanwhile. Never called from inside a checkpoint, which it would wait for.
+async fn rebuild_chain(inner: &Inner, primary: &Primary) {
+    let mut changes = primary.changed.subscribe();
     loop {
-        match load_chain(&inner, &primary, &handle).await {
-            Ok(chain) => {
-                if primary.chain_built(chain).is_ok() {
-                    return;
-                }
-                // A batch was published that the rebuilt chain doesn't reach: read again.
-            }
-            Err(error) => {
-                tracing::warn!(database = %primary.name, %error, "can't build the log's hash chain");
-                return;
-            }
+        let checkpoints = primary.checkpoints();
+        if checkpoints % 2 == 1 {
+            // A checkpoint's end bumps `changed`, whose sender lives as long as the primary.
+            let _ = changes.changed().await;
+            continue;
+        }
+        let built = match inner.registry().open(&primary.name).await {
+            Ok(handle) => load_chain(inner, primary, &handle).await,
+            Err(error) => Err(error.to_string()),
+        };
+        match primary.chain_built(built, checkpoints) {
+            Rebuild::Built | Rebuild::Failed => return,
+            Rebuild::Again => {}
         }
     }
 }
@@ -1075,6 +1140,9 @@ async fn load_chain(
     let Some(engine) = frame_source(inner) else {
         return Err("the engine isn't a frame source".to_owned());
     };
+    if inner.forks.faults().take_chain_build_failure() {
+        return Err("the fault hooks failed this build".to_owned());
+    }
     let recorded = {
         let chains = inner.chains.clone();
         let database = primary.name.clone();
@@ -1250,6 +1318,10 @@ fn fill_gap(
 
 /// Keeps one stream open to each follower in the database's replica set, as membership changes,
 /// and starts checkpoints that come due while nothing is published.
+///
+/// It also reads the database's replica sets from control state again, in a task of its own,
+/// whenever this node's ring is newer than the placement it counts, and while a membership
+/// change keeps the old replica set, so that it learns of the release (ADR-0031, amendment 2).
 pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
     match inner.registry().open(&primary.name).await {
         Ok(handle) => match handle.position().await {
@@ -1260,10 +1332,30 @@ pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
         },
         Err(error) => tracing::warn!(database = %primary.name, %error, "can't open the database"),
     }
-    rebuild_chain(Arc::clone(&inner), Arc::clone(&primary)).await;
+    rebuild_chain(&inner, &primary).await;
     let mut membership = inner.membership.clone();
     let mut streams: BTreeMap<NodeId, AbortOnDrop> = BTreeMap::new();
+    let mut reading: Option<AbortOnDrop> = None;
+    let mut last_read: Option<Instant> = None;
     loop {
+        let read_due = match inner.replica_sets_staleness(&primary.name) {
+            Staleness::Fresh => false,
+            Staleness::Periodic => {
+                last_read.is_none_or(|at| at.elapsed() >= inner.settings.retry_interval * 5)
+            }
+            // Not more than once per retry interval, so that a control node that can't answer
+            // isn't asked in a loop.
+            Staleness::Now => {
+                last_read.is_none_or(|at| at.elapsed() >= inner.settings.retry_interval)
+            }
+        };
+        if reading.is_none() && read_due {
+            last_read = Some(Instant::now());
+            reading = Some(AbortOnDrop(tokio::spawn(read_replica_sets(
+                Arc::clone(&inner),
+                Arc::clone(&primary),
+            ))));
+        }
         let quorum = inner.followers_of(&primary);
         primary.retain_followers(&quorum.followers, inner.clock.now());
         streams.retain(|node, _| quorum.followers.contains(node));
@@ -1278,15 +1370,60 @@ pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
             }
         }
         maybe_checkpoint(&inner, &primary, &quorum);
-        // Streams rebuild a chain they find lost; a lone primary has none to (#156).
-        if primary.take_lost() {
-            tokio::spawn(rebuild_chain(Arc::clone(&inner), Arc::clone(&primary)));
-        }
+        // Streams rebuild a chain they find lost; a lone primary has none to (#156). A build
+        // that failed is tried again here too, with no write needed to set it off.
+        rebuild_lost_chain(&inner, &primary);
         tokio::select! {
             changed = membership.changed() => if changed.is_none() {
                 time::sleep(inner.settings.retry_interval).await;
             },
             () = time::sleep(inner.settings.retry_interval * 5) => {}
+            () = read(&mut reading) => reading = None,
+        }
+    }
+}
+
+/// Waits for the read of the replica sets under way, if there is one, and forever otherwise.
+async fn read(reading: &mut Option<AbortOnDrop>) {
+    match reading {
+        Some(AbortOnDrop(task)) => {
+            let _ = task.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Reads the replica sets of `primary`'s database from control state and follows them, giving
+/// up after the acknowledgement timeout: the stream supervisor asks again on its next round.
+/// An answer without sets, from a control node that predates them, pins placement by the ring
+/// this node had when it asked, unless sets were followed meanwhile (ADR-0031, amendment 2).
+async fn read_replica_sets(inner: Arc<Inner>, primary: Arc<Primary>) {
+    let database = &primary.name;
+    let asked = inner.sets.generation(database);
+    let ring = inner.membership.view();
+    match time::timeout(inner.settings.ack_timeout, inner.authority.view(database)).await {
+        Ok(Ok(view)) => match view.sets {
+            Some(sets) => {
+                inner.sets.follow(database, sets, Origin::Asked);
+            }
+            None => {
+                let placed = ring
+                    .ring()
+                    .map_or_else(Vec::new, |ring| placed_on(ring, &primary));
+                if inner
+                    .sets
+                    .follow_ring(database, ring.epoch(), placed, asked)
+                    == RingFollowed::ReplacedSets
+                {
+                    tracing::warn!(database = %database, "the control plane no longer shows replica sets, as after a rollback; counting placement by the ring");
+                }
+            }
+        },
+        Ok(Err(status)) => {
+            tracing::debug!(database = %database, %status, "can't read the replica sets; will retry");
+        }
+        Err(_) => {
+            tracing::debug!(database = %database, "reading the replica sets timed out; will retry");
         }
     }
 }
@@ -1343,10 +1480,18 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
         Err(error) => return stream_failed(error),
     };
     let (outgoing, messages) = mpsc::channel(settings.max_in_flight.get() + 2);
+    // A follower that truncated back to the epoch's start may hold no hash there any more: it
+    // takes this one rather than lead a chain of its own until the next batch.
+    let epoch_start_chain = primary
+        .start
+        .as_ref()
+        .and_then(|start| primary.hash_at(Some(start)))
+        .map(|hash| hash.as_bytes().to_vec());
     let open = Message::Open(ReplicateOpen {
         database: primary.name.to_string(),
         epoch: primary.role.epoch.get(),
         epoch_start: primary.start.clone().map(Position::into_bytes),
+        epoch_start_chain,
     });
     if outgoing.send(message(open)).await.is_err() {
         return stream_failed("stream closed");
@@ -1421,9 +1566,7 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
                     }
                 }
             };
-            if primary.take_lost() {
-                tokio::spawn(rebuild_chain(Arc::clone(inner), Arc::clone(primary)));
-            }
+            rebuild_lost_chain(inner, primary);
             if in_flight.is_empty() {
                 deadline = Instant::now() + settings.stall_timeout;
             }
@@ -1595,4 +1738,54 @@ fn message(message: Message) -> ReplicateMessage {
 /// A position as the protocol carries it: empty bytes for an empty log.
 pub(super) fn held(bytes: Vec<u8>) -> Option<Position> {
     (!bytes.is_empty()).then(|| Position::from(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use fleetring::ReplicationFactor;
+    use fleetring_control::LeaseEpoch;
+
+    use super::*;
+
+    fn primary() -> Primary {
+        let role = PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(1));
+        Primary::new("db".parse().expect("a valid name"), role, None)
+    }
+
+    /// A build that a checkpoint started during reads the log again, whether its reads built a
+    /// chain or failed, since the checkpoint may have restarted the log between them (#156).
+    #[test]
+    fn a_build_a_checkpoint_raced_reads_again() {
+        let primary = primary();
+        let before = primary.checkpoints();
+        primary.begin_checkpoint(&[]).expect("no checkpoint runs");
+        let raced = Err("position 0020 does not fit the log".to_owned());
+        assert_eq!(primary.chain_built(raced, before), Rebuild::Again);
+        assert!(primary.chain_loading(), "the build goes on");
+        primary.end_checkpoint(Err(()), &[]);
+        assert_eq!(
+            primary.chain_built(Ok(Chain::genesis()), before),
+            Rebuild::Again
+        );
+        assert_eq!(
+            primary.chain_built(Ok(Chain::genesis()), primary.checkpoints()),
+            Rebuild::Built
+        );
+        assert!(primary.hash_at(None).is_some());
+    }
+
+    /// A build that fails with no checkpoint in between leaves the chain lost, not loading, so
+    /// that it is built again when next asked, with no write to set it off (#156).
+    #[test]
+    fn a_failed_build_leaves_the_chain_lost() {
+        let primary = primary();
+        let failed = Err("the log can't be read".to_owned());
+        assert_eq!(
+            primary.chain_built(failed, primary.checkpoints()),
+            Rebuild::Failed
+        );
+        assert!(!primary.chain_loading());
+        assert!(primary.take_lost(), "the next asker builds it again");
+        assert!(primary.chain_loading());
+    }
 }

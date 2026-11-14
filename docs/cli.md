@@ -10,7 +10,7 @@ Names come from the [lexicon](lexicon.md). A command, flag, column or JSON field
 
 The CLI is one of three surfaces over one client crate (ADR-0033). The TUI and the desktop app follow the same names, the same confirmation rules and the same output fields.
 
-This guide describes the 0.7.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet. Anything marked *planned for 0.8.0* is designed here and not built yet; [§15](#15-forks) describes `db fork` (ADR-0046), which is built in 0.8.0 (FR-086) and reaches `ready` once the fleet's members report the `fork` feature.
+This guide describes the 0.8.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet, and anything marked *planned* is designed here and not built yet. [§15](#15-forks) describes `db fork` (ADR-0046, FR-086), which reaches `ready` once the fleet's members report the `fork` feature, and [§16](#16-delegation) delegation (ADR-0047, FR-090 to FR-093), which works once they report `delegation`.
 
 ## 1. Structure: `fleetring <noun> <verb>`
 
@@ -49,16 +49,18 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `completions bash\|zsh\|fish\|powershell` | Prints a shell completion script |
 | Databases | `db create \| list \| show \| edit \| locate \| exec \| query \| verify \| restore \| drop` | Databases. `db restore` is the online restore into the fleet |
 | | `db watch <db> [--from <position>]` | Follows a database's row changes, one transaction per line (ADR-0045) |
-| | `db fork <source> <target> [--operation-id <id>] [--detach]` | *Planned for 0.8.0.* Makes a new database from another's current contents, and waits until it is ready (ADR-0046, §15) |
+| | `db fork <source> <target> [--operation-id <id>] [--detach]` | Makes a new database from another's current contents, and waits until it is ready (ADR-0046, §15) |
 | Fleet | `status [--node <id> \| --address <host:port>]` | Gives the fleet overview, or one data node's view |
 | | `node list \| drain \| undrain \| remove` | Members, with liveness, release, and drain state |
 | | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042) |
 | | `upgrade [--check \| --rollback \| --version <v>]` | Installs another release in place, once the release's `serve --check` accepts the node's configuration (ADR-0038) |
 | | `lease watch` | Follows the leases a data node holds |
 | Security | `cert init \| node \| client` | Creates the authority and issues certificates |
+| | `cert issuer --name <name> --dir <authority dir>` | Gives a control node its delegation issuer: a key and an issuer certificate (ADR-0047, §16) |
 | | `token issue \| revoke` | Issues and revokes bearer tokens. `--scope <action>:<pattern>` (repeated) or `fleet`, with six actions: `read`, `write`, `fork`, `admin`, `stream`, `grant` (ADR-0044, point 2; FR-088). A token carrying `fork` or `grant` is refused by nodes before 0.8, and `token issue` notes so |
 | Agents | `mcp [--agent <id>] [--read-only]` | Serves the Model Context Protocol on stdio as one principal (ADR-0041) |
-| | `agent add \| list \| show \| renew \| remove` | Manages agent identities: a certificate and a token scoped `admin:agent-<id>-*` and `stream:agent-<id>-*` per agent (ADR-0043, point 8; FR-081) |
+| | `agent add \| list \| show \| renew \| remove` | Manages agent identities: a certificate and a token scoped `admin:agent-<id>-*` and `stream:agent-<id>-*` per agent (ADR-0043, point 8; FR-081), and once every member reports `delegation`, the same on `agent-<id>.*` and `grant` on both (ADR-0047) |
+| | `agent delegate <child-id> [--scope <s>]… [--ttl <d>]` | Asks the control plane for a child agent's narrower, shorter-lived token, as its parent (ADR-0047, §16) |
 | Recovery | `archive show \| verify \| restore` | Archives. `archive restore` is the offline restore into a directory, with no fleet |
 
 ### Nouns, verbs and top-level commands
@@ -74,10 +76,11 @@ Groups are the headings `fleetring -h` prints them under (§9).
   | `edit` | change an item's settings, any number at once (`db edit`: description, labels, expiry, durability) | no |
   | `use` | make an item the current one (`context use`) | no |
   | `renew` | reissue an item's credentials before they expire (`agent renew`) | no |
+  | `delegate` | get a narrower, shorter-lived credential for a child, as its parent (`agent delegate`) | no |
   | `watch` | follow a stream until interrupted | no |
   | `verify` | check, and report only | no |
   | `restore` | build a new item from an archive, never over an existing one | no |
-  | `fork` | *planned for 0.8.0:* build a new database from another's current contents, never over an existing one (`db fork`) | no |
+  | `fork` | build a new database from another's current contents, never over an existing one (`db fork`) | no |
   | `drain` | move work off, keeping data | asks |
   | `undrain` | clear a drain mark, so the node takes work again | no |
   | `stop` | end a running process cleanly (`stop`, `dev stop`) | no |
@@ -91,7 +94,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
   - **`upgrade`**, which replaces this binary.
   - **`mcp`, a long-running process on stdio** (ADR-0041, point 8). It acts on many nouns, so it belongs under none.
   - **`completions`** and **`ui`** (*planned*, FR-057).
-- **Arguments** are for the thing the command acts on (`db drop <database>`, `archive restore <database>`, `agent add <id>`). Everything else is a flag. A command takes at most one positional kind, plus SQL and its parameters for `db exec` and `db query`. `db fork <source> <target>` (*planned for 0.8.0*) takes two of that one kind, source first, as `cp` does.
+- **Arguments** are for the thing the command acts on (`db drop <database>`, `archive restore <database>`, `agent add <id>`). Everything else is a flag. A command takes at most one positional kind, plus SQL and its parameters for `db exec` and `db query`. `db fork <source> <target>` takes two of that one kind, source first, as `cp` does.
 - **No aliases.** A command or flag has one spelling; a rename replaces it outright ([renames](#14-renames)). The exceptions are the compatibility names above, which are documented in `--help` and go in 1.0, and `switch`.
 
 ## 2. Flags
@@ -191,7 +194,7 @@ PS1='$(fleetring context current) $ '
   | `status` | `dev_mode`, `membership_epoch`, `ring_fingerprint`, and `members`, each as `node list` prints a node |
   | `status --node`, `status --address` | `node`, `membership_epoch`, `ring_fingerprint`; `databases`, each `database`, `role`, `lease_epoch` and `position`; `orphans`, each as `orphan list` prints one; `sinks`, each `sink`, `database`, `position`, `mark` (`replicated` or `local`), `acknowledged`, `backlog`, `failures`, `resets` and `last_error` |
   | `node list` | `nodes`, each `node`, `address`, `zone`, `host`, `weight`, `liveness`, `draining` and `release` |
-  | `db locate` | `database`; `placement`: `engine`, `lease_epoch`, `replication_factor`, `acks`, `min_replicas`, `primary`, `candidate`, `followers`, and `replicas`, each `node`, `address`, `liveness`, `reported_role` and `position`; `metadata`, as `db show` prints it, or `null` |
+  | `db locate` | `database`; `placement`: `engine`, `lease_epoch`, `replication_factor`, `acks`, `min_replicas`, `primary`, `candidate`, `followers`, `replicas`, each `node`, `address`, `liveness`, `reported_role` and `position`, and `placed_replicas`, where the ring places the database while that differs from `replicas` (a membership change kept the replica set, or a ready fork keeps its holders, until the hand-over; ADR-0031, amendment 2), else `null`; `metadata`, as `db show` prints it, or `null` |
   | `db list` | `databases`, each as `db locate` prints one, by name. The description's text is left out |
   | `db show` | `db locate`'s fields, with `metadata`: `description`, `description_by`, `labels`, `created_by`, `created_at`, `expires_at`, `expires_in_ms` and `version`; `schema`: `objects`, each `kind`, `name`, `table`, `definition`, `rows` and `rows_at_least`, and `truncated`; and `schema_unavailable` |
   | `db edit` | `database`, `durability` (`acks`, `min_replicas`, `current_acks`, `current_min_replicas`), `metadata` and `metadata_error` |
@@ -199,12 +202,13 @@ PS1='$(fleetring context current) $ '
   | `db verify` | `database`, `position`, `replicas` (each `node`, `chain_hash` and `error`), `chain_hash`, `agree`, `expected` and `unchanged` |
   | `lease watch` | one object per line: `event` (`held`, `gained` or `lost`), `node`, `database` and `lease_epoch` |
   | `db watch` | one object per transaction, per line: `database`; `start`, the position the transaction started from (`null` for the log's beginning); `position`, where `--from` resumes after it; `lease_epoch`, the serving primary's; and `changes`, each `table`, `operation` (`insert`, `update` or `delete`), `key`, `before`, `after` and `updated`. `key`, `before` and `after` are objects from column name to value in the table's column order, values as `db query` prints them; `before`, `after` and `updated` are `null` when the database's capture mode doesn't record them. Delivery across reconnections is at least once: drop a transaction whose `start` is before the last `position` kept |
-  | `db fork` (*planned for 0.8.0*) | `operation_id`, `database`, `incarnation`, `state`, `source`, `source_incarnation`, `position`, `chain_hash`, `failure`, `elapsed_ms`, and `placement`, as `db locate` prints it (§15) |
-  | `db locate`, `db list`, `db show`: fork fields (*planned for 0.8.0*) | `placement` gains `incarnation`; each database gains `fork`, `null` for a database no fork made; `metadata` gains `forked_from` (§15) |
+  | `db fork` | `operation_id`, `database`, `incarnation`, `state`, `source`, `source_incarnation`, `position`, `chain_hash`, `failure`, `elapsed_ms`, and `placement`, as `db locate` prints it (§15) |
+  | `db locate`, `db list`, `db show`: fork fields | `placement` gains `incarnation`; each database gains `fork`, `null` for a database no fork made; `metadata` gains `forked_from` (§15) |
   | `orphan list` | `orphans`, each `node`, `database`, `epoch`, `bytes`, `kind` (`database` or `staged`), and `incarnation`, `operation_id` and `attempt`, which are `null` for a database's copy |
   | `archive show` | `database`, `archive`, `latest`, `latest_archived_at`, `segments`, `segment_bytes`, `snapshots` (each `id`, `position`, `lease_epoch`, `taken_at`, `bytes` and `has_metadata`), `incomplete` and `unusable` |
   | `context list`, `context show` | `contexts`, each `name`, `current`, `fleet`, `control`, `tls_dir`, `ca`, `cert`, `key`, `as` and `token_file`; `show` prints one context alone |
-  | `agent list`, `agent show` | `agents`, each `id`, `principal`, `scopes`, `read_only`, `cert_expires_at`, `token_expires_at`, `issued_by` and `dir` |
+  | `agent list`, `agent show` | `agents`, each `id`, `principal`, `scopes`, `read_only`, `cert_expires_at`, `token_expires_at`, `issued_by` and `dir`; `parent`, `root`, `owner`, `delegation_id`, `issuer_key_id` and `operation_id`, `null` for a root agent; `cert_expires_at` is `null` for a child (§16) |
+  | `agent delegate` | `agent show`'s object for the child, with `capped` (§16) |
   | `dev status` | `running`, `pid`, `address`, `release`, `data_dir` and `log` |
   | `serve --check` | `config`, the file as given; `valid`; `node` and `role`, with the flags applied, or `null` if the file couldn't be read or parsed; and `problems`, each `field` (dotted, such as `admin.listen`, or `null`), `line` and `column` (from 1, or `null`) and `message`. The check stops at the first problem, as a start does |
 
@@ -250,11 +254,11 @@ fleetring: database 'notes' doesn't exist on fleet 'home'
 
 ## 7. Confirmation and `--yes`
 
-- **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost, and where: `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` name the fleet and the context, or the fleet and the control address when no context is in use. Irreversible actions ask for the name typed, not `y`. *Planned for 0.8.0:* dropping a fork that isn't ready also says that it cancels the fork in progress, and names the operation (§15).
+- **Destructive commands ask first** on a terminal. That covers dropping a database, removing a member, removing an orphan copy, removing an agent, revoking every token of a signing key, and re-initializing an authority. The prompt names what will be lost, and where: `drop database 'notes' on fleet 'home' (context 'home') and every replica's copy? type the name to confirm:`. `db drop`, `orphan remove`, `node remove`, `token revoke` and `agent remove` name the fleet and the context, or the fleet and the control address when no context is in use. Irreversible actions ask for the name typed, not `y`. Dropping a fork that isn't ready also says that it cancels the fork in progress, and names the operation (§15).
 - **`--yes` skips the question.** Without a terminal and without `--yes`, the command refuses with exit code 2 and says to pass `--yes`.
 - **`--dry-run`** shows what would change, where the command can know: a drain lists the databases it would hand over.
 - **Drain asks too** when the node holds a database's only replica, since that database is then unavailable until the node returns. A drain can be undone with `undrain`, so it asks for `y`.
-- **`token revoke --token-id`** doesn't ask, since a token expires on its own, at most 30 days after it was issued; it prints the fleet and the context on stderr and acts. `--key-id` asks, since every token the key signed stops working for good.
+- **`token revoke --token-id`** doesn't ask, since a token expires on its own, at most 30 days after it was issued; it prints the fleet and the context on stderr and acts. `--key-id` asks, since every token the key signed stops working for good. `--principal` asks for the name typed, since it ends every token of the principal and of every agent below it; `agent remove` of a child says that it ends every agent below the child too (§16).
 
 ## 8. Exit codes
 
@@ -263,7 +267,7 @@ Documented in `--help` and the man page, and the same for every command. One fun
 | Code | Meaning |
 |---|---|
 | 0 | Success. `dev -d` when the dev node already runs, `dev status` either way. |
-| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, an `upgrade` whose release refuses the node's configuration, or an agent with no identity outside dev mode. *Planned for 0.8.0:* a fork that failed, was cancelled, or was refused (§15). |
+| 1 | The command failed: a missing database, a failed precondition, a failed check (replicas that disagree in `db verify`, a configuration `serve --check` refuses), no node to `stop`, an `upgrade` whose release refuses the node's configuration, or an agent with no identity outside dev mode. A fork that failed, was cancelled, or was refused (§15). |
 | 2 | Usage: a bad flag or argument, a confirmation needed without a terminal, or `switch` with no name and no terminal. |
 | 3 | Authentication or authorization: `UNAUTHENTICATED` or `PERMISSION_DENIED`. |
 | 4 | Unavailable, and a retry may succeed: `UNAVAILABLE`, `DEADLINE_EXCEEDED`, no leader yet. |
@@ -500,6 +504,118 @@ Examples:
 
 The MCP server's `db_fork` tool, offered only with read-write access, is described in the daemon README's MCP section.
 
+## 16. Delegation
+
+*Built in 0.8.0* (FR-090 to FR-093, #140 to #143). ADR-0047 is the design it follows. The words are the [lexicon](lexicon.md)'s: *delegated agent* (in prose, a *child*), *root agent*, *delegation*, *delegation ID*, *delegation issuer*, *issuer certificate*, *lineage*, and *operation ID*. Every command here works only once the fleet's members report the `delegation` feature, and refuses before that with the `FeatureUnsupported` hint, naming the member and its release.
+
+### `cert issuer`
+
+```text
+fleetring cert issuer --name <name> [--ttl <duration>] --dir <authority dir> [--out <dir>]
+```
+
+It gives a control node its delegation issuer: a new Ed25519 key and an issuer certificate for `fleetring://<fleet>/issuer/<name>`, signed by the authority in `--dir`, where `ca.key` is.
+
+- **Its place.** It belongs to the `cert` noun, in the Security group, after `cert client`.
+- **`--name`** has the node ID grammar; by convention it is the control node's ID. Each control node gets its own.
+- **Files.** `issuer.<name>.crt` and `issuer.<name>.key` (`0600`), in `--out` (created `0700`) or `--dir`. Every run makes a new key, so running it again renews the certificate and rotates the key; the control node reloads both files without a restart. It writes over an existing pair through temporary names and renames the key into place before the certificate, so a control node that reloads between the two renames keeps the pair it had until its next check.
+- **`--ttl`** is 30 days by default, as for `cert node`, and at most 90 days; nodes refuse a longer issuer certificate.
+- **The result** names the two files and the two lines to add to the control node's configuration, `[control] issuer_cert` and `issuer_key`. The key is never printed.
+- **Dev mode** makes its own, `tls/issuer.dev.crt` and `.key`, at start, and replaces them, at start and while it runs, when fewer than 30 days remain; `cert issuer` isn't needed there.
+
+### `agent delegate`
+
+```text
+fleetring agent delegate <child-id> [--scope <scope>]… [--ttl <duration>] [--not-before <time>]
+    [--operation-id <id>] [-o table|json | --json]
+```
+
+It asks the control plane for a child's token, as the parent, and writes the child's identity. `42.c7` is a child of `42`, and `42.c7.r1` of `42.c7`.
+
+- **Its place.** It belongs to the `agent` noun, in the Agents group, after `agent add`. `delegate` is a verb of its own (§1's table).
+- **The parent** is `<child-id>` minus its last segment, and must be an identity in the agents directory: a root agent, or a child made earlier. The command acts as the parent, with the parent's token, over a direct connection (never a relay).
+- **The segment** is 1 to 32 lowercase letters, digits and `_`, and the child's principal, `agent-<child-id>`, is at most 64 bytes, at most 8 levels below the root.
+- **`--scope`** (repeatable) names exactly what the child gets. Each must be covered whole by the parent's scopes and its `grant` patterns, and must stay inside the root's databases, with any `grant` only below the child itself, or the command is refused, naming the first that doesn't. Without `--scope`, the child gets the parent's own actions on `agent-<child-id>-*`, among `admin` and `stream`: a read-only parent's child gets `read` and `stream`. The defaults hold no `grant`, so a default child can't delegate.
+- **`--ttl`** is how long the child's token lasts. Without it, 2 hours, or less if the parent's token ends sooner, and the result says `capped at the parent's expiry`. An explicit `--ttl` beyond the parent's remaining lifetime, over 24 hours, or under 1 minute is refused, never capped.
+- **`--not-before <time>`** (RFC 3339) starts the child's token later; by default it starts now. A time more than 30 seconds in the past, or more than 24 hours ahead, is refused.
+- **The operation ID comes first.** The command makes an operation ID, writes it to the child's directory as `operation` before it calls, and prints it on stderr unless `-q`. When the first reply is lost, or the control plane answers `UNAVAILABLE`, it sends the same request again under the same ID, up to 5 times within 60 s, and a resend never records a second delegation. Running the command again after a crash, which finds the directory holding `operation` but no `identity.toml`, reuses that ID. The token a resend returns has the same delegation ID and claims, and may be signed by another control node.
+- **`--operation-id <id>`** submits under an ID the caller chose, as `db fork`'s does (§15). The same ID with another child, other scopes, another `--ttl` or another `--not-before` is refused, naming the flag. An ID is kept until the delegation expires, plus 1 hour, or for 1 hour after the delegation is revoked; after that the same command records a new delegation.
+- **What it writes.** `<agents dir>/<child-id>/`, created `0700` under `.lock`: `token` (`0600`), then `identity.toml` last (version 2, `issued_by = "delegation"`, with `principal`, `owner`, `parent`, `root`, the scopes, `read_only`, `token_id` (the delegation ID), `token_expires_at`, `issuer_key_id`, and `operation`; `parent` and `root` are principals, `agent-42`, and there is no `cert_expires_at`). Once `identity.toml` holds the operation ID, the `operation` file is removed, so the directory holds only `.lock`, `token` and `identity.toml`. No certificate or key is written: the child connects with its root's certificate. A directory that already holds `identity.toml` is refused, with a hint to pick a fresh segment, or to run `agent renew <child-id>`.
+- **After a refusal.** A refusal records nothing, so the command removes `operation` and the next run asks under a new ID. Two answers keep it: the operation known with other flags (`ALREADY_EXISTS`), so the original flags can be given again, and a control plane that stays unavailable (exit 4).
+- **It prints** the child's effective scopes, its expiry, and the trusted-local-development line (the lexicon's [trusted local development](lexicon.md#trusted-local-development)).
+
+**Text result,** on stdout, as key and value lines:
+
+```text
+agent: 42.c7
+principal: agent-42.c7
+parent: 42
+root: 42
+owner: admin
+scopes: admin:agent-42.c7-*, stream:agent-42.c7-*
+token expires: 2026-11-11T12:15:00Z (capped at the parent's expiry)
+delegation: Zq3v0b8yTfKx1nH2aLmQwA
+operation: 4k7mxq…
+```
+
+**JSON result:** `{"agents": [<agent show's object for the child>]}` (below), with `capped`. The token is in neither result.
+
+**Refusals and their hints:**
+
+| Refusal | Hint |
+|---|---|
+| the parent's token can't delegate (no `kind`, from 0.7 or before every node ran 0.8) | `fleetring agent renew <parent>` |
+| the parent holds no `grant` over the child (`NoGrant`) | names the parent and the `grant` pattern it would need |
+| a requested scope isn't covered (`NotCovered`) | names the scope |
+| `--ttl` beyond the parent's remaining lifetime, over 24 h, or under 1 min | names the limit |
+| the child's directory exists | pick another segment, or `fleetring agent renew <child-id>` |
+| the fleet can't use `delegation` yet (`FeatureUnsupported`) | names the member and its release, and says to upgrade it |
+| the control node has no delegation issuer (`FAILED_PRECONDITION`) | `fleetring cert issuer --name <control node> --dir <authority dir>`, then `[control] issuer_cert` and `issuer_key` |
+| too many delegations: 256 live under the root (revoked ones don't count), 30 a minute from this parent or 60 from its lineage's delegated agents (never counting the root), or 8 levels (`RESOURCE_EXHAUSTED`) | names the limit, and that revoking a child frees its slot |
+| the child's name was revoked less than a second ago (`UNAVAILABLE`) | none; the command's resends retry it |
+| control time leads the control node's clock by more than 30 s (`UNAVAILABLE`) | retry later; the command's resends do |
+| the operation ID is known with another request | names the differing flag |
+
+**Exit codes** (§8): 0 on success; 1 when refused for any reason but scope; 2 for usage; 3 for a refused scope (`NoGrant`, `NotCovered`, or a child wider than its delegated parent's record), and for `UNAUTHENTICATED`, as for every command; 4 when the control plane stays unavailable after the resends, with the operation ID and the command that retries it in the hint; 130 on Ctrl-C.
+
+### Using a child's identity
+
+- **`--agent 42.c7`** (or `FLEETRING_AGENT=42.c7`) means the root's TLS directory, `<agents dir>/42/`, as `agent-42`, with the child's token, `<agents dir>/42.c7/token`. It works on every client command, as `--agent` does (§3).
+- **`mcp --agent 42.c7`** serves as `agent-42.c7` with the child's token, and never mints. At start it names the parent, the owner and the expiry, and prints the trusted-local-development line. An expired child's refusal says: `ask the parent: fleetring agent renew 42.c7`.
+- **`agent add 42.c7`** is refused: `delegated agents are created by fleetring agent delegate`.
+- **No MCP tool delegates, renews or revokes,** and none returns a token.
+
+### `agent list`, `agent show`, `agent renew` and `agent remove` with children
+
+- **`agent list`** shows children under their parent, with a `PARENT` column (`-` for a root agent). **`agent list --fleet [--recorded-by <node-id>] [--since <time>]`** needs `fleet`, and lists the fleet's live delegation records instead of local directories, by the control node that recorded them and by when: the incident-response listing after a control node is compromised. The recording node is stamped by the leader, so a compromised leader could name another; after a compromise, list with `--since` over the whole time the node may have led, not only `--recorded-by`. Its table has the columns `PRINCIPAL`, `PARENT`, `DELEGATION`, `EXPIRES`, `RECORDED BY` and `RECORDED AT`; its JSON is `{"delegations": [...]}`, each with `principal`, `delegation_id`, `parent`, `chain` (`id` and `kid` for each ancestor, root first), `issued_at`, `expires_at`, `recorded_by` and `recorded_at`, from `fleetring_client::output`. **`agent show <id>`** adds, for a child, `parent`, `root`, `owner`, `delegation` (the delegation ID, which revokes it), `issuer key` (the ID of the key that signed this copy of the token), and `operation`.
+- **`agent renew <child-id>`** delegates again as the parent, with the scopes the identity records and a new operation ID, writes the new token, then revokes the old delegation ID. If that revocation is refused, the new token is kept and the command says when the old one expires. Renewing a parent never renews its children.
+- **`agent remove <child-id>`** revokes the child as a principal, `Revoked::Principal`, as its nearest local ancestor identity (the parent, or the root if the parent's directory is gone), which ends the child and every agent below it, then deletes its directory. It asks for the ID to be typed (§7), and says it ends every agent below the child too, naming those whose directories are here, which it leaves for `agent remove <id> --no-revoke`.
+- **`agent remove <root-id>`** works without the `fleet` scope: the agent revokes itself, both as a principal and by its own token ID, ending every agent below it. It prints when a replacement root token may be minted: 30 seconds after the revocation's time, which the reply carries; a token minted sooner is refused for as long as the principal's entry is kept (30 days). If the control plane refuses the agent's own revocation for a reason other than a scope, the command revokes the token ID alone with `fleet`, and says so. `--no-revoke` is unchanged. A principal revocation enables the `delegation` fleet feature, so on a fleet that hasn't enabled it yet this command closes rollback to 0.7; to remove a root agent without enabling it, run `agent remove <root-id> --no-revoke`, then `token revoke --token-id <id>` with `fleet`, which revokes its token alone; the ID is `token_id` in the agent's `identity.toml`, so read it first.
+
+**JSON:** `agent list` and `agent show` gain, for every agent, `owner`, and `parent`, `root`, `delegation_id`, `issuer_key_id` and `operation_id`, each `null` for a root agent; `parent` and `root` are agent IDs, as `id` is (`42`, not `agent-42`). `cert_expires_at` is `null` for a child, which has no certificate.
+
+### `token revoke --principal` and the ancestor rule
+
+```text
+fleetring token revoke (--token-id <id> | --key-id <id> | --principal <name>) [--yes]
+```
+
+- **`--principal <name>`** revokes every token of the principal issued until now, and every delegated agent's below it (`agent-42` ends `agent-42` and `agent-42.*`, never `agent-420`). The control node sets the moment; the command can't. For a root agent, a replacement token minted within 30 seconds of it is refused too, and the command prints when one may be minted; a delegated agent can be delegated again a second later. It asks for the name to be typed (§7), since it ends tokens nobody listed. With `fleet`, a name with older dotted names below it (`workload` and `workload.prod`) ends both, and the prompt says so.
+- **Without the `fleet` scope,** run as an agent (`--agent <id>`, on a direct connection; through a relay, only `--token-id` of the token it presents), it follows the ancestor rule: `--token-id` revokes the agent's own token or any recorded delegation below it, and `--principal` revokes the agent itself or any principal delegated below it. `--key-id` still needs `fleet`, and services can't use the rule. Anything else is refused with exit 3, naming the rule; an unknown token ID is `no live delegation with that token id`, revealing nothing about tokens outside the lineage. A revocation that would take the lineage past 1,024 live entries added this way by the root, or 1,024 by its delegated agents, or a caller past 30 a minute (60 for the lineage's delegated agents, which never stops the root), is refused with `RESOURCE_EXHAUSTED`. A refusal for the delegated agents' entries names the child whose subtree holds the most: revoking that child replaces them. A refusal for the root's own entries says to wait for them to expire, to revoke the root itself, or to ask an operator with `fleet`. A root agent's revocation of its own principal or of the root token it presents is never refused for a cap or a rate, and neither is a revocation of a principal that replaces entries below it, unless it would add entries to a root's full budget.
+
+### Help
+
+`agent delegate` is in the Agents group of `fleetring -h`, and `cert issuer` in the Security group, inside the 50-line budget (§9). `agent delegate --help` opens with examples:
+
+```text
+Examples:
+  fleetring agent delegate 42.c7                                   a child with the parent's actions on agent-42.c7-*
+  fleetring agent delegate 42.c7 --scope admin:agent-42.c7-* \
+      --scope fork:agent-42-memory                                 a child that may fork the parent's memory
+  fleetring db create agent-42.c7-scratch --agent 42.c7            act as the child
+  fleetring agent remove 42.c7                                     revoke the child and every agent below it
+```
+
 ## Where `fleetring` stands
 
 As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](plans/0.7.0-cli.md); FR-056 is #59, FR-075 is #103, and FR-079 is #114.
@@ -532,3 +648,4 @@ As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](
 | `db watch` | None; change streams reach only configured sinks. | Done in 0.8.0 (FR-075 item 7, ADR-0045): `db watch <db> [--from <position>]`, with `jsonl`. |
 | `db fork` | None. | Done in 0.8.0 (FR-086, ADR-0046): `db fork <source> <target>`, fork status in `db show` and `db list`, cancellation by `db drop`, and MCP `db_fork` (§15). |
 | `router` | None; applications speak the gRPC `Database` service. | Done in 0.8.0 (FR-066, ADR-0037): `router --config <file>` under "Getting started". |
+| Delegation | None; only the authority's key mints a token. | Done in 0.8.0 (FR-090 to FR-093, ADR-0047): `cert issuer`, `agent delegate`, children under `--agent`, lineage in `agent list` and `agent show`, `agent renew` and `agent remove` for children, and `token revoke --principal` with the ancestor rule (§16). |

@@ -4006,7 +4006,24 @@ mod expiry {
         }
         node.shutdown().await;
         let control = fleetringd::Daemon::start(config).await?;
+        let mut states = control.control().ok_or("no control handle")?.watch();
+        let started = states.borrow().now();
         switch.set(control.control_address().ok_or("no control address")?);
+        // Each data node's connections to the control plane that stopped fail as they notice it
+        // gone, and a call of the test's that a data node forwards meanwhile would fail with
+        // them: the fleet is ready once every data node has reached the new control plane.
+        let ids: Vec<fleetring::NodeId> = data
+            .iter()
+            .map(|daemon| daemon.config().node.id.clone())
+            .collect();
+        tokio::time::timeout(
+            super::HANG_GUARD,
+            states.wait_for(|state| {
+                ids.iter()
+                    .all(|id| state.last_heartbeat(id).is_some_and(|beat| beat > started))
+            }),
+        )
+        .await??;
         Ok(Fleet { control, data, tls })
     }
 
@@ -4176,12 +4193,20 @@ mod orphans {
     /// What a node reports as orphans: each database with its epoch, in name order.
     type Reported = Vec<(String, u64)>;
 
-    /// The orphans data daemon `id` reports in its node status.
-    async fn orphans_of(fleet: &Fleet, id: &str) -> Result<Reported, Box<dyn Error>> {
+    /// The node status of data daemon `id`.
+    async fn node_status(
+        fleet: &Fleet,
+        id: &str,
+    ) -> Result<fleetringd::data::NodeStatus, Box<dyn Error>> {
         let address = fleet.data_daemon(id)?.listen_address().to_string();
-        let status = Client::new(address.clone(), network(&fleet.tls)?)
+        Ok(Client::new(address.clone(), network(&fleet.tls)?)
             .node_status(&address)
-            .await?;
+            .await?)
+    }
+
+    /// The orphans data daemon `id` reports in its node status, each of some size on disk.
+    async fn orphans_of(fleet: &Fleet, id: &str) -> Result<Reported, Box<dyn Error>> {
+        let status = node_status(fleet, id).await?;
         assert!(
             status.orphans.iter().all(|orphan| orphan.bytes > 0),
             "{:?}",
@@ -4450,13 +4475,13 @@ mod orphans {
         // Admin on every database isn't enough: removing an orphan is a fleet operation.
         let signer = fleet.tls.authority().token_signer()?;
         let now = SystemClock.now();
-        let token = signer.issue(&TokenSpec {
-            principal: "tester".parse()?,
-            scopes: ["admin:*".parse()?].into_iter().collect(),
-            id: "no-fleet".parse()?,
-            not_before: now,
-            expires_at: now.saturating_add(fleetring_control::Millis::new(600_000)),
-        })?;
+        let token = signer.issue(&TokenSpec::new(
+            "tester".parse()?,
+            ["admin:*".parse()?].into_iter().collect(),
+            "no-fleet".parse()?,
+            now,
+            now.saturating_add(fleetring_control::Millis::new(600_000)),
+        ))?;
         let scoped = Client::new(
             address.clone(),
             network(&fleet.tls)?.with_credentials(Credentials::bearer(&token)?),
@@ -4563,14 +4588,16 @@ mod orphans {
         Ok(())
     }
 
-    /// Sends `DropCopy` for `database` at each of `epochs` to every data daemon, as the node
-    /// `data-1`'s certificate, as a stolen node key or a control node retrying late would, and
-    /// checks that each node refuses it: for its binding where control state holds the database
-    /// at that epoch or later, and as naming another incarnation than its copy's otherwise.
+    /// Sends `DropCopy` for `database` at each of `epochs`, naming `incarnation` if given, to
+    /// every data daemon, as the node `data-1`'s certificate, as a stolen node key or a control
+    /// node retrying late would, and checks that each node refuses it: for its binding where
+    /// control state holds the database the notice names, and as naming another incarnation than
+    /// its copy's otherwise.
     async fn drop_copy_refused_everywhere(
         fleet: &Fleet,
         database: &str,
         epochs: &[u64],
+        incarnation: Option<u64>,
     ) -> TestResult {
         let sender = fleet.tls.node_network("data-1")?;
         for id in DATA {
@@ -4580,6 +4607,7 @@ mod orphans {
                     .drop_copy(DropCopyRequest {
                         database: database.to_owned(),
                         epoch: *epoch,
+                        incarnation,
                         ..DropCopyRequest::default()
                     })
                     .await
@@ -4603,19 +4631,30 @@ mod orphans {
 
     /// A drop notice for a live database is refused, whatever epoch it names: the one its copies
     /// are at, since control state still holds the database there, or any other, since it names
-    /// no copy's incarnation. Nothing is deleted.
+    /// no copy's incarnation; and so is one that names the copies' own incarnation, at an epoch
+    /// past control state's (the FR-106 review's probe). Nothing is deleted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_forged_drop_notice_deletes_no_live_database() -> TestResult {
         let dir = tempfile::tempdir()?;
         let fleet = Fleet::start(dir.path()).await?;
         let client = fleet.client()?;
         create_noted(dir.path(), &client, "live", three()?).await?;
+        let live = name("live")?;
         let before = copies(dir.path(), "live");
+        let primary = client.locate(&live).await?.primary.ok_or("no primary")?;
+        let recorded = fleet
+            .data_daemon(primary.as_str())?
+            .replication()
+            .ok_or("no replication")?
+            .copy_incarnation(&live)
+            .ok_or("the primary's copy records no incarnation")?;
 
-        drop_copy_refused_everywhere(&fleet, "live", &[0, 1, 2, u64::MAX]).await?;
+        drop_copy_refused_everywhere(&fleet, "live", &[0, 1, 2, u64::MAX], None).await?;
+        drop_copy_refused_everywhere(&fleet, "live", &[1, 2, u64::MAX], Some(recorded.get()))
+            .await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(copies(dir.path(), "live"), before, "nothing was deleted");
-        insert_note(&client, &name("live")?, 4).await?;
+        insert_note(&client, &live, 4).await?;
         fleet.stop().await;
         Ok(())
     }
@@ -4644,10 +4683,89 @@ mod orphans {
         let before = copies(dir.path(), "reused");
         assert_eq!(before.len(), DATA.len(), "{before:?}");
 
-        drop_copy_refused_everywhere(&fleet, "reused", &[1, 2]).await?;
+        drop_copy_refused_everywhere(&fleet, "reused", &[1, 2], None).await?;
+        // A late retry names the dropped database's incarnation, which, before forks, is the
+        // new one's too.
+        let primary = location.primary.clone().ok_or("no primary")?;
+        let recorded = fleet
+            .data_daemon(primary.as_str())?
+            .replication()
+            .ok_or("no replication")?
+            .copy_incarnation(&reused)
+            .ok_or("the primary's copy records no incarnation")?;
+        drop_copy_refused_everywhere(&fleet, "reused", &[1, 2, u64::MAX], Some(recorded.get()))
+            .await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(copies(dir.path(), "reused"), before, "nothing was deleted");
         insert_note(&client, &reused, 4).await?;
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// FR-077: a late notice for an earlier database of the name, at the epoch this node's copy
+    /// is at, deletes nothing once control state no longer knows the name: the copy recorded its
+    /// own incarnation when this node led it, and the notice names another. A notice naming the
+    /// copy's own incarnation still deletes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_drop_notice_for_another_incarnation_keeps_the_copy() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "solo", ReplicationFactor::ONE).await?;
+        let solo = name("solo")?;
+        let primary = client.locate(&solo).await?.primary.ok_or("no primary")?;
+        let before = copies(dir.path(), "solo");
+        let recorded = fleet
+            .data_daemon(primary.as_str())?
+            .replication()
+            .ok_or("no replication")?
+            .copy_incarnation(&solo)
+            .ok_or("the primary's copy records no incarnation")?;
+
+        // Control state forgets the name, so it confirms a drop of it at any incarnation.
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[]).await?;
+        wait_until("the primary keeping its copy as an orphan", async || {
+            orphans_of(&fleet, primary.as_str())
+                .await
+                .is_ok_and(|orphans| orphans == [("solo".to_owned(), 1)])
+        })
+        .await?;
+        let address = fleet
+            .data_daemon(primary.as_str())?
+            .listen_address()
+            .to_string();
+        let sender = fleet.tls.node_network("data-1")?;
+        let notice = |incarnation: fleetring_control::Incarnation| DropCopyRequest {
+            database: "solo".to_owned(),
+            epoch: 1,
+            incarnation: Some(incarnation.get()),
+            operation: None,
+        };
+
+        let earlier = fleetring_control::Incarnation::new(recorded.get() ^ 1);
+        replication_client(sender.channel(&address)?)
+            .drop_copy(notice(earlier))
+            .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(copies(dir.path(), "solo"), before, "the copy is kept");
+        assert_eq!(
+            orphans_of(&fleet, primary.as_str()).await?,
+            [("solo".to_owned(), 1)]
+        );
+
+        replication_client(sender.channel(&address)?)
+            .drop_copy(notice(recorded))
+            .await?;
+        // The node deletes the copy's files before it stops listing the orphan, so it may list
+        // one of no size for a moment: the deletion is done once neither is left.
+        wait_until("the copy deleted", async || {
+            copies(dir.path(), "solo").is_empty()
+                && node_status(&fleet, primary.as_str())
+                    .await
+                    .is_ok_and(|status| status.orphans.is_empty())
+        })
+        .await?;
+        assert!(orphans_of(&fleet, primary.as_str()).await?.is_empty());
         fleet.stop().await;
         Ok(())
     }

@@ -8,7 +8,7 @@ fleetring\-agent\-renew \- Reissues an agent\*(Aqs certificate and token now, an
 .SH DESCRIPTION
 Reissues an agent\*(Aqs certificate and token now, and revokes the old token
 .PP
-An identity that holds exactly the scope 0.7 gave by default, `admin:agent\-<id>\-*` (or `read:agent\-<id>\-*` for a read\-only one), also gets `stream:agent\-<id>\-*`, today\*(Aqs default. Scopes chosen with `\-\-scope` are kept as they are.
+An identity that holds exactly the scope 0.7 gave by default, `admin:agent\-<id>\-*` (or `read:agent\-<id>\-*` for a read\-only one), also gets `stream:agent\-<id>\-*`, today\*(Aqs default. Once every node reports the `delegation` feature, an identity that holds exactly 0.7\*(Aqs or those defaults gets the defaults that let it delegate. Scopes chosen with `\-\-scope` are kept as they are. A delegated agent, such as `42.c7`, is delegated again by its parent with the scopes it records, and its old delegation ID revoked. Renewing an agent never renews the delegated agents below it, which the old token\*(Aqs revocation ends.
 .SH OPTIONS
 .TP
 \fB\-\-authority\fR \fI<DIR>\fR
@@ -70,7 +70,7 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 \fB\-\-agent\fR \fI<ID>\fR
 Acts as the agent with this ID, with the identity minted for it
 
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`
@@ -103,4 +103,4 @@ never: Never
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fIID\fR>
-The agent\*(Aqs ID
+The agent\*(Aqs ID, such as `42`, or a delegated agent\*(Aqs, such as `42.c7`

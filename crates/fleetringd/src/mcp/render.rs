@@ -701,6 +701,7 @@ mod tests {
                     reported_role: Some("primary"),
                     position: None,
                 }],
+                placed_replicas: None,
             },
             metadata: None,
             schema,

@@ -36,6 +36,10 @@ pub enum FaultPoint {
     /// A seeded fork's first live holder has checked its staged copy and hasn't asked for the
     /// fork's first lease yet: held, the fork stays seeded with no primary.
     FirstLease,
+    /// A seeded fork's first live holder has taken the fork's first lease and moved its staged
+    /// copy into place, and hasn't asked control state to confirm the lease yet: held, its
+    /// lease runs on while nothing is served.
+    ConfirmFirstLease,
     /// A fork's primary has opened its copy and hasn't run the fork-reset write yet.
     BeforeReset,
     /// A fork's primary reports its fork-reset write running, and hasn't run it yet. The write is
@@ -100,6 +104,11 @@ struct Hooks {
     disk: std::sync::Mutex<Option<(u64, u64)>>,
     /// Whether the control service fails the reply to the next fork request it applies.
     drop_reply: std::sync::atomic::AtomicBool,
+    /// Whether the control service answers `Locate` as a control node from before replica sets
+    /// were shown (0.7) does: without `placed_replicas` or `membership_epoch`.
+    hide_replica_sets: std::sync::atomic::AtomicBool,
+    /// Whether the next build of a primary's hash chain fails.
+    fail_chain_build: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "fault-hooks")]
@@ -114,6 +123,8 @@ impl ForkFaults {
                 passed: std::sync::Mutex::new(BTreeMap::new()),
                 disk: std::sync::Mutex::new(None),
                 drop_reply: std::sync::atomic::AtomicBool::new(false),
+                hide_replica_sets: std::sync::atomic::AtomicBool::new(false),
+                fail_chain_build: std::sync::atomic::AtomicBool::new(false),
             })),
         }
     }
@@ -222,6 +233,39 @@ impl ForkFaults {
             .is_some_and(|hooks| hooks.drop_reply.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    /// Makes the control service answer `Locate` as a control node from before replica sets
+    /// were shown (0.7) does, without `placed_replicas` or `membership_epoch`, while `hidden`:
+    /// how a scenario runs data nodes of this release under an older control node, and then
+    /// upgrades it (ADR-0031, amendment 2).
+    pub fn hide_replica_sets(&self, hidden: bool) {
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .hide_replica_sets
+                .store(hidden, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Makes the next build of a primary's hash chain from its record and its log fail, once,
+    /// as one whose reads a checkpoint restarted the log between did.
+    pub fn fail_next_chain_build(&self) {
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .fail_chain_build
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the next chain build is still to fail: `false` once the one
+    /// [`fail_next_chain_build`](Self::fail_next_chain_build) asked for has failed.
+    #[must_use]
+    pub fn fails_next_chain_build(&self) -> bool {
+        self.hooks.as_ref().is_some_and(|hooks| {
+            hooks
+                .fail_chain_build
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
     /// Makes the node believe its data volume holds `volume` bytes, of which `free` are free
     /// less what its data directory grows by from now on, in place of what the volume says.
     pub fn set_disk(&self, free: u64, volume: u64) {
@@ -286,6 +330,36 @@ impl ForkFaults {
                 hooks
                     .drop_reply
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
+            })
+        }
+        #[cfg(not(feature = "fault-hooks"))]
+        false
+    }
+
+    /// Whether this chain build is to fail; true once per
+    /// [`fail_next_chain_build`](Self::fail_next_chain_build).
+    pub(crate) fn take_chain_build_failure(&self) -> bool {
+        #[cfg(feature = "fault-hooks")]
+        {
+            self.hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .fail_chain_build
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            })
+        }
+        #[cfg(not(feature = "fault-hooks"))]
+        false
+    }
+
+    /// Whether the control service answers `Locate` without replica sets, as a 0.7 control node
+    /// does ([`hide_replica_sets`](Self::hide_replica_sets)).
+    pub(crate) fn hides_replica_sets(&self) -> bool {
+        #[cfg(feature = "fault-hooks")]
+        {
+            self.hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .hide_replica_sets
+                    .load(std::sync::atomic::Ordering::SeqCst)
             })
         }
         #[cfg(not(feature = "fault-hooks"))]

@@ -1,0 +1,9 @@
+# Written by fleetring. Edit it with `fleetring context`.
+version = 1
+current = "legacy"
+
+[contexts.legacy]
+fleet = "legacy"
+control = ["127.0.0.1:7400"]
+tls_dir = "TLS_DIR"
+as = "tester"

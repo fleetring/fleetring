@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
 
-use crate::common::{Fleet, TestResult, guarded, name, role, settings, sqlite};
+use crate::common::{Fleet, TestResult, eventually, guarded, name, put, role, settings, sqlite};
 
 fn open(database: &str, epoch: u64) -> ReplicateMessage {
     ReplicateMessage {
@@ -19,6 +19,7 @@ fn open(database: &str, epoch: u64) -> ReplicateMessage {
             database: database.to_owned(),
             epoch,
             epoch_start: None,
+            epoch_start_chain: None,
         })),
     }
 }
@@ -240,5 +241,72 @@ async fn self_replicating_engines_are_refused_cleanly() -> TestResult {
         status.message().contains("replicate themselves"),
         "{status:?}"
     );
+    Ok(())
+}
+
+/// A node whose replication stopped while its server still runs, as an in-process daemon's
+/// connections can outlive its server, applies no more of a primary's batches: its stream ends,
+/// and a stream opened to it again, like any replication call, is refused as unavailable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_node_follows_nothing_more() -> TestResult {
+    let fleet = Fleet::start(&["a", "b", "c"], sqlite(), settings(), BTreeMap::new()).await?;
+    let db = name("stopped");
+    fleet.create("a", &db, 3).await?;
+    let b = &fleet.node("b").replication;
+    let before = b.follower_status(&db).ok_or("b follows nothing")?.position;
+
+    b.stop();
+    let a = fleet.node("a");
+    for k in 1..=5 {
+        guarded("a write", a.registry().execute(&db, put(k, 100))).await??;
+    }
+    let primary = &a.replication;
+    let c = fleet.node("c").id.clone();
+    eventually("c acknowledging every write", || {
+        primary.primary_status(&db).is_some_and(|status| {
+            status
+                .followers
+                .iter()
+                .any(|follower| follower.node == c && follower.acknowledged == status.committed)
+        })
+    })
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        b.follower_status(&db).ok_or("b's slot is gone")?.position,
+        before,
+        "the stopped node applied a batch"
+    );
+
+    let (acks, status) = replicate(&fleet.address("b"), vec![open("stopped", 1)]).await?;
+    assert!(acks.is_empty());
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert!(status.message().contains("has stopped"), "{status:?}");
+    Ok(())
+}
+
+/// A copy nothing has recorded, as a restore builds before its first lease is confirmed, is
+/// deleted by `discard_unrecorded`; one a primary has streamed to, which recorded its epoch,
+/// is kept, since it may hold frames the primary counted (the FR-106 review).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_copy_nothing_recorded_is_discarded_unrecorded() -> TestResult {
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings(), BTreeMap::new()).await?;
+    let followed = name("followed");
+    fleet.create("a", &followed, 2).await?;
+    let b = fleet.node("b");
+    let place = |database: &str| b.root.join("databases").join(database);
+    assert!(place("followed").exists(), "b follows the database");
+    assert!(
+        !b.replication.discard_unrecorded(&followed).await?,
+        "a copy a stream recorded stays"
+    );
+    assert!(place("followed").exists());
+
+    let fresh = name("fresh");
+    b.registry().create(&fresh).await?;
+    b.registry().close(&fresh).await;
+    assert!(place("fresh").exists());
+    assert!(b.replication.discard_unrecorded(&fresh).await?);
+    assert!(!place("fresh").exists(), "an unrecorded copy goes");
     Ok(())
 }

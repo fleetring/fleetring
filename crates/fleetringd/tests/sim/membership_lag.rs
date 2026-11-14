@@ -3,9 +3,16 @@
 //!
 //! An ordinary database on three of four nodes, {P, A, B}, with R = 3 and W = 2. P is cut off from
 //! the control node, so it keeps its view of the ring, and from A. A fifth node, X, joins, which
-//! moves the replica set to {P, A, X}; B stays a member, and still follows P. Before P polls
-//! again, it acknowledges a write that P and B hold. Then P crashes, the control node promotes a
-//! quorum of {A, X}, and a read asks whether the acknowledged write survived.
+//! moves placement to {P, A, X}; B stays a member, and still follows P. Before P polls again, it
+//! acknowledges a write that P and B hold. Then P crashes, and a read asks whether the
+//! acknowledged write survived the promotion.
+//!
+//! Before the fix the promotion fenced a quorum of {A, X}, neither of which held the write. The
+//! join now keeps {P, A, B} as the replica set promotions fence, so the promotion fences A and B,
+//! and B holds the write; once the new primary reports that placement's write quorum holds its
+//! log, the control plane releases {P, A, B} and the database follows placement (ADR-0031,
+//! amendment 2). The history checker's `AcknowledgedWritesFenced` property catches the loss
+//! whatever the read says.
 
 use std::time::Duration;
 
@@ -92,7 +99,7 @@ fn moved_name(
     Err("no name the join moves as the probe needs".into())
 }
 
-fn scenario(seed: u64) -> TestResult {
+pub(crate) fn scenario(seed: u64) -> TestResult {
     let mut builder = Fleet::builder(seed).control(CONTROL);
     for node in NODES.iter().chain([&JOINER]) {
         builder = builder.data(node);
@@ -132,10 +139,12 @@ fn scenario(seed: u64) -> TestResult {
     fleet.repair(JOINER, CONTROL)?;
     let moved = database.clone();
     let lost = b.clone();
-    fleet.run_until(LIMIT, "the replica set moving", |fleet| {
+    // Placement moves at once; the replica set promotions fence stays {P, A, B} until P
+    // reports that placement's write quorum holds its log, which P, cut off, can't.
+    fleet.run_until(LIMIT, "placement moving", |fleet| {
         fleet.control_state().is_some_and(|state| {
             state
-                .replica_set(&moved)
+                .placed_replica_set(&moved)
                 .is_ok_and(|set| set.iter().all(|node| node.as_str() != lost))
         })
     })?;
@@ -165,6 +174,9 @@ fn scenario(seed: u64) -> TestResult {
                 .is_some_and(|lease| lease.holder().as_str() != old)
         })
     })?;
+    // The history checker holds every acknowledged write to a write quorum of the replica set
+    // the promotion fences (`AcknowledgedWritesFenced`).
+    fleet.check_history()?;
     let read = script(
         &mut fleet,
         "reader",
@@ -183,15 +195,203 @@ fn scenario(seed: u64) -> TestResult {
     }
     fleet.repair(&primary, CONTROL)?;
     fleet.restart(&primary)?;
+    fleet.await_ring_on(&[primary.as_str()], LIMIT)?;
+    // The new primary counts both write quorums; once placement's holds its log, the control
+    // plane releases the kept set and the database follows placement.
+    let released = database.clone();
+    fleet.run_until(LIMIT, "the kept replica set released", |fleet| {
+        fleet.control_state().is_some_and(|state| {
+            state
+                .database(&released)
+                .is_some_and(|db| db.kept_replicas().is_none())
+                && state.replica_set(&released).ok() == state.placed_replica_set(&released).ok()
+        })
+    })?;
     fleet.await_workloads(LIMIT)?;
     fleet.finish()?;
     Ok(())
 }
 
-/// Reproduced on seed 157: the write is acknowledged by P and B, and the promoted node of {A, X}
-/// doesn't hold it.
+/// Runs `operations` on a client named `name` and returns every answer once each arrived, a
+/// timeout included. The client goes on sending an operation whose answer was uncertain.
+fn answers_of(
+    fleet: &mut Fleet,
+    name: &str,
+    operations: Vec<Operation>,
+) -> Result<Vec<Outcome>, Box<dyn std::error::Error>> {
+    let count = operations.len();
+    fleet.client(name, Script::new(operations));
+    let answers = |fleet: &Fleet| -> Vec<Outcome> {
+        fleet
+            .history()
+            .records()
+            .iter()
+            .filter(|record| record.client() == name)
+            .map(|record| record.outcome().clone())
+            .collect()
+    };
+    fleet.run_until(LIMIT, &format!("{name} answered"), |fleet| {
+        answers(fleet).len() >= count
+    })?;
+    Ok(answers(fleet))
+}
+
+/// The upgrade path (FR-102's review, finding 1): data nodes are upgraded before the control
+/// node, so a primary may start leading under a control node that shows no replica sets. It
+/// counts placement by the ring pinned at the last answer; once the control node shows sets,
+/// the first membership change keeps the old set, and the primary, reading control state again
+/// when its ring moves, counts it too. Before the fix it counted its new ring alone, so a write
+/// acknowledged by P and the joiner was lost when the promotion fenced A and B.
+#[cfg(feature = "fault-hooks")]
+pub(crate) fn upgraded_control_node(seed: u64) -> TestResult {
+    let mut builder = Fleet::builder(seed).control(CONTROL);
+    for node in NODES.iter().chain([&JOINER]) {
+        builder = builder.data(node);
+    }
+    let mut fleet = builder.build()?;
+    let control = fleet
+        .fork_faults(CONTROL)
+        .ok_or("the control host has no hooks")?;
+    // The control node answers as 0.7 does until the test upgrades it.
+    control.hide_replica_sets(true);
+    fleet.partition(JOINER, CONTROL)?;
+    fleet.await_ring_on(&NODES, Duration::from_secs(10))?;
+    let state = fleet.control_state().ok_or("the control node is down")?;
+    let (database, primary, a, b) = moved_name(&state)?;
+    let (traffic, handle) = Traffic::new([(database.clone(), 3)], 0);
+    fleet.client("traffic", traffic);
+    let watched = handle.clone();
+    let name = database.clone();
+    fleet.run_until(LIMIT, "writes to the database", |_| {
+        watched.acknowledged(&name) >= 20
+    })?;
+    handle.stop();
+    fleet.run_for(Duration::from_millis(300))?;
+    let state = fleet.control_state().ok_or("the control node is down")?;
+    let leader = state
+        .database(&database)
+        .and_then(|db| db.lease())
+        .map(|lease| lease.holder().to_string());
+    if leader.as_deref() != Some(primary.as_str()) {
+        return Err(format!("{database} is led by {leader:?}, not {primary}").into());
+    }
+    fleet.note(format!(
+        "{database} on {primary}, {a}, {b}, led under a control node that shows no replica sets; {JOINER} joins once it shows them"
+    ));
+
+    // The control node is upgraded. P reaches it, but neither A, nor B, nor yet the joiner, so
+    // that placement can't catch up, and P can't report, before P is cut off from the control
+    // node too.
+    control.hide_replica_sets(false);
+    fleet.partition(&primary, &a)?;
+    fleet.partition(&primary, &b)?;
+    fleet.partition(&primary, JOINER)?;
+    // A write no replica can acknowledge leaves P's log ahead of every follower's, so that
+    // placement doesn't hold it yet.
+    let ahead = answers_of(
+        &mut fleet,
+        "ahead",
+        vec![Operation::Write {
+            database: database.clone(),
+            value: PROBE - 1,
+        }],
+    )?;
+    fleet.note(format!("the write ahead: {:?}", ahead.first()));
+    fleet.repair(JOINER, CONTROL)?;
+    let moved = database.clone();
+    let lost = b.clone();
+    fleet.run_until(LIMIT, "placement moving", |fleet| {
+        fleet.control_state().is_some_and(|state| {
+            state
+                .placed_replica_set(&moved)
+                .is_ok_and(|set| set.iter().all(|node| node.as_str() != lost))
+                && state
+                    .database(&moved)
+                    .is_some_and(|db| db.kept_replicas().is_some())
+        })
+    })?;
+    // P publishes the new ring and reads control state again; then it is cut off from the
+    // control node, so that no report of its arrives and the set stays kept, and reaches the
+    // joiner, which catches up.
+    fleet.await_ring_on(&[primary.as_str(), JOINER], LIMIT)?;
+    fleet.run_for(Duration::from_secs(1))?;
+    fleet.partition(&primary, CONTROL)?;
+    fleet.repair(&primary, JOINER)?;
+    fleet.run_for(Duration::from_secs(2))?;
+    let answers = answers_of(
+        &mut fleet,
+        "probe",
+        vec![Operation::Write {
+            database: database.clone(),
+            value: PROBE,
+        }],
+    )?;
+    let acknowledged = matches!(
+        answers.first(),
+        Some(Outcome::Acknowledged(Ack::Written { .. }))
+    );
+    fleet.note(format!("the probe write: {:?}", answers.first()));
+    fleet.crash(&primary)?;
+    fleet.repair(&primary, &a)?;
+    fleet.repair(&primary, &b)?;
+    let promoted = database.clone();
+    let old = primary.clone();
+    fleet.run_until(LIMIT, "a promotion", |fleet| {
+        fleet.control_state().is_some_and(|state| {
+            state
+                .database(&promoted)
+                .and_then(|db| db.lease())
+                .is_some_and(|lease| lease.holder().as_str() != old)
+        })
+    })?;
+    fleet.check_history()?;
+    let read = script(
+        &mut fleet,
+        "reader",
+        vec![Operation::Read {
+            database: database.clone(),
+            value: Some(PROBE),
+        }],
+    )?;
+    let survived = matches!(read.first(), Some(Outcome::Acknowledged(Ack::Read { values })) if values.contains(&PROBE));
+    if acknowledged && !survived {
+        return Err(format!(
+            "write {PROBE} was acknowledged by {primary}, which led under a control node that showed no replica sets, and is gone after the promotion ({:?})",
+            read.first()
+        )
+        .into());
+    }
+    fleet.repair(&primary, CONTROL)?;
+    fleet.restart(&primary)?;
+    fleet.await_ring_on(&[primary.as_str()], LIMIT)?;
+    let released = database.clone();
+    fleet.run_until(LIMIT, "the kept replica set released", |fleet| {
+        fleet.control_state().is_some_and(|state| {
+            state
+                .database(&released)
+                .is_some_and(|db| db.kept_replicas().is_none())
+        })
+    })?;
+    fleet.await_workloads(LIMIT)?;
+    fleet.finish()?;
+    Ok(())
+}
+
+/// A primary that started leading under a control node that shows no replica sets, as data
+/// nodes upgraded before their control node do, never counts a newer ring than the control
+/// node last answered for, so the first membership change after the control node's upgrade
+/// loses no acknowledged write (FR-102's review, finding 1).
+#[cfg(feature = "fault-hooks")]
 #[test]
-#[ignore = "#157"]
+fn a_primary_started_under_an_older_control_node_counts_the_kept_set() {
+    seeds::run(BINARY, &[1, 24, 29, 157, 2_026], upgraded_control_node);
+}
+
+/// Reproduced on seed 157 before the fix: the write was acknowledged by P and B, and the
+/// promotion fenced {A, X}, neither of which held it. A membership change now keeps the old
+/// replica set as the one promotions fence until the primary reports that the new set's write
+/// quorum holds its log (ADR-0031, amendment 2).
+#[test]
 fn a_write_acknowledged_on_the_old_replica_set_survives_a_promotion() {
-    seeds::run(BINARY, &[157], scenario);
+    seeds::run(BINARY, &[1, 24, 29, 157, 2_026], scenario);
 }

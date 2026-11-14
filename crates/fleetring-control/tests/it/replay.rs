@@ -216,6 +216,7 @@ fn the_generated_log_exercises_every_kind_of_change() {
         "metadata conflict",
         "expiry passed",
         "not expired",
+        "kept set released",
     ] {
         assert!(
             counts.get(kind).copied().unwrap_or(0) > 0,
@@ -256,6 +257,7 @@ fn count_outcomes(outcomes: &[Outcome], log: Option<&[Command]>) -> BTreeMap<&'s
             Ok(Applied::TokenRevoked { .. }) => "revoked",
             Ok(Applied::DatabaseUpdated { .. }) => "updated",
             Ok(Applied::DatabaseExpired { .. }) => "expired",
+            Ok(Applied::KeptReplicasReleased { .. }) => "kept set released",
             Ok(_) => "other",
             Err(fleetring_control::Rejection::MetadataConflict { .. }) => "metadata conflict",
             Err(fleetring_control::Rejection::ExpiryPassed { .. }) => "expiry passed",

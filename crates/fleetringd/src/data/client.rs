@@ -67,8 +67,13 @@ pub struct Location {
     pub primary: Option<NodeId>,
     /// The node carrying out its promotion to `epoch`, while one is in progress (FR-050).
     pub candidate: Option<NodeId>,
-    /// Its replica set in the ring's preference order, the primary included.
+    /// Its replica set in the ring's preference order, the primary included: the one promotions
+    /// fence, which is a ready fork's recorded holders, or the set a membership change kept,
+    /// until it is handed over to placement (ADR-0046, point 3.10; ADR-0031, amendment 2).
     pub replicas: Vec<ReplicaInfo>,
+    /// Where the ring places it, in preference order, while that differs from `replicas`;
+    /// `None` when it doesn't, and from a control node that predates showing it.
+    pub placed: Option<Vec<NodeId>>,
     /// How many replicas it should have, R.
     pub replication_factor: ReplicationFactor,
     /// The durability settings in effect: its acknowledgement mode and its floor on reachable

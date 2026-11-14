@@ -175,7 +175,7 @@ pub(super) struct Inner {
     /// The databases this node stopped serving because the control plane no longer knows them,
     /// whose change streams it is flushing ([`Retiring`]), each with what becomes of its copy
     /// afterwards. A new database of the same name isn't created or restored here meanwhile.
-    retiring: Mutex<BTreeMap<DatabaseName, Fate>>,
+    retiring: Retirements,
     /// Where writes, queries, renewals, transfers, and promotions are counted.
     metrics: DataMetrics,
     /// The last SQL session ID handed out.
@@ -284,19 +284,98 @@ pub(super) enum Fate {
     },
 }
 
+impl Fate {
+    /// The fate of a copy two retirements decided on: deleted if either saw its drop, at the
+    /// later epoch if both did. A drop once seen is never forgotten.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Kept, Self::Kept) => Self::Kept,
+            (Self::Deleted { epoch }, Self::Kept) | (Self::Kept, Self::Deleted { epoch }) => {
+                Self::Deleted { epoch }
+            }
+            (Self::Deleted { epoch: a }, Self::Deleted { epoch: b }) => {
+                Self::Deleted { epoch: a.max(b) }
+            }
+        }
+    }
+}
+
+/// One database being retired: what becomes of its copy, and how many [`Retiring`] guards hold
+/// its name.
+#[derive(Debug, Clone, Copy)]
+struct Retirement {
+    fate: Fate,
+    guards: usize,
+}
+
+/// The databases being retired on this node, by name. Two retirements of one name can begin
+/// together, as when a drop notice and a renewal the control plane refuses both stop serving
+/// it; the name stays retiring until the last guard goes, and its fate is what both decided
+/// ([`Fate::and`]).
+#[derive(Debug, Clone, Default)]
+struct Retirements(Arc<Mutex<BTreeMap<DatabaseName, Retirement>>>);
+
+impl Retirements {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, Retirement>> {
+        self.0.lock().expect("retiring databases lock poisoned")
+    }
+
+    /// Marks `name` as retiring, with `fate` for its copy unless a retirement under way has
+    /// decided on deletion, until the returned guard is dropped.
+    fn begin(&self, name: &DatabaseName, fate: Fate) -> Retiring {
+        let mut retiring = self.lock();
+        let retirement = retiring
+            .entry(name.clone())
+            .or_insert(Retirement { fate, guards: 0 });
+        retirement.fate = retirement.fate.and(fate);
+        retirement.guards += 1;
+        Retiring {
+            retirements: self.clone(),
+            name: name.clone(),
+        }
+    }
+
+    /// Marks the copy of `name` being retired for deletion at `epoch`. Returns whether one was
+    /// being retired.
+    fn confirm_drop(&self, name: &DatabaseName, epoch: LeaseEpoch) -> bool {
+        self.lock()
+            .get_mut(name)
+            .map(|retirement| retirement.fate = retirement.fate.and(Fate::Deleted { epoch }))
+            .is_some()
+    }
+
+    /// What becomes of the copy of `name` being retired: [`Fate::Kept`] unless its drop was seen.
+    fn fate(&self, name: &DatabaseName) -> Fate {
+        self.lock()
+            .get(name)
+            .map_or(Fate::Kept, |retirement| retirement.fate)
+    }
+
+    /// Whether a copy of `name` is being retired.
+    fn contains(&self, name: &DatabaseName) -> bool {
+        self.lock().contains_key(name)
+    }
+}
+
 /// Marks a database whose change streams this node is flushing because it stopped serving it,
-/// until dropped. While it lives, the node refuses to create or restore a database of the same
-/// name, so the old copy can't be opened as the new database's or its deletion take the new
-/// database's files (ADR-0041, point 4).
+/// until dropped. While any guard of the name lives, the node refuses to create or restore a
+/// database of the same name, so the old copy can't be opened as the new database's or its
+/// deletion take the new database's files (ADR-0041, point 4).
 #[derive(Debug)]
 pub(crate) struct Retiring {
-    node: DataNode,
+    retirements: Retirements,
     name: DatabaseName,
 }
 
 impl Drop for Retiring {
     fn drop(&mut self) {
-        self.node.lock_retiring().remove(&self.name);
+        let mut retiring = self.retirements.lock();
+        if let Some(retirement) = retiring.get_mut(&self.name) {
+            retirement.guards -= 1;
+            if retirement.guards == 0 {
+                retiring.remove(&self.name);
+            }
+        }
     }
 }
 
@@ -352,7 +431,7 @@ impl DataNode {
                 draining: tokio::sync::Mutex::new(()),
                 staging: tokio::sync::Semaphore::new(1),
                 creating: NameLocks::default(),
-                retiring: Mutex::new(BTreeMap::new()),
+                retiring: Retirements::default(),
                 metrics,
                 last_session: AtomicU64::new(0),
                 open_sessions: Arc::new(AtomicUsize::new(0)),
@@ -432,38 +511,22 @@ impl DataNode {
         &self.inner.replication
     }
 
-    fn lock_retiring(&self) -> MutexGuard<'_, BTreeMap<DatabaseName, Fate>> {
-        self.inner
-            .retiring
-            .lock()
-            .expect("retiring databases lock poisoned")
-    }
-
     /// Marks `name`'s copy as being retired, with `fate` for it afterwards, until the returned
-    /// guard is dropped. Take it before serving stops.
+    /// guard is dropped. Take it before serving stops. A retirement of the name already under
+    /// way keeps the name until its own guard goes too, and a drop it saw still deletes the copy.
     pub(super) fn begin_retiring(&self, name: &DatabaseName, fate: Fate) -> Retiring {
-        self.lock_retiring().insert(name.clone(), fate);
-        Retiring {
-            node: self.clone(),
-            name: name.clone(),
-        }
+        self.inner.retiring.begin(name, fate)
     }
 
     /// Marks the copy of `name` being retired for deletion, because its drop at `epoch` was seen
     /// meanwhile. Returns whether one was being retired.
     pub(super) fn confirm_drop(&self, name: &DatabaseName, epoch: LeaseEpoch) -> bool {
-        self.lock_retiring()
-            .get_mut(name)
-            .map(|fate| *fate = Fate::Deleted { epoch })
-            .is_some()
+        self.inner.retiring.confirm_drop(name, epoch)
     }
 
     /// What becomes of the copy of `name` being retired: [`Fate::Kept`] unless its drop was seen.
     pub(super) fn fate(&self, name: &DatabaseName) -> Fate {
-        self.lock_retiring()
-            .get(name)
-            .copied()
-            .unwrap_or(Fate::Kept)
+        self.inner.retiring.fate(name)
     }
 
     /// Holds `name` against a create, a restore, or an orphan removal while the guard lives.
@@ -484,7 +547,7 @@ impl DataNode {
         let _creating = self.inner.creating.lock(name).await;
         let id = &self.inner.id;
         let replication = self.replication();
-        if self.lock_retiring().contains_key(name) {
+        if self.inner.retiring.contains(name) {
             return Err(Status::failed_precondition(format!(
                 "{name} is being retired on node {id}, not an orphan; try again once it is"
             )));
@@ -494,7 +557,7 @@ impl DataNode {
                 "node {id} serves {name}; only an orphan copy can be removed"
             )));
         }
-        let Some(epoch) = replication.highest_epoch(name) else {
+        let Some(epoch) = replication.copy_epoch(name) else {
             return Err(Status::not_found(format!(
                 "node {id} holds no copy of {name}"
             )));
@@ -542,8 +605,7 @@ impl DataNode {
     ///
     /// `UNAVAILABLE` saying the name [`BEING_DROPPED`]; a client retries it.
     pub(super) fn check_not_dropping(&self, name: &DatabaseName) -> Result<(), Status> {
-        if self.lock_retiring().contains_key(name) || self.inner.replication.serving(name).is_some()
-        {
+        if self.inner.retiring.contains(name) || self.inner.replication.serving(name).is_some() {
             return Err(Status::unavailable(format!("{name} {BEING_DROPPED}")));
         }
         Ok(())
@@ -560,7 +622,8 @@ impl DataNode {
     /// `FAILED_PRECONDITION` naming the orphan, its node, and its epoch, and the command that
     /// removes it.
     pub(super) fn refuse_orphan(&self, name: &DatabaseName) -> Result<(), Status> {
-        let Some(epoch) = self.inner.replication.highest_epoch(name) else {
+        // A fork holder's installed copy records its incarnation before any epoch reaches it.
+        let Some(epoch) = self.inner.replication.copy_epoch(name) else {
             return Ok(());
         };
         let id = &self.inner.id;
@@ -689,9 +752,25 @@ impl DataNode {
             })
             .await?;
         tracing::info!(database = %name, %source, archive = archive.name(), epoch = lease.epoch, position = ?restored.position, segments = restored.segments, "restored from the archive and took the first lease");
-        let placement = self.locate(name).await?;
-        self.serve(name, &placement).await?;
-        Ok((placement, restored))
+        let leased = self.locate(name).await?;
+        if let Err(status) = confirm_first_lease(self.id(), name, &placement, lease.epoch, &leased)
+        {
+            // The name is still held against a create or another restore: the copy just
+            // installed goes, so no later database of the name opens it as its own, unless a
+            // promotion fenced or streamed to it meanwhile, which recorded it.
+            match replication.discard_unrecorded(name).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(database = %name, "kept a restored copy whose first lease wasn't confirmed: it has been recorded since");
+                }
+                Err(error) => {
+                    tracing::warn!(database = %name, %error, "can't remove a restored copy whose first lease wasn't confirmed");
+                }
+            }
+            return Err(status);
+        }
+        self.serve(name, &leased).await?;
+        Ok((leased, restored))
     }
 
     /// This node's ID.
@@ -823,9 +902,10 @@ impl DataNode {
                     .await?;
                 tracing::info!(database = %name, epoch = lease.epoch, "took the first lease");
                 self.create_file(name).await?;
-                let placement = self.locate(name).await?;
-                self.serve(name, &placement).await?;
-                Ok(placement)
+                let leased = self.locate(name).await?;
+                confirm_first_lease(self.id(), name, &placement, lease.epoch, &leased)?;
+                self.serve(name, &leased).await?;
+                Ok(leased)
             }
         }
     }
@@ -942,19 +1022,7 @@ impl DataNode {
         let durability = lease
             .durability
             .unwrap_or_else(|| Durability::quorum(lease.replication_factor));
-        // A fork that isn't known to be ready serves no client, and starts no change stream,
-        // until its primary has checked its copy and, if the copy lacks the fork's marker, run
-        // the fork-reset write at its bootstrap quorum (ADR-0046, point 6.2).
-        let gated = matches!(lease.fork, ForkGate::Pending | ForkGate::Ready);
-        let serve_at_once = lease.fork == ForkGate::Pending
-            && fleetring_control::mutation::Mutation::ServeAtSeeded.is_active();
-        if gated && !serve_at_once {
-            crate::data::fork::close_unless_open(self, name, lease.epoch);
-        }
-        if lease.fork == ForkGate::Pending {
-            // Streams start as soon as the node leads: to the recorded holders alone.
-            crate::data::fork::freeze_holders(self, name).await;
-        }
+        // Checked first, so a refused lease leaves no gate or replica-set state behind.
         if let Some(incarnation) = lease.incarnation {
             match self
                 .inner
@@ -963,13 +1031,61 @@ impl DataNode {
                 .await
             {
                 Ok(recorded) if recorded != incarnation => {
-                    tracing::warn!(database = %name, %recorded, placed = %incarnation, "this node's copy records another incarnation than the database it serves");
+                    // The copy is an earlier database's of the name: serving it would hand its
+                    // rows to the database control state placed here.
+                    tracing::warn!(database = %name, %recorded, placed = %incarnation, "this node's copy records another incarnation than the database it would serve; serving nothing");
+                    let id = &self.inner.id;
+                    return Err(Status::failed_precondition(format!(
+                        "{name}'s copy on node {id} belongs to incarnation {recorded}, not \
+                         {incarnation}, the database control state placed; if that database is \
+                         gone for good, delete the copy with `fleetringd orphan remove {name} \
+                         --node {id}`"
+                    )));
                 }
                 Ok(_) => {}
                 Err(status) => {
                     tracing::warn!(database = %name, %status, "can't record the copy's incarnation");
                 }
             }
+        }
+        // A gate this node opened, or was opening, for an earlier database of the name can't
+        // match this lease; it would only make the name look like a fork's here.
+        self.inner
+            .replication
+            .forks()
+            .forget_other_incarnation(name, lease.incarnation);
+        if lease.fork == ForkGate::Ordinary && self.inner.replication.is_gated(name) {
+            // No fork made this database: a gate still closed here was a dropped fork's of the
+            // name, and would refuse every client as a fork that isn't ready.
+            tracing::info!(database = %name, "opened a readiness gate a dropped fork of the name left closed");
+            self.inner.replication.open_gate(name);
+        }
+        // A fork that isn't known to be ready serves no client, and starts no change stream,
+        // until its primary has checked its copy and, if the copy lacks the fork's marker, run
+        // the fork-reset write at its bootstrap quorum (ADR-0046, point 6.2).
+        let gated = matches!(lease.fork, ForkGate::Pending | ForkGate::Ready);
+        let serve_at_once = lease.fork == ForkGate::Pending
+            && fleetring_control::mutation::Mutation::ServeAtSeeded.is_active();
+        if gated && !serve_at_once {
+            crate::data::fork::close_unless_open(self, name, lease);
+        }
+        if lease.fork == ForkGate::Pending {
+            // Streams start as soon as the node leads: to the recorded holders alone.
+            crate::data::fork::freeze_holders(self, name).await;
+        }
+        // A primary counts the replica sets control state shows, never its own ring, so it
+        // learns them before it leads (ADR-0031, amendment 2). Each caller has just read the
+        // placement, and this reads it only for a caller that didn't pass it on.
+        if !self.inner.replication.knows_replica_sets(name) {
+            let placement = self.locate(name).await.map_err(|status| {
+                Status::unavailable(format!(
+                    "can't learn the replica sets of {name}: {}",
+                    status.message()
+                ))
+            })?;
+            self.inner
+                .replication
+                .follow_replica_sets(name, &placement)?;
         }
         let role =
             PrimaryRole::new(lease.replication_factor, lease.epoch).with_durability(durability);
@@ -1021,6 +1137,9 @@ impl DataNode {
         placement: &Placement,
         start: Option<crate::engine::Position>,
     ) -> Result<HeldLease, Status> {
+        self.inner
+            .replication
+            .follow_replica_sets(name, placement)?;
         let lease = HeldLease::of(placement);
         self.start_serving(name, lease, start).await?;
         Ok(lease)
@@ -1203,11 +1322,68 @@ fn missing_file(name: &DatabaseName, placement: &Placement, error: &DatabaseErro
     }
 }
 
+/// Checks that `leased`, the placement of `name` asked after node `id` took its first lease at
+/// `epoch`, shows `id` leading at that epoch, and the database `before` showed, asked before the
+/// lease: of the same incarnation. Otherwise the lease was superseded, or the name dropped and
+/// created again, before it was served, and serving it now would open this copy as a database it
+/// isn't.
+///
+/// # Errors
+///
+/// `UNAVAILABLE` saying which; a client retries it, and is redirected to the new primary.
+fn confirm_first_lease(
+    id: &NodeId,
+    name: &DatabaseName,
+    before: &Placement,
+    epoch: u64,
+    leased: &Placement,
+) -> Result<(), Status> {
+    if leased.incarnation != before.incarnation {
+        return Err(Status::unavailable(format!(
+            "{name} was dropped and created again while node {id} took its first lease; retry"
+        )));
+    }
+    if leased.epoch != epoch || leased.primary.as_deref() != Some(id.as_str()) {
+        return Err(Status::unavailable(format!(
+            "node {id}'s first lease on {name} at epoch {epoch} was superseded before it was \
+             served: control state shows {} at epoch {}; retry",
+            leased.primary.as_deref().unwrap_or("no primary"),
+            leased.epoch
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_first_lease_is_served_only_as_control_state_confirms_it() {
+        let id: NodeId = "n1".parse().expect("a node");
+        let name: DatabaseName = "db".parse().expect("a name");
+        let placement = |incarnation: u64, epoch: u64, primary: Option<&str>| Placement {
+            incarnation,
+            epoch,
+            primary: primary.map(str::to_owned),
+            ..Placement::default()
+        };
+        let before = placement(7, 0, None);
+        assert!(confirm_first_lease(&id, &name, &before, 1, &placement(7, 1, Some("n1"))).is_ok());
+        for (leased, why) in [
+            (placement(7, 2, Some("n2")), "a promotion took over"),
+            (
+                placement(7, 2, Some("n1")),
+                "a later epoch than the lease's",
+            ),
+            (placement(8, 1, Some("n1")), "the name created again"),
+        ] {
+            let refused = confirm_first_lease(&id, &name, &before, 1, &leased).expect_err(why);
+            assert_eq!(refused.code(), tonic::Code::Unavailable, "{why}");
+        }
+    }
 
     #[tokio::test]
     async fn one_name_is_created_or_restored_by_one_caller_at_a_time() {
@@ -1223,5 +1399,77 @@ mod tests {
         let third = locks.lock(&a).await;
         drop(third);
         assert!(locks.map().is_empty(), "locks no one holds are forgotten");
+    }
+
+    /// The interleaving `stop_serving` runs when a drop notice and a renewal the control plane
+    /// refuses both stop serving one database: the notice's retirement, which hands the copy on
+    /// to be flushed, begins first, and the renewal's begins next, finds the lease already
+    /// forgotten, and drops its guard at once.
+    #[test]
+    fn a_refused_renewal_racing_a_drop_notice_neither_keeps_the_copy_nor_frees_the_name() {
+        let retiring = Retirements::default();
+        let dst: DatabaseName = "dst".parse().expect("a name");
+        let notice = retiring.begin(
+            &dst,
+            Fate::Deleted {
+                epoch: LeaseEpoch::new(1),
+            },
+        );
+        let renewal = retiring.begin(&dst, Fate::Kept);
+        drop(renewal);
+        assert!(
+            retiring.contains(&dst),
+            "the name stays taken while the notice's retirement flushes"
+        );
+        assert_eq!(
+            retiring.fate(&dst),
+            Fate::Deleted {
+                epoch: LeaseEpoch::new(1)
+            },
+            "the copy whose drop was seen is deleted, not kept as an orphan"
+        );
+        drop(notice);
+        assert!(
+            !retiring.contains(&dst),
+            "the name is free once both are done"
+        );
+        assert_eq!(retiring.fate(&dst), Fate::Kept);
+    }
+
+    /// The same race the other way round: the renewal's retirement hands the copy on, and the
+    /// notice's, which saw the drop, begins while it flushes.
+    #[test]
+    fn a_drop_notice_racing_a_refused_renewal_still_deletes_the_copy() {
+        let retiring = Retirements::default();
+        let dst: DatabaseName = "dst".parse().expect("a name");
+        let renewal = retiring.begin(&dst, Fate::Kept);
+        drop(retiring.begin(
+            &dst,
+            Fate::Deleted {
+                epoch: LeaseEpoch::new(2),
+            },
+        ));
+        assert!(retiring.contains(&dst));
+        assert_eq!(
+            retiring.fate(&dst),
+            Fate::Deleted {
+                epoch: LeaseEpoch::new(2)
+            }
+        );
+        // A later notice at a lower epoch doesn't lower it, nor a later refusal undo it.
+        assert!(retiring.confirm_drop(&dst, LeaseEpoch::new(1)));
+        drop(retiring.begin(&dst, Fate::Kept));
+        assert_eq!(
+            retiring.fate(&dst),
+            Fate::Deleted {
+                epoch: LeaseEpoch::new(2)
+            }
+        );
+        drop(renewal);
+        assert!(!retiring.contains(&dst));
+        assert!(
+            !retiring.confirm_drop(&dst, LeaseEpoch::new(2)),
+            "nothing is retiring now"
+        );
     }
 }

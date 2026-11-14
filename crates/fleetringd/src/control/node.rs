@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{io, thread};
 
+use fleetring::NodeId;
 use fleetring_control::{Action, Command, ControlConfig, Outcome, Rejection, State, apply};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -39,12 +40,13 @@ pub enum StorageIo {
 }
 
 /// How to run a control node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlOptions {
     config: ControlConfig,
     snapshot_every: NonZeroU64,
     mailbox: NonZeroUsize,
     storage_io: StorageIo,
+    recorder: Option<NodeId>,
 }
 
 impl ControlOptions {
@@ -57,7 +59,23 @@ impl ControlOptions {
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             mailbox: DEFAULT_MAILBOX,
             storage_io: StorageIo::DedicatedThread,
+            recorder: None,
         }
+    }
+
+    /// Stamps every command this node logs with `recorder`, its own node ID, beside the time it
+    /// stamps (ADR-0047, point 6.1). Without one, commands carry no recorder, as before 0.8,
+    /// and `apply` refuses a delegation.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: NodeId) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Returns the node ID this node stamps on the commands it logs, if any.
+    #[must_use]
+    pub fn recorder(&self) -> Option<&NodeId> {
+        self.recorder.as_ref()
     }
 
     /// Takes a snapshot after every `snapshot_every` commands.
@@ -130,7 +148,8 @@ pub enum SubmitError {
     /// ADR-0038, point 4): a join whose release is outside the window or lacks an enabled
     /// feature, or a command that needs a fleet feature a member doesn't support. Nothing changed,
     /// and nothing was logged, so a control node of an older release, which would accept the
-    /// command, never meets it in its log.
+    /// command, never meets it in its log. A command that needs the `delegation` fleet feature
+    /// is refused here, unlogged, for any rejection `apply` would give it (ADR-0047, point 6.2).
     #[error(transparent)]
     Refused(Rejection),
 }
@@ -202,9 +221,11 @@ impl ControlHandle {
     ///
     /// # Errors
     ///
-    /// [`SubmitError`] if the writer has stopped or can't log the command. A command the state
-    /// machine rejects is not an error here: it is logged, and its [`Committed::outcome`] holds
-    /// the rejection.
+    /// [`SubmitError`] if the writer has stopped or can't log the command, or refused it before
+    /// logging it. A command the state machine rejects is otherwise not an error here: it is
+    /// logged, and its [`Committed::outcome`] holds the rejection. The exception is a command
+    /// that needs the `delegation` fleet feature, whose rejection is [`SubmitError::Refused`]
+    /// and is never logged (ADR-0047, point 6.2).
     pub async fn submit(&self, action: Action) -> Result<Committed, SubmitError> {
         let (reply, receive) = oneshot::channel();
         self.mailbox
@@ -368,6 +389,7 @@ struct Writer {
     last_index: LogIndex,
     snapshot_every: NonZeroU64,
     clock: Box<dyn Clock>,
+    recorder: Option<NodeId>,
     publish: watch::Sender<Arc<State>>,
     metrics: ControlMetrics,
 }
@@ -411,6 +433,7 @@ impl Writer {
             last_index,
             snapshot_every: options.snapshot_every,
             clock,
+            recorder: options.recorder,
             publish,
             metrics,
         };
@@ -469,22 +492,42 @@ impl Writer {
         }
     }
 
-    /// Stamps and numbers `submits` in order, logs them in one transaction, then applies,
-    /// publishes, and answers each. Nothing is answered before the whole group is durable.
+    /// Returns `action` stamped with the time and, if this node has one, its recorder, as every
+    /// command it logs is, its own commands included (ADR-0047, point 6.1).
+    fn stamp(&self, action: Action) -> Command {
+        match &self.recorder {
+            Some(by) => Command::stamped(self.clock.now(), by.clone(), action),
+            None => Command::new(self.clock.now(), action),
+        }
+    }
+
+    /// Stamps and numbers `submits` in order, each with the time and the recorder, logs them in
+    /// one transaction, then applies, publishes, and answers each. Nothing is answered before the whole group is durable.
     ///
     /// A command `apply` would refuse for software, a join or a command that needs a fleet
     /// feature some member lacks, is refused at once and never logged ([`State::check_admission`]).
     /// It is checked against the state the commands queued before it in the group leave, which is
-    /// the state `apply` will see.
+    /// the state `apply` will see. A join or a leave that [`State::handover_due`] says would keep
+    /// the first replica set is preceded by [`Action::EnableHandover`], logged by the writer
+    /// itself in the same group.
+    ///
+    /// A command that needs the `delegation` fleet feature is answered with
+    /// [`SubmitError::Refused`] and never logged when `apply` would refuse it on that state
+    /// ([`refused_unlogged`]).
     fn commit_group(&mut self, submits: Vec<(Action, Reply)>) -> Flow {
         let mut commands: Vec<(LogIndex, Command)> = Vec::with_capacity(submits.len());
         let mut replies = Vec::with_capacity(submits.len());
         let mut last = self.last_index;
         let mut exhausted = None;
-        // The state after the group's commands so far, built only once a command needs screening.
+        // The state after the group's commands so far, built only once a command needs screening,
+        // or, until `handover` is enabled, once a membership change comes.
         let mut preview: Option<State> = None;
         for (action, reply) in submits {
-            if needs_screening(&action) {
+            let membership = matches!(action, Action::Join { .. } | Action::Leave { .. });
+            let mut enable = false;
+            if needs_screening(&action)
+                || (membership && !self.state.is_enabled(fleetring_control::Feature::Handover))
+            {
                 let preview = preview.get_or_insert_with(|| {
                     let mut state = self.state.clone();
                     for (_, command) in &commands {
@@ -492,7 +535,38 @@ impl Writer {
                     }
                     state
                 });
-                if let Err(rejection) = preview.check_admission(&action) {
+                if needs_screening(&action)
+                    && let Err(rejection) = preview.check_admission(&action)
+                {
+                    let _unheard = reply.send(Err(SubmitError::Refused(rejection)));
+                    continue;
+                }
+                // The first membership change that would keep a replica set, once every member
+                // supports `handover`, is preceded by the command that enables it, so that what
+                // a change does depends on the log alone (ADR-0031, amendment 2).
+                enable = preview.handover_due(&action);
+            }
+            if enable {
+                let Some(index) = last.next() else {
+                    exhausted = Some(reply);
+                    break;
+                };
+                last = index;
+                let command = self.stamp(Action::EnableHandover);
+                if let Some(preview) = &mut preview {
+                    let _outcome = apply(preview, command.clone());
+                }
+                commands.push((index, command));
+                replies.push(None);
+            }
+            let unlogged_if_refused = refused_unlogged(&action);
+            let command = self.stamp(action);
+            if let Some(preview) = &mut preview {
+                let outcome = apply(preview, command.clone());
+                // The preview applied exactly the command `apply_logged` would, to exactly the
+                // state it would see, so its refusal is the one the log would hold; a refusal
+                // changes nothing, `State::now` included, so leaving it out replays the same.
+                if unlogged_if_refused && let Err(rejection) = outcome {
                     let _unheard = reply.send(Err(SubmitError::Refused(rejection)));
                     continue;
                 }
@@ -502,12 +576,8 @@ impl Writer {
                 break;
             };
             last = index;
-            let command = Command::new(self.clock.now(), action);
-            if let Some(preview) = &mut preview {
-                let _outcome = apply(preview, command.clone());
-            }
             commands.push((index, command));
-            replies.push(reply);
+            replies.push(Some(reply));
         }
         let started = tokio::time::Instant::now();
         let written = if commands.is_empty() {
@@ -522,15 +592,18 @@ impl Writer {
         if let Err(error) = written {
             tracing::error!(error = %error, "control log write failed; stopping the writer");
             // The first waiter learns why; the rest see the writer stop.
-            if let Some(reply) = replies.into_iter().next() {
+            if let Some(reply) = replies.into_iter().flatten().next() {
                 let _unheard = reply.send(Err(SubmitError::Storage(error)));
             }
             return Flow::Stop(None);
         }
         for ((index, command), reply) in commands.into_iter().zip(replies) {
             let committed = self.apply_logged(index, command);
-            // A caller that gave up still had its command applied, as logged.
-            let _unheard = reply.send(Ok(committed));
+            // A caller that gave up still had its command applied, as logged. The writer's own
+            // commands have no caller.
+            if let Some(reply) = reply {
+                let _unheard = reply.send(Ok(committed));
+            }
         }
         if let Some(reply) = exhausted {
             tracing::error!("control log index is exhausted; stopping the writer");
@@ -545,6 +618,7 @@ impl Writer {
         self.last_index = index;
         let action = action_label(&command.action);
         let pending = pending_forks(&self.state);
+        let enabled: Vec<fleetring_control::Feature> = self.state.features().collect();
         let outcome = apply(&mut self.state, command.clone());
         let label = if outcome.is_ok() {
             "applied"
@@ -554,6 +628,7 @@ impl Writer {
         self.metrics.command(index.get(), action, label);
         if outcome.is_ok() {
             count_finished_forks(&self.state, &pending, &self.metrics);
+            log_enabled_features(&self.state, &enabled, index);
         }
         let state = if outcome.is_ok() {
             let state = Arc::new(self.state.clone());
@@ -625,8 +700,262 @@ fn count_finished_forks(
     }
 }
 
+/// Logs, as an audit line, each fleet feature `state` has enabled beyond `before`: the command
+/// at `index` enabled it for good, and from then on a release without it can't join, and
+/// `upgrade --rollback` to one is refused (ADR-0038, point 4).
+fn log_enabled_features(state: &State, before: &[fleetring_control::Feature], index: LogIndex) {
+    for feature in state.features().filter(|feature| !before.contains(feature)) {
+        tracing::info!(target: "fleetringd::audit", feature = feature.as_str(), index = index.get(), "fleet feature enabled for good: members without it can no longer join, and rolling back to a release without it is refused");
+    }
+}
+
 /// Whether `action` may be refused for software, so the writer screens it before it logs it: a
 /// join, or a command that needs any fleet feature.
 fn needs_screening(action: &Action) -> bool {
     !action.features().is_empty() || matches!(action, Action::Join { .. })
+}
+
+/// Whether the writer answers `apply`'s refusal of `action` without logging it: a command that
+/// needs the `delegation` fleet feature (ADR-0047, points 5.10 and 6.2).
+///
+/// An agent's token drives these, so a refusal, a rate limit's above all, must cost the log
+/// nothing; and a refused command doesn't enable its feature, so logging one would leave a
+/// command the previous release line can't decode in a log it may still roll back to
+/// (ADR-0038, point 4). Every such command [`needs_screening`], so the preview exists.
+fn refused_unlogged(action: &Action) -> bool {
+    action
+        .features()
+        .contains(&fleetring_control::Feature::Delegation)
+}
+
+#[cfg(test)]
+mod tests {
+    use fleetring_control::Timestamp;
+
+    use super::*;
+    use crate::clock::SimClock;
+
+    /// The writer stamps its own node ID beside the time on every command it logs, and a
+    /// recovery replays the stamp from the log (ADR-0047, point 6.1); without a recorder it
+    /// stamps none, as before 0.8.
+    #[tokio::test(start_paused = true)]
+    async fn control_writer_stamps_its_node_id() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("control.db");
+        let base = Timestamp::from_millis(1_000);
+        let options = ControlOptions::default()
+            .with_storage_io(StorageIo::Inline)
+            .with_recorder("control-1".parse().expect("an id"));
+        assert_eq!(options.recorder().map(NodeId::as_str), Some("control-1"));
+        let node = ControlNode::open(&path, options, SimClock::new(base))
+            .await
+            .expect("opens");
+        let committed = node.handle().submit(Action::Tick).await.expect("commits");
+        assert_eq!(
+            committed.command().recorded_by.as_ref().map(NodeId::as_str),
+            Some("control-1")
+        );
+        node.shutdown().await;
+
+        let unstamped = ControlOptions::default().with_storage_io(StorageIo::Inline);
+        let node = ControlNode::open(&path, unstamped, SimClock::new(base))
+            .await
+            .expect("reopens");
+        assert_eq!(node.recovered().replayed, 1);
+        let committed = node.handle().submit(Action::Tick).await.expect("commits");
+        assert_eq!(committed.command().recorded_by, None);
+        node.shutdown().await;
+
+        let log = CommandLog::open(&path, ControlConfig::new()).expect("the log opens");
+        let stamps: Vec<Option<String>> = log
+            .commands()
+            .expect("reads")
+            .into_iter()
+            .map(|(_, command)| command.recorded_by.map(|by| by.as_str().to_owned()))
+            .collect();
+        assert_eq!(stamps, [Some("control-1".to_owned()), None]);
+    }
+
+    /// The `EnableHandover` the writer logs before the first membership change that keeps a
+    /// replica set carries the writer's recorder, as every command it logs does (ADR-0031,
+    /// amendment 2; ADR-0047, point 6.1), and comes just before that change in the log.
+    #[tokio::test(start_paused = true)]
+    async fn control_writer_stamps_the_handover_it_enables() {
+        use fleetring::ReplicationFactor;
+        use fleetring_control::{Engine, Feature, Incarnation, Member, Release, Software};
+
+        let software = Feature::ALL.into_iter().fold(
+            Software::new(Release::new(0, 8, 0), 1),
+            Software::with_feature,
+        );
+        let join = |name: &str| Action::Join {
+            member: Member::new(name.parse().expect("an id")).with_software(software.clone()),
+        };
+        let create = |name: &str| Action::CreateDatabase {
+            name: name.parse().expect("a name"),
+            replication_factor: ReplicationFactor::new(3).expect("nonzero"),
+            engine: Engine::Sqlite,
+            durability: None,
+            metadata: None,
+            incarnation: Incarnation::LEGACY,
+        };
+        // A database whose replica set `d`'s join moves, found on a state of its own.
+        let (name, primary) = (0..200)
+            .find_map(|n| {
+                let name = format!("t{n}");
+                let mut state = State::new(ControlConfig::new());
+                for member in ["a", "b", "c"] {
+                    apply(&mut state, Command::new(Timestamp::ZERO, join(member))).ok()?;
+                }
+                apply(&mut state, Command::new(Timestamp::ZERO, create(&name))).ok()?;
+                let database = name.parse().expect("a name");
+                let before = state.replica_set(&database).ok()?;
+                apply(&mut state, Command::new(Timestamp::ZERO, join("d"))).ok()?;
+                let after = state.replica_set(&database).ok()?;
+                (after != before).then(|| (name, before[0].clone()))
+            })
+            .expect("a name that d's join moves");
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("control.db");
+        let options = ControlOptions::default()
+            .with_storage_io(StorageIo::Inline)
+            .with_recorder("control-1".parse().expect("an id"));
+        let node = ControlNode::open(&path, options, SimClock::new(Timestamp::from_millis(1_000)))
+            .await
+            .expect("opens");
+        let handle = node.handle();
+        let lease = Action::AcquireLease {
+            database: name.parse().expect("a name"),
+            node: primary,
+        };
+        for action in [
+            join("a"),
+            join("b"),
+            join("c"),
+            create(&name),
+            lease,
+            join("d"),
+        ] {
+            let committed = handle.submit(action).await.expect("commits");
+            assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        }
+        assert!(handle.state().is_enabled(Feature::Handover));
+        node.shutdown().await;
+
+        let log = CommandLog::open(&path, ControlConfig::new()).expect("the log opens");
+        let commands: Vec<Command> = log
+            .commands()
+            .expect("reads")
+            .into_iter()
+            .map(|(_, command)| command)
+            .collect();
+        let enabled = commands
+            .iter()
+            .position(|command| matches!(command.action, Action::EnableHandover))
+            .expect("the writer logged EnableHandover");
+        assert!(
+            matches!(&commands[enabled + 1].action, Action::Join { member } if member.id().as_str() == "d"),
+            "{:?}",
+            commands[enabled + 1]
+        );
+        assert!(
+            commands.iter().all(
+                |command| command.recorded_by.as_ref().map(NodeId::as_str) == Some("control-1")
+            ),
+            "{commands:?}"
+        );
+    }
+
+    /// A delegation `apply` refuses is answered `Refused` and never logged, so a refusal costs
+    /// the log nothing and a refused first use leaves no command the previous release line can't
+    /// decode while the feature stays off (ADR-0047, point 6.2; ADR-0038, point 4). The accepted
+    /// delegations around it are logged as before, and the log alone replays to the state the
+    /// writer published.
+    #[tokio::test(start_paused = true)]
+    async fn refused_delegations_are_never_logged() {
+        use fleetring_control::Feature;
+        use fleetring_control::delegation::{Limit, StructureViolation};
+
+        use crate::control::test_support::{member_with_every_feature, root_delegation};
+
+        let delegation = |now, n| root_delegation(now, n, 60_000);
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("control.db");
+        let options = ControlOptions::default()
+            .with_storage_io(StorageIo::Inline)
+            .with_recorder("control-1".parse().expect("an id"));
+        let clock = SimClock::new(Timestamp::from_millis(1_000_000));
+        let node = ControlNode::open(&path, options, clock)
+            .await
+            .expect("opens");
+        let handle = node.handle();
+        let member = member_with_every_feature("data-1");
+        handle
+            .submit(Action::Join { member })
+            .await
+            .expect("the join commits");
+
+        // A first use that `apply` refuses: the requester isn't the caller.
+        let mut planted = delegation(clock.now(), 0);
+        if let Action::RecordDelegation { requested_by, .. } = &mut planted {
+            *requested_by = "agent-43".parse().expect("a name");
+        }
+        let before = handle.state();
+        let refused = handle.submit(planted).await;
+        assert!(
+            matches!(
+                refused,
+                Err(SubmitError::Refused(Rejection::DelegationStructure {
+                    reason: StructureViolation::RequesterNotCaller
+                }))
+            ),
+            "{refused:?}"
+        );
+        assert!(!handle.state().is_enabled(Feature::Delegation));
+        assert_eq!(*handle.state(), *before);
+
+        // The caller's rate: 30 a minute, then refused, unlogged, and judged again later.
+        for n in 1..=30 {
+            let committed = handle
+                .submit(delegation(clock.now(), n))
+                .await
+                .expect("commits");
+            assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        }
+        for n in 31..=40 {
+            let refused = handle.submit(delegation(clock.now(), n)).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(SubmitError::Refused(Rejection::DelegationLimit {
+                        limit: Limit::CallerRate
+                    }))
+                ),
+                "{refused:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        let later = handle
+            .submit(delegation(clock.now(), 41))
+            .await
+            .expect("commits");
+        assert!(later.outcome().is_ok(), "{:?}", later.outcome());
+        let published = handle.state();
+        node.shutdown().await;
+
+        let log = CommandLog::open(&path, ControlConfig::new()).expect("the log opens");
+        let commands = log.commands().expect("reads");
+        let logged = commands
+            .iter()
+            .filter(|(_, command)| matches!(command.action, Action::RecordDelegation { .. }))
+            .count();
+        assert_eq!(logged, 31, "only the accepted delegations are logged");
+        let mut replayed = State::new(log.genesis());
+        for (_, command) in commands {
+            let _outcome = apply(&mut replayed, command);
+        }
+        assert_eq!(replayed, *published);
+    }
 }

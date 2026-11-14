@@ -75,7 +75,7 @@ Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
 \fB\-\-agent\fR \fI<ID>\fR
 Acts as the agent with this ID, with the identity minted for it
 
-The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. Defaults to `FLEETRING_AGENT`.
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`
@@ -120,6 +120,10 @@ The configuration holds no secret (Claude Code\*(Aqs .mcp.json, Cursor\*(Aqs mcp
 `claude mcp add fleetring \-\- fleetring mcp \-\-agent 42 \-\-context dev` registers it with
 Claude Code. For a fleet that isn\*(Aqt dev mode\*(Aqs, `fleetring agent add 42 \-\-context <name>
 \-\-authority <dir>` mints the identity where the authority is.
+
+`\-\-agent 42.c7` serves as a delegated agent that `fleetring agent delegate 42.c7` made: with
+its own token and its root agent\*(Aqs certificate. A start never mints or renews its token; its
+parent delegates a new one.
 
 This is trusted local development: agents on this machine can read each other\*(Aqs
 credentials, so separate identities don\*(Aqt isolate agents from each other.

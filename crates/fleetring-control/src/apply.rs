@@ -7,17 +7,25 @@ use fleetring::{Epoch, NodeId, ReplicationFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::command::UnknownReports;
+use crate::delegation::apply::{self as delegations, Proposed, Times};
+use crate::delegation::prune as delegation_state;
+use crate::delegation::revoke as delegation_revoke;
+use crate::delegation::{
+    AgentName, AncestorViolation, ClaimsViolation, DelegationId, Forgery, Limit, RequestField,
+    Resent, RevocationLimit, StructureViolation, TokenClaims,
+};
 use crate::fork::apply as forks;
 use crate::fork::{
     CancelCause, ForkFailure, ForkIdentity, IntentField, OperationId, OperationOutcome, RetryCause,
 };
-use crate::member::ForkReports;
+use crate::member::{ForkReports, HandoverReports};
+use crate::scope::GrantStepError;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
     Action, Command, Database, DatabaseName, DescriptionChange, Durability, DurabilityError,
     Engine, ExpiryChange, Feature, HostedReplica, Incarnation, Lease, LeaseEpoch, MAX_LABELS,
     Member, Metadata, MetadataChange, MetadataSpec, Position, PrincipalName, Promotion, Quorums,
-    Release, Revoked, Software, State, Timestamp,
+    Release, Revoked, Software, State, Timestamp, TokenId,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -46,6 +54,10 @@ pub type Outcome = Result<Applied, Rejection>;
 /// **Forks** (ADR-0046): a command that drives an existing fork names its fork identity
 /// ([`Action::fork_identity`]), and is refused with [`Rejection::StaleForkIdentity`] before any
 /// other check, the feature gate included, unless that identity is the current fork's.
+///
+/// **Delegations** (ADR-0047): `RecordDelegation`, `RevokeToken`, and `Tick` forget delegation
+/// state past its `kept_until`, and rate-window times past their minute, after every check has
+/// passed; every limit ignores such entries, so it never depends on whether they were pruned.
 ///
 /// # Errors
 ///
@@ -82,15 +94,27 @@ pub type Outcome = Result<Applied, Rejection>;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn apply(state: &mut State, command: Command) -> Outcome {
-    let now = command.at.max(state.now);
-    if let Some(identity) = command.action.fork_identity() {
+    let Command {
+        at,
+        recorded_by,
+        action,
+    } = command;
+    let now = at.max(state.now);
+    if let Some(identity) = action.fork_identity() {
         crate::fork::rules::current_fork(state, identity)?;
     }
-    let features = command.action.features();
+    let features = action.features();
     for feature in features {
         state.check_feature(*feature)?;
     }
-    let applied = match command.action {
+    // A membership change never moves the replica set promotions fence (ADR-0031, amendment 2).
+    // The ring before it is all that is kept, and the databases are looked at only if the
+    // membership epoch grows: a rejoin that changes nothing costs one ring.
+    let membership_epoch = state.membership_epoch;
+    let ring_before = matches!(action, Action::Join { .. } | Action::Leave { .. })
+        .then(|| state.ring().ok())
+        .flatten();
+    let applied = match action {
         Action::Join { member } => join(state, now, member),
         Action::Leave { id } => leave(state, id),
         Action::Heartbeat {
@@ -160,12 +184,19 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         Action::Tick => {
             state.revocations.forget_through(now);
             forks::tick(state, now);
+            delegation_state::forget_through(state, now);
             Ok(Applied::Ticked { at: now })
         }
         Action::Drain { id } => drain(state, id),
         Action::Undrain { id } => undrain(state, id),
         Action::TransferLease { database, target } => transfer_lease(state, now, database, target),
         Action::RevokeToken { revoked, until } => revoke_token(state, now, revoked, until),
+        Action::RevokePrincipal { principal } => {
+            delegation_revoke::revoke_principal(state, now, principal)
+        }
+        Action::RevokeAsAncestor { target, caller } => {
+            delegation_revoke::revoke_as_ancestor(state, Times { at, now }, target, caller)
+        }
         Action::ForkDatabase {
             operation,
             intent,
@@ -220,7 +251,42 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         Action::ReleaseForkHolders { fork, epoch } => {
             forks::release_fork_holders(state, &fork, epoch)
         }
+        Action::RecordDelegation {
+            operation,
+            requested_by,
+            request,
+            caller,
+            id,
+            scopes,
+            not_before,
+            expires_at,
+        } => delegations::record_delegation(
+            state,
+            Times { at, now },
+            recorded_by,
+            Proposed {
+                operation,
+                requested_by,
+                request,
+                caller,
+                id,
+                scopes,
+                not_before,
+                expires_at,
+            },
+        ),
+        Action::ReleaseKeptReplicas {
+            database,
+            incarnation,
+            epoch,
+        } => crate::handover::release_kept_replicas(state, database, incarnation, epoch),
+        Action::EnableHandover => Ok(Applied::HandoverEnabled),
     }?;
+    if let Some(before) = ring_before
+        && state.membership_epoch != membership_epoch
+    {
+        crate::handover::keep_moved(state, &before);
+    }
     state.features.extend(features.iter().copied());
     state.now = now;
     Ok(applied)
@@ -363,6 +429,36 @@ pub enum Applied {
         until: Timestamp,
     },
 
+    /// A principal is on the denylist (ADR-0047, point 11): every token naming it or a name
+    /// below it, issued at or before `before`, is refused.
+    PrincipalRevoked {
+        /// The principal.
+        revoked: Revoked,
+        /// The control time the entry refuses tokens issued until: the command's effective time
+        /// (ADR-0047, point 11.5). A replacement root token may be minted 30 seconds after it,
+        /// by its signer's clock.
+        before: Timestamp,
+        /// When the entry may be forgotten: the later of this and any earlier revocation's.
+        until: Timestamp,
+    },
+
+    /// A principal and a token are on the denylist, revoked by one command under the ancestor
+    /// rule (ADR-0047, point 11.7).
+    PrincipalAndTokenRevoked {
+        /// The principal.
+        principal: Revoked,
+        /// The control time the principal's entry refuses tokens issued until, as for
+        /// [`Applied::PrincipalRevoked`].
+        before: Timestamp,
+        /// When the principal's entry may be forgotten.
+        until: Timestamp,
+        /// The token.
+        token: Revoked,
+        /// When the token's entry may be forgotten, or `None` if the principal's entry covers
+        /// the token, which then has no entry of its own.
+        token_until: Option<Timestamp>,
+    },
+
     /// A database's metadata was patched.
     DatabaseUpdated {
         /// The database.
@@ -470,6 +566,29 @@ pub enum Applied {
         /// The epoch of the primary that reported placement caught up.
         epoch: LeaseEpoch,
     },
+
+    /// A delegation is recorded, or a resend of its operation returned it unchanged: the
+    /// control node signs exactly these claims (ADR-0047, point 5.5).
+    DelegationRecorded {
+        /// The delegation ID, the child token's `jti`.
+        id: DelegationId,
+        /// The child token's claims, every claim but `kid` and `x5c`.
+        claims: TokenClaims,
+        /// Whether the command resent a known operation.
+        resent: Resent,
+    },
+
+    /// A database's replica set moved from the set a membership change kept onto placement
+    /// (ADR-0031, amendment 2).
+    KeptReplicasReleased {
+        /// The database.
+        database: DatabaseName,
+        /// The epoch of the primary that reported placement caught up.
+        epoch: LeaseEpoch,
+    },
+
+    /// [`Feature::Handover`] is enabled (ADR-0031, amendment 2).
+    HandoverEnabled,
 }
 
 /// How a join changed the membership.
@@ -795,8 +914,8 @@ pub enum Rejection {
         fork: ForkIdentity,
     },
 
-    /// A fork request reused a known operation ID, from its requester, asking for something
-    /// else (ADR-0046, point 5.2).
+    /// A fork request reused a known fork operation ID, from its requester, asking for
+    /// something else (ADR-0046, point 5.2).
     #[error("operation {operation} was requested with a different {field}")]
     OperationConflict {
         /// The operation.
@@ -805,8 +924,8 @@ pub enum Rejection {
         field: IntentField,
     },
 
-    /// A fork request reused an operation ID another principal requested. Nothing about the
-    /// operation is revealed (ADR-0046, point 5.2).
+    /// A fork or delegation request reused an operation ID another principal requested.
+    /// Nothing about the operation is revealed (ADR-0046, point 5.2; ADR-0047, point 5.8).
     #[error("operation {operation} isn't yours")]
     OperationNotYours {
         /// The operation.
@@ -994,12 +1113,151 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
+    /// A replica set a membership change kept is released only while the database keeps one,
+    /// for the database's incarnation, and only once its lease holder reports, at the lease's
+    /// epoch, that the write quorum of placement at the current membership epoch holds its log.
+    #[error(
+        "database '{database}' keeps no replica set to release, or its primary hasn't reported \
+         that placement at the current membership epoch holds its log"
+    )]
+    KeptReplicasNotReleasable {
+        /// The database.
+        database: DatabaseName,
+    },
+
     /// A fork's durability can't change until it is ready: its completion counted holders
     /// under the settings it was made with.
     #[error("fork '{database}' is not ready; its durability can't change yet")]
     ForkNotReady {
         /// The fork.
         database: DatabaseName,
+    },
+
+    /// A `RecordDelegation` carries no `recorded_by`: the log layer didn't stamp it, so it
+    /// can't be attributed (ADR-0047, point 6.1).
+    #[error("a delegation is recorded only by a command its control node stamped")]
+    Unstamped,
+
+    /// A delegation breaks the structure ADR-0047 point 5.9 asks of it, or disagrees with its
+    /// delegated parent's record.
+    #[error("invalid delegation: {reason}")]
+    DelegationStructure {
+        /// What it breaks.
+        reason: StructureViolation,
+    },
+
+    /// A delegation's claims aren't a recordable issuer-signed token's (ADR-0047, points 3.1 to
+    /// 3.8 and 5.9).
+    #[error("invalid delegation: {reason}")]
+    DelegationClaims {
+        /// The first rule the claims break.
+        reason: ClaimsViolation,
+    },
+
+    /// A delegation's scopes aren't in canonical form: sorted, with nothing repeated or covered
+    /// (ADR-0047, point 6.5).
+    #[error("a delegation's scopes must be in canonical form")]
+    NonCanonicalScopes,
+
+    /// A delegated parent's record doesn't cover the child's scopes by the strict grant step
+    /// (ADR-0047, point 5.9).
+    #[error("the child isn't a narrowing of its parent's record: {reason}")]
+    NotNarrowed {
+        /// Why the strict grant step refuses.
+        reason: GrantStepError,
+    },
+
+    /// The denylist refuses the caller's token: its own ID or key, or an ID or key in its chain
+    /// (ADR-0047, point 5.9).
+    #[error("the caller's token is revoked by {by}")]
+    CallerRevoked {
+        /// The first entry that refuses it.
+        by: Revoked,
+    },
+
+    /// A delegated caller's lineage can't be vouched for (ADR-0047, point 5.9, I6).
+    #[error("the caller's lineage is forged: {reason}")]
+    ForgedLineage {
+        /// Why.
+        reason: Forgery,
+    },
+
+    /// A delegation would pass a limit of ADR-0047 point 5.10 or the backstop of point 6.3.
+    #[error("too many delegations: {limit}")]
+    DelegationLimit {
+        /// The limit.
+        limit: Limit,
+    },
+
+    /// `RevokeToken` named a principal, which only `RevokePrincipal` and `RevokeAsAncestor`
+    /// revoke, since they choose its `before` (ADR-0047, point 11.5).
+    #[error("{revoked} is revoked by a principal revocation, not a token's")]
+    PrincipalNeedsItsAction {
+        /// The principal target.
+        revoked: Revoked,
+    },
+
+    /// The ancestor rule doesn't let the caller revoke the target (ADR-0047, point 11.3).
+    #[error("the ancestor rule refuses it: {reason}")]
+    NotAncestor {
+        /// Why.
+        reason: AncestorViolation,
+    },
+
+    /// Under the ancestor rule, a token target is neither the token the caller presented nor a
+    /// delegation still recorded below it (ADR-0047, point 11.3). The message says nothing more,
+    /// so nobody can probe for another principal's tokens.
+    #[error("no live delegation with that token id")]
+    NoLiveDelegation {
+        /// The token ID named.
+        id: TokenId,
+    },
+
+    /// A revocation under the ancestor rule would pass a limit of ADR-0047 point 11.6.
+    #[error("too many revocations: {limit}")]
+    RevocationLimit {
+        /// The limit.
+        limit: RevocationLimit,
+    },
+
+    /// The child's name was revoked by principal within the second its token would be issued
+    /// in, so every node would refuse the token (ADR-0047, points 5.9 and 11.5). A retry a
+    /// second later records a token that works.
+    #[error("{principal} was revoked less than a second ago; retry")]
+    RevokedThisSecond {
+        /// The child's name.
+        principal: AgentName,
+    },
+
+    /// A kept delegation already has the ID the command drew; the control node draws another.
+    #[error("delegation id {id} is taken")]
+    DelegationIdTaken {
+        /// The ID.
+        id: DelegationId,
+    },
+
+    /// A delegation request reused a known operation ID, from its requester, with another
+    /// canonical request (ADR-0047, point 5.8).
+    #[error("operation {operation} was requested with a different {field}")]
+    DelegationConflict {
+        /// The operation.
+        operation: OperationId,
+        /// The first field of the request that differs.
+        field: RequestField,
+    },
+
+    /// A resend named an operation whose delegation has expired (ADR-0047, point 5.7).
+    #[error("this operation's delegation has expired")]
+    DelegationExpired {
+        /// The operation.
+        operation: OperationId,
+    },
+
+    /// A resend named an operation whose delegation is revoked (ADR-0047, point 5.7).
+    #[error("this operation's delegation is revoked")]
+    DelegationRevoked {
+        /// The operation.
+        operation: OperationId,
     },
 }
 
@@ -1161,10 +1419,15 @@ fn heartbeat(state: &mut State, now: Timestamp, reported: Reported) -> Outcome {
     } else {
         (ForkReports::Drop, None)
     };
+    let handover = if state.is_enabled(Feature::Handover) {
+        HandoverReports::Record
+    } else {
+        HandoverReports::Drop
+    };
     let reports = replicas
         .into_iter()
         .filter(|replica| !unknown.contains(replica.database()))
-        .map(|replica| replica.into_report(now, forks))
+        .map(|replica| replica.into_report(now, forks, handover))
         .collect();
 
     let Some(entry) = state.members.get_mut(&id) else {
@@ -1587,12 +1850,27 @@ fn best_candidate(
     Ok((candidate.clone(), position.clone()))
 }
 
+/// Applies `RevokeToken`: after its one check, prunes the delegations a token's revocation ends
+/// and keeps the entry past the longest `kept_until` among them (ADR-0047, points 11.4 and
+/// 11.5), forgets delegation state and revocations the time has passed, and adds the entry.
+/// Without delegation state it does exactly what it did before delegation.
 fn revoke_token(state: &mut State, now: Timestamp, revoked: Revoked, until: Timestamp) -> Outcome {
+    match revoked {
+        Revoked::Token(_) | Revoked::Key(_) => {}
+        Revoked::Principal { .. } => return Err(Rejection::PrincipalNeedsItsAction { revoked }),
+    }
     if until <= now {
         return Err(Rejection::RevocationPassed { revoked, until });
     }
+    let covered = delegation_state::prune_revoked(state, &revoked, now)
+        .map(|kept_until| kept_until.saturating_add(crate::delegation::REVOCATION_MARGIN));
+    let until = covered.map_or(until, |covered| until.max(covered));
+    delegation_state::forget_through(state, now);
     state.revocations.forget_through(now);
-    let until = state.revocations.insert(revoked.clone(), until);
+    let until = state
+        .revocations
+        .insert(revoked.clone(), crate::Entry::fleet(until))
+        .until;
     Ok(Applied::TokenRevoked { revoked, until })
 }
 
