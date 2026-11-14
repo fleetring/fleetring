@@ -370,13 +370,18 @@ impl Fleet {
         Ok(())
     }
 
-    /// Revokes as `token`, under the ancestor rule.
-    async fn revoke_as(&self, token: &BearerToken, request: RevokeTokenRequest) -> TestResult {
+    /// Revokes as `token`, under the ancestor rule, and returns the principal entry's `before`
+    /// (milliseconds) when the request named a principal.
+    async fn revoke_as(
+        &self,
+        token: &BearerToken,
+        request: RevokeTokenRequest,
+    ) -> Result<Option<u64>, Box<dyn Error>> {
         let answer = self.control(token)?.revoke_token(request.clone()).await?;
         if !request.principal.is_empty() {
             assert!(answer.before_ms.is_some(), "{answer:?}");
         }
-        Ok(())
+        Ok(answer.before_ms)
     }
 }
 
@@ -692,10 +697,10 @@ async fn c7_principal(change: Change) -> TestResult {
 async fn remove_root(change: Change) -> TestResult {
     let mut fleet = Fleet::start().await?;
     let mut l = lineage(&mut fleet, change).await?;
-    let revoked_at = SystemClock.now();
-    fleet
+    let before = fleet
         .revoke_as(&l.root.token, principal_request("agent-42", Some(ROOT_ID)))
-        .await?;
+        .await?
+        .ok_or("the principal revocation answered no before")?;
     check(
         &fleet,
         "agent remove 42",
@@ -703,8 +708,12 @@ async fn remove_root(change: Change) -> TestResult {
         &mut [],
     )
     .await?;
-    // By the wall clock the signer reads, which may be stepped while a sleep runs.
-    let after = revoked_at.saturating_add(Millis::new(32_000));
+    // From the entry's own `before`, not from when the call was sent: under load the control
+    // plane can apply the revocation a little later. Nodes compare `iat` in whole seconds with
+    // 30 s of leeway, so the first token that works is signed in the first whole second after
+    // `before` + 30 s, the time `agent remove` prints. Read by the wall clock the signer reads,
+    // which may be stepped while a sleep runs.
+    let after = Timestamp::from_millis((before.saturating_add(30_000) / 1_000 + 1) * 1_000);
     while SystemClock.now() < after {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

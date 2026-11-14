@@ -62,8 +62,14 @@ struct State {
     recent_bytes: usize,
     /// Payload bytes published since the last checkpoint.
     log_bytes: u64,
+    /// When the last build of the chain failed, unless one has succeeded since.
+    build_failed: Option<Instant>,
     /// How many times a checkpoint has started or ended: odd while one runs.
     checkpoints: u64,
+    /// How many checkpoints have ended that restarted the log, or may have: every one that
+    /// succeeded, and every one that failed other than blocked. A blocked checkpoint never
+    /// touches the log, so a build of the chain that one overlapped still describes one log.
+    restarts: u64,
     /// The last checkpoint's marker.
     marker: Option<CheckpointMarker>,
     /// How many batches have been published since this primary started serving.
@@ -95,20 +101,51 @@ enum ChainState {
     Ready(Chain),
     /// A batch was published that the chain couldn't continue from, or the last build failed:
     /// the next stream batch, checkpoint, pass of [`drive`], snapshot, or seeding request
-    /// builds it again.
+    /// builds it again, though only a snapshot or a seeding request within
+    /// [`CHAIN_BUILD_PAUSE`] of a build that failed.
     Lost,
 }
 
+/// How long after a build of the chain fails it isn't built again for a stream batch, a
+/// checkpoint, or a pass of [`drive`], so that a build that keeps failing isn't retried for
+/// every batch shipped. A snapshot or a fork's seeding request, which needs the chain now and
+/// whose asker paces its own retries, builds it at once.
+const CHAIN_BUILD_PAUSE: Duration = Duration::from_secs(1);
+
+/// What one build of the chain read from the record and the log.
+#[derive(Debug)]
+struct Reads {
+    /// The chain the reads built, or why they built none.
+    built: Result<Chain, String>,
+    /// [`State::restarts`] when the reads began, with no checkpoint running.
+    restarts: u64,
+    /// The count of [`State::checkpoints`] at which every checkpoint that started before the
+    /// reads were first judged has ended, once they have been.
+    settled: Option<u64>,
+}
+
 /// How one build of the chain from the record and the log ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Rebuild {
     /// The chain is built.
     Built,
     /// The reads are stale, so the build reads again: a batch was published that the chain
-    /// they built doesn't reach, or a checkpoint started meanwhile.
+    /// they built doesn't reach, or a checkpoint that may have restarted the log ran meanwhile.
     Again,
     /// The build failed, and the chain is lost, so that it is built again when next asked.
     Failed,
+    /// A checkpoint that started during the reads still runs: it may restart the log between
+    /// them, or be blocked and leave it untouched, so the reads are judged again once it ends.
+    Pending(Reads),
+}
+
+/// How a checkpoint that failed left the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointFailure {
+    /// Untouched: the engine refused to checkpoint, as while a snapshot is pinned.
+    Blocked,
+    /// Perhaps restarted, as by a checkpoint that failed partway.
+    Other,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,35 +270,57 @@ impl Primary {
         }
     }
 
-    /// Takes what a build read from the record and the log, which it began reading when
-    /// `checkpoints` checkpoints had started or ended and none ran.
+    /// Takes what a build read from the record and the log, which it began reading while no
+    /// checkpoint ran.
     ///
-    /// A checkpoint that started since may have restarted the log between the build's reads,
-    /// which then don't describe one log: neither the chain they built nor their failure counts,
-    /// and the build reads again. A build that failed otherwise leaves the chain lost, never
-    /// loading, so that it is built again when next asked, with no write needed to set it off
-    /// (#156).
-    fn chain_built(&self, built: Result<Chain, String>, checkpoints: u64) -> Rebuild {
+    /// A checkpoint that restarted the log meanwhile, or may have, makes reads that don't
+    /// describe one log: neither the chain they built nor their failure counts, and the build
+    /// reads again. One that still runs is waited for, since it may yet turn out blocked, as
+    /// every checkpoint is while a fork's seeder holds a pin: a blocked checkpoint never touches
+    /// the log, so it costs the build nothing, however many writes set one off. A build that
+    /// failed otherwise leaves the chain lost, never loading, so that it is built again when
+    /// next asked, with no write needed to set it off (#156).
+    fn chain_built(&self, reads: Reads) -> Rebuild {
         let mut state = self.lock();
-        if state.checkpoints != checkpoints {
-            tracing::debug!(database = %self.name, "a checkpoint started while the chain was being built; reading the log again");
+        let settled = reads
+            .settled
+            .unwrap_or(state.checkpoints + state.checkpoints % 2);
+        if state.checkpoints < settled {
+            return Rebuild::Pending(Reads {
+                settled: Some(settled),
+                ..reads
+            });
+        }
+        if state.restarts != reads.restarts {
+            tracing::debug!(database = %self.name, "a checkpoint ran while the chain was being built; reading the log again");
             return Rebuild::Again;
         }
-        match built {
+        match reads.built {
             Ok(chain)
                 if chain.tip().0 == state.committed.as_ref()
                     || state.chain_can_reach(&chain, state.committed.as_ref()) =>
             {
                 state.chain = ChainState::Ready(chain);
+                state.build_failed = None;
                 Rebuild::Built
             }
             Ok(_) => Rebuild::Again,
             Err(error) => {
                 tracing::warn!(database = %self.name, %error, "can't build the log's hash chain; building it again when next asked");
                 state.chain = ChainState::Lost;
+                state.build_failed = Some(Instant::now());
                 Rebuild::Failed
             }
         }
+    }
+
+    /// [`State::restarts`], if no checkpoint runs, for a build that is to begin reading.
+    fn idle_restarts(&self) -> Option<u64> {
+        let state = self.lock();
+        state
+            .checkpoints
+            .is_multiple_of(2)
+            .then_some(state.restarts)
     }
 
     /// Whether a build of the chain is under way, which ends with the chain built or lost.
@@ -368,10 +427,14 @@ impl Primary {
         built
     }
 
-    /// Whether the chain was lost and needs rebuilding; sets it loading if so.
-    fn take_lost(&self) -> bool {
+    /// Whether the chain was lost and needs rebuilding, unless the last build failed less than
+    /// `pause` ago; sets it loading if so.
+    fn take_lost(&self, pause: Duration) -> bool {
         let mut state = self.lock();
-        if matches!(state.chain, ChainState::Lost) {
+        let paused = state
+            .build_failed
+            .is_some_and(|failed| failed.elapsed() < pause);
+        if matches!(state.chain, ChainState::Lost) && !paused {
             state.chain = ChainState::Loading;
             true
         } else {
@@ -679,10 +742,17 @@ impl Primary {
         Ok(())
     }
 
-    fn end_checkpoint(&self, result: Result<&CheckpointMarker, ()>, excluded: &[NodeId]) {
+    fn end_checkpoint(
+        &self,
+        result: Result<&CheckpointMarker, CheckpointFailure>,
+        excluded: &[NodeId],
+    ) {
         {
             let mut state = self.lock();
             state.checkpoints += 1;
+            if result != Err(CheckpointFailure::Blocked) {
+                state.restarts += 1;
+            }
             if let Ok(marker) = result {
                 state.log_bytes = 0;
                 for node in excluded {
@@ -1010,7 +1080,12 @@ pub(super) async fn checkpoint(
             Ok(marker)
         }
         Err(error) => {
-            primary.end_checkpoint(Err(()), &excluded);
+            let failure = if matches!(error.engine_error(), Some(EngineError::CheckpointBlocked)) {
+                CheckpointFailure::Blocked
+            } else {
+                CheckpointFailure::Other
+            };
+            primary.end_checkpoint(Err(failure), &excluded);
             Err(failed(format!("checkpoint failed: {error}")))
         }
     }
@@ -1081,52 +1156,86 @@ pub(super) async fn chain_to(
     }
 }
 
-/// Brings the chain up to `target` as [`chain_to`] does, rebuilding it first, here, if it is
-/// lost. A snapshot or a fork's seeding request calls this, since it needs the hash at its
-/// position now, and the next pass of [`drive`] would only have it asked again.
+/// Brings the chain up to `target` as [`chain_to`] does, rebuilding it first, and waiting for
+/// that, if it is lost. A snapshot or a fork's seeding request calls this, since it needs the
+/// hash at its position now, and the next pass of [`drive`] would only have it asked again.
+///
+/// The build runs in a task of its own, which a caller dropped meanwhile, as a call whose peer
+/// went away is, doesn't cancel: a cancelled build would leave the chain loading for good, and
+/// nothing builds a loading chain (#156).
 pub(super) async fn chain_to_rebuilt(
-    inner: &Inner,
-    primary: &Primary,
+    inner: &Arc<Inner>,
+    primary: &Arc<Primary>,
     handle: &DatabaseHandle,
     target: Option<&Position>,
 ) -> bool {
-    if primary.take_lost() {
-        rebuild_chain(inner, primary).await;
+    if primary.take_lost(Duration::ZERO) {
+        let build = spawn_rebuild(inner, primary, Some(FaultPoint::ChainRebuild));
+        if let Err(error) = build.await {
+            tracing::warn!(database = %primary.name, %error, "the hash chain's build ended early");
+        }
     }
     chain_to(inner, primary, handle, target).await
 }
 
-/// Rebuilds the chain in a task of its own if it is lost.
+/// Rebuilds the chain in a task of its own if it is lost, unless a build failed less than
+/// [`CHAIN_BUILD_PAUSE`] ago.
 fn rebuild_lost_chain(inner: &Arc<Inner>, primary: &Arc<Primary>) {
-    if primary.take_lost() {
-        let inner = Arc::clone(inner);
-        let primary = Arc::clone(primary);
-        tokio::spawn(async move { rebuild_chain(&inner, &primary).await });
+    if primary.take_lost(CHAIN_BUILD_PAUSE) {
+        drop(spawn_rebuild(inner, primary, None));
     }
+}
+
+/// Rebuilds the chain, which the caller set loading, in a task of its own, passing `point`
+/// first if there is one.
+fn spawn_rebuild(
+    inner: &Arc<Inner>,
+    primary: &Arc<Primary>,
+    point: Option<FaultPoint>,
+) -> JoinHandle<()> {
+    let inner = Arc::clone(inner);
+    let primary = Arc::clone(primary);
+    tokio::spawn(async move {
+        if let Some(point) = point {
+            inner.forks.faults().pass_any(point).await;
+        }
+        rebuild_chain(&inner, &primary).await;
+    })
 }
 
 /// Rebuilds the primary's chain from its record and the log, as [`drive`] does when serving
 /// starts, and as a lost chain is when next asked for. Ends with the chain built, or lost if the
 /// build failed.
 ///
-/// A checkpoint restarts the log, so the build reads only while none runs, and reads again if
-/// one started meanwhile. Never called from inside a checkpoint, which it would wait for.
+/// A checkpoint restarts the log, so the build begins reading only while none runs, and reads
+/// again if one that restarted the log, or may have, ran meanwhile. Never called from inside a
+/// checkpoint, which it would wait for.
 async fn rebuild_chain(inner: &Inner, primary: &Primary) {
     let mut changes = primary.changed.subscribe();
     loop {
-        let checkpoints = primary.checkpoints();
-        if checkpoints % 2 == 1 {
-            // A checkpoint's end bumps `changed`, whose sender lives as long as the primary.
+        // A checkpoint's end bumps `changed`, whose sender lives as long as the primary.
+        let Some(restarts) = primary.idle_restarts() else {
             let _ = changes.changed().await;
             continue;
-        }
+        };
         let built = match inner.registry().open(&primary.name).await {
             Ok(handle) => load_chain(inner, primary, &handle).await,
             Err(error) => Err(error.to_string()),
         };
-        match primary.chain_built(built, checkpoints) {
-            Rebuild::Built | Rebuild::Failed => return,
-            Rebuild::Again => {}
+        let mut reads = Reads {
+            built,
+            restarts,
+            settled: None,
+        };
+        loop {
+            match primary.chain_built(reads) {
+                Rebuild::Built | Rebuild::Failed => return,
+                Rebuild::Again => break,
+                Rebuild::Pending(pending) => {
+                    reads = pending;
+                    let _ = changes.changed().await;
+                }
+            }
         }
     }
 }
@@ -1752,25 +1861,67 @@ mod tests {
         Primary::new("db".parse().expect("a valid name"), role, None)
     }
 
-    /// A build that a checkpoint started during reads the log again, whether its reads built a
-    /// chain or failed, since the checkpoint may have restarted the log between them (#156).
+    /// What a build read, beginning while no checkpoint ran.
+    fn reads(primary: &Primary, built: Result<Chain, String>) -> Reads {
+        Reads {
+            built,
+            restarts: primary.idle_restarts().expect("no checkpoint runs"),
+            settled: None,
+        }
+    }
+
+    /// A build that a checkpoint ran during reads the log again once the checkpoint has
+    /// restarted it, whether its reads built a chain or failed, since the log may have restarted
+    /// between them (#156).
     #[test]
     fn a_build_a_checkpoint_raced_reads_again() {
         let primary = primary();
-        let before = primary.checkpoints();
+        let raced = reads(
+            &primary,
+            Err("position 0020 does not fit the log".to_owned()),
+        );
         primary.begin_checkpoint(&[]).expect("no checkpoint runs");
-        let raced = Err("position 0020 does not fit the log".to_owned());
-        assert_eq!(primary.chain_built(raced, before), Rebuild::Again);
+        assert_eq!(primary.idle_restarts(), None, "no build begins meanwhile");
+        let Rebuild::Pending(raced) = primary.chain_built(raced) else {
+            panic!("reads a running checkpoint overlapped are judged when it ends");
+        };
         assert!(primary.chain_loading(), "the build goes on");
-        primary.end_checkpoint(Err(()), &[]);
-        assert_eq!(
-            primary.chain_built(Ok(Chain::genesis()), before),
-            Rebuild::Again
+        let marker = CheckpointMarker {
+            position: Position::from(vec![0x20]),
+        };
+        primary.end_checkpoint(Ok(&marker), &[]);
+        assert!(matches!(primary.chain_built(raced), Rebuild::Again));
+        let built = reads(&primary, Ok(Chain::genesis()));
+        primary.begin_checkpoint(&[]).expect("no checkpoint runs");
+        primary.end_checkpoint(Err(CheckpointFailure::Other), &[]);
+        assert!(
+            matches!(primary.chain_built(built), Rebuild::Again),
+            "a checkpoint that failed partway may have restarted the log"
         );
-        assert_eq!(
-            primary.chain_built(Ok(Chain::genesis()), primary.checkpoints()),
-            Rebuild::Built
-        );
+        let built = reads(&primary, Ok(Chain::genesis()));
+        assert!(matches!(primary.chain_built(built), Rebuild::Built));
+        assert!(primary.hash_at(None).is_some());
+    }
+
+    /// Blocked checkpoints, which a write sets off once the log is long enough while a fork's
+    /// seeder holds a pin, cost a build nothing, whether they end before its reads are judged or
+    /// run while they are: they never touch the log (#156).
+    #[test]
+    fn blocked_checkpoints_cost_a_build_nothing() {
+        let primary = primary();
+        let built = reads(&primary, Ok(Chain::genesis()));
+        for _ in 0..3 {
+            primary.begin_checkpoint(&[]).expect("no checkpoint runs");
+            primary.end_checkpoint(Err(CheckpointFailure::Blocked), &[]);
+        }
+        primary.begin_checkpoint(&[]).expect("no checkpoint runs");
+        let Rebuild::Pending(built) = primary.chain_built(built) else {
+            panic!("reads a running checkpoint overlapped are judged when it ends");
+        };
+        primary.end_checkpoint(Err(CheckpointFailure::Blocked), &[]);
+        // Another checkpoint that started after the reads were judged is no reason to wait.
+        primary.begin_checkpoint(&[]).expect("no checkpoint runs");
+        assert!(matches!(primary.chain_built(built), Rebuild::Built));
         assert!(primary.hash_at(None).is_some());
     }
 
@@ -1779,13 +1930,41 @@ mod tests {
     #[test]
     fn a_failed_build_leaves_the_chain_lost() {
         let primary = primary();
-        let failed = Err("the log can't be read".to_owned());
-        assert_eq!(
-            primary.chain_built(failed, primary.checkpoints()),
-            Rebuild::Failed
-        );
+        let failed = reads(&primary, Err("the log can't be read".to_owned()));
+        assert!(matches!(primary.chain_built(failed), Rebuild::Failed));
         assert!(!primary.chain_loading());
-        assert!(primary.take_lost(), "the next asker builds it again");
+        assert!(
+            primary.take_lost(Duration::ZERO),
+            "the next asker builds it again"
+        );
         assert!(primary.chain_loading());
+    }
+
+    /// A build that keeps failing is tried again by streams, checkpoints, and passes of
+    /// [`drive`] at most once per [`CHAIN_BUILD_PAUSE`], and by a snapshot or a seeding request
+    /// at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_build_waits_before_it_is_tried_again() {
+        let primary = primary();
+        let failed = reads(&primary, Err("the log can't be read".to_owned()));
+        assert!(matches!(primary.chain_built(failed), Rebuild::Failed));
+        assert!(
+            !primary.take_lost(CHAIN_BUILD_PAUSE),
+            "not for the next batch"
+        );
+        time::advance(CHAIN_BUILD_PAUSE).await;
+        assert!(
+            primary.take_lost(CHAIN_BUILD_PAUSE),
+            "once the pause is over"
+        );
+        let failed = reads(&primary, Err("the log can't be read".to_owned()));
+        assert!(matches!(primary.chain_built(failed), Rebuild::Failed));
+        assert!(
+            primary.take_lost(Duration::ZERO),
+            "a seeding request builds it at once"
+        );
+        let built = reads(&primary, Ok(Chain::genesis()));
+        assert!(matches!(primary.chain_built(built), Rebuild::Built));
+        assert_eq!(primary.lock().build_failed, None);
     }
 }

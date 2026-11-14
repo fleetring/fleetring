@@ -33,7 +33,9 @@ use crate::replication::{Replication, ReplicationParts};
 use crate::tls::{
     Identity, IdentityError, IssuerFileProblem, IssuerFilesError, IssuerPair, IssuerWatch, Security,
 };
-use crate::transport::{Listener, Peers, control_server, database_server, incoming};
+use crate::transport::{
+    AcceptLoop, Listener, Peers, control_server, database_server, incoming_and_accept_loop,
+};
 use crate::{
     AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, DataDir, DataDirError,
     DatabaseStatuses, Membership, MembershipTasks, OnShutdown, Plaintext, Registry,
@@ -113,6 +115,9 @@ struct RunningServer {
     address: SocketAddr,
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<(), tonic::transport::Error>>,
+    /// The task that accepts connections and owns the listener, which ends once the server
+    /// stops accepting.
+    accepting: AcceptLoop,
 }
 
 /// The error returned when a daemon can't start.
@@ -547,6 +552,10 @@ impl Daemon {
                 let _aborted = task.await;
             }
         }
+        // The server dropped its connections' stream when it stopped accepting, and the accept
+        // loop closes the listener once it notices: waiting for that frees the port before this
+        // returns, for a node started again on it in this process.
+        self.server.accepting.closed().await;
         // The server has stopped, but a connection it dropped at its grace may still run a call
         // in a runtime that goes on, as an in-process daemon's does: stopping replication ends
         // the primaries' streams and every stream following a database here, and refuses
@@ -717,29 +726,13 @@ async fn bind_admin(
              non-loopback address, to anyone who can connect",
         );
     }
-    let listener = listen_tcp(admin.listen).map_err(|source| StartError::Listen {
-        address: admin.listen,
-        source,
-    })?;
+    let listener = tokio::net::TcpListener::bind(admin.listen)
+        .await
+        .map_err(|source| StartError::Listen {
+            address: admin.listen,
+            source,
+        })?;
     Ok(Some(listener))
-}
-
-/// How many connections the kernel queues on a listener before it accepts them.
-const LISTEN_BACKLOG: u32 = 1_024;
-
-/// Listens on `address`. On Unix the socket may reuse an address whose connections the
-/// previous run closed and that still linger in `TIME_WAIT`, so a node restarted on its
-/// configured port binds it at once, as servers do; `TcpListener::bind` doesn't, and refused for
-/// up to a minute. Never on Windows, where the option lets a second listener take the port.
-fn listen_tcp(address: SocketAddr) -> io::Result<tokio::net::TcpListener> {
-    let socket = match address {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-    #[cfg(unix)]
-    socket.set_reuseaddr(true)?;
-    socket.bind(address)?;
-    socket.listen(LISTEN_BACKLOG)
 }
 
 /// The address this node reaches the control plane at: `[control] address`, or else its own
@@ -923,7 +916,11 @@ async fn bind(config: &Config, network: &Network) -> Result<(Listener, SocketAdd
         source,
     };
     let listener = if network.is_tcp() {
-        Listener::Tcp(listen_tcp(config.listen).map_err(listen_error)?)
+        Listener::Tcp(
+            tokio::net::TcpListener::bind(config.listen)
+                .await
+                .map_err(listen_error)?,
+        )
     } else {
         #[cfg(feature = "simulation")]
         {
@@ -1006,12 +1003,13 @@ fn serve(
         )
         .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))))
         .add_optional_service(data.map(|node| node.replication().server()));
-    let task =
-        tokio::spawn(router.serve_with_incoming_shutdown(incoming(listener, security), shutdown));
+    let (incoming, accepting) = incoming_and_accept_loop(listener, security);
+    let task = tokio::spawn(router.serve_with_incoming_shutdown(incoming, shutdown));
     RunningServer {
         address,
         stop,
         task,
+        accepting,
     }
 }
 

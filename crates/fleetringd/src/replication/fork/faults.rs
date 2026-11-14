@@ -64,6 +64,10 @@ pub enum FaultPoint {
     /// the checkpoint yet: held, writes land in between, which the restarted log no longer
     /// holds once it runs. Held only for every database, with [`hold`](ForkFaults::hold).
     Checkpoint,
+    /// A snapshot or a fork's seeding request found its database's hash chain lost, and is
+    /// about to build it again: held, the chain stays loading. Held only for every database,
+    /// with [`hold`](ForkFaults::hold).
+    ChainRebuild,
     /// A node has written a fork's copy and its sidecar to temporary files and synced them, and
     /// hasn't renamed either into place: a crash here leaves only temporary files.
     StagingWritten,
@@ -107,8 +111,8 @@ struct Hooks {
     /// Whether the control service answers `Locate` as a control node from before replica sets
     /// were shown (0.7) does: without `placed_replicas` or `membership_epoch`.
     hide_replica_sets: std::sync::atomic::AtomicBool,
-    /// Whether the next build of a primary's hash chain fails.
-    fail_chain_build: std::sync::atomic::AtomicBool,
+    /// How many of the next builds of a primary's hash chain fail.
+    fail_chain_builds: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(feature = "fault-hooks")]
@@ -124,7 +128,7 @@ impl ForkFaults {
                 disk: std::sync::Mutex::new(None),
                 drop_reply: std::sync::atomic::AtomicBool::new(false),
                 hide_replica_sets: std::sync::atomic::AtomicBool::new(false),
-                fail_chain_build: std::sync::atomic::AtomicBool::new(false),
+                fail_chain_builds: std::sync::atomic::AtomicU32::new(0),
             })),
         }
     }
@@ -248,21 +252,29 @@ impl ForkFaults {
     /// Makes the next build of a primary's hash chain from its record and its log fail, once,
     /// as one whose reads a checkpoint restarted the log between did.
     pub fn fail_next_chain_build(&self) {
+        self.fail_next_chain_builds(1);
+    }
+
+    /// Makes the next `count` builds of a primary's hash chain fail, as
+    /// [`fail_next_chain_build`](Self::fail_next_chain_build) does the next one, in place of
+    /// any count asked for before: 0 lets the next build run.
+    pub fn fail_next_chain_builds(&self, count: u32) {
         if let Some(hooks) = &self.hooks {
             hooks
-                .fail_chain_build
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+                .fail_chain_builds
+                .store(count, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
-    /// Whether the next chain build is still to fail: `false` once the one
-    /// [`fail_next_chain_build`](Self::fail_next_chain_build) asked for has failed.
+    /// Whether the next chain build is still to fail: `false` once every build
+    /// [`fail_next_chain_builds`](Self::fail_next_chain_builds) asked to fail has failed.
     #[must_use]
     pub fn fails_next_chain_build(&self) -> bool {
         self.hooks.as_ref().is_some_and(|hooks| {
             hooks
-                .fail_chain_build
+                .fail_chain_builds
                 .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
         })
     }
 
@@ -336,16 +348,26 @@ impl ForkFaults {
         false
     }
 
-    /// Whether this chain build is to fail; true once per
-    /// [`fail_next_chain_build`](Self::fail_next_chain_build).
+    /// Whether this chain build is to fail; true once per build
+    /// [`fail_next_chain_builds`](Self::fail_next_chain_builds) asked to fail.
     pub(crate) fn take_chain_build_failure(&self) -> bool {
         #[cfg(feature = "fault-hooks")]
         {
-            self.hooks.as_ref().is_some_and(|hooks| {
-                hooks
-                    .fail_chain_build
-                    .swap(false, std::sync::atomic::Ordering::SeqCst)
-            })
+            use std::sync::atomic::Ordering::SeqCst;
+            let Some(hooks) = &self.hooks else {
+                return false;
+            };
+            let mut count = hooks.fail_chain_builds.load(SeqCst);
+            while count > 0 {
+                match hooks
+                    .fail_chain_builds
+                    .compare_exchange(count, count - 1, SeqCst, SeqCst)
+                {
+                    Ok(_) => return true,
+                    Err(now) => count = now,
+                }
+            }
+            false
         }
         #[cfg(not(feature = "fault-hooks"))]
         false

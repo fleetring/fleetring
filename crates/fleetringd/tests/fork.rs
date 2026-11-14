@@ -1205,6 +1205,17 @@ async fn dev_node_with_faults(
     extra: &str,
     faults: ForkFaults,
 ) -> Result<(Daemon, Client), Box<dyn Error>> {
+    let (daemon, client, _) = dev_node_with_tls(dir, extra, faults).await?;
+    Ok((daemon, client))
+}
+
+/// A dev node as [`dev_node_with_faults`] makes it, with the authority that issued its
+/// certificate, which issues others for the node `dev`.
+async fn dev_node_with_tls(
+    dir: &Path,
+    extra: &str,
+    faults: ForkFaults,
+) -> Result<(Daemon, Client, Tls), Box<dyn Error>> {
     logs();
     let tls = Tls::create(dir)?;
     let text = format!(
@@ -1227,7 +1238,7 @@ async fn dev_node_with_faults(
     .await?
     .ok_or("membership stopped")?;
     let client = Client::new(address.to_string(), client_network(&tls)?);
-    Ok((daemon, client))
+    Ok((daemon, client, tls))
 }
 
 /// A dev node, R = 1 and W = 1, forks and its fork becomes ready through the same path
@@ -1323,6 +1334,84 @@ async fn a_lone_primary_builds_its_chain_again_after_a_build_fails() -> TestResu
         notes(&client, &target).await?,
         notes(&client, &source).await?
     );
+    daemon.run_until(async {}).await;
+    Ok(())
+}
+
+/// A seeding request that finds its source's hash chain lost builds it again, and a build
+/// whose request is dropped meanwhile, as one the seeder's idle limit gives up on is, still ends
+/// with the chain built rather than loading for good, so a later request is served (#156).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_seeding_request_still_builds_the_chain() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let faults = ForkFaults::new();
+    faults.set_disk(ROOMY, 2 * ROOMY);
+    let (daemon, client, tls) = dev_node_with_tls(dir.path(), "", faults.clone()).await?;
+    // Every build fails until the request below holds one, so the chain stays lost.
+    faults.fail_next_chain_builds(u32::MAX);
+    let source = name("src")?;
+    create_source(&client, &source, 1, 3).await?;
+    // The seeder never asks, so the requests below are the only ones.
+    faults.hold(FaultPoint::Fetch);
+    faults.hold(FaultPoint::ChainRebuild);
+    let id = operation(45);
+    client
+        .fork_database(&source, &name("dst")?, &spec(id, 1)?)
+        .await?;
+    if !faults
+        .await_arrivals(FaultPoint::Fetch, 1, HANG_GUARD)
+        .await
+    {
+        return Err("the seeder never got to ask".into());
+    }
+    let status = client.fork_operation(id).await?;
+    let request = seeding_request(&source, &status, status.attempt, false);
+    let as_seeder = tls.node_network("dev")?;
+    let address = daemon.listen_address().to_string();
+    // A request that finds a failed build under way is told to ask again, and does.
+    let asking = loop {
+        let mut asking = tokio::spawn({
+            let (network, address, request) = (as_seeder.clone(), address.clone(), request.clone());
+            async move {
+                ask(&network, &address, request)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        });
+        tokio::select! {
+            arrived = faults.await_arrivals(FaultPoint::ChainRebuild, 1, HANG_GUARD) => {
+                if !arrived {
+                    return Err("no seeding request built the chain".into());
+                }
+                break asking;
+            }
+            answer = &mut asking => {
+                let answer = answer??;
+                assert!(
+                    answer.as_ref().is_err_and(|status| status.code() == Code::Unavailable),
+                    "{answer:?}"
+                );
+            }
+        }
+    };
+    faults.fail_next_chain_builds(0);
+    asking.abort();
+    let _ = asking.await;
+    // The source's server drops the request's call once it sees the stream reset.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    faults.release(FaultPoint::ChainRebuild);
+    wait_until("the source's chain is built", async || {
+        client.verify(&address, &source, None).await.is_ok()
+    })
+    .await?;
+    let served = ask(&as_seeder, &address, request).await?;
+    assert!(
+        served
+            .as_ref()
+            .is_ok_and(|chunk| chunk.total_bytes.is_some()),
+        "{served:?}"
+    );
+    faults.release(FaultPoint::Fetch);
     daemon.run_until(async {}).await;
     Ok(())
 }
