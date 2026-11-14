@@ -286,6 +286,7 @@ A draft for 0.8.0's notes (ADR-0045; ADR-0037; ADR-0046 and its amendment of 202
 - **A primary's hash chain is built again after a failed build** (#156). A checkpoint between the build's two reads failed it for good, so a fork's seeder retried the source until its attempt timed out; under heavy load a fork of a database that had checkpointed failed about 1 run in 40.
 - **A follower whose truncated tail held its chain record no longer reports a divergence the data didn't have.** A stream's open now carries the primary's hash at the epoch's start (ADR-0016's amendment of 2026-11-12).
 - **A node stopped and started again in one process frees and rebinds its port,** while connections the previous run closed sit in `TIME_WAIT`, rather than finding it taken for up to a minute.
+- **A freshly issued certificate works at once on a node whose clock is a little behind.** Certificates for agents (`agent add`, `agent renew`), `cert init`, `cert node`, `cert client`, and dev mode now start 30 seconds before they are issued, the clock skew a token's `nbf` already allows, and still end their lifetime after it; before, a node whose clock was even a second behind the issuing host refused the certificate's TLS handshake until its clock caught up. Delegation issuer certificates start when they are issued, as before (ADR-0047, point 1.2).
 
 **Breaking changes, and the `fleetringd` library:**
 
