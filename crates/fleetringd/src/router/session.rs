@@ -57,6 +57,9 @@ pub(crate) struct NodeSession {
 pub(crate) enum OpenError {
     /// The control plane or the node doesn't know the database.
     NotFound(String),
+    /// The caller's token is refused: revoked, as the control plane or the node finds, since the
+    /// router holds no denylist (ADR-0037, point 18).
+    Unauthenticated(String),
     /// The caller may not open it.
     Denied(String),
     /// No primary could be reached in time.
@@ -253,7 +256,8 @@ fn refused(database: &DatabaseName, status: &Status) -> Result<String, OpenError
         Code::NotFound => Err(OpenError::NotFound(format!(
             "database {database} doesn't exist"
         ))),
-        Code::PermissionDenied | Code::Unauthenticated => Err(OpenError::Denied(message)),
+        Code::Unauthenticated => Err(OpenError::Unauthenticated(message)),
+        Code::PermissionDenied => Err(OpenError::Denied(message)),
         // Not a fault of the router's: the fleet is part way through an upgrade, and the request
         // may be retried once the primary runs one with sessions.
         Code::Unimplemented => Err(OpenError::Unavailable(format!(
@@ -276,5 +280,20 @@ mod tests {
             panic!("{refusal:?}");
         };
         assert!(message.contains("upgrade it"), "{message}");
+    }
+
+    /// A token the node or the control plane refuses, as a revoked one, is an authentication
+    /// failure, not a scope one, as the router's own check of a token makes it (ADR-0037,
+    /// point 18).
+    #[test]
+    fn a_refused_token_is_unauthenticated_and_a_missing_scope_denied() {
+        let database: DatabaseName = "db".parse().expect("a name");
+        let revoked = refused(&database, &Status::unauthenticated("the token is revoked"));
+        assert!(
+            matches!(&revoked, Err(OpenError::Unauthenticated(message)) if message == "the token is revoked"),
+            "{revoked:?}"
+        );
+        let denied = refused(&database, &Status::permission_denied("no write on db"));
+        assert!(matches!(denied, Err(OpenError::Denied(_))), "{denied:?}");
     }
 }

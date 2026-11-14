@@ -30,8 +30,12 @@ use crate::observe::health::Probes;
 use crate::observe::sampler::{Sampler, Sources};
 use crate::observe::{Metrics, NodeInfo, TraceLayer};
 use crate::replication::{Replication, ReplicationParts};
-use crate::tls::{Identity, IdentityError, Security};
-use crate::transport::{Listener, Peers, control_server, database_server, incoming};
+use crate::tls::{
+    Identity, IdentityError, IssuerFileProblem, IssuerFilesError, IssuerPair, IssuerWatch, Security,
+};
+use crate::transport::{
+    AcceptLoop, Listener, Peers, control_server, database_server, incoming_and_accept_loop,
+};
 use crate::{
     AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, DataDir, DataDirError,
     DatabaseStatuses, Membership, MembershipTasks, OnShutdown, Plaintext, Registry,
@@ -80,11 +84,13 @@ pub struct Daemon {
     sampler: Sampler,
 }
 
-/// What the control role runs: the control node, and its failover timer.
+/// What the control role runs: the control node, its failover timer, and its delegation issuer
+/// pair, if it has one, with the task that checks it.
 #[derive(Debug)]
 struct ControlRole {
     node: ControlNode,
     failover: Failover,
+    issuer: Option<(IssuerPair, IssuerWatch)>,
 }
 
 /// What the data role runs: membership, the databases this node hosts and replicates, and the
@@ -109,6 +115,9 @@ struct RunningServer {
     address: SocketAddr,
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<(), tonic::transport::Error>>,
+    /// The task that accepts connections and owns the listener, which ends once the server
+    /// stops accepting.
+    accepting: AcceptLoop,
 }
 
 /// The error returned when a daemon can't start.
@@ -144,6 +153,9 @@ pub enum StartError {
     /// The `[tls]` files can't be loaded.
     #[error("can't load the [tls] identity")]
     Identity(#[from] IdentityError),
+    /// The control node's delegation issuer pair can't be loaded (ADR-0047, point 1.3).
+    #[error("can't load the delegation issuer pair ([control] issuer_cert and issuer_key)")]
+    Issuer(#[from] IssuerFilesError),
 }
 
 impl Daemon {
@@ -235,6 +247,7 @@ impl Daemon {
         };
         let admin_tls = admin_tls(&config, environment.network().security())?;
         let metrics = Metrics::new(&NodeInfo::new(config.node.id.clone(), config.role, fleet));
+        let issuer = load_issuer(&config, &environment)?;
         let data_dir = DataDir::lock(&config.data_dir)?;
         let control = if config.role.runs_control() {
             let node = open_control(&config, &data_dir, &environment, &metrics).await?;
@@ -244,7 +257,15 @@ impl Daemon {
                 environment.network().clone(),
                 FailoverSettings::new().with_tick_interval(config.control.tick_interval()),
             );
-            Some(ControlRole { node, failover })
+            let issuer = issuer.map(|pair| {
+                let watch = pair.watch();
+                (pair, watch)
+            });
+            Some(ControlRole {
+                node,
+                failover,
+                issuer,
+            })
         } else {
             None
         };
@@ -278,7 +299,7 @@ impl Daemon {
             listener,
             address,
             control.as_ref().map(|role| {
-                ControlService::new(role.node.handle())
+                let service = ControlService::new(role.node.handle())
                     .with_default_replication_factor(config.replication.replication_factor)
                     .with_durability_defaults(config.replication.durability_defaults())
                     .with_clock(environment.clock())
@@ -286,7 +307,11 @@ impl Daemon {
                     .with_fork_limits(config.fork.limits())
                     .with_fork_faults(environment.fork_faults())
                     .with_dev_mode(config.dev)
-                    .with_network(network.clone())
+                    .with_network(network.clone());
+                match &role.issuer {
+                    Some((pair, _)) => service.with_issuer(pair.clone()),
+                    None => service,
+                }
             }),
             data.as_ref().map(|(_, node)| node),
             control_address(&config, address),
@@ -417,6 +442,16 @@ impl Daemon {
         self.control.as_ref().map(|role| role.node.handle())
     }
 
+    /// The control node's delegation issuer pair, if this daemon runs control and has one
+    /// (ADR-0047, point 1.3).
+    #[must_use]
+    pub fn issuer(&self) -> Option<IssuerPair> {
+        self.control
+            .as_ref()
+            .and_then(|role| role.issuer.as_ref())
+            .map(|(pair, _)| pair.clone())
+    }
+
     /// The node's membership and ring, if this daemon hosts data.
     #[must_use]
     pub fn membership(&self) -> Option<Membership> {
@@ -517,8 +552,15 @@ impl Daemon {
                 let _aborted = task.await;
             }
         }
-        // No call is running any more: stop the primaries' streams, finish the writes databases
-        // accepted, then close them.
+        // The server dropped its connections' stream when it stopped accepting, and the accept
+        // loop closes the listener once it notices: waiting for that frees the port before this
+        // returns, for a node started again on it in this process.
+        self.server.accepting.closed().await;
+        // The server has stopped, but a connection it dropped at its grace may still run a call
+        // in a runtime that goes on, as an in-process daemon's does: stopping replication ends
+        // the primaries' streams and every stream following a database here, and refuses
+        // replication calls from then on. Then finish the writes databases accepted, and close
+        // them.
         if let Some(replication) = replication {
             replication.stop();
             replication.registry().close_all().await;
@@ -592,15 +634,54 @@ fn security(config: &Config, environment: &Environment) -> Result<Security, Star
     }
 }
 
+/// Loads the delegation issuer pair [`Config::issuer_files`] names, checked against the node's
+/// trusted authorities (ADR-0047, point 1.3). A dev node first replaces a pair that is missing,
+/// can't be used, or has fewer than 30 days left, from the authority beside `[tls] ca`
+/// (point 1.7); no other node reads an authority's key.
+fn load_issuer(
+    config: &Config,
+    environment: &Environment,
+) -> Result<Option<IssuerPair>, StartError> {
+    let Some(files) = config.issuer_files() else {
+        return Ok(None);
+    };
+    let Security::Tls(identity) = environment.network().security() else {
+        return Err(IssuerFilesError::new(&files, IssuerFileProblem::NoIdentity).into());
+    };
+    let authority_dir = config
+        .tls
+        .as_ref()
+        .filter(|_| config.dev == DevMode::On)
+        .and_then(|tls| tls.ca.parent());
+    let pair = match authority_dir {
+        Some(dir) => {
+            IssuerPair::load_dev(&files, identity, environment.clock(), dir, &config.node.id)?
+        }
+        None => IssuerPair::load(&files, identity, environment.clock())?,
+    };
+    let certificate = pair.certificate();
+    tracing::info!(
+        cert = %files.cert.display(),
+        key = %files.key.display(),
+        key_id = %certificate.key_id(),
+        not_after = %certificate.not_after(),
+        "loaded the delegation issuer pair",
+    );
+    Ok(Some(pair))
+}
+
 async fn open_control(
     config: &Config,
     data_dir: &DataDir,
     environment: &Environment,
     metrics: &Metrics,
 ) -> Result<ControlNode, StartError> {
+    // The writer stamps its own node ID on every command it logs, beside the time, as the log
+    // layer's leader ID (ADR-0047, point 6.1).
     let options = ControlOptions::new(config.control.control_config())
         .with_snapshot_every(config.control.snapshot_every)
-        .with_storage_io(environment.control_storage_io());
+        .with_storage_io(environment.control_storage_io())
+        .with_recorder(config.node.id.clone());
     let path = data_dir.path().join(CONTROL_DB);
     Ok(ControlNode::open_with_metrics(
         path,
@@ -922,12 +1003,13 @@ fn serve(
         )
         .add_optional_service(data.map(|node| database_server(DatabaseService::new(node.clone()))))
         .add_optional_service(data.map(|node| node.replication().server()));
-    let task =
-        tokio::spawn(router.serve_with_incoming_shutdown(incoming(listener, security), shutdown));
+    let (incoming, accepting) = incoming_and_accept_loop(listener, security);
+    let task = tokio::spawn(router.serve_with_incoming_shutdown(incoming, shutdown));
     RunningServer {
         address,
         stop,
         task,
+        accepting,
     }
 }
 

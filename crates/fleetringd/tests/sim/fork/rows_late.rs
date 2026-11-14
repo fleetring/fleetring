@@ -15,15 +15,16 @@ use std::time::Duration;
 
 use fleetring::NodeId;
 use fleetring_control::fork::{
-    ChainHash, ForkFailure, ForkState, OperationId, ResetReport, RetryCause, SeedFailure,
-    SeedFailureReason, StagedCopy,
+    ChainHash, ForkFailure, ForkIdentity, ForkState, OperationId, ResetReport, RetryCause,
+    SeedFailure, SeedFailureReason, StagedCopy,
 };
 use fleetring_control::{
     Action, DatabaseName, HostedReplica, Incarnation, LeaseEpoch, Position, ReplicaRole,
 };
 use fleetringd::replication::FaultPoint;
 use fleetringd::sim::{
-    Ack, Expected, Fleet, LossRate, OTHER_PRINCIPAL, Operation, Outcome, Script, SeedingProbe,
+    Ack, DurabilityMode, Expected, Fleet, LossRate, OTHER_PRINCIPAL, Operation, Outcome, Script,
+    SeedingProbe,
 };
 
 use super::matrix::{
@@ -175,9 +176,24 @@ row!(
     row_13_link_loss,
     sweep_row_13_link_loss,
     Point::ALL,
-    link_loss,
-    "bug #163: a fork's work on a data node hangs on a stalled connection to the control node under link loss"
+    link_loss
 );
+
+/// Row 13 under link loss, on the seeds where the first lease's holder ran the fork reset after
+/// a promotion had opened the fork and acknowledged writes (fork property (h)): its lease expired
+/// while its `Locate` after the lease stalled, and it never saw the promotion's epoch.
+#[test]
+fn row_13_link_loss_a_superseded_first_lease_runs_no_reset() {
+    super::matrix::pinned(&[904, 526], Point::BeforeFirstLease, link_loss);
+}
+
+/// Row 13 under link loss, on the seed where the source's primary, its control calls stalled,
+/// refused the attempt's seeder for its binding once the source's lease had moved: a request made
+/// at another moment, answered with a retry-after (ADR-0046, points 4.1 and 4.4, as amended).
+#[test]
+fn row_13_link_loss_a_moved_source_lease_is_answered_not_refused() {
+    super::matrix::pinned(&[870], Point::BeforePin, link_loss);
+}
 
 /// Runs `operation` on a client named `name` as `principal` until it is answered, and returns
 /// the answer.
@@ -391,22 +407,133 @@ fn partitions(seed: u64, point: Point) -> Result<()> {
 row!(
     row_17_partitions,
     sweep_row_17_partitions,
-    [
-        Point::AfterSeederStaged,
-        Point::DuringPeerCopies,
-        Point::BeforeFirstLease,
-        Point::DuringReset
-    ],
+    Point::ALL,
     partitions
 );
 
-row!(
-    row_17_partitions_while_seeding,
-    sweep_row_17_partitions_while_seeding,
-    [Point::BeforePin, Point::DuringStream],
-    partitions,
-    "bug #164: a seeder's Snapshot call has no deadline and hangs after a partition heals"
-);
+/// The probes a late peer and a late seeder would send for `operation`'s fork, each naming
+/// `fork` and attempt 1: a peer's request to the seeder for its staged copy, and the seeder's
+/// request to the source's primary. Each comes with the host it is sent to.
+fn late_seeding_probes(
+    run: &Run,
+    operation: OperationId,
+    fork: &ForkIdentity,
+) -> Result<[(String, Operation); 2]> {
+    let source = run.source.clone();
+    let source_incarnation = run
+        .state()?
+        .database(&source)
+        .map(fleetring_control::Database::incarnation)
+        .ok_or("no source")?;
+    let seeder = run.seeder(operation)?;
+    let source_primary = run.primary(&source)?;
+    let peer = run
+        .placement(fork.name.as_str(), REPLICAS)?
+        .into_iter()
+        .find(|node| *node != seeder)
+        .ok_or("no peer")?;
+    let to_seeder = Operation::SeedingProbe {
+        to: seeder.parse()?,
+        as_node: peer.parse()?,
+        request: SeedingProbe {
+            fork: fork.clone(),
+            attempt: 1,
+            database: fork.name.clone(),
+            source_incarnation,
+            staged: true,
+        },
+    };
+    let to_source = Operation::SeedingProbe {
+        to: source_primary.parse()?,
+        as_node: seeder.parse()?,
+        request: SeedingProbe {
+            fork: fork.clone(),
+            attempt: 1,
+            database: source,
+            source_incarnation,
+            staged: false,
+        },
+    };
+    Ok([(seeder, to_seeder), (source_primary, to_source)])
+}
+
+/// How many binding refusals `host` has counted.
+fn refusals(run: &Run, host: &str) -> Result<u64> {
+    Ok(run.fleet.binding_refusals(host).ok_or("a host is down")?)
+}
+
+/// A seeding request with the fork's own identity that arrives after the fork completed, as a
+/// late peer's or seeder's may, is answered `UNAVAILABLE` with no binding named, and neither the
+/// seeder nor the source's primary counts it as a binding refusal (ADR-0046, point 4.4, as
+/// amended). The run's own check that no legitimate call was refused for its binding holds too.
+fn late_request_answered(seed: u64, point: Point) -> Result<()> {
+    let mut run = Run::start(seed, &Setup::default())?;
+    let target: DatabaseName = "dst".parse()?;
+    let (operation, _) = run.fork_to(&target, point)?;
+    let fork = run.identity(&target, operation)?;
+    let probes = late_seeding_probes(&run, operation, &fork)?;
+    for (index, (to, probe)) in probes.into_iter().enumerate() {
+        let before = refusals(&run, &to)?;
+        let answer = ask(&mut run, &format!("late-{index}"), "workload", probe)?;
+        let retryable = matches!(
+            &answer,
+            Outcome::Acknowledged(Ack::Refused {
+                code: tonic::Code::Unavailable,
+                binding: None,
+            })
+        );
+        if !retryable {
+            return Err(format!("a late request to {to} was answered {answer}").into());
+        }
+        if refusals(&run, &to)? != before {
+            return Err(format!("{to} counted a late request as a binding refusal").into());
+        }
+    }
+    run.release(point.hook(), operation)?;
+    run.finish(operation, Expected::Ready)
+}
+
+#[test]
+fn a_late_seeding_request_is_answered_not_refused() {
+    super::matrix::fixed(&[Point::BeforeFirstLease], late_request_answered);
+}
+
+/// The same requests, naming another operation under the fork's name and incarnation, are still
+/// refused for their binding and counted (ADR-0046, point 4.4).
+fn mismatched_request_refused(seed: u64, point: Point) -> Result<()> {
+    let mut run = Run::start(seed, &Setup::default())?;
+    // The scenario's own probes are refused, and counted below.
+    run.allow_binding_refusals();
+    let target: DatabaseName = "dst".parse()?;
+    let (operation, _) = run.fork_to(&target, point)?;
+    let fork = run.identity(&target, operation)?;
+    let other = ForkIdentity::new(fork.name.clone(), fork.incarnation, run.operation_id());
+    let probes = late_seeding_probes(&run, operation, &other)?;
+    for (index, (to, probe)) in probes.into_iter().enumerate() {
+        let before = refusals(&run, &to)?;
+        let answer = ask(&mut run, &format!("mismatched-{index}"), "workload", probe)?;
+        let refused = matches!(
+            &answer,
+            Outcome::Acknowledged(Ack::Refused {
+                code: tonic::Code::PermissionDenied,
+                binding: Some(binding),
+            }) if binding == "seeding"
+        );
+        if !refused {
+            return Err(format!("a mismatched request to {to} was answered {answer}").into());
+        }
+        if refusals(&run, &to)? != before + 1 {
+            return Err(format!("{to} didn't count a mismatched request as a refusal").into());
+        }
+    }
+    run.release(point.hook(), operation)?;
+    run.finish(operation, Expected::Ready)
+}
+
+#[test]
+fn a_mismatched_seeding_request_is_still_refused_and_counted() {
+    super::matrix::fixed(&[Point::BeforeFirstLease], mismatched_request_refused);
+}
 
 /// Row 18: the fork is dropped and created again under its name, a new fork with the same
 /// source, placement, seeder, and attempt number, while the old fork's work is held at each
@@ -709,6 +836,27 @@ fn await_new_primary(run: &mut Run, target: &DatabaseName, old: &str) -> Result<
     Ok(())
 }
 
+/// Waits until every other replica of `target` follows its primary `primary`, connected and
+/// reported.
+fn await_followers(run: &mut Run, target: &DatabaseName, primary: &str) -> Result<()> {
+    let others = usize::try_from(REPLICAS)? - 1;
+    run.fleet
+        .run_until(LIMIT, "the fork's holders following its primary", |fleet| {
+            fleet
+                .replication(primary)
+                .and_then(|replication| replication.primary_status(target))
+                .is_some_and(|status| {
+                    status
+                        .followers
+                        .iter()
+                        .filter(|follower| follower.connected && follower.reported)
+                        .count()
+                        == others
+                })
+        })?;
+    Ok(())
+}
+
 /// Row 20: a failover between completion and the reset: the first lease expires, its primary
 /// cut off from the control node, or its primary is drained, before the reset commits; and
 /// again just after, once clients have written to the fork. The reset runs exactly once
@@ -733,6 +881,12 @@ fn failover(seed: u64, point: Point) -> Result<()> {
     if expire {
         run.fleet.partition(&primary, CONTROL)?;
     } else {
+        if !after {
+            // A drain hands a lease to a connected follower that has reported, and leaves one
+            // it can't hand over to fail over once the node stops: the drain comes once the
+            // fork's other holders follow its first primary, as they do before its reset.
+            await_followers(&mut run, &target, &primary)?;
+        }
         run.operator.push(Operation::Drain {
             node: primary.parse()?,
         });
@@ -761,8 +915,7 @@ row!(
     row_20_drain_before_reset,
     sweep_row_20_drain_before_reset,
     [Point::DuringStream],
-    failover,
-    "flaky #166: a drained fork primary held before its reset doesn't always hand over its lease without tokio_unstable"
+    failover
 );
 
 /// Row 21: one replica refuses on disk at each seeding step before it copies: the other two
@@ -990,8 +1143,10 @@ row!(
     after_readiness
 );
 
-/// A ready fork is dropped, and the name forked again under a new operation: the new fork must
-/// become ready as the first did.
+/// Row 16, after readiness, found by FR-087 (#165): a ready fork is dropped, and the name forked
+/// again under a new operation: the new fork must become ready as the first did. Its first lease
+/// has the epoch the dropped fork's had, often on the same first holder, which must still run the
+/// new fork's reset before it serves: its gate opened for the dropped fork doesn't count.
 fn refork_after_drop(seed: u64, point: Point) -> Result<()> {
     let mut run = Run::start(seed, &Setup::default())?;
     // The dropped fork's late calls are refused by the binding, as in row 16.
@@ -1012,13 +1167,170 @@ fn refork_after_drop(seed: u64, point: Point) -> Result<()> {
     run.finish(second, Expected::Ready)
 }
 
-/// Row 16, after readiness: found by FR-087. Followers of the dropped fork keep their copies as
-/// orphans, and the new fork's first primary never gets its reset to a bootstrap quorum.
-#[test]
-#[ignore = "bug #165: a fork made again under a dropped ready fork's name stays seeded"]
-fn row_16_refork_after_drop() {
-    super::matrix::fixed(&[Point::BeforePin], refork_after_drop);
+row!(
+    row_16_refork_after_drop,
+    sweep_row_16_refork_after_drop,
+    [Point::BeforePin],
+    refork_after_drop
+);
+
+/// Longer than a fork's control call may wait, five seconds, so a call cut off for it fails.
+const PAST_A_CONTROL_CALL: Duration = Duration::from_secs(6);
+
+/// Row 16 after an unconfirmed first lease, found by the FR-106 review: the fork's first holder
+/// takes the first lease and moves its staged copy into place, and is cut off from the control
+/// node before control state confirms the lease, so it serves nothing; its lease expires, and a
+/// promotion may open the fork meanwhile, at an epoch the holder never sees. Then the fork is
+/// dropped.
+/// The copy in place must still be known to the holder, so the drop deletes it: a database of
+/// the name made afterwards never starts from the dropped fork's data. Returns the dropped
+/// fork's operation.
+fn drop_after_unconfirmed_first_lease(run: &mut Run, target: &DatabaseName) -> Result<OperationId> {
+    run.allow_binding_refusals();
+    let operation = run.operation_id();
+    run.hold(FaultPoint::ConfirmFirstLease, operation)?;
+    run.fork_as(target, operation)?;
+    let holder = run.await_arrival(FaultPoint::ConfirmFirstLease, &BTreeMap::new())?;
+    run.fleet.partition(&holder, CONTROL)?;
+    run.release(FaultPoint::ConfirmFirstLease, operation)?;
+    run.wait(PAST_A_CONTROL_CALL)?;
+    run.fleet.repair(&holder, CONTROL)?;
+    run.traffic.remove(target);
+    run.script([Operation::Drop {
+        database: target.clone(),
+    }])?;
+    run.wait(Duration::from_secs(5))?;
+    Ok(operation)
 }
+
+/// Fails if any data host's copy of `target` holds a value written to `source`.
+fn no_copy_holds_writes_to(run: &Run, target: &DatabaseName, source: &DatabaseName) -> Result<()> {
+    let written: BTreeSet<i64> = run
+        .fleet
+        .history()
+        .records()
+        .iter()
+        .filter_map(|record| match record.operation() {
+            Operation::Write { database, value } if database == source => Some(*value),
+            _ => None,
+        })
+        .collect();
+    for (host, rows) in run.fleet.replica_rows(target)? {
+        if let Some(value) = rows.iter().find(|value| written.contains(value)) {
+            return Err(format!(
+                "{host}'s copy of {target} holds {value}, a write to {source}: the dropped fork's copy was opened as the new database"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Row 16 after an unconfirmed first lease, then an ordinary database created under the name:
+/// it starts empty on every replica.
+fn create_after_unconfirmed_first_lease(seed: u64, _point: Point) -> Result<()> {
+    let mut run = Run::start(seed, &Setup::default())?;
+    let target: DatabaseName = "dst".parse()?;
+    let dropped = drop_after_unconfirmed_first_lease(&mut run, &target)?;
+    run.script([Operation::Create {
+        database: target.clone(),
+        replication_factor: REPLICAS,
+        durability: DurabilityMode::Quorum,
+    }])?;
+    run.script([Operation::Write {
+        database: target.clone(),
+        value: 1_000_000,
+    }])?;
+    run.wait(Duration::from_secs(2))?;
+    let source = run.source.clone();
+    no_copy_holds_writes_to(&run, &target, &source)?;
+    run.finish(dropped, Expected::Terminal)
+}
+
+row!(
+    row_16_create_after_unconfirmed_first_lease,
+    sweep_row_16_create_after_unconfirmed_first_lease,
+    [Point::BeforeFirstLease],
+    create_after_unconfirmed_first_lease
+);
+
+/// Row 16 after an unconfirmed first lease, then the name forked again: the new fork becomes
+/// ready, its first holder's copy its own.
+fn refork_after_unconfirmed_first_lease(seed: u64, _point: Point) -> Result<()> {
+    let mut run = Run::start(seed, &Setup::default())?;
+    let target: DatabaseName = "dst".parse()?;
+    let dropped = drop_after_unconfirmed_first_lease(&mut run, &target)?;
+    let second = run.operation_id();
+    run.fork_as(&target, second)?;
+    run.fleet
+        .fork_expectations()
+        .expect(dropped, Expected::Terminal);
+    run.finish(second, Expected::Ready)
+}
+
+row!(
+    row_16_refork_after_unconfirmed_first_lease,
+    sweep_row_16_refork_after_unconfirmed_first_lease,
+    [Point::BeforeFirstLease],
+    refork_after_unconfirmed_first_lease
+);
+
+/// Row 16 before the reset, then an ordinary database created under the name, found by the
+/// FR-106 review: the fork's first primary has closed its readiness gate and is about to run the
+/// reset when the fork is dropped. The gate goes with the copy, so the new database, which no
+/// fork made, serves its clients.
+fn create_after_drop_before_reset(seed: u64, _point: Point) -> Result<()> {
+    let mut run = Run::start(seed, &Setup::default())?;
+    run.allow_binding_refusals();
+    let target: DatabaseName = "dst".parse()?;
+    let operation = run.operation_id();
+    run.hold(FaultPoint::BeforeReset, operation)?;
+    run.fork_as(&target, operation)?;
+    run.await_arrival(FaultPoint::BeforeReset, &BTreeMap::new())?;
+    run.traffic.remove(&target);
+    run.script([Operation::Drop {
+        database: target.clone(),
+    }])?;
+    run.release(FaultPoint::BeforeReset, operation)?;
+    run.wait(Duration::from_secs(5))?;
+    run.script([Operation::Create {
+        database: target.clone(),
+        replication_factor: REPLICAS,
+        durability: DurabilityMode::Quorum,
+    }])?;
+    // A client retries a refused write a few times, as one would while a primary settles.
+    let mut answer = None;
+    for attempt in 0..5_i64 {
+        let outcome = ask(
+            &mut run,
+            &format!("writer-{attempt}"),
+            "workload",
+            Operation::Write {
+                database: target.clone(),
+                value: 2_000_000 + attempt,
+            },
+        )?;
+        if matches!(outcome, Outcome::Acknowledged(Ack::Written { .. })) {
+            answer = None;
+            break;
+        }
+        answer = Some(outcome);
+        run.wait(Duration::from_secs(1))?;
+    }
+    if let Some(outcome) = answer {
+        return Err(
+            format!("the database created under {target} never took a write: {outcome}").into(),
+        );
+    }
+    run.finish(operation, Expected::Terminal)
+}
+
+row!(
+    row_16_create_after_drop_before_reset,
+    sweep_row_16_create_after_drop_before_reset,
+    [Point::DuringReset],
+    create_after_drop_before_reset
+);
 
 /// Row 23, ADR-0046 point 12's "placement changes between `Seeded` and `Ready`", at the two
 /// seeded steps: before the first lease, and during the reset. A data host outside the source's
@@ -1028,6 +1340,37 @@ fn row_16_refork_after_drop() {
 /// placement's write quorum holds its log (`PlacementCaughtUp`, `ReleaseForkHolders`), and every
 /// write acknowledged before is on a write quorum of placement (property i).
 fn placement_moves_while_seeded(seed: u64, point: Point) -> Result<()> {
+    let (mut run, operation, target, returning) = ready_with_holders_kept(seed, point)?;
+    let returning_id: NodeId = returning.parse()?;
+    run.fleet
+        .run_until(LIMIT, "the fork's holders released to placement", |fleet| {
+            fleet.control_state().is_some_and(|state| {
+                state
+                    .database(&target)
+                    .and_then(|db| db.fork())
+                    .is_some_and(|fork| {
+                        matches!(fork.state(), ForkState::Ready { holders: None, .. })
+                    })
+            })
+        })?;
+    let released = run.fleet.control_state().is_some_and(|state| {
+        state
+            .replica_set(&target)
+            .is_ok_and(|replicas| replicas.contains(&returning_id))
+    });
+    if !released {
+        return Err(format!("{target} was released to a placement without {returning}").into());
+    }
+    run.finish(operation, Expected::Ready)
+}
+
+/// Row 23's setup: a data host leaves, the fork is placed without it, and it comes back while
+/// the fork is seeded, so that placement names it in place of a holder. Returns the run once
+/// the fork is ready with its holders kept, its operation, its name, and the returning host.
+fn ready_with_holders_kept(
+    seed: u64,
+    point: Point,
+) -> Result<(Run, OperationId, DatabaseName, String)> {
     let mut run = Run::start(seed, &Setup::default())?;
     let source = run.source.clone();
     let source_set: Vec<String> = run
@@ -1097,6 +1440,51 @@ fn placement_moves_while_seeded(seed: u64, point: Point) -> Result<()> {
     run.wait(Duration::from_secs(1))?;
     run.release(point.hook(), operation)?;
     run.await_outcome(operation, Expected::Ready)?;
+    Ok((run, operation, target, returning))
+}
+
+row!(
+    row_23_placement_moves_while_seeded,
+    sweep_row_23_placement_moves_while_seeded,
+    [Point::BeforeFirstLease, Point::DuringReset],
+    placement_moves_while_seeded
+);
+
+/// Row 24, from FR-102's review (finding 2): a membership change during and just after a fork's
+/// hand-over to placement. Row 23's fork is ready with its holders kept; its primary reports
+/// that placement's write quorum holds its log, and is then held before it follows the view in
+/// which control state released the holders (`FollowReady`), as one that hasn't polled again
+/// yet. A member of the placement the holders were released to leaves, which moves placement
+/// again; control state keeps the released placement as the replica set promotions fence
+/// (ADR-0031, amendment 2). The primary, cut off from the nodes that would make that set's
+/// write quorum, is given a write, and crashes. Every write it acknowledged must be on a write
+/// quorum of the kept set, which the promotion fences (`AcknowledgedWritesFenced`). Before the
+/// fix the primary counted the holders and its own, newer ring, and acknowledged a write the
+/// promotion couldn't find.
+fn membership_change_during_handover(seed: u64, point: Point) -> Result<()> {
+    let (mut run, operation, target, _) = ready_with_holders_kept(seed, point)?;
+    let primary = run.primary(&target)?;
+    let primary_id: NodeId = primary.parse()?;
+    let holders = run.holders(&target)?;
+    let reported = |fleet: &Fleet| {
+        fleet.control_state().is_some_and(|state| {
+            state
+                .report(&primary_id, &target)
+                .and_then(|report| report.placement_caught_up())
+                .is_some()
+                || state
+                    .database(&target)
+                    .and_then(|db| db.fork())
+                    .is_some_and(|fork| {
+                        matches!(fork.state(), ForkState::Ready { holders: None, .. })
+                    })
+        })
+    };
+    run.fleet
+        .run_until(LIMIT, "the primary reporting placement caught up", reported)?;
+    // From here on the primary doesn't follow the fork's view, so it may not see the release.
+    run.faults(&primary)?
+        .hold_operation(FaultPoint::FollowReady, operation);
     run.fleet
         .run_until(LIMIT, "the fork's holders released to placement", |fleet| {
             fleet.control_state().is_some_and(|state| {
@@ -1108,20 +1496,134 @@ fn placement_moves_while_seeded(seed: u64, point: Point) -> Result<()> {
                     })
             })
         })?;
-    let released = run.fleet.control_state().is_some_and(|state| {
-        state
-            .replica_set(&target)
-            .is_ok_and(|replicas| replicas.contains(&returning_id))
-    });
-    if !released {
-        return Err(format!("{target} was released to a placement without {returning}").into());
+    let released = run.placement(target.as_str(), REPLICAS)?;
+    // A member of the released placement that is neither the primary nor a holder leaves,
+    // which moves placement.
+    let members: Vec<&str> = NODES.to_vec();
+    let mut leaving = None;
+    for node in &released {
+        if *node == primary || holders.contains(node) {
+            continue;
+        }
+        let rest: Vec<&str> = members.iter().copied().filter(|m| m != node).collect();
+        let moved = run.placement_among(target.as_str(), REPLICAS, &rest)?;
+        leaving = Some((node.clone(), moved));
+        break;
     }
+    let Some((leaving, moved)) = leaving else {
+        // Every member of the released placement is a holder: no change moves it off a set
+        // the primary doesn't count anyway.
+        run.faults(&primary)?
+            .release_operation(FaultPoint::FollowReady, operation);
+        return run.finish(operation, Expected::Ready);
+    };
+    let leaving_id: NodeId = leaving.parse()?;
+    run.fleet.note(format!(
+        "{target}: holders {holders:?}, primary {primary}, released to {released:?}; {leaving} leaves, moving placement to {moved:?}"
+    ));
+    // Stopped first: a removed node that runs joins again.
+    run.crash(&leaving)?;
+    run.operator.push(Operation::Leave {
+        node: leaving_id.clone(),
+    });
+    let kept = target.clone();
+    run.fleet
+        .run_until(LIMIT, "the leave keeping the released placement", |fleet| {
+            fleet.control_state().is_some_and(|state| {
+                state.member(&leaving_id).is_none()
+                    && state
+                        .database(&kept)
+                        .is_some_and(|db| db.kept_replicas().is_some())
+            })
+        })?;
+    run.fleet.await_ring_on(&[primary.as_str()], LIMIT)?;
+    // Cut the primary off from nodes so that the holders' and the new placement's write
+    // quorums can still acknowledge, but the kept set's can't: what a primary that counts its
+    // own ring would acknowledge, and a promotion of the kept set couldn't find.
+    let Some(cut) = cut_for_loss(&primary, &leaving, &holders, &released, &moved) else {
+        run.fleet
+            .note("no partition separates the kept set from the counted ones".to_owned());
+        run.faults(&primary)?
+            .release_operation(FaultPoint::FollowReady, operation);
+        return run.finish(operation, Expected::Ready);
+    };
+    for node in &cut {
+        run.fleet.partition(&primary, node)?;
+    }
+    run.wait(Duration::from_secs(2))?;
+    // Sent once: a script would send it again after an uncertain answer, and a later attempt,
+    // acknowledged by the next primary, would read as the same write an earlier read saw.
+    run.operator.push(Operation::Write {
+        database: target.clone(),
+        value: 24_102,
+    });
+    run.wait(Duration::from_secs(5))?;
+    run.crash(&primary)?;
+    for node in &cut {
+        run.fleet.repair(&primary, node)?;
+    }
+    // The node that left comes back, so that a quorum of the kept set is live without the
+    // primary: its join moves placement back onto that set.
+    run.restart(&leaving)?;
+    run.faults(&primary)?
+        .release_operation(FaultPoint::FollowReady, operation);
+    let promoted = target.clone();
+    let old = primary.clone();
+    run.fleet.run_until(LIMIT, "a promotion", |fleet| {
+        fleet.control_state().is_some_and(|state| {
+            state
+                .database(&promoted)
+                .and_then(|db| db.lease())
+                .is_some_and(|lease| lease.holder().as_str() != old)
+        })
+    })?;
+    run.fleet.check_history()?;
+    run.restart(&primary)?;
     run.finish(operation, Expected::Ready)
 }
 
 row!(
-    row_23_placement_moves_while_seeded,
-    sweep_row_23_placement_moves_while_seeded,
+    row_24_membership_change_during_handover,
+    sweep_row_24_membership_change_during_handover,
     [Point::BeforeFirstLease, Point::DuringReset],
-    placement_moves_while_seeded
+    membership_change_during_handover
 );
+
+/// The nodes to cut `primary` off from so that, counting the write quorums of `holders` and
+/// `moved` alone, it could acknowledge a write that fewer than a write quorum of `kept` hold:
+/// the smallest such set, or `None` if there is none. `leaving` is removed, and counts nowhere.
+fn cut_for_loss(
+    primary: &str,
+    leaving: &str,
+    holders: &[String],
+    kept: &[String],
+    moved: &[String],
+) -> Option<Vec<String>> {
+    let others: Vec<&str> = NODES
+        .iter()
+        .copied()
+        .filter(|node| *node != primary && *node != leaving)
+        .collect();
+    let write_quorum = |set: &[String]| set.len() / 2 + 1;
+    let mut best: Option<Vec<String>> = None;
+    for mask in 0_u32..(1 << others.len()) {
+        let cut: Vec<String> = others
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, node)| (*node).to_owned())
+            .collect();
+        let holds = |node: &String| {
+            node == primary
+                || (!cut.contains(node) && (holders.contains(node) || moved.contains(node)))
+        };
+        let count = |set: &[String]| set.iter().filter(|node| holds(node)).count();
+        let acknowledged =
+            count(holders) >= write_quorum(holders) && count(moved) >= write_quorum(moved);
+        let lost = count(kept) < write_quorum(kept);
+        if acknowledged && lost && best.as_ref().is_none_or(|best| cut.len() < best.len()) {
+            best = Some(cut);
+        }
+    }
+    best
+}

@@ -407,6 +407,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<Streaming<ReplicateMessage>>,
     ) -> Result<Response<Self::ReplicateStream>, Status> {
+        self.inner.check_running()?;
         let peer = Peer::of(&request);
         let caller = calling_node(&peer, "Replicate")?;
         let named: Option<NodeId> = request
@@ -457,6 +458,10 @@ impl Replication for ReplicationService {
             name,
             epoch: open.epoch,
             epoch_start: open.epoch_start.and_then(held),
+            epoch_start_chain: open
+                .epoch_start_chain
+                .as_deref()
+                .and_then(ChainHash::from_bytes),
             primary,
         };
         tokio::spawn(async move {
@@ -479,6 +484,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<FenceRequest>,
     ) -> Result<Response<FenceResponse>, Status> {
+        self.inner.check_running()?;
         let caller = calling_node(&Peer::of(&request), "Fence")?;
         failover::fence_rpc(&self.inner, request.into_inner(), caller.as_ref())
             .await
@@ -489,6 +495,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<FetchRequest>,
     ) -> Result<Response<FetchResponse>, Status> {
+        self.inner.check_running()?;
         let caller = calling_node(&Peer::of(&request), "Fetch")?;
         let request = request.into_inner();
         if let Some(caller) = &caller {
@@ -504,6 +511,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
+        self.inner.check_running()?;
         let caller = calling_node(&Peer::of(&request), "Promote")?;
         let request = request.into_inner();
         if caller.is_some() {
@@ -518,6 +526,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<DropCopyRequest>,
     ) -> Result<Response<DropCopyResponse>, Status> {
+        self.inner.check_running()?;
         let caller = calling_node(&Peer::of(&request), "DropCopy")?;
         let request = request.into_inner();
         let name = parse_database(&request.database)?;
@@ -549,6 +558,7 @@ impl Replication for ReplicationService {
         &self,
         request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
+        self.inner.check_running()?;
         let caller = calling_node(&Peer::of(&request), "Snapshot")?;
         let request = request.into_inner();
         if let Some(seeding) = binding::SeedingRequest::parse(&request)? {
@@ -575,6 +585,8 @@ struct Follow {
     epoch: u64,
     /// Where the epoch's log began, if its primary was promoted to it.
     epoch_start: Option<Position>,
+    /// The primary's chain hash at [`epoch_start`](Self::epoch_start), if it sent one.
+    epoch_start_chain: Option<ChainHash>,
     primary: Option<NodeId>,
 }
 
@@ -593,6 +605,10 @@ impl Follow {
         let _applying = self.slot.applying().lock().await;
         if !self.slot.is_current(self.session) {
             return Err(Status::aborted("a newer stream replaced this one"));
+        }
+        // A stream admitted as replication stopped, after the stop began its sessions.
+        if inner.check_running().is_err() {
+            return Err(Status::aborted("replication on this node has stopped"));
         }
         let location = inner.registry().location(&self.name);
         let exists = {
@@ -640,13 +656,16 @@ impl Follow {
                     })
                     .await?
                 };
-                let chain = chain?;
+                let mut chain = chain?;
                 if chain.tip().0 != position.as_ref() {
                     return Err(Status::internal(format!(
                         "the chain of {} ends at {:?}, but the copy is at {position:?}",
                         self.name,
                         chain.tip().0
                     )));
+                }
+                if let Some(anchor) = self.adopt_epoch_start(&mut chain, position.as_ref()) {
+                    record_anchor(inner, &self.name, anchor).await;
                 }
                 self.slot.set_chain(Some(chain));
                 (Some(follower), ack(position.as_ref()))
@@ -815,6 +834,20 @@ impl Follow {
         seeded_chain(inner, &self.name, &self.slot, &seeded).await;
         tracing::info!(database = %self.name, from = %primary, "installed the initial copy");
         Ok(())
+    }
+
+    /// Takes the primary's hash at the epoch's start for `chain`, the chain over a copy at
+    /// `position`, if the copy is there and no record fits it, as after a truncation back past
+    /// the anchor a snapshot recorded (ADR-0016, point 12: a derived chain takes the primary's
+    /// hash on first contact). Returns the anchor to record.
+    fn adopt_epoch_start(&self, chain: &mut Chain, position: Option<&Position>) -> Option<Anchor> {
+        let start = self.epoch_start.as_ref()?;
+        let hash = self.epoch_start_chain?;
+        if !chain.is_derived() || position != Some(start) {
+            return None;
+        }
+        tracing::info!(database = %self.name, at = %start, "taking the primary's chain hash at the epoch's start for a derived chain");
+        Some(chain.adopt(Some(start), hash))
     }
 
     /// Moves the chain's anchor up to `log_start`, the position the copy's log now continues

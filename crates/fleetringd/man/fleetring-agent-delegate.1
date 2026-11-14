@@ -1,0 +1,158 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH fleetring-agent-delegate 1  FleetRing "FleetRing manual"
+.SH NAME
+fleetring\-agent\-delegate \- Asks the control plane for a delegated agent\*(Aqs token, as its parent
+.SH SYNOPSIS
+\fBfleetring agent delegate\fR [\fB\-\-scope\fR] [\fB\-\-ttl\fR] [\fB\-\-not\-before\fR] [\fB\-\-operation\-id\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-json\fR] [\fB\-\-control\fR] [\fB\-\-config\fR] [\fB\-\-context\fR] [\fB\-\-tls\-dir\fR] [\fB\-\-ca\fR] [\fB\-\-cert\fR] [\fB\-\-key\fR] [\fB\-\-as\fR] [\fB\-\-insecure\-plaintext\fR] [\fB\-\-token\fR] [\fB\-\-token\-file\fR] [\fB\-\-agent\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fICHILD_ID\fR> 
+.SH DESCRIPTION
+Asks the control plane for a delegated agent\*(Aqs token, as its parent
+.PP
+The parent is the child\*(Aqs ID less its last segment, `42` for `42.c7`, and must have an identity here. The child gets a narrower, shorter\-lived token, recorded by the control plane, and an identity of its own that holds only that token: it connects with its root agent\*(Aqs certificate. Every node must report the `delegation` feature.
+.SH OPTIONS
+.TP
+\fB\-\-scope\fR \fI<SCOPE>\fR
+A scope the child gets instead of the defaults
+
+`<action>:<pattern>`. Each must be covered whole by the parent\*(Aqs scopes and its `grant` patterns, and stay inside the root\*(Aqs databases, with any `grant` only below the child. Without it, the child gets the parent\*(Aqs own actions on `agent\-<child\-id>\-*`, among `admin` and `stream`, and no `grant`. Repeat it for more.
+.TP
+\fB\-\-ttl\fR \fI<TTL>\fR
+How long the child\*(Aqs token lasts: `<n>h`, `<n>m`, or `<n>s`
+
+From 1 minute to 24 hours. Without it, 2 hours, or less if the parent\*(Aqs token ends sooner, and the result says so. One past the parent\*(Aqs token is refused, never capped.
+.TP
+\fB\-\-not\-before\fR \fI<TIME>\fR
+When the child\*(Aqs token starts, RFC 3339
+
+At most 30 seconds ago, and at most 24 hours ahead; by default, now.
+.TP
+\fB\-\-operation\-id\fR \fI<ID>\fR
+Asks under this operation ID instead of a new one
+
+26 lowercase base32 characters, as an earlier run printed it. The same ID with another child, other scopes, another `\-\-ttl`, or another `\-\-not\-before` is refused, naming the flag.
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: table]
+The output format: `table`, `json`, or `jsonl`
+
+`table` is for people; `json` is one object with stable snake_case fields; `jsonl` is the same object on one line. A watch prints one object per line for either.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+table: For people: a table, or key and value lines for one item
+.IP \(bu 2
+json: For programs: one JSON object, indented
+.IP \(bu 2
+jsonl: For programs: one JSON object per line
+.RE
+.TP
+\fB\-\-json\fR
+Short for `\-o json`
+.TP
+\fB\-\-control\fR \fI<CONTROL>\fR
+The control node\*(Aqs address, `host:port`
+
+The node that runs the control role, not any node in the fleet; a data\-only node answers with the control node\*(Aqs address. Defaults to `FLEETRING_CONTROL`, or else the context\*(Aqs `control`, when neither this nor `\-\-config` is given.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+A daemon\*(Aqs configuration file, to take the control node\*(Aqs address from
+.TP
+\fB\-\-context\fR \fI<NAME>\fR
+Uses this context for every setting it names, instead of the current one
+
+It outranks the environment variables; `FLEETRING_CONTEXT`, and else the current context, rank below them.
+.TP
+\fB\-\-tls\-dir\fR \fI<DIR>\fR
+A directory with `ca.crt` and the client certificates `cert client` writes
+
+`client.crt` and `client.key`, and the `client.<principal>.crt` and `.key` files `\-\-as` picks from. Defaults to `FLEETRING_TLS_DIR`, or else the context\*(Aqs `tls_dir`.
+.TP
+\fB\-\-ca\fR \fI<CA>\fR
+The trusted authority certificates, PEM
+
+Defaults to `FLEETRING_CA`, the context\*(Aqs `ca`, or `ca.crt` in the TLS directory.
+.TP
+\fB\-\-cert\fR \fI<CERT>\fR
+The client certificate, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_CERT`, the context\*(Aqs `cert`, or `client.crt` in the TLS directory.
+.TP
+\fB\-\-key\fR \fI<KEY>\fR
+The client certificate\*(Aqs private key, PEM; overrides `\-\-as`
+
+Defaults to `FLEETRING_KEY`, the context\*(Aqs `key`, or `client.key` in the TLS directory.
+.TP
+\fB\-\-as\fR \fI<PRINCIPAL>\fR
+Acts as this principal, with its certificate in the TLS directory
+
+Uses `client.<principal>.crt` and `client.<principal>.key` under the TLS directory, as `cert client <principal>` writes them. An explicit certificate or key at the same step wins over this for that file, and this wins over `client.crt` and `client.key`. Defaults to `FLEETRING_AS`, or else the context\*(Aqs `as`.
+.TP
+\fB\-\-insecure\-plaintext\fR
+Connects in plaintext, to a daemon started with `\-\-insecure\-plaintext`
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+A bearer token from `token issue`, sent with every request
+
+The request then acts with the token\*(Aqs scopes. Defaults to `FLEETRING_TOKEN`, if set.
+.TP
+\fB\-\-token\-file\fR \fI<PATH>\fR
+A file that holds a bearer token, or `\-` for stdin
+
+Defaults to `FLEETRING_TOKEN_FILE`, or else the context\*(Aqs `token_file`.
+.TP
+\fB\-\-agent\fR \fI<ID>\fR
+Acts as the agent with this ID, with the identity minted for it
+
+The identity `fleetring agent add` or `fleetring mcp \-\-agent` minted: `agent\-<id>`, its certificate, and its token, from its directory under the context\*(Aqs agents directory. A delegated agent\*(Aqs ID, such as `42.c7`, uses its root agent\*(Aqs certificate, `agent\-42`\*(Aqs, with the token `fleetring agent delegate` wrote for it. Defaults to `FLEETRING_AGENT`.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
+Writes log lines as `text` or `json`
+
+Overrides `FLEETRING_LOG_FORMAT` and the configuration file\*(Aqs `[log] format`.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Prints the result and errors only
+
+No progress, notes, warnings or override warnings. A command with no result then prints nothing.
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to colour log lines and the picker
+
+`auto` colours on a terminal unless `NO_COLOR` is set or `TERM` is `dumb`; `always` and `never` do as they say.
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: On a terminal, unless `NO_COLOR` is set or `TERM` is `dumb`
+.IP \(bu 2
+always: Always, even into a pipe or a file
+.IP \(bu 2
+never: Never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fICHILD_ID\fR>
+The child\*(Aqs ID: its parent\*(Aqs followed by `.<segment>`, such as `42.c7`
+
+The segment is 1 to 32 lowercase letters, digits, or \*(Aq_\*(Aq. The child\*(Aqs principal, `agent\-<id>`, is at most 64 bytes, at most 8 levels below the root.
+.SH EXTRA
+Examples:
+  fleetring agent delegate 42.c7                                   a child with the parent\*(Aqs actions on agent\-42.c7\-*
+  fleetring agent delegate 42.c7 \-\-scope admin:agent\-42.c7\-* \\
+      \-\-scope fork:agent\-42\-memory                                 a child that may fork the parent\*(Aqs memory
+  fleetring db create agent\-42.c7\-scratch \-\-agent 42.c7            act as the child
+  fleetring agent remove 42.c7                                     revoke the child and every agent below it
+
+The command writes the operation ID into the child\*(Aqs directory before it asks, and sends the
+same request again under it, up to 5 times within 60 seconds, while the control plane is
+unavailable or the reply is lost. Run it again after a crash or an exit code of 4: it finds the
+operation ID and resends it, and never records a second delegation.
+
+Exit codes: 0 on success; 1 when refused for any reason but scope; 2 for usage; 3 for a refused
+scope; 4 when the control plane stays unavailable after the resends.

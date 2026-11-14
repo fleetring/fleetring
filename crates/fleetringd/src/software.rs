@@ -30,7 +30,14 @@ pub fn release() -> Release {
 /// the feature covers (ADR-0041, point 3): this one carries out all of them, `expiry` included,
 /// since its control node sweeps expired databases, and [`Feature::Fork`], since its control
 /// state drives forks and its data nodes seed them, open them only after their fork-reset write,
-/// and gate them until then (ADR-0046).
+/// and gate them until then (ADR-0046), and [`Feature::Handover`], since its primaries count
+/// both write quorums while control state keeps a database's old replica set and report when
+/// placement's holds their log (ADR-0031, amendment 2), and [`Feature::Delegation`], since it
+/// enforces every rule of ADR-0047 points 3 and 11: the issuer path, the lineage checks,
+/// `Revoked::Principal` with its leeway by signer, and the unreadable-denylist rule (point 6.6).
+///
+/// Reporting a feature enables nothing: the fleet enables it at its first use (ADR-0038), so a
+/// fleet upgraded from 0.7 can still roll back until then.
 #[must_use]
 pub fn running() -> Software {
     SUPPORTED.into_iter().fold(
@@ -40,11 +47,13 @@ pub fn running() -> Software {
 }
 
 /// The fleet features this build acts on in full.
-const SUPPORTED: [Feature; 4] = [
+const SUPPORTED: [Feature; 6] = [
     Feature::Undrain,
     Feature::Metadata,
     Feature::Expiry,
     Feature::Fork,
+    Feature::Handover,
+    Feature::Delegation,
 ];
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
@@ -114,13 +123,13 @@ mod tests {
             software_from_proto(software_to_proto(&software)).expect("valid"),
             software
         );
-        // Stored, `expiry` and `metadata` go where the 0.5 line doesn't look, so a rollback
-        // still decodes a member's record (ADR-0041, amendment 1).
+        // Stored, `expiry`, `metadata` and the later features go where the 0.5 line doesn't
+        // look, so a rollback still decodes a member's record (ADR-0041, amendment 1).
         let stored = serde_json::to_value(&software).expect("serializes");
         assert_eq!(stored["features"], serde_json::json!(["undrain"]));
         assert_eq!(
             stored["newer_features"],
-            serde_json::json!(["expiry", "fork", "metadata"])
+            serde_json::json!(["delegation", "expiry", "fork", "handover", "metadata"])
         );
         // `upgrade --software` lists `expiry` now that the control node sweeps expired
         // databases (ADR-0041, point 3).
@@ -128,10 +137,36 @@ mod tests {
             serde_json::from_str(&running_json()).expect("upgrade --software prints JSON");
         assert_eq!(
             printed["features"],
-            serde_json::json!(["undrain", "metadata", "expiry", "fork"])
+            serde_json::json!([
+                "undrain",
+                "metadata",
+                "expiry",
+                "fork",
+                "delegation",
+                "handover"
+            ])
         );
         // An upgrade runs this build's `serve --check` before it swaps it in (#95).
         assert_eq!(printed["config_check"], serde_json::json!(true));
+    }
+
+    /// FR-093's build reports `delegation`, as it reports every feature it knows, in every
+    /// build and on every node (ADR-0047, points 6.6 and 12.3).
+    #[test]
+    fn this_build_reports_delegation() {
+        assert!(running().supports(Feature::Delegation));
+        assert!(
+            Feature::ALL
+                .into_iter()
+                .all(|feature| running().supports(feature))
+        );
+        let reported = software_to_proto(&running());
+        assert!(
+            reported
+                .features
+                .iter()
+                .any(|feature| feature == "delegation")
+        );
     }
 
     #[test]

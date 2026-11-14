@@ -178,6 +178,46 @@ impl Life {
     fn contains(&self, record: &Record) -> bool {
         record.invoked_at() >= self.start && self.end.is_none_or(|end| record.completed_at() <= end)
     }
+
+    /// Whether `record` was sent while the fork lived. An orphan copy of the fork may hold such
+    /// a write however late, or whether, its answer came.
+    fn sent_during(&self, record: &Record) -> bool {
+        record.invoked_at() >= self.start && self.end.is_none_or(|end| record.invoked_at() < end)
+    }
+
+    /// The fork marker its reset write leaves in its copies, as [`CopyOnDisk::markers`] holds it.
+    fn marker(&self) -> (u64, Vec<u8>) {
+        (
+            self.identity.incarnation.get(),
+            self.identity.operation.to_bytes().to_vec(),
+        )
+    }
+}
+
+/// The fork of `name` that `copy` belongs to by its markers: the one its only marker names.
+/// `None` for a copy without a marker, or with markers that name no one fork of the name.
+fn marked_life<'l>(
+    learned: &'l Learned,
+    name: &DatabaseName,
+    copy: &CopyOnDisk,
+) -> Option<&'l Life> {
+    let [marker] = copy.markers.as_slice() else {
+        return None;
+    };
+    learned
+        .forks
+        .iter()
+        .find(|life| life.identity.name == *name && life.marker() == *marker)
+}
+
+/// Which of a fork's writes a copy checked against it may hold as its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Own {
+    /// Those sent and answered while it lived: a live or staged copy of it.
+    Answered,
+    /// Those sent while it lived: an orphan copy of it, kept when its database went, which
+    /// holds what its primary applied before then, answered or not.
+    Sent,
 }
 
 /// One life of a database name: its incarnation, in simulated time.
@@ -226,8 +266,9 @@ fn identity_of(db: &Database) -> Option<ForkIdentity> {
 
 /// The replica set ADR-0046 gives `db`, worked out here rather than asked of control state: a
 /// seeded fork's recorded holders, and a ready one's while it keeps them (point 3.10, invariant
-/// (i)); otherwise the ring's placement over the fleet's members with its replication factor,
-/// computed with the placement crate itself.
+/// (i)); the replica set a membership change kept, while control state records one (ADR-0031,
+/// amendment 2); otherwise the ring's placement over the fleet's members with its replication
+/// factor, computed with the placement crate itself.
 #[must_use]
 pub fn expected_replica_set(state: &State, db: &Database) -> Vec<NodeId> {
     match db.fork().map(Fork::state) {
@@ -238,7 +279,11 @@ pub fn expected_replica_set(state: &State, db: &Database) -> Vec<NodeId> {
                 ..
             },
         ) => holders.iter().cloned().collect(),
-        _ => placement(state, db),
+        // A replica set a membership change kept is the set promotions fence until it is
+        // released (ADR-0031, amendment 2).
+        _ => db
+            .kept_replicas()
+            .map_or_else(|| placement(state, db), <[NodeId]>::to_vec),
     }
 }
 
@@ -1030,32 +1075,46 @@ fn rows(
             .database(&life.identity.name)
             .and_then(identity_of)
             .is_some_and(|identity| identity == life.identity);
-        let mut copies: Vec<(String, &[i64])> = Vec::new();
-        if current {
-            for ((name, host), copy) in &disk.copies {
-                if *name == life.identity.name {
-                    copies.push((format!("{host}'s copy"), &copy.values));
+        // A copy whose marker names another fork of the name is an orphan of that fork, kept
+        // when it was dropped: it is checked against that fork, never against this one.
+        let mut copies: Vec<(String, &[i64], Own)> = Vec::new();
+        for ((name, host), copy) in &disk.copies {
+            if *name != life.identity.name {
+                continue;
+            }
+            match marked_life(learned, name, copy) {
+                Some(marked) if marked.identity != life.identity => {}
+                Some(_) if !current => {
+                    copies.push((format!("{host}'s orphan copy"), &copy.values, Own::Sent));
                 }
+                _ if current => {
+                    copies.push((format!("{host}'s copy"), &copy.values, Own::Answered));
+                }
+                _ => {}
             }
         }
         let directory = format!("{}-{}", life.identity.incarnation, life.identity.operation);
         for (host, name, dir, values) in &disk.staged {
             if *name == life.identity.name && *dir == directory {
-                copies.push((format!("{host}'s staged copy"), values));
+                copies.push((format!("{host}'s staged copy"), values, Own::Answered));
             }
         }
         let source = state
             .database(&life.source)
             .filter(|db| db.incarnation() == life.source_incarnation)
             .and_then(|_| surviving(state, disk, &life.source));
-        for (whose, values) in copies {
+        for (whose, values, window) in copies {
             let mut from_source = Vec::new();
             let mut own = false;
             for value in values {
                 let Some((database, record)) = origins.get(value) else {
                     continue;
                 };
-                if **database == life.identity.name && life.contains(record) {
+                let ours = match window {
+                    Own::Answered => life.contains(record),
+                    Own::Sent => life.sent_during(record),
+                };
+                if **database == life.identity.name && ours {
                     own = true;
                     continue;
                 }
@@ -1317,13 +1376,14 @@ fn reset_once(
             .get(&life.identity.operation)
             .map(|writes| writes.iter().map(|(value, _)| *value).collect())
             .unwrap_or_default();
-        let marker = (
-            life.identity.incarnation.get(),
-            life.identity.operation.to_bytes().to_vec(),
-        );
+        let marker = life.marker();
         for ((name, host), copy) in &disk.copies {
             let holds_ours = copy.values.iter().any(|value| ours.contains(value));
-            if *name != life.identity.name || (!holds_ours && copy.markers.is_empty()) {
+            // An orphan of another fork of the name, holding none of this one's writes, is
+            // checked against its own fork.
+            let orphan = marked_life(learned, name, copy)
+                .is_some_and(|marked| marked.identity != life.identity);
+            if *name != life.identity.name || (!holds_ours && (copy.markers.is_empty() || orphan)) {
                 continue;
             }
             if copy.markers != [marker.clone()] {
@@ -1488,4 +1548,75 @@ fn handover(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn life(
+        name: &DatabaseName,
+        incarnation: u64,
+        operation: u8,
+        start: u64,
+        end: Option<u64>,
+    ) -> Life {
+        Life {
+            identity: ForkIdentity::new(
+                name.clone(),
+                Incarnation::new(incarnation),
+                OperationId::from_bytes([operation; 16]),
+            ),
+            source: "src".parse().expect("a name"),
+            source_incarnation: Incarnation::new(0),
+            write: 2,
+            bootstrap: 2,
+            start: Duration::from_millis(start),
+            end: end.map(Duration::from_millis),
+        }
+    }
+
+    fn copy(markers: Vec<(u64, Vec<u8>)>) -> CopyOnDisk {
+        CopyOnDisk {
+            values: Vec::new(),
+            markers,
+        }
+    }
+
+    #[test]
+    fn a_copy_belongs_to_the_one_fork_its_marker_names() {
+        let dst: DatabaseName = "dst".parse().expect("a name");
+        let other: DatabaseName = "other".parse().expect("a name");
+        let dropped = life(&dst, 1, 1, 0, Some(1_000));
+        let again = life(&dst, 2, 2, 1_500, None);
+        let elsewhere = life(&other, 4, 4, 0, None);
+        let learned = Learned {
+            forks: vec![dropped.clone(), again.clone(), elsewhere],
+            ..Learned::default()
+        };
+        let owner =
+            |markers| marked_life(&learned, &dst, &copy(markers)).map(|life| &life.identity);
+        assert_eq!(
+            owner(vec![dropped.marker()]),
+            Some(&dropped.identity),
+            "an orphan of the dropped fork"
+        );
+        assert_eq!(owner(vec![again.marker()]), Some(&again.identity));
+        assert_eq!(owner(Vec::new()), None, "no marker names no fork");
+        assert_eq!(
+            owner(vec![dropped.marker(), again.marker()]),
+            None,
+            "two markers name no one fork, and are checked as the current fork's"
+        );
+        assert_eq!(
+            owner(vec![(3, vec![3; 16])]),
+            None,
+            "a marker of no known fork"
+        );
+        assert_eq!(
+            marked_life(&learned, &other, &copy(vec![dropped.marker()])).map(|life| &life.identity),
+            None,
+            "a marker of another name's fork"
+        );
+    }
 }

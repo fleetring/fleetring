@@ -101,6 +101,7 @@ impl EpochAuthority for Authority {
                 holders: holders.await?,
                 incarnation: Incarnation::new(7),
                 fork,
+                sets: None,
             })
         })
     }
@@ -374,6 +375,7 @@ impl Bound {
                     database: DATABASE.to_owned(),
                     epoch,
                     epoch_start: None,
+                    epoch_start_chain: None,
                 })),
             })
             .await

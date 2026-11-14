@@ -127,7 +127,7 @@ impl Epochs {
         self.cache.lock().expect("epoch cache lock poisoned")
     }
 
-    fn file(&self, database: &DatabaseName) -> PathBuf {
+    pub(super) fn file(&self, database: &DatabaseName) -> PathBuf {
         self.root
             .join(layout::database_dir(database))
             .join(EPOCH_FILE)
@@ -168,6 +168,31 @@ impl Epochs {
     pub(super) fn highest(&self, database: &DatabaseName) -> Option<u64> {
         let record = self.record(database);
         (record.highest > 0).then_some(record.highest)
+    }
+
+    /// The highest epoch recorded for `database`'s copy if it may belong to the database of
+    /// `incarnation`: a record that names another incarnation is an earlier database's, left
+    /// behind as when forgetting it failed, and says nothing of this one's epochs. A record or a
+    /// caller without an incarnation is taken at its word.
+    pub(super) fn highest_of(
+        &self,
+        database: &DatabaseName,
+        incarnation: Option<u64>,
+    ) -> Option<u64> {
+        let record = self.record(database);
+        if let (Some(recorded), Some(asked)) = (record.incarnation, incarnation)
+            && recorded != asked
+        {
+            return None;
+        }
+        (record.highest > 0).then_some(record.highest)
+    }
+
+    /// Whether this node has never written a record of `database`: its file is absent. A file
+    /// that exists but can't be read, or reads as nothing, isn't absent, though
+    /// [`record`](Self::record) reads it as empty.
+    pub(super) fn never_recorded(&self, database: &DatabaseName) -> bool {
+        matches!(self.file(database).try_exists(), Ok(false))
     }
 
     /// The record of `database`; an empty one if there is none or it can't be read.
@@ -245,6 +270,56 @@ impl Epochs {
         self.update(database, |record| {
             Ok(*record.incarnation.get_or_insert(incarnation))
         })
+    }
+
+    /// Whether a drop of `database` at `epoch`, naming `incarnation` if it names one, names this
+    /// node's copy: `None` if the node has no record of one. It does when the copy's highest
+    /// epoch is the drop's and the two don't name different incarnations, or when both name the
+    /// same random incarnation and the copy is at a lower epoch: a copy of the dropped database
+    /// that missed its later epochs, as a first holder whose lease was never confirmed, or a
+    /// replica cut off from a promotion. The legacy incarnation, 0, names every database of the
+    /// name made before forks, so it is judged by the exact epoch, as a copy or a notice without
+    /// an incarnation is: a database created again under the name restarts its epochs. The caller
+    /// checks control state too: a notice never stands while control state holds the database it
+    /// names.
+    /// A copy that records an incarnation and no epoch yet, a fork holder's installed copy whose
+    /// first stream or fence hasn't come, is a copy too, at epoch 0.
+    pub(super) fn names_copy(
+        &self,
+        database: &DatabaseName,
+        epoch: u64,
+        incarnation: Option<u64>,
+    ) -> Option<bool> {
+        let record = self.record(database);
+        if record.highest == 0 && record.incarnation.is_none() {
+            return None;
+        }
+        let legacy = fleetring_control::Incarnation::LEGACY.get();
+        Some(match (incarnation, record.incarnation) {
+            (Some(named), Some(recorded)) if named != recorded => false,
+            (Some(named), Some(_)) if named != legacy => record.highest <= epoch,
+            _ => epoch > 0 && record.highest == epoch,
+        })
+    }
+
+    /// Records durably that this node installed a staged copy of `database`, the fork of
+    /// `incarnation`, as its copy: the incarnation, unless the copy recorded one already, and,
+    /// for its first primary, the lease's `epoch` with this node, `node`, as its holder. From
+    /// then on the copy is known here, whatever becomes of its lease: a drop notice deletes it,
+    /// and a new database of the name refuses it as an orphan rather than open it as its own.
+    /// The incarnation is written even if the epoch is refused.
+    ///
+    /// It blocks on the file system when the record changes.
+    pub(super) fn record_install(
+        &self,
+        database: &DatabaseName,
+        incarnation: u64,
+        lease: Option<(u64, &NodeId)>,
+    ) -> Result<(), EpochError> {
+        self.update(database, |record| {
+            record.incarnation.get_or_insert(incarnation);
+            Ok(lease.map_or(Ok(()), |(epoch, node)| raise(record, epoch, Some(node))))
+        })?
     }
 
     /// Deletes `database`'s record, as when the database is dropped, so that a database created
@@ -402,6 +477,152 @@ mod tests {
         let again = Epochs::new(dir.path().to_owned());
         assert_eq!(again.highest(&db), None);
         again.admit(&db, 1).expect("the name starts over");
+    }
+
+    #[test]
+    fn an_earlier_incarnations_epochs_say_nothing_of_a_later_ones() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db: DatabaseName = "db".parse().expect("name");
+        let epochs = Epochs::new(dir.path().to_owned());
+        epochs.admit(&db, 5).expect("an epoch");
+        // Not yet led here: every incarnation sees the epoch.
+        assert_eq!(epochs.highest_of(&db, Some(7)), Some(5));
+        assert_eq!(epochs.highest_of(&db, None), Some(5));
+        epochs
+            .record_incarnation(&db, 7)
+            .expect("the copy's incarnation");
+        assert_eq!(epochs.highest_of(&db, Some(7)), Some(5));
+        assert_eq!(
+            epochs.highest_of(&db, None),
+            Some(5),
+            "an unnamed incarnation is judged by the epoch"
+        );
+        assert_eq!(
+            epochs.highest_of(&db, Some(8)),
+            None,
+            "another incarnation's epochs don't count"
+        );
+        assert_eq!(
+            epochs.highest(&db),
+            Some(5),
+            "the plain highest epoch is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_drop_names_a_copy_by_its_epoch_and_incarnation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db: DatabaseName = "db".parse().expect("name");
+        let epochs = Epochs::new(dir.path().to_owned());
+        assert_eq!(epochs.names_copy(&db, 1, Some(7)), None, "no copy");
+        epochs.admit(&db, 2).expect("an epoch");
+        // No incarnation recorded: the epoch alone.
+        assert_eq!(epochs.names_copy(&db, 2, Some(7)), Some(true));
+        assert_eq!(epochs.names_copy(&db, 3, Some(7)), Some(false));
+        assert_eq!(epochs.names_copy(&db, 1, None), Some(false));
+        epochs.record_incarnation(&db, 7).expect("an incarnation");
+        assert_eq!(epochs.names_copy(&db, 2, Some(7)), Some(true));
+        assert_eq!(
+            epochs.names_copy(&db, 3, Some(7)),
+            Some(true),
+            "a copy that missed later epochs"
+        );
+        assert_eq!(
+            epochs.names_copy(&db, 1, Some(7)),
+            Some(false),
+            "a copy past the drop"
+        );
+        assert_eq!(
+            epochs.names_copy(&db, 2, Some(8)),
+            Some(false),
+            "another incarnation's drop"
+        );
+        assert_eq!(
+            epochs.names_copy(&db, 3, None),
+            Some(false),
+            "an unnamed drop: the epoch alone"
+        );
+        assert_eq!(epochs.names_copy(&db, 2, None), Some(true));
+
+        // A holder's installed copy, with its incarnation and no epoch yet.
+        let held: DatabaseName = "held".parse().expect("name");
+        epochs
+            .record_install(&held, 7, None)
+            .expect("a holder's install");
+        assert_eq!(epochs.names_copy(&held, 1, Some(7)), Some(true));
+        assert_eq!(epochs.names_copy(&held, 1, Some(8)), Some(false));
+        assert_eq!(epochs.names_copy(&held, 1, None), Some(false));
+
+        // The legacy incarnation names every database of the name made before forks: the exact
+        // epoch alone, as without one.
+        let legacy: DatabaseName = "legacy".parse().expect("name");
+        epochs.admit(&legacy, 1).expect("an epoch");
+        epochs
+            .record_incarnation(&legacy, 0)
+            .expect("the legacy incarnation");
+        assert_eq!(epochs.names_copy(&legacy, 1, Some(0)), Some(true));
+        assert_eq!(
+            epochs.names_copy(&legacy, 2, Some(0)),
+            Some(false),
+            "a later legacy drop"
+        );
+        assert_eq!(epochs.names_copy(&legacy, u64::MAX, Some(0)), Some(false));
+        assert_eq!(
+            epochs.names_copy(&legacy, 0, None),
+            Some(false),
+            "epoch 0 names no copy"
+        );
+    }
+
+    #[test]
+    fn an_installed_copy_is_known_by_its_incarnation_and_first_lease() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db: DatabaseName = "db".parse().expect("name");
+        let epochs = Epochs::new(dir.path().to_owned());
+        epochs
+            .record_install(&db, 7, Some((1, &node("n1"))))
+            .expect("a first primary's install");
+        let reopened = Epochs::new(dir.path().to_owned());
+        assert_eq!(reopened.highest(&db), Some(1));
+        assert_eq!(reopened.record(&db).holder(), Some("n1"));
+        assert_eq!(
+            reopened
+                .record(&db)
+                .incarnation()
+                .map(fleetring_control::Incarnation::get),
+            Some(7)
+        );
+
+        // A holder's install records the incarnation alone.
+        let other: DatabaseName = "other".parse().expect("name");
+        reopened
+            .record_install(&other, 9, None)
+            .expect("a holder's install");
+        assert_eq!(reopened.highest(&other), None);
+        assert_eq!(
+            reopened
+                .record(&other)
+                .incarnation()
+                .map(fleetring_control::Incarnation::get),
+            Some(9)
+        );
+
+        // An epoch refused still leaves the incarnation recorded.
+        let stale: DatabaseName = "stale".parse().expect("name");
+        reopened.admit(&stale, 5).expect("an epoch");
+        assert!(
+            reopened
+                .record_install(&stale, 3, Some((1, &node("n1"))))
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .record(&stale)
+                .incarnation()
+                .map(fleetring_control::Incarnation::get),
+            Some(3)
+        );
+        assert_eq!(reopened.highest(&stale), Some(5));
     }
 
     #[test]

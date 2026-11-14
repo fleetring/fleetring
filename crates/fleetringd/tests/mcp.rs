@@ -235,13 +235,13 @@ fn issue_token(tls: &Tls, scopes: &[&str]) -> Result<String, Box<dyn Error>> {
         .iter()
         .map(|scope| scope.parse::<Scope>())
         .collect::<Result<_, _>>()?;
-    let token = tls.authority().token_signer()?.issue(&TokenSpec {
-        principal: AGENT.parse()?,
+    let token = tls.authority().token_signer()?.issue(&TokenSpec::new(
+        AGENT.parse()?,
         scopes,
-        id: format!("agent-42-mcp-{}", now.as_millis()).parse()?,
-        not_before: now,
-        expires_at: now.saturating_add(Millis::new(3_600_000)),
-    })?;
+        format!("agent-42-mcp-{}", now.as_millis()).parse()?,
+        now,
+        now.saturating_add(Millis::new(3_600_000)),
+    ))?;
     Ok(token.expose().to_owned())
 }
 

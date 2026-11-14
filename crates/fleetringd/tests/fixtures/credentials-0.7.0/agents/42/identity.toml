@@ -1,0 +1,11 @@
+# Written by fleetring: agent 42's identity. It holds no secret.
+version = 1
+principal = "agent-42"
+owner = "tester"
+fleet = "legacy"
+scopes = ["admin:agent-42-*"]
+read_only = false
+token_id = "sVq1MzDvIXSU5FJ6Ticnog"
+token_expires_at = "2026-12-14T02:11:47Z"
+cert_expires_at = "2126-10-21T02:11:47Z"
+issued_by = "authority"

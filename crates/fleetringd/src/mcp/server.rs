@@ -28,6 +28,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::{Code, Status};
 
+use std::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
@@ -330,10 +331,23 @@ fn new_operation_id() -> Result<OperationId, Failed> {
     Ok(OperationId::from_bytes(bytes))
 }
 
+/// How the server gets a client with the credentials now on disk: `None` if they haven't changed
+/// since the client it holds was made.
+#[derive(Clone)]
+pub struct Reload(pub Arc<dyn Fn() -> Option<Client> + Send + Sync>);
+
+impl std::fmt::Debug for Reload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reload(..)")
+    }
+}
+
 /// The MCP server: one fleet, one principal.
 #[derive(Debug)]
 pub(crate) struct FleetringMcp {
-    client: Client,
+    /// The client calls go through; replaced when [`Reload`] says the credentials changed.
+    client: Mutex<Client>,
+    reload: Option<Reload>,
     settings: McpSettings,
     /// The turns of `changes` calls, [`MAX_CONCURRENT_CHANGES`] of them: calls run in parallel,
     /// and each holds a watcher slot on the node.
@@ -345,9 +359,49 @@ impl FleetringMcp {
     /// deadline, so the primary interrupts one before its tool call times out (FR-078).
     pub(crate) fn new(client: Client, settings: McpSettings) -> Self {
         Self {
-            client: client.with_call_timeout(STATEMENT_TIMEOUT),
+            client: Mutex::new(client.with_call_timeout(STATEMENT_TIMEOUT)),
+            reload: None,
             settings,
             changes_turns: Semaphore::new(MAX_CONCURRENT_CHANGES),
+        }
+    }
+
+    /// This server, taking a new client from `reload` when a call is refused as unauthenticated
+    /// and the credentials have changed since the client was made.
+    pub(crate) fn with_reload(mut self, reload: Reload) -> Self {
+        self.reload = Some(reload);
+        self
+    }
+
+    /// The client calls go through now.
+    fn client(&self) -> Client {
+        self.client.lock().expect("client lock poisoned").clone()
+    }
+
+    /// Replaces the client with the one [`Reload`] makes, if it makes one: the credentials the
+    /// server reads from disk changed, as when `agent renew` replaced a delegated agent's token.
+    /// Returns whether it did.
+    fn reload_client(&self) -> bool {
+        let Some(Reload(reload)) = &self.reload else {
+            return false;
+        };
+        let Some(client) = reload() else {
+            return false;
+        };
+        *self.client.lock().expect("client lock poisoned") =
+            client.with_call_timeout(STATEMENT_TIMEOUT);
+        true
+    }
+
+    /// Runs `tool` within [`CALL_TIMEOUT`].
+    async fn run_timed(
+        &self,
+        tool: ToolName,
+        arguments: JsonObject,
+    ) -> Result<serde_json::Value, Failed> {
+        match tokio::time::timeout(CALL_TIMEOUT, self.run(tool, arguments)).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(Failed::TimedOut),
         }
     }
 
@@ -405,9 +459,9 @@ impl FleetringMcp {
         };
         // A plain creation keeps the call every release knows (ADR-0041, point 2).
         let location = if metadata.is_empty() {
-            self.client.create_database_with(&name, spec).await
+            self.client().create_database_with(&name, spec).await
         } else {
-            self.client
+            self.client()
                 .create_database_with_metadata(&name, spec, &metadata)
                 .await
         }
@@ -462,7 +516,7 @@ impl FleetringMcp {
         };
         // A resumed operation the control plane knows is followed, and resends nothing.
         let known = if input.operation_id.is_some() {
-            match self.client.fork_operation(operation).await {
+            match self.client().fork_operation(operation).await {
                 Ok(status) => {
                     if let Some(found) = status.request.as_ref().and_then(|request| {
                         fork_flow::difference(request, source.as_str(), name.as_str(), &spec)
@@ -479,6 +533,7 @@ impl FleetringMcp {
         } else {
             None
         };
+        let client = self.client();
         let first = match known {
             Some(status) => status,
             None => {
@@ -487,7 +542,7 @@ impl FleetringMcp {
                     FORK_RESEND_WINDOW,
                     Duration::from_millis(250),
                 );
-                fork_flow::submit(policy, || self.client.fork_database(&source, &name, &spec))
+                fork_flow::submit(policy, || client.fork_database(&source, &name, &spec))
                     .await
                     .map_err(|error| match error {
                         SubmitError::Refused(status)
@@ -500,7 +555,7 @@ impl FleetringMcp {
             .saturating_sub(FORK_MARGIN);
         let status = match fork_flow::follow(
             first,
-            || self.client.fork_operation(operation),
+            || client.fork_operation(operation),
             fork_flow::POLL_INTERVAL,
             wait,
             |_| {},
@@ -512,7 +567,7 @@ impl FleetringMcp {
         };
         let mut out = fork_result_out(&fork_report(&status, started.elapsed()));
         if out.ready
-            && let Ok(location) = self.client.locate(&name).await
+            && let Ok(location) = self.client().locate(&name).await
         {
             let now = SystemClock.now();
             out.database = Some(database_out(
@@ -553,7 +608,7 @@ impl FleetringMcp {
             limit: Some(limit),
         };
         let listing = self
-            .client
+            .client()
             .list_databases_where(&filter)
             .await
             .map_err(Failed::status)?;
@@ -568,7 +623,7 @@ impl FleetringMcp {
 
     async fn db_show(&self, input: DbShowInput) -> Result<DatabaseOut, Failed> {
         let name = database_name(&input.name)?;
-        let location = self.client.locate(&name).await.map_err(Failed::status)?;
+        let location = self.client().locate(&name).await.map_err(Failed::status)?;
         let now = SystemClock.now();
         let mut report = database_report(&location, now);
         if input.schema.unwrap_or(true) {
@@ -579,7 +634,7 @@ impl FleetringMcp {
                     .min(MAX_COUNT_LIMIT),
                 internal: Internal::Hide,
             };
-            report = match self.client.schema(&name, request).await {
+            report = match self.client().schema(&name, request).await {
                 Ok(view) => report.with_schema(schema_report(&view)),
                 Err(status) => match schema_unavailable(&status) {
                     Some(reason) => report.without_schema(reason),
@@ -611,7 +666,7 @@ impl FleetringMcp {
             .clamp(1, MAX_ROWS);
         let max_rows = NonZeroU32::new(max_rows).unwrap_or(NonZeroU32::MIN);
         let rows = self
-            .client
+            .client()
             .query_limited(&name, statement, max_rows)
             .await
             .map_err(Failed::statement)?;
@@ -663,7 +718,7 @@ impl FleetringMcp {
             bytes: self.settings.max_result_bytes.saturating_sub(envelope),
             rows: MAX_CHANGES_ROWS,
         };
-        let collected = collect_changes(&self.client, &name, after, limit, budget)
+        let collected = collect_changes(&self.client(), &name, after, limit, budget)
             .await
             .map_err(Failed::status)?;
         let mut out = ChangesOut {
@@ -683,7 +738,7 @@ impl FleetringMcp {
         let name = database_name(&input.database)?;
         let statement = statement(input.sql, input.params)?;
         let written = self
-            .client
+            .client()
             .execute(&name, statement)
             .await
             .map_err(Failed::statement)?;
@@ -732,7 +787,7 @@ impl FleetringMcp {
             ));
         }
         let metadata = self
-            .client
+            .client()
             .update_database_with(&name, &change, expiry, input.expected_version)
             .await
             .map_err(Failed::status)?;
@@ -756,7 +811,7 @@ impl FleetringMcp {
         }
         let name = database_name(&input.name)?;
         let epoch = self
-            .client
+            .client()
             .drop_database(&name)
             .await
             .map_err(Failed::status)?;
@@ -985,16 +1040,45 @@ impl ServerHandler for FleetringMcp {
             ));
         };
         let arguments = request.arguments.unwrap_or_default();
-        let outcome = match tokio::time::timeout(CALL_TIMEOUT, self.run(tool, arguments)).await {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => Err(Failed::TimedOut),
-        };
+        let mut outcome = self.run_timed(tool, arguments.clone()).await;
+        // A refusal as unauthenticated rejected the call before it ran, so sending it again with
+        // the credentials now on disk repeats nothing.
+        if matches!(&outcome, Err(Failed::Status(status)) if status.code() == Code::Unauthenticated)
+            && self.reload_client()
+        {
+            outcome = self.run_timed(tool, arguments).await;
+        }
         match outcome {
             Ok(value) => Ok(success(value)?.into()),
             Err(Failed::Input(message)) => Err(ErrorData::invalid_params(message, None)),
-            Err(failed) => Ok(failure(&failed.body())?.into()),
+            Err(failed) => Ok(failure(&parent_renews(self.me(), failed.body()))?.into()),
         }
     }
+}
+
+/// `body`, with the next step for a delegated agent whose credentials were refused: a restart
+/// mints no token for it, so its parent delegates a new one (ADR-0047, point 10), which the
+/// server then reads from the token file. The hint names
+/// only the principal the server's own credentials name.
+fn parent_renews(me: Option<&PrincipalName>, mut body: ErrorBody) -> ErrorBody {
+    if body.code != code_name(Code::Unauthenticated) {
+        return body;
+    }
+    let delegated = me
+        .and_then(|me| fleetring_control::delegation::AgentName::try_from(me.clone()).ok())
+        .filter(fleetring_control::delegation::AgentName::is_delegated);
+    if let Some(name) = delegated {
+        let id = name
+            .as_str()
+            .strip_prefix("agent-")
+            .unwrap_or(name.as_str());
+        body.hint = Some(format!(
+            "the server's credentials were refused: the token was revoked, replaced, or has \
+             expired; a token its parent replaced is picked up on the next call, and otherwise \
+             ask the parent: fleetring agent renew {id}"
+        ));
+    }
+    body
 }
 
 /// Why a tool call failed.
@@ -1164,8 +1248,9 @@ fn feature_hint(status: &Status) -> Option<&'static str> {
 /// mode (ADR-0043, point 8.2).
 fn credential_hint(status: &Status) -> Option<&'static str> {
     (status.code() == Code::Unauthenticated).then_some(
-        "the server's credentials were refused; if its token expired, restart the MCP server \
-         (`fleetring mcp --agent <id>` renews the token at start in dev mode)",
+        "the server's credentials were refused: the token was revoked, replaced, or has \
+         expired; one replaced on disk is picked up on the next call, and otherwise restart the \
+         MCP server (`fleetring mcp --agent <id>` renews the token at start in dev mode)",
     )
 }
 
@@ -1445,9 +1530,9 @@ mod tests {
             crate::Network::tcp(crate::transport::TransportConfig::default()),
         );
         let server = FleetringMcp::new(client, McpSettings::default());
-        assert_eq!(server.client.call_timeout(), Some(STATEMENT_TIMEOUT));
+        assert_eq!(server.client().call_timeout(), Some(STATEMENT_TIMEOUT));
         let request = server
-            .client
+            .client()
             .timed(fleetring_proto::v1::QueryRequest::default());
         let header = request
             .metadata()
@@ -1485,6 +1570,29 @@ mod tests {
             ToolName::find("exec", Access::ReadWrite),
             Some(ToolName::Exec)
         );
+    }
+
+    /// ADR-0047, point 7: credentials stay out of model context, so no tool delegates, renews or
+    /// revokes, and none returns or takes a token.
+    #[test]
+    fn mcp_tool_list_has_no_delegate_or_token_tool() -> Result<(), serde_json::Error> {
+        for access in [Access::ReadWrite, Access::ReadOnly] {
+            for tool in tools(access) {
+                for word in ["delegat", "token", "renew", "revoke", "credential"] {
+                    assert!(!tool.name.contains(word), "{} names {word}", tool.name);
+                }
+                let schema = serde_json::to_string(&tool.input_schema)?.to_lowercase();
+                assert!(
+                    !schema.contains("\"token\"") && !schema.contains("delegat"),
+                    "{} takes a credential: {schema}",
+                    tool.name
+                );
+            }
+        }
+        for tool in ToolName::ALL {
+            assert!(!tool.name().contains("delegate") && !tool.name().contains("token"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -1668,6 +1776,28 @@ mod tests {
                 .is_some_and(|hint| hint.contains("restart the MCP server")),
             "{expired:?}"
         );
+    }
+
+    #[test]
+    fn a_refused_child_says_to_ask_its_parent() -> Result<(), Box<dyn std::error::Error>> {
+        let expired = || Failed::Status(Status::unauthenticated("the token has expired")).body();
+        let child: PrincipalName = "agent-42.c7".parse()?;
+        let hint = parent_renews(Some(&child), expired()).hint;
+        assert!(
+            hint.as_deref()
+                .is_some_and(|hint| hint.contains("ask the parent: fleetring agent renew 42.c7")),
+            "{hint:?}"
+        );
+        // A root agent, or any other principal, restarts the server as before.
+        let root: PrincipalName = "agent-42".parse()?;
+        assert_eq!(parent_renews(Some(&root), expired()).hint, expired().hint);
+        assert_eq!(parent_renews(None, expired()).hint, expired().hint);
+        let denied = Failed::Status(Status::permission_denied("no")).body();
+        assert_eq!(
+            parent_renews(Some(&child), denied).hint,
+            Failed::Status(Status::permission_denied("no")).body().hint
+        );
+        Ok(())
     }
 
     #[test]

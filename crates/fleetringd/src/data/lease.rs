@@ -28,7 +28,8 @@
 //!   time, or a primary that is down when the drop happens, leaves the archive as of its last
 //!   archived segment. The flush runs beside the renewals, so it never holds up another
 //!   database's lease. Then the copy is deleted if a drop notice arrived, before or during the
-//!   flush, and kept as an orphan otherwise. Until then, the node refuses to create or restore
+//!   flush, and kept as an orphan otherwise, even if a refused renewal stopped serving it at the
+//!   same moment as the notice. Until then, the node refuses to create or restore
 //!   a database of the same name with `UNAVAILABLE`, which clients retry, and the deletion
 //!   leaves the copy alone if the node serves the name at another epoch by then. A node that
 //!   was down when the drop happened gets no notice, and keeps its copy as an orphan.
@@ -67,7 +68,7 @@ use crate::control::missing_database;
 use crate::data::drain::DrainSettings;
 use crate::data::node::{DataNode, Fate, HeldLease, Retiring};
 use crate::engine::Position;
-use crate::replication::{Fenced, PromotionRequest, Replication};
+use crate::replication::{DropNotice, Fenced, PromotionRequest, Replication};
 
 /// The longest a primary waits for a dropped database's change streams to deliver what its copy
 /// acknowledged before it deletes the copy (ADR-0041, point 4).
@@ -212,7 +213,7 @@ async fn run(node: DataNode, settings: LeaseSettings) {
                         {
                             drop_staged(&node, &database, incarnation, operation).await;
                         }
-                        drop_seen(&node, &database, notice.epoch, &dropped_found).await;
+                        drop_seen(&node, &database, &notice, &dropped_found).await;
                     });
                 }
             }
@@ -306,6 +307,10 @@ async fn recover(node: &DataNode, restarting: &mut JoinSet<()>) -> bool {
             tracing::warn!(database = %name, %error, "holds the lease but can't open the database");
             continue;
         }
+        if let Err(status) = replication.follow_replica_sets(name, &placement) {
+            tracing::warn!(database = %name, %status, "can't read the replica sets of a lease held after a restart");
+            continue;
+        }
         tracing::info!(database = %name, epoch = placement.epoch, "holds the lease after a restart");
         let node = node.clone();
         let name = name.clone();
@@ -389,7 +394,9 @@ async fn stop_serving(
 ) {
     // Both taken before serving stops: the streams of a database the node no longer serves stop
     // as soon as they notice, and the name must never be free for a new database while the old
-    // copy is still here.
+    // copy is still here. A notice and a refused renewal can both get here for one lease: the
+    // one that finds the lease already forgotten drops its guard at once, which neither frees
+    // the name nor undoes a drop the other saw.
     let retiring = node.begin_retiring(database, fate);
     let streams = node.change_streams().hold(database);
     if node.forget(database, epoch) {
@@ -522,7 +529,8 @@ const UNKNOWN: &str =
     "the control plane doesn't know the database, and no control node said it dropped it";
 
 /// Why a copy was kept as an orphan: the control plane holds the name at a lower epoch.
-const OLDER: &str = "the control plane holds the name only at a lower epoch than this copy's";
+const OLDER: &str = "the control plane holds the name only at a lower epoch than this copy's, \
+     or at another incarnation";
 
 /// Why a copy was kept as an orphan: the control plane's database of the name was never leased.
 const NEVER_LEASED: &str =
@@ -546,29 +554,51 @@ async fn keep_orphan(node: &DataNode, database: &DatabaseName, why: &'static str
 /// Acts on a drop a control node told this node of (ADR-0042): deletes this node's copy of
 /// `database`, after flushing its change streams if this node serves it.
 ///
-/// The copy is deleted only if its highest epoch is exactly `epoch`, the one the database was
-/// dropped at, so the notice names this copy's incarnation, and only while control state still
-/// agrees: it holds no database of the name, or one at a lower epoch. Both are judged again
-/// here, under the name's lock, since a database of the name may have been created and leased
-/// since the notice arrived. A control plane that can't be reached leaves the copy, which
-/// becomes an orphan the usual way.
+/// The copy is deleted only if the notice names this copy's incarnation: when both the notice
+/// and the copy name an incarnation, the same one, at the copy's highest epoch or a later one,
+/// since a copy that missed the database's later epochs is the dropped database's all the same;
+/// otherwise, the copy's highest epoch is exactly the notice's, the one the database was dropped
+/// at. A database created again under the name restarts its epochs, so the epoch alone doesn't
+/// tell a late notice for the dropped database from one for the copy's. A notice or a copy
+/// without an incarnation, from a release before them or a copy this node only followed, is
+/// judged by the epoch alone, and a replica that missed a promotion keeps its copy as an orphan.
+/// The copy is deleted
+/// only while control state still agrees, too: it holds no database of the name, or one at a
+/// lower epoch, and never the database a notice's random incarnation names, whatever the epoch
+/// (a notice naming the live database at a later epoch is forged or wrong). All of this is judged again here, under the name's lock, since a database of the
+/// name may have been created and leased since the notice arrived. A control plane that can't
+/// be reached leaves the copy, which becomes an orphan the usual way.
 async fn drop_seen(
     node: &DataNode,
     database: &DatabaseName,
-    epoch: LeaseEpoch,
+    notice: &DropNotice,
     dropped: &mpsc::UnboundedSender<Dropped>,
 ) {
+    let epoch = notice.epoch;
     // No create, restore, or orphan removal of the name runs while the notice is judged and
     // acted on, so the copy judged is the copy deleted.
     let _name = node.lock_name(database).await;
-    let Some(highest) = node.replication().highest_epoch(database) else {
-        return;
-    };
-    if highest != epoch {
-        tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), "a drop notice names another incarnation than this node's copy; kept the copy");
-        return;
+    let replication = node.replication();
+    let highest = replication
+        .highest_epoch(database)
+        .unwrap_or(LeaseEpoch::ZERO);
+    match replication.drop_names_copy(database, epoch, notice.incarnation) {
+        Some(true) => {}
+        None => return,
+        Some(false) => {
+            let recorded = replication.copy_incarnation(database);
+            tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), named = ?notice.incarnation, ?recorded, "a drop notice names another incarnation than this node's copy; kept the copy");
+            return;
+        }
     }
+    let random = notice
+        .incarnation
+        .filter(|named| *named != fleetring_control::Incarnation::LEGACY);
     match node.locate(database).await {
+        Ok(placement) if random.is_some_and(|named| named.get() == placement.incarnation) => {
+            tracing::info!(database = %database, epoch = epoch.get(), "the control plane still holds the database the drop notice names; kept the copy");
+            return;
+        }
         Ok(placement) if placement.epoch < epoch.get() => {}
         Err(status) if missing_database(&status).is_some() => {}
         Ok(_) => {
@@ -580,7 +610,10 @@ async fn drop_seen(
             return;
         }
     }
-    if node.confirm_drop(database, epoch) {
+    // The copy goes at its own highest epoch, the notice's or, for a copy that missed the
+    // database's later epochs, a lower one: a newer database's copy here would have moved past it.
+    let dropped_at = highest;
+    if node.confirm_drop(database, dropped_at) {
         tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; its copy goes once its change streams are flushed");
         return;
     }
@@ -590,7 +623,7 @@ async fn drop_seen(
             node,
             database,
             lease.epoch,
-            Fate::Deleted { epoch },
+            Fate::Deleted { epoch: dropped_at },
             dropped,
         )
         .await;
@@ -631,11 +664,22 @@ async fn drop_staged(
 
 /// Whether this node's copy of `database` comes from a database that was dropped and created
 /// again under the name: the control plane never issues an epoch below one a replica has seen, so
-/// a placement below the recorded epoch belongs to a new database.
+/// a placement below the recorded epoch belongs to a new database, and one of another random
+/// incarnation than the copy recorded does too.
 fn is_past_incarnation(node: &DataNode, database: &DatabaseName, placement: &Placement) -> bool {
-    node.replication()
-        .highest_epoch(database)
-        .is_some_and(|highest| placement.epoch < highest.get())
+    let replication = node.replication();
+    // A copy that records a random incarnation control state no longer holds is an earlier
+    // database's, whatever the epochs; the legacy incarnation says nothing either way.
+    let other = replication
+        .copy_incarnation(database)
+        .is_some_and(|recorded| {
+            placement.incarnation != fleetring_control::Incarnation::LEGACY.get()
+                && recorded.get() != placement.incarnation
+        });
+    other
+        || replication
+            .highest_epoch(database)
+            .is_some_and(|highest| placement.epoch < highest.get())
 }
 
 /// Removes every trace of `database`, whose drop this node saw: the lease this node holds on it,

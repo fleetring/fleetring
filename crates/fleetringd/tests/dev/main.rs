@@ -67,13 +67,15 @@ const CLIENT_VARS: [&str; 10] = [
 ];
 
 /// The files a first run creates that a second must leave byte for byte as they are.
-const STATE: [&str; 7] = [
+const STATE: [&str; 9] = [
     "tls/ca.crt",
     "tls/ca.key",
     "tls/node.dev.crt",
     "tls/node.dev.key",
     "tls/client.admin.crt",
     "tls/client.admin.key",
+    "tls/issuer.dev.crt",
+    "tls/issuer.dev.key",
     "fleetringd.toml",
 ];
 
@@ -276,8 +278,8 @@ fn a_first_run_creates_the_state_and_a_second_reuses_it_byte_for_byte() -> TestR
     let mut node = DevNode::start(root.path(), &dir)?;
     assert!(
         node.log_text().contains(
-            "created the authority, the node certificate, the admin certificate, and \
-             fleetringd.toml"
+            "created the authority, the node certificate, the admin certificate, the delegation \
+             issuer pair, and fleetringd.toml"
         ),
         "{}",
         node.log_text()
@@ -312,6 +314,47 @@ fn a_first_run_creates_the_state_and_a_second_reuses_it_byte_for_byte() -> TestR
             }
         }
     })?;
+    node.stop()
+}
+
+#[test]
+fn a_dev_dir_from_0_7_gets_the_default_issuer_pair_without_a_config_rewrite() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join("old");
+    let mut node = DevNode::start(root.path(), &dir)?;
+    node.stop()?;
+    // What 0.7 left: its configuration names no issuer pair, and there is none.
+    let config = dir.join("fleetringd.toml");
+    let text = fs::read_to_string(&config)?;
+    let start = text.find("[control]\n").ok_or("no [control] table")?;
+    let end = start + text[start..].find("\n\n").ok_or("no end to it")? + 2;
+    let old = format!("{}{}", &text[..start], &text[end..]);
+    fs::write(&config, &old)?;
+    for name in ["tls/issuer.dev.crt", "tls/issuer.dev.key"] {
+        fs::remove_file(dir.join(name))?;
+    }
+
+    node.spawn(root.path(), None)?;
+    assert!(
+        node.log_text()
+            .contains("created the delegation issuer pair; reused the rest"),
+        "{}",
+        node.log_text()
+    );
+    assert!(
+        node.log_text()
+            .contains("loaded the delegation issuer pair"),
+        "{}",
+        node.log_text()
+    );
+    assert_eq!(
+        fs::read_to_string(&config)?,
+        old,
+        "the configuration was rewritten"
+    );
+    for name in ["tls/issuer.dev.crt", "tls/issuer.dev.key"] {
+        assert!(dir.join(name).exists(), "{name}");
+    }
     node.stop()
 }
 

@@ -1,0 +1,1 @@
+{"iss":"lab","sub":"agent-42.c7","jti":"BwcHBwcHBwcHBwcHBwcHBw","iat":1800086400,"nbf":1800086400,"exp":1800172800,"fleetring.scopes":["admin:agent-42.c7-*"],"fleetring.kind":"agent","fleetring.owner":null,"fleetring.parent":"agent-42","fleetring.chain":[{"id":"root-1","kid":"rootrootrootroot"}]}

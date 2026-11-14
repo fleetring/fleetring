@@ -121,6 +121,10 @@ pub fn placement_report(location: &Location) -> PlacementReport {
                 position: replica.position.as_ref().map(ToString::to_string),
             })
             .collect(),
+        placed_replicas: location
+            .placed
+            .as_ref()
+            .map(|placed| placed.iter().map(ToString::to_string).collect()),
     }
 }
 
@@ -1013,6 +1017,7 @@ mod tests {
                     reported_role: Some("primary"),
                     position: None,
                 }],
+                placed_replicas: None,
             },
             metadata: Some(MetadataReport {
                 description: description.map(str::to_owned),

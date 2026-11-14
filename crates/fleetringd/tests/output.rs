@@ -151,7 +151,8 @@ fn replica_shape() -> Value {
     })
 }
 
-/// A one-replica placement's shape: no candidate, no followers.
+/// A one-replica placement's shape: no candidate, no followers, and no placement apart from
+/// its replica set.
 fn placement_shape() -> Value {
     json!({
         "acks": "string",
@@ -161,6 +162,7 @@ fn placement_shape() -> Value {
         "incarnation": "string",
         "lease_epoch": "number",
         "min_replicas": "number",
+        "placed_replicas": "null",
         "primary": "string",
         "replicas": [replica_shape()],
         "replication_factor": "number",
@@ -202,14 +204,19 @@ async fn every_read_command_prints_json_with_pinned_fields() -> TestResult {
         }
 
         // The replica reports its role and position with its next heartbeats; until then they
-        // are null, or the log's beginning, and the snapshot below pins them as strings.
+        // are null, or the log's beginning, and the snapshot below pins them as strings. `db
+        // verify` checks the position the control plane last heard, so the checks wait until
+        // that is the node's own, the last write's: a report from before it would move on
+        // between the two verifications below.
         for _ in 0..POLLS {
             let located = fleet.json(&["db", "locate", "notes", "--json"])?;
             let replica = &located["placement"]["replicas"][0];
+            let node = fleet.json(&["status", "--address", &fleet.control, "--json"])?;
             if replica["reported_role"].is_string()
                 && replica["position"]
                     .as_str()
                     .is_some_and(|position| !position.is_empty())
+                && replica["position"] == node["databases"][0]["position"]
             {
                 break;
             }

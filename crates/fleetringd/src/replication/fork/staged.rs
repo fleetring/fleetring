@@ -466,6 +466,50 @@ impl StagedStore {
         Ok(())
     }
 
+    /// Moves `key`'s files back from `location`, the database's place, after an
+    /// [`install`](Self::install) whose record elsewhere couldn't be written, and forgets that
+    /// they were moved: the copy is staged again, and nothing is left in the database's place.
+    /// If they can't be moved back, they are removed from `location`. It blocks on the file
+    /// system.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error if neither works.
+    pub(crate) fn uninstall(&self, key: &StagedKey, location: &Path) -> io::Result<()> {
+        let dir = key.dir(&self.root);
+        let copy = self.copy_dir(key);
+        let parent = location
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let moved = fs::rename(location, &copy)
+            .and_then(|()| sync_dir(&parent))
+            .and_then(|()| sync_dir(&dir));
+        if let Err(error) = moved {
+            tracing::error!(location = %location.display(), %error, "can't move an installed staged copy back; removing it from the database's place");
+            remove_dir_if_present(location)?;
+            return Ok(());
+        }
+        match fs::remove_file(dir.join(INSTALLED)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        sync_dir(&dir)?;
+        if let Some(staged) = self.lock().get_mut(key) {
+            staged.held = Held::Present;
+        }
+        Ok(())
+    }
+
+    /// The staged copies whose files were moved into the database's place.
+    pub(crate) fn installed_keys(&self) -> Vec<StagedKey> {
+        self.lock()
+            .iter()
+            .filter(|(_, staged)| staged.held == Held::Installed)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Records that `key`'s files were moved into the database's place: they are no longer
     /// here, but the sidecar stays until a signal deletes it. It blocks on the file system.
     ///
@@ -747,6 +791,65 @@ mod tests {
             store.get(&first).map(|staged| staged.held),
             Some(Held::Installed)
         );
+        assert_eq!(store.installed_keys(), std::slice::from_ref(&first));
+        // Moved back, as when its record elsewhere can't be written: staged again, across a
+        // restart too, and nothing left in the database's place.
+        store.uninstall(&first, &location).expect("uninstall");
+        assert!(!location.exists());
+        assert!(store.installed_keys().is_empty());
+        let again = StagedStore::new(dir.path().join("staged"));
+        again.scan();
+        assert_eq!(
+            again.get(&first).map(|staged| staged.held),
+            Some(Held::Present)
+        );
+        assert_eq!(
+            fs::read(again.copy_dir(&first).join("data.db")).expect("staged again"),
+            b"hello"
+        );
+    }
+
+    /// At start, an installed copy whose epoch record was never written is recorded; one whose
+    /// record exists but can't be read is left in place, unrecorded and unmoved (the FR-106
+    /// review): an unreadable record isn't an absent one.
+    #[test]
+    fn the_start_records_only_an_installed_copy_whose_record_is_absent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = StagedStore::new(dir.path().join("staged"));
+        let first = key(1);
+        stage(&store, &first, b"hello");
+        let databases = dir.path().join("databases");
+        let location = |name: &DatabaseName| databases.join(name.as_str().replace('/', "_"));
+        let name = first.fork.name.clone();
+        store.install(&first, &location(&name)).expect("install");
+        let epochs = crate::replication::epochs::Epochs::new(dir.path().join("epochs"));
+
+        // A record that exists but doesn't read.
+        let file = epochs.file(&name);
+        fs::create_dir_all(file.parent().expect("a parent")).expect("dir");
+        fs::write(&file, b"{not json").expect("garble");
+        crate::replication::fork::record_installed(&epochs, &store, location);
+        assert!(location(&name).join("data.db").is_file(), "left in place");
+        assert_eq!(
+            store.installed_keys(),
+            std::slice::from_ref(&first),
+            "not moved back"
+        );
+        assert_eq!(
+            fs::read(&file).expect("still there"),
+            b"{not json",
+            "not rewritten"
+        );
+
+        // An absent record is written, naming the fork's incarnation.
+        fs::remove_file(&file).expect("remove");
+        let epochs = crate::replication::epochs::Epochs::new(dir.path().join("epochs"));
+        crate::replication::fork::record_installed(&epochs, &store, location);
+        assert_eq!(
+            epochs.record(&name).incarnation(),
+            Some(first.fork.incarnation)
+        );
+        assert!(location(&name).join("data.db").is_file());
     }
 
     #[test]

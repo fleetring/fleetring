@@ -14,8 +14,8 @@ use fleetring_control::fork::{
     ResetReport, RetryCause, SeedFailure, SeedFailureReason, StagedCopy, completion_quorum,
 };
 use fleetring_control::{
-    Database, DatabaseName, HostedReplica, Incarnation, LeaseEpoch, Position, ReplicaRole, Report,
-    State,
+    Database, DatabaseName, HostedReplica, Incarnation, LeaseEpoch, Position, ReplicaRole,
+    ReplicasCaughtUp, Report, State,
 };
 use fleetring_proto::v1 as proto;
 use fleetring_proto::v1::metadata_spec::Expiry as SpecExpiry;
@@ -177,6 +177,16 @@ pub(crate) fn replica_from_proto(
             Epoch::new(membership_epoch),
         ));
     }
+    // The same holds of a hand-over report (ADR-0031, amendment 2).
+    if let Some(caught_up) = status.replicas_caught_up
+        && let Some(membership_epoch) = caught_up.membership_epoch
+    {
+        replica = replica.with_replicas_caught_up(ReplicasCaughtUp::new(
+            Incarnation::new(caught_up.incarnation),
+            LeaseEpoch::new(caught_up.epoch),
+            Epoch::new(membership_epoch),
+        ));
+    }
     let progress = status
         .seed_progress
         .map(|progress| {
@@ -280,6 +290,13 @@ pub(crate) fn replica_to_proto(
                 membership_epoch: Some(caught_up.membership_epoch().get()),
             }
         }),
+        replicas_caught_up: replica
+            .replicas_caught_up()
+            .map(|caught_up| proto::ReplicasCaughtUp {
+                incarnation: caught_up.incarnation().get(),
+                epoch: caught_up.epoch().get(),
+                membership_epoch: Some(caught_up.membership_epoch().get()),
+            }),
     }
 }
 

@@ -11,7 +11,7 @@
 //! - [`Command`] is a stamped [`Action`]: join, leave, heartbeat, create or drop a database,
 //!   change its durability or its metadata, expire it, acquire or renew a lease, start a
 //!   promotion, record a fenced member, complete a promotion, tick, drain or undrain a member,
-//!   transfer a lease, revoke a bearer token, or create and drive a fork.
+//!   transfer a lease, revoke a bearer token, create and drive a fork, or record a delegation.
 //! - [`apply`] checks a command against the rules of ADR-0017 and ADR-0018 and returns an
 //!   [`Outcome`]: what changed, or a [`Rejection`] that left the state untouched.
 //!
@@ -77,6 +77,25 @@
 //!   an operation whose ID the client chooses; a resubmission of the same intent returns the
 //!   same operation, and the operation's record is kept for a retention after its outcome.
 //!
+//! The scope grammar and lattice ([`scope`]) and the database rules they are built on
+//! ([`matcher`]) live here too, so the control plane can check delegations against the one
+//! implementation (ADR-0047, point 6.5). They are not re-exported at the crate root:
+//! [`scope::Action`] is a request's action, not the control [`Action`].
+//!
+//! So does the lineage vocabulary of online delegation ([`delegation`], ADR-0047): agent names,
+//! a token's claims and chain, who signed it, and the agent tier; with
+//! [`Revocations::refuses_token`], which decides whether the denylist refuses a token by its own
+//! ID and key or by any ancestor's in its chain. Nodes and the control plane decide with these
+//! same functions.
+//!
+//! - **Delegations** (ADR-0047, points 5.9 and 6): once the `delegation` feature is enabled,
+//!   [`Action::RecordDelegation`] records a child's complete claims before the control node
+//!   signs them, checked against the caller's presented claims and, for a delegated caller, its
+//!   own record. Each record and its operation are kept for a retention after the token
+//!   expires, a token's revocation prunes the records it ends, and rate windows bound how fast a
+//!   lineage records. [`Command::recorded_by`], stamped by the log layer, names the control
+//!   node that logged a command.
+//!
 //! # Examples
 //!
 //! ```
@@ -115,11 +134,15 @@ mod apply;
 mod command;
 mod config;
 mod database;
+pub mod delegation;
 pub mod fork;
+mod handover;
+pub mod matcher;
 mod member;
 mod metadata;
 pub mod mutation;
 mod revocation;
+pub mod scope;
 mod software;
 mod state;
 mod time;
@@ -132,6 +155,7 @@ pub use database::{
     LeaseEpoch, ParseAcksError, ParseDatabaseNameError, ParseIncarnationError, Position, Promotion,
     Quorums,
 };
+pub use handover::ReplicasCaughtUp;
 pub use member::{HostedReplica, Liveness, Member, ReplicaRole, Report};
 pub use metadata::{
     Description, DescriptionChange, ExpiryChange, FORBIDDEN_FORMAT_CHARACTERS, LabelKey,
@@ -139,7 +163,10 @@ pub use metadata::{
     ParseDescriptionError, ParseLabelError, ParsePrincipalNameError, PrincipalName,
     RESERVED_LABEL_DOMAIN, parse_label,
 };
-pub use revocation::{KeyId, ParseCredentialIdError, Revocations, Revoked, TokenId};
+pub use revocation::{
+    Added, Entry, FleetRef, KeyId, ParseCredentialIdError, ParseFleetRefError, Revocations,
+    Revoked, TokenId, TokenRef,
+};
 pub use software::{Feature, ParseFeatureError, ParseReleaseError, Release, Software};
 pub use state::{State, membership_ring};
 pub use time::{Millis, Timestamp};
@@ -148,19 +175,46 @@ pub use time::{Millis, Timestamp};
 const _: () = {
     const fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
     assert_debug_send_sync::<Acks>();
+    assert_debug_send_sync::<Added>();
     assert_debug_send_sync::<Action>();
     assert_debug_send_sync::<Applied>();
     assert_debug_send_sync::<Command>();
     assert_debug_send_sync::<ControlConfig>();
     assert_debug_send_sync::<Database>();
     assert_debug_send_sync::<DatabaseName>();
+    assert_debug_send_sync::<delegation::AgentName>();
+    assert_debug_send_sync::<delegation::CallerToken>();
+    assert_debug_send_sync::<delegation::CanonicalRequest>();
+    assert_debug_send_sync::<delegation::ChainLink>();
+    assert_debug_send_sync::<delegation::ClaimField>();
+    assert_debug_send_sync::<delegation::ClaimsViolation>();
+    assert_debug_send_sync::<delegation::Delegation>();
+    assert_debug_send_sync::<delegation::DelegationId>();
+    assert_debug_send_sync::<delegation::DelegationOperation>();
+    assert_debug_send_sync::<delegation::Forgery>();
+    assert_debug_send_sync::<delegation::Limit>();
+    assert_debug_send_sync::<delegation::OperationOutcome>();
+    assert_debug_send_sync::<delegation::RateKey>();
+    assert_debug_send_sync::<delegation::RateKind>();
+    assert_debug_send_sync::<delegation::RateScope>();
+    assert_debug_send_sync::<delegation::RequestField>();
+    assert_debug_send_sync::<delegation::Resent>();
+    assert_debug_send_sync::<delegation::StructureViolation>();
+    assert_debug_send_sync::<delegation::ParseAgentNameError>();
+    assert_debug_send_sync::<delegation::ParseDelegationIdError>();
+    assert_debug_send_sync::<delegation::SignerKind>();
+    assert_debug_send_sync::<delegation::TokenClaims>();
+    assert_debug_send_sync::<delegation::TokenKind>();
+    assert_debug_send_sync::<delegation::tier::TierViolation>();
     assert_debug_send_sync::<Description>();
     assert_debug_send_sync::<DescriptionChange>();
     assert_debug_send_sync::<Durability>();
     assert_debug_send_sync::<DurabilityError>();
     assert_debug_send_sync::<Engine>();
+    assert_debug_send_sync::<Entry>();
     assert_debug_send_sync::<ExpiryChange>();
     assert_debug_send_sync::<Feature>();
+    assert_debug_send_sync::<FleetRef>();
     assert_debug_send_sync::<HostedReplica>();
     assert_debug_send_sync::<Incarnation>();
     assert_debug_send_sync::<fork::CancelCause>();
@@ -204,6 +258,7 @@ const _: () = {
     assert_debug_send_sync::<ParseDatabaseNameError>();
     assert_debug_send_sync::<ParseDescriptionError>();
     assert_debug_send_sync::<ParseFeatureError>();
+    assert_debug_send_sync::<ParseFleetRefError>();
     assert_debug_send_sync::<ParseIncarnationError>();
     assert_debug_send_sync::<ParseLabelError>();
     assert_debug_send_sync::<ParsePrincipalNameError>();
@@ -215,6 +270,7 @@ const _: () = {
     assert_debug_send_sync::<Rejection>();
     assert_debug_send_sync::<Release>();
     assert_debug_send_sync::<Report>();
+    assert_debug_send_sync::<ReplicasCaughtUp>();
     assert_debug_send_sync::<Revocations>();
     assert_debug_send_sync::<Revoked>();
     assert_debug_send_sync::<ReplicaRole>();
@@ -222,4 +278,15 @@ const _: () = {
     assert_debug_send_sync::<State>();
     assert_debug_send_sync::<Timestamp>();
     assert_debug_send_sync::<TokenId>();
+    assert_debug_send_sync::<TokenRef<'static>>();
+    assert_debug_send_sync::<matcher::DatabaseMatcher>();
+    assert_debug_send_sync::<matcher::DatabaseMatchers>();
+    assert_debug_send_sync::<matcher::ParseMatcherError>();
+    assert_debug_send_sync::<scope::Action>();
+    assert_debug_send_sync::<scope::GrantStepError>();
+    assert_debug_send_sync::<scope::ParseScopeError>();
+    assert_debug_send_sync::<scope::Scope>();
+    assert_debug_send_sync::<scope::Scopes>();
+    assert_debug_send_sync::<scope::Target>();
+    assert_debug_send_sync::<scope::TooManyScopes>();
 };

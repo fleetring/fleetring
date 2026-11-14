@@ -167,15 +167,15 @@ async fn a_lost_reply_is_an_error_and_never_resent() {
     let token = authority
         .token_signer()
         .expect("a signer")
-        .issue(&TokenSpec {
-            principal: "app".parse().expect("a principal"),
-            scopes: ["write:notes".parse::<Scope>().expect("a scope")]
+        .issue(&TokenSpec::new(
+            "app".parse().expect("a principal"),
+            ["write:notes".parse::<Scope>().expect("a scope")]
                 .into_iter()
                 .collect(),
-            id: "t1".parse().expect("an id"),
-            not_before: now,
-            expires_at: now.saturating_add(Millis::new(3_600_000)),
-        })
+            "t1".parse().expect("an id"),
+            now,
+            now.saturating_add(Millis::new(3_600_000)),
+        ))
         .expect("a token");
     let mut headers = HeaderMap::new();
     headers.insert(

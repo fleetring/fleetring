@@ -47,6 +47,12 @@ pub(crate) fn line_behind() -> Release {
     Release::new(major, minor.saturating_sub(1), 0)
 }
 
+/// The last line before the rename, `.0`: it doesn't know `serve` (ADR-0043, point 1.1), whatever
+/// this build's line is.
+pub(crate) fn before_the_rename() -> Release {
+    Release::new(0, 6, 0)
+}
+
 /// The release the binary at `bin` says it is, from `--version`: `fleetring <version>`, or
 /// `fleetringd <version>` from a release before 0.7 or a binary named `fleetringd`.
 pub(crate) fn release_of(bin: &Path) -> TestResult<Release> {

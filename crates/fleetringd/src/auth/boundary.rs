@@ -8,11 +8,19 @@
 //! handler checks the database its request names before it touches any state, and with which a
 //! streaming handler ends its stream once the token behind it expires or is revoked.
 //!
-//! Refusals are `PERMISSION_DENIED`; a token that doesn't verify is `UNAUTHENTICATED`; and a
-//! token a data node can't check, because its denylist hasn't arrived or has gone stale, is
-//! `UNAVAILABLE`, which a client retries. Each refusal is logged once on the `fleetringd::audit`
-//! target with the principal, the credential, the action, the database, and the RPC; allowed requests
-//! are logged at debug. Credentials are never logged.
+//! A token is accepted only on a connection with a client certificate, and only when that
+//! certificate may carry it (ADR-0047, point 4.1): the certificate names the token's subject, or,
+//! for a token a delegation issuer signed, an ancestor of it; or the certificate's principal
+//! forwards tokens, which makes the token *relay-carried* ([`Carriage::Relayed`]).
+//!
+//! Refusals are `PERMISSION_DENIED`; a token that doesn't verify, or one on a connection without
+//! a client certificate, is `UNAUTHENTICATED`; and a token a node can't check, because its
+//! denylist hasn't arrived, has gone stale, or holds an entry it can't read (ADR-0047, point 3),
+//! or a control node's state isn't known to be current, is `UNAVAILABLE`, which a client retries. Each refusal is logged once on the
+//! `fleetringd::audit` target with the principal, the credential, the action, the database, and
+//! the RPC; allowed requests are logged at debug. A token is named by its ID, its signer, and how
+//! it arrived, and a delegated agent's token also by its parent, its chain's token IDs, and its
+//! issuer key's ID. Tokens are never logged.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,7 +30,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fleetring_control::{DatabaseName, KeyId, Revocations, Timestamp, TokenId};
+use fleetring_control::delegation::TokenClaims;
+use fleetring_control::{DatabaseName, KeyId, PrincipalName, Revocations, Revoked, TokenId};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};
@@ -30,7 +39,11 @@ use tonic::codegen::http;
 use tonic::{Request, Status};
 use tower::{Layer, Service};
 
-use crate::auth::{Action, BearerToken, Caller, Credential, Denied, Denylist, Requirement, Rpc};
+use crate::auth::freshness::Currency;
+use crate::auth::{
+    Action, BearerToken, Caller, Carriage, ControlFreshness, Credential, Denied, Denylist,
+    Requirement, Rpc, Signer, Verified,
+};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{PrincipalConfig, TokenForwarding};
 use crate::control::ControlHandle;
@@ -60,8 +73,12 @@ enum Source {
     /// A data node's copy, refreshed by its joins and heartbeats, trusted only while it is at
     /// most `max_age` old.
     Denylist { list: Denylist, max_age: Duration },
-    /// The control node's own state, always current.
-    Control(ControlHandle),
+    /// The control node's own state, trusted while `freshness` says it is current: always,
+    /// for the fleet's only control writer.
+    Control {
+        handle: ControlHandle,
+        freshness: ControlFreshness,
+    },
 }
 
 impl fmt::Debug for Source {
@@ -72,7 +89,10 @@ impl fmt::Debug for Source {
                 .field("list", list)
                 .field("max_age", max_age)
                 .finish(),
-            Self::Control(_) => f.write_str("Control"),
+            Self::Control { freshness, .. } => f
+                .debug_struct("Control")
+                .field("freshness", freshness)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -154,10 +174,26 @@ impl Authorizer {
         })
     }
 
-    /// Checks tokens against the control node's own state.
+    /// Checks tokens against the control node's own state, as the fleet's only control writer,
+    /// whose state is always current ([`ControlFreshness::SoleWriter`]).
     #[must_use]
     pub fn with_control(self, control: ControlHandle) -> Self {
-        self.with_source(Source::Control(control))
+        self.with_control_freshness(control, ControlFreshness::SoleWriter)
+    }
+
+    /// Checks tokens against the control node's own state while `freshness` says it is current,
+    /// and refuses every token with `UNAVAILABLE` otherwise, as a data node does while its
+    /// denylist is stale (ADR-0047, invariant I5). Certificates keep working either way.
+    #[must_use]
+    pub fn with_control_freshness(
+        self,
+        control: ControlHandle,
+        freshness: ControlFreshness,
+    ) -> Self {
+        self.with_source(Source::Control {
+            handle: control,
+            freshness,
+        })
     }
 
     fn with_source(self, revocations: Source) -> Self {
@@ -171,10 +207,19 @@ impl Authorizer {
     }
 
     /// Runs `check` on the current denylist, or answers `UNAVAILABLE` if a data node's copy is
-    /// missing or stale.
+    /// missing, stale, or holds an entry the node can't read, or a control node's state isn't
+    /// known to be current.
     fn with_revocations<T>(&self, check: impl FnOnce(&Revocations) -> T) -> Result<T, Status> {
         match &self.inner.revocations {
-            Source::Control(control) => Ok(check(control.state().revocations())),
+            Source::Control { handle, freshness } => match freshness.currency() {
+                Currency::Current => Ok(check(handle.state().revocations())),
+                Currency::Unacknowledged => Err(Status::unavailable(
+                    "this control node hasn't been acknowledged by its group yet; retry",
+                )),
+                Currency::Stale => Err(Status::unavailable(
+                    "this control node's state is stale; retry",
+                )),
+            },
             Source::Denylist { list, max_age } => match list.age() {
                 None => Err(Status::unavailable(
                     "this node hasn't received the token denylist yet; retry",
@@ -182,7 +227,14 @@ impl Authorizer {
                 Some(age) if age > *max_age => Err(Status::unavailable(
                     "this node's token denylist is stale; retry",
                 )),
-                Some(_) => Ok(check(&list.load())),
+                Some(_) => match list.load() {
+                    Ok(revocations) => Ok(check(&revocations)),
+                    // An entry this node can't read makes the whole list no list (ADR-0047,
+                    // point 3); the entry was logged when the list arrived.
+                    Err(_unusable) => Err(Status::unavailable(
+                        "this node's token denylist holds an entry it can't read; retry",
+                    )),
+                },
             },
         }
     }
@@ -192,10 +244,11 @@ impl Authorizer {
     ///
     /// # Errors
     ///
-    /// `UNAUTHENTICATED` for a token that doesn't verify, or one on a plaintext connection;
-    /// `UNAVAILABLE` for a token while this node's denylist is missing or stale;
-    /// `PERMISSION_DENIED` for a token on a node's connection, or one naming another principal
-    /// than the client certificate unless that principal forwards tokens.
+    /// `UNAUTHENTICATED` for a token that doesn't verify, or one on a connection without a
+    /// client certificate; `UNAVAILABLE` for a token while this node's denylist is missing,
+    /// stale, or unreadable, or its control state isn't known to be current; `PERMISSION_DENIED` for a token on
+    /// a node's connection, or one the client certificate may not carry (ADR-0047, point 4.1)
+    /// unless the certificate's principal forwards tokens.
     pub fn resolve(&self, peer: &Peer, token: Option<&BearerToken>) -> Result<Caller, Status> {
         self.resolve_identified(peer, token)
             .map_err(|refused| refused.status)
@@ -242,8 +295,14 @@ impl Authorizer {
                 )
                 .into());
             }
-            Peer::Principal(name) => Some(name),
-            Peer::Plaintext => None,
+            Peer::Principal(name) => name,
+            // Without a certificate, a token would be a bearer token alone, whatever signed it
+            // (ADR-0047, point 4.1). Refused before any work goes into verifying it.
+            Peer::Plaintext => {
+                return Err(
+                    Status::unauthenticated("a bearer token needs a client certificate").into(),
+                );
+            }
         };
         let Some(identity) = &self.inner.identity else {
             return Err(Status::unauthenticated(
@@ -257,43 +316,102 @@ impl Authorizer {
             .with_revocations(|revoked| verifier.verify_identified(token, now, revoked))?
             .map_err(|refusal| Refused {
                 status: Status::unauthenticated(refusal.clone().into_error().to_string()),
-                token: refusal.token().cloned(),
+                token: refusal.token().map(|id| Box::new(TokenAudit::of_id(id))),
             })?;
-        if let Some(name) = certificate
-            && *name != verified.spec.principal
-        {
-            let forwards = self
-                .inner
-                .principals
-                .get(name)
-                .is_some_and(|entry| entry.forward_tokens == TokenForwarding::Allowed);
-            if !forwards {
+        let carriage = match self.carriage(certificate, &verified) {
+            Ok(carriage) => carriage,
+            Err(status) => {
                 return Err(Refused {
-                    status: Status::permission_denied(
-                        "the token names another principal than the client certificate",
-                    ),
-                    token: Some(verified.spec.id),
+                    status,
+                    token: Some(Box::new(TokenAudit::of_verified(&verified))),
                 });
             }
-        }
+        };
+        let Verified {
+            principal,
+            claims,
+            key,
+            signer,
+        } = verified;
         Ok(Caller::Principal {
-            name: verified.spec.principal,
-            scopes: verified.spec.scopes,
+            name: principal,
+            scopes: claims.scopes.clone(),
             credential: Credential::Token {
-                id: verified.spec.id,
-                key: verified.key,
-                expires_at: verified.spec.expires_at,
+                id: claims.id.clone(),
+                key,
+                expires_at: claims.expires_at,
+                signer,
+                carriage,
+                claims: Arc::new(claims),
             },
         })
     }
 
-    /// Whether the token `id`, signed by `key` and expiring at `expires_at`, still holds now.
-    fn token_holds(&self, id: &TokenId, key: &KeyId, expires_at: Timestamp) -> Result<(), Status> {
-        if self.inner.clock.now() >= expires_at {
-            return Err(Status::unauthenticated("the token has expired"));
+    /// How `verified` reached this node on a connection whose client certificate names
+    /// `certificate` (ADR-0047, point 4.1).
+    ///
+    /// An authority's token is carried directly only by a certificate naming its subject, so
+    /// `workload`'s certificate never carries `workload.prod`'s token. A delegation issuer's
+    /// token is also carried directly by a certificate naming an ancestor of its subject: the
+    /// certificate's principal followed by `.` is a byte prefix of the subject, so `agent-42`'s
+    /// certificate carries `agent-42.c7`'s and `agent-42.c7.r1`'s tokens and never
+    /// `agent-420.c7`'s. Any other token is relay-carried if the certificate's principal forwards
+    /// tokens, and refused if it doesn't.
+    fn carriage(&self, certificate: &Principal, verified: &Verified) -> Result<Carriage, Status> {
+        let direct = match &verified.signer {
+            Signer::Authority => *certificate == verified.principal,
+            Signer::Issuer { .. } => certificate
+                .as_str()
+                .parse::<PrincipalName>()
+                .is_ok_and(|ancestor| verified.claims.principal.is_at_or_below(&ancestor)),
+        };
+        if direct {
+            return Ok(Carriage::Direct);
         }
-        if self.with_revocations(|revoked| revoked.refuses(id, key))? {
-            return Err(Status::unauthenticated("the token is revoked"));
+        let forwarding = self
+            .inner
+            .principals
+            .get(certificate)
+            .map_or(TokenForwarding::Refused, |entry| entry.forward_tokens);
+        match (forwarding, &verified.signer) {
+            (TokenForwarding::Allowed, Signer::Authority | Signer::Issuer { .. }) => {
+                Ok(Carriage::Relayed)
+            }
+            (TokenForwarding::Refused, Signer::Authority) => Err(Status::permission_denied(
+                "the token names another principal than the client certificate",
+            )),
+            (TokenForwarding::Refused, Signer::Issuer { .. }) => Err(Status::permission_denied(
+                "the delegated token names neither the client certificate's principal nor a \
+                 principal below it",
+            )),
+        }
+    }
+
+    /// Whether the token `credential` holds still holds now: it hasn't expired, and no entry of
+    /// the denylist refuses it, the key that certified its signer, any ancestor in its chain, or
+    /// its principal or an ancestor's, by the rule verification applied. A certificate always
+    /// holds.
+    fn token_holds(&self, credential: &Credential) -> Result<(), Lapsed> {
+        let (key, expires_at, signer, claims) = match credential {
+            Credential::Certificate => return Ok(()),
+            Credential::Token {
+                key,
+                expires_at,
+                signer,
+                claims,
+                ..
+            } => (key, *expires_at, signer, claims),
+        };
+        if self.inner.clock.now() >= expires_at {
+            return Err(Status::unauthenticated("the token has expired").into());
+        }
+        if let Some(entry) =
+            self.with_revocations(|revoked| signer.refusal_in(revoked, claims, key))?
+        {
+            return Err(Lapsed {
+                status: Status::unauthenticated("the token is revoked"),
+                entry: Some(entry),
+            });
         }
         Ok(())
     }
@@ -332,12 +450,16 @@ impl Authorizer {
                     Peer::Plaintext => "anonymous".to_owned(),
                 };
                 // The ID is there whenever the token verified far enough to have one.
-                let credential =
-                    token.map_or_else(|| "token".to_owned(), |id| format!("token:{id}"));
+                let token = token.map_or_else(TokenAudit::unidentified, |token| *token);
                 tracing::warn!(
                     target: AUDIT,
                     principal,
-                    credential,
+                    credential = token.credential,
+                    signer = token.signer,
+                    carriage = token.carriage,
+                    parent = token.parent,
+                    chain = token.chain,
+                    issuer_key = token.issuer_key,
                     action = action_of(rpc),
                     database = None::<&str>,
                     rpc = rpc.method(),
@@ -371,7 +493,9 @@ impl Authorizer {
             Requirement::Node
             | Requirement::Fleet
             | Requirement::Listing(_)
-            | Requirement::Requester => {
+            | Requirement::Requester
+            | Requirement::Delegator
+            | Requirement::FleetOrAncestor => {
                 authorized.check(None)?;
                 Ok(authorized)
             }
@@ -380,10 +504,11 @@ impl Authorizer {
 }
 
 /// Why a request's credentials were refused, and which token it carried if the token verified far
-/// enough to have an ID. The ID is for the audit line; the client only sees the status.
+/// enough to have an ID. The token's description is for the audit line; the client only sees the
+/// status.
 struct Refused {
     status: Status,
-    token: Option<TokenId>,
+    token: Option<Box<TokenAudit>>,
 }
 
 impl From<Status> for Refused {
@@ -391,6 +516,22 @@ impl From<Status> for Refused {
         Self {
             status,
             token: None,
+        }
+    }
+}
+
+/// Why a token stopped holding, and the denylist entry that refuses it, if one does, for the
+/// audit line.
+struct Lapsed {
+    status: Status,
+    entry: Option<Revoked>,
+}
+
+impl From<Status> for Lapsed {
+    fn from(status: Status) -> Self {
+        Self {
+            status,
+            entry: None,
         }
     }
 }
@@ -512,20 +653,23 @@ impl Authorized {
     /// without a token is returned as it is: certificates aren't revoked one by one (there is no
     /// revocation list), so it lasts as long as its connection, and a certificate stops being
     /// accepted only when it expires or the fleet stops trusting the authority that issued it.
+    ///
+    /// The recheck applies the revocation rule verification applied, lineage included: a
+    /// delegated agent's stream ends once its own ID or issuer key, the authority key that
+    /// certified its issuer, any ancestor's ID or key in its chain, or its principal or an
+    /// ancestor's is revoked (ADR-0047, point 3); and any token's stream ends with `UNAVAILABLE`
+    /// once the denylist goes stale or holds an entry this node can't read. A router's session
+    /// on a node is such a stream, so it ends too.
     pub fn guard<T: Send + 'static>(&self, stream: BoxStream<T>) -> BoxStream<T> {
         let Caller::Principal {
-            credential:
-                Credential::Token {
-                    id,
-                    key,
-                    expires_at,
-                },
+            name,
+            credential: credential @ Credential::Token { .. },
             ..
         } = &self.caller
         else {
             return stream;
         };
-        let (id, key, expires_at) = (id.clone(), key.clone(), *expires_at);
+        let (principal, credential) = (name.to_string(), credential.clone());
         let authorizer = self.authorizer.clone();
         let rpc = self.rpc.method();
         let (sender, receiver) = mpsc::channel(STREAM_BUFFER);
@@ -543,8 +687,22 @@ impl Authorized {
                         None => return,
                     },
                 };
-                if let Err(status) = authorizer.token_holds(&id, &key, expires_at) {
-                    tracing::info!(target: AUDIT, token_id = %id, rpc, reason = status.message(), "ended a stream");
+                if let Err(Lapsed { status, entry }) = authorizer.token_holds(&credential) {
+                    let token = TokenAudit::of_credential(&credential);
+                    tracing::info!(
+                        target: AUDIT,
+                        principal,
+                        credential = token.credential,
+                        signer = token.signer,
+                        carriage = token.carriage,
+                        parent = token.parent,
+                        chain = token.chain,
+                        issuer_key = token.issuer_key,
+                        rpc,
+                        revoked = entry.map(|entry| entry.to_string()),
+                        reason = status.message(),
+                        "ended a stream",
+                    );
                     // Either the subscriber reads the refusal or it has gone; the stream ends.
                     let _ = sender.send(Err(status)).await;
                     return;
@@ -560,20 +718,105 @@ impl Authorized {
     }
 }
 
+/// What an audit line says of a request's credential: never the credential itself.
+///
+/// A token is named by its ID (`token:<jti>`), its signer, and how it reached this node, and a
+/// delegated agent's token also by its parent, its chain's token IDs, root first, and its issuer
+/// key's ID (ADR-0047, point 3, and invariant I8). A field that doesn't apply is `None`, which
+/// an audit line leaves out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenAudit {
+    /// `certificate`, `plaintext`, `token` for a token that never verified far enough to be
+    /// named, or `token:<jti>`.
+    credential: String,
+    /// `authority` or `issuer`.
+    signer: Option<&'static str>,
+    /// `direct` or `relayed`.
+    carriage: Option<&'static str>,
+    /// A delegated token's `fleetring.parent`.
+    parent: Option<String>,
+    /// A delegated token's chain: its ancestors' token IDs, root first, joined by `,`.
+    chain: Option<String>,
+    /// A delegated token's `kid`: the ID of the issuer key that signed it.
+    issuer_key: Option<String>,
+}
+
+impl TokenAudit {
+    /// A credential that is no token, such as `certificate`.
+    fn plain(credential: &str) -> Self {
+        Self {
+            credential: credential.to_owned(),
+            signer: None,
+            carriage: None,
+            parent: None,
+            chain: None,
+            issuer_key: None,
+        }
+    }
+
+    /// A token that never verified far enough to have an ID anyone vouches for.
+    fn unidentified() -> Self {
+        Self::plain("token")
+    }
+
+    /// A refused token known only by its ID.
+    fn of_id(id: &TokenId) -> Self {
+        Self::plain(&format!("token:{id}"))
+    }
+
+    /// A verified token the connection rule refused, so it never arrived.
+    fn of_verified(verified: &Verified) -> Self {
+        Self::of_token(&verified.claims, &verified.key, &verified.signer, None)
+    }
+
+    /// A caller's credential.
+    fn of_credential(credential: &Credential) -> Self {
+        match credential {
+            Credential::Certificate => Self::plain("certificate"),
+            Credential::Token {
+                key,
+                signer,
+                carriage,
+                claims,
+                ..
+            } => Self::of_token(claims, key, signer, Some(*carriage)),
+        }
+    }
+
+    fn of_token(
+        claims: &TokenClaims,
+        key: &KeyId,
+        signer: &Signer,
+        carriage: Option<Carriage>,
+    ) -> Self {
+        let mut audit = Self::plain(&format!("token:{}", claims.id));
+        audit.carriage = carriage.map(Carriage::as_str);
+        match signer {
+            Signer::Authority => audit.signer = Some("authority"),
+            Signer::Issuer { .. } => {
+                let chain: Vec<String> = claims
+                    .chain
+                    .iter()
+                    .map(|link| link.id.to_string())
+                    .collect();
+                audit.signer = Some("issuer");
+                audit.parent = claims.parent.as_ref().map(ToString::to_string);
+                audit.chain = Some(chain.join(","));
+                audit.issuer_key = Some(key.to_string());
+            }
+        }
+        audit
+    }
+}
+
 /// The principal and credential an audit line names: never the credential itself.
-fn who(caller: &Caller) -> (String, String) {
+fn who(caller: &Caller) -> (String, TokenAudit) {
     match caller {
-        Caller::Node(id) => (format!("node:{id}"), "certificate".to_owned()),
+        Caller::Node(id) => (format!("node:{id}"), TokenAudit::plain("certificate")),
         Caller::Principal {
             name, credential, ..
-        } => {
-            let credential = match credential {
-                Credential::Certificate => "certificate".to_owned(),
-                Credential::Token { id, .. } => format!("token:{id}"),
-            };
-            (name.to_string(), credential)
-        }
-        Caller::Anonymous => ("anonymous".to_owned(), "plaintext".to_owned()),
+        } => (name.to_string(), TokenAudit::of_credential(credential)),
+        Caller::Anonymous => ("anonymous".to_owned(), TokenAudit::plain("plaintext")),
     }
 }
 
@@ -593,6 +836,8 @@ fn action_of(rpc: &Rpc) -> String {
         // The target's; the source's `fork` is logged with its own check.
         Requirement::Fork => Action::Admin.as_str().to_owned(),
         Requirement::Requester => "requester".to_owned(),
+        Requirement::Delegator => "delegate".to_owned(),
+        Requirement::FleetOrAncestor => "fleet|ancestor".to_owned(),
     }
 }
 
@@ -601,11 +846,16 @@ fn audit_denied(caller: &Caller, rpc: &Rpc, denied: &Denied) {
 }
 
 fn audit_denied_action(caller: &Caller, rpc: &Rpc, action: &str, denied: &Denied) {
-    let (principal, credential) = who(caller);
+    let (principal, token) = who(caller);
     tracing::warn!(
         target: AUDIT,
         principal,
-        credential,
+        credential = token.credential,
+        signer = token.signer,
+        carriage = token.carriage,
+        parent = token.parent,
+        chain = token.chain,
+        issuer_key = token.issuer_key,
         action,
         database = denied.database().map(DatabaseName::as_str),
         rpc = rpc.method(),
@@ -617,11 +867,16 @@ fn audit_allowed(caller: &Caller, rpc: &Rpc, database: Option<&DatabaseName>) {
     if !tracing::enabled!(target: AUDIT, tracing::Level::DEBUG) {
         return;
     }
-    let (principal, credential) = who(caller);
+    let (principal, token) = who(caller);
     tracing::debug!(
         target: AUDIT,
         principal,
-        credential,
+        credential = token.credential,
+        signer = token.signer,
+        carriage = token.carriage,
+        parent = token.parent,
+        chain = token.chain,
+        issuer_key = token.issuer_key,
         action = action_of(rpc),
         database = database.map(DatabaseName::as_str),
         rpc = rpc.method(),
@@ -728,7 +983,7 @@ where
             }
             Err(status) => {
                 // `admit` answers `UNAVAILABLE` only for a token it can't check for want of a
-                // fresh denylist.
+                // fresh, readable denylist.
                 let refusal = if crate::auth::rpc_at(request.uri().path()).is_none() {
                     Some(Refusal::NoRequirement)
                 } else if status.code() == tonic::Code::Unavailable {
@@ -747,8 +1002,11 @@ where
 }
 
 #[cfg(test)]
+mod delegation_tests;
+
+#[cfg(test)]
 mod tests {
-    use fleetring_control::Revoked;
+    use fleetring_control::Timestamp;
 
     use super::*;
     use crate::auth::{Scopes, TokenSigner, TokenSpec};
@@ -815,16 +1073,16 @@ mod tests {
         expires_ms: u64,
     ) -> BearerToken {
         signer
-            .issue(&TokenSpec {
-                principal: principal.parse().expect("a principal"),
-                scopes: scopes
+            .issue(&TokenSpec::new(
+                principal.parse().expect("a principal"),
+                scopes
                     .iter()
                     .map(|scope| scope.parse().expect("a scope"))
                     .collect::<Scopes>(),
-                id: id.parse().expect("a token id"),
-                not_before: Timestamp::ZERO,
-                expires_at: Timestamp::from_millis(expires_ms),
-            })
+                id.parse().expect("a token id"),
+                Timestamp::ZERO,
+                Timestamp::from_millis(expires_ms),
+            ))
             .expect("a token")
     }
 
@@ -1214,16 +1472,19 @@ mod tests {
         items.send(Ok(9_u32)).await.expect("sent");
         assert_eq!(stream.next().await.map(|item| item.ok()), Some(Some(9)));
     }
-    /// Collects the audit lines a test logs.
-    #[derive(Clone, Default)]
-    struct AuditLog(Arc<std::sync::Mutex<Vec<u8>>>);
+    std::thread_local! {
+        /// The audit lines logged on this thread since the last [`admit_with`].
+        pub(super) static AUDIT_LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    impl std::io::Write for AuditLog {
+    /// Writes what an event logs to the buffer of the thread that logged it, so tests that run
+    /// in parallel never see one another's lines.
+    #[derive(Clone, Copy)]
+    struct ThreadLog;
+
+    impl std::io::Write for ThreadLog {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("the log isn't poisoned")
-                .extend_from_slice(bytes);
+            AUDIT_LINES.with(|lines| lines.borrow_mut().extend_from_slice(bytes));
             Ok(bytes.len())
         }
 
@@ -1232,42 +1493,52 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditLog {
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
         type Writer = Self;
 
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            *self
         }
     }
 
-    impl AuditLog {
-        fn lines(&self) -> Vec<String> {
-            let bytes = self.0.lock().expect("the log isn't poisoned").clone();
-            String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        }
+    /// Installs the process-wide subscriber once.
+    ///
+    /// A thread-local subscriber (`set_default`, `with_default`) races with other tests: while
+    /// only one dispatcher is live, a callsite's first registration takes its interest from the
+    /// registering thread's own subscriber, so a thread with none can leave the callsite cached
+    /// as never interested (#84, #85). A global one has no such race.
+    pub(super) fn install_audit_subscriber() {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ThreadLog)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test in this binary installs a global subscriber");
+        });
     }
 
     /// Admits a call to `Join` as `app`, carrying `bearer`, and returns the audit lines logged
     /// and whether it was admitted.
     fn admit_with(auth: &Authorizer, bearer: &BearerToken) -> (Vec<String>, bool) {
-        let log = AuditLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
+        install_audit_subscriber();
+        // Events are logged on the calling thread, so its buffer holds this call's lines alone.
+        AUDIT_LINES.with(|lines| lines.borrow_mut().clear());
         let mut request = http::Request::builder()
             .uri("/fleetring.v1.Control/Join")
             .header(AUTHORIZATION, format!("Bearer {}", bearer.expose()))
             .body(())
             .expect("a request");
         request.extensions_mut().insert(principal("app"));
-        let admitted =
-            tracing::subscriber::with_default(subscriber, || auth.admit(&request).is_ok());
-        (log.lines(), admitted)
+        let admitted = auth.admit(&request).is_ok();
+        let bytes = AUDIT_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+        let lines = String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (lines, admitted)
     }
 
     #[test]

@@ -5,11 +5,13 @@
 //! requirement is denied to everyone until it gets one, and a test fails until then.
 
 use std::fmt;
+use std::sync::Arc;
 
 use fleetring::NodeId;
+use fleetring_control::delegation::TokenClaims;
 use fleetring_control::{DatabaseName, KeyId, Timestamp, TokenId};
 
-use crate::auth::{Action, Binding, Scopes, Target};
+use crate::auth::{Action, Binding, Scopes, Signer, Target};
 use crate::tls::Principal;
 
 /// What an RPC needs from its caller.
@@ -40,6 +42,15 @@ pub enum Requirement {
     /// handler checks against the record. The boundary admits a principal that may administer
     /// some database, since no other could have requested a fork or administer its target.
     Requester,
+    /// A delegation (ADR-0047, point 5): an agent's bearer token whose `grant` covers the child,
+    /// carried directly, which the handler checks once it has read the request. The boundary
+    /// admits any principal that presented a token.
+    Delegator,
+    /// A revocation (ADR-0047, point 11.3): the `fleet` scope, which may revoke anything, or an
+    /// agent's bearer token under the ancestor rule, which the handler and `apply` check once the
+    /// request is read. The boundary admits a principal with `fleet` or one that presented a
+    /// token.
+    FleetOrAncestor,
 }
 
 /// The actions, as a requirement names them: `read`, or `read or stream`.
@@ -63,6 +74,10 @@ impl fmt::Display for Requirement {
             }
             Self::Fork => f.write_str("admin on the database, and fork on `source`"),
             Self::Requester => f.write_str("the requesting principal, or admin on the target"),
+            Self::Delegator => f.write_str(
+                "an agent's token whose grant covers the child (checked in the handler)",
+            ),
+            Self::FleetOrAncestor => f.write_str("fleet, or the ancestor rule"),
         }
     }
 }
@@ -119,7 +134,9 @@ const fn rpc(path: &'static str, requirement: Requirement, binding: Binding) -> 
         | Requirement::DatabaseOrFleet(_)
         | Requirement::Listing(_)
         | Requirement::Fork
-        | Requirement::Requester => ForNodes::Refused,
+        | Requirement::Requester
+        | Requirement::Delegator
+        | Requirement::FleetOrAncestor => ForNodes::Refused,
     };
     Rpc {
         path,
@@ -237,7 +254,7 @@ pub const RPCS: &[Rpc] = &[
     ),
     rpc(
         "/fleetring.v1.Control/RevokeToken",
-        Requirement::Fleet,
+        Requirement::FleetOrAncestor,
         Binding::None,
     ),
     // Database metadata (ADR-0041): what creating and dropping need, so a scoped principal
@@ -262,6 +279,18 @@ pub const RPCS: &[Rpc] = &[
     rpc(
         "/fleetring.v1.Control/GetForkOperation",
         Requirement::Requester,
+        Binding::None,
+    ),
+    // Delegation (ADR-0047): an agent's token, whose grant, carriage, and kind the handler
+    // checks; the records, never tokens, to an operator.
+    rpc(
+        "/fleetring.v1.Control/DelegateToken",
+        Requirement::Delegator,
+        Binding::None,
+    ),
+    rpc(
+        "/fleetring.v1.Control/ListDelegations",
+        Requirement::Fleet,
         Binding::None,
     ),
     // Replication: nodes only.
@@ -384,13 +413,69 @@ pub enum Credential {
     Certificate,
     /// A bearer token; the scopes are the token's.
     Token {
-        /// The token's ID, which audit lines name instead of the token.
+        /// The token's ID, which audit lines name instead of the token: for a delegated agent's
+        /// token, its delegation ID.
         id: TokenId,
-        /// The signing key that signed it.
+        /// The signing key that signed it, its `kid`: for a delegated agent's token, the
+        /// issuer key's ID.
         key: KeyId,
         /// When it expires, which ends any stream opened with it.
         expires_at: Timestamp,
+        /// Who signed it: the authority, or a delegation issuer certified by it.
+        signer: Signer,
+        /// How it reached this node: on a connection whose certificate may carry it, or through
+        /// a relay that forwards tokens (ADR-0047, point 4.1).
+        carriage: Carriage,
+        /// Every claim it carries, its lineage included, which the stream recheck checks against
+        /// the denylist.
+        claims: Arc<TokenClaims>,
     },
+}
+
+/// How a bearer token reached this node (ADR-0047, point 4.1).
+///
+/// The request boundary decides it from the connection's client certificate and the token's
+/// signer. A token on a connection with no client certificate is refused, so every token a
+/// [`Caller`] holds has one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carriage {
+    /// The certificate may carry the token itself: it names the token's subject, or, for a token
+    /// a delegation issuer signed, an ancestor of it (`agent-42`'s certificate carries
+    /// `agent-42.c7`'s token).
+    Direct,
+    /// *Relay-carried*: the certificate names a principal that may not carry the token itself,
+    /// but whose `[[principal]]` entry sets `forward_tokens`, as a router's does. Delegation and
+    /// the ancestor rule's revocations refuse such a token, except a token revoking its own ID
+    /// (ADR-0047, point 4.5).
+    Relayed,
+}
+
+impl Carriage {
+    /// The word audit lines use for it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relayed => "relayed",
+        }
+    }
+}
+
+impl fmt::Display for Carriage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Credential {
+    /// How the token reached this node, or `None` for a certificate.
+    #[must_use]
+    pub fn carriage(&self) -> Option<Carriage> {
+        match self {
+            Self::Certificate => None,
+            Self::Token { carriage, .. } => Some(*carriage),
+        }
+    }
 }
 
 /// Who made a request, as the request boundary resolved it.
@@ -416,6 +501,17 @@ pub enum Caller {
 }
 
 impl Caller {
+    /// How the caller's token reached this node, or `None` for a caller without one. A
+    /// relay-carried token ([`Carriage::Relayed`]) may neither delegate nor revoke under the
+    /// ancestor rule, apart from revoking its own ID (ADR-0047, point 4.5).
+    #[must_use]
+    pub fn carriage(&self) -> Option<Carriage> {
+        match self {
+            Self::Node(_) | Self::Anonymous => None,
+            Self::Principal { credential, .. } => credential.carriage(),
+        }
+    }
+
     /// Whether the caller may see `database` in a listing filtered by `action`.
     #[must_use]
     pub fn sees(&self, action: Action, database: &DatabaseName) -> bool {
@@ -490,6 +586,35 @@ impl Caller {
             // handler's to check against the record.
             Requirement::Requester if scopes.covers_some(Action::Admin) => Ok(()),
             Requirement::Requester => Err(denied(Needed::Requester)),
+            // Whether the token is an agent's, reached the node directly, and holds a grant over
+            // the child is the handler's to check, once it has read the request.
+            Requirement::Delegator => match self {
+                Self::Principal {
+                    credential: Credential::Token { .. },
+                    ..
+                } => Ok(()),
+                Self::Principal {
+                    credential: Credential::Certificate,
+                    ..
+                }
+                | Self::Node(_)
+                | Self::Anonymous => Err(denied(Needed::Token)),
+            },
+            // Who may revoke what without `fleet` is the ancestor rule's, which the handler and
+            // `apply` check once the request is read; a node is a principal with no scopes.
+            Requirement::FleetOrAncestor if scopes.allows(Target::Fleet) => Ok(()),
+            Requirement::FleetOrAncestor => match self {
+                Self::Principal {
+                    credential: Credential::Token { .. },
+                    ..
+                } => Ok(()),
+                Self::Principal {
+                    credential: Credential::Certificate,
+                    ..
+                }
+                | Self::Node(_)
+                | Self::Anonymous => Err(denied(Needed::FleetOrToken)),
+            },
         }
     }
 
@@ -531,6 +656,10 @@ pub enum Needed {
     Some(&'static [Action]),
     /// The principal that requested a fork operation, or `admin` on its target.
     Requester,
+    /// An agent's bearer token: a certificate alone authorizes no delegation.
+    Token,
+    /// The `fleet` scope, or an agent's bearer token for the ancestor rule.
+    FleetOrToken,
 }
 
 /// A refused request: the method and what it needed, never what the caller has.
@@ -554,6 +683,10 @@ fn needed_text(needed: &Needed) -> String {
         Needed::Requester => {
             "the principal that requested the operation, or admin on its target".to_owned()
         }
+        Needed::Token => "an agent's bearer token; a certificate alone can't delegate".to_owned(),
+        Needed::FleetOrToken => {
+            "the fleet scope, or an agent's bearer token for the ancestor rule".to_owned()
+        }
     }
 }
 
@@ -563,7 +696,12 @@ impl Denied {
     pub fn database(&self) -> Option<&DatabaseName> {
         match &self.needed {
             Needed::Database(_, database) => Some(database),
-            Needed::Node | Needed::Fleet | Needed::Some(_) | Needed::Requester => None,
+            Needed::Node
+            | Needed::Fleet
+            | Needed::Some(_)
+            | Needed::Requester
+            | Needed::Token
+            | Needed::FleetOrToken => None,
         }
     }
 
@@ -1092,7 +1230,8 @@ mod tests {
         let refusals = [
             (
                 "/fleetring.v1.Control/RevokeToken",
-                "RevokeToken needs the fleet scope",
+                "RevokeToken needs the fleet scope, or an agent's bearer token for the ancestor \
+                 rule",
             ),
             (
                 "/fleetring.v1.Control/DropDatabase",

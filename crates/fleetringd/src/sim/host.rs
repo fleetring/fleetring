@@ -95,6 +95,21 @@ impl Shared {
         self.clock_shift.fetch_add(by, Ordering::SeqCst) + by
     }
 
+    /// Sets every host's clock `by` back, toward simulated time.
+    /// Returns how far ahead the clocks are then, in milliseconds.
+    pub(super) fn set_clocks_back(&self, by: std::time::Duration) -> u64 {
+        let by = millis(by);
+        // Only the test's driver changes the shift, between steps, so nothing races this.
+        let shift = self.clock_shift.load(Ordering::SeqCst).saturating_sub(by);
+        self.clock_shift.store(shift, Ordering::SeqCst);
+        shift
+    }
+
+    /// How far ahead of simulated time every host's clock is, in milliseconds.
+    pub(super) fn clock_shift(&self) -> u64 {
+        self.clock_shift.load(Ordering::SeqCst)
+    }
+
     fn clock(&self) -> ShiftedClock {
         let elapsed = turmoil::sim_elapsed().unwrap_or_default();
         ShiftedClock {

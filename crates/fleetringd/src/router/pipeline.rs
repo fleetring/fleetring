@@ -101,6 +101,7 @@ pub(crate) async fn pipeline(
     let mut stream = stream_for(context, request.baton.as_deref(), caller, target)?;
     let mut committed = None;
     let mut budget = context.config.streams.max_response_bytes.get();
+    let mut called = false;
     let mut results = Vec::with_capacity(request.requests.len());
     for request in request.requests {
         let ran = if stream.closed {
@@ -113,9 +114,13 @@ pub(crate) async fn pipeline(
                 stream: &mut stream,
                 committed: &mut committed,
                 budget: &mut budget,
+                called: &mut called,
             };
             run.request(request).await
         };
+        if let Err(error) = &ran {
+            refuse_unauthenticated(error, called)?;
+        }
         results.push(match ran {
             Ok(response) => StreamResult::Ok { response },
             Err(error) => StreamResult::Error { error },
@@ -148,6 +153,7 @@ pub(crate) async fn cursor(
     let mut stream = stream_for(context, request.baton.as_deref(), caller, target)?;
     let mut committed = None;
     let mut budget = context.config.streams.max_response_bytes.get();
+    let mut called = false;
     let entries = if stream.closed {
         vec![CursorEntry::Error {
             error: Error::new(code::PROTOCOL_ERROR, "the stream is closed"),
@@ -160,16 +166,34 @@ pub(crate) async fn cursor(
             stream: &mut stream,
             committed: &mut committed,
             budget: &mut budget,
+            called: &mut called,
         };
         match run.batch(request.batch.steps).await {
             Ok(result) => entries(result),
-            Err(error) => vec![CursorEntry::Error { error }],
+            Err(error) => {
+                refuse_unauthenticated(&error, called)?;
+                vec![CursorEntry::Error { error }]
+            }
         }
     };
     let (baton, base_url) = finish(context, target, stream);
     Ok(Answered {
         body: (CursorResponse { baton, base_url }, entries),
         committed,
+    })
+}
+
+/// Refuses the whole request, `401`, for `error`, a refusal of the caller's token by the control
+/// plane or the node, as a revoked token's is, if no call was sent for it yet, so nothing ran:
+/// the router answers its own refusal of a token so (ADR-0037, point 18). Once a call was sent,
+/// what ran is reported, and the error with it.
+fn refuse_unauthenticated(error: &Error, called: bool) -> Result<(), Refused> {
+    if called || error.code.as_deref() != Some(code::UNAUTHENTICATED) {
+        return Ok(());
+    }
+    Err(Refused {
+        status: StatusCode::UNAUTHORIZED,
+        error: error.clone(),
     })
 }
 
@@ -233,6 +257,8 @@ struct Run<'r> {
     committed: &'r mut Option<Committed>,
     /// What is left of the most bytes of rows one response may carry.
     budget: &'r mut usize,
+    /// Whether a call was sent to a node for the HTTP request, which may then have run.
+    called: &'r mut bool,
 }
 
 impl Run<'_> {
@@ -416,6 +442,7 @@ impl Run<'_> {
             // transaction, and the stream then has none.
             let mut session = self.stream.session.take().expect("a session is open");
             let primary = session.primary.clone();
+            *self.called = true;
             let called = session.call(&call, timeout).await;
             self.stream.session = Some(session);
             let error = match called {
@@ -566,6 +593,7 @@ fn failure(answer: Option<Answer>) -> Error {
 fn open_error(error: OpenError) -> Error {
     match error {
         OpenError::NotFound(message) => Error::new(code::NOT_FOUND, message),
+        OpenError::Unauthenticated(message) => Error::new(code::UNAUTHENTICATED, message),
         OpenError::Denied(message) => Error::new(code::PERMISSION_DENIED, message),
         OpenError::Unavailable(message) => Error::new(code::UNAVAILABLE, message),
         OpenError::Failed(message) => Error::new(code::INTERNAL, message),

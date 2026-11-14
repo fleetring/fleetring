@@ -280,6 +280,56 @@ mod tests {
         assert_eq!(problem.message, "missing field `listen`");
     }
 
+    /// What `serve --check` reports for `text`: the first problem, as a start would find it.
+    fn check_problem(text: &str) -> Option<ConfigProblem> {
+        let path = Path::new("node.toml");
+        match Config::from_toml(text) {
+            Err(error) => Some(config_problem(&error, path)),
+            Ok(config) => Daemon::check(&config)
+                .err()
+                .map(|error| problem_of_start(&error, path)),
+        }
+    }
+
+    #[test]
+    fn serve_check_reports_issuer_problems() {
+        let head = "data_dir = \"x\"\nlisten = \"127.0.0.1:1\"\ninsecure_plaintext = true\n";
+        let node = "[node]\nid = \"n\"\n[admin]\nenabled = false\n";
+        for (role, control, field, says) in [
+            (
+                "both",
+                "issuer_cert = \"/tls/i.crt\"\n",
+                "control.issuer_key",
+                "both or neither",
+            ),
+            (
+                "control",
+                "issuer_key = \"/tls/i.key\"\n",
+                "control.issuer_cert",
+                "both or neither",
+            ),
+            (
+                "data",
+                "address = \"10.0.0.1:7400\"\nissuer_cert = \"/tls/i.crt\"\n\
+                 issuer_key = \"/tls/i.key\"\n",
+                "control.issuer_cert",
+                "control role",
+            ),
+        ] {
+            let text = format!("role = \"{role}\"\n{head}{node}[control]\n{control}");
+            let problem = check_problem(&text).unwrap_or_else(|| panic!("{role}: no problem"));
+            assert_eq!(problem.field.as_deref(), Some(field), "{role}: {problem:?}");
+            assert!(problem.message.contains(says), "{role}: {problem:?}");
+        }
+        // Both on a node that runs control passes: the check reads none of the files a
+        // configuration names (ADR-0038), so the pair itself is checked when the node starts.
+        let text = format!(
+            "{head}{node}[control]\nissuer_cert = \"/no/i.crt\"\nissuer_key = \"/no/i.key\"\n"
+        );
+        let problem = check_problem(&text);
+        assert!(problem.is_none(), "{problem:?}");
+    }
+
     #[test]
     fn a_span_is_placed_by_line_and_character_column() {
         let text = "a = 1\nbé = 2\n[x]\n";

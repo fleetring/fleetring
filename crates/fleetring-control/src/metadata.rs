@@ -575,6 +575,17 @@ impl PrincipalName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The name `text`, which the caller knows is a principal name because it is built from one
+    /// by a rule that keeps the grammar, such as a leading part of an agent name ending before a
+    /// `.`. It checks nothing in a release build, so it can't fail on `apply`'s path.
+    pub(crate) fn new_unchecked(text: &str) -> Self {
+        debug_assert!(
+            text.parse::<Self>().is_ok(),
+            "'{text}' was assumed to be a principal name"
+        );
+        Self(text.into())
+    }
 }
 
 impl fmt::Display for PrincipalName {

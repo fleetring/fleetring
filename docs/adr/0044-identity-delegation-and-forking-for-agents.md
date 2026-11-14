@@ -18,6 +18,8 @@ This is a design record. It decides the model: who acts, what they may do, how a
 
 *Note (2026-11-08):* S2 (§7) is superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed), which keeps §2.1 and §7.6. The umbrella and its text are unchanged.
 
+*Note (2026-11-11):* S1 (§3) stays Proposed and is deferred after 0.8 by [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12), which delegates online instead: the control plane records a child's lineage and signs its narrower JWT with a per-control-node issuer key that the authority certifies. ADR-0047 takes `Revoked::Principal` (§3.8), §3.9's `delegation` feature, and §3.10 from S1, and lists the evidence that would bring the rest back (ADR-0047, point 9). It also proposes, for §9.1, that the scope grammar and lattice move from `fleetringd::auth` into `fleetring-control`, since delegation records hold scopes that `apply` checks (ADR-0047, point 6.5). The umbrella and its text are unchanged.
+
 The umbrella fixes what the specifications must achieve (a child never holds more than its parent, stolen bytes are inert, revoking a parent ends its descendants, a fork records its source, "verified" means identity); each specification decides how, and may be accepted, revised, or replaced by a follow-up ADR without reopening the umbrella. Point 4 shows the delegation model with S1's mechanism, as an example. Open questions are grouped the same way.
 
 ## Context
@@ -134,6 +136,8 @@ The actions become a lattice, with two additions:
 
 *Specification S1: Proposed; accepted separately.*
 
+*Deferred after 0.8 by [ADR-0047](0047-online-delegation.md) (Proposed, 2026-11-11).* Biscuit tokens, holder keys, `[tls] accept_holder_keys`, bearer self-delegation, and `Revoked::Block` aren't built in 0.8; `Revoked::Principal` (point 8), the `delegation` feature (point 9), and point 10 survive there.
+
 **Requirements.** A holder must be able to narrow its token for a child without holding the authority's key and without a network call. A node must verify the result offline with the authority's public key alone, as it does a JWT today. A child must never hold more than its parent, or for longer. Someone who copies a token's bytes, without the holder's private key, must gain nothing by it. Revoking a parent must revoke what it delegated. And because agents are written in Python and TypeScript as often as in Rust, an agent framework must be able to build and append blocks in its own language.
 
 | | Biscuit (v3) | Macaroons | JWT chains or signed sub-tokens |
@@ -207,6 +211,8 @@ The actions become a lattice, with two additions:
 
 The model is the umbrella's; the mechanism shown is S1's (point 3).
 
+*Note (2026-11-11):* under [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12), 0.8 satisfies this example online: `agent delegate` replaces steps 1 and 2, the child uses its root's certificate with its own token in step 3, and step 4 holds on direct connections (ADR-0047, points 4, 5, and 9.3).
+
 A parent agent `42` holds a token whose authority block names its certificate's key as holder and grants `admin:agent-42-*`, `admin:agent-42.*`, `grant:agent-42-*`, and `grant:agent-42.*`. It spawns child `c7`, which may fork the parent's memory:
 
 1. The child's harness creates `<agents_dir>/42.c7/`, generates the child's holder key and a self-signed certificate for it there, and passes the public key to the parent.
@@ -219,6 +225,8 @@ A parent agent `42` holds a token whose authority block names its certificate's 
 In 0.8, `agent add` gives a root agent `admin:agent-<id>-*`, `admin:agent-<id>.*`, `grant:agent-<id>-*`, and `grant:agent-<id>.*` by default, with its certificate's key as holder: the two `grant` scopes let it delegate access to its own databases and its subtree, and nothing else. The commands that spawn and delegate are designed with the 0.8 CLI.
 
 ### 5. The edge: OIDC for people, an issuer for tokens
+
+*Note (2026-11-11):* [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12) builds point 3's issuer key as a constrained anchor narrowly, for delegation only: a *delegation issuer* key per control node, certified by the authority, carried in each token's `x5c`, its constraint the agent tier, fixed in code (ADR-0047, points 1 to 3). The issuer for people of this section is unchanged and later.
 
 1. **Nodes verify only FleetRing tokens**, offline. They never fetch a JWKS, never accept an OIDC ID token, and never call an identity provider: verification stays a pure function of the token, the trust anchors, the denylist, and the time.
 2. **An *issuer* turns a login into a token.** It runs the OIDC authorization-code flow with PKCE (and the device flow for `fleetring login`), verifies the ID token (issuer, audience, signature against the provider's JWKS, expiry, nonce), maps the provider's `(iss, sub)` to a principal through the identity registry, maps configured group claims to groups (only from issuers the registry trusts for groups), expands access roles (point 2.5), and issues a short-lived biscuit, 12 hours at most for a person. Wallet sign-in (EIP-4361) and passkeys are later login methods into the same mapping.

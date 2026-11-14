@@ -1,5 +1,5 @@
-//! The names certificates carry: the fleet, and the URI that names a node, a principal, or the
-//! authority (ADR-0025).
+//! The names certificates carry: the fleet, and the URI that names a node, a principal, a
+//! delegation issuer, or the authority (ADR-0025, ADR-0047 point 1.2).
 
 use std::fmt;
 use std::str::FromStr;
@@ -10,7 +10,7 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 /// The URI scheme of every subject alternative name the authority issues.
-const SCHEME: &str = "fleetring://";
+pub(super) const SCHEME: &str = "fleetring://";
 
 /// The longest fleet or principal name.
 const MAX_NAME_LEN: usize = 64;
@@ -207,6 +207,15 @@ pub enum SubjectUri {
         /// The fleet.
         fleet: FleetName,
     },
+    /// `fleetring://<fleet>/issuer/<name>`: a control node's delegation issuer key (ADR-0047,
+    /// point 1.2). `<name>` has the node ID grammar and is, by convention, the control node's
+    /// ID. Such a certificate signs delegated tokens and never opens a connection.
+    Issuer {
+        /// The fleet.
+        fleet: FleetName,
+        /// The issuer's name.
+        name: NodeId,
+    },
 }
 
 impl SubjectUri {
@@ -230,13 +239,21 @@ impl SubjectUri {
         }
     }
 
+    pub(crate) fn issuer(fleet: &FleetName, name: &NodeId) -> Self {
+        Self::Issuer {
+            fleet: fleet.clone(),
+            name: name.clone(),
+        }
+    }
+
     /// Returns the fleet the URI belongs to.
     #[must_use]
     pub fn fleet(&self) -> &FleetName {
         match self {
             Self::Node { fleet, .. }
             | Self::Principal { fleet, .. }
-            | Self::Authority { fleet } => fleet,
+            | Self::Authority { fleet }
+            | Self::Issuer { fleet, .. } => fleet,
         }
     }
 
@@ -258,9 +275,14 @@ impl SubjectUri {
                     .value
                     .general_names
                     .iter()
-                    .filter_map(|name| match name {
-                        GeneralName::URI(uri) if uri.starts_with(SCHEME) => Some(*uri),
-                        _ => None,
+                    .filter_map(|name| {
+                        if let GeneralName::URI(uri) = name
+                            && uri.starts_with(SCHEME)
+                        {
+                            Some(*uri)
+                        } else {
+                            None
+                        }
                     })
                     .collect()
             })
@@ -291,8 +313,12 @@ impl FromStr for SubjectUri {
                 fleet,
                 name: name.parse()?,
             }),
+            Some(("issuer", name)) => Ok(Self::Issuer {
+                fleet,
+                name: name.parse()?,
+            }),
             None if path == "authority" => Ok(Self::Authority { fleet }),
-            _ => Err(malformed()),
+            Some(_) | None => Err(malformed()),
         }
     }
 }
@@ -305,6 +331,7 @@ impl fmt::Display for SubjectUri {
                 write!(f, "{SCHEME}{fleet}/principal/{name}")
             }
             Self::Authority { fleet } => write!(f, "{SCHEME}{fleet}/authority"),
+            Self::Issuer { fleet, name } => write!(f, "{SCHEME}{fleet}/issuer/{name}"),
         }
     }
 }
@@ -330,6 +357,7 @@ mod tests {
             "fleetring://lab/node/n1",
             "fleetring://lab/principal/alice",
             "fleetring://lab/authority",
+            "fleetring://lab/issuer/control-1",
         ] {
             let uri: SubjectUri = text.parse().expect(text);
             assert_eq!(uri.to_string(), text);
@@ -346,6 +374,10 @@ mod tests {
             "fleetring://Lab/node/n1",
             "fleetring://lab/node/N1",
             "fleetring://lab/authority/x",
+            "fleetring://lab/issuer",
+            "fleetring://lab/issuer/",
+            "fleetring://lab/issuer/Control",
+            "fleetring://lab/issuer/a/b",
             "fleetring:///node/n1",
         ] {
             assert!(text.parse::<SubjectUri>().is_err(), "{text}");

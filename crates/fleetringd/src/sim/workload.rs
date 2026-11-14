@@ -17,9 +17,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleetring::NodeId;
-use fleetring_control::fork::ForkIdentity;
-use fleetring_control::{Action, DatabaseName, Feature, HostedReplica, Incarnation, LeaseEpoch};
+use fleetring_control::delegation::DelegationId;
+use fleetring_control::fork::{ForkIdentity, OperationId as RequestId};
+use fleetring_control::{
+    Action, DatabaseName, Feature, HostedReplica, Incarnation, KeyId, LeaseEpoch, Millis,
+    PrincipalName, Revoked, Timestamp, TokenId,
+};
 use tonic::Code;
+
+use crate::auth::BearerToken;
+use crate::tls::Principal;
 
 use crate::replication::FaultPoint;
 use crate::sim::SimRng;
@@ -47,6 +54,15 @@ pub enum Operation {
         /// The node.
         node: NodeId,
         /// The fleet features it reports beyond this build's.
+        features: Vec<Feature>,
+    },
+    /// Joins `node` reporting this build's software without `features`, as a node of the
+    /// previous release would: so that a scenario can run a fleet with a member that lacks a
+    /// fleet feature, such as `handover` (ADR-0031, amendment 2). The node joins with no data.
+    JoinWithout {
+        /// The node.
+        node: NodeId,
+        /// The fleet features it doesn't report.
         features: Vec<Feature>,
     },
     /// Sends a heartbeat for `node` that reports `replicas`, with what each says about a fork
@@ -232,6 +248,70 @@ pub enum Operation {
         /// The epoch asked for.
         epoch: LeaseEpoch,
     },
+    /// Asks the control plane for a delegated agent's token (ADR-0047, point 5), on a
+    /// connection whose certificate names `certificate`, carrying `token`. Sent once per call:
+    /// a resend is another `Delegate` with the same `operation`.
+    Delegate {
+        /// The principal the connection's certificate names: the caller or an ancestor.
+        certificate: Principal,
+        /// The caller's token.
+        token: BearerToken,
+        /// The operation ID the caller chose.
+        operation: RequestId,
+        /// The child's last segment.
+        segment: String,
+        /// The scopes asked for; none for the defaults.
+        scopes: Vec<String>,
+        /// The lifetime asked for, if one is.
+        lifetime: Option<Millis>,
+    },
+    /// Creates `database` with one replica on a connection whose certificate names
+    /// `certificate`, carrying `token`: an agent using a token, which the checker holds to the
+    /// token's scopes.
+    CreateAs {
+        /// The principal the connection's certificate names.
+        certificate: Principal,
+        /// The token the call carries.
+        token: BearerToken,
+        /// The database.
+        database: DatabaseName,
+    },
+    /// Adds `revoked` to the denylist until `until`, as an operator does with `fleet`.
+    Revoke {
+        /// What is revoked.
+        revoked: Revoked,
+        /// When the entry may be forgotten.
+        until: Timestamp,
+    },
+    /// Revokes `principal` and every name below it, as an operator does with `fleet`
+    /// (ADR-0047, point 11).
+    RevokePrincipal {
+        /// The principal.
+        principal: PrincipalName,
+    },
+    /// Calls `Control.RevokeToken` under the ancestor rule (ADR-0047, point 11.3), on a
+    /// connection whose certificate names `certificate`, carrying `token`, naming a principal,
+    /// a token ID, or both. Sent once per call.
+    RevokeAs {
+        /// The principal the connection's certificate names: the caller or an ancestor.
+        certificate: Principal,
+        /// The caller's token.
+        token: BearerToken,
+        /// The principal revoked, if any.
+        principal: Option<PrincipalName>,
+        /// The token ID revoked, if any.
+        token_id: Option<TokenId>,
+    },
+    /// Reads `database` on its primary with a token, on `certificate`'s certificate: the data
+    /// node judges the token against the denylist it heard.
+    QueryAs {
+        /// The principal the connection's certificate names.
+        certificate: Principal,
+        /// The token the call carries.
+        token: BearerToken,
+        /// The database.
+        database: DatabaseName,
+    },
 }
 
 impl Operation {
@@ -258,12 +338,19 @@ impl Operation {
             | Self::Watch { database: target } => Some(target),
             Self::Join { .. }
             | Self::JoinWith { .. }
+            | Self::JoinWithout { .. }
             | Self::Report { .. }
             | Self::Heartbeat { .. }
             | Self::Leave { .. }
             | Self::Drain { .. }
             | Self::Propose { .. }
-            | Self::SeedingProbe { .. } => None,
+            | Self::SeedingProbe { .. }
+            | Self::Delegate { .. }
+            | Self::CreateAs { .. }
+            | Self::Revoke { .. }
+            | Self::RevokePrincipal { .. }
+            | Self::RevokeAs { .. }
+            | Self::QueryAs { .. } => None,
         }
     }
 }
@@ -279,6 +366,13 @@ impl fmt::Display for Operation {
             Self::Heartbeat { node } => write!(f, "heartbeat {node}"),
             Self::JoinWith { node, features } => {
                 write!(f, "join {node} with")?;
+                for feature in features {
+                    write!(f, " {feature}")?;
+                }
+                Ok(())
+            }
+            Self::JoinWithout { node, features } => {
+                write!(f, "join {node} without")?;
                 for feature in features {
                     write!(f, " {feature}")?;
                 }
@@ -386,6 +480,62 @@ impl fmt::Display for Operation {
                 f,
                 "impostor snapshot of {database} from {target} at epoch {}",
                 epoch.get()
+            ),
+            // Never the token: a trace is printed when a seed fails.
+            Self::Delegate {
+                certificate,
+                operation,
+                segment,
+                scopes,
+                lifetime,
+                ..
+            } => {
+                write!(
+                    f,
+                    "delegate {segment} as {certificate}'s token, operation {operation}"
+                )?;
+                if !scopes.is_empty() {
+                    write!(f, " scopes {}", scopes.join(","))?;
+                }
+                if let Some(lifetime) = lifetime {
+                    write!(f, " for {} ms", lifetime.get())?;
+                }
+                Ok(())
+            }
+            Self::CreateAs {
+                certificate,
+                database,
+                ..
+            } => write!(
+                f,
+                "create {database} with a token, on {certificate}'s certificate"
+            ),
+            Self::Revoke { revoked, until } => {
+                write!(f, "revoke {revoked} until {}", until.as_millis())
+            }
+            Self::RevokePrincipal { principal } => write!(f, "revoke principal {principal}"),
+            Self::RevokeAs {
+                certificate,
+                principal,
+                token_id,
+                ..
+            } => {
+                write!(f, "revoke as {certificate}'s token")?;
+                if let Some(principal) = principal {
+                    write!(f, " principal {principal}")?;
+                }
+                if let Some(token_id) = token_id {
+                    write!(f, " token {token_id}")?;
+                }
+                Ok(())
+            }
+            Self::QueryAs {
+                certificate,
+                database,
+                ..
+            } => write!(
+                f,
+                "query {database} with a token, on {certificate}'s certificate"
             ),
         }
     }
@@ -574,6 +724,25 @@ pub enum Ack {
         /// The values, in the order seen.
         values: Vec<i64>,
     },
+    /// The control plane delegated a token, or signed a recorded one again for a resend.
+    Delegated {
+        /// The child's token.
+        token: BearerToken,
+        /// Its delegation ID.
+        delegation: DelegationId,
+        /// The child's principal.
+        principal: String,
+        /// Its scopes, in canonical form.
+        scopes: Vec<String>,
+        /// When it expires.
+        expires_at: Timestamp,
+        /// The issuer key that signed this copy.
+        issuer_key: KeyId,
+    },
+    /// The entry is on the denylist.
+    Revoked,
+    /// The query was answered.
+    Queried,
 }
 
 impl fmt::Display for Ack {
@@ -632,6 +801,17 @@ impl fmt::Display for Ack {
             Self::Proposed { accepted: false } => f.write_str("proposal refused"),
             Self::Padded => f.write_str("padded"),
             Self::Watched { values } => write!(f, "watched {} inserts", values.len()),
+            Self::Delegated {
+                delegation,
+                principal,
+                issuer_key,
+                ..
+            } => write!(
+                f,
+                "delegated {principal} as {delegation}, signed by {issuer_key}"
+            ),
+            Self::Revoked => f.write_str("revoked"),
+            Self::Queried => f.write_str("queried"),
             Self::Read { values } => {
                 const SHOWN: usize = 6;
                 write!(f, "read {} values", values.len())?;
@@ -933,6 +1113,7 @@ pub struct History {
     fork_passes: Vec<ForkPass>,
     fork_transitions: Vec<ForkTransition>,
     fork_markers: Vec<ForkMarkerSeen>,
+    fenced: Vec<FencedSeen>,
     clock_shifts: Vec<(Duration, u64)>,
 }
 
@@ -1113,6 +1294,19 @@ impl History {
         &self.fork_transitions
     }
 
+    /// Records that a promotion started in control state, or that a database's replica set
+    /// changed there.
+    pub fn observe_fenced(&mut self, seen: FencedSeen) {
+        self.fenced.push(seen);
+    }
+
+    /// Returns every promotion the fleet saw start in control state, and every change of a
+    /// replica set it saw, in order.
+    #[must_use]
+    pub fn fenced(&self) -> &[FencedSeen] {
+        &self.fenced
+    }
+
     /// Records that a holder's copy of a fork was first seen holding the fork's marker on disk.
     pub fn observe_fork_marker(&mut self, seen: ForkMarkerSeen) {
         self.fork_markers.push(seen);
@@ -1166,6 +1360,12 @@ impl History {
             fork_passes: self.fork_passes.clone(),
             fork_transitions: self.fork_transitions.clone(),
             fork_markers: self.fork_markers.clone(),
+            fenced: self
+                .fenced
+                .iter()
+                .filter(|seen| !names.contains(&seen.database))
+                .cloned()
+                .collect(),
             clock_shifts: self.clock_shifts.clone(),
         }
     }
@@ -1742,6 +1942,27 @@ pub struct ForkTransition {
     pub rows: ReplicaRows,
 }
 
+/// A promotion, or a change of a database's replica set, as the fleet first saw it in control
+/// state after a step: the replica set a promotion fences a quorum of from then on, the write
+/// quorum over that set, and every data host's rows of the database, read from disk then
+/// (FR-102).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedSeen {
+    /// When the fleet saw it.
+    pub at: Duration,
+    /// The database.
+    pub database: DatabaseName,
+    /// The epoch a promotion promotes to; `None` for a change of the replica set.
+    pub promotion: Option<LeaseEpoch>,
+    /// The replica set control state fences: the set `RecordFenced` counts.
+    pub replica_set: Vec<NodeId>,
+    /// The write quorum W over that set: a quorum Q = R - W + 1 of it intersects every write
+    /// held by W of its members.
+    pub write_quorum: usize,
+    /// Each data host's rows of the database's writes table then.
+    pub rows: ReplicaRows,
+}
+
 /// A holder's copy of a fork on disk holding the fork's marker, its reset write, as the fleet
 /// first saw it after a step (FR-087): read from the copy's files, not from what any node says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1909,6 +2130,175 @@ impl Workload for Traffic {
             }
             (Operation::Write { database, .. }, Outcome::Acknowledged(_)) => {
                 *state.acknowledged.entry(database.clone()).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Delegates `children` agents from one token, one after another, and uses each child's token
+/// twice: to create a database within its prefix, and one outside it, which every node must
+/// refuse (ADR-0047, invariant I1).
+///
+/// A delegation that gets no answer, or `UNAVAILABLE`, is sent again under the same operation
+/// ID, as `agent delegate` resends, until it is answered: the control plane must record it once
+/// and answer each resend with the same delegation (I7). Any other refusal moves on to the next
+/// child.
+#[derive(Debug, Clone)]
+pub struct Delegations {
+    certificate: Principal,
+    token: BearerToken,
+    /// Distinguishes this workload's operation IDs from another's.
+    salt: u8,
+    children: u32,
+    pause: Duration,
+    next: u32,
+    step: DelegationStep,
+    waiting: bool,
+}
+
+/// Where a [`Delegations`] workload is with its current child.
+#[derive(Debug, Clone)]
+enum DelegationStep {
+    /// Asking for the child.
+    Delegate,
+    /// Using the child's token within its prefix.
+    Inside {
+        token: BearerToken,
+        database: DatabaseName,
+    },
+    /// Using the child's token outside its prefix.
+    Outside {
+        token: BearerToken,
+        database: DatabaseName,
+    },
+    /// Pausing before the next child.
+    Pause,
+}
+
+impl Delegations {
+    /// A workload that delegates `children` agents, `<salt>c0` to `<salt>c<children - 1>`
+    /// below the token's principal, on a connection whose certificate names `certificate`,
+    /// carrying `token`, pausing `pause` after each.
+    #[must_use]
+    pub fn new(
+        certificate: Principal,
+        token: BearerToken,
+        salt: u8,
+        children: u32,
+        pause: Duration,
+    ) -> Self {
+        Self {
+            certificate,
+            token,
+            salt,
+            children,
+            pause,
+            next: 0,
+            step: DelegationStep::Delegate,
+            waiting: false,
+        }
+    }
+
+    /// The operation ID of the delegation of child `child`: the same for every resend.
+    fn operation(&self, child: u32) -> RequestId {
+        let mut bytes = [self.salt; 16];
+        bytes[12..].copy_from_slice(&child.to_be_bytes());
+        RequestId::from_bytes(bytes)
+    }
+
+    fn segment(&self, child: u32) -> String {
+        format!("s{}c{child}", self.salt)
+    }
+
+    fn advance(&mut self) {
+        self.step = DelegationStep::Pause;
+    }
+}
+
+impl Workload for Delegations {
+    fn next(&mut self, _rng: &mut SimRng) -> Step {
+        if self.waiting {
+            self.waiting = false;
+            return Step::Sleep(SCRIPT_RETRY);
+        }
+        if self.next >= self.children {
+            return Step::Done;
+        }
+        match &self.step {
+            DelegationStep::Delegate => Step::Run(Operation::Delegate {
+                certificate: self.certificate.clone(),
+                token: self.token.clone(),
+                operation: self.operation(self.next),
+                segment: self.segment(self.next),
+                scopes: Vec::new(),
+                lifetime: None,
+            }),
+            DelegationStep::Inside { token, database }
+            | DelegationStep::Outside { token, database } => Step::Run(Operation::CreateAs {
+                certificate: self.certificate.clone(),
+                token: token.clone(),
+                database: database.clone(),
+            }),
+            DelegationStep::Pause => {
+                self.next += 1;
+                self.step = DelegationStep::Delegate;
+                Step::Sleep(self.pause)
+            }
+        }
+    }
+
+    fn observe(&mut self, operation: &Operation, outcome: &Outcome) {
+        let retry = match outcome {
+            Outcome::Indeterminate { .. } => true,
+            Outcome::Rejected { code, .. } => *code == Code::Unavailable,
+            Outcome::Acknowledged(_) => false,
+        };
+        match (operation, &self.step) {
+            (Operation::Delegate { .. }, DelegationStep::Delegate) => {
+                if retry {
+                    self.waiting = true;
+                    return;
+                }
+                let Some(Ack::Delegated {
+                    token, principal, ..
+                }) = outcome.ack()
+                else {
+                    self.advance();
+                    return;
+                };
+                match format!("{principal}-db").parse() {
+                    Ok(database) => {
+                        self.step = DelegationStep::Inside {
+                            token: token.clone(),
+                            database,
+                        };
+                    }
+                    Err(_) => self.advance(),
+                }
+            }
+            (Operation::CreateAs { .. }, DelegationStep::Inside { token, .. }) => {
+                if matches!(outcome, Outcome::Indeterminate { .. }) {
+                    self.waiting = true;
+                    return;
+                }
+                let outside = format!("agent-43-s{}x{}", self.salt, self.next).parse();
+                match outside {
+                    Ok(database) => {
+                        self.step = DelegationStep::Outside {
+                            token: token.clone(),
+                            database,
+                        };
+                    }
+                    Err(_) => self.advance(),
+                }
+            }
+            (Operation::CreateAs { .. }, DelegationStep::Outside { .. }) => {
+                if matches!(outcome, Outcome::Indeterminate { .. }) {
+                    self.waiting = true;
+                    return;
+                }
+                self.advance();
             }
             _ => {}
         }

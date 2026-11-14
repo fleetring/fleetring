@@ -80,7 +80,8 @@ fn data_sample(sources: &Sources, membership: &Membership) -> DataSample {
     let denylist = membership.denylist();
     let mut sample = DataSample {
         denylist_age: denylist.age().map(|age| age.as_secs_f64()),
-        denylist_entries: denylist.load().len(),
+        denylist_entries: denylist.entries().unwrap_or(0),
+        denylist_unusable: denylist.entries().is_none(),
         membership_epoch: membership.epoch().get(),
         ..DataSample::default()
     };
@@ -152,6 +153,10 @@ fn control_sample(control: &ControlHandle) -> ControlSample {
             .databases()
             .filter(|database| database.promotion().is_some())
             .count(),
+        kept_replica_sets: state
+            .databases()
+            .filter(|database| database.kept_replicas().is_some())
+            .count(),
         // One control node is the control plane's leader until FR-064's Raft group.
         leader: control.is_running(),
         ..ControlSample::default()
@@ -179,5 +184,44 @@ mod tests {
         assert_eq!(FOLLOWER_STATES[BEHIND], "behind");
         assert_eq!(FOLLOWER_STATES[DISCONNECTED], "disconnected");
         assert_eq!(FOLLOWER_STATES[RESEEDING], "reseeding");
+    }
+
+    /// An unusable denylist is sampled as such, not as an empty list (ADR-0047, point 3).
+    #[test]
+    fn an_unusable_denylist_is_sampled_as_unusable() {
+        let membership = Membership::detached();
+        let sources = Sources {
+            membership: Some(membership.clone()),
+            ..Sources::default()
+        };
+        let metrics = crate::observe::Metrics::new(&crate::observe::NodeInfo::new(
+            "n1".parse().expect("a node id"),
+            crate::NodeRole::Data,
+            None,
+        ));
+        membership
+            .denylist()
+            .receive(Err(crate::auth::UnreadableEntry::new(0, "unknown case")));
+        let sampled = data_sample(&sources, &membership);
+        assert!(sampled.denylist_unusable);
+        assert_eq!(sampled.denylist_entries, 0);
+        super::sample(&sources, metrics.sampled());
+        assert!(
+            metrics
+                .encode()
+                .contains("\nfleetring_denylist_unusable 1\n"),
+            "{}",
+            metrics.encode()
+        );
+        membership
+            .denylist()
+            .replace(fleetring_control::Revocations::default());
+        assert!(!data_sample(&sources, &membership).denylist_unusable);
+        super::sample(&sources, metrics.sampled());
+        assert!(
+            metrics
+                .encode()
+                .contains("\nfleetring_denylist_unusable 0\n")
+        );
     }
 }

@@ -30,18 +30,25 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Operations: `db create/exec/query/locate/list/drop/verify`, `node list` and `status`, with a hash-chained log that shows whether every replica holds the same history; Prometheus metrics, health and readiness probes, request IDs, and JSON logs; `fleetring upgrade`, verified with cosign, with rollback and a tested rolling upgrade
 - Contexts: `fleetring context` names a fleet's addresses, certificates and principal once, and `fleetring switch` moves between fleets
 - `fleetring dev`: one command for a local node on a laptop, over the same TLS and scopes as a fleet
-- `fleetring mcp`: an MCP server over stdio, so an agent creates, finds, queries, and drops its own databases as one scoped principal, with text others wrote marked untrusted
+- `fleetring mcp`: an MCP server over stdio, so an agent creates, finds, queries, follows, forks, and drops its own databases as one scoped principal, with text others wrote marked untrusted; `fleetring agent` gives each agent an identity of its own
+
+**New in 0.8.0**, being prepared:
+
+- `fleetring router`: a libSQL/Hrana front door, so existing libSQL and Turso clients reach each database's primary unchanged
+- `fleetring db watch`, which follows a database's row changes, and an MCP `changes` tool
+- Database forks: `fleetring db fork` copies a database's current contents into a new, independent one, at a position its write quorum acknowledged
+- Online delegation: `fleetring agent delegate` gives a child agent a narrower, shorter-lived credential from the control plane, recorded with its lineage, and revoking any ancestor ends every agent below it
+- Membership changes hand replica sets over on joint quorums, so a write acknowledged just before a node joins or leaves survives the next failover
 
 **Planned**, each tracked as a [GitHub issue](https://github.com/fleetring/fleetring/issues):
 
-- Router that works with existing libSQL and Turso clients
 - Live migration when nodes join or leave, with zero lost writes, and rebalancing
 - A Raft control plane, so the control plane has no single point of failure
 - Fault injection on real daemons, judged by the history checker
 - Keyed leases, Merkle anti-entropy, and cells in the daemon
-- JSON output for every command, a terminal UI, and a desktop app
+- A terminal UI and a desktop app
 - Archive follow-ups: acknowledging a write once it is archived, workload-identity credentials, and Vercel Blob
-- The rest of the agent kit (database expiry and a skill), vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
+- An agent launcher that sandboxes agents, vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
 - apt, yum, AUR, and Homebrew packages
 
 ## Install
@@ -113,7 +120,7 @@ Run another `db exec` and watch its row arrive in the `tail`. Ctrl-C stops the n
 
 ## Agents
 
-An AI agent can have its own databases: it creates them under its own name prefix, describes and labels them so they can be found again, gives scratch databases an expiry, and drops them when it's done, through `fleetring mcp`, an MCP server, or the CLI. One command sets one up on a laptop: an MCP client that runs `fleetring mcp --agent 42` gets a dev node and an identity of the agent's own, scoped to its `agent-42-` databases. The [agent quickstart](docs/agents/quickstart.md) walks through it, and says what it doesn't do: agents on one machine run as one user and can read each other's credentials, so this is trusted local development, not isolation. The [agent skill](docs/agents/SKILL.md) is what the agent reads: when to create a database rather than a table, naming, labels, expiry, and SQL patterns for memory, task state, and full-text search. [`llms.txt`](llms.txt) lists the pages an agent should read.
+An AI agent can have its own databases: it creates them under its own name prefix, describes and labels them so they can be found again, gives scratch databases an expiry, and drops them when it's done, through `fleetring mcp`, an MCP server, or the CLI. One command sets one up on a laptop: an MCP client that runs `fleetring mcp --agent 42` gets a dev node and an identity of the agent's own, scoped to its `agent-42-` databases. The [agent quickstart](docs/agents/quickstart.md) walks through it, and says what it doesn't do: agents on one machine run as one user and can read each other's credentials, so this is trusted local development, not isolation. From 0.8.0 an agent's harness can also give each child agent a narrower, shorter-lived credential of its own with `fleetring agent delegate`, and end it, and everything below it, with `fleetring agent remove`. The [agent skill](docs/agents/SKILL.md) is what the agent reads: when to create a database rather than a table, naming, labels, expiry, forks, working as a delegated agent, and SQL patterns for memory, task state, and full-text search. [`llms.txt`](llms.txt) lists the pages an agent should read.
 
 ## The placement crate
 
@@ -135,7 +142,8 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 - [x] Metrics, health checks, and a tested rolling upgrade (0.4.0)
 - [x] `fleetring dev`, a one-command local node, and webhook sinks over HTTPS (0.5.0)
 - [x] Agent kit: database descriptions, labels and expiry, `db show`, an MCP server, and an agent skill (0.6.0)
-- [ ] Router sidecar (libSQL/Hrana protocol)
+- [x] The `fleetring` CLI: contexts, JSON output, exit codes, man pages, and an identity per agent (0.7.0)
+- [ ] Router (libSQL/Hrana protocol), `db watch`, database forks, online delegation between agents, and the joint-quorum hand-over (0.8.0, being prepared)
 - [ ] Live migration
 - [ ] Raft control plane
 - [ ] Fault injection on real daemons

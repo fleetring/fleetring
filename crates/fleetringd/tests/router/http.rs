@@ -4,6 +4,10 @@
 
 use std::time::Duration;
 
+use fleetring_control::Millis;
+use fleetring_proto::v1::revocation::Revoked;
+use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
+use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::engine::{Statement, Value as SqlValue};
 use fleetringd::transport::Credentials;
 use http_body_util::Full;
@@ -386,6 +390,68 @@ async fn requests_are_refused_before_any_node_is_called() -> TestResult {
         assert_eq!(answer.status, StatusCode::OK, "{probe}");
     }
     router.stop().await;
+    Ok(())
+}
+
+/// A revoked token, which the router can't tell from a valid one since it holds no denylist, is
+/// refused as the router refuses any token it rejects once the node refuses it: `401` with
+/// `UNAUTHENTICATED`, for a pipeline and a cursor alike, not a stream error naming a missing
+/// scope (ADR-0037, point 18).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_token_is_unauthenticated() -> TestResult {
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("notes", 1).await?;
+    let token = fleet.token("app", &["write:notes"], "t-revoked")?;
+    let body = pipeline(None, json!([execute("SELECT 1", json!([])), close()]));
+    let served = fleet
+        .post("/db/notes/v3/pipeline", Some(&token), &body)
+        .await?;
+    assert_eq!(served.status, StatusCode::OK, "{}", served.text);
+    assert_eq!(served.result(0)["type"], "ok", "{}", served.text);
+    fleet
+        .admin
+        .control()
+        .revoke_token(RevokeTokenRequest {
+            revocation: Some(Revocation {
+                revoked: Some(Revoked::TokenId("t-revoked".into())),
+                until_ms: SystemClock
+                    .now()
+                    .saturating_add(Millis::new(3_600_000))
+                    .as_millis(),
+            }),
+            principal: String::new(),
+        })
+        .await?;
+    // The data node learns of the revocation with its next heartbeat.
+    let refused = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let answer = fleet
+                .post("/db/notes/v3/pipeline", Some(&token), &body)
+                .await?;
+            if answer.status != StatusCode::OK || answer.result(0)["type"] != "ok" {
+                return Ok::<_, Box<dyn std::error::Error>>(answer);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.text);
+    assert_eq!(refused.body["code"], "UNAUTHENTICATED", "{}", refused.text);
+    assert_eq!(refused.body["message"], "the token is revoked");
+    let cursor = fleet
+        .post(
+            "/db/notes/v3/cursor",
+            Some(&token),
+            &json!({"baton": null, "batch": {"steps": [{"stmt": {"sql": "SELECT 1"}}]}}),
+        )
+        .await?;
+    assert_eq!(cursor.status, StatusCode::UNAUTHORIZED, "{}", cursor.text);
+    assert_eq!(cursor.body["code"], "UNAUTHENTICATED", "{}", cursor.text);
+    fleet.stop().await;
     Ok(())
 }
 

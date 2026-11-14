@@ -730,6 +730,20 @@ impl Control for Redirecting {
     ) -> Result<Response<RevokeTokenResponse>, Status> {
         self.redirect()
     }
+
+    async fn delegate_token(
+        &self,
+        _: Request<fleetring_proto::v1::DelegateTokenRequest>,
+    ) -> Result<Response<fleetring_proto::v1::DelegateTokenResponse>, Status> {
+        self.redirect()
+    }
+
+    async fn list_delegations(
+        &self,
+        _: Request<fleetring_proto::v1::ListDelegationsRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListDelegationsResponse>, Status> {
+        self.redirect()
+    }
 }
 
 async fn serve_redirect(
@@ -1395,6 +1409,7 @@ async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResul
             revoked: Some(revoked),
             until_ms,
         }),
+        principal: String::new(),
     };
     let far = u64::MAX;
     // A token's entry is kept no longer than any token lasts; a key's as long as asked.
@@ -1442,12 +1457,16 @@ async fn a_revocation_reaches_data_nodes_through_their_heartbeats() -> TestResul
     let key = fleetring_control::Revoked::Key("key-1".parse()?);
     // Guards against a hang only; nothing here asserts how long a heartbeat takes.
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while !membership.denylist().load().contains(&token) {
+        while !membership
+            .denylist()
+            .load()
+            .is_ok_and(|list| list.contains(&token))
+        {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await?;
-    let list = membership.denylist().load();
+    let list = membership.denylist().load().expect("a readable list");
     assert!(list.contains(&key));
     assert_eq!(list.len(), 2);
     tasks.stop().await;
@@ -1477,6 +1496,7 @@ async fn a_node_hears_the_denylist_from_a_control_plane_slower_than_its_heartbea
                 revoked: Some(Wire::KeyId("key-1".into())),
                 until_ms: u64::MAX,
             }),
+            principal: String::new(),
         })
         .await?;
 
@@ -1491,7 +1511,11 @@ async fn a_node_hears_the_denylist_from_a_control_plane_slower_than_its_heartbea
     let key = fleetring_control::Revoked::Key("key-1".parse()?);
     // Guards against a hang only; nothing here asserts how long a heartbeat takes.
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while !membership.denylist().load().contains(&key) {
+        while !membership
+            .denylist()
+            .load()
+            .is_ok_and(|list| list.contains(&key))
+        {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
@@ -1528,6 +1552,7 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
             revoked: Some(Wire::TokenId("tok-1".into())),
             until_ms: u64::MAX,
         }),
+        principal: String::new(),
     };
 
     // A node certificate may not drain or remove another member, nor revoke a token.
@@ -1554,7 +1579,10 @@ async fn a_node_certificate_acts_on_its_own_node_only() -> TestResult {
         .await
         .expect_err("a node can't revoke tokens");
     assert_eq!(revoked.code(), Code::PermissionDenied, "{revoked}");
-    assert_eq!(revoked.message(), "RevokeToken needs the fleet scope");
+    assert_eq!(
+        revoked.message(),
+        "RevokeToken needs the fleet scope, or an agent's bearer token for the ancestor rule"
+    );
     // Nor create a database, or hand over a lease it doesn't hold.
     let created = a
         .create_database(CreateDatabaseRequest {
@@ -3506,6 +3534,9 @@ mod node_list {
     /// How long a member stays live without a heartbeat in these tests.
     const HEARTBEAT_TIMEOUT_MS: u64 = 400;
 
+    /// Guards against a hang only.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
+
     /// A control daemon with three members: `node-a` (live, on 0.3.1, with every attribute),
     /// `node-b` (live, draining, on the 0.3.0 a member that reports no software runs), and
     /// `node-c` (down).
@@ -3531,12 +3562,11 @@ mod node_list {
             let address = daemon.control_address().ok_or("no control address")?;
             let control = secure_client(address, &tls)?;
 
-            // node-c joins first and never beats again, so it is down by the time the others
-            // have joined.
+            // node-c joins first and never beats again: it is down once the control plane's
+            // time, which the others' heartbeats move on, passes its heartbeat timeout.
             node_client(address, &tls, "node-c")?
                 .join(join_request("node-c"))
                 .await?;
-            tokio::time::sleep(Duration::from_millis(HEARTBEAT_TIMEOUT_MS * 2)).await;
             node_client(address, &tls, "node-a")?
                 .join(JoinRequest {
                     node: Some(Node {
@@ -3578,6 +3608,18 @@ mod node_list {
                     }))
                 })
                 .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            // The control plane's time is the wall clock's, which can step back on a loaded
+            // machine, so the test waits for control state to see node-c down rather than for
+            // a fixed time to pass.
+            let down: fleetring::NodeId = "node-c".parse()?;
+            let mut states = daemon.control().ok_or("no control handle")?.watch();
+            tokio::time::timeout(
+                HANG_GUARD,
+                states.wait_for(|state| {
+                    state.liveness(&down, state.now()) == Some(fleetring_control::Liveness::Down)
+                }),
+            )
+            .await??;
             Ok(Self {
                 _dir: dir,
                 tls,
@@ -3756,6 +3798,69 @@ mod forks {
     fn without_placement(mut status: ForkOperationStatus) -> ForkOperationStatus {
         status.placement = None;
         status
+    }
+
+    /// FR-096: while a member runs 0.7.0, which reports `undrain`, `metadata` and `expiry` but
+    /// not `fork`, `db fork` is refused naming it, nothing is logged, and creations keep the
+    /// legacy incarnation. Once it rejoins on a release with `fork`, the first fork is accepted
+    /// and enables the feature.
+    #[tokio::test]
+    async fn a_fork_is_refused_naming_a_0_7_member_until_it_runs_0_8() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let tls = Tls::create(dir.path())?;
+        let text = format!(
+            "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \
+             \"control-1\"\n{}",
+            dir.path().join("data"),
+            tls.node_table("control-1")?
+        );
+        let daemon = Daemon::start(Config::from_toml(&text)?).await?;
+        let address = daemon.control_address().ok_or("no control address")?;
+        let handle = daemon.control().ok_or("no control node")?;
+        let v0_7_0 = Software {
+            features: ["undrain", "metadata", "expiry"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..reporting("0.7.0")
+        };
+        for (id, software) in [("a", forking()), ("b", forking()), ("old", v0_7_0)] {
+            node_client(address, &tls, id)?
+                .join(join_with(id, Some(software)))
+                .await?;
+        }
+        let control = secure_client(address, &tls)?;
+        control.create_database(create_request("notes", 3)).await?;
+
+        let operation = OperationId::from_bytes([0x07; 16]);
+        let refused = control
+            .fork_database(fork_request(operation, 3))
+            .await
+            .expect_err("a member lacks fork");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        for part in ["node 'old'", "0.7.0", "fork"] {
+            assert!(refused.message().contains(part), "{part}: {refused}");
+        }
+        let state = handle.state();
+        assert!(!state.is_enabled(Feature::Fork));
+        assert_eq!(state.fork_operations().len(), 0);
+        assert!(state.database(&"scratch".parse()?).is_none());
+        let later = control
+            .create_database(create_request("later", 3))
+            .await?
+            .placement
+            .ok_or("no placement")?;
+        assert_eq!(later.incarnation, 0);
+
+        // `old` restarts on a release with `fork`, and rejoins saying so.
+        node_client(address, &tls, "old")?
+            .join(join_with("old", Some(forking())))
+            .await?;
+        assert!(!handle.state().is_enabled(Feature::Fork));
+        let status = control.fork_database(fork_request(operation, 3)).await?;
+        assert_eq!(status.state, i32::from(ForkState::Seeding));
+        assert!(handle.state().is_enabled(Feature::Fork));
+        daemon.run_until(async {}).await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3952,6 +4057,499 @@ mod forks {
         assert_eq!(read.state, i32::from(ForkState::Seeded));
 
         daemon.run_until(async {}).await;
+        Ok(())
+    }
+}
+
+/// A control plane that answers `Join` and `Heartbeat` with the denylist the test sets, and
+/// nothing else: what a data node hears, entry by entry, including entries it can't read.
+#[derive(Debug, Clone, Default)]
+struct Publishing {
+    revocations: Arc<std::sync::Mutex<Vec<fleetring_proto::v1::Revocation>>>,
+}
+
+impl Publishing {
+    fn publish(&self, revocations: Vec<fleetring_proto::v1::Revocation>) {
+        *self.revocations.lock().expect("lock") = revocations;
+    }
+
+    fn published(&self) -> Vec<fleetring_proto::v1::Revocation> {
+        self.revocations.lock().expect("lock").clone()
+    }
+}
+
+fn unimplemented_stub<T>() -> Result<Response<T>, Status> {
+    Err(Status::unimplemented("a stub that publishes a denylist"))
+}
+
+#[tonic::async_trait]
+impl Control for Publishing {
+    type WatchMembershipStream = BoxStream<MembershipUpdate>;
+
+    async fn join(&self, _: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
+        Ok(Response::new(JoinResponse {
+            revocations: self.published(),
+            protocol: Some(PROTOCOL_VERSION),
+            membership_epoch: 1,
+        }))
+    }
+
+    async fn heartbeat(
+        &self,
+        _: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        Ok(Response::new(HeartbeatResponse {
+            membership_epoch: 1,
+            unknown_databases: Vec::new(),
+            revocations: self.published(),
+            forks: Vec::new(),
+        }))
+    }
+
+    async fn watch_membership(
+        &self,
+        _: Request<WatchMembershipRequest>,
+    ) -> Result<Response<Self::WatchMembershipStream>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn create_database(
+        &self,
+        _: Request<CreateDatabaseRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn create_database_with_metadata(
+        &self,
+        _: Request<fleetring_proto::v1::CreateDatabaseWithMetadataRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn update_database(
+        &self,
+        _: Request<fleetring_proto::v1::UpdateDatabaseRequest>,
+    ) -> Result<Response<fleetring_proto::v1::UpdateDatabaseResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn fork_database(
+        &self,
+        _: Request<fleetring_proto::v1::ForkDatabaseRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ForkOperationStatus>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn get_fork_operation(
+        &self,
+        _: Request<fleetring_proto::v1::GetForkOperationRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ForkOperationStatus>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn drop_database(
+        &self,
+        _: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn change_durability(
+        &self,
+        _: Request<ChangeDurabilityRequest>,
+    ) -> Result<Response<ChangeDurabilityResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn list_databases(
+        &self,
+        _: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn acquire_lease(
+        &self,
+        _: Request<AcquireLeaseRequest>,
+    ) -> Result<Response<LeaseResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn renew_lease(
+        &self,
+        _: Request<RenewLeaseRequest>,
+    ) -> Result<Response<LeaseResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn leave(&self, _: Request<LeaveRequest>) -> Result<Response<LeaveResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn start_promotion(
+        &self,
+        _: Request<StartPromotionRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn record_fenced(
+        &self,
+        _: Request<RecordFencedRequest>,
+    ) -> Result<Response<RecordFencedResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn complete_promotion(
+        &self,
+        _: Request<CompletePromotionRequest>,
+    ) -> Result<Response<CompletePromotionResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn drain(&self, _: Request<DrainRequest>) -> Result<Response<DrainResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn undrain(
+        &self,
+        _: Request<fleetring_proto::v1::UndrainRequest>,
+    ) -> Result<Response<fleetring_proto::v1::UndrainResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn transfer_lease(
+        &self,
+        _: Request<TransferLeaseRequest>,
+    ) -> Result<Response<PromotionResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn revoke_token(
+        &self,
+        _: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn delegate_token(
+        &self,
+        _: Request<fleetring_proto::v1::DelegateTokenRequest>,
+    ) -> Result<Response<fleetring_proto::v1::DelegateTokenResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn list_delegations(
+        &self,
+        _: Request<fleetring_proto::v1::ListDelegationsRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListDelegationsResponse>, Status> {
+        unimplemented_stub()
+    }
+}
+
+/// The denylist a data node hears from its joins and heartbeats (ADR-0047, point 3, I5).
+mod heard_denylist {
+    use std::time::Duration;
+
+    use fleetring_control::delegation::{ChainLink, DelegationId, TokenClaims, TokenKind};
+    use fleetring_proto::v1::revocation::Revoked as Wire;
+    use fleetring_proto::v1::{PrincipalRevocation, Revocation};
+    use fleetringd::auth::{BearerToken, DelegationSigner, Denylist, TokenSpec};
+    use fleetringd::tls::{Peer, Security, Validity};
+    use fleetringd::{Membership, MembershipSettings};
+    use rustls_pki_types::pem::PemObject as _;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    use super::*;
+
+    /// Guards against a hang only; nothing here asserts how long a heartbeat takes.
+    const HANG_GUARD: Duration = Duration::from_secs(60);
+
+    const HOUR: u64 = 3_600_000;
+
+    /// A stub control plane, a data node's membership hearing it, and that node's request
+    /// boundary, which checks tokens against what membership heard.
+    struct Node {
+        tls: Tls,
+        _dir: tempfile::TempDir,
+        stub: Publishing,
+        denylist: Denylist,
+        authorizer: Authorizer,
+        tasks: fleetringd::MembershipTasks,
+    }
+
+    impl Node {
+        async fn start(published: Vec<Revocation>) -> Result<Self, Box<dyn Error>> {
+            let dir = tempfile::tempdir()?;
+            let tls = Tls::create(dir.path())?;
+            let stub = Publishing::default();
+            stub.publish(published);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(control_server(stub.clone()))
+                    .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+            );
+            let settings = MembershipSettings {
+                heartbeat_interval_ms: NonZeroU64::new(20).ok_or("zero")?,
+                ..MembershipSettings::default()
+            };
+            let (membership, tasks) =
+                Membership::start(Member::new("data-1".parse()?), client(address), &settings);
+            let denylist = membership.denylist().clone();
+            let authorizer = Authorizer::new(
+                &[],
+                &Security::Tls(tls.node_identity("data-1")?),
+                Arc::new(SystemClock),
+            )
+            .with_denylist(denylist.clone(), HANG_GUARD);
+            Ok(Self {
+                tls,
+                _dir: dir,
+                stub,
+                denylist,
+                authorizer,
+                tasks,
+            })
+        }
+
+        /// Publishes `revocations` and waits until the node has heard a list that `heard`
+        /// accepts.
+        async fn hear(
+            &self,
+            revocations: Vec<Revocation>,
+            heard: impl Fn(&Denylist) -> bool,
+        ) -> TestResult {
+            self.stub.publish(revocations);
+            tokio::time::timeout(HANG_GUARD, async {
+                while !heard(&self.denylist) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            Ok(())
+        }
+
+        fn resolve(&self, token: &BearerToken) -> Result<(), Status> {
+            self.authorizer
+                .resolve(
+                    &Peer::Principal("agent-42".parse().expect("a principal")),
+                    Some(token),
+                )
+                .map(|_| ())
+        }
+
+        /// `agent-42`'s root token, issued at `issued_at` seconds after the epoch.
+        fn root(&self, id: &str, issued_at: u64) -> Result<BearerToken, Box<dyn Error>> {
+            let at = Timestamp::from_millis(issued_at * 1_000);
+            Ok(self.tls.authority().token_signer()?.issue(
+                &TokenSpec::new(
+                    "agent-42".parse()?,
+                    ["admin:agent-42-*".parse()?].into_iter().collect(),
+                    id.parse()?,
+                    at,
+                    SystemClock.now().saturating_add(Millis::new(HOUR)),
+                )
+                .agent("alice".parse()?),
+            )?)
+        }
+
+        /// `agent-42.c7`'s token from a delegation issuer, issued at `issued_at` seconds.
+        fn child(&self, issued_at: u64) -> Result<BearerToken, Box<dyn Error>> {
+            let at = Timestamp::from_millis(issued_at * 1_000);
+            let authority = self.tls.authority();
+            let pair = authority.issue_issuer(
+                &"control-a".parse()?,
+                Validity::new(
+                    Timestamp::from_millis(at.as_millis().saturating_sub(HOUR)),
+                    Duration::from_secs(24 * 3_600),
+                ),
+            )?;
+            let cert = CertificateDer::from_pem_slice(pair.certificate_pem().as_bytes())?;
+            let PrivateKeyDer::Pkcs8(key) =
+                PrivateKeyDer::from_pem_slice(pair.key_pem().as_bytes())?
+            else {
+                return Err("an issuer key is PKCS#8".into());
+            };
+            let signer = DelegationSigner::new(
+                cert.as_ref(),
+                key.secret_pkcs8_der(),
+                authority.fleet(),
+                &[authority.token_signer()?.verifying_key()],
+            )?;
+            let claims = TokenClaims {
+                fleet: authority.fleet().as_str().into(),
+                principal: "agent-42.c7".parse()?,
+                id: DelegationId::from_bytes([7; 16]).into(),
+                issued_at: Some(at),
+                not_before: at,
+                expires_at: at.saturating_add(Millis::new(HOUR)),
+                scopes: ["admin:agent-42.c7-*".parse()?].into_iter().collect(),
+                kind: Some(TokenKind::Agent),
+                owner: Some("alice".parse()?),
+                parent: Some("agent-42".parse()?),
+                chain: vec![ChainLink {
+                    id: "root-42".parse()?,
+                    kid: authority.token_signer()?.key_id().clone(),
+                }],
+            };
+            Ok(signer.sign(&claims)?)
+        }
+
+        async fn stop(self) {
+            self.tasks.stop().await;
+        }
+    }
+
+    fn token_entry(id: &str) -> Revocation {
+        Revocation {
+            revoked: Some(Wire::TokenId(id.to_owned())),
+            until_ms: u64::MAX,
+        }
+    }
+
+    fn principal_entry(fleet: Option<&str>, principal: &str, before_ms: u64) -> Revocation {
+        Revocation {
+            revoked: Some(Wire::Principal(PrincipalRevocation {
+                fleet: fleet.map(str::to_owned),
+                principal: principal.to_owned(),
+                before_ms,
+            })),
+            until_ms: u64::MAX,
+        }
+    }
+
+    /// The whole second, in seconds since the epoch, a minute ago.
+    fn a_minute_ago() -> u64 {
+        SystemClock.now().as_millis() / 1_000 - 60
+    }
+
+    /// From 0.8 one entry a node can't read makes the whole list unusable: a case absent or
+    /// unknown to it (prost reads both as none), or another fleet's principal. Every token is
+    /// refused with `UNAVAILABLE` until a list it reads wholly arrives; certificates keep
+    /// working. Skipping the entry, as 0.7 did, would accept the tokens it refuses.
+    #[tokio::test]
+    async fn unreadable_entry_makes_every_token_unavailable_until_a_readable_list_arrives()
+    -> TestResult {
+        let node = Node::start(vec![token_entry("old-1")]).await?;
+        node.hear(vec![token_entry("old-1")], |list| list.entries() == Some(1))
+            .await?;
+        let root = node.root("root-42", a_minute_ago())?;
+        node.resolve(&root)?;
+
+        let unreadable = [
+            Revocation {
+                revoked: None,
+                until_ms: u64::MAX,
+            },
+            principal_entry(Some("other"), "agent-99", 1),
+            token_entry("not a token id"),
+        ];
+        for entry in unreadable {
+            node.hear(vec![token_entry("old-1"), entry.clone()], |list| {
+                list.load()
+                    .is_err_and(|unusable| unusable.entry().index() == 1)
+            })
+            .await?;
+            let refused = node.resolve(&root).expect_err("an unusable list");
+            assert_eq!(refused.code(), Code::Unavailable, "{entry:?}: {refused:?}");
+            assert_eq!(
+                refused.message(),
+                "this node's token denylist holds an entry it can't read; retry"
+            );
+            node.authorizer
+                .resolve(&Peer::Principal("agent-42".parse()?), None)
+                .map_err(|status| format!("a certificate still works: {status}"))?;
+            // A readable list brings tokens back.
+            node.hear(vec![token_entry("old-1")], |list| list.entries() == Some(1))
+                .await?;
+            node.resolve(&root)?;
+        }
+        node.stop().await;
+        Ok(())
+    }
+
+    /// While the list is unusable, a client certificate still authenticates as before: only
+    /// tokens depend on the denylist, as for a stale list (ADR-0026, point 6).
+    #[tokio::test]
+    async fn certificates_keep_working_with_an_unusable_list() -> TestResult {
+        let node = Node::start(vec![Revocation {
+            revoked: None,
+            until_ms: u64::MAX,
+        }])
+        .await?;
+        node.hear(
+            vec![Revocation {
+                revoked: None,
+                until_ms: u64::MAX,
+            }],
+            |list| list.age().is_some() && list.load().is_err(),
+        )
+        .await?;
+        let caller = node
+            .authorizer
+            .resolve(&Peer::Principal("agent-42".parse()?), None)?;
+        assert_eq!(
+            caller.carriage(),
+            None,
+            "a certificate's caller: {caller:?}"
+        );
+        let root = node.root("root-42", a_minute_ago())?;
+        let refused = node.resolve(&root).expect_err("an unusable list");
+        assert_eq!(refused.code(), Code::Unavailable);
+        node.stop().await;
+        Ok(())
+    }
+
+    /// A principal entry heard from the control plane refuses tokens by point 3's comparison,
+    /// with the leeway by signer: a root token issued up to 30 s after `before` is refused and
+    /// one 31 s after is not; a delegated token issued at `before` is refused and one a second
+    /// later is not.
+    #[tokio::test]
+    async fn heard_principal_entry_refuses_by_the_leeway_of_the_signer() -> TestResult {
+        let before = a_minute_ago();
+        let node = Node::start(Vec::new()).await?;
+        node.hear(
+            vec![principal_entry(None, "agent-42", before * 1_000)],
+            |list| list.entries() == Some(1),
+        )
+        .await?;
+        let cases = [
+            (
+                "root issued 29 s after",
+                node.root("root-a", before + 29)?,
+                true,
+            ),
+            (
+                "root issued 30 s after",
+                node.root("root-b", before + 30)?,
+                true,
+            ),
+            (
+                "root issued 31 s after",
+                node.root("root-c", before + 31)?,
+                false,
+            ),
+            ("child issued at before", node.child(before)?, true),
+            ("child issued 1 s after", node.child(before + 1)?, false),
+        ];
+        for (case, token, refused) in cases {
+            match node.resolve(&token) {
+                Err(status) if refused => {
+                    assert_eq!(status.code(), Code::Unauthenticated, "{case}: {status:?}");
+                    assert_eq!(status.message(), "the token is revoked", "{case}");
+                }
+                Ok(()) if !refused => {}
+                other => panic!("{case}: {other:?}"),
+            }
+        }
+        node.stop().await;
         Ok(())
     }
 }
