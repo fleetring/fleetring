@@ -564,10 +564,10 @@ fn a_context_and_an_agent_identity_from_0_7_still_read() -> TestResult {
     );
     let shown = run(&["agent", "show", "42"])?;
     for line in [
-        "principal    agent-42",
-        "fleet        legacy",
-        "scopes       admin:agent-42-*",
-        "cert expires 2126-10-21T02:11:47Z",
+        "principal     agent-42",
+        "fleet         legacy",
+        "scopes        admin:agent-42-*",
+        "cert expires  2126-10-21T02:11:47Z",
     ] {
         assert!(shown.contains(line), "{line}: {shown}");
     }
