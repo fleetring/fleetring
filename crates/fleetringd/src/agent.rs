@@ -1396,7 +1396,8 @@ impl AgentDir {
             token = Some((issued, id, expires_at));
         }
         if renewal.certificate() {
-            let issued = authority.issue_client(&principal, Validity::new(now, spec.cert_ttl))?;
+            let issued =
+                authority.issue_client(&principal, Validity::issued_at(now, spec.cert_ttl))?;
             let lifetime =
                 Millis::new(u64::try_from(spec.cert_ttl.as_millis()).unwrap_or(u64::MAX));
             write_private(&self.ca_file(), authority.certificate_pem().as_bytes())?;

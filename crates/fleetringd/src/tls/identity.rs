@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use rustls::crypto::CryptoProvider;
+use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject as _;
@@ -176,8 +177,7 @@ impl Loaded {
             roots.add(authority)?;
         }
         let roots = Arc::new(roots);
-        let verifier =
-            WebPkiClientVerifier::builder_with_provider(Arc::clone(&roots), provider()).build()?;
+        let verifier = client_verifier(&roots)?;
         let mut server = ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(verifier)
@@ -250,6 +250,14 @@ fn token_key(certificate: &CertificateDer<'_>) -> Option<VerifyingKey> {
         return None;
     }
     VerifyingKey::from_raw(key.subject_public_key.as_ref())
+}
+
+/// How the node's listener checks a client's certificate: against `roots`, at the node's own
+/// time, with no leeway of its own.
+fn client_verifier(
+    roots: &Arc<RootCertStore>,
+) -> Result<Arc<dyn ClientCertVerifier>, VerifierBuilderError> {
+    WebPkiClientVerifier::builder_with_provider(Arc::clone(roots), provider()).build()
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -427,6 +435,65 @@ mod tests {
     use crate::tls::{Authority, Validity};
 
     const CENTURY: Duration = Duration::from_secs(36_500 * 24 * 60 * 60);
+
+    /// A client certificate issued with [`Validity::issued_at`] passes the node's check at once
+    /// on a node whose clock is up to 30 seconds behind the issuer's, as after a wall clock
+    /// steps back; one that starts at its issuing is refused there until the node's clock
+    /// reaches it.
+    #[test]
+    fn a_client_certificate_is_accepted_by_a_node_whose_clock_is_behind() {
+        use rustls_pki_types::UnixTime;
+
+        let fleet: FleetName = "test".parse().expect("a fleet");
+        let authority =
+            Authority::create(fleet, Validity::new(Timestamp::ZERO, CENTURY)).expect("authority");
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::from_pem_slice(authority.certificate_pem().as_bytes())
+                    .expect("the authority's PEM"),
+            )
+            .expect("a root");
+        let verifier = client_verifier(&Arc::new(roots)).expect("a verifier");
+        let issued_ms: u64 = 1_800_000_000_250;
+        let issued = Timestamp::from_millis(issued_ms);
+        let principal = "agent-42".parse().expect("a principal");
+        let lifetime = Duration::from_secs(24 * 60 * 60);
+        let check = |validity: Validity, behind: Duration| {
+            let certificate = authority
+                .issue_client(&principal, validity)
+                .expect("a client certificate");
+            let der = CertificateDer::from_pem_slice(certificate.certificate_pem().as_bytes())
+                .expect("the certificate's PEM");
+            let node_time = Duration::from_millis(issued_ms) - behind;
+            verifier
+                .verify_client_cert(&der, &[], UnixTime::since_unix_epoch(node_time))
+                .map(|_| ())
+        };
+        for behind in [
+            Duration::ZERO,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        ] {
+            assert_eq!(
+                check(Validity::issued_at(issued, lifetime), behind),
+                Ok(()),
+                "{behind:?} behind"
+            );
+        }
+        assert!(
+            check(
+                Validity::issued_at(issued, lifetime),
+                Duration::from_secs(31)
+            )
+            .is_err(),
+            "accepted 31 s behind"
+        );
+        assert!(
+            check(Validity::new(issued, lifetime), Duration::from_secs(2)).is_err(),
+            "a certificate that starts at its issuing was accepted 2 s before it"
+        );
+    }
 
     /// A replacement authority bundle of the same size, written with the same modification time,
     /// is still noticed: the stamp is the files' contents, and the bundle decides which issuer

@@ -711,14 +711,16 @@ pub fn prepare(dir: &Path, port: Option<u16>, now: Timestamp) -> Result<Prepared
     let authority = match loaded {
         Some(authority) => authority,
         None => {
-            let authority =
-                Authority::create(name(FLEET)?, Validity::new(now, DEFAULT_AUTHORITY_LIFETIME))?;
+            let authority = Authority::create(
+                name(FLEET)?,
+                Validity::issued_at(now, DEFAULT_AUTHORITY_LIFETIME),
+            )?;
             authority.write(&tls)?;
             created.push(Created::Authority);
             authority
         }
     };
-    let leaf = Validity::new(now, LEAF_LIFETIME);
+    let leaf = Validity::issued_at(now, LEAF_LIFETIME);
     if node == Pair::Absent {
         let names: Vec<String> = LOOPBACK_NAMES.iter().map(|&name| name.to_owned()).collect();
         authority

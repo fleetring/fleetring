@@ -3351,7 +3351,7 @@ async fn revoke_principal(
 
 /// Runs a `cert` command and returns what it wrote.
 fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
-    let validity = |ttl| Validity::new(SystemClock.now(), ttl);
+    let validity = |ttl| Validity::issued_at(SystemClock.now(), ttl);
     match command {
         CertCommand::Init { fleet, dir, ttl } => {
             let authority = Authority::create(
@@ -3426,8 +3426,10 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
             let authority = agent::load_authority(&dir)?;
             // The certificate starts now, with no backdating, so its lifetime is the whole of
             // what the 90-day cap counts (ADR-0047, point 1.2).
-            let issued =
-                authority.issue_issuer(&name, validity(ttl.unwrap_or(DEFAULT_ISSUER_LIFETIME)))?;
+            let issued = authority.issue_issuer(
+                &name,
+                Validity::new(SystemClock.now(), ttl.unwrap_or(DEFAULT_ISSUER_LIFETIME)),
+            )?;
             let into = match out {
                 Some(out) => {
                     if let Some(warning) = agent::prepare_out_dir(&out)? {
