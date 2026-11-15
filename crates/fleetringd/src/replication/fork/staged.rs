@@ -7,6 +7,8 @@
 //!     sidecar.json     the identity, the attempt, the position, the chain hash, the stamped
 //!                      source incarnation, the stream's size and checksum, the files in stream
 //!                      order, and log epoch 0
+//!     installing       present from just before the copy is moved into the database's place
+//!                      until `installed` is written
 //!     installed        present once the copy was moved into the database's place
 //! ```
 //!
@@ -17,6 +19,12 @@
 //! reported, so the scan at start removes it, with every `.tmp` entry. A sidecar whose `copy/`
 //! is gone, without `installed`, describes a lost copy, which the node reports as such and never
 //! opens.
+//!
+//! An install writes `installing` durably before it moves `copy/` into the database's place, and
+//! `installed` after. A crash between the move and `installed` leaves `installing` without
+//! `copy/`: the copy is in the database's place, and the scan at start records it as installed,
+//! so the node records its incarnation then (ADR-0046, amendment item 9). `installing` beside
+//! `copy/` means the move never happened, and the scan removes it.
 //!
 //! The store deletes a staged directory only when told to, on a positive signal for its own
 //! identity (ADR-0046, point 4.6, and ADR-0042), or at an operator's request for an orphan.
@@ -44,6 +52,9 @@ const COPY: &str = "copy";
 const SIDECAR: &str = "sidecar.json";
 /// Present once the copy was moved into the database's place.
 const INSTALLED: &str = "installed";
+/// Present from just before the copy is moved into the database's place until [`INSTALLED`] is
+/// written: the intent that tells a crash after the move from a lost copy.
+const INSTALLING: &str = "installing";
 /// The suffix of everything not committed yet.
 const TEMPORARY: &str = ".tmp";
 
@@ -262,6 +273,7 @@ impl StagedStore {
             if sidecar {
                 match read_sidecar(&dir) {
                     Some(staged) => {
+                        settle_install(&dir, staged.held);
                         found.insert(staged.sidecar.key.clone(), staged);
                     }
                     None => {
@@ -429,40 +441,85 @@ impl StagedStore {
     }
 
     /// Moves `key`'s staged files to `location`, the database's place, which must hold nothing,
-    /// and records durably that they were moved. Should anything fail once they are moved, they
-    /// are moved back, or, if that fails too, removed from `location`: a copy is never left in the
-    /// database's place without the record that it came from here. It blocks on the file system.
+    /// and records durably that they were moved: [`move_into_place`](Self::move_into_place), then
+    /// [`record_moved`](Self::record_moved). It blocks on the file system.
+    ///
+    /// # Errors
+    ///
+    /// As the two steps'.
+    #[cfg(test)]
+    pub(crate) fn install(&self, key: &StagedKey, location: &Path) -> io::Result<()> {
+        self.move_into_place(key, location)?;
+        self.record_moved(key, location)
+    }
+
+    /// Moves `key`'s staged files to `location`, the database's place, which must hold nothing,
+    /// after writing durably that it is about to: a crash once they are moved, before
+    /// [`record_moved`](Self::record_moved), leaves the intent beside the sidecar, and the scan at
+    /// the next start counts the copy as installed rather than lost. It blocks on the file system.
     ///
     /// # Errors
     ///
     /// [`io::ErrorKind::AlreadyExists`] if `location` holds something, and the I/O error of the
-    /// step that failed otherwise.
-    pub(crate) fn install(&self, key: &StagedKey, location: &Path) -> io::Result<()> {
+    /// step that failed otherwise; the files are then where they were, and the intent is removed.
+    pub(crate) fn move_into_place(&self, key: &StagedKey, location: &Path) -> io::Result<()> {
         if location.try_exists()? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("{} holds a copy", location.display()),
             ));
         }
+        let dir = key.dir(&self.root);
         let copy = self.copy_dir(key);
         let parent = location
             .parent()
             .map_or_else(PathBuf::new, Path::to_path_buf);
         fs::create_dir_all(&parent)?;
-        fs::rename(&copy, location)?;
-        let recorded = sync_dir(&parent)
-            .and_then(|()| copy.parent().map_or(Ok(()), sync_dir))
-            .and_then(|()| self.installed(key));
-        if let Err(error) = recorded {
+        File::create(dir.join(INSTALLING))?.sync_all()?;
+        sync_dir(&dir)?;
+        let moved = fs::rename(&copy, location)
+            .and_then(|()| sync_dir(&parent))
+            .and_then(|()| sync_dir(&dir));
+        if let Err(error) = moved {
+            if !copy.exists() && location.exists() {
+                // Moved, but not durably known to be: put it back before the intent goes.
+                if let Err(undo) = fs::rename(location, &copy) {
+                    tracing::error!(location = %location.display(), %undo, "can't move a staged copy back after its move failed; removing it from the database's place");
+                    remove_dir_if_present(location)?;
+                }
+            }
+            remove_intent(&dir);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Records durably that `key`'s files were moved to `location` by
+    /// [`move_into_place`](Self::move_into_place). Should that fail, they are moved back, or, if
+    /// that fails too, removed from `location`: a copy is never left in the database's place
+    /// without the record that it came from here. It blocks on the file system.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of the record.
+    pub(crate) fn record_moved(&self, key: &StagedKey, location: &Path) -> io::Result<()> {
+        let dir = key.dir(&self.root);
+        let copy = self.copy_dir(key);
+        let parent = location
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        if let Err(error) = self.installed(key) {
             let undone = fs::rename(location, &copy)
                 .and_then(|()| sync_dir(&parent))
-                .and_then(|()| copy.parent().map_or(Ok(()), sync_dir));
+                .and_then(|()| sync_dir(&dir));
             if let Err(undo) = undone {
                 tracing::error!(location = %location.display(), %undo, "can't move a staged copy back after its install failed; removing it from the database's place");
                 remove_dir_if_present(location)?;
             }
+            remove_intent(&dir);
             return Err(error);
         }
+        remove_intent(&dir);
         Ok(())
     }
 
@@ -489,10 +546,12 @@ impl StagedStore {
             remove_dir_if_present(location)?;
             return Ok(());
         }
-        match fs::remove_file(dir.join(INSTALLED)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        for marker in [INSTALLED, INSTALLING] {
+            match fs::remove_file(dir.join(marker)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         sync_dir(&dir)?;
         if let Some(staged) = self.lock().get_mut(key) {
@@ -612,10 +671,49 @@ fn read_sidecar(dir: &Path) -> Option<Staged> {
         Held::Installed
     } else if dir.join(COPY).is_dir() {
         Held::Present
+    } else if dir.join(INSTALLING).exists() {
+        // Moved into the database's place by an install that a crash stopped before its record.
+        Held::Installed
     } else {
         Held::Lost
     };
     Some(Staged { sidecar, held })
+}
+
+/// Settles, at start, the markers an install that a crash stopped left in `dir`, whose copy
+/// [`read_sidecar`] found `held`: an intent beside the copy's files is an install that never
+/// moved them, and goes; an intent without them is an install that moved them and wrote no
+/// record, which is written now, so the copy is installed from here on. Best effort: whatever
+/// can't be settled now reads the same at the next start.
+fn settle_install(dir: &Path, held: Held) {
+    if !dir.join(INSTALLING).exists() {
+        return;
+    }
+    if held == Held::Installed && !dir.join(INSTALLED).exists() {
+        tracing::warn!(dir = %dir.display(), "a staged copy was moved into its database's place by an install a crash stopped; recording it as installed");
+        let recorded = File::create(dir.join(INSTALLED))
+            .and_then(|file| file.sync_all())
+            .and_then(|()| sync_dir(dir));
+        if let Err(error) = recorded {
+            tracing::warn!(dir = %dir.display(), %error, "can't record an interrupted install; it reads the same at the next start");
+            return;
+        }
+    }
+    remove_intent(dir);
+}
+
+/// Removes the install intent in `dir`, best effort: one left beside the copy's files, or beside
+/// `installed`, reads as nothing more than they do.
+fn remove_intent(dir: &Path) {
+    match fs::remove_file(dir.join(INSTALLING)) {
+        Ok(()) => {
+            let _ = sync_dir(dir);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "can't remove a staged copy's install intent");
+        }
+    }
 }
 
 /// The size and XXH3-128 checksum of the stream that packs `files`, in order, from `dir`: what
@@ -850,6 +948,60 @@ mod tests {
             Some(first.fork.incarnation)
         );
         assert!(location(&name).join("data.db").is_file());
+    }
+
+    /// A crash after an install moved the copy into the database's place, before it recorded
+    /// the move, leaves the intent without the copy's files: the next start reads the copy as
+    /// installed, not lost, records it so, and the start's recovery then records its
+    /// incarnation, so a later database of the name never opens it as its own (ADR-0046,
+    /// amendment item 9). An intent beside the files is an install that never moved them.
+    #[test]
+    fn a_crash_between_the_move_and_its_record_leaves_an_installed_copy() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = StagedStore::new(dir.path().join("staged"));
+        let first = key(1);
+        stage(&store, &first, b"hello");
+        let databases = dir.path().join("databases");
+        let location = |name: &DatabaseName| databases.join(name.as_str().replace('/', "_"));
+        let name = first.fork.name.clone();
+        store
+            .move_into_place(&first, &location(&name))
+            .expect("moved");
+        // The crash: nothing after the move ran.
+        let staged_dir = first.dir(store.root());
+        assert!(staged_dir.join(INSTALLING).is_file());
+        assert!(!staged_dir.join(INSTALLED).exists());
+
+        let again = StagedStore::new(dir.path().join("staged"));
+        again.scan();
+        assert_eq!(
+            again.get(&first).map(|staged| staged.held),
+            Some(Held::Installed),
+            "the intent without the files is an install, not a lost copy"
+        );
+        assert!(staged_dir.join(INSTALLED).is_file(), "recorded at the scan");
+        assert!(!staged_dir.join(INSTALLING).exists(), "the intent goes");
+        let epochs = crate::replication::epochs::Epochs::new(dir.path().join("epochs"));
+        assert!(epochs.never_recorded(&name));
+        crate::replication::fork::record_installed(&epochs, &again, location);
+        assert_eq!(
+            epochs.record(&name).incarnation(),
+            Some(first.fork.incarnation),
+            "the start records the copy's incarnation"
+        );
+
+        // An intent beside the files: the move never happened, and the copy is staged.
+        let second = key(2);
+        stage(&store, &second, b"world");
+        let second_dir = second.dir(store.root());
+        File::create(second_dir.join(INSTALLING)).expect("an intent");
+        let again = StagedStore::new(dir.path().join("staged"));
+        again.scan();
+        assert_eq!(
+            again.get(&second).map(|staged| staged.held),
+            Some(Held::Present)
+        );
+        assert!(!second_dir.join(INSTALLING).exists(), "a stale intent goes");
     }
 
     #[test]

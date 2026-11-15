@@ -78,6 +78,10 @@ pub enum FaultPoint {
     /// the directory yet: a crash here leaves the copy committed, and a power loss may undo the
     /// rename.
     StagingUnsynced,
+    /// A node has moved a fork's staged copy into the database's place and synced it, and hasn't
+    /// recorded the move beside the copy's sidecar, nor the copy's incarnation: a crash here
+    /// leaves the copy in place with only the install's intent.
+    InstallMoved,
 }
 
 /// The fault hooks a daemon's fork work passes through.
