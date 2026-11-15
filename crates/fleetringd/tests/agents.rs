@@ -2723,6 +2723,64 @@ async fn a_running_child_server_uses_the_token_its_parent_renews() -> TestResult
     Ok(())
 }
 
+// `agent renew <child>` run again after a crash that wrote the new token, before the record and
+// the operation file, resends the same operation and gets the same delegation back. It revokes
+// the token the first run replaced, never the one it wrote, whether the first run kept the
+// replaced token beside the operation ID or, as before this release, didn't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_renewal_run_again_after_a_crash_keeps_the_token_it_wrote() -> TestResult {
+    let machine = Machine::new()?;
+    machine.ok(&["agent", "add", "42"])?;
+    let output = delegate(&machine, "42.c7", &[])?;
+    assert!(output.status.success(), "{}", printed(&output));
+    let certificate = copy_certificate(&machine, "42")?;
+    let dir = machine.agent_dir("42.c7");
+    for kept in [true, false] {
+        let old = machine.token("42.c7")?;
+        let old_record = fs::read_to_string(dir.join("identity.toml"))?;
+        machine.ok(&["agent", "renew", "42.c7"])?;
+        let new = machine.token("42.c7")?;
+        assert_ne!(new, old);
+        let renewed = machine.record("42.c7")?;
+        let operation = renewed["operation"]
+            .as_str()
+            .ok_or("no operation")?
+            .to_owned();
+        // The crash, as the first run left it: the new token, the old record, the operation ID,
+        // and the token it replaced beside it.
+        fs::write(dir.join("identity.toml"), &old_record)?;
+        fs::write(dir.join("operation"), format!("{operation}\n"))?;
+        if kept {
+            let expires = claims(&old)?["exp"].as_u64().ok_or("no exp")? * 1_000;
+            fs::write(
+                dir.join("replaces"),
+                format!("{} {expires}\n", token_id(&old)?),
+            )?;
+        }
+        let again = machine.run(&["agent", "renew", "42.c7"])?;
+        assert!(again.status.success(), "{}", printed(&again));
+        assert!(
+            stderr(&again).contains(&format!("resending operation {operation}")),
+            "{}",
+            printed(&again)
+        );
+        assert_eq!(
+            machine.token("42.c7")?,
+            new,
+            "the same delegation, re-signed"
+        );
+        let listed = list_with_token(&machine, certificate.path(), &new)?;
+        assert!(
+            listed.status.success(),
+            "kept={kept}: the renewed token still works: {}",
+            printed(&listed)
+        );
+        wait_until_revoked(&machine, certificate.path(), &old)?;
+        assert!(!dir.join("operation").exists() && !dir.join("replaces").exists());
+    }
+    Ok(())
+}
+
 // FR-092 (B3): an agent's refusal says to ask its parent or the operator, never to look for
 // other credentials, and the fork refusal no longer speaks of a fork action yet to ship.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

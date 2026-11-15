@@ -72,6 +72,10 @@ const REPLACEMENT_FILE_PREFIX: &str = ".mint-after-";
 /// record is written (ADR-0047, point 10).
 const OPERATION_FILE: &str = "operation";
 
+/// The token an interrupted `agent renew` of a delegated agent replaces, beside its operation ID:
+/// its ID and expiry, `<id> <expires_at_ms>`, read under the lock before anything was sent.
+const REPLACES_FILE: &str = "replaces";
+
 /// The newest `identity.toml` format this release reads and writes (ADR-0044, point 1.7).
 ///
 /// Version 2 adds `scopes_from`, and a delegated agent's record: `issued_by = "delegation"`, with
@@ -1474,12 +1478,21 @@ pub(crate) struct Pending {
     _lock: File,
     operation: OperationId,
     from: OperationFrom,
+    /// For a renewal, the token it replaces, as it was before the operation was first sent.
+    replaces: Option<OldToken>,
 }
 
 impl Pending {
     /// The operation ID the request carries.
     pub(crate) fn operation(&self) -> OperationId {
         self.operation
+    }
+
+    /// For a renewal, the token it replaces: read under the lock when the operation was first
+    /// written, and kept beside it, so a run after a crash revokes the token the renewal
+    /// replaced, never the one it wrote.
+    pub(crate) fn replaces(&self) -> Option<&OldToken> {
+        self.replaces.as_ref()
     }
 
     /// Where the operation ID came from.
@@ -1616,30 +1629,53 @@ impl DelegatedDir {
 
     /// Locks the directory of an identity `agent renew` delegates again, and returns the
     /// operation ID to ask under: one an earlier renewal that didn't finish left there, or else a
-    /// new one, written into the directory before this returns. [`finish`](Self::finish) then
-    /// writes the new token and record over the old.
+    /// new one, written into the directory before this returns. With a new one, it reads the
+    /// token the renewal replaces, under the lock, and keeps its ID and expiry beside the
+    /// operation ID; with an earlier one, it reads them back, so a run after a crash that wrote
+    /// the new token already still revokes the old one. [`finish`](Self::finish) then writes the
+    /// new token and record over the old.
     ///
     /// # Errors
     ///
-    /// [`AgentError::NoDelegated`] if the directory holds no record, and the errors of locking,
-    /// reading, and writing.
-    pub(crate) fn begin_renewal(&self) -> Result<Pending, AgentError> {
+    /// [`AgentError::NoDelegated`] if the directory holds no record, [`AgentError::Link`] if it is
+    /// a symbolic link, and the errors of locking, reading, and writing.
+    pub(crate) fn begin_renewal(&self, now: Timestamp) -> Result<Pending, AgentError> {
         let no_record = || AgentError::NoDelegated {
             id: self.id.to_string(),
             dir: self.dir.clone(),
         };
+        refuse_link(&self.dir)?;
         if !self.dir.is_dir() {
             return Err(no_record());
         }
         let lock = lock_file(&self.dir)?;
-        if self.record()?.is_none() {
+        let Some(record) = self.record()? else {
             return Err(no_record());
-        }
+        };
         let (operation, from) = self.operation_to_ask(None)?;
+        let replaces_file = self.dir.join(REPLACES_FILE);
+        let replaces = match from {
+            OperationFrom::New => {
+                let old = self.old_token(&record, now);
+                write_private(
+                    &replaces_file,
+                    format!("{} {}\n", old.id, old.until.as_millis()).as_bytes(),
+                )?;
+                sync_dir(&self.dir)?;
+                old
+            }
+            // A crash before the file was written left the token unwritten too, and one from a
+            // release that wrote no such file is caught by the caller's check of the answer's
+            // delegation ID.
+            OperationFrom::Earlier => {
+                read_replaces(&replaces_file).unwrap_or_else(|| self.old_token(&record, now))
+            }
+        };
         Ok(Pending {
             _lock: lock,
             operation,
             from,
+            replaces: Some(replaces),
         })
     }
 
@@ -1670,6 +1706,7 @@ impl DelegatedDir {
             _lock: lock,
             operation,
             from,
+            replaces: None,
         })
     }
 
@@ -1772,20 +1809,27 @@ impl DelegatedDir {
             lifetime_ms: delegation.lifetime_ms,
         };
         write_record(&self.dir, &self.record_file(), self.id.as_str(), &record)?;
-        match fs::remove_file(self.operation_file()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(AgentError::File {
-                    action: "remove",
-                    path: self.operation_file(),
-                    source,
-                });
-            }
-        }
-        sync_dir(&self.dir)?;
+        self.forget_operation()?;
         drop(pending);
         Ok(record)
+    }
+
+    /// Removes the operation ID, and what a renewal kept beside it, under the lock.
+    fn forget_operation(&self) -> Result<(), AgentError> {
+        for path in [self.operation_file(), self.dir.join(REPLACES_FILE)] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(AgentError::File {
+                        action: "remove",
+                        path,
+                        source,
+                    });
+                }
+            }
+        }
+        sync_dir(&self.dir)
     }
 
     /// Gives `pending` up after the control plane refused it, recording nothing: removes the
@@ -1796,18 +1840,7 @@ impl DelegatedDir {
     ///
     /// [`AgentError::File`] if the operation ID can't be removed.
     pub(crate) fn abandon(&self, pending: Pending) -> Result<(), AgentError> {
-        match fs::remove_file(self.operation_file()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(AgentError::File {
-                    action: "remove",
-                    path: self.operation_file(),
-                    source,
-                });
-            }
-        }
-        sync_dir(&self.dir)?;
+        self.forget_operation()?;
         drop(pending);
         Ok(())
     }
@@ -1858,6 +1891,18 @@ fn old_token_in(path: &Path, record: &AgentRecord, now: Timestamp) -> OldToken {
             }
         }
     }
+}
+
+/// The token an interrupted renewal replaces, as [`DelegatedDir::begin_renewal`] kept it in
+/// `path`, or `None` if it is missing or unreadable.
+fn read_replaces(path: &Path) -> Option<OldToken> {
+    let text = fs::read_to_string(path).ok()?;
+    let (id, until) = text.trim().split_once(' ')?;
+    let until = until.parse::<u64>().ok()?;
+    (!id.is_empty()).then(|| OldToken {
+        id: id.to_owned(),
+        until: Timestamp::from_millis(until),
+    })
 }
 
 /// The token in `path`, trimmed.
@@ -3113,23 +3158,26 @@ mod tests {
             Access::ReadWrite,
         );
         let dir = DelegatedDir::new(root.path(), delegated("42.c7"));
+        let now = Timestamp::from_millis(1_000);
         assert!(matches!(
-            dir.begin_renewal(),
+            dir.begin_renewal(now),
             Err(AgentError::NoDelegated { .. })
         ));
         let pending = dir.begin(None)?;
         let first = pending.operation();
         let record = dir.finish(pending, delegation(&dir, parent.clone()))?;
-        let renewal = dir.begin_renewal()?;
+        let renewal = dir.begin_renewal(now)?;
         assert_ne!(renewal.operation(), first);
         let second = renewal.operation();
         drop(renewal);
         // An interrupted renewal is resent under its own operation ID.
-        let again = dir.begin_renewal()?;
+        let replaced = renewal_replaces(&dir, now)?;
+        let again = dir.begin_renewal(now)?;
         assert_eq!(
             (again.operation(), again.from()),
             (second, OperationFrom::Earlier)
         );
+        assert_eq!(again.replaces(), Some(&replaced));
         let renewed = dir.finish(
             again,
             Delegation {
@@ -3141,6 +3189,60 @@ mod tests {
         assert_eq!(renewed.operation, Some(second.to_string()));
         assert_ne!(renewed.operation, record.operation);
         assert!(!dir.operation_file().exists());
+        assert!(!dir.dir().join(REPLACES_FILE).exists());
+        Ok(())
+    }
+
+    /// What the first run of an interrupted renewal kept as the token it replaces.
+    fn renewal_replaces(dir: &DelegatedDir, now: Timestamp) -> Result<OldToken, AgentError> {
+        let record = dir.record()?.ok_or(AgentError::NoDelegated {
+            id: dir.id().to_string(),
+            dir: dir.dir().to_owned(),
+        })?;
+        Ok(read_replaces(&dir.dir().join(REPLACES_FILE))
+            .unwrap_or_else(|| dir.old_token(&record, now)))
+    }
+
+    /// A renewal run again after a crash that wrote the new token, before the record and the
+    /// operation file: it resends under the same operation, and replaces the token the first
+    /// run read, never the one it wrote. A directory that is a symbolic link is refused.
+    #[test]
+    fn a_renewal_after_a_crash_replaces_the_token_it_first_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let parent = record_with(
+            &["admin:agent-42-*"],
+            ScopesFrom::Defaults,
+            Access::ReadWrite,
+        );
+        let dir = DelegatedDir::new(root.path(), delegated("42.c7"));
+        let now = Timestamp::from_millis(1_000);
+        let record = dir.finish(dir.begin(None)?, delegation(&dir, parent))?;
+        let first = dir.begin_renewal(now)?;
+        let old = first
+            .replaces()
+            .cloned()
+            .ok_or("a renewal replaces a token")?;
+        assert_eq!(old, dir.old_token(&record, now));
+        let operation = first.operation();
+        // The crash: the new token is written, nothing after it.
+        fs::write(dir.token_file(), "a.new.token\n")?;
+        drop(first);
+        let again = dir.begin_renewal(now)?;
+        assert_eq!(again.operation(), operation);
+        assert_eq!(again.replaces(), Some(&old), "the token the first run read");
+        drop(again);
+
+        let link = root.path().join("42.c8");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.dir(), &link)?;
+            let linked = DelegatedDir::new(root.path(), delegated("42.c8"));
+            assert!(matches!(
+                linked.begin_renewal(now),
+                Err(AgentError::Link { .. })
+            ));
+        }
         Ok(())
     }
 

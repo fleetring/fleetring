@@ -877,8 +877,9 @@ fn dev_admin(checked: &DevChecked) -> Result<Client, Box<dyn Error>> {
 enum Revocation {
     /// The fleet refuses the token until this time, as the control node answered.
     Until(Timestamp),
-    /// The token had expired already, so there was nothing to revoke.
-    Expired,
+    /// The fleet refused the token itself, presented to revoke itself: it has expired or was
+    /// revoked already, by the control node's judgement, so there was nothing left to revoke.
+    Refused,
 }
 
 impl Revocation {
@@ -890,20 +891,42 @@ impl Revocation {
                 token.id,
                 format_time(until.as_millis())
             ),
-            Self::Expired => format!("token {} had expired already", token.id),
+            Self::Refused => format!(
+                "the fleet refuses token {} already: it has expired or was revoked",
+                token.id
+            ),
         }
     }
 }
 
+/// Whose token a revocation's client presents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presenting {
+    /// The token being revoked, revoking itself.
+    Itself,
+    /// Another identity's: one with `fleet`, or an ancestor's.
+    Another,
+}
+
 /// Revokes `token` through `client` by its ID until the token itself expires, which
 /// [`OldToken`] reads from the token, never from `identity.toml`. With `fleet` the entry lasts
-/// as asked; under the ancestor rule the control plane chooses.
-async fn revoke(client: &Client, token: &OldToken) -> Result<Revocation, Unanswered> {
-    if token.until <= SystemClock.now() {
-        return Ok(Revocation::Expired);
+/// as asked; under the ancestor rule the control plane chooses. It always asks: the control
+/// node, not this machine's clock, judges whether the token still needs revoking, and a token
+/// that revokes itself and is refused as unauthenticated has nothing left to revoke.
+async fn revoke(
+    client: &Client,
+    token: &OldToken,
+    presenting: Presenting,
+) -> Result<Revocation, Unanswered> {
+    match revoke::send_revocation(client, &revoke::token_request(token)).await {
+        Ok(answer) => Ok(Revocation::Until(Timestamp::from_millis(answer.until_ms))),
+        Err(Unanswered::Refused(status))
+            if presenting == Presenting::Itself && status.code() == Code::Unauthenticated =>
+        {
+            Ok(Revocation::Refused)
+        }
+        Err(unanswered) => Err(unanswered),
     }
-    let answer = revoke::send_revocation(client, &revoke::token_request(token)).await?;
-    Ok(Revocation::Until(Timestamp::from_millis(answer.until_ms)))
 }
 
 /// What `agent renew` says, before it revokes the token it replaced as the agent itself: the
@@ -924,7 +947,7 @@ async fn revoke_replaced(
     old: &OldToken,
 ) -> bool {
     let by_fleet = match fleet_client {
-        Some(client) => Some(revoke(client, old).await),
+        Some(client) => Some(revoke(client, old, Presenting::Another).await),
         None => None,
     };
     let outcome = match by_fleet {
@@ -935,12 +958,9 @@ async fn revoke_replaced(
     let outcome = match outcome {
         Some(outcome) => outcome,
         None => {
-            // An expired token needs no request, so nothing is enabled.
-            if old.until > SystemClock.now() {
-                note(ANCESTOR_RULE_WARNING);
-            }
+            note(ANCESTOR_RULE_WARNING);
             match as_itself() {
-                Ok(client) => revoke(&client, old)
+                Ok(client) => revoke(&client, old, Presenting::Itself)
                     .await
                     .map_err(|unanswered| revoke::describe(&unanswered)),
                 Err(error) => Err(error.to_string()),
@@ -950,7 +970,7 @@ async fn revoke_replaced(
     match outcome {
         Ok(revocation) => {
             note(revocation.describe(old));
-            revocation != Revocation::Expired
+            revocation != Revocation::Refused
         }
         Err(error) => {
             note(format!(
@@ -1098,9 +1118,13 @@ async fn renew_delegated(
         &parent_token,
         situation.dev_control(),
     )?;
-    let old = dir.old_token(&record, SystemClock.now());
-
-    let pending = dir.begin_renewal()?;
+    // Read under the lock, and kept beside the operation ID: a run after a crash that wrote the
+    // new token already revokes the token the renewal replaced, not the one it wrote.
+    let pending = dir.begin_renewal(SystemClock.now())?;
+    let old = pending
+        .replaces()
+        .cloned()
+        .ok_or("a renewal names the token it replaces")?;
     let operation = pending.operation();
     match pending.from() {
         OperationFrom::Earlier => note(format!(
@@ -1171,25 +1195,16 @@ async fn renew_delegated(
     };
     let renewed = dir.finish(pending, delegation)?;
 
-    match revoke(&client, &old).await {
-        Ok(revocation) => {
-            note(revocation.describe(&old));
-            if revocation != Revocation::Expired
-                && let Some(ended) = revoke::ended_below(
-                    &revoke::local_descendants(&situation.agents_dir, id.as_str()),
-                    "renewing an agent never renews the agents below it: renew each with \
-                     `fleetring agent renew <id>`",
-                )
-            {
-                note(ended);
-            }
-        }
-        Err(unanswered) => note(format!(
-            "warning: couldn't revoke the old token {} ({}); it stays valid until {}",
-            old.id,
-            revoke::describe(&unanswered),
-            format_time(old.until.as_millis())
-        )),
+    if old.id == renewed.token_id {
+        // The control plane answered with the delegation the token file already holds: an
+        // earlier run wrote it, and the token it replaced was revoked then, or is named in
+        // `replaces` no longer. Revoking it would end the token just renewed.
+        note(format!(
+            "token {} is the renewed one, written by an earlier run; not revoking it",
+            old.id
+        ));
+    } else {
+        revoke_renewed(&client, &old, &situation, &id).await;
     }
     let capped = if capped {
         " (capped at the parent's expiry)"
@@ -1202,6 +1217,29 @@ async fn renew_delegated(
         renewed.scopes.join(", "),
         renewed.token_id
     ))
+}
+
+/// Revokes `old`, the delegated agent `id`'s token a renewal replaced, as its parent through
+/// `client`, and says what that ended below it; warns rather than fails if it can't.
+async fn revoke_renewed(client: &Client, old: &OldToken, situation: &Situation, id: &DelegatedId) {
+    match revoke(client, old, Presenting::Another).await {
+        Ok(revocation) => {
+            note(revocation.describe(old));
+            if let Some(ended) = revoke::ended_below(
+                &revoke::local_descendants(&situation.agents_dir, id.as_str()),
+                "renewing an agent never renews the agents below it: renew each with \
+                 `fleetring agent renew <id>`",
+            ) {
+                note(ended);
+            }
+        }
+        Err(unanswered) => note(format!(
+            "warning: couldn't revoke the old token {} ({}); it stays valid until {}",
+            old.id,
+            revoke::describe(&unanswered),
+            format_time(old.until.as_millis())
+        )),
+    }
 }
 
 /// What `agent renew` says about the scopes the new token carries.
@@ -1296,10 +1334,6 @@ async fn remove_root(
             ));
             (String::new(), String::new())
         }
-        Revoke::Required if token.until <= now => (
-            format!("{} and ", Revocation::Expired.describe(&token)),
-            String::new(),
-        ),
         Revoke::Required => {
             let principal = dir.id().principal().to_string();
             let refused = |error: String| {
@@ -1353,6 +1387,12 @@ async fn remove_root(
                         replacement,
                     )
                 }
+                // The control node refuses the token itself, so it has expired or was revoked:
+                // nothing is left that it could revoke as itself, or that needs revoking.
+                Err(Unanswered::Refused(status)) if status.code() == Code::Unauthenticated => (
+                    format!("{} and ", Revocation::Refused.describe(&token)),
+                    String::new(),
+                ),
                 Err(unanswered) if revoke::falls_back(&unanswered) => {
                     note(format!(
                         "warning: agent {} couldn't revoke itself as a principal ({}); revoking \
@@ -1361,7 +1401,7 @@ async fn remove_root(
                         revoke::describe(&unanswered)
                     ));
                     let client = fleet_client(&situation, target)?;
-                    let revocation = revoke(&client, &token)
+                    let revocation = revoke(&client, &token, Presenting::Another)
                         .await
                         .map_err(|unanswered| refused(revoke::describe(&unanswered)))?;
                     (
@@ -1495,14 +1535,12 @@ async fn remove_delegated(
             ));
             String::new()
         }
-        // Every agent below it expires no later than it does.
-        Revoke::Required if token.until <= now => {
-            format!("{} and ", Revocation::Expired.describe(&token))
-        }
-        Revoke::Required => {
-            let Some((ancestor, ancestor_token)) =
-                revoke::nearest_ancestor(&situation.agents_dir, &id, now)?
-            else {
+        Revoke::Required => match revoke::nearest_ancestor(&situation.agents_dir, &id, now)? {
+            // With no ancestor to ask as, this machine's clock is all there is: a token past its
+            // expiry, and every agent below it, which expires no later, is refused everywhere
+            // already. With one, the control node judges.
+            None if token.until <= now => format!("token {} had expired already, and ", token.id),
+            None => {
                 return Err(format!(
                     "can't revoke {principal} (no ancestor of agent {id} has a usable identity \
                      here to revoke it as), so nothing was removed\n  hint: if its root agent \
@@ -1511,22 +1549,24 @@ async fn remove_delegated(
                      can end it with `fleetring token revoke --principal {principal}`"
                 )
                 .into());
-            };
-            let client = target.client_as(
-                dir.root().identity()?,
-                &ancestor_token,
-                situation.dev_control(),
-            )?;
-            let answer =
-                revoke::send_revocation(&client, &revoke::principal_request(&principal, None))
-                    .await
-                    .map_err(|unanswered| refused(revoke::describe(&unanswered)))?;
-            let until = answer.principal_until_ms.unwrap_or(answer.until_ms);
-            format!(
-                "revoked {principal} and every agent below it until {}, as agent {ancestor}, and ",
-                format_time(until)
-            )
-        }
+            }
+            Some((ancestor, ancestor_token)) => {
+                let client = target.client_as(
+                    dir.root().identity()?,
+                    &ancestor_token,
+                    situation.dev_control(),
+                )?;
+                let answer =
+                    revoke::send_revocation(&client, &revoke::principal_request(&principal, None))
+                        .await
+                        .map_err(|unanswered| refused(revoke::describe(&unanswered)))?;
+                let until = answer.principal_until_ms.unwrap_or(answer.until_ms);
+                format!(
+                    "revoked {principal} and every agent below it until {}, as agent {ancestor}, and ",
+                    format_time(until)
+                )
+            }
+        },
     };
     dir.remove()?;
     if !revoked.is_empty()
