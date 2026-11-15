@@ -289,6 +289,8 @@ Before `apply` records a delegation, and before an issuer signs one, `TokenClaim
 
 An issuer's signer (`DelegationSigner::sign`) also refuses claims for another fleet, with no scopes or more than 256, with a time that isn't a whole second, that expire after its certificate, or that would make a token longer than 8,192 bytes. `apply` also refuses, among the other checks of ADR-0047 point 5.9, scopes that aren't in canonical form (§3.3), more than 256 of them, and times that aren't whole seconds.
 
+For a root caller, which has no delegation record, `apply` also requires the child's scopes to pass §3.5's strict grant step against the scopes the caller's presented token carries, as the command holds them, so the narrowing doesn't rest on the handler alone. And an ancestor-rule revocation's `apply` refuses a caller whose presented token §8 refuses, as a delegation's `apply` does. Both only refuse.
+
 ### 7.4 An authority-signed token
 
 A node refuses an authority-signed token whose `sub` is a reserved dotted agent name (§4.1), that carries `fleetring.parent` or `fleetring.chain`, or whose `fleetring.kind` is `"agent"` with a `sub` that isn't a root agent name. It also refuses one that lasts more than 30 days from `nbf` to `exp`, whose `nbf` is more than 30 seconds after the node's time, whose `exp` isn't after it, or whose `iat`, if present, is more than 30 seconds after it (ADR-0026 point 5, ADR-0047 point 2.7).

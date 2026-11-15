@@ -23,7 +23,7 @@ use super::record::{
     AncestorTarget, AncestorViolation, CallerToken, ClaimField, Forgery, RateKey, RateKind,
     RateScope, RevocationLimit,
 };
-use super::{AgentName, DelegationId, TokenClaims};
+use super::{AgentName, DelegationId, SignerKind, TokenClaims};
 
 /// Applies `RevokePrincipal`, a principal revocation with `fleet` (ADR-0047, points 11.3 to
 /// 11.5).
@@ -275,6 +275,16 @@ fn check(
         if let Some(field) = ClaimField::first_difference(&record.claims, presented) {
             return Err(forged(Forgery::Differs { field }));
         }
+    }
+
+    // The caller's own token, as `RecordDelegation` checks it: its ID and key, every ID and key
+    // in its chain, and its principal or an ancestor's, with the leeway for a root caller's.
+    let signer = SignerKind::for_principal(&presented.principal);
+    if let Some(revoked) = state
+        .revocations
+        .refuses_token(&presented.token_ref(&caller.kid, signer))
+    {
+        return Err(Rejection::CallerRevoked { by: revoked });
     }
 
     // The targets: what the caller presented, itself, or what is recorded below it.

@@ -423,10 +423,12 @@ fn only_principal_entries_replace_and_never_root_token_or_fleet_entries() {
     assert_eq!(state.revocations().len(), 4);
 
     // The root's principal replaces exactly the two ancestor entries below it.
+    // Asked with another root token of agent-42's: the one it revoked can ask nothing more.
+    let second = root_token("agent-42", "root-jti-2");
     let (_, until) = principal_revoked(stamped(
         &mut state,
         7_000,
-        as_ancestor(&root(), principal_target("agent-42")),
+        as_ancestor(&second, principal_target("agent-42")),
     ));
     let keys: BTreeSet<Revoked> = state
         .revocations()
@@ -1670,23 +1672,21 @@ fn a_root_revoking_itself_is_never_split_or_refused_by_its_own_rate() {
         ));
     }
 
-    // 29 in the window: the principal and then the token, as two commands, both land.
+    // 29 in the window: the principal, as a command of its own, lands; the token then can't,
+    // since the principal's entry refuses the token that asks, which is why `agent remove`
+    // sends both in one command.
     let mut split = state.clone();
     principal_revoked(stamped(
         &mut split,
         millis,
         as_ancestor(&root(), principal_target("agent-42")),
     ));
-    token_revoked(stamped(
-        &mut split,
-        millis,
-        as_ancestor(&root(), own_token()),
+    assert!(matches!(
+        refused(&mut split, millis, as_ancestor(&root(), own_token())),
+        Rejection::CallerRevoked {
+            by: Revoked::Principal { .. }
+        }
     ));
-    assert!(
-        split
-            .revocations()
-            .contains(&Revoked::Token(root().claims.id))
-    );
 
     // Neither is counted: after the root revokes another root token it holds, which ends none
     // of the leaves, its 30th revocation of a leaf still lands, and the 31st is refused.
@@ -1719,17 +1719,6 @@ fn a_root_revoking_itself_is_never_split_or_refused_by_its_own_rate() {
         millis,
         as_ancestor(&root(), token_target(&leaves[usize::from(rate) - 1].id)),
     ));
-    let mut alone = state.clone();
-    principal_revoked(stamped(
-        &mut alone,
-        millis,
-        as_ancestor(&root(), principal_target("agent-42")),
-    ));
-    token_revoked(stamped(
-        &mut alone,
-        millis,
-        as_ancestor(&root(), own_token()),
-    ));
     match stamped(
         &mut state,
         millis,
@@ -1747,11 +1736,12 @@ fn a_root_revoking_itself_is_never_split_or_refused_by_its_own_rate() {
         }) => {}
         other => panic!("expected both revoked: {other:?}"),
     }
-    assert_eq!(
-        serde_json::to_string(state.revocations()).expect("serializes"),
-        serde_json::to_string(alone.revocations()).expect("serializes"),
-        "the pair adds what its two commands add"
-    );
+    for revoked in [
+        Revoked::principal(principal("agent-42")),
+        Revoked::Token(root().claims.id),
+    ] {
+        assert!(state.revocations().contains(&revoked), "{revoked:?}");
+    }
 }
 
 /// The principal and the token of one command land together or not at all, and a token the
@@ -2253,4 +2243,82 @@ fn a_principal_revocation_replays_identically() {
     check_replay_from_scratch(&log, &outcomes, &state);
     check_replay_from_snapshots(&log, &outcomes, &state);
     check_replay_through_serialization(&log, &outcomes, &state);
+}
+
+/// `RevokeAsAncestor`'s `apply` checks its caller against the denylist, as `RecordDelegation`'s
+/// does: a caller whose own token ID, principal, or an ancestor's principal is revoked adds
+/// nothing, whoever proposes the command, and the state is left as it was.
+#[test]
+fn a_revoked_caller_can_revoke_nothing_under_the_ancestor_rule() {
+    let mut state = fleet();
+    let root = root();
+    let c7 = delegate(&mut state, 1_000, 1, &root, "c7", delegating("agent-42.c7"));
+    let r1 = delegate(
+        &mut state,
+        2_000,
+        2,
+        &copy(&c7, ISSUER),
+        "r1",
+        leaf("agent-42.c7.r1"),
+    );
+
+    // The issuer key that signed c7's copy is revoked, with `fleet`. A key's revocation prunes
+    // no record, so c7's is still kept, live, and equal to what it presents: only the denylist
+    // check refuses it.
+    stamped(
+        &mut state,
+        3_000,
+        Action::RevokeToken {
+            revoked: Revoked::Key(key(ISSUER)),
+            until: Timestamp::MAX,
+        },
+    )
+    .expect("revoked with fleet");
+    assert_eq!(
+        refused(
+            &mut state,
+            4_000,
+            as_ancestor(&copy(&c7, ISSUER), token_target(&r1.id)),
+        ),
+        Rejection::CallerRevoked {
+            by: Revoked::Key(key(ISSUER))
+        }
+    );
+
+    // The root's own token ID is revoked: the root revokes nothing more with it.
+    let mut state = fleet();
+    let c7 = delegate(&mut state, 1_000, 1, &root, "c7", delegating("agent-42.c7"));
+    stamped(
+        &mut state,
+        2_000,
+        Action::RevokeToken {
+            revoked: Revoked::Token(root.claims.id.clone()),
+            until: Timestamp::from_millis(31 * 24 * HOUR),
+        },
+    )
+    .expect("revoked with fleet");
+    assert_eq!(
+        refused(&mut state, 3_000, as_ancestor(&root, token_target(&c7.id))),
+        Rejection::CallerRevoked {
+            by: Revoked::Token(root.claims.id.clone())
+        }
+    );
+
+    // The root's principal is revoked: the same, by the principal's entry.
+    let mut state = fleet();
+    let c7 = delegate(&mut state, 1_000, 1, &root, "c7", delegating("agent-42.c7"));
+    stamped(
+        &mut state,
+        2_000,
+        Action::RevokePrincipal {
+            principal: principal("agent-42"),
+        },
+    )
+    .expect("revoked with fleet");
+    assert!(matches!(
+        refused(&mut state, 3_000, as_ancestor(&root, token_target(&c7.id))),
+        Rejection::CallerRevoked {
+            by: Revoked::Principal { .. }
+        }
+    ));
 }
