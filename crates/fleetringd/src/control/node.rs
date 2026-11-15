@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::{io, thread};
 
 use fleetring::NodeId;
-use fleetring_control::{Action, Command, ControlConfig, Outcome, Rejection, State, apply};
+use fleetring_control::delegation::Resent;
+use fleetring_control::{
+    Action, Applied, Command, ControlConfig, Outcome, Rejection, State, apply,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
@@ -154,7 +157,8 @@ pub enum SubmitError {
     Refused(Rejection),
 }
 
-/// A command that was logged and applied.
+/// A command that was logged and applied, or a resend of a delegation the log already records,
+/// which the writer answers from the state without logging it again (ADR-0047, point 5.7).
 #[derive(Debug, Clone)]
 pub struct Committed {
     index: LogIndex,
@@ -164,7 +168,8 @@ pub struct Committed {
 }
 
 impl Committed {
-    /// Returns the command's position in the log.
+    /// Returns the command's position in the log: for a resend answered from the state, the last
+    /// command logged when it was answered, whose state recorded what the resend asked for.
     #[must_use]
     pub fn index(&self) -> LogIndex {
         self.index
@@ -225,7 +230,9 @@ impl ControlHandle {
     /// logging it. A command the state machine rejects is otherwise not an error here: it is
     /// logged, and its [`Committed::outcome`] holds the rejection. The exception is a command
     /// that needs the `delegation` fleet feature, whose rejection is [`SubmitError::Refused`]
-    /// and is never logged (ADR-0047, point 6.2).
+    /// and is never logged (ADR-0047, point 6.2); and a resend of a delegation the log already
+    /// records, which is answered with that record, [`Resent::Yes`](fleetring_control::delegation::Resent::Yes),
+    /// once the commands before it are durable, and is never logged either.
     pub async fn submit(&self, action: Action) -> Result<Committed, SubmitError> {
         let (reply, receive) = oneshot::channel();
         self.mailbox
@@ -513,10 +520,14 @@ impl Writer {
     ///
     /// A command that needs the `delegation` fleet feature is answered with
     /// [`SubmitError::Refused`] and never logged when `apply` would refuse it on that state
-    /// ([`refused_unlogged`]).
+    /// ([`refused_unlogged`]). A `RecordDelegation` that resends an operation the state records,
+    /// as racing identical calls do, is answered with the recorded delegation and never logged:
+    /// its answer waits for the group to be durable, since the record may be one of the group's.
     fn commit_group(&mut self, submits: Vec<(Action, Reply)>) -> Flow {
         let mut commands: Vec<(LogIndex, Command)> = Vec::with_capacity(submits.len());
         let mut replies = Vec::with_capacity(submits.len());
+        // Resends answered from the state, sent once the group is durable.
+        let mut resent: Vec<(Reply, Command, Outcome)> = Vec::new();
         let mut last = self.last_index;
         let mut exhausted = None;
         // The state after the group's commands so far, built only once a command needs screening,
@@ -562,6 +573,19 @@ impl Writer {
             let unlogged_if_refused = refused_unlogged(&action);
             let command = self.stamp(action);
             if let Some(preview) = &mut preview {
+                // A resend changes nothing, so it costs the log nothing either: N racing
+                // identical calls log one command, not N with full claims each.
+                if let Some(Ok((id, record))) =
+                    preview.delegation_resend(&command.action, command.at)
+                {
+                    let outcome = Ok(Applied::DelegationRecorded {
+                        id: id.clone(),
+                        claims: record.claims.clone(),
+                        resent: Resent::Yes,
+                    });
+                    resent.push((reply, command, outcome));
+                    continue;
+                }
                 let outcome = apply(preview, command.clone());
                 // The preview applied exactly the command `apply_logged` would, to exactly the
                 // state it would see, so its refusal is the one the log would hold; a refusal
@@ -603,6 +627,17 @@ impl Writer {
             // commands have no caller.
             if let Some(reply) = reply {
                 let _unheard = reply.send(Ok(committed));
+            }
+        }
+        if !resent.is_empty() {
+            let state = Arc::clone(&self.publish.borrow());
+            for (reply, command, outcome) in resent {
+                let _unheard = reply.send(Ok(Committed {
+                    index: self.last_index,
+                    command,
+                    outcome,
+                    state: Arc::clone(&state),
+                }));
             }
         }
         if let Some(reply) = exhausted {
@@ -957,5 +992,73 @@ mod tests {
             let _outcome = apply(&mut replayed, command);
         }
         assert_eq!(replayed, *published);
+    }
+
+    /// Racing identical `DelegateToken` calls submit the same `RecordDelegation` at once: the
+    /// first is logged, and every other is answered with the same delegation, `Resent::Yes`,
+    /// without a log entry of its own (ADR-0047, point 5.7), whether it queued in the same group
+    /// or a later one.
+    #[tokio::test(start_paused = true)]
+    async fn racing_identical_delegations_log_once() {
+        use fleetring_control::delegation::Resent;
+
+        use crate::control::test_support::{member_with_every_feature, root_delegation};
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("control.db");
+        let options = ControlOptions::default()
+            .with_storage_io(StorageIo::Inline)
+            .with_recorder("control-1".parse().expect("an id"));
+        let clock = SimClock::new(Timestamp::from_millis(1_000_000));
+        let node = ControlNode::open(&path, options, clock)
+            .await
+            .expect("opens");
+        let handle = node.handle();
+        handle
+            .submit(Action::Join {
+                member: member_with_every_feature("data-1"),
+            })
+            .await
+            .expect("the join commits");
+
+        let action = root_delegation(clock.now(), 1, 60_000);
+        let racing: Vec<_> = (0..8)
+            .map(|_| {
+                let handle = handle.clone();
+                let action = action.clone();
+                tokio::spawn(async move { handle.submit(action).await })
+            })
+            .collect();
+        let mut answers = Vec::new();
+        for task in racing {
+            answers.push(task.await.expect("joins").expect("answered"));
+        }
+        // And one more, after the group that recorded it.
+        answers.push(handle.submit(action).await.expect("answered"));
+        let mut new = 0;
+        let mut ids = std::collections::BTreeSet::new();
+        for answer in &answers {
+            match answer.outcome() {
+                Ok(Applied::DelegationRecorded { id, resent, .. }) => {
+                    ids.insert(id.clone());
+                    if *resent == Resent::No {
+                        new += 1;
+                    }
+                }
+                other => panic!("expected the delegation: {other:?}"),
+            }
+        }
+        assert_eq!(new, 1, "recorded once");
+        assert_eq!(ids.len(), 1, "every answer names the one delegation");
+        node.shutdown().await;
+
+        let log = CommandLog::open(&path, ControlConfig::new()).expect("the log opens");
+        let logged = log
+            .commands()
+            .expect("reads")
+            .iter()
+            .filter(|(_, command)| matches!(command.action, Action::RecordDelegation { .. }))
+            .count();
+        assert_eq!(logged, 1, "the resends cost the log nothing");
     }
 }
