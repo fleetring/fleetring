@@ -1079,7 +1079,7 @@ Handing a database's lease from its holder to a follower at the next epoch witho
 
 ### Trust anchor
 
-*Planned* (ADR-0044). A public key a fleet or a reader trusts, with a purpose and a constraint. Authorization anchors sign tokens: the fleet's authority (unconstrained), issuer keys, and other fleets' authorities (each limited to the patterns and actions it may vouch for). A [delegation issuer](#delegation-issuer) (ADR-0047) is the first issuer key, its constraint fixed in code. Provenance anchors, publisher keys, only verify content and never authorize.
+*Deferred after 0.8* (ADR-0044; #145). A public key a fleet or a reader trusts, with a purpose and a constraint. Authorization anchors sign tokens: the fleet's authority (unconstrained), issuer keys, and other fleets' authorities (each limited to the patterns and actions it may vouch for). A [delegation issuer](#delegation-issuer) (ADR-0047) is the first issuer key, its constraint fixed in code. Provenance anchors, publisher keys, only verify content and never authorize.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet.
