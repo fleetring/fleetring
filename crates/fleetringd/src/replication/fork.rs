@@ -1158,17 +1158,33 @@ impl super::Replication {
         let moved = {
             let inner = Arc::clone(inner);
             let key = key.clone();
+            let location = location.clone();
             super::follower::blocking(inner.execution, move || {
-                inner.forks.store().install(&key, &location)
+                inner.forks.store().move_into_place(&key, &location)
             })
             .await?
         };
-        moved.map_err(|error| match error.kind() {
+        let failed = |error: std::io::Error| match error.kind() {
             std::io::ErrorKind::AlreadyExists => Status::failed_precondition(format!(
                 "this node holds a copy of {database} already: {error}"
             )),
             _ => Status::internal(format!("can't move the staged copy into place: {error}")),
-        })?;
+        };
+        moved.map_err(failed)?;
+        inner
+            .forks
+            .faults()
+            .pass(FaultPoint::InstallMoved, key.fork.operation)
+            .await;
+        let marked = {
+            let inner = Arc::clone(inner);
+            let key = key.clone();
+            super::follower::blocking(inner.execution, move || {
+                inner.forks.store().record_moved(&key, &location)
+            })
+            .await?
+        };
+        marked.map_err(failed)?;
         // Recorded at once, before anything is served: a copy in place that no record names
         // would be unknown to a drop notice, an orphan check, and `orphan remove`, and a new
         // database of the name would open it as its own.

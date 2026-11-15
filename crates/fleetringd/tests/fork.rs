@@ -2576,6 +2576,88 @@ async fn crash_while_staging(point: FaultPoint, leftover: Leftover, seed: u8) ->
     Ok(())
 }
 
+/// A holder killed after it moved its staged copy into the database's place, before it recorded
+/// the move or the copy's incarnation, records both at its next start (ADR-0046, amendment item
+/// 9): the copy is installed, not lost, so a drop notice, the orphan check and `orphan remove`
+/// know it, and a later database of the name never opens it as its own. The fork then becomes
+/// ready with the source's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_killed_between_its_install_and_its_record_records_it_at_start() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut fleet = Fleet::start(
+        dir.path(),
+        Settings {
+            stay: true,
+            ..Settings::default()
+        },
+    )
+    .await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    let source_primary = create_source(&client, &source, 1, 5).await?;
+    let target = fleet.name_apart("dst", 2, &source_primary)?;
+    let id = operation(77);
+    for faults in &fleet.faults {
+        faults.hold_operation(FaultPoint::InstallMoved, id);
+    }
+    client
+        .fork_database(&source, &target, &spec(id, 2)?)
+        .await?;
+    let holder = await_held(&fleet, FaultPoint::InstallMoved).await?;
+    let [staged] = staged_dirs(dir.path(), &holder, &target)
+        .try_into()
+        .map_err(|found| format!("one staging directory, not {found:?}"))?;
+    assert!(
+        database_dir(dir.path(), &holder, &target).is_dir(),
+        "the copy is in the database's place"
+    );
+    assert!(staged.join("installing").is_file(), "with the intent");
+    assert!(!staged.join("installed").exists(), "and no record yet");
+    let epoch = dir
+        .path()
+        .join(holder.as_str())
+        .join("replication")
+        .join("epochs")
+        .join(target.as_str())
+        .join("epoch");
+    assert!(!epoch.exists(), "the incarnation isn't recorded yet");
+
+    let config = fleet.daemon(&holder)?.config().clone();
+    fleet.crash(&holder).await?;
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::InstallMoved, id);
+    }
+    let hooks = ForkFaults::new();
+    hooks.set_disk(ROOMY, 2 * ROOMY);
+    fleet.restart_with(config, hooks).await?;
+    assert!(
+        staged.join("installed").is_file(),
+        "the start reads the copy as installed, and records it so"
+    );
+    assert!(!staged.join("installing").exists(), "the intent goes");
+    assert!(
+        epoch.is_file(),
+        "the start records the installed copy's incarnation"
+    );
+
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let status = client.fork_operation(id).await?;
+            if status.state() == proto::ForkState::Ready {
+                return Ok::<_, tonic::Status>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
+    fleet.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seeder_killed_while_writing_its_copy_refetches() -> TestResult {
     crash_while_staging(FaultPoint::StagingWritten, Leftover::Torn, 70).await
