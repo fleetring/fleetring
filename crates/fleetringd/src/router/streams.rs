@@ -8,9 +8,10 @@
 //! and a replayed or forked one is refused. A stream belongs to the token that opened it:
 //! another principal's request is refused with `403`, as is the same principal's with another
 //! token, so a client that rotates its token mid-stream opens a new stream. A principal holds at
-//! most `max_streams_per_principal` streams, so that one caller can't take every place. A stream
-//! idle past its timeout expires, and dropping it closes its session, which rolls back what it
-//! left open on the primary.
+//! most `max_streams_per_principal` streams, so that one caller can't take every place; a
+//! delegated agent's streams count under its lineage's root agent, with the root's own, so that
+//! delegating never multiplies the quota. A stream idle past its timeout expires, and dropping it
+//! closes its session, which rolls back what it left open on the primary.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -137,6 +138,9 @@ pub(crate) struct HranaStream {
     pub(crate) sql: BTreeMap<i32, String>,
     /// The session on the primary, once a call has needed one.
     pub(crate) session: Option<NodeSession>,
+    /// Whether a node has accepted the stream's token, by opening a session for it. The router
+    /// holds no denylist, so it keeps a stream past its first request only once one has.
+    pub(crate) vouched: Vouched,
     /// Whether the stream is in a transaction, as its last call left it.
     pub(crate) autocommit: Autocommit,
     /// Why the stream can't go on, once something broke it.
@@ -167,6 +171,17 @@ impl HranaStream {
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
+}
+
+/// Whether a node has vouched for a stream's token by opening a session for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Vouched {
+    /// No session was opened yet.
+    Not,
+    /// The stream's first request tried to open one, and couldn't.
+    Failed,
+    /// A node opened one.
+    Yes,
 }
 
 /// A stream locked for one request, which has it to itself until the guard drops.
@@ -205,8 +220,9 @@ impl StreamRefusal {
             Self::PrincipalFull(max) => Error::new(
                 code::RESOURCE_EXHAUSTED,
                 format!(
-                    "this principal holds {max} streams already, as many as [streams] \
-                     max_streams_per_principal allows; close one, or let one expire"
+                    "this principal, with the other agents of its lineage if it is one, holds \
+                     {max} streams already, as many as [streams] max_streams_per_principal \
+                     allows; close one, or let one expire"
                 ),
             ),
         }
@@ -223,18 +239,19 @@ pub(crate) struct Streams {
 #[derive(Debug, Default)]
 struct Table {
     streams: BTreeMap<u64, Entry>,
-    /// How many streams each principal holds; a principal with none has no entry.
+    /// How many streams each quota principal holds ([`Caller::quota`]); one with none has no
+    /// entry.
     held: BTreeMap<Principal, usize>,
 }
 
 impl Table {
-    /// Removes the stream `id`, giving its principal's place back.
+    /// Removes the stream `id`, giving its quota principal's place back.
     fn remove(&mut self, id: u64) -> Option<Entry> {
         let entry = self.streams.remove(&id)?;
-        if let Some(count) = self.held.get_mut(&entry.principal) {
+        if let Some(count) = self.held.get_mut(&entry.quota) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                self.held.remove(&entry.principal);
+                self.held.remove(&entry.quota);
             }
         }
         Some(entry)
@@ -246,7 +263,8 @@ impl Table {
 #[derive(Debug)]
 struct Entry {
     secret: [u8; SECRET_BYTES],
-    principal: Principal,
+    /// The principal whose quota the stream counts against.
+    quota: Principal,
     stream: Arc<tokio::sync::Mutex<HranaStream>>,
 }
 
@@ -264,7 +282,7 @@ impl Streams {
     /// # Errors
     ///
     /// [`StreamRefusal::Full`] if the router holds `max_streams` already, and
-    /// [`StreamRefusal::PrincipalFull`] if the caller's principal holds
+    /// [`StreamRefusal::PrincipalFull`] if the caller's quota principal holds
     /// `max_streams_per_principal`.
     pub(crate) fn create(
         &self,
@@ -279,7 +297,7 @@ impl Streams {
             return Err(StreamRefusal::Full);
         }
         let per_principal = self.limits.max_streams_per_principal.get();
-        if table.held.get(&caller.principal).copied().unwrap_or(0) >= per_principal {
+        if table.held.get(&caller.quota).copied().unwrap_or(0) >= per_principal {
             return Err(StreamRefusal::PrincipalFull(per_principal));
         }
         let id = loop {
@@ -299,6 +317,7 @@ impl Streams {
             database: database.clone(),
             sql: BTreeMap::new(),
             session: None,
+            vouched: Vouched::Not,
             autocommit: Autocommit::On,
             broken: None,
             closed: false,
@@ -307,12 +326,12 @@ impl Streams {
         let locked = Arc::clone(&stream)
             .try_lock_owned()
             .map_err(|_| StreamRefusal::Invalid("a new stream is already locked".to_owned()))?;
-        *table.held.entry(caller.principal.clone()).or_default() += 1;
+        *table.held.entry(caller.quota.clone()).or_default() += 1;
         table.streams.insert(
             id,
             Entry {
                 secret,
-                principal: caller.principal.clone(),
+                quota: caller.quota.clone(),
                 stream,
             },
         );

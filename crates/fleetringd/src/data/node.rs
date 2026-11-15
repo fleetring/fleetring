@@ -440,7 +440,8 @@ impl DataNode {
         }
     }
 
-    /// A place for one more SQL session of `principal`'s, with a new ID.
+    /// A place for one more SQL session of `principal`'s, with a new ID. A delegated agent's
+    /// sessions come here under its lineage's root agent, so `principal` holds its descendants'.
     ///
     /// # Errors
     ///
@@ -457,8 +458,9 @@ impl DataNode {
             let count = counts.entry(principal.to_owned()).or_default();
             if *count >= cap {
                 return Err(Status::resource_exhausted(format!(
-                    "{principal} holds {cap} sessions on node {} already, as many as one \
-                     principal may ([sessions] max_sessions_per_principal); close one first",
+                    "{principal} holds {cap} sessions on node {} already, with the agents of its \
+                     lineage if it is a root agent, as many as one principal may ([sessions] \
+                     max_sessions_per_principal); close one first",
                     self.inner.id
                 )));
             }

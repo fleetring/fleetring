@@ -8,6 +8,12 @@
 //! request fails with `FLEETRING_OUTCOME_UNKNOWN` and the stream is broken, since what ran is
 //! unknown; only a call the node says never ran is sent again, to the new primary. A stream
 //! whose transaction's session is gone fails with `FLEETRING_TRANSACTION_ABORTED`.
+//!
+//! The router holds no denylist (ADR-0037, point 18), so a new stream is kept past its first
+//! request only once a node has accepted its token by opening a session for it: a request that
+//! made no call opens the session before it answers, a token the node refuses gets `401` and no
+//! stream, and a stream whose node later refuses its token, as a revoked one's, is dropped at
+//! its next request. Streams no node vouched for can't fill the router's table.
 
 use fleetring_client::redirect::primary_hint;
 use fleetring_proto::v1::{
@@ -24,7 +30,7 @@ use crate::router::hrana::{
 };
 use crate::router::naming::{Hrana, Target};
 use crate::router::session::{CallError, NodeSession, OpenError};
-use crate::router::streams::{Locked, StreamRefusal};
+use crate::router::streams::{Locked, StreamRefusal, Vouched};
 
 /// How deeply a batch step's condition may nest; the node holds it to the same bound.
 const MAX_CONDITION_DEPTH: usize = crate::data::calls::MAX_CONDITION_DEPTH;
@@ -118,13 +124,18 @@ pub(crate) async fn pipeline(
             };
             run.request(request).await
         };
-        if let Err(error) = &ran {
-            refuse_unauthenticated(error, called)?;
+        if let Err(error) = &ran
+            && let Err(refused) = refuse_unauthenticated(error, called)
+        {
+            return Err(abandon(context, stream, refused));
         }
         results.push(match ran {
             Ok(response) => StreamResult::Ok { response },
             Err(error) => StreamResult::Error { error },
         });
+    }
+    if let Err(refused) = vouch(context, caller, &mut stream).await {
+        return Err(abandon(context, stream, refused));
     }
     let (baton, base_url) = finish(context, target, stream);
     Ok(Answered {
@@ -171,11 +182,16 @@ pub(crate) async fn cursor(
         match run.batch(request.batch.steps).await {
             Ok(result) => entries(result),
             Err(error) => {
-                refuse_unauthenticated(&error, called)?;
+                if let Err(refused) = refuse_unauthenticated(&error, called) {
+                    return Err(abandon(context, stream, refused));
+                }
                 vec![CursorEntry::Error { error }]
             }
         }
     };
+    if let Err(refused) = vouch(context, caller, &mut stream).await {
+        return Err(abandon(context, stream, refused));
+    }
     let (baton, base_url) = finish(context, target, stream);
     Ok(Answered {
         body: (CursorResponse { baton, base_url }, entries),
@@ -195,6 +211,53 @@ fn refuse_unauthenticated(error: &Error, called: bool) -> Result<(), Refused> {
         status: StatusCode::UNAUTHORIZED,
         error: error.clone(),
     })
+}
+
+/// Removes `stream` from the router's table, closing its session, for a request refused as a
+/// whole with `refused`, which it returns: a stream whose token a node refused is never kept.
+fn abandon(context: &Context, stream: Locked, refused: Refused) -> Refused {
+    let id = stream.id();
+    drop(stream);
+    context.streams.remove(id);
+    refused
+}
+
+/// Has a node vouch for `stream`'s token before the router keeps the stream, if none has yet:
+/// opens the session the stream's next call would open (ADR-0037, point 18). A stream a request
+/// closed needs none. A session that can't be opened for another reason than the token closes
+/// the stream instead, so the answer carries no baton and the client opens a new one.
+///
+/// # Errors
+///
+/// [`Refused`] with `401` if the node refuses the token: nothing ran, since no session was open.
+async fn vouch(context: &Context, caller: &Caller, stream: &mut Locked) -> Result<(), Refused> {
+    match stream.vouched {
+        _ if stream.closed => return Ok(()),
+        Vouched::Yes => return Ok(()),
+        // A call of this request tried and couldn't, and said why in its result: not again.
+        Vouched::Failed => {
+            stream.closed = true;
+            return Ok(());
+        }
+        Vouched::Not => {}
+    }
+    let database = stream.database.clone();
+    match NodeSession::open(context, &database, caller).await {
+        Ok(session) => {
+            stream.session = Some(session);
+            stream.vouched = Vouched::Yes;
+            Ok(())
+        }
+        Err(OpenError::Unauthenticated(message)) => Err(Refused::new(
+            StatusCode::UNAUTHORIZED,
+            code::UNAUTHENTICATED,
+            message,
+        )),
+        Err(_) => {
+            stream.closed = true;
+            Ok(())
+        }
+    }
 }
 
 /// Refuses a request with more statements than one may carry.
@@ -434,7 +497,14 @@ impl Run<'_> {
                     return Err(self.break_with(aborted("its session ended")));
                 }
                 let opened = NodeSession::open(self.context, &database, self.caller).await;
-                self.stream.session = Some(opened.map_err(open_error)?);
+                let opened = opened.map_err(|error| {
+                    if self.stream.vouched == Vouched::Not {
+                        self.stream.vouched = Vouched::Failed;
+                    }
+                    open_error(error)
+                })?;
+                self.stream.session = Some(opened);
+                self.stream.vouched = Vouched::Yes;
             }
             let timeout = self.context.config.routing.call_timeout();
             // The call owns the session while it runs: if the request goes away mid-call, the

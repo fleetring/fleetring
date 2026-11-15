@@ -1215,6 +1215,42 @@ pub enum Signer {
 }
 
 impl Signer {
+    /// The principal whose per-principal quotas a token this signer signed for `principal`
+    /// counts against: for an issuer-signed token, a delegated agent's, the root agent of its
+    /// lineage, so that delegating never multiplies a quota (`[streams]
+    /// max_streams_per_principal` on the router, `[sessions] max_sessions_per_principal` on a
+    /// node); for an authority-signed token, the principal itself. A root agent's own token
+    /// counts under the same name as its descendants'.
+    ///
+    /// ```
+    /// use fleetringd::auth::Signer;
+    /// use fleetringd::tls::Principal;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let issuer = Signer::Issuer {
+    ///     name: "control-1".parse()?,
+    ///     authority: "AAAAAAAAAAAAAAAA".parse()?,
+    /// };
+    /// let child: Principal = "agent-42.c7.r1".parse()?;
+    /// assert_eq!(issuer.quota_principal(&child).as_str(), "agent-42");
+    /// let service: Principal = "workload.prod".parse()?;
+    /// assert_eq!(Signer::Authority.quota_principal(&service), service);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn quota_principal(&self, principal: &Principal) -> Principal {
+        match self {
+            Self::Authority => principal.clone(),
+            Self::Issuer { .. } => principal
+                .as_str()
+                .parse::<fleetring_control::delegation::AgentName>()
+                .ok()
+                .and_then(|name| name.root().as_str().parse().ok())
+                .unwrap_or_else(|| principal.clone()),
+        }
+    }
+
     /// Which kind of signer this is, which decides how a principal revocation judges the
     /// token's `iat` (ADR-0047, point 3).
     #[must_use]
