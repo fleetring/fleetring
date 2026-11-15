@@ -70,8 +70,9 @@ jobs:
 
   # FR-087's fork matrix: every row over the same number of seeds as `seeds`, each seed at the
   # seeding step it picks (the ignored `sweep_row_*` tests), and FR-102's hand-over sweep
-  # (`sweep_handover`) over as many. A row ignored for an open bug is ignored as a whole, so no
-  # filter skips it. Eight shards split each sweep's seeds, all from one base seed per run. It
+  # (`sweep_handover`) over as many. `--ignored` runs every ignored test the filters match, so a
+  # row ignored for an open bug runs here too and fails the sweep until the bug is fixed; to leave
+  # one out, add `--skip <its sweep test>` to the command below. Eight shards split each sweep's seeds, all from one base seed per run. It
   # needs the fault hooks, which refuse a build without debug assertions, so it runs optimized
   # with them kept.
   # #137's acceptance sweep: `gh workflow run simulation-sweep.yml --ref <branch> -f seeds=1000`.

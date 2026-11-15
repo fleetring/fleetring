@@ -16,7 +16,7 @@ This is a design record. It decides the model: who acts, what they may do, how a
 | **S3, federation:** sites, fleets that trust each other, fleet-qualified identities, signed heads across fleets | 6.5, 6.6 | Proposed; accepted separately |
 | **S4, packages:** publishers, manifests, freshness, overlays | 8 | Proposed; accepted separately |
 
-*Note (2026-11-08):* S2 (§7) is superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed), which keeps §2.1 and §7.6. The umbrella and its text are unchanged.
+*Note (2026-11-08):* S2 (§7) is superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (accepted 2026-11-10), which keeps §2.1 and §7.6. The umbrella and its text are unchanged.
 
 *Note (2026-11-11):* S1 (§3) stays Proposed and is deferred after 0.8 by [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12), which delegates online instead: the control plane records a child's lineage and signs its narrower JWT with a per-control-node issuer key that the authority certifies. ADR-0047 takes `Revoked::Principal` (§3.8), §3.9's `delegation` feature, and §3.10 from S1, and lists the evidence that would bring the rest back (ADR-0047, point 9). It also proposes, for §9.1, that the scope grammar and lattice move from `fleetringd::auth` into `fleetring-control`, since delegation records hold scopes that `apply` checks (ADR-0047, point 6.5). The umbrella and its text are unchanged.
 
@@ -136,7 +136,7 @@ The actions become a lattice, with two additions:
 
 *Specification S1: Proposed; accepted separately.*
 
-*Deferred after 0.8 by [ADR-0047](0047-online-delegation.md) (Proposed, 2026-11-11).* Biscuit tokens, holder keys, `[tls] accept_holder_keys`, bearer self-delegation, and `Revoked::Block` aren't built in 0.8; `Revoked::Principal` (point 8), the `delegation` feature (point 9), and point 10 survive there.
+*Deferred after 0.8 by [ADR-0047](0047-online-delegation.md) (accepted 2026-11-12).* Biscuit tokens, holder keys, `[tls] accept_holder_keys`, bearer self-delegation, and `Revoked::Block` aren't built in 0.8; `Revoked::Principal` (point 8), the `delegation` feature (point 9), and point 10 survive there.
 
 **Requirements.** A holder must be able to narrow its token for a child without holding the authority's key and without a network call. A node must verify the result offline with the authority's public key alone, as it does a JWT today. A child must never hold more than its parent, or for longer. Someone who copies a token's bytes, without the holder's private key, must gain nothing by it. Revoking a parent must revoke what it delegated. And because agents are written in Python and TypeScript as often as in Rust, an agent framework must be able to build and append blocks in its own language.
 
@@ -271,7 +271,7 @@ In 0.8, `agent add` gives a root agent `admin:agent-<id>-*`, `admin:agent-<id>.*
 
 *Specification S2: Proposed; accepted separately.*
 
-*Superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (Proposed, 2026-11-08).* Points 1, 2, and 3 survive there with incarnations added; points 4 and 5 are replaced by its seeding, completion, readiness, and operation design; point 6 stands.
+*Superseded for 0.8 by [ADR-0046](0046-forks-name-an-incarnation-and-complete-on-a-write-quorum.md) (accepted 2026-11-10).* Points 1, 2, and 3 survive there with incarnations added; points 4 and 5 are replaced by its seeding, completion, readiness, and operation design; point 6 stands.
 
 1. **A fork is a new database** seeded from a source database's snapshot at a position, and independent from then on: its own name, placement, replicas, log, epochs, expiry, and archive. Nothing flows from the source to the fork, or back, after the fork is made. A fork's engine is its source's.
 2. **A fork records where it came from**, in a new metadata field, `forked_from`, set only by the fork command:
