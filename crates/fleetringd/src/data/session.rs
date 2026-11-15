@@ -34,7 +34,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Status, Streaming};
 
 use crate::actor::{Admission, Admit, SessionId, SessionTurn};
-use crate::auth::{Action, Authorized, BoxStream, Caller, authorized};
+use crate::auth::{Action, Authorized, BoxStream, Caller, Credential, authorized};
 use crate::data::calls::{
     NotRun, Then, call_from_proto, commit_to_proto, error_result, not_run_result, refused_a_write,
     result_to_proto,
@@ -120,10 +120,17 @@ pub(crate) async fn open(
     Ok(caller.guard(Box::pin(ReceiverStream::new(stream))))
 }
 
-/// The principal `caller` acts as, by which sessions are counted and waiting writes shared: a
-/// forwarded token's own principal, not the router's.
+/// The principal `caller`'s sessions are counted and waiting writes shared under: a forwarded
+/// token's own principal, not the router's, and for a delegated agent's token, the root agent of
+/// its lineage, so that delegating never multiplies `[sessions] max_sessions_per_principal` or a
+/// principal's share of waiting writes.
 fn principal_of(caller: &Authorized) -> String {
     match caller.caller() {
+        Caller::Principal {
+            name,
+            credential: Credential::Token { signer, .. },
+            ..
+        } => signer.quota_principal(name).to_string(),
         Caller::Principal { name, .. } => name.to_string(),
         Caller::Node(id) => format!("node:{id}"),
         _ => "anonymous".to_owned(),

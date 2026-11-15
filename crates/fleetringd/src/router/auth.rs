@@ -4,13 +4,15 @@
 //! the fleet's authority keys and the fleet name its own certificate carries, at its own clock,
 //! and checks `read` on the database the request names. The router has no denylist: data nodes,
 //! which do, check the token again on every call the router makes with it, so a revoked token
-//! that passes here is refused there (ADR-0026, point 6).
+//! that passes here is refused there (ADR-0026, point 6). So the router keeps a new stream only
+//! once a node has accepted its token (`pipeline`), and counts a delegated agent's streams under
+//! its lineage's root agent ([`Caller::quota`]).
 
 use fleetring_control::{DatabaseName, Revocations, Timestamp, TokenId};
 use hyper::HeaderMap;
 use hyper::header::AUTHORIZATION;
 
-use crate::auth::{Action, BearerToken, Scopes, Target, TokenVerifier};
+use crate::auth::{Action, BearerToken, Scopes, Signer, Target, TokenVerifier};
 use crate::tls::Principal;
 use crate::transport::Credentials;
 
@@ -20,10 +22,25 @@ use crate::transport::Credentials;
 #[derive(Clone)]
 pub(crate) struct Caller {
     pub(crate) principal: Principal,
+    /// The principal whose per-principal quota the caller's streams count against: the root
+    /// agent of a delegated agent's lineage, so delegating never multiplies the quota
+    /// ([`Signer::quota_principal`](crate::auth::Signer::quota_principal)); else the principal.
+    pub(crate) quota: Principal,
     pub(crate) token_id: TokenId,
     scopes: Scopes,
+    /// A delegated agent's lineage, for audit lines.
+    lineage: Option<LineageAudit>,
     /// The token as the router sends it on to nodes.
     pub(crate) credentials: Credentials,
+}
+
+/// What an audit line names of a delegated agent's token, as a node's do: its parent, its
+/// ancestors' token IDs, root first, and the issuer key that signed it. Never the token.
+#[derive(Debug, Clone)]
+struct LineageAudit {
+    parent: String,
+    chain: String,
+    issuer_key: String,
 }
 
 impl std::fmt::Debug for Caller {
@@ -80,10 +97,31 @@ pub(crate) fn authenticate(
     let credentials = Credentials::bearer(&token).map_err(|error| {
         Refusal::Unauthenticated(format!("the token can't be forwarded: {error}"))
     })?;
+    let lineage = match &verified.signer {
+        Signer::Authority => None,
+        Signer::Issuer { .. } => Some(LineageAudit {
+            parent: verified
+                .claims
+                .parent
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            chain: verified
+                .claims
+                .chain
+                .iter()
+                .map(|link| link.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            issuer_key: verified.key.to_string(),
+        }),
+    };
     Ok(Caller {
+        quota: verified.signer.quota_principal(&verified.principal),
         principal: verified.principal,
         token_id: verified.claims.id,
         scopes: verified.claims.scopes,
+        lineage,
         credentials,
     })
 }
@@ -100,10 +138,15 @@ pub(crate) fn require_read(caller: &Caller, database: &DatabaseName) -> Result<(
     {
         return Ok(());
     }
+    let lineage = caller.lineage.as_ref();
     tracing::warn!(
         target: "fleetringd::audit",
         principal = %caller.principal,
         credential = %format!("token:{}", caller.token_id),
+        signer = if lineage.is_some() { "issuer" } else { "authority" },
+        parent = lineage.map(|lineage| lineage.parent.as_str()),
+        chain = lineage.map(|lineage| lineage.chain.as_str()),
+        issuer_key = lineage.map(|lineage| lineage.issuer_key.as_str()),
         action = "read",
         database = database.as_str(),
         rpc = "router",
@@ -171,6 +214,7 @@ mod tests {
         )
         .expect("verified");
         assert_eq!(caller.principal.as_str(), "app");
+        assert_eq!(caller.quota, caller.principal);
         assert!(caller.credentials.has_token());
         assert!(
             !format!("{caller:?}").contains(token.expose()),
@@ -266,6 +310,12 @@ mod tests {
         )
         .expect("verified");
         assert_eq!(caller.principal.as_str(), "agent-42.c7");
+        assert_eq!(
+            caller.quota.as_str(),
+            "agent-42",
+            "counted under its lineage's root"
+        );
+        assert!(caller.lineage.is_some());
         assert_eq!(caller.token_id, claims.id);
         assert!(caller.credentials.has_token(), "forwarded unchanged");
         assert!(!format!("{caller:?}").contains(token.expose()));

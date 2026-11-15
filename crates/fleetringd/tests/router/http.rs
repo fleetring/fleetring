@@ -426,15 +426,28 @@ async fn a_revoked_token_is_unauthenticated() -> TestResult {
             principal: String::new(),
         })
         .await?;
-    // The data node learns of the revocation with its next heartbeat.
+    // The data node learns of the revocation with its next heartbeat. Until then requests run;
+    // one in flight as it lands may see its session end, which the router reports honestly as
+    // an unknown outcome caused by the revocation; after it, every request gets `401`.
     let refused = tokio::time::timeout(HANG_GUARD, async {
         loop {
             let answer = fleet
                 .post("/db/notes/v3/pipeline", Some(&token), &body)
                 .await?;
-            if answer.status != StatusCode::OK || answer.result(0)["type"] != "ok" {
+            if answer.status != StatusCode::OK {
                 return Ok::<_, Box<dyn std::error::Error>>(answer);
             }
+            let result = answer.result(0);
+            let revoked_mid_call = result["type"] == "error"
+                && result["error"]["code"] == "FLEETRING_OUTCOME_UNKNOWN"
+                && result["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("the token is revoked"));
+            assert!(
+                result["type"] == "ok" || revoked_mid_call,
+                "only ok, an outcome the revocation made unknown, or 401: {}",
+                answer.text
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
