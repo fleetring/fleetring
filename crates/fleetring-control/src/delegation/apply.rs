@@ -247,7 +247,16 @@ fn check(state: &State, times: Times, proposed: &Proposed) -> Result<Checked, Re
     // Against a delegated parent's record.
     let signer = SignerKind::for_principal(&presented.principal);
     let parent_record = match signer {
-        SignerKind::Authority => None,
+        // A root parent has no record: the scopes its presented token carries, which the
+        // command holds, are what the child must narrow, so a proposer that skipped the
+        // handler's check can't widen a root's child either.
+        SignerKind::Authority => {
+            presented
+                .scopes
+                .grant_step_strict(&claims.scopes)
+                .map_err(|reason| Rejection::NotNarrowed { reason })?;
+            None
+        }
         SignerKind::Issuer => {
             let forged = |reason| Rejection::ForgedLineage { reason };
             let record = DelegationId::try_from(presented.id.clone())

@@ -50,6 +50,9 @@ struct Model {
     clock: u64,
     draws: Draws,
     roots: Vec<CallerToken>,
+    /// A root token of the first lineage whose ID the operator revoked at the start: it may
+    /// neither delegate nor revoke, whoever proposes.
+    revoked_root: CallerToken,
     /// Every delegation the log accepted as new, to resend.
     sent: Vec<Action>,
     next: u32,
@@ -81,10 +84,24 @@ impl Model {
                 root_token("agent-1", "root-1"),
                 root_token("agent-2", "root-2"),
             ],
+            revoked_root: root_token("agent-1", "root-1-revoked"),
             sent: Vec::new(),
             next: 0,
             steps: 0,
         }
+    }
+
+    /// A new model whose operator has revoked [`Model::revoked_root`]'s token ID.
+    fn started(seed: u64) -> Self {
+        let mut model = Self::new(seed);
+        let revoked = model.revoked_root.claims.id.clone();
+        model
+            .stamped(Action::RevokeToken {
+                revoked: Revoked::Token(revoked),
+                until: Timestamp::from_millis(31 * 24 * HOUR),
+            })
+            .expect("the operator revokes a root token");
+        model
     }
 
     fn run(&mut self, command: Command) -> Outcome {
@@ -167,6 +184,14 @@ impl Model {
             1 => ask.scopes = scopes(&[&format!("admin:{child}-*"), "read:pub-*"]),
             2 => caller.claims.not_before = at(caller.claims.not_before.as_millis() + 1_000),
             3 => unstamped = true,
+            // A root caller whose presented scopes don't cover the child's: `apply` holds a
+            // root's child to them, as it holds a delegated caller's to its record.
+            4 if !caller.claims.principal.as_str().contains('.') => {
+                caller.claims.scopes = scopes(&[
+                    &format!("read:{}.*", caller.claims.principal),
+                    &format!("grant:{}.*", caller.claims.principal),
+                ]);
+            }
             _ => {}
         }
         let action = ask.action(&caller);
@@ -266,8 +291,10 @@ impl Model {
                     .roots
                     .iter()
                     .find(|other| other.claims.id != root.claims.id);
-                match other {
-                    Some(other) if self.draws.below(2) == 0 => (other.clone(), by_principal),
+                match (other, self.draws.below(3)) {
+                    (Some(other), 0) => (other.clone(), by_principal),
+                    // A revoked caller: `apply` checks the denylist for it, as for a delegation.
+                    (_, 1) => (self.revoked_root.clone(), by_token),
                     _ => (
                         target,
                         AncestorTarget::Principal(parent.parse().expect("an agent name")),
@@ -344,6 +371,10 @@ fn counts(model: &Model) -> BTreeMap<&'static str, usize> {
                 }),
             ) if replaces => "cap refused a replacing revocation",
             (_, Err(Rejection::RevocationLimit { .. })) => "revocation limit",
+            (Action::RevokeAsAncestor { .. }, Err(Rejection::CallerRevoked { .. })) => {
+                "revoked caller"
+            }
+            (Action::RecordDelegation { .. }, Err(Rejection::NotNarrowed { .. })) => "not narrowed",
             (_, Ok(_)) => "other",
             (_, Err(Rejection::DelegationLimit { limit })) => match limit {
                 Limit::Live => "live limit",
@@ -420,7 +451,7 @@ fn assert_budgets_bounded(state: &State) {
 }
 
 fn generate(seed: u64, steps: usize) -> Model {
-    let mut model = Model::new(seed);
+    let mut model = Model::started(seed);
     for _ in 0..steps {
         model.step();
     }
@@ -440,6 +471,8 @@ fn assert_exercised(counts: &BTreeMap<&'static str, usize>, limits: Limits) {
         ("ancestor pair", 5),
         ("fleet principal", 5),
         ("refused", 1),
+        ("revoked caller", 1),
+        ("not narrowed", 1),
     ];
     if limits == Limits::Each {
         wanted.extend([

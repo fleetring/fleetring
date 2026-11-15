@@ -285,6 +285,36 @@ fn apply_refuses_a_child_wider_than_its_recorded_parent() {
     recorded(stamped(&mut state, 2_000, within.action(&caller)));
 }
 
+/// A root parent has no record, so `apply` holds the child to the scopes the root's presented
+/// token carries, which the command holds: a proposer that skipped the handler's narrowing can't
+/// widen a root's child within the tier.
+#[test]
+fn apply_refuses_a_child_wider_than_its_root_callers_presented_scopes() {
+    let mut state = fleet();
+    let mut root = root_token("agent-42", "root-jti");
+    // The root may read its children's databases, and grant below itself.
+    root.claims.scopes = scopes(&["read:agent-42.*", "grant:agent-42.*"]);
+    let wider = Ask::new(1, "c7", leaf("agent-42.c7"), EXP);
+    assert!(matches!(
+        refused(&mut state, 1_000, wider.action(&root)),
+        Rejection::NotNarrowed {
+            reason: GrantStepError::NotCovered { .. }
+        }
+    ));
+    // A root without `grant` hands on nothing.
+    let mut ungranted = root.clone();
+    ungranted.claims.scopes = scopes(&["admin:agent-42.*"]);
+    let ask = Ask::new(2, "c7", scopes(&["read:agent-42.c7-*"]), EXP);
+    assert!(matches!(
+        refused(&mut state, 1_000, ask.action(&ungranted)),
+        Rejection::NotNarrowed {
+            reason: GrantStepError::NoGrant
+        }
+    ));
+    let within = Ask::new(3, "c7", scopes(&["read:agent-42.c7-*"]), EXP);
+    recorded(stamped(&mut state, 1_000, within.action(&root)));
+}
+
 #[test]
 fn apply_refuses_a_child_whose_chain_omits_its_parent() {
     let mut state = fleet();
@@ -882,7 +912,27 @@ proptest! {
                 }),
             };
             if let Some(action) = action {
-                let _ = stamped(&mut state, clock, action);
+                // An ancestor-rule caller the denylist refuses adds nothing (I10): `apply` checks
+                // it, as it checks a delegation's caller.
+                let refused_caller = match &action {
+                    Action::RevokeAsAncestor { caller, .. } => {
+                        let signer = SignerKind::for_principal(&caller.claims.principal);
+                        state
+                            .revocations()
+                            .refuses_token(&caller.claims.token_ref(&caller.kid, signer))
+                    }
+                    _ => None,
+                };
+                let outcome = stamped(&mut state, clock, action);
+                if let Some(by) = refused_caller {
+                    prop_assert!(
+                        matches!(
+                            outcome,
+                            Err(Rejection::CallerRevoked { .. } | Rejection::ForgedLineage { .. })
+                        ),
+                        "a caller revoked by {by:?} revoked: {outcome:?}"
+                    );
+                }
             }
             for (_, record) in state.delegations() {
                 if !record.is_live(at(clock), state.now()) {
