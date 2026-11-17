@@ -668,13 +668,15 @@ impl Follow {
                         chain.tip().0
                     )));
                 }
-                if let Some(anchor) = self.adopt_epoch_start(&mut chain, position.as_ref()) {
-                    record_anchor(inner, &self.name, anchor).await;
-                }
-                // The primary counts the position only once this hash matches its own there.
+                // The primary counts the position only once this hash matches its own there. It
+                // is taken before a derived chain adopts the primary's hash at the epoch's start,
+                // which would only echo the primary's own hash back and prove nothing.
                 let proof = (!chain.is_derived())
                     .then(|| chain.hash_at(position.as_ref()))
                     .flatten();
+                if let Some(anchor) = self.adopt_epoch_start(&mut chain, position.as_ref()) {
+                    record_anchor(inner, &self.name, anchor).await;
+                }
                 self.slot.set_chain(Some(chain));
                 (Some(follower), first_ack(position.as_ref(), proof))
             }
