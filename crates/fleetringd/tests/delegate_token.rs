@@ -777,6 +777,10 @@ async fn retry_after_rotation_returns_same_id_and_claims_signed_by_b_and_both_ve
         Validity::new(start, Duration::from_secs(60 * 24 * 3600)),
     )?;
     std::fs::File::create(&files.key)?.write_all(pair.key_pem().as_bytes())?;
+    std::fs::set_permissions(
+        &files.key,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
     std::fs::File::create(&files.cert)?.write_all(pair.certificate_pem().as_bytes())?;
     let b = tokio::time::timeout(HANG_GUARD, async {
         loop {
@@ -953,6 +957,10 @@ async fn copy_signed_by_another_issuer_key_cannot_resend_and_its_children_name_t
     )?;
     std::fs::write(&files.cert, pair.certificate_pem())?;
     std::fs::write(&files.key, pair.key_pem())?;
+    std::fs::set_permissions(
+        &files.key,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
     let other = IssuerPair::load(
         &files,
         &dev.tls.node_identity("dev")?,

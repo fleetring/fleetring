@@ -285,9 +285,11 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
 }
 
 /// Replaces `path` atomically, so a reload never reads half a file.
+/// Writes `contents` over `path` whole, private to its owner, as keys are written.
 fn replace_file(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
     let staged = path.with_extension("staged");
     std::fs::write(&staged, contents)?;
+    std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     std::fs::rename(&staged, path)?;
     Ok(())
 }
