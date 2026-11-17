@@ -511,7 +511,7 @@ The MCP server's `db_fork` tool, offered only with read-write access, is describ
 ### `cert issuer`
 
 ```text
-fleetring cert issuer --name <name> [--ttl <duration>] --dir <authority dir> [--out <dir>]
+fleetring cert issuer --name <name> [--ttl <duration>] --dir <authority dir> [--out <dir>] [--replace]
 ```
 
 It gives a control node its delegation issuer: a new Ed25519 key and an issuer certificate for `fleetring://<fleet>/issuer/<name>`, signed by the authority in `--dir`, where `ca.key` is.
@@ -519,6 +519,7 @@ It gives a control node its delegation issuer: a new Ed25519 key and an issuer c
 - **Its place.** It belongs to the `cert` noun, in the Security group, after `cert client`.
 - **`--name`** has the node ID grammar; by convention it is the control node's ID. Each control node gets its own.
 - **Files.** `issuer.<name>.crt` and `issuer.<name>.key` (`0600`), in `--out` (created `0700`) or `--dir`. Every run makes a new key, so running it again renews the certificate and rotates the key; the control node reloads both files without a restart. It writes over an existing pair through temporary names and renames the key into place before the certificate, so a control node that reloads between the two renames keeps the pair it had until its next check.
+- **Renewing in place.** `--out` may already hold issuer pairs, and nothing else: a directory `cert issuer` wrote. Before it writes, the command checks the certificate it would replace: it renews only a pair the same authority certified for the same fleet and name. Anything else it would overwrite, a pair another authority certified, another issuer's certificate under this name, or a key with no certificate beside it, is refused with exit code 2 and the hint to pass `--replace`, which writes over it with a warning. The same check applies in `--dir`.
 - **`--ttl`** is 30 days by default, as for `cert node`, and at most 90 days; nodes refuse a longer issuer certificate.
 - **The result** names the two files and the two lines to add to the control node's configuration, `[control] issuer_cert` and `issuer_key`. The key is never printed.
 - **Dev mode** makes its own, `tls/issuer.dev.crt` and `.key`, at start, and replaces them, at start and while it runs, when fewer than 30 days remain; `cert issuer` isn't needed there.

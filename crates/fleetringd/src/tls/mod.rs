@@ -46,8 +46,8 @@ pub(crate) use issuer::IssuerCache;
 pub use issuer::{IssuerCertError, IssuerCertificate};
 pub use issuer_files::{
     DEV_ISSUER_CERT_FILE, DEV_ISSUER_KEY_FILE, DEV_ISSUER_LIFETIME, DEV_RENEW_BEFORE,
-    DevIssuerOutcome, EXPIRY_WARNING_WINDOW, IssuerFileProblem, IssuerFiles, IssuerFilesError,
-    IssuerPair, ensure_dev_pair, write_issuer_pair,
+    DevIssuerOutcome, EXPIRY_WARNING_WINDOW, ExistingPair, IssuerFileProblem, IssuerFiles,
+    IssuerFilesError, IssuerPair, ensure_dev_pair, existing_pair, write_issuer_pair,
 };
 pub(crate) use issuer_files::{DEV_ISSUER_FILES, IssuerWatch};
 pub use names::{AGENT_PREFIX, FleetName, NameError, Principal, SubjectUri};
