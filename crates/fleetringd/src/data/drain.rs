@@ -46,6 +46,7 @@ use tonic::{Code, Status};
 
 use crate::data::node::{DataNode, HeldLease};
 use crate::engine::Position;
+use crate::replication::FollowerProgress;
 
 /// How a node paces a drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,15 +212,15 @@ async fn transfer(
     }
 
     // 2. Pick the target and ship it the tail. A `local` database's followers may hold logs from
-    //    different epochs, which only the control plane can rank, so it chooses; the tail is
-    //    shipped to its choice once it is known.
+    //    different epochs, which only the control plane can rank, so it chooses, as it does when
+    //    no follower's position counts yet; the tail is shipped to its choice once it is known.
     let target = if lease
         .durability
         .is_some_and(|durability| durability.acks() == Acks::Local)
     {
         None
     } else {
-        Some(pick_target(node, database, lease)?)
+        pick_target(node, database, lease)?
     };
     if let Some(target) = &target {
         ship_tail(node, database, target, settings).await;
@@ -286,38 +287,57 @@ async fn ship_tail(
 }
 
 /// The follower to hand `database` to: among the connected, live followers in its replica set,
-/// the one that has acknowledged the most, and the earliest in preference order on ties.
+/// the one that has acknowledged the most, and the earliest in preference order on ties; or
+/// `None`, for the control plane to rank, when followers are connected and none's position counts
+/// yet, as a follower's whose first acknowledgement on an idle database proved nothing.
 fn pick_target(
     node: &DataNode,
     database: &DatabaseName,
     lease: HeldLease,
-) -> Result<NodeId, Stuck> {
+) -> Result<Option<NodeId>, Stuck> {
     let replication = node.replication();
     let status = replication
         .primary_status(database)
         .ok_or(Stuck::NotServing)?;
     let view = replication.membership_view();
     let replicas = replication.replica_set(database, lease.replication_factor);
+    let live = replicas.iter().filter(|replica| {
+        *replica != node.id() && view.liveness(replica) == Some(fleetring_control::Liveness::Live)
+    });
+    choose_target(live.filter_map(|replica| {
+        status
+            .followers
+            .iter()
+            .find(|progress| &progress.node == replica)
+    }))
+}
+
+/// Chooses the target among `followers`, live and in preference order, as [`pick_target`]
+/// describes.
+fn choose_target<'a>(
+    followers: impl IntoIterator<Item = &'a FollowerProgress>,
+) -> Result<Option<NodeId>, Stuck> {
     let mut best: Option<(&NodeId, Option<&Position>)> = None;
-    for replica in &replicas {
-        if replica == node.id() || view.liveness(replica) != Some(fleetring_control::Liveness::Live)
-        {
+    let mut connected = false;
+    for progress in followers {
+        if !progress.connected {
             continue;
         }
-        let Some(progress) = status.followers.iter().find(|f| &f.node == replica) else {
-            continue;
-        };
-        if !progress.connected || !progress.reported {
+        connected = true;
+        if !progress.reported {
             continue;
         }
         let acknowledged = progress.acknowledged.as_ref();
         // Strictly greater, so the earliest in preference order wins ties.
         if best.is_none_or(|(_, held)| acknowledged > held) {
-            best = Some((replica, acknowledged));
+            best = Some((&progress.node, acknowledged));
         }
     }
-    best.map(|(replica, _)| replica.clone())
-        .ok_or(Stuck::NoFollower)
+    match best {
+        Some((target, _)) => Ok(Some(target.clone())),
+        None if connected => Ok(None),
+        None => Err(Stuck::NoFollower),
+    }
 }
 
 /// Asks the control plane to transfer `database`'s lease to `target`, or to whoever it ranks
@@ -402,5 +422,54 @@ impl DataNode {
             "drained",
         );
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn follower(
+        name: &str,
+        acknowledged: Option<u8>,
+        reported: bool,
+        connected: bool,
+    ) -> FollowerProgress {
+        FollowerProgress {
+            node: name.parse().expect("a valid node ID"),
+            acknowledged: acknowledged.map(|byte| Position::from(vec![byte])),
+            reported,
+            connected,
+            needs_snapshot: false,
+        }
+    }
+
+    /// The drain names the connected follower whose counted position is furthest, the earliest
+    /// on ties; with followers connected and none counted, as on an idle database whose
+    /// followers' first acknowledgements proved nothing, it leaves the control plane to rank
+    /// them; with none connected it is stuck (FR-106).
+    #[test]
+    fn a_drain_leaves_unproven_followers_to_the_control_plane() {
+        let ranked = [
+            follower("b", Some(1), true, true),
+            follower("c", Some(2), true, true),
+            follower("d", Some(2), true, true),
+            follower("e", Some(9), false, true),
+            follower("f", Some(9), true, false),
+        ];
+        assert_eq!(
+            choose_target(&ranked)
+                .ok()
+                .flatten()
+                .map(|node| node.to_string()),
+            Some("c".to_owned())
+        );
+        let unproven = [
+            follower("b", Some(1), false, true),
+            follower("c", None, true, false),
+        ];
+        assert!(matches!(choose_target(&unproven), Ok(None)));
+        let gone = [follower("b", Some(1), true, false)];
+        assert!(matches!(choose_target(&gone), Err(Stuck::NoFollower)));
     }
 }
