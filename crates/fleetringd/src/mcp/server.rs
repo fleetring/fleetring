@@ -1039,10 +1039,22 @@ impl ServerHandler for FleetringMcp {
                 None,
             ));
         };
-        let arguments = request.arguments.unwrap_or_default();
+        let mut arguments = request.arguments.unwrap_or_default();
+        // A fork without an operation ID gets one now, so that sending the call again below
+        // resends the same operation, or follows it, rather than asking for a second fork: a
+        // refusal as unauthenticated may come after the fork was submitted, while it is followed.
+        if tool == ToolName::DbFork && !arguments.contains_key("operation_id") {
+            let operation = new_operation_id().map_err(|_| {
+                ErrorData::internal_error("no randomness for the operation ID", None)
+            })?;
+            arguments.insert(
+                "operation_id".to_owned(),
+                serde_json::Value::String(operation.to_string()),
+            );
+        }
         let mut outcome = self.run_timed(tool, arguments.clone()).await;
         // A refusal as unauthenticated rejected the call before it ran, so sending it again with
-        // the credentials now on disk repeats nothing.
+        // the credentials now on disk repeats nothing; a fork resends under its operation ID.
         if matches!(&outcome, Err(Failed::Status(status)) if status.code() == Code::Unauthenticated)
             && self.reload_client()
         {
