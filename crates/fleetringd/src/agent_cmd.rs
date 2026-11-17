@@ -21,7 +21,7 @@ use fleetring_client::context::{Context, ContextError, ContextName, DEV_NAME, se
 use fleetring_control::Timestamp;
 use fleetring_proto::v1::{DelegateTokenRequest, DelegateTokenResponse};
 use fleetringd::Network;
-use fleetringd::auth::{Action, BearerToken, MAX_TOKEN_LIFETIME, Scope};
+use fleetringd::auth::{Action, BearerToken, MAX_TOKEN_LIFETIME, Scope, TokenError};
 use fleetringd::clock::{Clock as _, SystemClock};
 use fleetringd::data::Client;
 use fleetringd::dev::{self, Detached, DevChecked};
@@ -921,12 +921,28 @@ async fn revoke(
     match revoke::send_revocation(client, &revoke::token_request(token)).await {
         Ok(answer) => Ok(Revocation::Until(Timestamp::from_millis(answer.until_ms))),
         Err(Unanswered::Refused(status))
-            if presenting == Presenting::Itself && status.code() == Code::Unauthenticated =>
+            if presenting == Presenting::Itself
+                && refuses_spent(&status, token, SystemClock.now()) =>
         {
             Ok(Revocation::Refused)
         }
         Err(unanswered) => Err(unanswered),
     }
+}
+
+/// Whether the fleet refused `token`, presented to revoke itself, because it has expired or is
+/// revoked, so nothing is left to revoke: the boundary says so, or it refuses the token as
+/// unauthenticated while the token's own expiry has passed by `now`, this machine's time, too.
+/// Any other refusal of the token, as of one not valid yet under clock skew, or signed by a key
+/// the node doesn't trust, leaves it unrevoked, and perhaps valid on other nodes.
+fn refuses_spent(status: &tonic::Status, token: &OldToken, now: Timestamp) -> bool {
+    if status.code() != Code::Unauthenticated {
+        return false;
+    }
+    let message = status.message();
+    message == TokenError::Expired.to_string()
+        || message == TokenError::Revoked.to_string()
+        || token.until <= now
 }
 
 /// What `agent renew` says, before it revokes the token it replaced as the agent itself: the
@@ -1387,9 +1403,10 @@ async fn remove_root(
                         replacement,
                     )
                 }
-                // The control node refuses the token itself, so it has expired or was revoked:
-                // nothing is left that it could revoke as itself, or that needs revoking.
-                Err(Unanswered::Refused(status)) if status.code() == Code::Unauthenticated => (
+                // The control node refuses the token itself because it has expired or was
+                // revoked: nothing is left that it could revoke as itself, or that needs
+                // revoking. Refused for another reason, it falls back to `fleet` below.
+                Err(Unanswered::Refused(status)) if refuses_spent(&status, &token, now) => (
                     format!("{} and ", Revocation::Refused.describe(&token)),
                     String::new(),
                 ),
@@ -2041,6 +2058,41 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an expired or revoked token counts as nothing left to revoke: a token refused for
+    /// another reason, as one not valid yet under clock skew or signed by a key the node doesn't
+    /// trust, still needs revoking, unless it has expired by this machine's clock too.
+    #[test]
+    fn only_a_spent_token_has_nothing_left_to_revoke() {
+        let now = Timestamp::from_millis(1_000_000);
+        let live = OldToken {
+            id: "t".to_owned(),
+            until: Timestamp::from_millis(2_000_000),
+        };
+        let expired = OldToken {
+            id: "t".to_owned(),
+            until: Timestamp::from_millis(500_000),
+        };
+        let refused = |error: TokenError| tonic::Status::unauthenticated(error.to_string());
+        assert!(refuses_spent(&refused(TokenError::Expired), &live, now));
+        assert!(refuses_spent(&refused(TokenError::Revoked), &live, now));
+        assert!(!refuses_spent(
+            &refused(TokenError::NotYetValid),
+            &live,
+            now
+        ));
+        assert!(!refuses_spent(&refused(TokenError::UnknownKey), &live, now));
+        assert!(refuses_spent(
+            &refused(TokenError::UnknownKey),
+            &expired,
+            now
+        ));
+        assert!(!refuses_spent(
+            &tonic::Status::permission_denied(TokenError::Expired.to_string()),
+            &expired,
+            now
+        ));
+    }
 
     fn invocation() -> Invocation {
         Invocation {
