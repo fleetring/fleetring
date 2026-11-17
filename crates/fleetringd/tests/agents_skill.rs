@@ -525,3 +525,133 @@ fn llms_txt_links_resolve() {
     }
     assert!(checked > 0, "llms.txt has no relative links");
 }
+
+/// The agent-facing pages #145's checks read: what an agent, or the person setting one up, reads.
+const AGENT_PAGES: [(&str, &str); 4] = [
+    ("SKILL.md", SKILL),
+    ("quickstart.md", QUICKSTART),
+    ("llms.txt", LLMS_TXT),
+    ("README.md", include_str!("../../../README.md")),
+];
+
+/// #145 (ADR-0044, point 11.3): no page calls a 0.8.0 agent setup "secure", "isolated" or
+/// "sandboxed". 0.8.0 is trusted local development: agents of one user can read each other's
+/// credentials. A line that names agents and one of those words must also say what isn't so.
+#[test]
+fn no_page_calls_an_agent_setup_secure_isolated_or_sandboxed() {
+    const CLAIMS: [&str; 3] = ["secure", "isolated", "sandboxed"];
+    const AGENT_WORDS: [&str; 3] = ["agent", "delegat", "child"];
+    const DENIALS: [&str; 6] = ["isn't", "not ", "don't", "needs", "no ", "without"];
+    let mut found = Vec::new();
+    for (page, text) in AGENT_PAGES {
+        for (number, line) in text.lines().enumerate() {
+            let lower = line.to_lowercase();
+            // Whole words, never part of a path such as `/secure/prod-ca`.
+            let claims = lower
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/'))
+                .any(|word| CLAIMS.contains(&word));
+            let about_agents = AGENT_WORDS.iter().any(|word| lower.contains(word));
+            let denied = DENIALS.iter().any(|word| lower.contains(word));
+            if claims && about_agents && !denied {
+                found.push(format!("{page}:{}: {line}", number + 1));
+            }
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// #145: no example passes a token to a model or an MCP tool. No tool takes an argument named
+/// for a token, no tool call in the pages carries one, and no page holds a token's text.
+#[test]
+fn no_example_passes_a_token_to_a_model_or_a_tool() -> Result<(), Box<dyn Error>> {
+    let tools: Vec<Json> = serde_json::from_str(TOOLS)?;
+    for tool in &tools {
+        let properties = tool["inputSchema"]["properties"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        for name in properties.keys() {
+            assert!(
+                !name.contains("token") && !name.contains("credential"),
+                "{}: argument {name}",
+                tool["name"]
+            );
+        }
+    }
+    for (page, text) in AGENT_PAGES {
+        // A JWT's header begins `eyJ`, base64 of `{"`.
+        assert!(!text.contains("eyJ"), "{page} holds a token's text");
+        for value in json_values(text)? {
+            if let Some(arguments) = value.get("arguments") {
+                let arguments = arguments.to_string();
+                assert!(
+                    !arguments.contains("token") && !arguments.contains("Bearer"),
+                    "{page}: a tool call carries a token: {arguments}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The command path after each `fleetring` in `text`: the words that follow it, up to the first
+/// that is an argument, a flag, or a placeholder.
+fn command_paths(text: &str) -> Vec<Vec<String>> {
+    let mut paths = Vec::new();
+    for (index, _) in text.match_indices("fleetring ") {
+        let before = text[..index].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/' || c == '.') {
+            continue;
+        }
+        let mut path = Vec::new();
+        for token in text[index + "fleetring ".len()..].split(' ') {
+            let word = token.trim_end_matches(['`', ',', ')', ';', ':', '.']);
+            let is_word = word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                && word.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+            if !is_word {
+                break;
+            }
+            path.push(word.to_owned());
+            if word.len() != token.len() {
+                break;
+            }
+        }
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Every `fleetring` command the skill and the quickstart name exists: `fleetring <path>
+/// --help` succeeds, which a subcommand that doesn't exist fails.
+#[test]
+fn every_command_in_the_skill_and_the_quickstart_exists() -> Result<(), Box<dyn Error>> {
+    let mut checked = std::collections::BTreeSet::new();
+    for (page, text) in [("SKILL.md", SKILL), ("quickstart.md", QUICKSTART)] {
+        for path in command_paths(text) {
+            if !checked.insert(path.clone()) {
+                continue;
+            }
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
+                .args(&path)
+                .arg("--help")
+                .env(
+                    "FLEETRING_HOME",
+                    std::env::temp_dir().join("fleetring-skill-help"),
+                )
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{page}: `fleetring {}` isn't a command: {}",
+                path.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    assert!(
+        checked.contains(&vec!["agent".to_owned(), "delegate".to_owned()]),
+        "{checked:?}"
+    );
+    Ok(())
+}
