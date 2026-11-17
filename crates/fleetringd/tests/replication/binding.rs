@@ -406,6 +406,18 @@ impl Bound {
     }
 
     async fn fence(&self, from: &str, to: &str, epoch: u64, candidate: &str) -> Result<(), Status> {
+        self.fence_naming(from, to, epoch, candidate, None).await
+    }
+
+    /// As [`fence`](Self::fence), naming `incarnation` as the database's.
+    async fn fence_naming(
+        &self,
+        from: &str,
+        to: &str,
+        epoch: u64,
+        candidate: &str,
+        incarnation: Option<u64>,
+    ) -> Result<(), Status> {
         let mut client = self
             .client(from, to)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -414,6 +426,7 @@ impl Bound {
                 database: DATABASE.to_owned(),
                 epoch,
                 candidate: candidate.to_owned(),
+                incarnation,
             })
             .await
             .map(|_| ())
@@ -504,6 +517,44 @@ async fn a_stream_naming_another_incarnation_than_the_copy_is_refused() -> TestR
         "the copy is kept as it was"
     );
     bound.replicate_naming("a", "c", 1, Some(7)).await?;
+    Ok(())
+}
+
+/// A fence names the database's incarnation, and a copy of another refuses it, even once its
+/// record names the caller the holder of the fenced epoch, which used to let a fence through on
+/// the record alone; the copy is kept as it was (ADR-0046's amendment, item 13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_naming_another_incarnation_than_the_copy_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    bound.authority.set(2, None, Some("b"), &["a", "b", "c"]);
+    bound.fence_naming("b", "c", 2, "b", Some(7)).await?;
+    assert_eq!(bound.highest_epoch("c"), Some(2));
+    let calls = bound.authority.calls();
+    let refused = bound
+        .fence_naming("b", "c", 2, "b", Some(8))
+        .await
+        .err()
+        .ok_or("a fence for another incarnation was accepted on the record")?;
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(refused.message().contains("orphan"), "{refused}");
+    assert_eq!(bound.refusals("c"), 0, "stale, not misbound");
+    assert_eq!(
+        bound.replication("c").copy_incarnation(&bound.db),
+        Some(Incarnation::new(7)),
+        "the copy is kept as it was"
+    );
+    // The fence for the copy's own incarnation still passes on the record.
+    bound.fence_naming("b", "c", 2, "b", Some(7)).await?;
+    assert_eq!(bound.authority.calls(), calls, "the record answered");
+    // One for an incarnation control state no longer holds is stale.
+    bound.authority.set(3, None, Some("b"), &["a", "b", "c"]);
+    let stale = bound
+        .fence_naming("b", "c", 3, "b", Some(8))
+        .await
+        .err()
+        .ok_or("a fence for an incarnation control state doesn't hold was accepted")?;
+    assert_eq!(stale.code(), Code::FailedPrecondition, "{stale}");
+    assert_eq!(bound.highest_epoch("c"), Some(2), "c recorded nothing");
     Ok(())
 }
 

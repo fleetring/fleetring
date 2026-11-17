@@ -301,6 +301,211 @@ fn scenario(seed: u64, forks: Forks) -> TestResult {
     Ok(())
 }
 
+/// A forked fleet's name is dropped and created again while a follower, S, whose record names
+/// T the holder of the dropped database's second epoch, is cut off from the control node and
+/// from the new primary, P (ADR-0046's amendment, item 13).
+///
+/// The first life fails over from P to T, so S's record names T the holder of epoch 2, and its
+/// copy records the first life's incarnation. S is cut off from the control node through the
+/// drop, so it never hears of it and keeps its copy, and from P. The name is created again: the
+/// new database is leased at epoch 1, on P, and P and T hold its writes. Then P fails, and the
+/// promotion to epoch 2 names T, the only live candidate, which must fence S, since Q = 2.
+/// Before the fix, S took the fence on its record alone, which names T at epoch 2, and reported
+/// the dropped database's position at log epoch 2, which outranks every copy of the new
+/// database: only the SQLite adapter's refusal of a log that doesn't continue T's kept T from
+/// adopting it, and the promotion failed again and again. Now the fence names the new database's
+/// incarnation, S refuses it and is never counted fenced, and the promotion waits for P.
+fn recreated_while_a_follower_is_cut_off(seed: u64) -> TestResult {
+    let timings = Timings {
+        heartbeat_timeout: Duration::from_secs(5),
+        lease_duration: Duration::from_secs(6),
+        lease_renewal: Duration::from_secs(1),
+        failover_margin: Duration::from_secs(1),
+        ..Timings::default()
+    };
+    let mut builder = Fleet::builder(seed)
+        .control(CONTROL)
+        .timings(timings)
+        .replication(settings())
+        .operation_timeout(Duration::from_secs(4));
+    for node in NODES {
+        builder = builder.data(node);
+    }
+    let mut fleet = builder.build()?;
+    fleet.await_ring(Duration::from_secs(10))?;
+    make_a_fork(&mut fleet)?;
+    let database = reused()?;
+
+    // The first life, which fails over from P to T.
+    let mut first = vec![Operation::Create {
+        database: database.clone(),
+        replication_factor: 3,
+        durability: DurabilityMode::Quorum,
+    }];
+    first.extend((0..FIRST_LIFE).map(|value| Operation::Write {
+        database: database.clone(),
+        value,
+    }));
+    run_script(&mut fleet, "first", first)?;
+    fleet.await_replicas_converged(LIMIT)?;
+    let primary = leader(&fleet, &database).ok_or("no primary for the first life")?;
+    fleet.crash(&primary)?;
+    let old = primary.clone();
+    let name = database.clone();
+    fleet.run_until(LIMIT, "the first life's promotion", |fleet| {
+        leader(fleet, &name).is_some_and(|holder| holder != old)
+    })?;
+    let promoted = leader(&fleet, &database).ok_or("no primary")?;
+    let epoch = fleet
+        .control_state()
+        .and_then(|state| state.database(&database).map(|db| db.epoch().get()))
+        .ok_or("no epoch")?;
+    if epoch != 2 {
+        return Err(format!("the first life's promotion is to epoch {epoch}, not 2").into());
+    }
+    let stale = NODES
+        .into_iter()
+        .find(|node| *node != primary && *node != promoted)
+        .ok_or("no third node")?
+        .to_owned();
+    fleet.restart(&primary)?;
+    fleet.await_ring(LIMIT)?;
+    run_script(
+        &mut fleet,
+        "first-again",
+        (FIRST_LIFE..FIRST_LIFE + 5)
+            .map(|value| Operation::Write {
+                database: database.clone(),
+                value,
+            })
+            .collect(),
+    )?;
+    fleet.await_replicas_converged(LIMIT)?;
+    fleet.note(format!(
+        "{database}'s first life failed over from {primary} to {promoted}; {stale} records \
+         {promoted} at epoch 2 and is cut off from the control node and from {primary}"
+    ));
+
+    // S hears nothing of the drop, nor of the new database.
+    fleet.partition(&stale, CONTROL)?;
+    fleet.partition(&stale, &primary)?;
+    run_script(
+        &mut fleet,
+        "drop",
+        vec![Operation::Drop {
+            database: database.clone(),
+        }],
+    )?;
+    let copy_on = |fleet: &Fleet, host: &str| {
+        fleet
+            .data_dir(host)
+            .is_some_and(|dir| dir.join("databases").join("reused").exists())
+    };
+    let (p, t) = (primary.clone(), promoted.clone());
+    fleet.run_until(LIMIT, "P and T deleting their copies", |fleet| {
+        !copy_on(fleet, &p) && !copy_on(fleet, &t)
+    })?;
+    run_script(
+        &mut fleet,
+        "again",
+        vec![Operation::Create {
+            database: database.clone(),
+            replication_factor: 3,
+            durability: DurabilityMode::Quorum,
+        }],
+    )?;
+    if leader(&fleet, &database).as_deref() != Some(primary.as_str()) {
+        return Err(format!(
+            "the second life is led by {:?}, not {primary}",
+            leader(&fleet, &database)
+        )
+        .into());
+    }
+    run_script(
+        &mut fleet,
+        "second",
+        (SECOND_LIFE..SECOND_LIFE + SECOND_WRITES)
+            .map(|value| Operation::Write {
+                database: database.clone(),
+                value,
+            })
+            .collect(),
+    )?;
+    let life = second_life(&fleet.history());
+    let acknowledged: Vec<i64> = life.acknowledged_writes().map(|(_, value)| value).collect();
+    if acknowledged.is_empty() {
+        return Err("the second life acknowledged no write".into());
+    }
+    if !copy_on(&fleet, &stale) {
+        return Err(format!("{stale} lost its copy of the first life").into());
+    }
+
+    // Whoever leads the new database serves every write it acknowledged and none of the dropped
+    // database's rows, and no promotion counts S fenced while S holds the dropped copy.
+    let stale_id: fleetring::NodeId = stale.parse()?;
+    let checked = |fleet: &Fleet| -> Result<()> {
+        let fenced = fleet.control_state().and_then(|state| {
+            state
+                .database(&database)?
+                .promotion()
+                .and_then(|promotion| promotion.fenced_position(&stale_id).cloned())
+        });
+        if let Some(position) = fenced {
+            return Err(format!(
+                "{stale} was fenced for the new database at {position:?}, with the dropped \
+                 database's copy"
+            )
+            .into());
+        }
+        let Some(holder) = leader(fleet, &database).filter(|holder| *holder != primary) else {
+            return Ok(());
+        };
+        let rows = fleet.replica_rows(&database)?;
+        let served = rows.get(&holder).cloned().unwrap_or_default();
+        if let Some(dropped) = served.iter().find(|value| **value < SECOND_LIFE) {
+            return Err(format!(
+                "{holder} serves the dropped database's row {dropped}, from {stale}'s copy: \
+                 {rows:?}"
+            )
+            .into());
+        }
+        for value in &acknowledged {
+            if !served.contains(value) {
+                return Err(format!(
+                    "{holder} was promoted without acknowledged write {value}: {rows:?}"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    };
+
+    // P fails: the promotion to epoch 2 names T, which must fence S.
+    fleet.crash(&primary)?;
+    for _ in 0..150 {
+        fleet.run_for(Duration::from_millis(100))?;
+        checked(&fleet)?;
+    }
+
+    // P comes back: the promotion fences it, and serves the new database's log.
+    fleet.restart(&primary)?;
+    let old = primary.clone();
+    let name = database.clone();
+    fleet.run_until(LIMIT, "the second life's promotion", |fleet| {
+        leader(fleet, &name).is_some_and(|holder| holder != old)
+    })?;
+    checked(&fleet)?;
+    // S keeps the dropped database's copy as an orphan, for `orphan remove` (ADR-0042), so it
+    // never follows the new database; the rest of the fleet finishes as ever.
+    fleet.repair(&stale, &primary)?;
+    fleet.repair(&stale, CONTROL)?;
+    fleet.await_ring(LIMIT)?;
+    fleet.run_for(Duration::from_secs(5))?;
+    checked(&fleet)?;
+    fleet.finish()?;
+    Ok(())
+}
+
 /// In a fleet that never forked, every database has the legacy incarnation: the follower's
 /// copy of the dropped database is told apart by its chain hash at its first acknowledgement,
 /// and re-seeded, before it counts toward any write.
@@ -315,4 +520,12 @@ fn a_dropped_databases_copy_never_counts_toward_a_database_created_again() {
 #[test]
 fn a_dropped_databases_copy_is_neither_followed_nor_kept_for_one_created_again() {
     seeds::run(BINARY, &seeds::FIXED, |seed| scenario(seed, Forks::Made));
+}
+
+/// A follower cut off while a forked fleet's name is dropped and created again refuses the
+/// promotion's fence, which names the new database's incarnation, though its record names the
+/// candidate the holder of the fenced epoch, so the candidate never adopts the dropped log.
+#[test]
+fn a_dropped_databases_copy_refuses_a_fence_for_one_created_again() {
+    seeds::run(BINARY, &seeds::FIXED, recreated_while_a_follower_is_cut_off);
 }

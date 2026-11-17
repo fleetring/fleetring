@@ -328,13 +328,20 @@ pub(super) async fn check_stream(
     Ok(Some(incarnation))
 }
 
-/// Checks a `Fence` that `caller` sends for `database` at `epoch`, naming `candidate`: the
-/// request names the caller, and control state names the caller the candidate of the promotion
-/// to `epoch` (or, once that promotion completed, the holder at it), and, for a fork whose
-/// replica set is its recorded holders, this node one of them. A fence the record already
-/// took from the caller at `epoch` needs no second look, and an epoch below the record's is left
-/// to the record, which refuses it. Returns the incarnation control state holds the database
-/// at, when it was asked, for the copy to record.
+/// Checks a `Fence` that `caller` sends for `database` at `epoch`, naming `candidate` and the
+/// database's incarnation `named` if the caller sends one: the request names the caller, and
+/// control state names the caller the candidate of the promotion to `epoch` (or, once that
+/// promotion completed, the holder at it), holds `named`, and, for a fork whose replica set is
+/// its recorded holders, names this node one of them. A fence the record already took from the
+/// caller at `epoch` needs no second look, and an epoch below the record's is left to the
+/// record, which refuses it. Returns the incarnation control state holds the database at, when
+/// it was asked, for the copy to record.
+///
+/// The record names a holder per epoch, not per database, as for streams, so a fence the record
+/// lets through must also name the incarnation the copy records
+/// ([`super::failover::check_fence_incarnation`]), which the fence checks before it records
+/// anything. A candidate that predates the field names none; it promotes only in a fleet that
+/// hasn't enabled forks, whose databases all have the legacy incarnation.
 ///
 /// # Errors
 ///
@@ -344,6 +351,7 @@ pub(super) async fn check_fence(
     database: &DatabaseName,
     epoch: u64,
     candidate: Option<&NodeId>,
+    named: Option<Incarnation>,
     caller: &NodeId,
 ) -> Result<Option<Incarnation>, Status> {
     let lease_epoch = LeaseEpoch::new(epoch);
@@ -385,6 +393,17 @@ pub(super) async fn check_fence(
         ..
     } = inner.authority.view(database).await?;
     other_incarnation(inner, database, &record, incarnation)?;
+    if let Some(named) = named
+        && named != incarnation
+        && incarnation != Incarnation::LEGACY
+    {
+        // The caller promotes a database of the name that control state no longer holds, as a
+        // candidate of a dropped database does until it learns of the drop: stale, not misbound.
+        return Err(Status::failed_precondition(format!(
+            "the fence is for incarnation {named} of {database}, but control state holds \
+             incarnation {incarnation}"
+        )));
+    }
     if holders.epoch > lease_epoch {
         return Err(superseded(database, epoch, holders.epoch));
     }

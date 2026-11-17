@@ -1046,11 +1046,14 @@ message ReplicateOpen {
   // agrees with the primary's before the next batch. Unset with `epoch_start`, when the
   // primary's chain doesn't hold it, or by a primary that predates the field.
   optional bytes epoch_start_chain = 4;
-  // The incarnation of the database the stream is for (ADR-0046, point 1). A follower whose
-  // copy records another incarnation refuses the stream and keeps the copy as an orphan: the
-  // copy is a dropped database's of the name, never followed as this one's. Unset for the legacy
-  // incarnation, 0, and by a primary that predates the field; a follower whose copy records a
-  // random incarnation then asks control state instead.
+  // The incarnation of the database the stream is for, as the primary's copy records it
+  // (ADR-0046, point 1, and its amendment, item 10), the legacy one, 0, included. A follower
+  // whose copy records another incarnation refuses the stream and keeps the copy as an orphan:
+  // the copy is a dropped database's of the name, never followed as this one's. A follower
+  // whose copy records none takes the one named here. Unset by a primary that predates the
+  // field, which leads only in a fleet that hasn't enabled forks, and by one whose own copy
+  // records none; a follower then records the incarnation control state shows, when its binding
+  // asks.
   optional uint64 incarnation = 5;
 }
 
@@ -1099,6 +1102,13 @@ message FenceRequest {
   // The node being promoted at `epoch`, the only one whose stream the replica accepts at it.
   // Empty from a caller that predates the field.
   string candidate = 3;
+  // The incarnation of the database the promotion is for, as control state holds it (ADR-0046,
+  // point 1, and its amendment, item 13), the legacy one, 0, included. A replica whose copy
+  // records another incarnation refuses the fence and keeps the copy as an orphan; so does one
+  // whose copy records an epoch and no incarnation, a copy of a database created before forks,
+  // when this names a random incarnation. Unset by a candidate that predates the field, which
+  // promotes only in a fleet that hasn't enabled forks.
+  optional uint64 incarnation = 4;
 }
 
 message FenceResponse {

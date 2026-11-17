@@ -863,6 +863,7 @@ async fn impostor(network: &Network, operation: &Operation) -> Ack {
                 database: database.to_string(),
                 epoch: epoch.get(),
                 candidate: candidate.to_string(),
+                incarnation: None,
             };
             match channel(network, target) {
                 Ok(channel) => replication_client(channel).fence(request).await.map(drop),

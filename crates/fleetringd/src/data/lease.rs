@@ -763,7 +763,7 @@ async fn carry_out(
     // A seeded fork's replica set is its recorded holders, whatever the ring says, and a ready
     // fork's until they are released: the promotion fences them, and only them, as control
     // state's quorums assume (ADR-0046, point 3.10). One that can't learn which is tried again.
-    replication.learn_fork_replicas(database).await?;
+    let incarnation = replication.learn_fork_replicas(database).await?;
     let me = node.id().clone();
     let replicas = replication.replica_set(database, request.replication_factor);
     if !replicas.contains(&me) {
@@ -775,7 +775,12 @@ async fn carry_out(
     tracing::info!(database = %database, epoch = epoch.get(), needed, "promoting: fencing replicas");
 
     // 1. Fence this replica, then the others in parallel, until Q are fenced and recorded.
-    let mine = replication.fence_local(database, epoch).await?;
+    // Every fence names the incarnation control state holds, so that a copy a dropped database
+    // of the name left, whose record may name this node the holder of `epoch`, refuses it
+    // (ADR-0046's amendment, item 13).
+    let mine = replication
+        .fence_local(database, epoch, incarnation)
+        .await?;
     record_fenced(node, database, &me, epoch, &mine).await?;
     let mut fenced: Vec<(NodeId, Fenced)> = vec![(me.clone(), mine.clone())];
     let mut fences = JoinSet::new();
@@ -784,7 +789,7 @@ async fn carry_out(
         let database = database.clone();
         fences.spawn(async move {
             let result = replication
-                .fence_peer(&peer, &database, epoch, settings.fence_timeout)
+                .fence_peer(&peer, &database, epoch, incarnation, settings.fence_timeout)
                 .await;
             (peer, result)
         });
