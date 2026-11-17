@@ -387,6 +387,16 @@ async fn serve_source(
         id,
     };
     let published_from = primary.published_bytes();
+    // An empty log is pinned whole; a log whose end the primary hasn't read yet isn't known to be
+    // empty.
+    if !primary.end_known() {
+        return Err(with_retry_after(
+            Status::unavailable(format!(
+                "the primary of {source} hasn't learned where its log ends yet; retry"
+            )),
+            RETRY_SOON,
+        ));
+    }
     let acknowledged = match primary.committed() {
         tip if fleetring_control::mutation::Mutation::PinAtTip.is_active() => tip,
         None => None,
