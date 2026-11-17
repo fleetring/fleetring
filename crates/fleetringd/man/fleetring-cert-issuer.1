@@ -4,7 +4,7 @@
 .SH NAME
 fleetring\-cert\-issuer \- Issues a delegation issuer pair: `issuer.<name>.crt` and `issuer.<name>.key`
 .SH SYNOPSIS
-\fBfleetring cert issuer\fR [\fB\-\-out\fR] [\fB\-\-ttl\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-name\fR> <\fB\-\-dir\fR> 
+\fBfleetring cert issuer\fR [\fB\-\-out\fR] [\fB\-\-ttl\fR] [\fB\-\-replace\fR] [\fB\-\-log\-format\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-name\fR> <\fB\-\-dir\fR> 
 .SH DESCRIPTION
 Issues a delegation issuer pair: `issuer.<name>.crt` and `issuer.<name>.key`
 .PP
@@ -26,6 +26,11 @@ Writes the files into this directory instead, created private to you
 How long the certificate lasts: `<n>d`, `<n>h`, `<n>m`, or `<n>s`
 
 30 days by default, and at most 90.
+.TP
+\fB\-\-replace\fR
+Writes over an existing pair this authority didn\*(Aqt certify for this name
+
+Without it, running the command again renews only a pair the same authority issued for the same name, and refuses anything else it would overwrite.
 .TP
 \fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR
 Writes log lines as `text` or `json`
