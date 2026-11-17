@@ -279,6 +279,14 @@ impl Streams {
 
     /// A new stream for `caller` on `database`, locked for its first request.
     ///
+    /// The stream is in the table before any node vouched for its token: the first request
+    /// vouches before it answers, or removes the stream. A first request dropped mid-flight, as
+    /// by a client that goes away, does neither, and leaves the stream unvouched until it expires
+    /// at the idle timeout (`[streams] idle_timeout_ms`, 10 seconds by default). Such streams
+    /// count toward `max_streams_per_principal` under the token's quota principal, its lineage's
+    /// root for a delegated agent, so a token that doesn't verify on any node can hold no more of
+    /// the table than its quota, and only for that long.
+    ///
     /// # Errors
     ///
     /// [`StreamRefusal::Full`] if the router holds `max_streams` already, and
