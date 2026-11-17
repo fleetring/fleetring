@@ -387,10 +387,10 @@ impl Authorizer {
         }
     }
 
-    /// Whether the token `credential` holds still holds now: it hasn't expired, and no entry of
-    /// the denylist refuses it, the key that certified its signer, any ancestor in its chain, or
-    /// its principal or an ancestor's, by the rule verification applied. A certificate always
-    /// holds.
+    /// Whether the token `credential` holds still holds now: it hasn't expired, the trust
+    /// anchors it rests on are still in the node's `[tls] ca` bundle, and no entry of the
+    /// denylist refuses it, the key that certified its signer, any ancestor in its chain, or its
+    /// principal or an ancestor's, by the rule verification applied. A certificate always holds.
     fn token_holds(&self, credential: &Credential) -> Result<(), Lapsed> {
         let (key, expires_at, signer, claims) = match credential {
             Credential::Certificate => return Ok(()),
@@ -405,6 +405,12 @@ impl Authorizer {
         if self.inner.clock.now() >= expires_at {
             return Err(Status::unauthenticated("the token has expired").into());
         }
+        if !self.anchored(key, signer, claims) {
+            return Err(Status::unauthenticated(
+                "the authority the token rests on is no longer trusted",
+            )
+            .into());
+        }
         if let Some(entry) =
             self.with_revocations(|revoked| signer.refusal_in(revoked, claims, key))?
         {
@@ -414,6 +420,26 @@ impl Authorizer {
             });
         }
         Ok(())
+    }
+
+    /// Whether the authority keys a verified token rests on are still trusted, by the bundle as
+    /// the node last reloaded it (`docs/spec/tokens-v1.md`, §7.1): for an authority-signed token
+    /// the key that signed it; for an issuer-signed one, the authority that certified its issuer
+    /// and the key that signed its root token, its chain's first link. So removing an authority
+    /// from `[tls] ca` ends the streams its tokens opened at the next recheck, as it refuses them
+    /// anew. Without a TLS identity, which no token reaches, it holds.
+    fn anchored(&self, key: &KeyId, signer: &Signer, claims: &TokenClaims) -> bool {
+        let Some(identity) = &self.inner.identity else {
+            return true;
+        };
+        let verifier = identity.token_verifier();
+        let trusted = |id: &KeyId| verifier.keys().iter().any(|trusted| trusted.id() == id);
+        match signer {
+            Signer::Authority => trusted(key),
+            Signer::Issuer { authority, .. } => {
+                trusted(authority) && claims.chain.first().is_some_and(|root| trusted(&root.kid))
+            }
+        }
     }
 
     /// Resolves and checks a request at the boundary, and returns what handlers need.
@@ -1416,6 +1442,60 @@ mod tests {
         assert_eq!(status.message(), "the token has expired");
         assert!(stream.next().await.is_none());
         refresher.abort();
+    }
+
+    /// The stream recheck asks whether a token's trust anchors are still in the node's bundle:
+    /// the key that signed an authority's token, and for an issuer's token the authority that
+    /// certified the issuer and the key of its root token (`docs/spec/tokens-v1.md`, §7.1). A key
+    /// the bundle doesn't hold, as after an authority's removal from `[tls] ca`, fails it.
+    #[test]
+    fn a_token_holds_only_while_its_trust_anchors_are_trusted() {
+        use fleetring_control::delegation::ChainLink;
+
+        let fixture = fixture();
+        let auth = authorizer(&fixture, &[]);
+        let trusted = fixture.signer.key_id().clone();
+        let removed = fixture_key_of_another_authority();
+        let mut claims = TokenClaims {
+            fleet: "test".into(),
+            principal: "agent-42.c7".parse().expect("a principal"),
+            id: "t1".parse().expect("a token id"),
+            issued_at: Some(Timestamp::ZERO),
+            not_before: Timestamp::ZERO,
+            expires_at: Timestamp::from_millis(3_600_000),
+            scopes: Scopes::default(),
+            kind: None,
+            owner: None,
+            parent: None,
+            chain: vec![ChainLink {
+                id: "root".parse().expect("a token id"),
+                kid: trusted.clone(),
+            }],
+        };
+        assert!(auth.anchored(&trusted, &Signer::Authority, &claims));
+        assert!(!auth.anchored(&removed, &Signer::Authority, &claims));
+        let issuer = |authority: &KeyId| Signer::Issuer {
+            name: "control-1".parse().expect("a node id"),
+            authority: authority.clone(),
+        };
+        assert!(auth.anchored(&removed, &issuer(&trusted), &claims));
+        assert!(!auth.anchored(&removed, &issuer(&removed), &claims));
+        claims.chain[0].kid = removed.clone();
+        assert!(
+            !auth.anchored(&trusted, &issuer(&trusted), &claims),
+            "a root token signed by an authority no longer trusted"
+        );
+    }
+
+    /// The key ID of an authority the fixture's node doesn't trust.
+    fn fixture_key_of_another_authority() -> KeyId {
+        let validity = Validity::new(Timestamp::ZERO, std::time::Duration::from_secs(3600));
+        Authority::create("test".parse().expect("a fleet"), validity)
+            .expect("an authority")
+            .token_signer()
+            .expect("a signer")
+            .key_id()
+            .clone()
     }
 
     #[tokio::test(start_paused = true)]
