@@ -376,14 +376,25 @@ fn revocation_races(seed: u64, how: Revocation) -> TestResult {
     };
     let revoked = once(&mut fleet, &operator, revoke.clone())?;
     assert_eq!(revoked.ack(), Some(&Ack::Revoked), "{how:?}: {revoked:?}");
-    let answered_at = fleet
+    let (invoked_at, answered_at) = fleet
         .history()
         .records()
         .iter()
         .find(|record| *record.operation() == revoke)
-        .map(|record| record.completed_at())
+        .map(|record| (record.invoked_at(), record.completed_at()))
         .ok_or("no revocation")?;
     fleet.await_workloads(Duration::from_secs(300))?;
+    // The race itself, read once every call has its answer: a call of the subtree's, made with
+    // a token below `agent-42.c7`, was in flight while the revocation was.
+    let overlapped = fleet.history().records().iter().any(|record| {
+        record.client() == AGENT
+            && record.invoked_at() < answered_at
+            && record.completed_at() > invoked_at
+    });
+    assert!(
+        overlapped,
+        "{how:?}: no call of agent-42.c7's subtree was in flight during the revocation"
+    );
 
     let history = fleet.history();
     let mut refused_after = 0;
