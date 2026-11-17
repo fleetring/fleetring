@@ -395,7 +395,12 @@ pub struct FollowerProgress {
     /// The last position it acknowledged durably, or `None` if it holds an empty log or hasn't
     /// reported yet.
     pub acknowledged: Option<Position>,
-    /// Whether it has reported its position since its stream opened.
+    /// Whether its position counts toward writes, the hand-over's report, and a lease
+    /// transfer's choice: its stream's first acknowledgement was proven by its chain hash, or it
+    /// has acknowledged a batch this primary shipped it, or it proved the same position to this
+    /// primary earlier (ADR-0046's amendment, item 11). A connected follower whose first
+    /// acknowledgement proved nothing, as one of 0.7 or with a derived chain on an idle
+    /// database, has `acknowledged` set and `reported` false.
     pub reported: bool,
     /// Whether its stream is open.
     pub connected: bool,
