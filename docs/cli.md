@@ -559,7 +559,7 @@ delegation: Zq3v0b8yTfKx1nH2aLmQwA
 operation: 4k7mxq…
 ```
 
-**JSON result:** `{"agents": [<agent show's object for the child>]}` (below), with `capped`. The token is in neither result.
+**JSON result:** `{"agents": [<agent show's object for the child>]}` (below), with `capped`. The token is in neither result. With `-o json`, the trusted local development line goes to stderr, so stdout stays valid JSON (§5).
 
 **Refusals and their hints:**
 
