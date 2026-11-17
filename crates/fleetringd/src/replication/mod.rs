@@ -1678,17 +1678,13 @@ impl Inner {
             .staleness(database, self.membership.view().epoch())
     }
 
-    /// Whether the write quorum of `members` holds everything `primary` has committed. A
-    /// primary that knows of nothing committed hasn't learned what they must hold.
+    /// Whether the write quorum of `members` holds everything `primary` has committed, an empty
+    /// log included: a database that has taken no write hands over once a write quorum of
+    /// `members` holds a copy of it.
     fn holds_log(&self, primary: &Primary, members: Vec<NodeId>) -> bool {
-        let Some(committed) = primary.committed() else {
-            return false;
-        };
         let placed = self.write_quorum(primary, members);
         let floor = usize::from(primary.role().durability.min_replicas());
-        primary
-            .quorum_held(&Quorum::over(vec![placed], floor))
-            .is_some_and(|held| held >= committed)
+        primary.holds_committed(&Quorum::over(vec![placed], floor))
     }
 
     /// The write quorum of `primary`'s database over the replica set `members`.

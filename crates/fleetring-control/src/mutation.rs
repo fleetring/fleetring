@@ -1,6 +1,6 @@
-//! Deliberate bugs for FR-087's mutation check: the fork simulation matrix, and the hand-over
-//! scenarios of FR-102, run once with each, and a history-checker property must fail every
-//! time, or the matrix has a gap.
+//! Deliberate bugs for FR-087's mutation check: the fork simulation matrix, the hand-over
+//! scenarios of FR-102, and the scenarios of a name created again (FR-106), run once with each,
+//! and a history-checker property must fail every time, or the matrix has a gap.
 //!
 //! A mutation is chosen at compile time with the `FLEETRING_MUTATION` environment variable,
 //! which `scripts/fork-mutations.sh` sets to one [`Mutation`]'s name. It can never reach a
@@ -61,11 +61,15 @@ pub enum Mutation {
     /// A primary counts placement's write quorum alone toward a write, not the kept replica
     /// set's beside it (FR-102; ADR-0031, amendment 2).
     CountPlacementAlone,
+    /// A primary counts a follower's first acknowledgement on a stream toward writes without
+    /// comparing the follower's chain hash at that position with its own: a dropped database's
+    /// copy acknowledged under a name created again counts for the new database (FR-106).
+    CountFirstAckUnproven,
 }
 
 impl Mutation {
     /// Every mutation, in the order the mutation check runs them.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::PinAtTip,
         Self::CompleteOnOneHolder,
         Self::NonHolderFirstLease,
@@ -80,6 +84,7 @@ impl Mutation {
         Self::FollowerReportsResetEarly,
         Self::MoveKeptReplicaSet,
         Self::CountPlacementAlone,
+        Self::CountFirstAckUnproven,
     ];
 
     /// The name `FLEETRING_MUTATION` gives it.
@@ -100,6 +105,7 @@ impl Mutation {
             Self::FollowerReportsResetEarly => "follower_reports_reset_early",
             Self::MoveKeptReplicaSet => "move_kept_replica_set",
             Self::CountPlacementAlone => "count_placement_alone",
+            Self::CountFirstAckUnproven => "count_first_ack_unproven",
         }
     }
 

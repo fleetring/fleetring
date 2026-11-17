@@ -184,14 +184,15 @@ fn superseded(database: &DatabaseName, epoch: u64, current: LeaseEpoch) -> Statu
     ))
 }
 
-/// Refuses a stream or a fence of `database` for a database that control state holds at
-/// `placed` when this node's copy records another incarnation: the copy is an earlier
-/// database's of the name, whose drop this node missed, and following the new database from it
-/// would mix the two, or let a late notice for the old one delete the new one's copy later. The
-/// copy is kept as an orphan: counting the refusal as an ended stream sends the lease keeper to
-/// ask control state, and it finds the copy's incarnation gone. A view with the legacy
-/// incarnation, from a control node that predates forks, says nothing either way.
-fn other_incarnation(
+/// Refuses a stream or a fence of `database` for the database of incarnation `placed`, as
+/// control state holds it or a stream's primary names it, when this node's copy records another
+/// incarnation: the copy is an earlier database's of the name, whose drop this node missed, and
+/// following the new database from it would mix the two, or let a late notice for the old one
+/// delete the new one's copy later. The copy is kept as an orphan: counting the refusal as an
+/// ended stream sends the lease keeper to ask control state, and it finds the copy's
+/// incarnation gone. The legacy incarnation, from a control node that predates forks or named
+/// by a primary of a database made before them, says nothing either way.
+pub(super) fn other_incarnation(
     inner: &Inner,
     database: &DatabaseName,
     record: &super::epochs::Record,
@@ -210,24 +211,37 @@ fn other_incarnation(
     )))
 }
 
-/// Checks a `Replicate` stream that `caller` opens for `database` at `epoch` against its binding,
-/// before anything is recorded: `caller` holds the epoch or is promoting to it, and this node is
-/// a replica of the database: one of a seeded fork's recorded holders, whatever the rings say.
+/// Checks a `Replicate` stream that `caller` opens for `database` at `epoch`, naming the
+/// database's incarnation `named` if its primary sends one, against its binding, before anything
+/// is recorded: `caller` holds the epoch or is promoting to it, and this node is a replica of
+/// the database: one of a seeded fork's recorded holders, whatever the rings say. Returns the
+/// incarnation control state holds the database at, when it was asked, for the copy to record.
 ///
 /// The epoch record decides when it names a holder at `epoch`; control state decides otherwise,
 /// once, and the stream then records the caller as the epoch's holder. An epoch below the
 /// record's is left to the record, which refuses it.
 ///
+/// The record names a holder per epoch, not per database, and a database created again under
+/// a name starts its epochs over, often on the same first holder. So a stream the record lets
+/// through must also name the incarnation the copy records
+/// ([`super::failover::check_incarnation`]). One from a primary that predates the field names
+/// none; such a primary leads only in a fleet that hasn't enabled forks, whose databases all
+/// have the legacy incarnation, which says nothing either way. What tells a dropped
+/// database's copy apart there is the chain hash of the follower's first acknowledgement,
+/// which a primary of this release checks before it counts the position.
+///
 /// # Errors
 ///
-/// A binding refusal; `FAILED_PRECONDITION` if control state has moved past `epoch`; and the
+/// A binding refusal; `FAILED_PRECONDITION` if control state has moved past `epoch`, holds
+/// another incarnation than the copy records, or holds another than `named`; and the
 /// authority's error as it is, `UNAVAILABLE` while control state can't be reached.
 pub(super) async fn check_stream(
     inner: &Inner,
     database: &DatabaseName,
     epoch: u64,
+    named: Option<Incarnation>,
     caller: &NodeId,
-) -> Result<(), Status> {
+) -> Result<Option<Incarnation>, Status> {
     let record = inner.epochs.record(database);
     let lease_epoch = LeaseEpoch::new(epoch);
     let not_holder = || {
@@ -242,11 +256,11 @@ pub(super) async fn check_stream(
         .naming(Binding::HolderOrCandidate)
     };
     if epoch < record.highest() {
-        return Ok(());
+        return Ok(None);
     }
     if epoch == record.highest() {
         match record.holder() {
-            Some(holder) if holder == caller.as_str() => return Ok(()),
+            Some(holder) if holder == caller.as_str() => return Ok(None),
             Some(_) => return Err(refuse(inner, Some(database), not_holder())),
             None => {}
         }
@@ -259,6 +273,17 @@ pub(super) async fn check_stream(
         ..
     } = inner.authority.view(database).await?;
     other_incarnation(inner, database, &record, incarnation)?;
+    if let Some(named) = named
+        && named != incarnation
+        && incarnation != Incarnation::LEGACY
+    {
+        // The caller leads a database of the name that control state no longer holds, as the
+        // primary of a dropped database does until it learns of the drop: stale, not misbound.
+        return Err(Status::failed_precondition(format!(
+            "the stream is for incarnation {named} of {database}, but control state holds \
+             incarnation {incarnation}"
+        )));
+    }
     if holders.epoch > lease_epoch {
         return Err(superseded(database, epoch, holders.epoch));
     }
@@ -300,7 +325,7 @@ pub(super) async fn check_stream(
         );
         return Err(refuse(inner, Some(database), denied));
     }
-    Ok(())
+    Ok(Some(incarnation))
 }
 
 /// Checks a `Fence` that `caller` sends for `database` at `epoch`, naming `candidate`: the
@@ -308,7 +333,8 @@ pub(super) async fn check_stream(
 /// to `epoch` (or, once that promotion completed, the holder at it), and, for a fork whose
 /// replica set is its recorded holders, this node one of them. A fence the record already
 /// took from the caller at `epoch` needs no second look, and an epoch below the record's is left
-/// to the record, which refuses it.
+/// to the record, which refuses it. Returns the incarnation control state holds the database
+/// at, when it was asked, for the copy to record.
 ///
 /// # Errors
 ///
@@ -319,7 +345,7 @@ pub(super) async fn check_fence(
     epoch: u64,
     candidate: Option<&NodeId>,
     caller: &NodeId,
-) -> Result<(), Status> {
+) -> Result<Option<Incarnation>, Status> {
     let lease_epoch = LeaseEpoch::new(epoch);
     let not_candidate = || {
         BindingDenied::new(
@@ -350,7 +376,7 @@ pub(super) async fn check_fence(
     if epoch < record.highest()
         || (epoch == record.highest() && record.holder() == Some(caller.as_str()))
     {
-        return Ok(());
+        return Ok(None);
     }
     let DatabaseView {
         holders,
@@ -381,7 +407,7 @@ pub(super) async fn check_fence(
         );
         return Err(refuse(inner, Some(database), denied));
     }
-    Ok(())
+    Ok(Some(incarnation))
 }
 
 /// Checks a `Fetch` that `caller` sends for `database` at `epoch`: this replica was fenced at

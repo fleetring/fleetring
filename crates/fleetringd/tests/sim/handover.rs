@@ -1,7 +1,8 @@
 //! The replica-set hand-over on membership changes (FR-102; ADR-0031, amendment 2), beyond
-//! #157's probe in `membership_lag`: a crash right after the release, a primary restarted during
-//! the hand-over, a kept member that leaves before the primary is lost, a fleet whose replica
-//! set grows, `local` acknowledgements, and a fleet with a member that lacks the feature.
+//! #157's probe in `membership_lag`: a database that has taken no write, a crash right after
+//! the release, a primary restarted during the hand-over, a kept member that leaves before the
+//! primary is lost, a fleet whose replica set grows, `local` acknowledgements, and a fleet with
+//! a member that lacks the feature.
 //!
 //! Every scenario runs the history checker, whose `AcknowledgedWritesFenced` property holds
 //! each acknowledged write to a write quorum of the replica set promotions fence at every
@@ -157,6 +158,32 @@ fn join(fleet: &mut Fleet, joiner: &str) -> Result<()> {
 /// Stops `traffic`, waits for every client, and finishes the run with every check.
 fn finish(mut fleet: Fleet, traffic: &fleetringd::sim::TrafficHandle) -> TestResult {
     traffic.stop();
+    fleet.await_workloads(LIMIT)?;
+    fleet.finish()?;
+    Ok(())
+}
+
+/// A database that has taken no write hands its kept replica set over like any other: its log
+/// is empty, and once placement's write quorum holds a copy, it holds the whole log, so the
+/// primary reports and control state releases the set. Until then nothing was lost by keeping
+/// it, but every write would have needed both quorums, and a second change would have kept the
+/// first set, for as long as the database stayed idle.
+fn idle_database_hands_over(seed: u64) -> TestResult {
+    let nodes = ["n1", "n2", "n3", "n4"];
+    let mut fleet = fleet(seed, &nodes, "n5")?;
+    let (database, before, after) = moved_by_join(&fleet, "n5", 3, "idle", |_, _| true)?;
+    let creator = Script::new([Operation::CreateEmpty {
+        database: database.clone(),
+        replication_factor: 3,
+    }]);
+    fleet.client("creator", creator);
+    let primary = await_leader(&mut fleet, &database)?;
+    fleet.note(format!(
+        "{database}, led by {primary} and never written, moves from {before:?} to {after:?}"
+    ));
+    join(&mut fleet, "n5")?;
+    await_kept(&mut fleet, &database, true)?;
+    await_kept(&mut fleet, &database, false)?;
     fleet.await_workloads(LIMIT)?;
     fleet.finish()?;
     Ok(())
@@ -444,6 +471,11 @@ fn mixed_fleet(seed: u64) -> TestResult {
 }
 
 #[test]
+fn an_idle_database_hands_over() {
+    seeds::run(BINARY, &SEEDS, idle_database_hands_over);
+}
+
+#[test]
 fn a_crash_right_after_the_release_loses_nothing() {
     seeds::run(BINARY, &SEEDS, crash_right_after_release);
 }
@@ -493,6 +525,7 @@ fn sweep_handover() {
         .and_then(|text| text.parse().ok())
         .unwrap_or(1);
     let scenarios: Vec<(&str, Scenario)> = vec![
+        ("idle_database_hands_over", idle_database_hands_over),
         ("crash_right_after_release", crash_right_after_release),
         (
             "primary_restart_during_handover",

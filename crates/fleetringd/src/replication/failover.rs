@@ -183,10 +183,14 @@ pub(super) async fn fence_rpc(
                 .map_err(|error| Status::invalid_argument(format!("invalid candidate: {error}")))?,
         )
     };
-    if let Some(caller) = caller {
-        binding::check_fence(inner, &name, request.epoch, candidate.as_ref(), caller).await?;
-    }
+    let confirmed = match caller {
+        Some(caller) => {
+            binding::check_fence(inner, &name, request.epoch, candidate.as_ref(), caller).await?
+        }
+        None => None,
+    };
     let fenced = fence(inner, &name, request.epoch, candidate.as_ref()).await?;
+    record_followed(inner, &name, confirmed).await?;
     Ok(FenceResponse {
         epoch: request.epoch,
         position: fenced
@@ -302,6 +306,77 @@ pub(super) fn drop_rpc(
 
 /// Admits a stream that opens at `epoch` from `primary`: refuses an older epoch, or another node
 /// than the epoch's recorded holder, and steps down as primary for a newer one.
+/// Refuses a stream of `database` whose primary names `named` as the database's incarnation when
+/// this node's copy records another (ADR-0046's amendment, item 9): the copy is a dropped
+/// database's of the name, and is kept as an orphan, never followed as this one's. Checked
+/// before the stream records its epoch, whatever the caller, as the record's holder for the
+/// epoch may be the dropped database's.
+///
+/// # Errors
+///
+/// `FAILED_PRECONDITION` naming both incarnations.
+pub(super) fn check_incarnation(
+    inner: &Inner,
+    database: &DatabaseName,
+    named: Option<Incarnation>,
+) -> Result<(), Status> {
+    let Some(named) = named else {
+        return Ok(());
+    };
+    binding::other_incarnation(inner, database, &inner.epochs.record(database), named)
+}
+
+/// Records durably that this node's copy of `database` belongs to `incarnation`, as a stream's
+/// primary or control state named it once a stream or a fence was admitted, unless the copy
+/// recorded one already: a copy this node only follows records its incarnation as one it leads
+/// does, so that drop notices, the stream-end check, and later streams and fences tell it from
+/// a copy of a database created again under the name (ADR-0046, point 1.3, and its amendment,
+/// item 9).
+///
+/// # Errors
+///
+/// `UNAVAILABLE` if the record can't be written; `FAILED_PRECONDITION` if the copy's record
+/// names another incarnation, as when a drop and a creation of the name raced the admission:
+/// the stream or fence is then refused, and the lease keeper's next check finds the copy's
+/// database gone.
+pub(super) async fn record_followed(
+    inner: &Arc<Inner>,
+    database: &DatabaseName,
+    incarnation: Option<Incarnation>,
+) -> Result<(), Status> {
+    let Some(incarnation) = incarnation else {
+        return Ok(());
+    };
+    let recorded = {
+        let inner = Arc::clone(inner);
+        let database = database.clone();
+        blocking(inner.execution, move || {
+            inner
+                .epochs
+                .record_incarnation(&database, incarnation.get())
+        })
+        .await?
+    };
+    match recorded {
+        // The legacy incarnation, from a control node that predates forks, says nothing either
+        // way, as `binding::other_incarnation` judges it.
+        Ok(recorded) if recorded == incarnation.get() || incarnation == Incarnation::LEGACY => {
+            Ok(())
+        }
+        Ok(recorded) => {
+            inner.stream_ended(database);
+            Err(Status::failed_precondition(format!(
+                "this node's copy of {database} belongs to incarnation {}, not {incarnation}, \
+                 the database control state holds; it keeps the copy as an orphan",
+                Incarnation::new(recorded)
+            )))
+        }
+        Err(error) => Err(Status::unavailable(format!(
+            "can't record the incarnation of {database}'s copy: {error}"
+        ))),
+    }
+}
+
 pub(super) async fn admit_stream(
     inner: &Arc<Inner>,
     database: &DatabaseName,
@@ -530,8 +605,10 @@ impl Replication {
     }
 
     /// The incarnation of the database this node's copy of `database` belongs to, once recorded:
-    /// a copy records it when this node first leads it (ADR-0046, point 1.3). `None` for a copy
-    /// this node only ever followed, and for one recorded before incarnations.
+    /// a copy records it when this node first leads it, installs it from a fork's staged copy,
+    /// or admits a stream or a fence for it (ADR-0046, point 1.3, and its amendment, item 9).
+    /// `None` for a copy recorded before incarnations, or followed only by a release before
+    /// followers recorded them, until its next stream or fence.
     #[must_use]
     pub fn copy_incarnation(&self, database: &DatabaseName) -> Option<Incarnation> {
         self.inner.epochs.record(database).incarnation()

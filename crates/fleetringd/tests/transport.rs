@@ -238,6 +238,7 @@ impl Replication for StubReplication {
                     let ack = ReplicateAck {
                         position: batch.end,
                         needs_snapshot: false,
+                        chain: None,
                     };
                     if acks.send(Ok(ack)).await.is_err() {
                         break;
@@ -363,6 +364,7 @@ async fn a_four_mib_batch_round_trips_as_one_message() -> TestResult {
                 epoch: 1,
                 epoch_start: None,
                 epoch_start_chain: None,
+                incarnation: None,
             })),
         },
         ReplicateMessage {

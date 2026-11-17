@@ -1,8 +1,9 @@
 #!/bin/sh
-# FR-087's mutation check: runs the fork simulation matrix, and FR-102's hand-over scenarios
-# (`membership_lag::`), once per deliberate bug and reports
-# which property and scenario failed for each (ADR-0046 point 12). A mutation counts as caught
-# only when the history checker reports a property violation ("invariant violated (...)"); a
+# FR-087's mutation check: runs the fork simulation matrix, FR-102's hand-over scenarios
+# (`membership_lag::`), and FR-106's name created again (`recreated::`), once per deliberate bug
+# and reports which property and scenario failed for each (ADR-0046 point 12). A mutation
+# counts as caught only when the history checker reports a property violation ("invariant
+# violated (...)"); a
 # scenario that fails otherwise, by a timeout or an outcome it didn't expect, is listed but
 # catches nothing. A mutation that makes no property fail means the matrix has a gap.
 #
@@ -19,7 +20,8 @@ set -u
 all="pin_at_tip complete_on_one_holder non_holder_first_lease skip_source_incarnation \
 skip_target_identity_apply skip_target_identity_binding unconditional_reset serve_at_seeded \
 disk_without_reservations move_seeded_replica_set reset_committed_on_one \
-follower_reports_reset_early move_kept_replica_set count_placement_alone"
+follower_reports_reset_early move_kept_replica_set count_placement_alone \
+count_first_ack_unproven"
 mutations=${*:-$all}
 logs=target/fork-mutations
 mkdir -p "$logs"
@@ -30,9 +32,9 @@ for mutation in $mutations; do
   log="$logs/$mutation.log"
   if [ "${REPORT_ONLY:-0}" != 1 ]; then
     FLEETRING_MUTATION="$mutation" cargo test -p fleetringd --features simulation,fault-hooks \
-      --test sim -- fork:: membership_lag:: > "$log" 2>&1
+      --test sim -- fork:: membership_lag:: recreated:: > "$log" 2>&1
   fi
-  failures=$(grep -E "^test (fork|membership_lag)::.* FAILED$" "$log" | sed -e 's/^test //' -e 's/ \.\.\. FAILED$//')
+  failures=$(grep -E "^test (fork|membership_lag|recreated)::.* FAILED$" "$log" | sed -e 's/^test //' -e 's/ \.\.\. FAILED$//')
   report=""
   for test in $failures; do
     # Each failing point, and the property it violated, from the panic message.

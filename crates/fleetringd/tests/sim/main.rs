@@ -20,6 +20,7 @@ mod history;
 mod membership;
 mod membership_lag;
 mod observe;
+mod recreated;
 mod replication;
 mod router;
 mod snapshot_chain;

@@ -306,6 +306,7 @@ async fn a_batch_whose_hash_differs_is_refused_and_the_follower_reseeded() -> Te
             epoch: 1,
             epoch_start: None,
             epoch_start_chain: None,
+            incarnation: None,
         },
     )
     .await?;

@@ -166,6 +166,45 @@ struct Progress {
     needs_snapshot: bool,
 }
 
+/// What a follower's first acknowledgement on a stream proves about its copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstAck {
+    /// Its chain hash at its position is this log's there: the position counts toward writes.
+    Proven,
+    /// Nothing proves it or disproves it: the follower sent no hash, as one whose chain is
+    /// derived or one that predates the field, or this primary holds no proving hash there. The
+    /// stream ships from the position, and the follower's acknowledgement of a batch it ships
+    /// counts: the batch carries this log's hash, which the follower's chain and its engine
+    /// check before it applies it.
+    Unproven,
+    /// The copy isn't on this log: its hash differs from this log's at its position, or its
+    /// position is past this log's end, as a dropped database's copy can be under the name of
+    /// one created again, whose epochs start over. It is re-seeded, as a copy whose log diverges
+    /// is, and counts toward nothing meanwhile.
+    Diverged,
+}
+
+/// Judges a follower's first acknowledgement on a stream, at `position` with its chain hash
+/// `theirs` if it sent one, against `ours`, this primary's proving hash there if it holds one,
+/// and `committed`, the end of this primary's log. Positions are opaque and ordered as bytes
+/// (ADR-0016, point 2), so the judgement knows nothing of the engine.
+fn judge_first_ack(
+    ours: Option<ChainHash>,
+    theirs: Option<ChainHash>,
+    position: Option<&Position>,
+    committed: Option<&Position>,
+) -> FirstAck {
+    match (ours, theirs) {
+        (Some(ours), Some(theirs)) if ours == theirs => FirstAck::Proven,
+        (Some(_), Some(_)) => FirstAck::Diverged,
+        // A follower never holds more of an epoch's log than its primary wrote: a promotion's
+        // followers cut their tails back to the epoch's start before their first
+        // acknowledgement.
+        _ if position > committed => FirstAck::Diverged,
+        _ => FirstAck::Unproven,
+    }
+}
+
 /// What a stream sends next.
 #[derive(Debug)]
 enum Plan {
@@ -250,6 +289,16 @@ impl Primary {
     pub(super) fn hash_at(&self, position: Option<&Position>) -> Option<ChainHash> {
         match &self.lock().chain {
             ChainState::Ready(chain) => chain.hash_at(position),
+            _ => None,
+        }
+    }
+
+    /// The chain hash at `position` if the chain is built, holds it, and was carried over rather
+    /// than derived: only such a hash proves that another replica's log is this one up to
+    /// `position` (ADR-0016, point 12).
+    fn proof_at(&self, position: Option<&Position>) -> Option<ChainHash> {
+        match &self.lock().chain {
+            ChainState::Ready(chain) if !chain.is_derived() => chain.hash_at(position),
             _ => None,
         }
     }
@@ -485,6 +534,25 @@ impl Primary {
         held
     }
 
+    /// Whether every write quorum of `quorum` holds everything this primary has committed:
+    /// `needed` of its followers reported a position at or past the log's end, or it needs none.
+    /// A log that is empty, as a database's that has taken no write, ends where it begins: then
+    /// a follower holds it once it has reported at all, which it does only once it holds a copy,
+    /// so the quorum holds the database whole (ADR-0031, amendment 2, point 3).
+    pub(super) fn holds_committed(&self, quorum: &Quorum) -> bool {
+        let state = self.lock();
+        let committed = state.committed.as_ref();
+        quorum.groups.iter().all(|group| {
+            let holding = group
+                .followers
+                .iter()
+                .filter_map(|node| state.followers.get(node))
+                .filter(|progress| progress.reported && progress.acked.as_ref() >= committed)
+                .count();
+            holding >= group.needed
+        })
+    }
+
     /// A subscription to this primary's changes, for a change stream's pump.
     pub(super) fn changes(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
@@ -585,9 +653,34 @@ impl Primary {
         }
     }
 
-    /// Records a follower's position, from its first acknowledgement on a new stream or a later
-    /// one.
+    /// Records a follower's position, from a first acknowledgement whose chain hash matched
+    /// this log's there, or from an acknowledgement of a batch this primary shipped it: the
+    /// position counts toward writes.
     fn acknowledged(&self, node: &NodeId, position: Option<Position>, retained_bytes: usize) {
+        self.record_acknowledgement(node, position, retained_bytes, FirstAck::Proven);
+    }
+
+    /// Records a follower's position from the first acknowledgement on a new stream that nothing
+    /// proved is on this log ([`FirstAck::Unproven`]): the stream continues from it, but it
+    /// counts toward no write, and for nothing else that needs the follower to hold this log,
+    /// until the follower acknowledges a batch the stream ships it. A position the follower
+    /// proved on an earlier stream to this primary goes on counting.
+    fn acknowledged_unproven(
+        &self,
+        node: &NodeId,
+        position: Option<Position>,
+        retained_bytes: usize,
+    ) {
+        self.record_acknowledgement(node, position, retained_bytes, FirstAck::Unproven);
+    }
+
+    fn record_acknowledgement(
+        &self,
+        node: &NodeId,
+        position: Option<Position>,
+        retained_bytes: usize,
+        proof: FirstAck,
+    ) {
         {
             let mut state = self.lock();
             let past_marker = state
@@ -595,12 +688,18 @@ impl Primary {
                 .as_ref()
                 .is_none_or(|marker| position.as_ref() >= Some(&marker.position));
             let progress = state.followers.entry(node.clone()).or_default();
+            let counts = match proof {
+                FirstAck::Proven => true,
+                FirstAck::Unproven | FirstAck::Diverged => {
+                    progress.reported && progress.acked == position
+                }
+            };
             // A follower that makes progress isn't lagging, however far behind a busy log it is.
             if !progress.reported || position > progress.acked {
                 progress.behind_since = None;
             }
             progress.acked = position;
-            progress.reported = true;
+            progress.reported = counts;
             progress.connected = true;
             if past_marker {
                 progress.released = false;
@@ -1596,11 +1695,19 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
         .as_ref()
         .and_then(|start| primary.hash_at(Some(start)))
         .map(|hash| hash.as_bytes().to_vec());
+    // The incarnation this node's copy records, which it recorded before it began to serve: a
+    // follower whose copy records another refuses the stream (ADR-0046's amendment, item 9).
+    let incarnation = inner
+        .epochs
+        .record(&primary.name)
+        .incarnation()
+        .map(fleetring_control::Incarnation::get);
     let open = Message::Open(ReplicateOpen {
         database: primary.name.to_string(),
         epoch: primary.role.epoch.get(),
         epoch_start: primary.start.clone().map(Position::into_bytes),
         epoch_start_chain,
+        incarnation,
     });
     if outgoing.send(message(open)).await.is_err() {
         return stream_failed("stream closed");
@@ -1631,8 +1738,28 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
         return reseed(inner, primary, node, &outgoing, &mut acks, 0).await;
     }
     let mut sent = held(first.position);
-    primary.acknowledged(node, sent.clone(), settings.retained_bytes);
-    tracing::debug!(database = %primary.name, follower = %node, position = ?sent, "replication stream open");
+    let theirs = first.chain.as_deref().and_then(ChainHash::from_bytes);
+    let judged = if fleetring_control::mutation::Mutation::CountFirstAckUnproven.is_active() {
+        FirstAck::Proven
+    } else {
+        judge_first_ack(
+            primary.proof_at(sent.as_ref()),
+            theirs,
+            sent.as_ref(),
+            primary.committed().as_ref(),
+        )
+    };
+    match judged {
+        FirstAck::Proven => primary.acknowledged(node, sent.clone(), settings.retained_bytes),
+        FirstAck::Unproven => {
+            primary.acknowledged_unproven(node, sent.clone(), settings.retained_bytes);
+        }
+        FirstAck::Diverged => {
+            tracing::warn!(database = %primary.name, follower = %node, position = ?sent, "the follower's copy isn't on this log at the position it acknowledged; re-seeding it");
+            return reseed(inner, primary, node, &outgoing, &mut acks, 0).await;
+        }
+    }
+    tracing::debug!(database = %primary.name, follower = %node, position = ?sent, ?judged, "replication stream open");
 
     let mut in_flight: VecDeque<Position> = VecDeque::new();
     let mut marker_sent: Option<Position> = None;
@@ -1854,11 +1981,148 @@ mod tests {
     use fleetring::ReplicationFactor;
     use fleetring_control::LeaseEpoch;
 
+    use super::super::WriteQuorum;
     use super::*;
 
     fn primary() -> Primary {
         let role = PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(1));
         Primary::new("db".parse().expect("a valid name"), role, None)
+    }
+
+    /// The primary of a database with three replicas, this node and `b` and `c`.
+    fn primary_of_three() -> Primary {
+        let factor = ReplicationFactor::new(3).expect("nonzero");
+        let role = PrimaryRole::new(factor, LeaseEpoch::new(1));
+        Primary::new("db".parse().expect("a valid name"), role, None)
+    }
+
+    fn node(name: &str) -> NodeId {
+        name.parse().expect("a valid node ID")
+    }
+
+    /// W = 2 of this node, `b`, and `c`: one follower must hold a write.
+    fn quorum_of_three() -> Quorum {
+        let group = WriteQuorum {
+            followers: vec![node("b"), node("c")],
+            required: 2,
+            needed: 1,
+            own: 1,
+        };
+        Quorum::over(vec![group], 2)
+    }
+
+    fn hash(byte: u8) -> ChainHash {
+        ChainHash::from_bytes(&[byte; ChainHash::LEN]).expect("a whole hash")
+    }
+
+    fn at(byte: u8) -> Position {
+        Position::from(vec![byte])
+    }
+
+    /// A follower's first acknowledgement is proven only by a matching chain hash at its
+    /// position; a different hash, or a position past the log's end, as a dropped database's
+    /// copy whose log checkpointed sorts past a young database's under the same name, is a copy
+    /// of another log, re-seeded (FR-106).
+    #[test]
+    fn a_first_acknowledgement_counts_only_once_its_hash_matches_the_log() {
+        let end = at(0x20);
+        let inside = at(0x10);
+        let cases = [
+            (
+                Some(hash(1)),
+                Some(hash(1)),
+                Some(&inside),
+                FirstAck::Proven,
+            ),
+            (
+                Some(hash(1)),
+                Some(hash(2)),
+                Some(&inside),
+                FirstAck::Diverged,
+            ),
+            (Some(hash(1)), None, Some(&inside), FirstAck::Unproven),
+            (None, Some(hash(2)), Some(&inside), FirstAck::Unproven),
+            (None, Some(hash(2)), Some(&at(0x90)), FirstAck::Diverged),
+            (None, None, Some(&at(0x90)), FirstAck::Diverged),
+        ];
+        for (ours, theirs, position, expected) in cases {
+            assert_eq!(
+                judge_first_ack(ours, theirs, position, Some(&end)),
+                expected,
+                "ours {ours:?}, theirs {theirs:?}, at {position:?}"
+            );
+        }
+        assert_eq!(
+            judge_first_ack(None, None, Some(&at(0x01)), None),
+            FirstAck::Diverged,
+            "anything past an empty log"
+        );
+        assert_eq!(
+            judge_first_ack(
+                Some(ChainHash::GENESIS),
+                Some(ChainHash::GENESIS),
+                None,
+                None
+            ),
+            FirstAck::Proven,
+            "two empty logs"
+        );
+    }
+
+    /// An unproven first acknowledgement counts toward no write, and for no hand-over, until
+    /// the follower acknowledges a batch its stream shipped; a position it proved on an earlier
+    /// stream to this primary goes on counting.
+    #[test]
+    fn an_unproven_first_acknowledgement_counts_toward_no_write() {
+        let primary = primary_of_three();
+        let quorum = quorum_of_three();
+        let end = at(0x20);
+        primary.raise_committed(Some(end.clone()));
+        let followers = [node("b"), node("c")];
+
+        primary.acknowledged_unproven(&node("b"), Some(end.clone()), 0);
+        assert_eq!(primary.acknowledged_by(&followers, &end), 0);
+        assert_eq!(primary.quorum_held(&quorum), None);
+        assert!(!primary.holds_committed(&quorum));
+
+        // An acknowledgement of a batch the stream shipped counts.
+        primary.acknowledged(&node("b"), Some(end.clone()), 0);
+        assert_eq!(primary.acknowledged_by(&followers, &end), 1);
+        assert!(primary.holds_committed(&quorum));
+
+        // The stream reopens at the same position: still proven.
+        primary.disconnected(&node("b"));
+        primary.acknowledged_unproven(&node("b"), Some(end.clone()), 0);
+        assert_eq!(primary.acknowledged_by(&followers, &end), 1);
+
+        // At another position it counts for nothing until it is proven there.
+        primary.acknowledged_unproven(&node("b"), Some(at(0x10)), 0);
+        assert_eq!(primary.acknowledged_by(&followers, &at(0x10)), 0);
+        assert_eq!(primary.quorum_held(&quorum), None);
+    }
+
+    /// A database that has taken no write holds its whole log on a write quorum once enough
+    /// followers hold a copy and reported, so its kept replica set can be released (finding 10,
+    /// ADR-0031, amendment 2); before any reported, it doesn't.
+    #[test]
+    fn an_empty_log_is_held_once_a_write_quorum_reported() {
+        let primary = primary_of_three();
+        let quorum = quorum_of_three();
+        assert_eq!(primary.committed(), None);
+        assert!(!primary.holds_committed(&quorum), "no follower reported");
+        primary.acknowledged_unproven(&node("c"), None, 0);
+        assert!(
+            !primary.holds_committed(&quorum),
+            "an unproven copy counts for nothing"
+        );
+        primary.acknowledged(&node("b"), None, 0);
+        assert!(primary.holds_committed(&quorum));
+
+        // Once the log has a write, the follower must hold it.
+        primary.raise_committed(Some(at(0x20)));
+        assert!(!primary.holds_committed(&quorum));
+        primary.acknowledged(&node("c"), Some(at(0x20)), 0);
+        assert!(primary.holds_committed(&quorum));
     }
 
     /// What a build read, beginning while no checkpoint ran.
