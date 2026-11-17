@@ -36,8 +36,12 @@ fn an_oversized_side_is_refused_before_any_work() {
     let fine = distinct("read", "a", MAX_SCOPES);
     let refused = GrantStepError::TooMany { limit: MAX_SCOPES };
     // A side far over the limit is refused as fast as one just over it: the length is
-    // checked before anything is compared.
+    // checked before anything is compared. The bound is relative, to the time building the
+    // huge side took, which is linear in its length, so a loaded machine slows both alike; a
+    // comparison of every pair, about 400 million here, would take many times longer.
+    let building = std::time::Instant::now();
     let huge = distinct("read", "a", 20_000);
+    let built_in = building.elapsed();
     let started = std::time::Instant::now();
     for asked in [&too_many, &huge] {
         assert_eq!(holder.grant_step(asked), Err(refused.clone()));
@@ -55,8 +59,8 @@ fn an_oversized_side_is_refused_before_any_work() {
         );
     }
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "refusing took {:?}",
+        started.elapsed() <= built_in,
+        "refusing took {:?}, longer than building the huge side ({built_in:?})",
         started.elapsed()
     );
     assert_eq!(
