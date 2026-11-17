@@ -215,6 +215,11 @@ pub(super) async fn run(args: AgentDelegateArgs) -> Result<String, Box<dyn Error
     let mut json = agent_json(&listed, &record);
     json["capped"] = serde_json::Value::Bool(capped);
     let shown = serde_json::json!({ "agents": [json] });
+    // In machine mode stdout holds only the JSON, so the line every delegating command prints
+    // goes to stderr, as notes do (`docs/cli.md`, section 5).
+    if output.format() != OutputFormat::Table {
+        note(TRUSTED_LOCAL);
+    }
     format::render(output.format(), &shown, |_| {
         Ok(delegated_text(&listed, &record, capped))
     })

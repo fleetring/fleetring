@@ -3334,6 +3334,12 @@ async fn delegate_refuses_identity_flags_and_its_json_holds_no_token() -> TestRe
     let token = machine.token("42.c7")?;
     assert!(!stdout(&output).contains(&token), "{json}");
     assert!(!stderr(&output).contains(&token));
+    // stdout holds only the JSON; the trusted local development line goes to stderr.
+    assert!(
+        stderr(&output).contains(TRUSTED_LOCAL),
+        "{}",
+        printed(&output)
+    );
     assert_eq!(json["agents"][0]["id"], "42.c7", "{json}");
     assert_eq!(
         json["agents"][0]["delegation_id"].as_str(),
