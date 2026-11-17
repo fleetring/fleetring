@@ -763,6 +763,14 @@ pub(crate) fn revocation_from_proto(
                     "this release reads no revocation of another fleet's principal",
                 ));
             }
+            // `before` is the revoking command's effective time, never 0: an entry that says 0
+            // would read as a principal's revocation that refuses nothing, so it is unreadable,
+            // and the node refuses every token until a list it can read arrives.
+            if principal.before_ms == 0 {
+                return Err(Status::invalid_argument(
+                    "a principal revocation's before_ms is 0, which no control node writes",
+                ));
+            }
             (
                 Revoked::principal(parse("principal", &principal.principal)?),
                 Entry::fleet_principal(until, Timestamp::from_millis(principal.before_ms)),
@@ -1493,6 +1501,14 @@ mod tests {
         let refused = revocation_from_proto(principal(Some("other"))).expect_err("unreadable");
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
         assert!(revocation_from_proto(principal(None)).is_ok());
+        // A `before` of 0, the field's default, is unreadable rather than a principal entry
+        // that refuses nothing.
+        let mut zero = principal(None);
+        if let Some(proto::revocation::Revoked::Principal(entry)) = &mut zero.revoked {
+            entry.before_ms = 0;
+        }
+        let refused = revocation_from_proto(zero).expect_err("unreadable");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
         let refused = revocation_request_from_proto(principal(None)).expect_err("refused");
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
         let token = proto::Revocation {

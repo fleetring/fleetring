@@ -139,9 +139,9 @@ pub(crate) fn agent() -> Option<&'static str> {
 fn agent_scope_hint(id: &str) -> String {
     if id.contains('.') {
         format!(
-            "agent {id}'s token doesn't allow it: ask your parent to delegate it with \
-             `fleetring agent delegate {id} --scope <action>:<database>`, or an operator; don't \
-             look for other credentials"
+            "agent {id}'s token doesn't allow it: ask your parent, which can delegate you again \
+             with that scope (`fleetring agent remove {id}`, then `fleetring agent delegate {id} \
+             --scope <action>:<database>`), or an operator; don't look for other credentials"
         )
     } else {
         format!(
