@@ -111,6 +111,18 @@ pub(super) enum EpochError {
         /// The node that claimed it.
         offered: String,
     },
+    /// The copy records another incarnation than the one offered with the epoch: it belongs to
+    /// another database of the name.
+    #[error(
+        "this node's copy belongs to incarnation {recorded:016x}, not {offered:016x}, the \
+         database control state holds; it keeps the copy as an orphan"
+    )]
+    OtherIncarnation {
+        /// The incarnation the copy records.
+        recorded: u64,
+        /// The incarnation offered.
+        offered: u64,
+    },
     /// The record couldn't be read or written.
     #[error("can't record the epoch")]
     Io(#[from] io::Error),
@@ -212,15 +224,36 @@ impl Epochs {
         self.update(database, |record| raise(record, epoch, None))
     }
 
-    /// Admits `epoch` for `database` from `holder`, the node that leads it: as
-    /// [`admit`](Self::admit), and also refuses it if another node was recorded as its holder.
-    pub(super) fn admit_from(
+    /// Admits `epoch` for `database` as [`admit`](Self::admit) does, refusing it too if `holder`
+    /// is given and another node was recorded as its holder, and in the same write records that
+    /// the copy belongs to `incarnation`, if one is given, unless it recorded one already: a copy
+    /// never records an epoch's holder without the incarnation it was admitted for, whatever
+    /// stops the admission after the write (ADR-0046's amendment, items 10 and 13). Nothing is
+    /// written if the copy records another incarnation than a random `incarnation`; the legacy
+    /// incarnation, 0, says nothing either way.
+    ///
+    /// It blocks on the file system when the record changes.
+    pub(super) fn admit_labelled(
         &self,
         database: &DatabaseName,
         epoch: u64,
-        holder: &NodeId,
+        holder: Option<&NodeId>,
+        incarnation: Option<u64>,
     ) -> Result<(), EpochError> {
-        self.update(database, |record| raise(record, epoch, Some(holder)))
+        let legacy = fleetring_control::Incarnation::LEGACY.get();
+        self.update(database, |record| {
+            if let (Some(offered), Some(recorded)) = (incarnation, record.incarnation)
+                && offered != recorded
+                && offered != legacy
+            {
+                return Err(EpochError::OtherIncarnation { recorded, offered });
+            }
+            raise(record, epoch, holder)?;
+            if let Some(offered) = incarnation {
+                record.incarnation.get_or_insert(offered);
+            }
+            Ok(())
+        })
     }
 
     /// Records durably that the last frames of `database`'s log came from the primary of
@@ -451,6 +484,41 @@ mod tests {
         text.parse().expect("node id")
     }
 
+    /// An admission writes its epoch and the copy's incarnation in one record, refuses a random
+    /// incarnation other than the copy's without writing, and takes the legacy one as saying
+    /// nothing.
+    #[test]
+    fn an_admission_records_its_epoch_and_incarnation_together() {
+        let dir = tempfile::tempdir().expect("dir");
+        let epochs = Epochs::new(dir.path().to_path_buf());
+        let db: DatabaseName = "labelled".parse().expect("a name");
+        let label = |epochs: &Epochs| {
+            epochs
+                .record(&db)
+                .incarnation()
+                .map(fleetring_control::Incarnation::get)
+        };
+        epochs
+            .admit_labelled(&db, 2, Some(&node("t")), Some(7))
+            .expect("admitted");
+        let reopened = Epochs::new(dir.path().to_path_buf());
+        let record = reopened.record(&db);
+        assert_eq!((record.highest(), record.holder()), (2, Some("t")));
+        assert_eq!(label(&reopened), Some(7));
+        assert!(matches!(
+            reopened.admit_labelled(&db, 3, Some(&node("u")), Some(8)),
+            Err(EpochError::OtherIncarnation {
+                recorded: 7,
+                offered: 8
+            })
+        ));
+        assert_eq!(reopened.record(&db).highest(), 2, "nothing written");
+        reopened
+            .admit_labelled(&db, 3, Some(&node("u")), Some(0))
+            .expect("the legacy incarnation says nothing");
+        assert_eq!(label(&reopened), Some(7));
+    }
+
     #[test]
     fn epochs_only_grow_and_survive_a_restart() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -632,20 +700,30 @@ mod tests {
         let db: DatabaseName = "db".parse().expect("name");
         let epochs = Epochs::new(dir.path().to_owned());
         epochs
-            .admit_from(&db, 2, &node("a"))
+            .admit_labelled(&db, 2, Some(&node("a")), None)
             .expect("a fences at 2");
-        epochs.admit_from(&db, 2, &node("a")).expect("a again");
+        epochs
+            .admit_labelled(&db, 2, Some(&node("a")), None)
+            .expect("a again");
         epochs.admit(&db, 2).expect("a batch at 2");
         assert!(matches!(
-            epochs.admit_from(&db, 2, &node("b")),
+            epochs.admit_labelled(&db, 2, Some(&node("b")), None),
             Err(EpochError::OtherHolder { .. })
         ));
         epochs
-            .admit_from(&db, 3, &node("b"))
+            .admit_labelled(&db, 3, Some(&node("b")), None)
             .expect("b at a newer epoch");
         let reopened = Epochs::new(dir.path().to_owned());
-        assert!(reopened.admit_from(&db, 3, &node("a")).is_err());
-        assert!(reopened.admit_from(&db, 3, &node("b")).is_ok());
+        assert!(
+            reopened
+                .admit_labelled(&db, 3, Some(&node("a")), None)
+                .is_err()
+        );
+        assert!(
+            reopened
+                .admit_labelled(&db, 3, Some(&node("b")), None)
+                .is_ok()
+        );
     }
 
     #[test]
