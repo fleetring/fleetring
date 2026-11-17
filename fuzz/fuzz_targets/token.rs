@@ -6,6 +6,12 @@
 //! claims' parsing, `check_issuer_signed`, the agent tier, and the checks after them. A stolen
 //! issuer key can sign any claims, so they are as untrusted as the rest. `fuzz/seeds/token` holds
 //! claims that pass and claims each check refuses.
+//!
+//! The authority is fixed, `fuzz/fixtures/authority`, a test authority for the fleet `lab` whose
+//! key ID the seeds' chains name, so a seed passes the checks before it reaches the denylist and
+//! the trust of its root. Signed claims are verified against an empty denylist and against one
+//! whose entries from the lineage the input's last byte chooses, so the revocation walk is fuzzed
+//! too.
 
 #![no_main]
 
@@ -15,13 +21,16 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use fleetring_control::delegation::{ChainLink, DelegationId, TokenClaims, TokenKind};
-use fleetring_control::{Revocations, Timestamp};
+use fleetring_control::{Revocations, Revoked, Timestamp};
 use fleetringd::auth::{BearerToken, DelegationSigner, TokenVerifier, VerifyingKey};
 use fleetringd::tls::{Authority, FleetName, IssuerCertificate, Validity};
 use libfuzzer_sys::fuzz_target;
 use ring::signature::Ed25519KeyPair;
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+/// The fixture authority's key ID, which the seeds' chains name.
+const AUTHORITY_KEY_ID: &str = "qX5AwDAN_E4Yj6VF";
 
 /// When the fixture's issuer certificate starts: 2027-01-15.
 const ISSUED: Timestamp = Timestamp::from_millis(1_800_000_000_000);
@@ -36,6 +45,8 @@ struct Fixture {
     verifier: TokenVerifier,
     /// The issuer's key, which signs the fuzzed claims.
     issuer_key: Ed25519KeyPair,
+    /// The ID of the issuer key, whose revocation the denylist may hold.
+    issuer_kid: fleetring_control::KeyId,
     /// The valid token's header part, as the issuer signs it.
     header: String,
     /// The valid token's key ID, claims part, and signature part.
@@ -53,10 +64,17 @@ fn fixture() -> &'static Fixture {
     static FIXTURE: OnceLock<Fixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let fleet: FleetName = "lab".parse().expect("a fleet");
-        let authority =
-            Authority::create(fleet.clone(), Validity::new(Timestamp::ZERO, 36_500 * DAY))
-                .expect("an authority");
+        let authority = Authority::load(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/authority"
+        )))
+        .expect("the fixture authority");
         let authorities = vec![authority.token_signer().expect("Ed25519").verifying_key()];
+        assert_eq!(
+            authorities[0].id().to_string(),
+            AUTHORITY_KEY_ID,
+            "the seeds name the fixture authority's key"
+        );
         let issued = authority
             .issue_issuer(
                 &"control-1".parse().expect("a node id"),
@@ -111,11 +129,33 @@ fn fixture() -> &'static Fixture {
             issuer_key,
             header,
             kid: signer.key_id().to_string(),
+            issuer_kid: signer.key_id().clone(),
             claims: parts.next().expect("claims").to_owned(),
             signature: parts.next().expect("a signature").to_owned(),
             now,
         }
     })
+}
+
+/// The denylist `choice` picks, one bit per entry: the root token's ID, the authority's key, the
+/// issuer's key, the root agent's principal, the child's principal, and a delegation ID.
+fn denylist(fixture: &Fixture, choice: u8) -> Revocations {
+    let until = Timestamp::MAX;
+    let principal = |name: &str| Revoked::principal(name.parse().expect("a principal"));
+    let entries = [
+        Revoked::Token("root-1".parse().expect("a token id")),
+        Revoked::Key(fixture.authorities[0].id().clone()),
+        Revoked::Key(fixture.issuer_kid.clone()),
+        principal("agent-42"),
+        principal("agent-42.c7"),
+        Revoked::Token(DelegationId::from_bytes([7; 16]).into()),
+    ];
+    entries
+        .into_iter()
+        .enumerate()
+        .filter(|(bit, _)| choice & (1 << bit) != 0)
+        .map(|(_, entry)| (entry, until))
+        .collect()
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -147,8 +187,13 @@ fuzz_target!(|data: &[u8]| {
     // The bytes as the claims JSON of a token the issuer signed, with a valid signature.
     let signed = format!("{}.{}", fixture.header, URL_SAFE_NO_PAD.encode(data));
     let signature = fixture.issuer_key.sign(signed.as_bytes());
-    let token = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()));
-    let _ = fixture
-        .verifier
-        .verify(&BearerToken::new(token), fixture.now, &none);
+    let token = BearerToken::new(format!(
+        "{signed}.{}",
+        URL_SAFE_NO_PAD.encode(signature.as_ref())
+    ));
+    let _ = fixture.verifier.verify(&token, fixture.now, &none);
+    // And against a denylist the input's last byte chooses, so a token that passes every check
+    // before it meets the revocation walk.
+    let revoked = denylist(fixture, data.last().copied().unwrap_or(0));
+    let _ = fixture.verifier.verify(&token, fixture.now, &revoked);
 });
