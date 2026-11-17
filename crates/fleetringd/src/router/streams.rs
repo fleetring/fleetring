@@ -462,19 +462,25 @@ mod tests {
         let c7 = Caller::verified_for_tests("agent-42.c7", "agent-42", "t-c7");
         let c8 = Caller::verified_for_tests("agent-42.c8", "agent-42", "t-c8");
         let other = Caller::verified_for_tests("agent-43.c1", "agent-43", "t-43");
-        let first = streams.create(&root, &database, &entropy).expect("the root's");
+        let first = streams
+            .create(&root, &database, &entropy)
+            .expect("the root's");
         let second = streams.create(&c7, &database, &entropy).expect("a child's");
         assert_eq!(
             streams.create(&c8, &database, &entropy).map(|_| ()),
             Err(StreamRefusal::PrincipalFull(2)),
             "a second child counts against the same quota"
         );
-        let theirs = streams.create(&other, &database, &entropy).expect("another lineage's");
+        let theirs = streams
+            .create(&other, &database, &entropy)
+            .expect("another lineage's");
         // A stream that goes gives the lineage's place back.
         let id = second.id();
         drop(second);
         streams.remove(id);
-        streams.create(&c8, &database, &entropy).expect("a place again");
+        streams
+            .create(&c8, &database, &entropy)
+            .expect("a place again");
         drop((first, theirs));
     }
 
