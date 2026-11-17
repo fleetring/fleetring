@@ -983,11 +983,18 @@ pub(super) fn record_installed(
 }
 
 /// Records an install of a staged copy of `database` that was cancelled after it moved the copy
-/// into the database's place and before it recorded the move, or the copy's incarnation, as a
-/// bootstrap that ran out of its time is: what the start would record (`settle_installs` and
+/// into the database's place and before it recorded the move, as a bootstrap that ran out of its
+/// time is: the staged copy is marked installed, and the copy's incarnation recorded if nothing
+/// has recorded an epoch for it, as the start would (`settle_installs` and
 /// [`record_installed`]), without waiting for a restart. Only a copy no longer beside its sidecar
-/// is touched, so an install still under way, whose files haven't moved, is left alone. The
-/// next stream following `database` calls this, under its lock, before it opens the copy.
+/// is touched, so an install still under way, whose files haven't moved, is left alone.
+///
+/// The next stream following `database` calls this, under its lock, before it opens the copy;
+/// its admission has labelled the copy already, so only the staged copy's marker is new there.
+/// A promoted holder calls it before it fences. Neither restores what the cancelled install
+/// would have written after the move: the copy's log epoch 0 and its chain anchor at the staged
+/// position. Its chain is then derived from its log, so the copy's first acknowledgement proves
+/// nothing until it acknowledges a write, as after a crash at the same point.
 pub(super) async fn recover_install(inner: &Arc<super::Inner>, database: &DatabaseName) {
     if inner.forks.store().of_name(database).is_empty() {
         return;
@@ -1311,6 +1318,8 @@ impl super::Replication {
             .await?
             .map_err(|error| Status::internal(error.to_string()))?;
         if exists {
+            // An install a cancellation stopped after the move is recorded before the fence.
+            recover_install(&self.inner, database).await;
             return Ok(());
         }
         install_holder(&self.inner, database).await.map(drop)
