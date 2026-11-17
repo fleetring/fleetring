@@ -2294,6 +2294,12 @@ mod tests {
             };
             std::fs::write(&files.cert, issued.certificate_pem()).expect("written");
             std::fs::write(&files.key, issued.key_pem()).expect("written");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&files.key, std::fs::Permissions::from_mode(0o600))
+                    .expect("private");
+            }
             let pair = IssuerPair::load(&files, &identity, Arc::new(clock)).expect("loads");
             let certifier = pair
                 .signer()

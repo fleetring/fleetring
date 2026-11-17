@@ -1105,6 +1105,12 @@ impl Fleet {
     ) -> Result<(), SimError> {
         let pair = self.authority.issue_issuer(issuer, validity)?;
         std::fs::write(&files.key, pair.key_pem())?;
+        // Private, as `cert issuer` writes it: a node refuses a key other users can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&files.key, std::fs::Permissions::from_mode(0o600))?;
+        }
         std::fs::write(&files.cert, pair.certificate_pem())?;
         Ok(())
     }
