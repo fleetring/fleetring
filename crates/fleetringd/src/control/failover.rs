@@ -557,10 +557,15 @@ mod tests {
         use fleetring_control::delegation::{
             CallerToken, CanonicalRequest, DelegationId, TokenClaims, TokenKind,
         };
-        let scopes: fleetring_control::scope::Scopes = ["admin:agent-42.c7-*"]
-            .iter()
-            .map(|text| text.parse().expect("a scope"))
-            .collect();
+        let parse = |texts: &[&str]| -> fleetring_control::scope::Scopes {
+            texts
+                .iter()
+                .map(|text| text.parse().expect("a scope"))
+                .collect()
+        };
+        let scopes = parse(&["admin:agent-42.c7-*"]);
+        // The root may hand a child what it grants: `apply` holds a root's child to them.
+        let held = parse(&["admin:agent-42.*", "grant:agent-42.*"]);
         let start = now.as_millis() - now.as_millis() % 1_000;
         let caller = CallerToken {
             claims: TokenClaims {
@@ -570,7 +575,7 @@ mod tests {
                 issued_at: Some(Timestamp::ZERO),
                 not_before: Timestamp::ZERO,
                 expires_at: Timestamp::MAX,
-                scopes: scopes.clone(),
+                scopes: held,
                 kind: Some(TokenKind::Agent),
                 owner: Some("sam".parse().expect("a name")),
                 parent: None,
