@@ -3266,7 +3266,10 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
             yes,
             target,
             ..
-        } => revoke_principal(&principal, yes, &target).await,
+        } => {
+            let asked = if yes { Asked::Already } else { Asked::Not };
+            revoke_principal(&principal, asked, &target).await
+        }
         TokenCommand::Revoke {
             token_id,
             key_id,
@@ -3316,19 +3319,27 @@ async fn run_token(command: TokenCommand) -> Result<String, Box<dyn Error>> {
     }
 }
 
+/// Whether the person confirmed a destructive command already, with `--yes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// `--yes`: don't ask.
+    Already,
+    /// Ask on a terminal, and refuse without one.
+    Not,
+}
+
 /// `token revoke --principal`: revokes every token of `principal` and of every name below it
 /// issued until now, with `fleet` or, run as an agent, under the ancestor rule (ADR-0047, point
 /// 11), and says when a new root token may be minted.
 async fn revoke_principal(
     principal: &Principal,
-    yes: bool,
+    asked: Asked,
     target: &Target,
 ) -> Result<String, Box<dyn Error>> {
     let place = target.place()?;
-    if yes {
-        note(format!("revoking principal {principal} {}", place.on()));
-    } else {
-        confirm::confirm(&confirm::revoke_principal(principal.as_str(), &place))?;
+    match asked {
+        Asked::Already => note(format!("revoking principal {principal} {}", place.on())),
+        Asked::Not => confirm::confirm(&confirm::revoke_principal(principal.as_str(), &place))?,
     }
     let answer = target
         .client()?

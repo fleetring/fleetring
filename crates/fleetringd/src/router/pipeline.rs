@@ -107,7 +107,7 @@ pub(crate) async fn pipeline(
     let mut stream = stream_for(context, request.baton.as_deref(), caller, target)?;
     let mut committed = None;
     let mut budget = context.config.streams.max_response_bytes.get();
-    let mut called = false;
+    let mut called = Called::No;
     let mut results = Vec::with_capacity(request.requests.len());
     for request in request.requests {
         let ran = if stream.closed {
@@ -164,7 +164,7 @@ pub(crate) async fn cursor(
     let mut stream = stream_for(context, request.baton.as_deref(), caller, target)?;
     let mut committed = None;
     let mut budget = context.config.streams.max_response_bytes.get();
-    let mut called = false;
+    let mut called = Called::No;
     let entries = if stream.closed {
         vec![CursorEntry::Error {
             error: Error::new(code::PROTOCOL_ERROR, "the stream is closed"),
@@ -203,8 +203,8 @@ pub(crate) async fn cursor(
 /// plane or the node, as a revoked token's is, if no call was sent for it yet, so nothing ran:
 /// the router answers its own refusal of a token so (ADR-0037, point 18). Once a call was sent,
 /// what ran is reported, and the error with it.
-fn refuse_unauthenticated(error: &Error, called: bool) -> Result<(), Refused> {
-    if called || error.code.as_deref() != Some(code::UNAUTHENTICATED) {
+fn refuse_unauthenticated(error: &Error, called: Called) -> Result<(), Refused> {
+    if called == Called::Yes || error.code.as_deref() != Some(code::UNAUTHENTICATED) {
         return Ok(());
     }
     Err(Refused {
@@ -311,6 +311,13 @@ fn finish(
     (Some(baton), base_url)
 }
 
+/// Whether a call was sent to a node for an HTTP request, which may then have run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Called {
+    No,
+    Yes,
+}
+
 /// One request's run on a locked stream.
 struct Run<'r> {
     context: &'r Context,
@@ -321,7 +328,7 @@ struct Run<'r> {
     /// What is left of the most bytes of rows one response may carry.
     budget: &'r mut usize,
     /// Whether a call was sent to a node for the HTTP request, which may then have run.
-    called: &'r mut bool,
+    called: &'r mut Called,
 }
 
 impl Run<'_> {
@@ -512,7 +519,7 @@ impl Run<'_> {
             // transaction, and the stream then has none.
             let mut session = self.stream.session.take().expect("a session is open");
             let primary = session.primary.clone();
-            *self.called = true;
+            *self.called = Called::Yes;
             let called = session.call(&call, timeout).await;
             self.stream.session = Some(session);
             let error = match called {

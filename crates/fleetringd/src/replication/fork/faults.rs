@@ -97,6 +97,14 @@ pub struct ForkFaults {
 #[cfg(feature = "fault-hooks")]
 type Scope = Option<[u8; 16]>;
 
+/// Whether a test holds work at a point, or lets it pass.
+#[cfg(feature = "fault-hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    Held,
+    Released,
+}
+
 #[cfg(feature = "fault-hooks")]
 #[derive(Debug)]
 struct Hooks {
@@ -137,12 +145,13 @@ impl ForkFaults {
         }
     }
 
-    fn set(&self, point: FaultPoint, scope: Scope, held: bool) {
+    fn set(&self, point: FaultPoint, scope: Scope, hold: Hold) {
         if let Some(hooks) = &self.hooks {
-            hooks.held.send_modify(|holds| {
-                if held {
+            hooks.held.send_modify(|holds| match hold {
+                Hold::Held => {
                     holds.insert((point, scope));
-                } else {
+                }
+                Hold::Released => {
                     holds.remove(&(point, scope));
                 }
             });
@@ -151,23 +160,23 @@ impl ForkFaults {
 
     /// Holds every piece of fork work that reaches `point`, until [`release`](Self::release).
     pub fn hold(&self, point: FaultPoint) {
-        self.set(point, None, true);
+        self.set(point, None, Hold::Held);
     }
 
     /// Lets the work held at `point` go on, and lets later work pass it.
     pub fn release(&self, point: FaultPoint) {
-        self.set(point, None, false);
+        self.set(point, None, Hold::Released);
     }
 
     /// Holds the work of the fork operation `operation` that reaches `point`, until
     /// [`release_operation`](Self::release_operation).
     pub fn hold_operation(&self, point: FaultPoint, operation: OperationId) {
-        self.set(point, Some(operation.to_bytes()), true);
+        self.set(point, Some(operation.to_bytes()), Hold::Held);
     }
 
     /// Lets the work of `operation` held at `point` go on.
     pub fn release_operation(&self, point: FaultPoint, operation: OperationId) {
-        self.set(point, Some(operation.to_bytes()), false);
+        self.set(point, Some(operation.to_bytes()), Hold::Released);
     }
 
     /// How many times work has arrived at `point` while it was held.
