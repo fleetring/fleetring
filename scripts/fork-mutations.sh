@@ -37,21 +37,29 @@ for mutation in $mutations; do
   failures=$(grep -E "^test (fork|membership_lag|handover|recreated)::.* FAILED$" "$log" | sed -e 's/^test //' -e 's/ \.\.\. FAILED$//')
   report=""
   for test in $failures; do
-    # Each failing point, and the property it violated, from the panic message.
-    lines=$(sed -n "/^---- $test stdout/,/rerun it alone/p" "$log" \
-      | grep -E "^(seed [0-9]+ failed: )?at [A-Za-z]+:" \
+    # Each failing point, and the property it violated, from the panic message: the matrix's
+    # rows name the point ("at <Point>: ..."), and the other scenarios' seeds fail with the
+    # violation itself ("seed N failed: invariant violated (...)"). libtest prints a blank line
+    # before the panic, so a test's block runs to the rerun hint, not to the first blank line.
+    block=$(sed -n "/^---- $test stdout/,/rerun it alone/p" "$log")
+    lines=$(printf '%s\n' "$block" \
+      | grep -E "^(seed [0-9]+ failed: )?(at [A-Za-z]+:|invariant violated)" \
       | sed -E 's/^seed [0-9]+ failed: //')
     if [ -z "$lines" ]; then
-      lines=$(sed -n "/^---- $test stdout/,/^$/p" "$log" | grep -E "panicked|Error" | head -n 1)
+      lines=$(printf '%s\n' "$block" | grep -E "^seed [0-9]+ failed:|panicked|Error" | grep -v "panicked at" | head -n 1)
+    fi
+    if [ -z "$lines" ]; then
+      lines=$(printf '%s\n' "$block" | grep -E "panicked|Error" | head -n 1)
     fi
     report="$report$(printf '%s\n' "$lines" | while IFS= read -r line; do
       [ -n "$line" ] || continue
       point=$(printf '%s' "$line" | grep -oE "^at [A-Za-z]+" || true)
+      where="$test${point:+ $point}"
       property=$(printf '%s' "$line" | grep -oE "invariant violated \(([^()]|\([a-z]\))*\)" | head -n 1)
       if [ -n "$property" ]; then
-        echo "  caught: $test $point: $property"
+        echo "  caught: $where: $property"
       else
-        echo "  failed, no property: $test $point: $(printf '%s' "$line" | cut -c1-140)"
+        echo "  failed, no property: $where: $(printf '%s' "$line" | cut -c1-140)"
       fi
     done)
 "
