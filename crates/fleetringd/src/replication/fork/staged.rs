@@ -241,7 +241,9 @@ impl StagedStore {
     }
 
     /// Reads the disk at start: removes what a crash left uncommitted, and indexes every staged
-    /// copy by its sidecar. It blocks on the file system.
+    /// copy by its sidecar. An install a crash stopped is settled later, by
+    /// [`settle_installs`](Self::settle_installs), which knows where each database's place is.
+    /// It blocks on the file system.
     pub(crate) fn scan(&self) {
         let mut found = BTreeMap::new();
         let mut pending = vec![self.root.clone()];
@@ -273,7 +275,6 @@ impl StagedStore {
             if sidecar {
                 match read_sidecar(&dir) {
                     Some(staged) => {
-                        settle_install(&dir, staged.held);
                         found.insert(staged.sidecar.key.clone(), staged);
                     }
                     None => {
@@ -672,7 +673,8 @@ fn read_sidecar(dir: &Path) -> Option<Staged> {
     } else if dir.join(COPY).is_dir() {
         Held::Present
     } else if dir.join(INSTALLING).exists() {
-        // Moved into the database's place by an install that a crash stopped before its record.
+        // Moved into the database's place by an install that a crash stopped before its record,
+        // if the place holds it, which `settle_installs` checks.
         Held::Installed
     } else {
         Held::Lost
@@ -680,26 +682,76 @@ fn read_sidecar(dir: &Path) -> Option<Staged> {
     Some(Staged { sidecar, held })
 }
 
-/// Settles, at start, the markers an install that a crash stopped left in `dir`, whose copy
-/// [`read_sidecar`] found `held`: an intent beside the copy's files is an install that never
-/// moved them, and goes; an intent without them is an install that moved them and wrote no
-/// record, which is written now, so the copy is installed from here on. Best effort: whatever
-/// can't be settled now reads the same at the next start.
-fn settle_install(dir: &Path, held: Held) {
-    if !dir.join(INSTALLING).exists() {
-        return;
+impl StagedStore {
+    /// Settles, at start, the markers installs that a crash or a cancellation stopped left,
+    /// with `location` naming each database's place: an intent beside a copy's files is an
+    /// install that never moved them, and goes; an intent without them is an install that moved
+    /// them and wrote no record, which is written now if the database's place holds them, so the
+    /// copy is installed from here on, and otherwise a copy that is gone, lost. Best effort:
+    /// whatever can't be settled now reads the same at the next start. It blocks on the file
+    /// system.
+    /// Records as installed every staged copy of `name` whose install moved its files into the
+    /// database's place, which the caller checked holds them, and wrote only the intent: an
+    /// install a cancellation stopped. Returns the copies it recorded. A copy whose files are
+    /// still beside its sidecar is left alone, intent and all, since its install may be under
+    /// way. It blocks on the file system.
+    pub(crate) fn settle_moved(&self, name: &DatabaseName) -> Vec<StagedKey> {
+        let keys: Vec<StagedKey> = self
+            .lock()
+            .keys()
+            .filter(|key| key.fork.name == *name)
+            .cloned()
+            .collect();
+        let mut settled = Vec::new();
+        for key in keys {
+            let dir = key.dir(&self.root);
+            if !dir.join(INSTALLING).exists() || dir.join(COPY).is_dir() {
+                continue;
+            }
+            if !dir.join(INSTALLED).exists() {
+                if let Err(error) = self.installed(&key) {
+                    tracing::warn!(dir = %dir.display(), %error, "can't record an interrupted install; it reads the same at the next start");
+                    continue;
+                }
+                tracing::warn!(dir = %dir.display(), "a staged copy was moved into its database's place by an install that was cancelled; recorded it as installed");
+            }
+            remove_intent(&dir);
+            settled.push(key);
+        }
+        settled
     }
-    if held == Held::Installed && !dir.join(INSTALLED).exists() {
-        tracing::warn!(dir = %dir.display(), "a staged copy was moved into its database's place by an install a crash stopped; recording it as installed");
-        let recorded = File::create(dir.join(INSTALLED))
-            .and_then(|file| file.sync_all())
-            .and_then(|()| sync_dir(dir));
-        if let Err(error) = recorded {
-            tracing::warn!(dir = %dir.display(), %error, "can't record an interrupted install; it reads the same at the next start");
-            return;
+
+    pub(crate) fn settle_installs(&self, location: impl Fn(&DatabaseName) -> PathBuf) {
+        let keys: Vec<StagedKey> = self.lock().keys().cloned().collect();
+        for key in keys {
+            let dir = key.dir(&self.root);
+            if !dir.join(INSTALLING).exists() {
+                continue;
+            }
+            if dir.join(COPY).is_dir() || dir.join(INSTALLED).exists() {
+                remove_intent(&dir);
+                continue;
+            }
+            let place = location(&key.fork.name);
+            if !place.exists() {
+                tracing::warn!(dir = %dir.display(), place = %place.display(), "an install a crash stopped left neither the staged copy nor the database's place; the copy is lost");
+                if let Some(staged) = self.lock().get_mut(&key) {
+                    staged.held = Held::Lost;
+                }
+                remove_intent(&dir);
+                continue;
+            }
+            tracing::warn!(dir = %dir.display(), "a staged copy was moved into its database's place by an install a crash stopped; recording it as installed");
+            let recorded = File::create(dir.join(INSTALLED))
+                .and_then(|file| file.sync_all())
+                .and_then(|()| sync_dir(&dir));
+            if let Err(error) = recorded {
+                tracing::warn!(dir = %dir.display(), %error, "can't record an interrupted install; it reads the same at the next start");
+                continue;
+            }
+            remove_intent(&dir);
         }
     }
-    remove_intent(dir);
 }
 
 /// Removes the install intent in `dir`, best effort: one left beside the copy's files, or beside
@@ -974,12 +1026,16 @@ mod tests {
 
         let again = StagedStore::new(dir.path().join("staged"));
         again.scan();
+        again.settle_installs(location);
         assert_eq!(
             again.get(&first).map(|staged| staged.held),
             Some(Held::Installed),
             "the intent without the files is an install, not a lost copy"
         );
-        assert!(staged_dir.join(INSTALLED).is_file(), "recorded at the scan");
+        assert!(
+            staged_dir.join(INSTALLED).is_file(),
+            "recorded at the start"
+        );
         assert!(!staged_dir.join(INSTALLING).exists(), "the intent goes");
         let epochs = crate::replication::epochs::Epochs::new(dir.path().join("epochs"));
         assert!(epochs.never_recorded(&name));
@@ -997,11 +1053,32 @@ mod tests {
         File::create(second_dir.join(INSTALLING)).expect("an intent");
         let again = StagedStore::new(dir.path().join("staged"));
         again.scan();
+        again.settle_installs(location);
         assert_eq!(
             again.get(&second).map(|staged| staged.held),
             Some(Held::Present)
         );
         assert!(!second_dir.join(INSTALLING).exists(), "a stale intent goes");
+
+        // An intent with neither the files nor the database's place holding them: the copy is
+        // gone, not installed.
+        let third = key(3);
+        stage(&store, &third, b"gone");
+        let third_dir = third.dir(store.root());
+        let elsewhere = dir.path().join("elsewhere");
+        store.move_into_place(&third, &elsewhere).expect("moved");
+        fs::remove_dir_all(&elsewhere).expect("removed");
+        let nowhere = |_: &DatabaseName| dir.path().join("nowhere");
+        let again = StagedStore::new(dir.path().join("staged"));
+        again.scan();
+        again.settle_installs(nowhere);
+        assert_eq!(
+            again.get(&third).map(|staged| staged.held),
+            Some(Held::Lost),
+            "an intent without the copy or its place is a lost copy"
+        );
+        assert!(!third_dir.join(INSTALLED).exists());
+        assert!(!third_dir.join(INSTALLING).exists(), "the intent goes");
     }
 
     #[test]

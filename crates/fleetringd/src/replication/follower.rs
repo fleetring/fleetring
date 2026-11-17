@@ -620,7 +620,10 @@ impl Follow {
             blocking(inner.execution, move || location.try_exists()).await?
         }
         .map_err(|error| Status::internal(error.to_string()))?;
-        if !exists {
+        if exists {
+            // A staged copy's install that a timeout cancelled after the move is recorded now.
+            super::fork::recover_install(inner, &self.name).await;
+        } else {
             tokio::time::timeout(inner.settings.open_timeout, self.bootstrap(&location))
                 .await
                 .map_err(|_| Status::deadline_exceeded("fetching the initial copy timed out"))??;

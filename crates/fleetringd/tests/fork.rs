@@ -2658,6 +2658,93 @@ async fn a_holder_killed_between_its_install_and_its_record_records_it_at_start(
     Ok(())
 }
 
+/// A follower whose install of its staged copy is cancelled after the move, as a bootstrap that
+/// runs out of its time is, has the move and the copy's incarnation recorded by its next stream,
+/// with no restart, as the start would record them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_install_still_records_its_move() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fleet = Fleet::start(
+        dir.path(),
+        Settings {
+            replication: "open_timeout_ms = 1500\n",
+            ..Settings::default()
+        },
+    )
+    .await?;
+    let client = fleet.client()?;
+    let source = name("src")?;
+    let source_primary = create_source(&client, &source, 1, 5).await?;
+    let target = fleet.name_apart("dst", 2, &source_primary)?;
+    let id = operation(78);
+    // The fork stays seeded, so its staged copies stay, until the check below is done.
+    for faults in &fleet.faults {
+        faults.hold_operation(FaultPoint::InstallMoved, id);
+        faults.hold_operation(FaultPoint::FollowerReset, id);
+    }
+    client
+        .fork_database(&source, &target, &spec(id, 2)?)
+        .await?;
+    // The first holder installs as the fork's primary; let it go on.
+    let first = await_held(&fleet, FaultPoint::InstallMoved).await?;
+    let faults_of = |node: &NodeId| {
+        fleet
+            .data
+            .iter()
+            .zip(&fleet.faults)
+            .find(|(daemon, _)| daemon.config().node.id == *node)
+            .map(|(_, faults)| faults.clone())
+    };
+    faults_of(&first)
+        .ok_or("no hooks for the first holder")?
+        .release_operation(FaultPoint::InstallMoved, id);
+    // The other installs as a follower, in the bootstrap of the primary's stream.
+    let mut follower = None;
+    wait_until("the follower's install reaching the move", async || {
+        follower = fleet
+            .data
+            .iter()
+            .zip(&fleet.faults)
+            .map(|(daemon, faults)| (daemon.config().node.id.clone(), faults))
+            .find(|(node, faults)| *node != first && faults.arrivals(FaultPoint::InstallMoved) > 0)
+            .map(|(node, _)| node);
+        follower.is_some()
+    })
+    .await?;
+    let follower = follower.ok_or("no follower")?;
+    // The bootstrap runs out of its time while the install is held after the move.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    faults_of(&follower)
+        .ok_or("no hooks for the follower")?
+        .release_operation(FaultPoint::InstallMoved, id);
+    let [staged] = staged_dirs(dir.path(), &follower, &target)
+        .try_into()
+        .map_err(|found| format!("one staging directory, not {found:?}"))?;
+    wait_until("the cancelled install recording its move", async || {
+        staged.join("installed").is_file() && !staged.join("installing").exists()
+    })
+    .await?;
+    assert!(database_dir(dir.path(), &follower, &target).is_dir());
+    let epoch = dir
+        .path()
+        .join(follower.as_str())
+        .join("replication")
+        .join("epochs")
+        .join(target.as_str())
+        .join("epoch");
+    assert!(epoch.is_file(), "the copy's incarnation is recorded");
+    for faults in &fleet.faults {
+        faults.release_operation(FaultPoint::FollowerReset, id);
+    }
+    await_state(&client, id, proto::ForkState::Ready).await?;
+    assert_eq!(
+        notes(&client, &target).await?,
+        notes(&client, &source).await?
+    );
+    fleet.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seeder_killed_while_writing_its_copy_refetches() -> TestResult {
     crash_while_staging(FaultPoint::StagingWritten, Leftover::Torn, 70).await

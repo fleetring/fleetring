@@ -947,11 +947,12 @@ pub(super) async fn install_holder(
 /// Records, at start, every staged copy that was moved into its database's place but whose
 /// incarnation the node never recorded: a crash or a failed write between the move and the
 /// record (`install_staged`) leaves such a copy, which a drop notice, the orphan check, and
-/// `orphan remove` would otherwise not know. It blocks on the file system.
+/// `orphan remove` would otherwise not know. The install markers such a crash left are settled
+/// first, against the database's place. It blocks on the file system.
 pub(super) fn record_installed_copies(inner: &super::Inner) {
-    record_installed(&inner.epochs, inner.forks.store(), |name| {
-        inner.registry().location(name)
-    });
+    let location = |name: &DatabaseName| inner.registry().location(name);
+    inner.forks.store().settle_installs(location);
+    record_installed(&inner.epochs, inner.forks.store(), location);
 }
 
 /// [`record_installed_copies`] over `epochs` and `store`, with `location` naming each
@@ -978,6 +979,46 @@ pub(super) fn record_installed(
                 tracing::error!(fork = %key.fork, %error, "can't record an installed staged copy a crash left unrecorded; left it in place");
             }
         }
+    }
+}
+
+/// Records an install of a staged copy of `database` that was cancelled after it moved the copy
+/// into the database's place and before it recorded the move, or the copy's incarnation, as a
+/// bootstrap that ran out of its time is: what the start would record (`settle_installs` and
+/// [`record_installed`]), without waiting for a restart. Only a copy no longer beside its sidecar
+/// is touched, so an install still under way, whose files haven't moved, is left alone. The
+/// next stream following `database` calls this, under its lock, before it opens the copy.
+pub(super) async fn recover_install(inner: &Arc<super::Inner>, database: &DatabaseName) {
+    if inner.forks.store().of_name(database).is_empty() {
+        return;
+    }
+    let inner = Arc::clone(inner);
+    let database = database.clone();
+    let recovered = super::follower::blocking(inner.execution, move || {
+        let location = inner.registry().location(&database);
+        if !location.exists() {
+            return;
+        }
+        for key in inner.forks.store().settle_moved(&database) {
+            if !inner.epochs.never_recorded(&database) {
+                continue;
+            }
+            match inner
+                .epochs
+                .record_install(&database, key.fork.incarnation.get(), None)
+            {
+                Ok(()) => {
+                    tracing::warn!(target: "fleetringd::audit", fork = %key.fork, attempt = key.attempt, "recorded an installed staged copy an interrupted install left unrecorded");
+                }
+                Err(error) => {
+                    tracing::error!(fork = %key.fork, %error, "can't record an installed staged copy an interrupted install left unrecorded; left it in place");
+                }
+            }
+        }
+    })
+    .await;
+    if let Err(status) = recovered {
+        tracing::warn!(%status, "can't settle an interrupted install; the next start does");
     }
 }
 
