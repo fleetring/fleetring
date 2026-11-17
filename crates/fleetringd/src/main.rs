@@ -53,8 +53,8 @@ use fleetringd::report::{
 use fleetringd::router::{Router, RouterConfig};
 use fleetringd::tls::{
     AUTHORITY_CERT_FILE, Authority, DEFAULT_AUTHORITY_LIFETIME, DEFAULT_CLIENT_LIFETIME,
-    DEFAULT_ISSUER_LIFETIME, DEFAULT_NODE_LIFETIME, FleetName, Identity, IssuerFiles, Peer,
-    Principal, Security, Validity, write_issuer_pair,
+    DEFAULT_ISSUER_LIFETIME, DEFAULT_NODE_LIFETIME, ExistingPair, FleetName, Identity, IssuerFiles,
+    Peer, Principal, Security, Validity, existing_pair, write_issuer_pair,
 };
 use fleetringd::transport::Credentials;
 #[cfg(unix)]
@@ -802,6 +802,12 @@ enum CertCommand {
         /// 30 days by default, and at most 90.
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<Duration>,
+        /// Writes over an existing pair this authority didn't certify for this name
+        ///
+        /// Without it, running the command again renews only a pair the same authority issued
+        /// for the same name, and refuses anything else it would overwrite.
+        #[arg(long)]
+        replace: bool,
     },
 }
 
@@ -3422,6 +3428,7 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
             dir,
             out,
             ttl,
+            replace,
         } => {
             let authority = agent::load_authority(&dir)?;
             // The certificate starts now, with no backdating, so its lifetime is the whole of
@@ -3430,25 +3437,55 @@ fn run_cert(command: CertCommand) -> Result<String, Box<dyn Error>> {
                 &name,
                 Validity::new(SystemClock.now(), ttl.unwrap_or(DEFAULT_ISSUER_LIFETIME)),
             )?;
+            let stem = format!("issuer.{name}");
             let into = match out {
                 Some(out) => {
-                    if let Some(warning) = agent::prepare_out_dir(&out)? {
+                    // A directory that holds only issuer pairs, and their temporary names, is
+                    // one `cert issuer` wrote: running it again renews in place.
+                    let pair_file = |file: &str| {
+                        file.starts_with("issuer.")
+                            && [".crt", ".key", ".crt.tmp", ".key.tmp"]
+                                .iter()
+                                .any(|suffix| file.ends_with(suffix))
+                    };
+                    if let Some(warning) = agent::prepare_out_dir_keeping(&out, &pair_file)? {
                         note(warning);
                     }
                     out
                 }
                 None => dir,
             };
-            let stem = format!("issuer.{name}");
+            let files = IssuerFiles {
+                cert: into.join(format!("{stem}.crt")),
+                key: into.join(format!("{stem}.key")),
+            };
+            let authorities = [authority.token_signer()?.verifying_key()];
+            match existing_pair(&files, authority.fleet(), &name, &authorities) {
+                ExistingPair::Absent | ExistingPair::Renewable => {}
+                ExistingPair::Foreign(why) if replace => {
+                    note(format!(
+                        "warning: replacing a pair this authority didn't issue: {why}"
+                    ));
+                }
+                ExistingPair::Foreign(why) => {
+                    return Err(exit::Usage(format!(
+                        "won't write over {}: {why}\n  hint: pass --replace to write over it, or \
+                         choose another --out",
+                        files.key.display()
+                    ))
+                    .into());
+                }
+                other => {
+                    return Err(format!(
+                        "can't tell what is at {}: {other:?}",
+                        files.key.display()
+                    )
+                    .into());
+                }
+            }
             // A new key every run: written over an existing pair, key first, so running it again
             // renews the certificate and rotates the key while the control node reloads them.
-            write_issuer_pair(
-                &IssuerFiles {
-                    cert: into.join(format!("{stem}.crt")),
-                    key: into.join(format!("{stem}.key")),
-                },
-                &issued,
-            )?;
+            write_issuer_pair(&files, &issued)?;
             Ok(format!(
                 "issued {} in {}: {stem}.crt and {stem}.key (keep the key on that control node \
                  alone)\n\nName them in the control node's configuration:\n\n  [control]\n  \

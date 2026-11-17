@@ -766,6 +766,60 @@ fn cert_issuer_writes_0600_key_and_refuses_over_90_days() -> TestResult {
     Ok(())
 }
 
+/// `cert issuer --out <dir>` run again renews the pair in place, as the CLI guide and ADR-0047
+/// point 1.1 say, beside other issuers' pairs; it refuses a directory holding anything else, and
+/// a pair another authority certified, unless `--replace` is given.
+#[test]
+fn cert_issuer_renews_in_its_out_dir_and_overwrites_another_pair_only_when_asked() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let tls = Tls::create(root.path())?;
+    let out = root.path().join("out");
+    let issuer = |name: &str, dir: &Path, extra: &[&str]| {
+        crate::support::fleetring()
+            .args(["cert", "issuer", "--name", name, "--dir"])
+            .arg(dir)
+            .arg("--out")
+            .arg(&out)
+            .args(extra)
+            .output()
+    };
+    let first = issuer("c1", tls.dir(), &[])?;
+    assert!(first.status.success(), "{first:?}");
+    let before = issuer_in(&out.join("issuer.c1.crt"), &tls)?;
+    let other = issuer("c2", tls.dir(), &[])?;
+    assert!(
+        other.status.success(),
+        "beside another issuer's pair: {other:?}"
+    );
+    let again = issuer("c1", tls.dir(), &[])?;
+    assert!(again.status.success(), "renewed in place: {again:?}");
+    let after = issuer_in(&out.join("issuer.c1.crt"), &tls)?;
+    assert_ne!(after.key_id(), before.key_id(), "a new key");
+
+    // A pair another authority certified under the same name is refused, then replaced on
+    // request.
+    let stranger = Tls::create(&root.path().join("stranger"))?;
+    let refused = issuer("c1", stranger.dir(), &[])?;
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    let stderr = String::from_utf8(refused.stderr)?;
+    assert!(stderr.contains("--replace"), "{stderr}");
+    assert_eq!(
+        issuer_in(&out.join("issuer.c1.crt"), &tls)?.key_id(),
+        after.key_id(),
+        "nothing was written"
+    );
+    let replaced = issuer("c1", stranger.dir(), &["--replace"])?;
+    assert!(replaced.status.success(), "{replaced:?}");
+    assert!(issuer_in(&out.join("issuer.c1.crt"), &stranger).is_ok());
+
+    // A directory holding anything but issuer pairs is still refused.
+    std::fs::write(out.join("notes.txt"), "mine")?;
+    let cluttered = issuer("c3", tls.dir(), &[])?;
+    assert!(!cluttered.status.success(), "{cluttered:?}");
+    assert!(!out.join("issuer.c3.key").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn control_node_with_mismatched_issuer_pair_refuses_to_start_naming_both_files() -> TestResult
 {

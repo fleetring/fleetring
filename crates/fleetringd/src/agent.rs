@@ -2070,6 +2070,19 @@ pub(crate) fn write_new_private(path: &Path, contents: &str) -> Result<(), Agent
 /// [`AgentError::OutNotEmpty`] for a directory that holds anything, [`AgentError::Link`] for a
 /// link, and [`AgentError::File`] if it can't be read or created.
 pub(crate) fn prepare_out_dir(dir: &Path) -> Result<Option<String>, AgentError> {
+    prepare_out_dir_keeping(dir, &|_| false)
+}
+
+/// [`prepare_out_dir`], but a directory whose every entry `keeps` names is as good as an empty
+/// one: `cert issuer` renews a pair in the directory it wrote it to.
+///
+/// # Errors
+///
+/// As [`prepare_out_dir`], for an entry `keeps` doesn't name.
+pub(crate) fn prepare_out_dir_keeping(
+    dir: &Path,
+    keeps: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, AgentError> {
     refuse_link(dir)?;
     let failed = |action, source| AgentError::File {
         action,
@@ -2090,7 +2103,14 @@ pub(crate) fn prepare_out_dir(dir: &Path) -> Result<Option<String>, AgentError> 
         }
         Err(source) => return Err(failed("read", source)),
     };
-    if entries.next().is_some() {
+    if entries.any(|entry| {
+        entry.map_or(true, |entry| {
+            !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| keeps(name) && entry.path().is_file())
+        })
+    }) {
         return Err(AgentError::OutNotEmpty {
             dir: dir.to_owned(),
         });
