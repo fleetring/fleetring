@@ -604,6 +604,24 @@ impl Replication {
         self.inner.primary(database).map(|primary| primary.role())
     }
 
+    /// Whether this node's copy of `database` can't be a copy of the database of `incarnation`,
+    /// as control state places it: the copy records another random incarnation, or records none
+    /// though it has seen an epoch, a copy of a database created before forks, while `incarnation`
+    /// is random, so the database was created again under the name since
+    /// ([`check_fence_incarnation`]). The legacy incarnation says nothing either way.
+    #[must_use]
+    pub fn copy_of_another_incarnation(
+        &self,
+        database: &DatabaseName,
+        incarnation: Incarnation,
+    ) -> bool {
+        let record = self.inner.epochs.record(database);
+        match record.incarnation() {
+            Some(recorded) => incarnation != Incarnation::LEGACY && recorded != incarnation,
+            None => unlabelled_copy_of_another(None, record.highest(), incarnation),
+        }
+    }
+
     /// The highest epoch this node has seen for `database`: offered by a stream, a fence, or its
     /// own lease.
     #[must_use]
@@ -1105,7 +1123,8 @@ impl Replication {
     }
 
     /// Whether this node keeps its copy of `database` as an orphan.
-    pub(crate) fn is_orphan(&self, database: &DatabaseName) -> bool {
+    #[must_use]
+    pub fn is_orphan(&self, database: &DatabaseName) -> bool {
         self.inner.lock_orphans().contains_key(database)
     }
 

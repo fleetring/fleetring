@@ -673,22 +673,19 @@ async fn drop_staged(
 
 /// Whether this node's copy of `database` comes from a database that was dropped and created
 /// again under the name: the control plane never issues an epoch below one a replica has seen, so
-/// a placement below the recorded epoch belongs to a new database, and one of another random
-/// incarnation than the copy recorded does too.
+/// a placement below the recorded epoch belongs to a new database, and so does one of a random
+/// incarnation the copy doesn't record, whether the copy records another or none though it has
+/// seen an epoch, as a copy of a database created before forks does (ADR-0046's amendment, item
+/// 13). Such a copy is kept as an orphan rather than ranked, fenced, or followed as the new
+/// database's.
 fn is_past_incarnation(node: &DataNode, database: &DatabaseName, placement: &Placement) -> bool {
     let replication = node.replication();
-    // A copy that records a random incarnation control state no longer holds is an earlier
-    // database's, whatever the epochs; the legacy incarnation says nothing either way.
-    let other = replication
-        .copy_incarnation(database)
-        .is_some_and(|recorded| {
-            placement.incarnation != fleetring_control::Incarnation::LEGACY.get()
-                && recorded.get() != placement.incarnation
-        });
-    other
-        || replication
-            .highest_epoch(database)
-            .is_some_and(|highest| placement.epoch < highest.get())
+    replication.copy_of_another_incarnation(
+        database,
+        fleetring_control::Incarnation::new(placement.incarnation),
+    ) || replication
+        .highest_epoch(database)
+        .is_some_and(|highest| placement.epoch < highest.get())
 }
 
 /// Removes every trace of `database`, whose drop this node saw: the lease this node holds on it,

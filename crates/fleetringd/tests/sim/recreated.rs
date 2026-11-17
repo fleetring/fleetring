@@ -506,6 +506,107 @@ fn recreated_while_a_follower_is_cut_off(seed: u64) -> TestResult {
     Ok(())
 }
 
+/// A copy whose record has seen an epoch but names no incarnation, as one a release before
+/// followers recorded incarnations left, is a copy of a database created before forks. When the
+/// name was dropped while its node was down and created again with a random incarnation, the
+/// node keeps that copy as an orphan at its next start, though the new database's epoch has
+/// reached the copy's, rather than leave it to be ranked and fenced as the new database's
+/// (ADR-0046's amendment, item 13).
+fn unlabelled_copy_after_a_recreation(seed: u64) -> TestResult {
+    let mut builder = Fleet::builder(seed)
+        .control(CONTROL)
+        .replication(settings());
+    for node in NODES {
+        builder = builder.data(node);
+    }
+    let mut fleet = builder.build()?;
+    fleet.await_ring(Duration::from_secs(10))?;
+    make_a_fork(&mut fleet)?;
+    let database = reused()?;
+    let mut first = vec![Operation::Create {
+        database: database.clone(),
+        replication_factor: 3,
+        durability: DurabilityMode::Quorum,
+    }];
+    first.extend((0..5).map(|value| Operation::Write {
+        database: database.clone(),
+        value,
+    }));
+    run_script(&mut fleet, "first", first)?;
+    fleet.await_replicas_converged(LIMIT)?;
+    let primary = leader(&fleet, &database).ok_or("no primary")?;
+    let stale = NODES
+        .into_iter()
+        .find(|node| *node != primary)
+        .ok_or("no follower")?
+        .to_owned();
+
+    // S is down through the drop and the creation again, so it hears of neither.
+    fleet.crash(&stale)?;
+    run_script(
+        &mut fleet,
+        "drop",
+        vec![Operation::Drop {
+            database: database.clone(),
+        }],
+    )?;
+    fleet.run_for(Duration::from_secs(10))?;
+    run_script(
+        &mut fleet,
+        "again",
+        vec![Operation::Create {
+            database: database.clone(),
+            replication_factor: 3,
+            durability: DurabilityMode::Quorum,
+        }],
+    )?;
+    // S's record as a release before followers recorded incarnations wrote it.
+    let record = fleet
+        .data_dir(&stale)
+        .ok_or("no data dir")?
+        .join("replication")
+        .join("epochs")
+        .join("reused")
+        .join("epoch");
+    let mut written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&record)?)?;
+    let epoch = written["highest"].as_u64().ok_or("no epoch")?;
+    written
+        .as_object_mut()
+        .ok_or("not an object")?
+        .remove("incarnation");
+    std::fs::write(&record, written.to_string())?;
+    let reached = fleet
+        .control_state()
+        .and_then(|state| state.database(&database).map(|db| db.epoch().get()))
+        .ok_or("no database")?;
+    if reached < epoch {
+        return Err(format!(
+            "the new database is at epoch {reached}, below the copy's {epoch}, which an orphan \
+             check catches anyway"
+        )
+        .into());
+    }
+    fleet.note(format!(
+        "{stale} restarts with an unlabelled copy at epoch {epoch}; the new database is at {reached}"
+    ));
+    fleet.restart(&stale)?;
+    let name = database.clone();
+    let host = stale.clone();
+    fleet.run_until(LIMIT, "S keeping its copy as an orphan", |fleet| {
+        fleet
+            .replication(&host)
+            .is_some_and(|replication| replication.is_orphan(&name))
+    })?;
+    Ok(())
+}
+
+/// A copy that records no incarnation is kept as an orphan once a database created again under
+/// its name holds a random one, whatever the epochs say.
+#[test]
+fn an_unlabelled_copy_is_an_orphan_once_the_name_has_a_random_incarnation() {
+    seeds::run(BINARY, &seeds::FIXED, unlabelled_copy_after_a_recreation);
+}
+
 /// In a fleet that never forked, every database has the legacy incarnation: the follower's
 /// copy of the dropped database is told apart by its chain hash at its first acknowledgement,
 /// and re-seeded, before it counts toward any write.
