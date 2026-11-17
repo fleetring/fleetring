@@ -434,7 +434,49 @@ impl Streams {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct Counting(std::sync::atomic::AtomicU8);
+
+    impl Entropy for Counting {
+        fn fill(&self, bytes: &mut [u8]) {
+            let next = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bytes.fill(next);
+        }
+    }
+
+    /// A root agent and every agent of its lineage share one per-principal quota, so minting
+    /// children never multiplies the streams a lineage holds; another root still opens its own.
+    #[tokio::test]
+    async fn a_lineage_shares_one_stream_quota() {
+        let streams = Streams::new(StreamsConfig {
+            max_streams_per_principal: NonZeroUsize::new(2).expect("nonzero"),
+            ..StreamsConfig::default()
+        });
+        let entropy = Counting(std::sync::atomic::AtomicU8::new(1));
+        let database: DatabaseName = "agent-42-notes".parse().expect("a name");
+        let root = Caller::verified_for_tests("agent-42", "agent-42", "t-root");
+        let c7 = Caller::verified_for_tests("agent-42.c7", "agent-42", "t-c7");
+        let c8 = Caller::verified_for_tests("agent-42.c8", "agent-42", "t-c8");
+        let other = Caller::verified_for_tests("agent-43.c1", "agent-43", "t-43");
+        let first = streams.create(&root, &database, &entropy).expect("the root's");
+        let second = streams.create(&c7, &database, &entropy).expect("a child's");
+        assert_eq!(
+            streams.create(&c8, &database, &entropy).map(|_| ()),
+            Err(StreamRefusal::PrincipalFull(2)),
+            "a second child counts against the same quota"
+        );
+        let theirs = streams.create(&other, &database, &entropy).expect("another lineage's");
+        // A stream that goes gives the lineage's place back.
+        let id = second.id();
+        drop(second);
+        streams.remove(id);
+        streams.create(&c8, &database, &entropy).expect("a place again");
+        drop((first, theirs));
+    }
 
     #[test]
     fn batons_round_trip_and_reject_garbage() {

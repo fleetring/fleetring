@@ -202,7 +202,8 @@ pub struct StreamsConfig {
     /// How many streams the router holds at once; a request for one more gets `503`.
     pub max_streams: NonZeroUsize,
     /// How many of those streams one principal, a token's own, may hold; a request for one more
-    /// gets `429`.
+    /// gets `429`. A delegated agent's streams count under its lineage's root agent, with the
+    /// root's own.
     pub max_streams_per_principal: NonZeroUsize,
     /// The largest request body, in bytes; a larger one gets `413`.
     pub max_request_bytes: NonZeroUsize,
