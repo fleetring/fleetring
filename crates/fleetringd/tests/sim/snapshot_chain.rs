@@ -77,6 +77,26 @@ fn follows(fleet: &Fleet, primary: &str, follower: &str) -> bool {
     })
 }
 
+/// Whether `follower` has an open stream from `primary` and holds everything `primary` committed,
+/// whether or not its position counts yet: a follower whose chain is derived, as one that
+/// truncated back to the epoch's start can be, proves nothing at its first acknowledgement, and
+/// counts once it acknowledges a write (ADR-0046's amendment, item 11; FR-111).
+fn caught_up(fleet: &Fleet, primary: &str, follower: &str) -> bool {
+    database().ok().is_some_and(|database| {
+        fleet
+            .replication(primary)
+            .and_then(|replication| replication.primary_status(&database))
+            .is_some_and(|status| {
+                status.followers.iter().any(|progress| {
+                    progress.node.as_str() == follower
+                        && progress.connected
+                        && !progress.needs_snapshot
+                        && progress.acknowledged == status.committed
+                })
+            })
+    })
+}
+
 fn scenario(seed: u64) -> TestResult {
     let mut builder = Fleet::builder(seed).control(CONTROL);
     for node in NODES {
@@ -157,7 +177,7 @@ fn scenario(seed: u64) -> TestResult {
         fleet.repair(&seeded, other)?;
     }
     fleet.run_until(LIMIT, "X following the new primary", |fleet| {
-        follows(fleet, &promoted, &seeded)
+        caught_up(fleet, &promoted, &seeded)
     })?;
     fleet.run_for(Duration::from_secs(1))?;
     let rows = fleet.replica_rows(&database)?;
@@ -182,6 +202,15 @@ fn scenario(seed: u64) -> TestResult {
     }
     fleet.restart(&primary)?;
     fleet.await_ring(LIMIT)?;
+    // A write the new primary ships every follower proves their copies, whatever their chains.
+    fleet.client(
+        "after",
+        Script::new([Operation::Write {
+            database: database.clone(),
+            value: WRITES,
+        }]),
+    );
+    fleet.await_workloads(LIMIT)?;
     fleet.await_replicas_converged(LIMIT)?;
     fleet.finish()?;
     Ok(())
