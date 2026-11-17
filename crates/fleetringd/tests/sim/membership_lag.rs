@@ -162,6 +162,13 @@ pub(crate) fn scenario(seed: u64) -> TestResult {
         Some(Outcome::Acknowledged(Ack::Written { .. }))
     );
     fleet.note(format!("the probe write: {:?}", answers.first()));
+    if !acknowledged {
+        return Err(format!(
+            "the probe write wasn't acknowledged ({:?}), so #157's window wasn't exercised",
+            answers.first()
+        )
+        .into());
+    }
     fleet.crash(&primary)?;
     fleet.repair(&primary, &a)?;
     let promoted = database.clone();
