@@ -94,9 +94,11 @@ fn install_this_build(bin: &Path) -> TestResult {
 fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestResult {
     let scratch = tempfile::tempdir()?;
     let Some(baseline) = baseline(scratch.path())? else {
-        return Err("no baseline: set FLEETRINGD_BASELINE_VERSION (a release, such as 0.7.0) or \
+        return Err(
+            "no baseline: set FLEETRINGD_BASELINE_VERSION (a release, such as 0.7.0) or \
                     FLEETRINGD_BASELINE_BIN (a binary) to run the rolling upgrade"
-            .into());
+                .into(),
+        );
     };
     // `node undrain` is the first fleet feature (0.4.0): a baseline before it makes the fleet
     // refuse the command until every member is upgraded.

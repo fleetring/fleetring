@@ -486,12 +486,17 @@ async fn a_stream_is_kept_only_once_a_node_accepts_its_token() -> TestResult {
         .post("/db/notes/v3/pipeline", Some(&token), &empty)
         .await?;
     assert_eq!(kept.status, StatusCode::OK, "{}", kept.text);
-    let baton = kept.baton().ok_or("a node accepted the token, so a baton")?;
+    let baton = kept
+        .baton()
+        .ok_or("a node accepted the token, so a baton")?;
     let next = fleet
         .post(
             "/db/notes/v3/pipeline",
             Some(&token),
-            &pipeline(Some(&baton), json!([execute("SELECT 1", json!([])), close()])),
+            &pipeline(
+                Some(&baton),
+                json!([execute("SELECT 1", json!([])), close()]),
+            ),
         )
         .await?;
     assert_eq!(next.result(0)["type"], "ok", "{}", next.text);
