@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use fleetring::ReplicationFactor;
 use fleetring_control::{DatabaseName, Member, membership_ring};
+use fleetringd::DatabaseStatuses as _;
 use fleetringd::sim::{Fleet, Traffic, seeds};
 
 use crate::{BINARY, TestResult};
@@ -144,6 +145,18 @@ fn scenario(seed: u64) -> TestResult {
     let name = database.clone();
     fleet.run_until(LIMIT, "a kept replica set", |fleet| keeps(fleet, &name))?;
     fleet.run_for(FAILING)?;
+    let reported = fleet
+        .replication(&promoted)
+        .ok_or("the promoted primary isn't running")?
+        .statuses()
+        .into_iter()
+        .find(|status| status.database == database.as_str());
+    if let Some(status) = reported {
+        return Err(format!(
+            "{promoted} reported {database} while it couldn't read where its log ends: {status:?}"
+        )
+        .into());
+    }
     let reseeded = reseeds(&fleet, &promoted)?;
     let released = !keeps(&fleet, &database);
     if reseeded > 0 || released {

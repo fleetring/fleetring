@@ -378,7 +378,8 @@ pub enum ServePrimaryError {
 pub struct PrimaryStatus {
     /// The epoch the primary serves.
     pub epoch: LeaseEpoch,
-    /// The end of the last committed batch the primary knows of.
+    /// The end of the last committed batch the primary knows of: `None` for an empty log, and
+    /// while the primary hasn't learned where its log ends, as just after it started serving.
     pub committed: Option<Position>,
     /// Where the primary last checkpointed, if it has since it started serving.
     pub checkpointed: Option<Position>,
@@ -1184,6 +1185,12 @@ impl DatabaseStatuses for Replication {
         }
         for (name, served) in self.inner.lock_primaries().iter() {
             let primary = &served.primary;
+            // A primary that hasn't learned where its log ends reports nothing yet, rather than
+            // a position that would read as an empty log, nor what its copy said as a follower.
+            if !primary.end_known() {
+                statuses.remove(name);
+                continue;
+            }
             statuses.insert(
                 name.clone(),
                 DatabaseStatus {
