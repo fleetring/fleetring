@@ -10,11 +10,12 @@
 //! Once every node runs this build, nothing is enabled: one node rolls back to the previous
 //! release, which the fleet allows, and while it runs there `db fork` is refused naming it,
 //! `agent delegate` is refused, and `agent renew` keeps the defaults a node of the previous
-//! release accepts and says why. The node then upgrades again. The first `db fork` enables `fork`
-//! and ends rollback; a database created after it carries an incarnation, and those before keep
-//! 0. `agent renew` then gives the agent this release's defaults, and the first `agent delegate`
-//! enables `delegation`. The previous release's token still works, `agent remove` revokes the
-//! child as its ancestor, and the fork is independent of its source.
+//! release accepts and says why. The node then upgrades again. `agent renew` then gives the agent
+//! this release's defaults, and the first `agent delegate` enables `delegation`, which alone ends
+//! rollback. The first `db fork` then enables `fork`, which rollback names from then on; a
+//! database created after it carries an incarnation, and those before keep 0. The previous
+//! release's token still works, `agent remove` revokes the child as its ancestor, and the fork is
+//! independent of its source.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -237,8 +238,10 @@ impl Features {
             "{databases:?}"
         );
 
-        self.first_fork(fleet, client).await?;
+        // Delegation first, so that its refusal of rollback is its own: once `fork` is enabled,
+        // rollback names `fork`, the first of the two the previous release lacks.
         self.first_delegation(fleet, client).await?;
+        self.first_fork(fleet, client).await?;
         self.afterwards(client).await
     }
 
@@ -326,11 +329,11 @@ impl Features {
         Ok(())
     }
 
-    /// The first `db fork` enables `fork`, and rollback is refused from then on.
+    /// The first `db fork` enables `fork`, beside `delegation`, and rollback names it.
     async fn first_fork(&self, fleet: &ProcessFleet, client: &Client) -> TestResult {
         let forked = self.run(&["db", "fork", MEMORY, FORK])?;
         assert!(forked.status.success(), "{}", printed(&forked));
-        assert_eq!(enabled(client).await?, [Feature::Fork]);
+        assert_eq!(enabled(client).await?, [Feature::Fork, Feature::Delegation]);
         self.rollback_refused(fleet, "fork")?;
         // Never written, so the reinstall that ends the rolling upgrade has nothing to catch up
         // on in it, and mustn't wait for it.
@@ -359,11 +362,12 @@ impl Features {
             printed(&renewed)
         );
         assert_eq!(self.claims(AGENT)?["fleetring.kind"], "agent");
-        assert_eq!(enabled(client).await?, [Feature::Fork]);
+        self.nothing_enabled(client).await?;
         let delegated = self.run(&["agent", "delegate", "42.c7"])?;
         assert!(delegated.status.success(), "{}", printed(&delegated));
-        assert_eq!(enabled(client).await?, [Feature::Fork, Feature::Delegation]);
-        self.rollback_refused(fleet, "")?;
+        assert_eq!(enabled(client).await?, [Feature::Delegation]);
+        // `delegation` alone refuses rollback: nothing else is enabled yet.
+        self.rollback_refused(fleet, "delegation")?;
         progress("the first delegation enabled delegation");
         Ok(())
     }
@@ -422,8 +426,8 @@ impl Features {
         Ok(())
     }
 
-    /// `upgrade --rollback` on [`ROLLED_BACK`] is refused, naming a feature (`feature`, if not
-    /// empty), and leaves its binary as it was.
+    /// `upgrade --rollback` on [`ROLLED_BACK`] is refused, naming `feature`, and leaves its
+    /// binary as it was.
     fn rollback_refused(&self, fleet: &ProcessFleet, feature: &str) -> TestResult {
         let node = &fleet.nodes[ROLLED_BACK];
         let running = fs::read(&node.bin)?;
@@ -434,8 +438,7 @@ impl Features {
             .output()?;
         assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
         assert!(
-            stderr(&refused).contains(&format!("lacks the fleet feature '{feature}"))
-                || (feature.is_empty() && stderr(&refused).contains("lacks the fleet feature")),
+            stderr(&refused).contains(&format!("lacks the fleet feature '{feature}'")),
             "{}",
             printed(&refused)
         );
