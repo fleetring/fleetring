@@ -608,7 +608,7 @@ impl Replication {
     /// as control state places it: the copy records another random incarnation, or records none
     /// though it has seen an epoch, a copy of a database created before forks, while `incarnation`
     /// is random, so the database was created again under the name since
-    /// ([`check_fence_incarnation`]). The legacy incarnation says nothing either way.
+    /// (ADR-0046's amendment, item 13). The legacy incarnation says nothing either way.
     #[must_use]
     pub fn copy_of_another_incarnation(
         &self,
