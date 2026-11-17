@@ -739,7 +739,9 @@ impl Primary {
                 }
             };
             // A follower that makes progress isn't lagging, however far behind a busy log it is.
-            if !progress.reported || position > progress.acked {
+            // One whose position doesn't count makes none, however often it reconnects, so it
+            // goes on aging toward the lag limit, past which it no longer holds checkpoints back.
+            if counts && (!progress.reported || position > progress.acked) {
                 progress.behind_since = None;
             }
             progress.acked = position;
@@ -2220,6 +2222,30 @@ mod tests {
         primary.acknowledged_unproven(&node("b"), Some(at(0x10)), 0);
         assert_eq!(primary.acknowledged_by(&followers, &at(0x10)), 0);
         assert_eq!(primary.quorum_held(&quorum), None);
+    }
+
+    /// A follower whose first acknowledgement never proves anything keeps aging toward the lag
+    /// limit however often it reconnects, so it doesn't hold checkpoints back for good; one that
+    /// acknowledges a shipped batch has made progress (FR-106).
+    #[test]
+    fn an_unproven_reconnect_is_no_progress() {
+        let primary = primary_of_three();
+        let since = Timestamp::from_millis(1_000);
+        primary.retain_followers(&[node("b"), node("c")], since);
+        let behind = |primary: &Primary| {
+            primary
+                .lock()
+                .followers
+                .get(&node("b"))
+                .and_then(|progress| progress.behind_since)
+        };
+        for _ in 0..3 {
+            primary.acknowledged_unproven(&node("b"), Some(at(0x10)), 0);
+            primary.disconnected(&node("b"));
+            assert_eq!(behind(&primary), Some(since), "a reconnect isn't progress");
+        }
+        primary.acknowledged(&node("b"), Some(at(0x10)), 0);
+        assert_eq!(behind(&primary), None, "a counted position is");
     }
 
     /// A database that has taken no write holds its whole log on a write quorum once enough
