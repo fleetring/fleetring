@@ -439,10 +439,14 @@ impl Replication for ReplicationService {
                 inner.engine.kind()
             )));
         }
-        if let Some(caller) = &caller {
-            binding::check_stream(inner, &name, open.epoch, caller).await?;
-        }
+        let named = open.incarnation.map(fleetring_control::Incarnation::new);
+        let confirmed = match &caller {
+            Some(caller) => binding::check_stream(inner, &name, open.epoch, named, caller).await?,
+            None => None,
+        };
+        failover::check_incarnation(inner, &name, named)?;
         failover::admit_stream(inner, &name, open.epoch, primary.as_ref()).await?;
+        failover::record_followed(inner, &name, named.or(confirmed)).await?;
         if inner.primary(&name).is_some() || inner.registry().is_open(&name) {
             return Err(Status::failed_precondition(format!(
                 "{name} is open as a primary on this node"
@@ -667,8 +671,12 @@ impl Follow {
                 if let Some(anchor) = self.adopt_epoch_start(&mut chain, position.as_ref()) {
                     record_anchor(inner, &self.name, anchor).await;
                 }
+                // The primary counts the position only once this hash matches its own there.
+                let proof = (!chain.is_derived())
+                    .then(|| chain.hash_at(position.as_ref()))
+                    .flatten();
                 self.slot.set_chain(Some(chain));
-                (Some(follower), ack(position.as_ref()))
+                (Some(follower), first_ack(position.as_ref(), proof))
             }
             // The copy stays closed until the primary answers with `Reseed`.
             Reconciled::NeedsSnapshot => {
@@ -1013,6 +1021,17 @@ fn ack(position: Option<&Position>) -> ReplicateAck {
     ReplicateAck {
         position: position.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
         needs_snapshot: false,
+        chain: None,
+    }
+}
+
+/// The first acknowledgement on a stream: the copy holds the log up to `position`, where its
+/// chain's hash is `proof` unless the chain is derived. The primary counts the position toward
+/// writes only once the hash matches its own there.
+fn first_ack(position: Option<&Position>, proof: Option<ChainHash>) -> ReplicateAck {
+    ReplicateAck {
+        chain: proof.map(|hash| hash.as_bytes().to_vec()),
+        ..ack(position)
     }
 }
 

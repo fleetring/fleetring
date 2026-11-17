@@ -560,14 +560,17 @@ async fn keep_orphan(node: &DataNode, database: &DatabaseName, why: &'static str
 /// otherwise, the copy's highest epoch is exactly the notice's, the one the database was dropped
 /// at. A database created again under the name restarts its epochs, so the epoch alone doesn't
 /// tell a late notice for the dropped database from one for the copy's. A notice or a copy
-/// without an incarnation, from a release before them or a copy this node only followed, is
-/// judged by the epoch alone, and a replica that missed a promotion keeps its copy as an orphan.
-/// The copy is deleted
-/// only while control state still agrees, too: it holds no database of the name, or one at a
-/// lower epoch, and never the database a notice's random incarnation names, whatever the epoch
-/// (a notice naming the live database at a later epoch is forged or wrong). All of this is judged again here, under the name's lock, since a database of the
-/// name may have been created and leased since the notice arrived. A control plane that can't
-/// be reached leaves the copy, which becomes an orphan the usual way.
+/// without an incarnation, from a release before them, is judged by the epoch alone, and such a
+/// replica that missed a promotion keeps its copy as an orphan.
+/// The copy is deleted only while control state still agrees, too: it never holds the database
+/// a notice's random incarnation names, whatever the epoch (a notice naming the live database
+/// at a later epoch is forged or wrong); and it holds no database of the name, or one at a
+/// lower epoch, or, when the copy records the notice's random incarnation, one of another
+/// incarnation at any epoch, since a database created again under the name restarts its epochs
+/// and may have reached the copy's by the time the notice is judged. All of this is judged
+/// again here, under the name's lock, since a database of the name may have been created and
+/// leased since the notice arrived. A control plane that can't be reached leaves the copy,
+/// which becomes an orphan the usual way.
 async fn drop_seen(
     node: &DataNode,
     database: &DatabaseName,
@@ -594,11 +597,17 @@ async fn drop_seen(
     let random = notice
         .incarnation
         .filter(|named| *named != fleetring_control::Incarnation::LEGACY);
+    // The copy records the random incarnation the notice names, so it is the dropped database's:
+    // a database of another incarnation in control state is one created again under the name,
+    // whatever epoch it has reached.
+    let names_recorded =
+        random.is_some_and(|named| replication.copy_incarnation(database) == Some(named));
     match node.locate(database).await {
         Ok(placement) if random.is_some_and(|named| named.get() == placement.incarnation) => {
             tracing::info!(database = %database, epoch = epoch.get(), "the control plane still holds the database the drop notice names; kept the copy");
             return;
         }
+        Ok(_) if names_recorded => {}
         Ok(placement) if placement.epoch < epoch.get() => {}
         Err(status) if missing_database(&status).is_some() => {}
         Ok(_) => {

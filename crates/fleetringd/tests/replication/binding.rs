@@ -365,6 +365,17 @@ impl Bound {
     /// Opens a `Replicate` stream from `from` to `to` for `orders` at `epoch`; `Ok` if `to`
     /// accepted it.
     async fn replicate(&self, from: &str, to: &str, epoch: u64) -> Result<(), Status> {
+        self.replicate_naming(from, to, epoch, None).await
+    }
+
+    /// As [`replicate`](Self::replicate), naming `incarnation` as the database's.
+    async fn replicate_naming(
+        &self,
+        from: &str,
+        to: &str,
+        epoch: u64,
+        incarnation: Option<u64>,
+    ) -> Result<(), Status> {
         let mut client = self
             .client(from, to)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -376,6 +387,7 @@ impl Bound {
                     epoch,
                     epoch_start: None,
                     epoch_start_chain: None,
+                    incarnation,
                 })),
             })
             .await
@@ -460,6 +472,38 @@ async fn a_stream_from_a_node_that_does_not_hold_the_epoch_is_refused() -> TestR
     // `a`'s stream to `b` goes on.
     bound.write(1).await?;
     bound.await_caught_up(&["b", "c"]).await?;
+    Ok(())
+}
+
+/// A follower records the incarnation of the copy it follows, as control state named it when
+/// the first stream came, and refuses a stream for another incarnation even from the epoch's
+/// recorded holder: a database created again under the name starts its epochs over on the
+/// same primary, and the copy is the dropped one's (FR-106). The copy stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_naming_another_incarnation_than_the_copy_is_refused() -> TestResult {
+    let bound = Bound::start().await?;
+    for follower in ["b", "c"] {
+        assert_eq!(
+            bound.replication(follower).copy_incarnation(&bound.db),
+            Some(Incarnation::new(7)),
+            "{follower} records the incarnation of the copy it follows"
+        );
+    }
+    let refused = bound
+        .replicate_naming("a", "b", 1, Some(8))
+        .await
+        .err()
+        .ok_or("a stream for another incarnation was accepted")?;
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(refused.message().contains("orphan"), "{refused}");
+    assert_eq!(bound.refusals("b"), 0, "stale, not misbound");
+    assert_eq!(bound.highest_epoch("b"), Some(1));
+    assert_eq!(
+        bound.replication("b").copy_incarnation(&bound.db),
+        Some(Incarnation::new(7)),
+        "the copy is kept as it was"
+    );
+    bound.replicate_naming("a", "c", 1, Some(7)).await?;
     Ok(())
 }
 

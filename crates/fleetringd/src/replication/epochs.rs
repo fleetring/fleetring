@@ -37,9 +37,10 @@ pub(super) struct Record {
     /// The epoch this node was promoted to lead, and the position its log had then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     led: Option<Led>,
-    /// The incarnation of the database this copy belongs to (ADR-0046, point 1.3), once this
-    /// node led it: the first placement it served under names it. Absent from records written
-    /// before incarnations, and before the node first led the database.
+    /// The incarnation of the database this copy belongs to (ADR-0046, point 1.3): the first
+    /// placement this node served it under, its first admitted stream or fence, or the fork
+    /// whose staged copy it installed names it. Absent from records written before
+    /// incarnations, and from a copy followed only by a release before followers recorded them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     incarnation: Option<u64>,
 }

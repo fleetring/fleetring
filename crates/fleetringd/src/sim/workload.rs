@@ -187,6 +187,15 @@ pub enum Operation {
         /// quorum.
         durability: DurabilityMode,
     },
+    /// Creates a SQLite database through the data plane, as `fleetringd db create` does, and
+    /// writes nothing to it, not even its [`WRITES_TABLE`]: its log stays empty until something
+    /// writes to it. A database that already exists counts as created.
+    CreateEmpty {
+        /// The database.
+        database: DatabaseName,
+        /// How many replicas it should have.
+        replication_factor: u32,
+    },
     /// Creates a SQLite database through the data plane with an expiry, as `db create
     /// --expires-in` does: it expires `expires_in` after the control node takes the creation
     /// (ADR-0041, point 4). An expiring database may be gone by the end of a run, so the check
@@ -320,6 +329,7 @@ impl Operation {
     pub fn database(&self) -> Option<&DatabaseName> {
         match self {
             Self::Create { database, .. }
+            | Self::CreateEmpty { database, .. }
             | Self::CreateExpiring { database, .. }
             | Self::Write { database, .. }
             | Self::Read { database, .. }
@@ -435,6 +445,10 @@ impl fmt::Display for Operation {
                 f,
                 "open {database} rf {replication_factor} acks {durability}"
             ),
+            Self::CreateEmpty {
+                database,
+                replication_factor,
+            } => write!(f, "open {database} rf {replication_factor}, empty"),
             Self::CreateExpiring {
                 database,
                 replication_factor,

@@ -20,6 +20,7 @@ fn open(database: &str, epoch: u64) -> ReplicateMessage {
             epoch,
             epoch_start: None,
             epoch_start_chain: None,
+            incarnation: None,
         })),
     }
 }

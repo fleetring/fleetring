@@ -517,6 +517,10 @@ async fn execute(
             replication_factor,
             durability,
         } => create(data, database, *replication_factor, *durability).await,
+        Operation::CreateEmpty {
+            database,
+            replication_factor,
+        } => create_empty(data, database, *replication_factor).await,
         Operation::CreateExpiring {
             database,
             replication_factor,
@@ -581,6 +585,34 @@ async fn create(
             )),
         )
         .await?;
+    Ok(Ack::Opened {
+        primary,
+        epoch: location.epoch,
+        durability: DurabilityMode::from(location.durability.acks()),
+    })
+}
+
+/// Creates `database` and opens it on its primary, writing nothing to it.
+async fn create_empty(
+    client: &Client,
+    database: &DatabaseName,
+    replication_factor: u32,
+) -> Result<Ack, tonic::Status> {
+    let replication_factor = u8::try_from(replication_factor)
+        .ok()
+        .and_then(ReplicationFactor::new)
+        .ok_or_else(|| tonic::Status::invalid_argument("invalid replication factor"))?;
+    let spec = DatabaseSpec::new(replication_factor);
+    let location = match client.create_database_with(database, spec).await {
+        Ok(location) => location,
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            client.locate(database).await?
+        }
+        Err(status) => return Err(status),
+    };
+    let primary = location
+        .primary
+        .ok_or_else(|| tonic::Status::internal("created without a primary"))?;
     Ok(Ack::Opened {
         primary,
         epoch: location.epoch,
@@ -809,6 +841,7 @@ async fn impostor(network: &Network, operation: &Operation) -> Ack {
                     epoch: epoch.get(),
                     epoch_start: None,
                     epoch_start_chain: None,
+                    incarnation: None,
                 })),
             };
             // No metadata names the sender: the certificate does.

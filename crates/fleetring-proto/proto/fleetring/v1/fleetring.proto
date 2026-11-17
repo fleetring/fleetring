@@ -1046,6 +1046,12 @@ message ReplicateOpen {
   // agrees with the primary's before the next batch. Unset with `epoch_start`, when the
   // primary's chain doesn't hold it, or by a primary that predates the field.
   optional bytes epoch_start_chain = 4;
+  // The incarnation of the database the stream is for (ADR-0046, point 1). A follower whose
+  // copy records another incarnation refuses the stream and keeps the copy as an orphan: the
+  // copy is a dropped database's of the name, never followed as this one's. Unset for the legacy
+  // incarnation, 0, and by a primary that predates the field; a follower whose copy records a
+  // random incarnation then asks control state instead.
+  optional uint64 incarnation = 5;
 }
 
 // One or more committed transactions, as the engine encodes them.
@@ -1078,6 +1084,13 @@ message ReplicateAck {
   // primary's frames don't continue it. The position isn't on the primary's log. The primary
   // answers with `Reseed`, and the follower takes no frames until it has.
   bool needs_snapshot = 2;
+  // The follower's hash chain at `position` (FR-044), as opaque bytes, on the first
+  // acknowledgement of a stream: the primary counts that position toward a write only once the
+  // hash matches its own chain's there, and re-seeds a copy whose hash differs, or whose
+  // position is past its log's end. Unset when the follower's chain is derived and so proves
+  // nothing, and by a follower that predates the field; such a follower counts once it has
+  // acknowledged a batch the stream shipped it.
+  optional bytes chain = 3;
 }
 
 message FenceRequest {
