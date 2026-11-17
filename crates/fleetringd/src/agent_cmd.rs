@@ -1213,7 +1213,7 @@ async fn renew_delegated(
     // below is done, so a crash before it leaves the next run to revoke that token.
     let (renewed, pending) = dir.finish_renewal(pending, delegation)?;
 
-    if old.id == renewed.token_id {
+    let attempt = if old.id == renewed.token_id {
         // The control plane answered with the delegation the token file already holds: an
         // earlier run wrote it, and the token it replaced was revoked then, or is named in
         // `replaces` no longer. Revoking it would end the token just renewed.
@@ -1221,10 +1221,16 @@ async fn renew_delegated(
             "token {} is the renewed one, written by an earlier run; not revoking it",
             old.id
         ));
+        RevocationAttempt::Settled
     } else {
-        revoke_renewed(&client, &old, &situation, &id).await;
+        revoke_renewed(&client, &old, &situation, &id).await
+    };
+    match attempt {
+        RevocationAttempt::Settled => dir.complete_renewal(pending)?,
+        // The operation and the token it replaced stay, so the next run resends the operation,
+        // gets the same delegation back, and tries the revocation again.
+        RevocationAttempt::Unreachable => drop(pending),
     }
-    dir.complete_renewal(pending)?;
     let capped = if capped {
         " (capped at the parent's expiry)"
     } else {
@@ -1238,9 +1244,25 @@ async fn renew_delegated(
     ))
 }
 
+/// Whether a renewal's revocation of the token it replaced is settled, done or refused, or is to
+/// be tried again because the control plane couldn't be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevocationAttempt {
+    /// Revoked, or refused for good: the renewal is over.
+    Settled,
+    /// The control plane didn't answer: the next run of the renewal tries again.
+    Unreachable,
+}
+
 /// Revokes `old`, the delegated agent `id`'s token a renewal replaced, as its parent through
-/// `client`, and says what that ended below it; warns rather than fails if it can't.
-async fn revoke_renewed(client: &Client, old: &OldToken, situation: &Situation, id: &DelegatedId) {
+/// `client`, and says what that ended below it; warns rather than fails if it can't, and says
+/// whether the control plane answered.
+async fn revoke_renewed(
+    client: &Client,
+    old: &OldToken,
+    situation: &Situation,
+    id: &DelegatedId,
+) -> RevocationAttempt {
     match revoke(client, old, Presenting::Another).await {
         Ok(revocation) => {
             note(revocation.describe(old));
@@ -1251,13 +1273,38 @@ async fn revoke_renewed(client: &Client, old: &OldToken, situation: &Situation, 
             ) {
                 note(ended);
             }
+            RevocationAttempt::Settled
         }
-        Err(unanswered) => note(format!(
-            "warning: couldn't revoke the old token {} ({}); it stays valid until {}",
-            old.id,
-            revoke::describe(&unanswered),
-            format_time(old.until.as_millis())
-        )),
+        Err(unanswered) if unreached(&unanswered) => {
+            note(format!(
+                "warning: couldn't reach the control plane to revoke the old token {} ({}); it \
+                 stays valid until {} unless `fleetring agent renew {id}` is run again, which \
+                 revokes it",
+                old.id,
+                revoke::describe(&unanswered),
+                format_time(old.until.as_millis())
+            ));
+            RevocationAttempt::Unreachable
+        }
+        Err(unanswered) => {
+            note(format!(
+                "warning: couldn't revoke the old token {} ({}); it stays valid until {}",
+                old.id,
+                revoke::describe(&unanswered),
+                format_time(old.until.as_millis())
+            ));
+            RevocationAttempt::Settled
+        }
+    }
+}
+
+/// Whether `unanswered` means the control plane couldn't be reached, rather than that it refused.
+fn unreached(unanswered: &Unanswered) -> bool {
+    match unanswered {
+        Unanswered::Lost { .. } => true,
+        Unanswered::Refused(status) => {
+            matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
+        }
     }
 }
 
@@ -2095,6 +2142,26 @@ mod tests {
             &expired,
             now
         ));
+    }
+
+    /// A renewal keeps its operation for the next run only when the control plane couldn't be
+    /// reached to revoke the replaced token; a refusal settles it.
+    #[test]
+    fn only_an_unreached_control_plane_keeps_a_renewal_open() {
+        let lost = Unanswered::Lost {
+            sends: 3,
+            last: tonic::Status::unavailable("down"),
+        };
+        assert!(unreached(&lost));
+        assert!(unreached(&Unanswered::Refused(
+            tonic::Status::deadline_exceeded("slow")
+        )));
+        assert!(!unreached(&Unanswered::Refused(
+            tonic::Status::permission_denied("no")
+        )));
+        assert!(!unreached(&Unanswered::Refused(
+            tonic::Status::unauthenticated("the token has expired")
+        )));
     }
 
     fn invocation() -> Invocation {
