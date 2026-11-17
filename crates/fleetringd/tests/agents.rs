@@ -2726,7 +2726,9 @@ async fn a_running_child_server_uses_the_token_its_parent_renews() -> TestResult
 // `agent renew <child>` run again after a crash that wrote the new token, before the record and
 // the operation file, resends the same operation and gets the same delegation back. It revokes
 // the token the first run replaced, never the one it wrote, whether the first run kept the
-// replaced token beside the operation ID or, as before this release, didn't.
+// replaced token beside the operation ID or, as before this release, didn't. So does a run after
+// a crash that wrote the record too, before the replaced token was revoked: the operation ID and
+// the replaced token stay beside the record until then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_child_renewal_run_again_after_a_crash_keeps_the_token_it_wrote() -> TestResult {
     let machine = Machine::new()?;
@@ -2735,7 +2737,7 @@ async fn a_child_renewal_run_again_after_a_crash_keeps_the_token_it_wrote() -> T
     assert!(output.status.success(), "{}", printed(&output));
     let certificate = copy_certificate(&machine, "42")?;
     let dir = machine.agent_dir("42.c7");
-    for kept in [true, false] {
+    for (kept, recorded) in [(true, false), (false, false), (true, true)] {
         let old = machine.token("42.c7")?;
         let old_record = fs::read_to_string(dir.join("identity.toml"))?;
         machine.ok(&["agent", "renew", "42.c7"])?;
@@ -2746,9 +2748,11 @@ async fn a_child_renewal_run_again_after_a_crash_keeps_the_token_it_wrote() -> T
             .as_str()
             .ok_or("no operation")?
             .to_owned();
-        // The crash, as the first run left it: the new token, the old record, the operation ID,
-        // and the token it replaced beside it.
-        fs::write(dir.join("identity.toml"), &old_record)?;
+        // The crash, as the first run left it: the new token, the old record unless it wrote the
+        // new one, the operation ID, and the token it replaced beside it.
+        if !recorded {
+            fs::write(dir.join("identity.toml"), &old_record)?;
+        }
         fs::write(dir.join("operation"), format!("{operation}\n"))?;
         if kept {
             let expires = claims(&old)?["exp"].as_u64().ok_or("no exp")? * 1_000;
@@ -2772,7 +2776,7 @@ async fn a_child_renewal_run_again_after_a_crash_keeps_the_token_it_wrote() -> T
         let listed = list_with_token(&machine, certificate.path(), &new)?;
         assert!(
             listed.status.success(),
-            "kept={kept}: the renewed token still works: {}",
+            "kept={kept}, recorded={recorded}: the renewed token still works: {}",
             printed(&listed)
         );
         wait_until_revoked(&machine, certificate.path(), &old)?;

@@ -1776,6 +1776,49 @@ impl DelegatedDir {
         pending: Pending,
         delegation: Delegation,
     ) -> Result<AgentRecord, AgentError> {
+        let record = self.write_delegation(&pending, delegation)?;
+        self.forget_operation()?;
+        drop(pending);
+        Ok(record)
+    }
+
+    /// Writes what the control plane answered a renewal's `pending` request with, as
+    /// [`finish`](Self::finish) does, but keeps the operation ID and the token it replaces, and
+    /// the lock, until [`complete_renewal`](Self::complete_renewal): a crash before the replaced
+    /// token is revoked leaves a run after it to resend the operation, get the same delegation
+    /// back, and revoke the token the first run replaced.
+    ///
+    /// # Errors
+    ///
+    /// As [`finish`](Self::finish).
+    pub(crate) fn finish_renewal(
+        &self,
+        pending: Pending,
+        delegation: Delegation,
+    ) -> Result<(AgentRecord, Pending), AgentError> {
+        let record = self.write_delegation(&pending, delegation)?;
+        Ok((record, pending))
+    }
+
+    /// Ends a renewal [`finish_renewal`](Self::finish_renewal) wrote, once the token it replaced
+    /// was revoked, or its revocation tried: removes the operation ID and the replaced token
+    /// kept beside it, under the lock.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::File`] if either can't be removed.
+    pub(crate) fn complete_renewal(&self, pending: Pending) -> Result<(), AgentError> {
+        self.forget_operation()?;
+        drop(pending);
+        Ok(())
+    }
+
+    /// Writes the token, then the record, of `delegation`, which answered `pending`'s request.
+    fn write_delegation(
+        &self,
+        pending: &Pending,
+        delegation: Delegation,
+    ) -> Result<AgentRecord, AgentError> {
         let want = self.id.name().as_str();
         if delegation.principal != want {
             return Err(AgentError::WrongChild {
@@ -1809,8 +1852,6 @@ impl DelegatedDir {
             lifetime_ms: delegation.lifetime_ms,
         };
         write_record(&self.dir, &self.record_file(), self.id.as_str(), &record)?;
-        self.forget_operation()?;
-        drop(pending);
         Ok(record)
     }
 
@@ -3198,7 +3239,7 @@ mod tests {
             (second, OperationFrom::Earlier)
         );
         assert_eq!(again.replaces(), Some(&replaced));
-        let renewed = dir.finish(
+        let (renewed, written) = dir.finish_renewal(
             again,
             Delegation {
                 delegation_id: "Ab3v0b8yTfKx1nH2aLmQwA".to_owned(),
@@ -3208,6 +3249,14 @@ mod tests {
         assert_eq!(renewed.token_id, "Ab3v0b8yTfKx1nH2aLmQwA");
         assert_eq!(renewed.operation, Some(second.to_string()));
         assert_ne!(renewed.operation, record.operation);
+        // Until the replaced token is revoked, a crash leaves the operation and the token it
+        // replaced for the next run, which revokes that token.
+        assert!(dir.operation_file().exists());
+        assert_eq!(
+            read_replaces(&dir.dir().join(REPLACES_FILE)),
+            Some(replaced)
+        );
+        dir.complete_renewal(written)?;
         assert!(!dir.operation_file().exists());
         assert!(!dir.dir().join(REPLACES_FILE).exists());
         Ok(())
