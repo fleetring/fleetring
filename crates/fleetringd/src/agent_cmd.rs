@@ -1209,7 +1209,9 @@ async fn renew_delegated(
         lifetime_ms: request.lifetime_ms,
         parent: parent_record,
     };
-    let renewed = dir.finish(pending, delegation)?;
+    // The operation ID and the token it replaced stay beside the record until the revocation
+    // below is done, so a crash before it leaves the next run to revoke that token.
+    let (renewed, pending) = dir.finish_renewal(pending, delegation)?;
 
     if old.id == renewed.token_id {
         // The control plane answered with the delegation the token file already holds: an
@@ -1222,6 +1224,7 @@ async fn renew_delegated(
     } else {
         revoke_renewed(&client, &old, &situation, &id).await;
     }
+    dir.complete_renewal(pending)?;
     let capped = if capped {
         " (capped at the parent's expiry)"
     } else {
