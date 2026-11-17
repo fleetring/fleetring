@@ -172,6 +172,19 @@ pub enum IssuerFileProblem {
     /// The key isn't the certificate's.
     #[error("the key doesn't match the certificate")]
     Mismatch,
+    /// The key file grants its group or other users some permission: a copy or a `chmod`
+    /// loosened it, and the key signs delegated tokens. Refused, as S3 credentials and webhook
+    /// secrets are.
+    #[error(
+        "{path} is readable by other users (mode {mode:o}); the delegation issuer key must be \
+         private to its owner\n  hint: run `chmod 600 {path}`"
+    )]
+    Shared {
+        /// The key file.
+        path: PathBuf,
+        /// Its permission bits.
+        mode: u32,
+    },
     /// The node has no TLS identity, so no trusted authority to check the certificate against.
     #[error(
         "the node has no [tls] identity, so no trusted authority to check the issuer certificate \
@@ -280,6 +293,7 @@ fn read_pair(
         })
     };
     let cert_pem = read(&files.cert)?;
+    check_private(&files.key)?;
     let key_pem = Zeroizing::new(read(&files.key)?);
     let certificates = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
@@ -468,29 +482,81 @@ fn sync_dir(path: &Path) {
     let _ = path;
 }
 
-/// Whether users other than its owner may read the file at `path`. Always `false` off Unix.
-fn readable_by_others(path: &Path) -> bool {
+/// Refuses the key at `path` if its mode grants its group or other users any permission. A
+/// missing file passes here, and fails at its read. Off Unix, every file passes.
+fn check_private(path: &Path) -> Result<(), IssuerFileProblem> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o077 != 0)
+        if let Ok(metadata) = fs::metadata(path) {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(IssuerFileProblem::Shared {
+                    path: path.to_owned(),
+                    mode,
+                });
+            }
+        }
     }
     #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
+    let _ = path;
+    Ok(())
 }
 
-/// Warns when the issuer key file is readable by other users than its owner: a copy or a
-/// `chmod` may have loosened it, and the key signs delegated tokens.
-fn warn_if_loose(key: &Path) {
-    if readable_by_others(key) {
-        tracing::warn!(
-            key = %key.display(),
-            "the delegation issuer key is readable by other users; run `chmod 600 {}`",
-            key.display(),
-        );
+/// What `cert issuer` finds where it is about to write a pair.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ExistingPair {
+    /// Neither file exists.
+    Absent,
+    /// The certificate is an issuer certificate for the same fleet and name, certified by the
+    /// authority about to sign the new one: running `cert issuer` again renews it.
+    Renewable,
+    /// Something else is there, which `cert issuer` writes over only with `--replace`.
+    Foreign(String),
+}
+
+/// What is at `files` before `cert issuer` writes a pair for `name` there, for `fleet`, with the
+/// authority keys `authorities`: the certificate alone decides, since a new key replaces the key
+/// either way, and a key whose certificate is missing belongs to nobody `cert issuer` can name.
+#[must_use]
+pub fn existing_pair(
+    files: &IssuerFiles,
+    fleet: &FleetName,
+    name: &NodeId,
+    authorities: &[VerifyingKey],
+) -> ExistingPair {
+    let exists = |path: &Path| fs::symlink_metadata(path).is_ok();
+    if !exists(&files.cert) && !exists(&files.key) {
+        return ExistingPair::Absent;
+    }
+    let Ok(cert_pem) = fs::read(&files.cert) else {
+        return ExistingPair::Foreign(format!(
+            "{} exists, but no certificate beside it says whose it is",
+            files.key.display()
+        ));
+    };
+    let der = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .and_then(|certificates| match certificates.as_slice() {
+            [der] => Some(der.clone()),
+            _ => None,
+        });
+    let Some(der) = der else {
+        return ExistingPair::Foreign(format!("{} isn't one certificate", files.cert.display()));
+    };
+    match IssuerCertificate::check(der.as_ref(), fleet, authorities) {
+        Ok(certificate) if certificate.name() == name => ExistingPair::Renewable,
+        Ok(certificate) => ExistingPair::Foreign(format!(
+            "{} is issuer {}'s certificate, not {name}'s",
+            files.cert.display(),
+            certificate.name()
+        )),
+        Err(error) => ExistingPair::Foreign(format!(
+            "{} isn't an issuer certificate this authority certified for fleet {fleet}: {error}",
+            files.cert.display()
+        )),
     }
 }
 
@@ -516,6 +582,9 @@ fn inspect(
         }
         Ok(loaded) => Inspection::Keep(Box::new(loaded)),
         Err(IssuerFileProblem::Mismatch) => Inspection::Replace("the key doesn't match"),
+        Err(IssuerFileProblem::Shared { .. }) => {
+            Inspection::Replace("its key is readable by other users")
+        }
         Err(
             IssuerFileProblem::Read { .. }
             | IssuerFileProblem::Pem { .. }
@@ -760,7 +829,6 @@ impl IssuerPair {
         let mut state = pair.lock();
         pair.warn_if_expiring(&mut state, pair.inner.clock.now());
         drop(state);
-        warn_if_loose(&files.key);
         pair
     }
 
@@ -873,9 +941,6 @@ impl IssuerPair {
     fn reload(&self, state: &mut CheckState) -> Result<(), IssuerFileProblem> {
         let (fleet, authorities) = trust(&self.inner.identity);
         let loaded = read_pair(&self.inner.files, &fleet, &authorities)?;
-        if loaded.stamp.files != self.inner.loaded.load().stamp.files {
-            warn_if_loose(&self.inner.files.key);
-        }
         tracing::info!(
             cert = %self.inner.files.cert.display(),
             key_id = %loaded.certificate.key_id(),
@@ -1061,9 +1126,15 @@ mod tests {
         "c".parse().expect("a name")
     }
 
+    /// Writes `contents` to `path` whole, private to its owner, as `cert issuer` writes a key.
     fn replace_whole(path: &Path, contents: &str) {
         let staged = path.with_extension("staged");
         fs::write(&staged, contents).expect("staged");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
         fs::rename(&staged, path).expect("renamed");
     }
 
@@ -1396,23 +1467,60 @@ mod tests {
         );
     }
 
+    /// A key its group or other users may read is refused at load, naming the file and the
+    /// `chmod` that fixes it, as S3 credentials and webhook secrets are; a private one loads.
     #[cfg(unix)]
     #[test]
-    fn a_key_readable_by_others_is_noticed() {
+    fn a_key_readable_by_others_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let fixture = Fixture::new();
         fixture.write_pair(&fixture.authority, 30 * DAY);
+        let (fleet, authorities) = trust(&fixture.identity);
         let set = |mode| {
             fs::set_permissions(&fixture.files.key, fs::Permissions::from_mode(mode))
                 .expect("chmod");
         };
         set(0o600);
-        assert!(!readable_by_others(&fixture.files.key));
-        for loose in [0o640, 0o604, 0o644] {
+        read_pair(&fixture.files, &fleet, &authorities).expect("a private key loads");
+        for loose in [0o640, 0o604, 0o644, 0o660] {
             set(loose);
-            assert!(readable_by_others(&fixture.files.key), "{loose:o}");
+            let refused = read_pair(&fixture.files, &fleet, &authorities).expect_err("shared");
+            assert!(
+                matches!(&refused, IssuerFileProblem::Shared { mode, .. } if *mode == loose),
+                "{loose:o}: {refused:?}"
+            );
+            assert!(refused.to_string().contains("chmod 600"), "{refused}");
         }
+    }
+
+    /// Before it writes, `cert issuer` tells a pair it may renew, one this authority certified
+    /// for this fleet and name, from anything else.
+    #[test]
+    fn an_existing_pair_is_renewable_only_if_this_authority_certified_it_for_the_name() {
+        let fixture = Fixture::new();
+        let trusted = [fixture
+            .authority
+            .token_signer()
+            .expect("a signer")
+            .verifying_key()];
+        let fleet = fixture.authority.fleet().clone();
+        let existing = || existing_pair(&fixture.files, &fleet, &name(), &trusted);
+        assert!(matches!(existing(), ExistingPair::Absent));
+        fixture.write_pair(&fixture.authority, 30 * DAY);
+        assert!(matches!(existing(), ExistingPair::Renewable));
+        let other_name: NodeId = "another".parse().expect("an id");
+        assert!(matches!(
+            existing_pair(&fixture.files, &fleet, &other_name, &trusted),
+            ExistingPair::Foreign(_)
+        ));
+        let century = Validity::new(Timestamp::ZERO, 36_500 * DAY);
+        let stranger =
+            Authority::create("test".parse().expect("a fleet"), century).expect("authority");
+        fixture.write_pair(&stranger, 30 * DAY);
+        assert!(matches!(existing(), ExistingPair::Foreign(_)));
+        fs::remove_file(&fixture.files.cert).expect("removed");
+        assert!(matches!(existing(), ExistingPair::Foreign(_)), "a lone key");
     }
 
     /// `fleetring cert issuer` renews a pair in place, through temporary names, key first.
