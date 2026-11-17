@@ -130,11 +130,14 @@ pub(super) async fn step_down(inner: &Inner, database: &DatabaseName, epoch: u64
 }
 
 /// Fences this replica of `database` at `epoch` for `candidate`, and reports where its log is.
+/// A fence for the database's `incarnation` is refused by a copy of another
+/// ([`check_fence_incarnation`]), and labels a copy that records none yet.
 pub(super) async fn fence(
     inner: &Arc<Inner>,
     database: &DatabaseName,
     epoch: u64,
     candidate: Option<&NodeId>,
+    incarnation: Option<Incarnation>,
 ) -> Result<Fenced, Status> {
     if let EngineCapability::SelfReplicating = inner.engine.capability() {
         return Err(Status::failed_precondition(format!(
@@ -143,10 +146,14 @@ pub(super) async fn fence(
         )));
     }
     inner.check_not_orphan(database)?;
+    check_fence_incarnation(inner, database, incarnation)?;
     step_down(inner, database, epoch).await;
     let slot = inner.slot(database);
     let _exclusive = exclusive(inner, &slot).await?;
+    // Checked again under the slot, which a stream admission records its label under too.
+    check_fence_incarnation(inner, database, incarnation)?;
     record_epoch(inner, database, epoch, candidate).await?;
+    record_followed(inner, database, incarnation).await?;
     if inner.primary(database).is_some() || inner.registry().is_open(database) {
         return Err(Status::failed_precondition(format!(
             "{database} is open as a primary at epoch {epoch} or later on this node"
@@ -183,14 +190,29 @@ pub(super) async fn fence_rpc(
                 .map_err(|error| Status::invalid_argument(format!("invalid candidate: {error}")))?,
         )
     };
+    let named = request.incarnation.map(Incarnation::new);
     let confirmed = match caller {
         Some(caller) => {
-            binding::check_fence(inner, &name, request.epoch, candidate.as_ref(), caller).await?
+            binding::check_fence(
+                inner,
+                &name,
+                request.epoch,
+                candidate.as_ref(),
+                named,
+                caller,
+            )
+            .await?
         }
         None => None,
     };
-    let fenced = fence(inner, &name, request.epoch, candidate.as_ref()).await?;
-    record_followed(inner, &name, confirmed).await?;
+    let fenced = fence(
+        inner,
+        &name,
+        request.epoch,
+        candidate.as_ref(),
+        named.or(confirmed),
+    )
+    .await?;
     Ok(FenceResponse {
         epoch: request.epoch,
         position: fenced
@@ -304,8 +326,6 @@ pub(super) fn drop_rpc(
     });
 }
 
-/// Admits a stream that opens at `epoch` from `primary`: refuses an older epoch, or another node
-/// than the epoch's recorded holder, and steps down as primary for a newer one.
 /// Refuses a stream of `database` whose primary names `named` as the database's incarnation when
 /// this node's copy records another (ADR-0046's amendment, item 9): the copy is a dropped
 /// database's of the name, and is kept as an orphan, never followed as this one's. Checked
@@ -377,6 +397,57 @@ pub(super) async fn record_followed(
     }
 }
 
+/// Refuses a fence of `database` for its incarnation `named` (ADR-0046's amendment, item 13)
+/// when this node's copy records another, as [`check_incarnation`] refuses a stream, or records
+/// none while its record has seen an epoch and `named` is a random incarnation. Checked before
+/// the fence steps down or records anything, whatever the caller, as the record's holder for the
+/// fence's epoch may be a dropped database's.
+///
+/// Every admission of this release that records a holder also records the copy's incarnation,
+/// so a copy that records an epoch and no incarnation was last admitted by a release before
+/// followers recorded them. Its database was created before forks were enabled, with the legacy
+/// incarnation, so a fence naming a random one is for a database created again under the name
+/// since: the copy holds none of it, and is kept as an orphan until a stream of that database
+/// labels and re-seeds it or a drop notice deletes it.
+///
+/// # Errors
+///
+/// `FAILED_PRECONDITION` naming the incarnations.
+pub(super) fn check_fence_incarnation(
+    inner: &Inner,
+    database: &DatabaseName,
+    named: Option<Incarnation>,
+) -> Result<(), Status> {
+    let Some(named) = named else {
+        return Ok(());
+    };
+    let record = inner.epochs.record(database);
+    if unlabelled_copy_of_another(record.incarnation(), record.highest(), named) {
+        inner.stream_ended(database);
+        return Err(Status::failed_precondition(format!(
+            "this node's copy of {database} records no incarnation, as a copy of a database \
+             created before forks does, so it isn't a copy of incarnation {named}; it keeps the \
+             copy as an orphan"
+        )));
+    }
+    binding::other_incarnation(inner, database, &record, named)
+}
+
+/// Whether a copy that records `recorded` as its incarnation, and `highest` as the highest epoch
+/// it has seen, is one a fence naming the random incarnation `named` can't be for: it records no
+/// incarnation and has seen an epoch, so it was last admitted by a release before followers
+/// recorded incarnations, and belongs to a database of the legacy incarnation
+/// ([`check_fence_incarnation`]).
+fn unlabelled_copy_of_another(
+    recorded: Option<Incarnation>,
+    highest: u64,
+    named: Incarnation,
+) -> bool {
+    recorded.is_none() && highest > 0 && named != Incarnation::LEGACY
+}
+
+/// Admits a stream that opens at `epoch` from `primary`: refuses an older epoch, or another node
+/// than the epoch's recorded holder, and steps down as primary for a newer one.
 pub(super) async fn admit_stream(
     inner: &Arc<Inner>,
     database: &DatabaseName,
@@ -644,13 +715,17 @@ impl Replication {
     /// Learns from control state whether `database` is a fork whose replica set is its
     /// recorded holders, seeded or ready with them kept, and which replica set its promotions
     /// fence, a set a membership change kept included (ADR-0031, amendment 2), as
-    /// [`replica_set`](Self::replica_set) answers from then on.
+    /// [`replica_set`](Self::replica_set) answers from then on. Returns the incarnation control
+    /// state holds the database at, which the promotion's fences name.
     ///
     /// # Errors
     ///
     /// `UNAVAILABLE` when control state can't be reached: a promotion that doesn't know which
     /// replica set control state fences mustn't guess the ring, so it stops and is tried again.
-    pub(crate) async fn learn_fork_replicas(&self, database: &DatabaseName) -> Result<(), Status> {
+    pub(crate) async fn learn_fork_replicas(
+        &self,
+        database: &DatabaseName,
+    ) -> Result<Incarnation, Status> {
         let inner = &self.inner;
         // Asked under this ring, before any sets followed meanwhile.
         let asked = inner.sets.generation(database);
@@ -674,7 +749,7 @@ impl Replication {
         }
         // The candidate serves the incarnation this placement names, if it completes.
         inner.follow_view(database, &view, super::handover::Origin::Serving);
-        Ok(())
+        Ok(view.incarnation)
     }
 
     /// The promotion quorum Q for a replica set of `members` members.
@@ -757,22 +832,31 @@ impl Replication {
     }
 
     /// Fences this node's own replica of `database` at `epoch`, as a promotion's candidate does
-    /// first.
+    /// first, for the database's `incarnation`, as control state holds it.
     ///
     /// # Errors
     ///
-    /// `FAILED_PRECONDITION` if this node has seen a newer epoch or another holder, and the
-    /// status of a copy that can't be read.
+    /// `FAILED_PRECONDITION` if this node has seen a newer epoch or another holder, or its copy
+    /// is another incarnation's, and the status of a copy that can't be read.
     pub async fn fence_local(
         &self,
         database: &DatabaseName,
         epoch: LeaseEpoch,
+        incarnation: Incarnation,
     ) -> Result<Fenced, Status> {
         let node = self.inner.node.clone();
-        fence(&self.inner, database, epoch.get(), Some(&node)).await
+        fence(
+            &self.inner,
+            database,
+            epoch.get(),
+            Some(&node),
+            Some(incarnation),
+        )
+        .await
     }
 
-    /// Fences `node`'s replica of `database` at `epoch` for this node, waiting at most `limit`.
+    /// Fences `node`'s replica of `database` at `epoch` for this node, naming the database's
+    /// `incarnation`, waiting at most `limit`.
     ///
     /// # Errors
     ///
@@ -783,6 +867,7 @@ impl Replication {
         node: &NodeId,
         database: &DatabaseName,
         epoch: LeaseEpoch,
+        incarnation: Incarnation,
         limit: Duration,
     ) -> Result<Fenced, Status> {
         let inner = &self.inner;
@@ -798,6 +883,7 @@ impl Replication {
             database: database.to_string(),
             epoch: epoch.get(),
             candidate: inner.node.to_string(),
+            incarnation: Some(incarnation.get()),
         };
         let response = tokio::time::timeout(limit, replication_client(channel).fence(request))
             .await
@@ -1123,4 +1209,28 @@ pub(super) fn size_on_disk(path: &std::path::Path) -> u64 {
             .map(|entry| size_on_disk(&entry.path()))
             .fold(0, u64::saturating_add)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy that records an epoch and no incarnation is a copy of a database created before
+    /// forks: a fence for a random incarnation isn't for it, while a fence for the legacy
+    /// incarnation, or one of a copy that has seen no epoch, may be (ADR-0046's amendment,
+    /// item 13).
+    #[test]
+    fn an_unlabelled_copy_refuses_only_a_random_incarnations_fence() {
+        let random = Incarnation::new(7);
+        assert!(unlabelled_copy_of_another(None, 2, random));
+        assert!(!unlabelled_copy_of_another(None, 2, Incarnation::LEGACY));
+        assert!(
+            !unlabelled_copy_of_another(None, 0, random),
+            "a copy that has seen no epoch"
+        );
+        assert!(
+            !unlabelled_copy_of_another(Some(random), 2, random),
+            "a labelled copy is judged by its label"
+        );
+    }
 }

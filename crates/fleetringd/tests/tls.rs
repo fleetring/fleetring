@@ -261,6 +261,7 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
             database: "acme".into(),
             epoch: 1,
             candidate: "solo".into(),
+            incarnation: None,
         })
         .await
         .expect_err("a principal can't fence");
@@ -276,6 +277,7 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
             database: "acme".into(),
             epoch: 1,
             candidate: "peer".into(),
+            incarnation: None,
         })
         .await
         .expect_err("control state knows no promotion of acme");

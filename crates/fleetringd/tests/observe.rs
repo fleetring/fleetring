@@ -771,6 +771,7 @@ async fn rpcs_and_refusals_are_counted() -> TestResult {
             database: "any".to_owned(),
             epoch: 1,
             candidate: String::new(),
+            incarnation: None,
         })
         .await
         .expect_err("a principal can't fence");
