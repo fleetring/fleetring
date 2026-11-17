@@ -683,13 +683,6 @@ fn read_sidecar(dir: &Path) -> Option<Staged> {
 }
 
 impl StagedStore {
-    /// Settles, at start, the markers installs that a crash or a cancellation stopped left,
-    /// with `location` naming each database's place: an intent beside a copy's files is an
-    /// install that never moved them, and goes; an intent without them is an install that moved
-    /// them and wrote no record, which is written now if the database's place holds them, so the
-    /// copy is installed from here on, and otherwise a copy that is gone, lost. Best effort:
-    /// whatever can't be settled now reads the same at the next start. It blocks on the file
-    /// system.
     /// Records as installed every staged copy of `name` whose install moved its files into the
     /// database's place, which the caller checked holds them, and wrote only the intent: an
     /// install a cancellation stopped. Returns the copies it recorded. A copy whose files are
@@ -721,6 +714,13 @@ impl StagedStore {
         settled
     }
 
+    /// Settles, at start, the markers installs that a crash or a cancellation stopped left,
+    /// with `location` naming each database's place: an intent beside a copy's files is an
+    /// install that never moved them, and goes; an intent without them is an install that moved
+    /// them and wrote no record, which is written now if the database's place holds them, so the
+    /// copy is installed from here on, and otherwise a copy that is gone, lost. Best effort:
+    /// whatever can't be settled now reads the same at the next start. It blocks on the file
+    /// system.
     pub(crate) fn settle_installs(&self, location: impl Fn(&DatabaseName) -> PathBuf) {
         let keys: Vec<StagedKey> = self.lock().keys().cloned().collect();
         for key in keys {
