@@ -17,6 +17,8 @@ mod fleet;
 mod fork;
 mod handover;
 mod history;
+#[cfg(feature = "fault-hooks")]
+mod log_end;
 mod membership;
 mod membership_lag;
 mod observe;

@@ -125,6 +125,22 @@ struct Hooks {
     hide_replica_sets: std::sync::atomic::AtomicBool,
     /// How many of the next builds of a primary's hash chain fail.
     fail_chain_builds: std::sync::atomic::AtomicU32,
+    /// How many of the next reads of a primary's log end fail.
+    fail_position_reads: std::sync::atomic::AtomicU32,
+}
+
+/// Takes one from `count` unless it is 0. Returns whether it did.
+#[cfg(feature = "fault-hooks")]
+fn take_one(count: &std::sync::atomic::AtomicU32) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut left = count.load(SeqCst);
+    while left > 0 {
+        match count.compare_exchange(left, left - 1, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
+    false
 }
 
 #[cfg(feature = "fault-hooks")]
@@ -141,6 +157,7 @@ impl ForkFaults {
                 drop_reply: std::sync::atomic::AtomicBool::new(false),
                 hide_replica_sets: std::sync::atomic::AtomicBool::new(false),
                 fail_chain_builds: std::sync::atomic::AtomicU32::new(0),
+                fail_position_reads: std::sync::atomic::AtomicU32::new(0),
             })),
         }
     }
@@ -279,6 +296,17 @@ impl ForkFaults {
         }
     }
 
+    /// Makes the next `count` reads of where a primary's log ends fail, as an engine that can't
+    /// answer does, in place of any count asked for before: 0 lets the next read run. A primary
+    /// reads it when it starts serving, and each build of its hash chain reads it again.
+    pub fn fail_next_position_reads(&self, count: u32) {
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .fail_position_reads
+                .store(count, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Whether the next chain build is still to fail: `false` once every build
     /// [`fail_next_chain_builds`](Self::fail_next_chain_builds) asked to fail has failed.
     #[must_use]
@@ -366,21 +394,22 @@ impl ForkFaults {
     pub(crate) fn take_chain_build_failure(&self) -> bool {
         #[cfg(feature = "fault-hooks")]
         {
-            use std::sync::atomic::Ordering::SeqCst;
-            let Some(hooks) = &self.hooks else {
-                return false;
-            };
-            let mut count = hooks.fail_chain_builds.load(SeqCst);
-            while count > 0 {
-                match hooks
-                    .fail_chain_builds
-                    .compare_exchange(count, count - 1, SeqCst, SeqCst)
-                {
-                    Ok(_) => return true,
-                    Err(now) => count = now,
-                }
-            }
-            false
+            self.hooks
+                .as_ref()
+                .is_some_and(|hooks| take_one(&hooks.fail_chain_builds))
+        }
+        #[cfg(not(feature = "fault-hooks"))]
+        false
+    }
+
+    /// Whether this read of a primary's log end is to fail; true once per read
+    /// [`fail_next_position_reads`](Self::fail_next_position_reads) asked to fail.
+    pub(crate) fn take_position_read_failure(&self) -> bool {
+        #[cfg(feature = "fault-hooks")]
+        {
+            self.hooks
+                .as_ref()
+                .is_some_and(|hooks| take_one(&hooks.fail_position_reads))
         }
         #[cfg(not(feature = "fault-hooks"))]
         false

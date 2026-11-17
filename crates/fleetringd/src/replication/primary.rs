@@ -50,8 +50,13 @@ pub(super) struct Primary {
 
 #[derive(Debug, Default)]
 struct State {
-    /// The end of the last committed batch.
+    /// The end of the last committed batch, once [`end_known`](Self::end_known) says it is the
+    /// log's end.
     committed: Option<Position>,
+    /// Whether `committed` is the log's end: [`drive`] read it when serving began, or a batch was
+    /// published since. Until then `committed` is `None` whatever the log holds, and says nothing
+    /// about it: an unknown end is never read as an empty log.
+    end_known: bool,
     /// Published batches that some follower may still need, oldest first, each continuing the
     /// one before.
     recent: VecDeque<Shipped>,
@@ -166,6 +171,16 @@ struct Progress {
     needs_snapshot: bool,
 }
 
+/// The end of a primary's log, as far as the primary knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogEnd {
+    /// Not learned yet: serving began, and neither has the log's end been read nor a batch
+    /// published since.
+    Unknown,
+    /// The log ends here; `None` for an empty log.
+    At(Option<Position>),
+}
+
 /// What a follower's first acknowledgement on a stream proves about its copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstAck {
@@ -186,24 +201,33 @@ enum FirstAck {
 
 /// Judges a follower's first acknowledgement on a stream, at `position` with its chain hash
 /// `theirs` if it sent one, against `ours`, this primary's proving hash there if it holds one,
-/// and `committed`, the end of this primary's log. Positions are opaque and ordered as bytes
-/// (ADR-0016, point 2), so the judgement knows nothing of the engine.
+/// and `end`, the end of this primary's log as far as it knows it. Positions are opaque and
+/// ordered as bytes (ADR-0016, point 2), so the judgement knows nothing of the engine.
+///
+/// While the end is unknown, nothing is judged a copy of another log: a position past an unknown
+/// end proves nothing, and a matching hash still proves the position.
 fn judge_first_ack(
     ours: Option<ChainHash>,
     theirs: Option<ChainHash>,
     position: Option<&Position>,
-    committed: Option<&Position>,
+    end: &LogEnd,
 ) -> FirstAck {
-    match (ours, theirs) {
-        (Some(ours), Some(theirs)) if ours == theirs => FirstAck::Proven,
-        (Some(_), Some(_)) => FirstAck::Diverged,
+    match (ours, theirs, end) {
+        (Some(ours), Some(theirs), _) if ours == theirs => FirstAck::Proven,
+        (_, _, LogEnd::Unknown) => FirstAck::Unproven,
+        (Some(_), Some(_), LogEnd::At(_)) => FirstAck::Diverged,
         // A follower never holds more of an epoch's log than its primary wrote: a promotion's
         // followers cut their tails back to the epoch's start before their first
         // acknowledgement.
-        _ if position > committed => FirstAck::Diverged,
+        (_, _, LogEnd::At(committed)) if position > committed.as_ref() => FirstAck::Diverged,
         _ => FirstAck::Unproven,
     }
 }
+
+/// How long [`drive`] waits, at most, between reads of the log's end that keep failing: each
+/// failure doubles the pause from the retry interval up to this, or the retry interval if that
+/// is longer.
+const END_READ_MAX_PAUSE: Duration = Duration::from_secs(5);
 
 /// What a stream sends next.
 #[derive(Debug)]
@@ -257,6 +281,21 @@ impl Primary {
 
     pub(super) fn committed(&self) -> Option<Position> {
         self.lock().committed.clone()
+    }
+
+    /// The log's end, as far as this primary knows it.
+    fn log_end(&self) -> LogEnd {
+        let state = self.lock();
+        if state.end_known {
+            LogEnd::At(state.committed.clone())
+        } else {
+            LogEnd::Unknown
+        }
+    }
+
+    /// Whether this primary knows where its log ends.
+    pub(super) fn end_known(&self) -> bool {
+        self.lock().end_known
     }
 
     /// How many batches have been published since this primary started serving.
@@ -538,9 +577,13 @@ impl Primary {
     /// `needed` of its followers reported a position at or past the log's end, or it needs none.
     /// A log that is empty, as a database's that has taken no write, ends where it begins: then
     /// a follower holds it once it has reported at all, which it does only once it holds a copy,
-    /// so the quorum holds the database whole (ADR-0031, amendment 2, point 3).
+    /// so the quorum holds the database whole (ADR-0031, amendment 2, point 3). A log whose end
+    /// this primary hasn't learned yet is held by no quorum.
     pub(super) fn holds_committed(&self, quorum: &Quorum) -> bool {
         let state = self.lock();
+        if !state.end_known {
+            return false;
+        }
         let committed = state.committed.as_ref();
         quorum.groups.iter().all(|group| {
             let holding = group
@@ -606,6 +649,7 @@ impl Primary {
             if position > state.committed {
                 state.committed = position;
             }
+            state.end_known = true;
         }
         self.notify();
     }
@@ -827,6 +871,11 @@ impl Primary {
         if state.checkpoints % 2 == 1 {
             return Err(failed("a checkpoint is already running".to_owned()));
         }
+        if !state.end_known {
+            return Err(failed(
+                "the primary hasn't learned where its log ends yet".to_owned(),
+            ));
+        }
         let committed = state.committed.clone();
         for node in followers {
             let caught_up = state
@@ -948,12 +997,15 @@ impl State {
         self.published_bytes = self.published_bytes.saturating_add(bytes);
         self.recent_bytes += batch.payload.len();
         if self.recent.is_empty() {
-            // Batches are published in commit order, each continuing the one before.
-            self.base = Some(self.committed.clone());
+            // Batches are published in commit order, each continuing the one before. Before the
+            // log's end was learned, where the first one continues from is unknown.
+            self.base = self.end_known.then(|| self.committed.clone());
         }
         if Some(&batch.end) > self.committed.as_ref() {
             self.committed = Some(batch.end.clone());
         }
+        // The batch just committed ends the log.
+        self.end_known = true;
         self.published = self.published.saturating_add(1);
         self.recent.push_back(shipped);
         self.prune(retained_bytes);
@@ -1365,7 +1417,7 @@ async fn load_chain(
             None
         }
     };
-    let position = handle.position().await.map_err(|error| error.to_string())?;
+    let position = read_end(inner, handle).await?;
     let anchored_at = recorded.as_ref().map(Anchor::position);
     let read = match anchored_at {
         Some(at) if at == position => LogRead::Continues(None),
@@ -1530,16 +1582,11 @@ fn fill_gap(
 /// It also reads the database's replica sets from control state again, in a task of its own,
 /// whenever this node's ring is newer than the placement it counts, and while a membership
 /// change keeps the old replica set, so that it learns of the release (ADR-0031, amendment 2).
+///
+/// Nothing is streamed, judged, or built before the primary knows where its log ends: it reads
+/// the end until it can, or until a write publishes a batch, which ends the log.
 pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
-    match inner.registry().open(&primary.name).await {
-        Ok(handle) => match handle.position().await {
-            Ok(position) => primary.raise_committed(position),
-            Err(error) => {
-                tracing::warn!(database = %primary.name, %error, "can't read the log's end")
-            }
-        },
-        Err(error) => tracing::warn!(database = %primary.name, %error, "can't open the database"),
-    }
+    learn_end(&inner, &primary).await;
     rebuild_chain(&inner, &primary).await;
     let mut membership = inner.membership.clone();
     let mut streams: BTreeMap<NodeId, AbortOnDrop> = BTreeMap::new();
@@ -1589,6 +1636,43 @@ pub(super) async fn drive(inner: Arc<Inner>, primary: Arc<Primary>) {
             () = read(&mut reading) => reading = None,
         }
     }
+}
+
+/// Reads where the primary's log ends, again after a pause that grows while the read fails, until
+/// it succeeds or a published batch tells the primary where the log ends.
+async fn learn_end(inner: &Inner, primary: &Primary) {
+    let mut changes = primary.changed.subscribe();
+    let longest = END_READ_MAX_PAUSE.max(inner.settings.retry_interval);
+    let mut pause = inner.settings.retry_interval;
+    while !primary.end_known() {
+        let read = match inner.registry().open(&primary.name).await {
+            Ok(handle) => read_end(inner, &handle).await,
+            Err(error) => Err(format!("can't open the database: {error}")),
+        };
+        match read {
+            Ok(position) => {
+                primary.raise_committed(position);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(database = %primary.name, %error, ?pause, "can't read the log's end; streams wait until it is read");
+            }
+        }
+        tokio::select! {
+            () = time::sleep(pause) => {}
+            // A published batch ends the log; the sender lives as long as the primary.
+            _ = changes.changed() => {}
+        }
+        pause = pause.saturating_mul(2).min(longest);
+    }
+}
+
+/// Reads where the log ends through `handle`, unless the fault hooks fail the read.
+async fn read_end(inner: &Inner, handle: &DatabaseHandle) -> Result<Option<Position>, String> {
+    if inner.forks.faults().take_position_read_failure() {
+        return Err("the fault hooks failed this read".to_owned());
+    }
+    handle.position().await.map_err(|error| error.to_string())
 }
 
 /// Waits for the read of the replica sets under way, if there is one, and forever otherwise.
@@ -1746,7 +1830,7 @@ async fn stream(inner: &Arc<Inner>, primary: &Arc<Primary>, node: &NodeId) -> St
             primary.proof_at(sent.as_ref()),
             theirs,
             sent.as_ref(),
-            primary.committed().as_ref(),
+            &primary.log_end(),
         )
     };
     match judged {
@@ -1984,16 +2068,28 @@ mod tests {
     use super::super::WriteQuorum;
     use super::*;
 
+    /// A lone primary that has read its log's end: an empty log.
     fn primary() -> Primary {
         let role = PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(1));
-        Primary::new("db".parse().expect("a valid name"), role, None)
+        let primary = Primary::new("db".parse().expect("a valid name"), role, None);
+        primary.raise_committed(None);
+        primary
     }
 
-    /// The primary of a database with three replicas, this node and `b` and `c`.
-    fn primary_of_three() -> Primary {
+    /// The primary of a database with three replicas, this node and `b` and `c`, that hasn't
+    /// learned where its log ends yet.
+    fn unread_primary_of_three() -> Primary {
         let factor = ReplicationFactor::new(3).expect("nonzero");
         let role = PrimaryRole::new(factor, LeaseEpoch::new(1));
         Primary::new("db".parse().expect("a valid name"), role, None)
+    }
+
+    /// The primary of a database with three replicas, this node and `b` and `c`, that has read
+    /// its log's end: an empty log.
+    fn primary_of_three() -> Primary {
+        let primary = unread_primary_of_three();
+        primary.raise_committed(None);
+        primary
     }
 
     fn node(name: &str) -> NodeId {
@@ -2047,22 +2143,47 @@ mod tests {
         ];
         for (ours, theirs, position, expected) in cases {
             assert_eq!(
-                judge_first_ack(ours, theirs, position, Some(&end)),
+                judge_first_ack(ours, theirs, position, &LogEnd::At(Some(end.clone()))),
                 expected,
                 "ours {ours:?}, theirs {theirs:?}, at {position:?}"
             );
         }
         assert_eq!(
-            judge_first_ack(None, None, Some(&at(0x01)), None),
+            judge_first_ack(None, None, Some(&at(0x01)), &LogEnd::At(None)),
             FirstAck::Diverged,
             "anything past an empty log"
         );
+        // Before the primary has learned where its log ends, nothing is past it, and only a
+        // matching hash proves anything.
+        let unknown = [
+            (None, None, Some(&at(0x90)), FirstAck::Unproven),
+            (None, Some(hash(2)), Some(&at(0x90)), FirstAck::Unproven),
+            (
+                Some(hash(1)),
+                Some(hash(2)),
+                Some(&inside),
+                FirstAck::Unproven,
+            ),
+            (
+                Some(hash(1)),
+                Some(hash(1)),
+                Some(&inside),
+                FirstAck::Proven,
+            ),
+        ];
+        for (ours, theirs, position, expected) in unknown {
+            assert_eq!(
+                judge_first_ack(ours, theirs, position, &LogEnd::Unknown),
+                expected,
+                "an unknown end: ours {ours:?}, theirs {theirs:?}, at {position:?}"
+            );
+        }
         assert_eq!(
             judge_first_ack(
                 Some(ChainHash::GENESIS),
                 Some(ChainHash::GENESIS),
                 None,
-                None
+                &LogEnd::At(None)
             ),
             FirstAck::Proven,
             "two empty logs"
@@ -2123,6 +2244,47 @@ mod tests {
         assert!(!primary.holds_committed(&quorum));
         primary.acknowledged(&node("c"), Some(at(0x20)), 0);
         assert!(primary.holds_committed(&quorum));
+    }
+
+    /// Until the primary has learned where its log ends, no quorum holds the log, however its
+    /// followers reported, and no checkpoint begins; a published batch ends the log, and so
+    /// teaches the primary where it ends (FR-106).
+    #[test]
+    fn an_unknown_log_end_is_held_by_no_quorum() {
+        let primary = unread_primary_of_three();
+        let quorum = quorum_of_three();
+        primary.acknowledged(&node("b"), Some(at(0x10)), 0);
+        primary.acknowledged(&node("c"), Some(at(0x10)), 0);
+        assert_eq!(primary.log_end(), LogEnd::Unknown);
+        assert!(!primary.holds_committed(&quorum), "an unknown end");
+        assert!(primary.begin_checkpoint(&[]).is_err(), "an unknown end");
+
+        primary.lock().append(
+            Shipped {
+                batch: FrameBatch {
+                    start: at(0x18),
+                    end: at(0x20),
+                    payload: crate::engine::Payload::from(vec![0]),
+                },
+                chain: None,
+            },
+            usize::MAX,
+        );
+        assert_eq!(primary.log_end(), LogEnd::At(Some(at(0x20))));
+        assert_eq!(
+            primary.lock().base,
+            None,
+            "where the first batch continues from is unknown"
+        );
+        assert!(!primary.holds_committed(&quorum), "the followers lack 0x20");
+        primary.acknowledged(&node("b"), Some(at(0x20)), 0);
+        assert!(primary.holds_committed(&quorum));
+
+        // Read at serving's start, the end is known too.
+        let read = unread_primary_of_three();
+        read.raise_committed(Some(at(0x20)));
+        read.acknowledged(&node("b"), Some(at(0x10)), 0);
+        assert!(!read.holds_committed(&quorum));
     }
 
     /// What a build read, beginning while no checkpoint ran.
