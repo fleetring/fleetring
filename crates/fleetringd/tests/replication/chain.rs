@@ -388,3 +388,60 @@ async fn a_batch_whose_hash_differs_is_refused_and_the_follower_reseeded() -> Te
     );
     Ok(())
 }
+
+/// A follower whose chain is derived sends no proof with its first acknowledgement, even at the
+/// epoch's start, where it takes the primary's hash: the hash it took would only echo the
+/// primary's own back, and prove nothing about the copy (FR-106).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_derived_chain_at_the_epoch_start_proves_nothing() -> TestResult {
+    // The test's own stream takes the follower over; a slow retry keeps the primary's stream
+    // from taking it back before the exchange is done.
+    let settings = ReplicationSettings {
+        retry_interval: std::time::Duration::from_secs(2),
+        ..settings()
+    };
+    let fleet = Fleet::start(&["a", "b"], sqlite(), settings, BTreeMap::new()).await?;
+    let db = name("echoed");
+    let two = ReplicationFactor::new(2).ok_or("nonzero")?;
+    fleet
+        .create_as("a", &db, PrimaryRole::new(two, LeaseEpoch::new(1)))
+        .await?;
+    let a = fleet.node("a");
+    let b = fleet.node("b");
+    a.registry().execute(&db, put(1, 100)).await?;
+    fleet.await_caught_up("a", &db).await?;
+    let at = b
+        .replication
+        .follower_status(&db)
+        .and_then(|status| status.position)
+        .ok_or("a position")?;
+    // Without its record, the follower's next stream derives its chain from the log's start.
+    a.replication.stop_primary(&db);
+    match fs::remove_file(b.root.join("replication/epochs/echoed/chain")) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let primary_hash = [0x5a; ChainHash::LEN];
+    let (sender, mut acks) = open_stream(
+        &fleet.address("b"),
+        "a",
+        ReplicateOpen {
+            database: db.to_string(),
+            epoch: 1,
+            epoch_start: Some(at.as_bytes().to_vec()),
+            epoch_start_chain: Some(primary_hash.to_vec()),
+            incarnation: None,
+        },
+    )
+    .await?;
+    let first = guarded("the first acknowledgement", acks.message())
+        .await??
+        .ok_or("no acknowledgement")?;
+    drop(sender);
+    assert_eq!(first.position, at.as_bytes());
+    assert_eq!(
+        first.chain, None,
+        "a derived chain proves nothing, though it took the primary's hash"
+    );
+    Ok(())
+}
