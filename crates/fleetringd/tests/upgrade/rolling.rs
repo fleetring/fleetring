@@ -23,7 +23,9 @@
 //!   the real cosign, into a scratch directory. The nightly workflow uses this.
 //! - `FLEETRINGD_BASELINE_BIN`: a binary built locally, as before the release exists.
 //!
-//! With neither, the test says so and passes. It is `#[ignore]`d: a run takes minutes.
+//! With neither, it fails, naming both: it is `#[ignore]`d, since a run takes minutes, so it runs
+//! only when asked for, and a run asked for without a baseline would otherwise pass having
+//! checked nothing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,10 +94,9 @@ fn install_this_build(bin: &Path) -> TestResult {
 fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestResult {
     let scratch = tempfile::tempdir()?;
     let Some(baseline) = baseline(scratch.path())? else {
-        progress(
-            "skipped: set FLEETRINGD_BASELINE_VERSION (a release) or FLEETRINGD_BASELINE_BIN (a binary)",
-        );
-        return Ok(());
+        return Err("no baseline: set FLEETRINGD_BASELINE_VERSION (a release, such as 0.7.0) or \
+                    FLEETRINGD_BASELINE_BIN (a binary) to run the rolling upgrade"
+            .into());
     };
     // `node undrain` is the first fleet feature (0.4.0): a baseline before it makes the fleet
     // refuse the command until every member is upgraded.
@@ -133,6 +134,12 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     let this_build = PathBuf::from(env!("CARGO_BIN_EXE_fleetring"));
     // From a release without forks and delegation (0.7), the checks of FR-096 run too.
     let features = Features::on_previous_release(&fleet, &baseline, scratch.path(), &path)?;
+    if features.is_none() {
+        progress(
+            "the fork and delegation checks don't apply: the baseline is before 0.7, or has \
+             `fork` already",
+        );
+    }
 
     // The data nodes first, then the control node.
     for index in [2, 1, 0] {
