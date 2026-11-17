@@ -1036,6 +1036,14 @@ pub(crate) enum InstallAs {
 }
 
 impl super::Replication {
+    /// Runs this node's fault points through `faults` from now on, keeping its fork limits: for
+    /// a test that builds replication by hand rather than through a daemon.
+    #[cfg(feature = "fault-hooks")]
+    pub fn set_fault_hooks(&self, faults: ForkFaults) {
+        let config = self.inner.forks.config();
+        self.inner.forks.configure(config, faults);
+    }
+
     /// Runs the node's fork work with `config`'s limits, through `faults`.
     pub(crate) fn configure_forks(&self, config: ForkConfig, faults: ForkFaults) {
         self.inner.forks.configure(config, faults);

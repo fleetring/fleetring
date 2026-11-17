@@ -152,8 +152,12 @@ pub(super) async fn fence(
     let _exclusive = exclusive(inner, &slot).await?;
     // Checked again under the slot, which a stream admission records its label under too.
     check_fence_incarnation(inner, database, incarnation)?;
-    record_epoch(inner, database, epoch, candidate).await?;
-    record_followed(inner, database, incarnation).await?;
+    record_epoch(inner, database, epoch, candidate, incarnation).await?;
+    inner
+        .forks
+        .faults()
+        .pass_any(super::FaultPoint::FenceRecorded)
+        .await;
     if inner.primary(database).is_some() || inner.registry().is_open(database) {
         return Err(Status::failed_precondition(format!(
             "{database} is open as a primary at epoch {epoch} or later on this node"
@@ -346,57 +350,6 @@ pub(super) fn check_incarnation(
     binding::other_incarnation(inner, database, &inner.epochs.record(database), named)
 }
 
-/// Records durably that this node's copy of `database` belongs to `incarnation`, as a stream's
-/// primary or control state named it once a stream or a fence was admitted, unless the copy
-/// recorded one already: a copy this node only follows records its incarnation as one it leads
-/// does, so that drop notices, the stream-end check, and later streams and fences tell it from
-/// a copy of a database created again under the name (ADR-0046, point 1.3, and its amendment,
-/// item 9).
-///
-/// # Errors
-///
-/// `UNAVAILABLE` if the record can't be written; `FAILED_PRECONDITION` if the copy's record
-/// names another incarnation, as when a drop and a creation of the name raced the admission:
-/// the stream or fence is then refused, and the lease keeper's next check finds the copy's
-/// database gone.
-pub(super) async fn record_followed(
-    inner: &Arc<Inner>,
-    database: &DatabaseName,
-    incarnation: Option<Incarnation>,
-) -> Result<(), Status> {
-    let Some(incarnation) = incarnation else {
-        return Ok(());
-    };
-    let recorded = {
-        let inner = Arc::clone(inner);
-        let database = database.clone();
-        blocking(inner.execution, move || {
-            inner
-                .epochs
-                .record_incarnation(&database, incarnation.get())
-        })
-        .await?
-    };
-    match recorded {
-        // The legacy incarnation, from a control node that predates forks, says nothing either
-        // way, as `binding::other_incarnation` judges it.
-        Ok(recorded) if recorded == incarnation.get() || incarnation == Incarnation::LEGACY => {
-            Ok(())
-        }
-        Ok(recorded) => {
-            inner.stream_ended(database);
-            Err(Status::failed_precondition(format!(
-                "this node's copy of {database} belongs to incarnation {}, not {incarnation}, \
-                 the database control state holds; it keeps the copy as an orphan",
-                Incarnation::new(recorded)
-            )))
-        }
-        Err(error) => Err(Status::unavailable(format!(
-            "can't record the incarnation of {database}'s copy: {error}"
-        ))),
-    }
-}
-
 /// Refuses a fence of `database` for its incarnation `named` (ADR-0046's amendment, item 13)
 /// when this node's copy records another, as [`check_incarnation`] refuses a stream, or records
 /// none while its record has seen an epoch and `named` is a random incarnation. Checked before
@@ -448,11 +401,16 @@ fn unlabelled_copy_of_another(
 
 /// Admits a stream that opens at `epoch` from `primary`: refuses an older epoch, or another node
 /// than the epoch's recorded holder, and steps down as primary for a newer one.
+///
+/// The copy records `incarnation`, the one the stream's primary named or control state showed,
+/// in the same write as the epoch, unless it recorded one already (ADR-0046's amendment, item
+/// 10).
 pub(super) async fn admit_stream(
     inner: &Arc<Inner>,
     database: &DatabaseName,
     epoch: u64,
     primary: Option<&NodeId>,
+    incarnation: Option<Incarnation>,
 ) -> Result<(), Status> {
     inner.check_not_orphan(database)?;
     if inner
@@ -462,34 +420,54 @@ pub(super) async fn admit_stream(
     {
         step_down(inner, database, epoch).await;
     }
-    record_epoch(inner, database, epoch, primary).await
+    record_epoch(inner, database, epoch, primary, incarnation).await
 }
 
-/// Records `epoch` for `database`, from `holder` if known, durably.
+/// Records `epoch` for `database`, from `holder` if known, durably, and in the same write that
+/// the copy belongs to `incarnation`, unless it recorded one already: a copy this node only
+/// follows records its incarnation as one it leads does, so that drop notices, the stream-end
+/// check, and later streams and fences tell it from a copy of a database created again under the
+/// name (ADR-0046, point 1.3, and its amendment, items 9, 10 and 13), and nothing that stops the
+/// admission after the write leaves an epoch's holder recorded without it.
+///
+/// # Errors
+///
+/// `FAILED_PRECONDITION` for a stale epoch, another holder, or a copy that records another
+/// incarnation, as when a drop and a creation of the name raced the admission: the lease
+/// keeper's next check then finds the copy's database gone. `INTERNAL` if the record can't be
+/// written.
 async fn record_epoch(
     inner: &Arc<Inner>,
     database: &DatabaseName,
     epoch: u64,
     holder: Option<&NodeId>,
+    incarnation: Option<Incarnation>,
 ) -> Result<(), Status> {
     let admitted = {
         let inner = Arc::clone(inner);
         let database = database.clone();
         let holder = holder.cloned();
-        blocking(inner.execution, move || match &holder {
-            Some(holder) => inner.epochs.admit_from(&database, epoch, holder),
-            None => inner.epochs.admit(&database, epoch),
+        blocking(inner.execution, move || {
+            inner.epochs.admit_labelled(
+                &database,
+                epoch,
+                holder.as_ref(),
+                incarnation.map(Incarnation::get),
+            )
         })
         .await?
     };
+    if let Err(EpochError::OtherIncarnation { .. }) = &admitted {
+        inner.stream_ended(database);
+    }
     admitted.map_err(epoch_status)
 }
 
 pub(super) fn epoch_status(error: EpochError) -> Status {
     match error {
-        EpochError::Stale { .. } | EpochError::OtherHolder { .. } => {
-            Status::failed_precondition(error.to_string())
-        }
+        EpochError::Stale { .. }
+        | EpochError::OtherHolder { .. }
+        | EpochError::OtherIncarnation { .. } => Status::failed_precondition(error.to_string()),
         EpochError::Io(_) => Status::internal(error.to_string()),
     }
 }

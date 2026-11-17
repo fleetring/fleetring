@@ -82,6 +82,11 @@ pub enum FaultPoint {
     /// recorded the move beside the copy's sidecar, nor the copy's incarnation: a crash here
     /// leaves the copy in place with only the install's intent.
     InstallMoved,
+    /// A replica has recorded a fence's epoch and holder, with the copy's incarnation, and
+    /// hasn't read its copy's position yet: held, the fence's caller can give up, as one whose
+    /// call ran out of time does, and fence again. Held only for every database, with
+    /// [`hold`](ForkFaults::hold).
+    FenceRecorded,
 }
 
 /// The fault hooks a daemon's fork work passes through.

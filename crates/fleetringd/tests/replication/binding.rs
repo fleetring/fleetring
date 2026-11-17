@@ -558,6 +558,47 @@ async fn a_fence_naming_another_incarnation_than_the_copy_is_refused() -> TestRe
     Ok(())
 }
 
+/// A fence that records a never-admitted replica's epoch records the copy's incarnation in the
+/// same write: a fence whose caller gave up right after the write, as one whose call ran out of
+/// time, leaves no epoch's holder recorded without it, so the fence tried again passes rather
+/// than finding a copy from before forks (ADR-0046's amendment, item 13).
+#[cfg(feature = "fault-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_interrupted_after_its_record_can_be_tried_again() -> TestResult {
+    use fleetringd::replication::{FaultPoint, ForkFaults};
+
+    let bound = Bound::start().await?;
+    // `d` holds no copy and no record; control state's promotion counts it as a replica.
+    bound
+        .authority
+        .set(2, None, Some("b"), &["a", "b", "c", "d"]);
+    let faults = ForkFaults::new();
+    bound.replication("d").set_fault_hooks(faults.clone());
+    faults.hold(FaultPoint::FenceRecorded);
+    let interrupted = tokio::time::timeout(
+        Duration::from_millis(500),
+        bound.fence_naming("b", "d", 2, "b", Some(7)),
+    )
+    .await;
+    assert!(interrupted.is_err(), "the fence was held: {interrupted:?}");
+    assert!(
+        faults
+            .await_arrivals(FaultPoint::FenceRecorded, 1, Duration::from_secs(10))
+            .await
+    );
+    // The server drops the call once it sees the caller give up.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    faults.release(FaultPoint::FenceRecorded);
+    assert_eq!(bound.highest_epoch("d"), Some(2), "the epoch was recorded");
+    assert_eq!(
+        bound.replication("d").copy_incarnation(&bound.db),
+        Some(Incarnation::new(7)),
+        "with the copy's incarnation"
+    );
+    bound.fence_naming("b", "d", 2, "b", Some(7)).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_to_a_node_outside_the_replica_set_is_refused() -> TestResult {
     let bound = Bound::start().await?;

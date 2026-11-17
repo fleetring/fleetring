@@ -445,8 +445,14 @@ impl Replication for ReplicationService {
             None => None,
         };
         failover::check_incarnation(inner, &name, named)?;
-        failover::admit_stream(inner, &name, open.epoch, primary.as_ref()).await?;
-        failover::record_followed(inner, &name, named.or(confirmed)).await?;
+        failover::admit_stream(
+            inner,
+            &name,
+            open.epoch,
+            primary.as_ref(),
+            named.or(confirmed),
+        )
+        .await?;
         if inner.primary(&name).is_some() || inner.registry().is_open(&name) {
             return Err(Status::failed_precondition(format!(
                 "{name} is open as a primary on this node"
