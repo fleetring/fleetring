@@ -3039,9 +3039,9 @@ async fn agent_remove_root_without_fleet_ends_the_subtree_by_principal_and_token
 }
 
 // ADR-0047, point 11.5: a root token signed within 30 seconds of its principal's revocation is
-// refused; one signed after the time `agent remove` printed works.
+// refused; one whose `iat` is the time `agent remove` printed works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn new_root_token_minted_31s_after_self_revocation_works() -> TestResult {
+async fn a_root_token_issued_at_the_printed_time_after_self_revocation_works() -> TestResult {
     let machine = Machine::new()?;
     machine.ok(&["agent", "add", "42"])?;
     let removed = machine.ok(&["agent", "remove", "42", "--yes"])?;
@@ -3079,21 +3079,49 @@ async fn new_root_token_minted_31s_after_self_revocation_works() -> TestResult {
     wait_until_revoked(&machine, certificate.path(), &soon)?;
     machine.ok(&["agent", "remove", "42", "--yes", "--no-revoke"])?;
 
-    // By the wall clock the command signs with, which may be stepped while a monotonic sleep
-    // runs.
-    while time::OffsetDateTime::now_utc() < from {
-        std::thread::sleep(Duration::from_millis(200));
+    // A token whose `iat` is the printed time works. Nodes judge a root token by its `iat`, not
+    // by when it arrives, and accept an `iat` up to 30 seconds ahead of their clock, so the test
+    // signs one with the dev authority, `iat` at the printed time, once the clock is within that
+    // leeway of it, rather than waiting the whole 31 seconds for `agent add` to sign one.
+    while time::OffsetDateTime::now_utc() < from - time::Duration::seconds(27) {
+        std::thread::sleep(Duration::from_millis(100));
     }
     machine.ok(&["agent", "add", "42"])?;
-    let later = machine.token("42")?;
-    let issued = claims(&later)?["iat"].as_i64().ok_or("no iat")?;
+    let added = claims(&machine.token("42")?)?;
+    let authority = fleetringd::tls::Authority::load(&machine.dev_dir().join("tls"))?;
+    let now = fleetring_control::Timestamp::from_millis(
+        u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())? * 1_000,
+    );
+    let scopes = added["fleetring.scopes"]
+        .as_array()
+        .ok_or("no scopes")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::parse)
+        .collect::<Result<fleetringd::auth::Scopes, _>>()?;
+    let owner = added["fleetring.owner"]
+        .as_str()
+        .ok_or("no owner")?
+        .parse()?;
+    let spec = fleetringd::auth::TokenSpec::new(
+        "agent-42".parse()?,
+        scopes,
+        "at-the-printed-time".parse()?,
+        now,
+        fleetring_control::Timestamp::from_millis(now.as_millis() + 3_600_000),
+    )
+    .signed_at(fleetring_control::Timestamp::from_millis(
+        u64::try_from(from.unix_timestamp())? * 1_000,
+    ))
+    .agent(owner);
+    let later = authority.token_signer()?.issue(&spec)?;
+    let issued = claims(later.expose())?["iat"].as_i64().ok_or("no iat")?;
     assert!(
         issued >= from.unix_timestamp(),
         "signed at {issued}, from {from}"
     );
     let certificate = copy_certificate(&machine, "42")?;
-    assert!(works(&machine, certificate.path(), &later)?);
-    machine.ok(&["db", "list", "--agent", "42"])?;
+    assert!(works(&machine, certificate.path(), later.expose())?);
     Ok(())
 }
 

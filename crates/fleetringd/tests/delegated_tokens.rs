@@ -23,7 +23,7 @@ const ISSUED: Timestamp = Timestamp::from_millis(1_800_000_000_000);
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The reload check's interval is one second; this waits it out with room.
+/// The reload check's interval is one second; the test advances paused time past it.
 const RELOAD_WAIT: Duration = Duration::from_millis(1_200);
 
 fn after(at: Timestamp, span: Duration) -> Timestamp {
@@ -137,8 +137,8 @@ fn write_bundle(path: &Path, pems: &[&str]) -> TestResult {
     Ok(())
 }
 
-#[test]
-fn x5c_cache_is_dropped_when_the_authority_bundle_changes() -> TestResult {
+#[tokio::test(start_paused = true)]
+async fn x5c_cache_is_dropped_when_the_authority_bundle_changes() -> TestResult {
     let fleet: FleetName = "lab".parse()?;
     // Authority A certifies the issuer; authority B certifies the node, so the identity still
     // loads once A leaves the bundle.
@@ -172,7 +172,7 @@ fn x5c_cache_is_dropped_when_the_authority_bundle_changes() -> TestResult {
 
     // A leaves the bundle; the next check after the reload interval loads a new generation.
     write_bundle(&ca, &[b.certificate_pem()])?;
-    std::thread::sleep(RELOAD_WAIT);
+    tokio::time::advance(RELOAD_WAIT).await;
     let verifier = identity.token_verifier();
     assert_eq!(verifier.keys().len(), 1, "the bundle was reloaded");
     assert_eq!(
@@ -184,7 +184,7 @@ fn x5c_cache_is_dropped_when_the_authority_bundle_changes() -> TestResult {
 
     // A returns: a new generation checks the certificate afresh and accepts it again.
     write_bundle(&ca, &[b.certificate_pem(), a.certificate_pem()])?;
-    std::thread::sleep(RELOAD_WAIT);
+    tokio::time::advance(RELOAD_WAIT).await;
     identity
         .token_verifier()
         .verify(&token, checked_at(), &none)?;
