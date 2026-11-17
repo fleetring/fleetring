@@ -10,6 +10,8 @@ use fleetringd::engine::{
 };
 use serde_json::Value as Json;
 
+mod support;
+
 const SKILL: &str = include_str!("../../../docs/agents/SKILL.md");
 const QUICKSTART: &str = include_str!("../../../docs/agents/quickstart.md");
 const LLMS_TXT: &str = include_str!("../../../llms.txt");
@@ -633,14 +635,7 @@ fn every_command_in_the_skill_and_the_quickstart_exists() -> Result<(), Box<dyn 
             if !checked.insert(path.clone()) {
                 continue;
             }
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_fleetring"))
-                .args(&path)
-                .arg("--help")
-                .env(
-                    "FLEETRING_HOME",
-                    std::env::temp_dir().join("fleetring-skill-help"),
-                )
-                .output()?;
+            let output = support::fleetring().args(&path).arg("--help").output()?;
             assert!(
                 output.status.success(),
                 "{page}: `fleetring {}` isn't a command: {}",
