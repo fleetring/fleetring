@@ -599,6 +599,54 @@ async fn a_fence_interrupted_after_its_record_can_be_tried_again() -> TestResult
     Ok(())
 }
 
+/// A copy whose record has seen an epoch but names no incarnation, as a release before
+/// followers recorded them wrote it, is a copy of a database created before forks: a fence
+/// naming a random incarnation is refused and records nothing, while one naming none, from a
+/// candidate of that release, or the legacy incarnation passes, and the legacy one labels the
+/// copy (ADR-0046's amendment, item 13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlabelled_copy_is_fenced_only_for_the_legacy_incarnation() -> TestResult {
+    let bound = Bound::start().await?;
+    // `d` has never been reached for `orders`; its record is written as 0.7 wrote one, read
+    // when the record is first asked for.
+    let record = bound
+        ._dir
+        .path()
+        .join("d")
+        .join("replication")
+        .join("epochs")
+        .join(DATABASE)
+        .join("epoch");
+    std::fs::create_dir_all(record.parent().ok_or("no parent")?)?;
+    std::fs::write(&record, r#"{"highest":2,"holder":"b"}"#)?;
+    bound
+        .authority
+        .set(2, None, Some("b"), &["a", "b", "c", "d"]);
+
+    bound.fence_naming("b", "d", 2, "b", None).await?;
+    assert_eq!(bound.replication("d").copy_incarnation(&bound.db), None);
+    let refused = bound
+        .fence_naming("b", "d", 2, "b", Some(7))
+        .await
+        .err()
+        .ok_or("an unlabelled copy took a random incarnation's fence")?;
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(
+        refused.message().contains("records no incarnation"),
+        "{refused}"
+    );
+    assert_eq!(bound.refusals("d"), 0, "stale, not misbound");
+    assert_eq!(bound.replication("d").copy_incarnation(&bound.db), None);
+    bound.fence_naming("b", "d", 2, "b", Some(0)).await?;
+    assert_eq!(
+        bound.replication("d").copy_incarnation(&bound.db),
+        Some(Incarnation::LEGACY),
+        "the legacy incarnation's fence labels the copy"
+    );
+    assert_eq!(bound.highest_epoch("d"), Some(2));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_to_a_node_outside_the_replica_set_is_refused() -> TestResult {
     let bound = Bound::start().await?;
