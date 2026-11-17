@@ -126,6 +126,22 @@ pub(crate) fn authenticate(
     })
 }
 
+#[cfg(test)]
+impl Caller {
+    /// A caller for `principal`, counted under `quota`, with token ID `token`, no scopes, and no
+    /// token to forward: for tests of what the router does with a caller it already verified.
+    pub(crate) fn verified_for_tests(principal: &str, quota: &str, token: &str) -> Self {
+        Self {
+            principal: principal.parse().expect("a principal"),
+            quota: quota.parse().expect("a principal"),
+            token_id: token.parse().expect("a token id"),
+            scopes: Scopes::default(),
+            lineage: None,
+            credentials: Credentials::none(),
+        }
+    }
+}
+
 /// Checks that `caller` may read `database`, the least any request through the router needs.
 ///
 /// # Errors

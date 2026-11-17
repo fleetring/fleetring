@@ -468,6 +468,67 @@ async fn a_revoked_token_is_unauthenticated() -> TestResult {
     Ok(())
 }
 
+/// The router holds no denylist, so it keeps a new stream only once a node has opened a session
+/// for its token: a pipeline that calls no node opens the session before it answers, and a token
+/// the node refuses, as a revoked one, gets `401` and no stream, so streams with empty pipelines
+/// can't fill the router's table after a revocation (ADR-0037, point 18; ADR-0047).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_is_kept_only_once_a_node_accepts_its_token() -> TestResult {
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("notes", 1).await?;
+    let token = fleet.token("app", &["write:notes"], "t-vouched")?;
+    let empty = pipeline(None, json!([{"type": "get_autocommit"}]));
+    let kept = fleet
+        .post("/db/notes/v3/pipeline", Some(&token), &empty)
+        .await?;
+    assert_eq!(kept.status, StatusCode::OK, "{}", kept.text);
+    let baton = kept.baton().ok_or("a node accepted the token, so a baton")?;
+    let next = fleet
+        .post(
+            "/db/notes/v3/pipeline",
+            Some(&token),
+            &pipeline(Some(&baton), json!([execute("SELECT 1", json!([])), close()])),
+        )
+        .await?;
+    assert_eq!(next.result(0)["type"], "ok", "{}", next.text);
+
+    fleet
+        .admin
+        .control()
+        .revoke_token(RevokeTokenRequest {
+            revocation: Some(Revocation {
+                revoked: Some(Revoked::TokenId("t-vouched".into())),
+                until_ms: SystemClock
+                    .now()
+                    .saturating_add(Millis::new(3_600_000))
+                    .as_millis(),
+            }),
+            principal: String::new(),
+        })
+        .await?;
+    let refused = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let answer = fleet
+                .post("/db/notes/v3/pipeline", Some(&token), &empty)
+                .await?;
+            if answer.status != StatusCode::OK {
+                return Ok::<_, Box<dyn std::error::Error>>(answer);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.text);
+    assert_eq!(refused.body["code"], "UNAUTHENTICATED", "{}", refused.text);
+    assert_eq!(refused.baton(), None, "no stream is kept: {}", refused.text);
+    fleet.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_refuses_v3_only_requests() -> TestResult {
     let fleet = Fleet::start(Options {
