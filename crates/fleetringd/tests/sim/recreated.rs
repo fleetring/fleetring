@@ -17,13 +17,20 @@
 //! the copy; and, once forks have given databases random incarnations, S refuses a stream for
 //! another incarnation than its copy records, and the drop notice deletes the copy, since the
 //! copy records the dropped incarnation and control state holds another.
+//!
+//! Since FR-110 every database a control node of 0.8.1 or later creates has a random
+//! incarnation, forked fleet or not (ADR-0046's FR-110 amendment). The scenarios of a fleet that
+//! never forked stand the control node in for one of 0.8.0 where only the chain hash can tell
+//! the copies apart, as while it isn't upgraded yet or after a rollback.
 
 use std::time::Duration;
 
 use fleetring_control::fork::OperationId;
-use fleetring_control::{DatabaseName, Feature};
+use fleetring_control::{DatabaseName, Feature, Incarnation, IncarnationRule};
 use fleetringd::replication::ReplicationSettings;
-use fleetringd::sim::{DurabilityMode, Fleet, History, Operation, Script, Timings, check, seeds};
+use fleetringd::sim::{
+    DurabilityMode, Fleet, History, Operation, ReplicaRows, Script, Timings, check, seeds,
+};
 
 use crate::{BINARY, TestResult};
 
@@ -44,13 +51,25 @@ const ORIGIN_VALUE: i64 = 9_000;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Whether the fleet has made a fork, so that new databases have random incarnations.
+/// Whether the fleet has made a fork, so that a control node of 0.8.0 gives new databases
+/// random incarnations.
 #[derive(Debug, Clone, Copy)]
 enum Forks {
-    /// Every database has the legacy incarnation: only the chain hash tells the copies apart.
+    /// The fleet never forked and its control node runs 0.8.0, so every database has the legacy
+    /// incarnation: only the chain hash tells the copies apart.
     Never,
     /// A fork enabled the `fork` feature before the name's first life.
     Made,
+}
+
+/// Which control node created the name's first life, in a fleet that never forked.
+#[derive(Debug, Clone, Copy)]
+enum FirstLife {
+    /// This release's: the first life has a random incarnation too.
+    Random,
+    /// One of 0.8.0, upgraded before the drop: the first life keeps the legacy incarnation,
+    /// and only the database created again has a random one.
+    BeforeTheUpgrade,
 }
 
 fn reused() -> Result<DatabaseName> {
@@ -164,6 +183,9 @@ fn scenario(seed: u64, forks: Forks) -> TestResult {
         .timings(timings)
         .replication(settings())
         .operation_timeout(Duration::from_secs(4));
+    if let Forks::Never = forks {
+        builder = builder.incarnation_rule(IncarnationRule::OnceForked);
+    }
     for node in NODES {
         builder = builder.data(node);
     }
@@ -506,6 +528,224 @@ fn recreated_while_a_follower_is_cut_off(seed: u64) -> TestResult {
     Ok(())
 }
 
+/// A never-forked fleet's name is dropped and created again quickly while a follower, S, handles
+/// the drop notice late, and the new primary, P, fails before it streams to S (FR-110).
+///
+/// The first life checkpoints several times on P, S and T. S's control calls are slow when the
+/// name is dropped: P and T delete their copies at once, S keeps its own while the name is
+/// created again on P at epoch 1, and P is cut off from S, so the new database's writes reach P and T alone.
+/// Then P fails, and the promotion to epoch 2 fences S and T. Before the fix both lives had the
+/// legacy incarnation, 0: S judged the notice by its epoch against the new database at epoch 1
+/// and kept the copy, the promotion's fence named 0 and S took it, and its position, whose log
+/// generation leads, ranked first, so the promotion served the dropped rows and lost the writes
+/// P and T acknowledged. Now every database created has a random incarnation, so the fence names
+/// one S's copy doesn't record, and S refuses it.
+///
+/// A first life with a random incarnation of its own goes on the late notice too, which names
+/// that incarnation while control state holds another. One created before the control node was
+/// upgraded keeps the legacy incarnation, and S keeps its copy as an orphan: the notice, judged by
+/// its epoch, is refused for its binding, as in a fleet that never forked; the fence of the new
+/// database, which names a random incarnation, is refused for the copy's.
+fn late_drop_notice_then_primary_lost(seed: u64, first_life: FirstLife) -> TestResult {
+    let timings = Timings {
+        heartbeat_timeout: Duration::from_secs(5),
+        lease_duration: Duration::from_secs(6),
+        lease_renewal: Duration::from_secs(1),
+        failover_margin: Duration::from_secs(1),
+        ..Timings::default()
+    };
+    let mut builder = Fleet::builder(seed)
+        .control(CONTROL)
+        .timings(timings)
+        .replication(settings())
+        .operation_timeout(Duration::from_secs(4));
+    if let FirstLife::BeforeTheUpgrade = first_life {
+        builder = builder.incarnation_rule(IncarnationRule::OnceForked);
+    }
+    for node in NODES {
+        builder = builder.data(node);
+    }
+    let mut fleet = builder.build()?;
+    fleet.await_ring(Duration::from_secs(10))?;
+    let database = reused()?;
+
+    // The first life, long enough to checkpoint several times, on every node.
+    let mut first = vec![Operation::Create {
+        database: database.clone(),
+        replication_factor: 3,
+        durability: DurabilityMode::Quorum,
+    }];
+    first.extend((0..FIRST_LIFE).map(|value| Operation::Write {
+        database: database.clone(),
+        value,
+    }));
+    run_script(&mut fleet, "first", first)?;
+    fleet.await_replicas_converged(LIMIT)?;
+    if let FirstLife::BeforeTheUpgrade = first_life {
+        // The control node is upgraded: the database it made keeps the legacy incarnation.
+        fleet.set_incarnation_rule(None);
+        fleet.stop(CONTROL)?;
+        fleet.restart(CONTROL)?;
+        fleet.await_ring(LIMIT)?;
+        // The data nodes reach the restarted control node again before the drop: a notice a node
+        // can't check against control state is refused, and its copy kept as an orphan.
+        fleet.run_for(Duration::from_secs(5))?;
+        let kept = fleet
+            .control_state()
+            .and_then(|state| state.database(&database).map(|db| db.incarnation()));
+        if kept != Some(Incarnation::LEGACY) {
+            return Err(format!("the upgrade gave the first life incarnation {kept:?}").into());
+        }
+        // The late notice names the legacy incarnation, so S refuses it for its binding, as
+        // in a fleet that never forked (ADR-0042, point 2).
+        fleet.allow_binding_refusals();
+        fleet.await_replicas_converged(LIMIT)?;
+    }
+    let primary = leader(&fleet, &database).ok_or("no primary for the first life")?;
+    let mut followers = NODES.into_iter().filter(|node| *node != primary);
+    let late = followers.next().ok_or("no follower")?.to_owned();
+    let prompt = followers.next().ok_or("no second follower")?.to_owned();
+    fleet.note(format!(
+        "{database} led by {primary}; {late} handles the drop notice late and is cut off from \
+         {primary}; {prompt} follows the new database"
+    ));
+
+    // S's control calls are slow when the name is dropped; P and T delete their copies at once.
+    fleet.set_latency(&late, CONTROL, SLOW)?;
+    run_script(
+        &mut fleet,
+        "drop",
+        vec![Operation::Drop {
+            database: database.clone(),
+        }],
+    )?;
+    let copy_on = |fleet: &Fleet, host: &str| {
+        fleet
+            .data_dir(host)
+            .is_some_and(|dir| dir.join("databases").join("reused").exists())
+    };
+    let (p, t) = (primary.clone(), prompt.clone());
+    fleet.run_until(LIMIT, "P and T deleting their copies", |fleet| {
+        !copy_on(fleet, &p) && !copy_on(fleet, &t)
+    })?;
+    if !copy_on(&fleet, &late) {
+        return Err(format!("{late} deleted its copy before the name was created again").into());
+    }
+
+    // The name is created again at once, on P, which never reaches S.
+    fleet.partition(&primary, &late)?;
+    run_script(
+        &mut fleet,
+        "again",
+        vec![Operation::Create {
+            database: database.clone(),
+            replication_factor: 3,
+            durability: DurabilityMode::Quorum,
+        }],
+    )?;
+    if leader(&fleet, &database).as_deref() != Some(primary.as_str()) {
+        return Err(format!(
+            "the second life is led by {:?}, not {primary}",
+            leader(&fleet, &database)
+        )
+        .into());
+    }
+    // Checked once the history has been: a property, not this, must catch the legacy
+    // incarnation stored again.
+    let created = fleet
+        .control_state()
+        .and_then(|state| state.database(&database).map(|db| db.incarnation()));
+    // S judges the drop notice against the second life at epoch 1. Its link heals before its
+    // heartbeats fall too far behind for it to count as live.
+    fleet.run_for(3 * SLOW)?;
+    fleet.set_latency(&late, CONTROL, Duration::from_millis(10))?;
+    fleet.run_for(Duration::from_secs(2))?;
+    run_script(
+        &mut fleet,
+        "second",
+        (SECOND_LIFE..SECOND_LIFE + SECOND_WRITES)
+            .map(|value| Operation::Write {
+                database: database.clone(),
+                value,
+            })
+            .collect(),
+    )?;
+    let life = second_life(&fleet.history());
+    let acknowledged: Vec<i64> = life.acknowledged_writes().map(|(_, value)| value).collect();
+    if acknowledged.is_empty() {
+        return Err("the second life acknowledged no write".into());
+    }
+    check::acknowledged_writes_replicated(&life, &database, &fleet.replica_rows(&database)?, 2)?;
+
+    // Whoever leads the new database holds every write it acknowledged, and none of the dropped
+    // database's rows.
+    let served = |fleet: &Fleet, holder: &str| -> Result<()> {
+        let rows = fleet.replica_rows(&database)?;
+        let held: ReplicaRows = rows
+            .get(holder)
+            .map(|values| (holder.to_owned(), values.clone()))
+            .into_iter()
+            .collect();
+        check::acknowledged_writes_replicated(&life, &database, &held, 1)?;
+        if let Some(dropped) = held.values().flatten().find(|value| **value < SECOND_LIFE) {
+            return Err(
+                format!("{holder} serves the dropped database's row {dropped}: {rows:?}").into(),
+            );
+        }
+        Ok(())
+    };
+
+    // P fails before it has streamed anything to S: the promotion to epoch 2 fences S and T.
+    fleet.crash(&primary)?;
+    let mut promoted = None;
+    for _ in 0..150 {
+        fleet.run_for(Duration::from_millis(100))?;
+        if let Some(holder) = leader(&fleet, &database).filter(|holder| *holder != primary) {
+            served(&fleet, &holder)?;
+            promoted = Some(holder);
+            break;
+        }
+    }
+    // A copy that outlived the notice refuses the fence, and the promotion waits for P.
+    fleet.repair(&primary, &late)?;
+    fleet.restart(&primary)?;
+    if promoted.is_none() {
+        let old = primary.clone();
+        let name = database.clone();
+        fleet.run_until(LIMIT, "the second life's promotion", |fleet| {
+            leader(fleet, &name).is_some_and(|holder| holder != old)
+        })?;
+    }
+    fleet.await_ring(LIMIT)?;
+    match first_life {
+        FirstLife::Random => {
+            fleet.await_replicas_converged(LIMIT)?;
+        }
+        // S keeps the legacy copy as an orphan, for `orphan remove` (ADR-0042): the notice was
+        // judged by its epoch, and the new database's streams and fences name another
+        // incarnation, so S never follows it, as in a fleet that has forked. The rest of the
+        // fleet finishes as ever.
+        FirstLife::BeforeTheUpgrade => {
+            let (host, name) = (late.clone(), database.clone());
+            fleet.run_until(LIMIT, "S keeping its copy as an orphan", |fleet| {
+                fleet
+                    .replication(&host)
+                    .is_some_and(|replication| replication.is_orphan(&name))
+            })?;
+            fleet.run_for(Duration::from_secs(5))?;
+        }
+    }
+    let holder = leader(&fleet, &database).ok_or("no primary")?;
+    served(&fleet, &holder)?;
+    let rows = fleet.replica_rows(&database)?;
+    check::acknowledged_writes_replicated(&life, &database, &rows, 2)?;
+    fleet.finish()?;
+    if created.is_none_or(|incarnation| incarnation == Incarnation::LEGACY) {
+        return Err(format!("the name was created again at incarnation {created:?}").into());
+    }
+    Ok(())
+}
+
 /// A copy whose record has seen an epoch but names no incarnation, as one a release before
 /// followers recorded incarnations left, is a copy of a database created before forks. When the
 /// name was dropped while its node was down and created again with a random incarnation, the
@@ -607,9 +847,9 @@ fn an_unlabelled_copy_is_an_orphan_once_the_name_has_a_random_incarnation() {
     seeds::run(BINARY, &seeds::FIXED, unlabelled_copy_after_a_recreation);
 }
 
-/// In a fleet that never forked, every database has the legacy incarnation: the follower's
-/// copy of the dropped database is told apart by its chain hash at its first acknowledgement,
-/// and re-seeded, before it counts toward any write.
+/// In a fleet that never forked, under a control node of 0.8.0, every database has the legacy
+/// incarnation: the follower's copy of the dropped database is told apart by its chain hash at
+/// its first acknowledgement, and re-seeded, before it counts toward any write.
 #[test]
 fn a_dropped_databases_copy_never_counts_toward_a_database_created_again() {
     seeds::run(BINARY, &seeds::FIXED, |seed| scenario(seed, Forks::Never));
@@ -629,4 +869,25 @@ fn a_dropped_databases_copy_is_neither_followed_nor_kept_for_one_created_again()
 #[test]
 fn a_dropped_databases_copy_refuses_a_fence_for_one_created_again() {
     seeds::run(BINARY, &seeds::FIXED, recreated_while_a_follower_is_cut_off);
+}
+
+/// In a fleet that never forked, a follower that handles a drop notice late, after the name was
+/// created again, holds a copy of another incarnation than the new database's, so a promotion
+/// after the new primary fails, before it streamed to that follower, never serves the dropped
+/// rows nor loses the new database's acknowledged writes.
+#[test]
+fn a_late_drop_notice_never_lets_a_promotion_serve_the_dropped_database() {
+    seeds::run(BINARY, &seeds::FIXED, |seed| {
+        late_drop_notice_then_primary_lost(seed, FirstLife::Random)
+    });
+}
+
+/// As above for a name whose first life a control node of 0.8.0 created, with the legacy
+/// incarnation, before it was upgraded: the database created again has a random incarnation, so
+/// `(name, 0)` names the first life alone, and its stale copy refuses the new database's fence.
+#[test]
+fn a_late_drop_notice_of_a_database_made_before_the_upgrade_never_serves_it() {
+    seeds::run(BINARY, &seeds::FIXED, |seed| {
+        late_drop_notice_then_primary_lost(seed, FirstLife::BeforeTheUpgrade)
+    });
 }
