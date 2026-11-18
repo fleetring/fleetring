@@ -660,6 +660,30 @@
       "docs": "https://github.com/fleetring/fleetring/blob/main/crates/fleetringd/README.md#mcp-server"
     },
     {
+      "id": "database-forks",
+      "component": "fleetringd",
+      "area": "access",
+      "title": "Database forks",
+      "description": "fleetring db fork and the MCP db_fork copy a database’s current contents into a new, independent database, usable once it is ready, with an operation ID that makes every retry safe.",
+      "status": "built",
+      "since": "0.8.0",
+      "ticket": "FR-086",
+      "issue": 136,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/cli.md#15-forks"
+    },
+    {
+      "id": "agent-delegation",
+      "component": "fleetringd",
+      "area": "access",
+      "title": "Delegated agents",
+      "description": "fleetring agent delegate gives a sub-agent its own narrower, shorter-lived credential, and agent remove revokes it and every agent below it. Trusted local development until the agent launcher exists.",
+      "status": "built",
+      "since": "0.8.0",
+      "ticket": "FR-092",
+      "issue": 142,
+      "docs": "https://github.com/fleetring/fleetring/blob/main/docs/agents/quickstart.md#5-give-a-sub-agent-its-own-credential"
+    },
+    {
       "id": "statement-deadlines",
       "component": "fleetringd",
       "area": "operations",

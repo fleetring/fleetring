@@ -2,7 +2,7 @@
 
 Give an AI agent its own FleetRing databases on a laptop with one command: the agent's MCP client runs `fleetring mcp --agent 42`, which starts a dev node if none runs, gives the agent its own principal scoped to its own databases, and serves. The [skill](SKILL.md) is what the agent reads afterwards.
 
-> **Trusted local development.** Agents on this machine can read each other's credentials. FleetRing tokens restrict FleetRing requests, not an agent's process: agents running as the same OS user can read each other's identity files under `~/.fleetring/agents/` and open SQLite files directly, so separate identities and private directories don't isolate them from each other. Secure separation between agents needs an isolated agent launcher and credential broker, which [ADR-0044](../adr/0044-identity-delegation-and-forking-for-agents.md) ("Runtime isolation and the agent launcher") designs, and which isn't part of 0.8. A [delegated agent](#5-delegate-to-a-child) doesn't change this: it runs with its root agent's certificate, on the same account.
+> **Trusted local development.** Agents on this machine can read each other's credentials. FleetRing tokens restrict FleetRing requests, not an agent's process: agents running as the same OS user can read each other's identity files under `~/.fleetring/agents/` and open SQLite files directly, so separate identities and private directories don't isolate them from each other. Secure separation between agents needs an isolated agent launcher and credential broker, which [ADR-0044](../adr/0044-identity-delegation-and-forking-for-agents.md) ("Runtime isolation and the agent launcher") designs, and which isn't part of 0.8. A [delegated agent](#5-give-a-sub-agent-its-own-credential) doesn't change this: it runs with its root agent's certificate, on the same account.
 
 ## 1. Register the MCP server
 
@@ -33,7 +33,7 @@ When the MCP client starts `fleetring mcp --agent 42` and the `dev` context is s
 1. **It acquires a node.** If no dev node runs from `~/.fleetring`, it starts one in the background, as `fleetring dev -d` does, writes the `dev` context, and makes it current unless another context is. The node outlives the MCP server; `fleetring dev stop` stops it, and `fleetring dev logs` shows its log.
 2. **It acquires an identity.** If `~/.fleetring/agents/42/` holds none, it checks that `~/.fleetring` is a dev directory (its configuration says `dev = true` and keeps every address on loopback, and its authority is for the fleet `dev`), then mints one from the dev authority:
    - the principal `agent-42`, with a client certificate valid for a year;
-   - a token scoped `admin:agent-42-*` and `stream:agent-42-*`, valid for 30 days, which lets the agent create, use, describe, label, list, follow the changes of, fork, and drop databases whose names start with `agent-42-`, and nothing else. Since 0.8, once every node reports the `delegation` feature, as a 0.8 dev node does, it also holds `admin:agent-42.*`, `stream:agent-42.*`, `grant:agent-42-*`, and `grant:agent-42.*`, so that the agent can [delegate](#5-delegate-to-a-child) to children, whose databases are `agent-42.<segment>-…`;
+   - a token scoped `admin:agent-42-*` and `stream:agent-42-*`, valid for 30 days, which lets the agent create, use, describe, label, list, follow the changes of, fork, and drop databases whose names start with `agent-42-`, and nothing else. Since 0.8, once every node reports the `delegation` feature, as a 0.8 dev node does, it also holds `admin:agent-42.*`, `stream:agent-42.*`, `grant:agent-42-*`, and `grant:agent-42.*`, so that the agent can [delegate](#5-give-a-sub-agent-its-own-credential) to children, whose databases are `agent-42.<segment>-…`;
    - in `~/.fleetring/agents/42/`, a directory only you can read (`0700`): `ca.crt`, `client.agent-42.crt` and `client.agent-42.key`, `token`, and `identity.toml`, which holds no secret. Every file is `0600`.
 3. **It serves** MCP on stdin and stdout as `agent-42`, and says on stderr whom it serves as, on which context, and when the certificate and token expire.
 
@@ -90,9 +90,9 @@ Nothing holds the agent's place between calls, so a dev node releases changes wi
 
 Then give the agent the [skill](SKILL.md): load it as a skill if the client supports skills, or put it in the agent's instructions. It covers when to create a database rather than a table, naming, labels, descriptions, expiry, following changes, and SQL patterns for memory, task state, and full-text search. `--max-result-bytes <n>` after `mcp` caps each result's JSON (256 KiB by default, from 64 KiB to 4 MiB); the [daemon README](../../crates/fleetringd/README.md#mcp-server) describes the tools, their results and errors, and how the server marks untrusted text.
 
-## 5. Delegate to a child
+## 5. Give a sub-agent its own credential
 
-An agent that spawns workers can give each one a credential of its own, narrower and shorter-lived than its own, without the authority's key (ADR-0047). The harness that starts the agents runs it, never the model: no MCP tool delegates, revokes, or returns a token. The child of `42` is `42.c7`, whose principal is `agent-42.c7` and whose databases are `agent-42.c7-…`.
+An agent that spawns sub-agents can give each one a credential of its own, narrower and shorter-lived than its own, without the authority's key (ADR-0047). Each sub-agent is a *delegated agent*, a child of the agent that delegates to it. The harness that starts the agents runs `agent delegate`, never the model: no MCP tool delegates, renews, revokes, or returns a token. The child of `42` is `42.c7`, whose principal is `agent-42.c7` and whose databases are `agent-42.c7-…`.
 
 ```sh
 fleetring agent delegate 42.c7
@@ -122,7 +122,9 @@ fleetring db query agent-42-memory --agent 42.c7 "SELECT 1"  # refused: the pare
 claude mcp add fleetring-c7 -- fleetring mcp --agent 42.c7 --context dev
 ```
 
-`mcp --agent 42.c7` serves with the child's token and never mints or renews it; at start it names the parent, the owner, and when the token expires.
+`mcp --agent 42.c7` serves with the child's token and never mints or renews it; at start it names the parent, the owner, and when the token expires, with the command that renews it.
+
+**When the child's token runs out,** its calls fail with `unauthenticated`, and the hint says to ask the parent: `fleetring agent renew 42.c7`. The harness runs that as the parent, and the child's running MCP server picks the new token up on its next call, with no restart. The child can't renew itself.
 
 **What a child can do.** By default, its parent's own actions, `admin` and `stream` (`read` and `stream` under a read-only parent), on `agent-42.c7-*`, and nothing else: not its parent's databases, not its siblings', and no children of its own. Ask for more with `--scope`, repeated, each covered whole by the parent's scopes and its `grant`, and inside agent 42's databases:
 
