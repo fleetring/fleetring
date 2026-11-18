@@ -4,9 +4,9 @@
 use fleetring::{NodeId, ReplicationFactor, Weight, Zone};
 use fleetring_control::{
     Acks, Action, Command, ControlConfig, DatabaseName, DescriptionChange, Durability, Engine,
-    ExpiryChange, Feature, HostedReplica, LeaseEpoch, Member, MetadataChange, MetadataSpec, Millis,
-    Outcome, Position, Release, ReplicaRole, ReplicasCaughtUp, Revoked, Software, State, Timestamp,
-    apply, parse_label,
+    ExpiryChange, Feature, HostedReplica, Incarnation, IncarnationRule, LeaseEpoch, Member,
+    MetadataChange, MetadataSpec, Millis, Outcome, Position, Release, ReplicaRole,
+    ReplicasCaughtUp, Revoked, Software, State, Timestamp, apply, parse_label,
 };
 use proptest::prelude::*;
 
@@ -63,7 +63,25 @@ pub(crate) fn create(name: &str, replication_factor: u8) -> Action {
         durability: None,
         metadata: None,
         incarnation: fleetring_control::Incarnation::LEGACY,
+        incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
     }
+}
+
+/// Creates `name` with `replication_factor` replicas at `incarnation`, under this release's rule,
+/// which stores the incarnation whether or not the fleet has forked (ADR-0046's FR-110
+/// amendment).
+pub(crate) fn create_always(name: &str, replication_factor: u8, incarnation: u64) -> Action {
+    let mut action = create(name, replication_factor);
+    if let Action::CreateDatabase {
+        incarnation: drawn,
+        incarnation_rule,
+        ..
+    } = &mut action
+    {
+        *drawn = Incarnation::new(incarnation);
+        *incarnation_rule = IncarnationRule::Always;
+    }
+    action
 }
 
 /// Creates `name` with `replication_factor` replicas in `acks`, with the floor at W.
@@ -75,6 +93,7 @@ pub(crate) fn create_with(name: &str, replication_factor: u8, acks: Acks) -> Act
         durability: Some(Durability::new(acks, factor(replication_factor))),
         metadata: None,
         incarnation: fleetring_control::Incarnation::LEGACY,
+        incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
     }
 }
 
@@ -270,6 +289,20 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
                 && let Action::CreateDatabase { metadata, .. } = &mut creation
             {
                 *metadata = Some(metadata_spec(state, op));
+            }
+            // Most creations among current members carry this release's rule, with an
+            // incarnation that is now and then 0, or a live database's, which `apply` refuses
+            // (ADR-0046's FR-110 amendment); the rest are logged as 0.8.0 logged them.
+            if mix == SoftwareMix::Current
+                && !b.is_multiple_of(3)
+                && let Action::CreateDatabase {
+                    incarnation,
+                    incarnation_rule,
+                    ..
+                } = &mut creation
+            {
+                *incarnation = Incarnation::new(u64::from(op.a % 16) * 0x0101_0101_0101_0101);
+                *incarnation_rule = IncarnationRule::Always;
             }
             creation
         }

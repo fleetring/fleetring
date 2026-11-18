@@ -11,8 +11,9 @@ use crate::fork::{
 };
 use crate::scope::Scopes;
 use crate::{
-    DatabaseName, Durability, Engine, Feature, HostedReplica, Incarnation, LeaseEpoch, Member,
-    MetadataChange, MetadataSpec, Position, PrincipalName, Revoked, Software, Timestamp,
+    DatabaseName, Durability, Engine, Feature, HostedReplica, Incarnation, IncarnationRule,
+    LeaseEpoch, Member, MetadataChange, MetadataSpec, Position, PrincipalName, Revoked, Software,
+    Timestamp,
 };
 
 /// The features of a command that needs database metadata.
@@ -172,11 +173,16 @@ pub enum Action {
         metadata: Option<MetadataSpec>,
         /// The database's incarnation: 64 random bits the proposing control node draws, so that
         /// a name dropped and created again names another life of it (ADR-0046, point 1).
-        /// Stored once [`Feature::Fork`] is enabled, when 0 is refused, and ignored until then,
-        /// so that a fleet that can still roll back stores nothing new. Creations logged before
-        /// the field existed carry 0.
+        /// Stored as `incarnation_rule` says, when 0 is refused, and otherwise ignored.
+        /// Creations logged before the field existed carry 0.
         #[serde(default, skip_serializing_if = "Incarnation::is_legacy")]
         incarnation: Incarnation,
+        /// When the incarnation is stored: [`IncarnationRule::Always`] from a control node of
+        /// 0.8.1 or later, and [`IncarnationRule::OnceForked`], which the log leaves out, from
+        /// earlier ones (ADR-0046's FR-110 amendment). A release before 0.8.1 ignores the field
+        /// and stores the creation as it always did.
+        #[serde(default, skip_serializing_if = "IncarnationRule::is_once_forked")]
+        incarnation_rule: IncarnationRule,
     },
 
     /// Changes a database's metadata with a patch (ADR-0041, point 2): only the description,

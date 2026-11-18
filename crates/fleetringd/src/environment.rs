@@ -11,6 +11,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fleetring_control::IncarnationRule;
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint};
 
@@ -241,6 +242,9 @@ pub struct Environment {
     drop_flush_limit: Duration,
     /// The fork tests' fault hooks; empty, and inert, unless a test gives some.
     fork_faults: ForkFaults,
+    /// The rule a control node logs creations under: [`IncarnationRule::Always`], unless a
+    /// simulation stands it in for one of an earlier release.
+    incarnation_rule: IncarnationRule,
 }
 
 impl Environment {
@@ -255,6 +259,7 @@ impl Environment {
             object_stores: BTreeMap::new(),
             drop_flush_limit: DROP_FLUSH_LIMIT,
             fork_faults: ForkFaults::default(),
+            incarnation_rule: IncarnationRule::Always,
         }
     }
 
@@ -275,6 +280,7 @@ impl Environment {
             object_stores: BTreeMap::new(),
             drop_flush_limit: DROP_FLUSH_LIMIT,
             fork_faults: ForkFaults::default(),
+            incarnation_rule: IncarnationRule::Always,
         }
     }
 
@@ -346,6 +352,22 @@ impl Environment {
     pub fn with_fork_faults(mut self, faults: ForkFaults) -> Self {
         self.fork_faults = faults;
         self
+    }
+
+    /// Logs every database creation under `rule`, as a control node of a release before 0.8.1
+    /// does with [`IncarnationRule::OnceForked`]: for simulations of a fleet whose control node
+    /// hasn't been upgraded, or was rolled back (ADR-0046's FR-110 amendment).
+    #[cfg(feature = "simulation")]
+    #[must_use]
+    pub fn with_incarnation_rule(mut self, rule: IncarnationRule) -> Self {
+        self.incarnation_rule = rule;
+        self
+    }
+
+    /// The rule a control node logs database creations under.
+    #[must_use]
+    pub fn incarnation_rule(&self) -> IncarnationRule {
+        self.incarnation_rule
     }
 
     /// The fault hooks the node's fork work passes.

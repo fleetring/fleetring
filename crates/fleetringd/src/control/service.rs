@@ -14,8 +14,8 @@ use fleetring_control::fork::{ForkExpiry, ForkIntent, ForkLimits, OperationId, O
 use fleetring_control::scope::Scopes;
 use fleetring_control::{
     Acks, Action, Applied, DatabaseName, Durability, Engine, ExpiryChange, Feature, Incarnation,
-    KeyId, Lease, LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position, PrincipalName,
-    Rejection, Revoked, Software, State, Timestamp,
+    IncarnationRule, KeyId, Lease, LeaseEpoch, Liveness, Member, MetadataSpec, Millis, Position,
+    PrincipalName, Rejection, Revoked, Software, State, Timestamp,
 };
 use fleetring_proto::v1::control_server::Control;
 use fleetring_proto::v1::{
@@ -134,6 +134,9 @@ pub struct ControlService {
     notices: Option<DropNotices>,
     /// Where incarnations come from (ADR-0020, ADR-0046 point 1.1).
     entropy: Arc<dyn Entropy>,
+    /// The rule every creation is logged under: [`IncarnationRule::Always`], unless a
+    /// simulation stands this control node in for one of an earlier release.
+    incarnation_rule: IncarnationRule,
     /// The limits each fork this service proposes records (ADR-0046, point 7).
     fork_limits: ForkLimits,
     /// Test-only faults: a lost reply to a fork request (FR-086).
@@ -158,6 +161,7 @@ impl ControlService {
             dev: DevMode::Off,
             notices: None,
             entropy: Arc::new(SystemEntropy::new()),
+            incarnation_rule: IncarnationRule::Always,
             fork_limits: ForkLimits::new(),
             fork_faults: ForkFaults::default(),
             progress: SeedProgressBoard::default(),
@@ -179,6 +183,15 @@ impl ControlService {
     #[must_use]
     pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
         self.entropy = entropy;
+        self
+    }
+
+    /// Logs every creation under `rule`, so that a simulation can stand this control node in for
+    /// one of a release before 0.8.1, which logs [`IncarnationRule::OnceForked`] (ADR-0046's
+    /// FR-110 amendment).
+    #[must_use]
+    pub(crate) fn with_incarnation_rule(mut self, rule: IncarnationRule) -> Self {
+        self.incarnation_rule = rule;
         self
     }
 
@@ -418,9 +431,10 @@ impl ControlService {
 
     /// Submits `action`, a command that brings a database name into existence, with an
     /// incarnation drawn from the injected generator, and draws again and resubmits while
-    /// `apply` refuses the incarnation as unavailable (ADR-0046, point 1.1). Every creation draws
-    /// one, before forks are enabled too: `apply` stores 0 until then, so a creation screened
-    /// before the feature was enabled and applied after it still stores a random value.
+    /// `apply` refuses the incarnation as unavailable (ADR-0046, point 1.1). A creation carries
+    /// [`IncarnationRule::Always`] too, so `apply` stores its incarnation whether or not the
+    /// fleet has forked, and a name dropped and created again never has the legacy incarnation
+    /// twice (ADR-0046's FR-110 amendment).
     ///
     /// # Errors
     ///
@@ -429,8 +443,15 @@ impl ControlService {
         for _ in 0..INCARNATION_DRAWS {
             let drawn = self.draw_incarnation();
             match &mut action {
-                Action::CreateDatabase { incarnation, .. }
-                | Action::ForkDatabase { incarnation, .. } => *incarnation = drawn,
+                Action::CreateDatabase {
+                    incarnation,
+                    incarnation_rule,
+                    ..
+                } => {
+                    *incarnation = drawn;
+                    *incarnation_rule = self.incarnation_rule;
+                }
+                Action::ForkDatabase { incarnation, .. } => *incarnation = drawn,
                 _ => {}
             }
             let committed = self
@@ -1584,8 +1605,9 @@ impl Control for ControlService {
             engine,
             durability: Some(durability),
             metadata,
-            // Drawn when it is submitted.
+            // Drawn when it is submitted, and stored whatever the fleet's features.
             incarnation: Incarnation::LEGACY,
+            incarnation_rule: IncarnationRule::Always,
         };
         self.create(name, replication_factor, action).await
     }
@@ -1626,8 +1648,9 @@ impl Control for ControlService {
             engine,
             durability: Some(durability),
             metadata: Some(spec),
-            // Drawn when it is submitted.
+            // Drawn when it is submitted, and stored whatever the fleet's features.
             incarnation: Incarnation::LEGACY,
+            incarnation_rule: IncarnationRule::Always,
         };
         self.create(name, replication_factor, action).await
     }

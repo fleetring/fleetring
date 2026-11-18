@@ -630,6 +630,7 @@ impl State {
     ///     durability: None,
     ///     metadata: None,
     ///     incarnation: fleetring_control::Incarnation::LEGACY,
+    ///     incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
     /// })?;
     /// run(&mut state, 0, Action::AcquireLease { database: db()?, node: "a".parse()? })?;
     /// // "b" keeps reporting its copy; "a" goes quiet.
@@ -694,6 +695,7 @@ impl State {
     ///         durability: None,
     ///         metadata: Some(spec),
     ///         incarnation: fleetring_control::Incarnation::LEGACY,
+    ///         incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
     ///     })?;
     /// }
     /// assert!(state.expired_databases(Timestamp::from_millis(59_999)).is_empty());

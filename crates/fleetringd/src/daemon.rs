@@ -304,6 +304,7 @@ impl Daemon {
                     .with_durability_defaults(config.replication.durability_defaults())
                     .with_clock(environment.clock())
                     .with_entropy(environment.entropy())
+                    .with_incarnation_rule(environment.incarnation_rule())
                     .with_fork_limits(config.fork.limits())
                     .with_fork_faults(environment.fork_faults())
                     .with_dev_mode(config.dev)

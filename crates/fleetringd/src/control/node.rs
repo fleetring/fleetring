@@ -833,6 +833,7 @@ mod tests {
             durability: None,
             metadata: None,
             incarnation: Incarnation::LEGACY,
+            incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
         };
         // A database whose replica set `d`'s join moves, found on a state of its own.
         let (name, primary) = (0..200)

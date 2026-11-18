@@ -19,7 +19,7 @@ use crate::common::delegation::{
     Ask, RECORDER, as_ancestor, leaf, principal, principal_target, root_token, token,
 };
 use crate::common::fork::{SOURCE, create_at, fork_of, fork_request};
-use crate::common::{at, config, create, db, id};
+use crate::common::{at, config, create, create_always, db, fixed_ops, id, run};
 use crate::rollback::v0_7;
 
 /// The leased databases a membership change may move.
@@ -393,4 +393,110 @@ fn a_0_7_snapshot_upgrades_in_place_and_enables_only_on_first_use() {
         .expect("the first fork");
     assert!(fleet.state.is_enabled(Feature::Fork));
     fleet.assert_0_7_refuses_it(Feature::Fork);
+}
+
+/// The members `n0`, `n1` and `n2`, on 0.8.0, which never forked, with `d0`, `d1` and `d2`
+/// created as a control node of 0.8.0 logged them: its proposer drew an incarnation for each, and
+/// its `apply` stored 0. Returns the state and the log.
+fn never_forked_on_0_8_0() -> (State, Vec<Command>) {
+    let mut state = State::new(config());
+    let mut log = Vec::new();
+    for node in ["n0", "n1", "n2"] {
+        log.push(Command::new(at(1), join(node, v0_8_0())));
+    }
+    for (n, name) in ["d0", "d1", "d2"].into_iter().enumerate() {
+        let drawn = 0x0de0_0000_0000_0000 + u64::try_from(n).expect("small");
+        log.push(Command::new(at(2), create_at(name, 3, drawn)));
+    }
+    for command in &log {
+        apply(&mut state, command.clone()).expect("0.8.0's log applies");
+    }
+    (state, log)
+}
+
+/// A control node upgraded from 0.8.0 replays 0.8.0's log to the same state, its databases at
+/// the legacy incarnation, though each creation carried a random one; a name it drops and
+/// creates again gets the random incarnation the creation carries, and never 0
+/// (ADR-0046's FR-110 amendment, items 14 and 15).
+#[test]
+fn an_upgraded_control_node_keeps_existing_databases_at_0_and_gives_a_name_created_again_another() {
+    let (mut state, log) = never_forked_on_0_8_0();
+    for database in state.databases() {
+        assert_eq!(database.incarnation(), Incarnation::LEGACY);
+    }
+    let mut replayed = State::new(config());
+    for command in &log {
+        let logged = serde_json::to_string(command).expect("serializes");
+        let decoded: Command = serde_json::from_str(&logged).expect("decodes");
+        apply(&mut replayed, decoded).expect("the log replays");
+    }
+    assert_eq!(replayed, state);
+
+    run(&mut state, 3, Action::DropDatabase { name: db("d0") }).expect("dropped");
+    let refused = run(&mut state, 4, create_always("d0", 3, 0));
+    assert_eq!(
+        refused,
+        Err(Rejection::IncarnationUnavailable {
+            incarnation: Incarnation::LEGACY
+        })
+    );
+    run(&mut state, 5, create_always("d0", 3, 0x5eed_0000_0000_0001)).expect("created again");
+    let again = state.database(&db("d0")).map(|db| db.incarnation());
+    assert_eq!(again, Some(Incarnation::new(0x5eed_0000_0000_0001)));
+    assert!(state.features().next().is_none(), "nothing is enabled");
+    for name in ["d1", "d2"] {
+        let kept = state.database(&db(name)).map(|db| db.incarnation());
+        assert_eq!(kept, Some(Incarnation::LEGACY), "{name}");
+    }
+}
+
+/// Once the control node runs this release, `(name, 0)` names at most one database for the
+/// rest of the fleet's life: the one that held it at the upgrade, until its drop. Generated
+/// drops and creations, some carrying 0 or an incarnation a live database has, never leave
+/// another database at the legacy incarnation (ADR-0046's FR-110 amendment, item 15).
+#[test]
+fn after_the_upgrade_the_legacy_incarnation_names_only_the_databases_that_had_it() {
+    const NAMES: [&str; 3] = ["d0", "d1", "d2"];
+    let (mut state, _) = never_forked_on_0_8_0();
+    let mut legacy: std::collections::BTreeSet<_> = state
+        .databases()
+        .filter(|database| database.incarnation() == Incarnation::LEGACY)
+        .map(|database| database.name().clone())
+        .collect();
+    assert_eq!(legacy.len(), NAMES.len());
+    let (mut created, mut dropped, mut refused) = (0, 0, 0);
+    for (step, op) in fixed_ops(0xF110, 600).into_iter().enumerate() {
+        let name = NAMES[usize::from(op.a) % NAMES.len()];
+        let action = if op.kind.is_multiple_of(2) {
+            Action::DropDatabase { name: db(name) }
+        } else {
+            let incarnation = u64::from(op.b % 8) * 0x0101_0101_0101_0101;
+            create_always(name, 1 + op.b % 3, incarnation)
+        };
+        let millis = 10 + u64::try_from(step).expect("small");
+        match run(&mut state, millis, action) {
+            Ok(Applied::DatabaseDropped { database, .. }) => {
+                legacy.remove(&database);
+                dropped += 1;
+            }
+            Ok(Applied::DatabaseCreated { .. }) => created += 1,
+            Err(Rejection::IncarnationUnavailable { .. }) => refused += 1,
+            _ => {}
+        }
+        for database in state.databases() {
+            assert!(
+                database.incarnation() != Incarnation::LEGACY || legacy.contains(database.name()),
+                "step {step}: {} holds the legacy incarnation after the upgrade",
+                database.name()
+            );
+        }
+    }
+    assert!(
+        legacy.is_empty(),
+        "every first life was dropped: {legacy:?}"
+    );
+    assert!(
+        created > 0 && dropped > 0 && refused > 0,
+        "{created} {dropped} {refused}"
+    );
 }

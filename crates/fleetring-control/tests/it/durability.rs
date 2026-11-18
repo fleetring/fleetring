@@ -135,6 +135,7 @@ fn a_database_records_its_settings_and_the_state_answers_quorums_from_them() {
         durability: Some(Durability::new(Acks::All, factor(5))),
         metadata: None,
         incarnation: fleetring_control::Incarnation::LEGACY,
+        incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
     };
     let before = state.clone();
     let rejection = run(&mut state, 0, bad).expect_err("floor above R");

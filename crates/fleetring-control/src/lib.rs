@@ -117,6 +117,7 @@
 //!     durability: None,
 //!     metadata: None,
 //!     incarnation: fleetring_control::Incarnation::LEGACY,
+//!     incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
 //! }))?;
 //! let quorums = state.quorums(&"tenant:acme".parse()?)?;
 //! assert_eq!((quorums.write(), quorums.promotion()), (2, 2));
@@ -151,9 +152,9 @@ pub use apply::{Applied, JoinKind, Outcome, Rejection, apply};
 pub use command::{Action, Command, UnknownReports};
 pub use config::ControlConfig;
 pub use database::{
-    Acks, Database, DatabaseName, Durability, DurabilityError, Engine, Incarnation, Lease,
-    LeaseEpoch, ParseAcksError, ParseDatabaseNameError, ParseIncarnationError, Position, Promotion,
-    Quorums,
+    Acks, Database, DatabaseName, Durability, DurabilityError, Engine, Incarnation,
+    IncarnationRule, Lease, LeaseEpoch, ParseAcksError, ParseDatabaseNameError,
+    ParseIncarnationError, Position, Promotion, Quorums,
 };
 pub use handover::ReplicasCaughtUp;
 pub use member::{HostedReplica, Liveness, Member, ReplicaRole, Report};
@@ -217,6 +218,7 @@ const _: () = {
     assert_debug_send_sync::<FleetRef>();
     assert_debug_send_sync::<HostedReplica>();
     assert_debug_send_sync::<Incarnation>();
+    assert_debug_send_sync::<IncarnationRule>();
     assert_debug_send_sync::<fork::CancelCause>();
     assert_debug_send_sync::<fork::ChainHash>();
     assert_debug_send_sync::<fork::CopyLossReason>();

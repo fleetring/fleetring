@@ -217,6 +217,8 @@ fn the_generated_log_exercises_every_kind_of_change() {
         "expiry passed",
         "not expired",
         "kept set released",
+        "created at a random incarnation",
+        "incarnation unavailable",
     ] {
         assert!(
             counts.get(kind).copied().unwrap_or(0) > 0,
@@ -225,8 +227,8 @@ fn the_generated_log_exercises_every_kind_of_change() {
     }
 }
 
-/// Counts outcomes by kind. Given the `log`, it also counts creations that recorded metadata,
-/// by replaying the log to see each created database.
+/// Counts outcomes by kind. Given the `log`, it also counts creations that recorded metadata or
+/// a random incarnation, by replaying the log to see each created database.
 fn count_outcomes(outcomes: &[Outcome], log: Option<&[Command]>) -> BTreeMap<&'static str, usize> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut state = State::new(config());
@@ -245,6 +247,12 @@ fn count_outcomes(outcomes: &[Outcome], log: Option<&[Command]>) -> BTreeMap<&'s
                 if with_metadata {
                     *counts.entry("created with metadata").or_default() += 1;
                 }
+                let random = state
+                    .database(database)
+                    .is_some_and(|db| db.incarnation() != fleetring_control::Incarnation::LEGACY);
+                if random {
+                    *counts.entry("created at a random incarnation").or_default() += 1;
+                }
                 "created"
             }
             Ok(Applied::DatabaseDropped { .. }) => "dropped",
@@ -262,6 +270,9 @@ fn count_outcomes(outcomes: &[Outcome], log: Option<&[Command]>) -> BTreeMap<&'s
             Err(fleetring_control::Rejection::MetadataConflict { .. }) => "metadata conflict",
             Err(fleetring_control::Rejection::ExpiryPassed { .. }) => "expiry passed",
             Err(fleetring_control::Rejection::NotExpired { .. }) => "not expired",
+            Err(fleetring_control::Rejection::IncarnationUnavailable { .. }) => {
+                "incarnation unavailable"
+            }
             Err(_) => "rejected",
         };
         *counts.entry(kind).or_default() += 1;

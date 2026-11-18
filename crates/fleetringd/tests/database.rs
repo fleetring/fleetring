@@ -4000,6 +4000,7 @@ mod expiry {
                     durability: None,
                     metadata: None,
                     incarnation: fleetring_control::Incarnation::LEGACY,
+                    incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
                 })
                 .await?;
             assert!(created.outcome().is_ok(), "{:?}", created.outcome());
