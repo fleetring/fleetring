@@ -750,7 +750,10 @@ mod tests {
         )));
         assert!(conflict.message.contains("--scope"), "{}", conflict.message);
         assert!(
-            conflict.message.contains("operation`") || conflict.message.contains("/operation"),
+            conflict.message.contains("operation`")
+                || conflict
+                    .message
+                    .contains(&format!("{}operation", std::path::MAIN_SEPARATOR)),
             "names the file to delete: {}",
             conflict.message
         );
