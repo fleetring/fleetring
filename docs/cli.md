@@ -429,7 +429,7 @@ operation: 4k7mxq…
 elapsed: 12.3 s
 ```
 
-then the placement, as `db locate` prints it. With `--detach`, `state: seeding`, and the position and chain hash read `not yet`. An incarnation prints as 16 lowercase hex digits; a database created before 0.8.1 in a fleet that hadn't forked has `0000000000000000`.
+then the placement, as `db locate` prints it. With `--detach`, `state: seeding`, and the position and chain hash read `not yet`. An incarnation prints as 16 lowercase hex digits; a database created before the fleet enabled `incarnations` or `fork` has `0000000000000000`.
 
 **JSON result:** `operation_id`; `database`; `incarnation`, a string of 16 hex digits; `state` (`seeding`, `seeded`, `ready`, or `failed`, and `cancelled` when `--operation-id` names an operation whose fork was dropped or expired before it was ready); `source`; `source_incarnation`; `position` and `chain_hash`, `null` until the fork is seeded; `failure`, `null` or an object with `reason`, `last_cause` (for `retries_exhausted` and `deadline_exceeded`: `seeder_down`, `attempt_timed_out`, `transfer_failed`, `pin_expired`, `holder_lost`, `holders_left`, or `seeder_disk_refused`, else `null`) and `attempts`; `elapsed_ms`; and `placement`, as `db locate` prints it, or `null` once the fork is gone. A `reason` is one of `source_gone`, `source_recreated`, `retries_exhausted`, `deadline_exceeded`, `source_too_large`, `insufficient_disk` and `engine_unsupported`; the list is open (`ForkFailure` is non-exhaustive), so a later release may add one, and a script treats an unknown reason as a failure. The text result says the failure in words, with the attempts counted (`failure: not enough disk on its replicas (1 attempt)`), and a failed fork exits 1 with the hint `fleetring db drop <target>` removes the failed fork, then run the same `db fork` again; there is nothing to resume. The resume hint (and its 7-day note) is for a pending fork: a timeout, `--detach`, or a lost connection.
 
@@ -475,7 +475,7 @@ hint: `fleetring db drop notes-exp` cancels the fork in progress
 
 **JSON**, in `db locate`, in each database of `db list`, and in `db show`:
 
-- `placement.incarnation`: the database's incarnation, a string of 16 hex digits, all zero for one created before 0.8.1 in a fleet that hadn't forked.
+- `placement.incarnation`: the database's incarnation, a string of 16 hex digits, all zero for one created before the fleet enabled `incarnations` or `fork`.
 - `fork`: `null` for a database no fork made, and otherwise `state` (`seeding`, `seeded`, `ready`, or `failed`); `operation_id`; `source` and `source_incarnation`; `attempt` and `max_attempts`; `seeder`, `seeder_excluded` and `disk_refused`, while seeding; `holders` and `holders_needed`; `kept_holders`, the replicas a ready fork stays on until placement catches up (empty otherwise); `bytes` and `total_bytes`, the seeder's progress while seeding; `position` and `chain_hash`, once seeded; `failure` (`reason`, `last_cause` and `attempts`); `requested_by` and `requested_at`; `deadline_at`; `completed_at`, `ready_at` and `failed_at`. A field that doesn't apply in the current state is `null`. `db list` always carries `fork`, whether or not the table shows the column.
 - `metadata.forked_from`: `null`, or `source`, `source_incarnation`, `position`, `chain_hash` and `forked_at`. It is the provenance a ready fork keeps, and, for a restored database, the archive's claim.
 
