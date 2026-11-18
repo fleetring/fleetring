@@ -291,6 +291,7 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
 fn replace_file(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
     let staged = path.with_extension("staged");
     std::fs::write(&staged, contents)?;
+    #[cfg(unix)]
     std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     std::fs::rename(&staged, path)?;
     Ok(())

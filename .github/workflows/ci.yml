@@ -108,7 +108,9 @@ jobs:
     needs: changes
     if: github.event_name != 'push' && !cancelled()
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # Linux runs the suite three times; with 0.8.0's fork and delegation tests that takes over
+    # 40 minutes on ubuntu-latest.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -325,7 +327,10 @@ jobs:
       # little-endian (LSB) binaries here, or none at all.
       - name: test binaries are big-endian
         run: |
-          file target/s390x-unknown-linux-gnu/release/deps/it-* | grep -v '\.d:' | tee /dev/stderr \
+          # Cargo keeps test binaries in `deps/` or, with its newer build-dir layout, under
+          # `build/<package>/<hash>/out/`; look in both.
+          find target/s390x-unknown-linux-gnu/release -type f -name 'it-*' ! -name '*.d' \
+            \( -path '*/deps/*' -o -path '*/out/*' \) -exec file {} + | tee /dev/stderr \
             | grep -q 'MSB.*S/390'
 
   wasm:

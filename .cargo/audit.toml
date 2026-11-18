@@ -2,5 +2,7 @@
 # ignored in both places, with the same reason, or in neither.
 
 [advisories]
-# Nothing is ignored today. Add entries as `"RUSTSEC-YYYY-NNNN", # reason`.
-ignore = []
+ignore = [
+    # chrono is unmaintained (informational, no vulnerability, no patched version); it reaches us only through rmcp and schemars, the MCP server's dependencies. Drop this once rmcp moves off chrono (FR-119).
+    "RUSTSEC-2026-0543",
+]

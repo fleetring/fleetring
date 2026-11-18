@@ -6,7 +6,9 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (informational, no vulnerability, no patched version); it reaches us only through rmcp and schemars, the MCP server's dependencies. Drop this once rmcp moves off chrono (FR-119)." },
+]
 
 [licenses]
 allow = [
