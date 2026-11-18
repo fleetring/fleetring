@@ -1,5 +1,5 @@
 //! Deliberate bugs for FR-087's mutation check: the fork simulation matrix, the hand-over
-//! scenarios of FR-102, and the scenarios of a name created again (FR-106), run once with each,
+//! scenarios of FR-102, and the scenarios of a name created again (FR-106, FR-110), run once with each,
 //! and a history-checker property must fail every time, or the matrix has a gap.
 //!
 //! A mutation is chosen at compile time with the `FLEETRING_MUTATION` environment variable,
@@ -65,11 +65,15 @@ pub enum Mutation {
     /// comparing the follower's chain hash at that position with its own: a dropped database's
     /// copy acknowledged under a name created again counts for the new database (FR-106).
     CountFirstAckUnproven,
+    /// A creation stores the legacy incarnation, 0, until the fleet enables `fork`, as 0.8.0
+    /// did, whatever rule it carries: a name dropped and created again before then has
+    /// incarnation 0 twice (FR-110).
+    StoreLegacyIncarnation,
 }
 
 impl Mutation {
     /// Every mutation, in the order the mutation check runs them.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::PinAtTip,
         Self::CompleteOnOneHolder,
         Self::NonHolderFirstLease,
@@ -85,6 +89,7 @@ impl Mutation {
         Self::MoveKeptReplicaSet,
         Self::CountPlacementAlone,
         Self::CountFirstAckUnproven,
+        Self::StoreLegacyIncarnation,
     ];
 
     /// The name `FLEETRING_MUTATION` gives it.
@@ -106,6 +111,7 @@ impl Mutation {
             Self::MoveKeptReplicaSet => "move_kept_replica_set",
             Self::CountPlacementAlone => "count_placement_alone",
             Self::CountFirstAckUnproven => "count_first_ack_unproven",
+            Self::StoreLegacyIncarnation => "store_legacy_incarnation",
         }
     }
 

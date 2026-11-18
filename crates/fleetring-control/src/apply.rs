@@ -19,13 +19,14 @@ use crate::fork::{
     CancelCause, ForkFailure, ForkIdentity, IntentField, OperationId, OperationOutcome, RetryCause,
 };
 use crate::member::{ForkReports, HandoverReports};
+use crate::mutation::Mutation;
 use crate::scope::GrantStepError;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
     Action, Command, Database, DatabaseName, DescriptionChange, Durability, DurabilityError,
-    Engine, ExpiryChange, Feature, HostedReplica, Incarnation, Lease, LeaseEpoch, MAX_LABELS,
-    Member, Metadata, MetadataChange, MetadataSpec, Position, PrincipalName, Promotion, Quorums,
-    Release, Revoked, Software, State, Timestamp, TokenId,
+    Engine, ExpiryChange, Feature, HostedReplica, Incarnation, IncarnationRule, Lease, LeaseEpoch,
+    MAX_LABELS, Member, Metadata, MetadataChange, MetadataSpec, Position, PrincipalName, Promotion,
+    Quorums, Release, Revoked, Software, State, Timestamp, TokenId,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -84,6 +85,7 @@ pub type Outcome = Result<Applied, Rejection>;
 ///     durability: None,
 ///     metadata: None,
 ///     incarnation: fleetring_control::Incarnation::LEGACY,
+///     incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
 /// }))?;
 /// let granted = apply(&mut state, Command::new(at, Action::AcquireLease {
 ///     database: "tenant:acme".parse()?,
@@ -141,6 +143,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             durability,
             metadata,
             incarnation,
+            incarnation_rule,
         } => create_database(
             state,
             now,
@@ -151,6 +154,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
                 durability,
                 metadata,
                 incarnation,
+                incarnation_rule,
             },
         ),
         Action::UpdateDatabase {
@@ -1041,9 +1045,9 @@ pub enum Rejection {
         database: DatabaseName,
     },
 
-    /// A creation's incarnation is the legacy 0, which a creation may carry only before forks
-    /// are enabled, or a database or a fork operation records it already. The control node
-    /// draws another and asks again.
+    /// A creation's incarnation is the legacy 0, which a creation may carry only under
+    /// [`IncarnationRule::OnceForked`] before forks are enabled, or a database or a fork
+    /// operation records it already. The control node draws another and asks again.
     #[error("incarnation {incarnation} is unavailable")]
     IncarnationUnavailable {
         /// The incarnation.
@@ -1450,6 +1454,7 @@ struct Creation {
     durability: Option<Durability>,
     metadata: Option<MetadataSpec>,
     incarnation: Incarnation,
+    incarnation_rule: IncarnationRule,
 }
 
 fn create_database(state: &mut State, now: Timestamp, creation: Creation) -> Outcome {
@@ -1460,6 +1465,7 @@ fn create_database(state: &mut State, now: Timestamp, creation: Creation) -> Out
         durability,
         metadata,
         incarnation,
+        incarnation_rule,
     } = creation;
     if state.databases.contains_key(&name) {
         return Err(Rejection::DatabaseExists { database: name });
@@ -1474,9 +1480,20 @@ fn create_database(state: &mut State, now: Timestamp, creation: Creation) -> Out
     if let Some(expires_at) = metadata.as_ref().and_then(|spec| spec.expires_at) {
         check_expiry(&name, now, expires_at)?;
     }
-    // Incarnations start with the `fork` feature, so that a fleet that can still roll back
-    // stores nothing new (ADR-0046, point 1.2): until then one in the command is ignored.
-    let incarnation = if state.is_enabled(Feature::Fork) {
+    // A creation logged by 0.8.1 or later stores its incarnation always, so that a name dropped
+    // and created again never has the legacy incarnation twice. One logged earlier stores it
+    // once the `fork` feature is enabled, and 0 before, so that it replays as it applied then
+    // (ADR-0046, point 1.2, as its FR-110 amendment changes it).
+    let incarnation_rule = if Mutation::StoreLegacyIncarnation.is_active() {
+        IncarnationRule::OnceForked
+    } else {
+        incarnation_rule
+    };
+    let stored = match incarnation_rule {
+        IncarnationRule::Always => true,
+        IncarnationRule::OnceForked => state.is_enabled(Feature::Fork),
+    };
+    let incarnation = if stored {
         forks::check_incarnation(state, incarnation)?;
         incarnation
     } else {

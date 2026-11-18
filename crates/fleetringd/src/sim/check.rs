@@ -1314,6 +1314,7 @@ mod tests {
                 durability: None,
                 metadata: None,
                 incarnation: fleetring_control::Incarnation::LEGACY,
+                incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
             },
             Action::AcquireLease {
                 database: "db".parse().expect("name"),

@@ -488,6 +488,7 @@ mod tests {
                     ..MetadataSpec::default()
                 }),
                 incarnation: fleetring_control::Incarnation::LEGACY,
+                incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
             })
             .await
             .expect("the creation commits");

@@ -451,9 +451,10 @@ impl fmt::Display for LeaseEpoch {
 /// The control node that proposes a creation draws its incarnation as 64 random bits and carries
 /// it in the command, as it carries the time, so `apply` stays pure and a replay gives the same
 /// incarnations. No rule rests on incarnations growing or never repeating: fencing compares a
-/// fork's whole identity. Incarnations are stored once the `fork` fleet feature is enabled; every
-/// database created before then, and every record written before incarnations existed, has
-/// [`Incarnation::LEGACY`], 0. Every fork has a nonzero incarnation.
+/// fork's whole identity. Every database a control node of 0.8.1 or later creates has a nonzero
+/// incarnation, as every fork has ([`IncarnationRule::Always`]). A database created earlier has
+/// [`Incarnation::LEGACY`], 0, unless the `fork` fleet feature was enabled by then, and so does
+/// every record written before incarnations existed.
 ///
 /// Text and JSON write an incarnation as 16 lowercase hex digits, since a 64-bit integer doesn't
 /// survive every JSON reader.
@@ -533,6 +534,47 @@ impl TryFrom<String> for Incarnation {
 impl From<Incarnation> for String {
     fn from(incarnation: Incarnation) -> Self {
         incarnation.to_string()
+    }
+}
+
+/// When a `CreateDatabase` stores the incarnation it carries (ADR-0046, point 1.2, as its
+/// FR-110 amendment changes it).
+///
+/// A creation names its rule in the log, so a replay never depends on which release replays it:
+/// a creation logged by 0.8.0, whose proposer drew an incarnation but whose `apply` stored it only
+/// once `fork` was enabled, replays the same on every later release, and every database it made
+/// keeps the incarnation it had.
+///
+/// # Examples
+///
+/// ```
+/// use fleetring_control::IncarnationRule;
+///
+/// // A creation that names no rule was logged before the rule existed.
+/// assert_eq!(IncarnationRule::default(), IncarnationRule::OnceForked);
+/// assert!(IncarnationRule::OnceForked.is_once_forked());
+/// assert!(!IncarnationRule::Always.is_once_forked());
+/// ```
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IncarnationRule {
+    /// The incarnation is stored once the `fork` fleet feature is enabled, and 0 before: what
+    /// every creation logged before 0.8.1 follows.
+    #[default]
+    OnceForked,
+    /// The incarnation is stored whether or not the fleet has forked, and 0 is refused: what a
+    /// control node of 0.8.1 or later logs, so that a name dropped and created again never has
+    /// the legacy incarnation twice.
+    Always,
+}
+
+impl IncarnationRule {
+    /// Returns whether this is [`IncarnationRule::OnceForked`], which the log leaves out.
+    #[must_use]
+    pub const fn is_once_forked(&self) -> bool {
+        matches!(self, Self::OnceForked)
     }
 }
 

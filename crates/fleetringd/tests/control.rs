@@ -2322,6 +2322,7 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
             durability: None,
             metadata,
             incarnation: fleetring_control::Incarnation::LEGACY,
+            incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
         })
     };
     let labelled = MetadataSpec {
@@ -3009,6 +3010,7 @@ mod metadata {
                 durability: None,
                 metadata: None,
                 incarnation: fleetring_control::Incarnation::LEGACY,
+                incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
             })
             .await?;
         assert!(
@@ -3259,6 +3261,7 @@ mod expiry {
                         ..MetadataSpec::default()
                     }),
                     incarnation: fleetring_control::Incarnation::LEGACY,
+                    incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
                 })
                 .await?;
             assert!(created.outcome().is_ok(), "{:?}", created.outcome());

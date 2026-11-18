@@ -63,6 +63,7 @@ fn create_with_metadata(name: &str, spec: MetadataSpec) -> Action {
         durability,
         metadata: Some(spec),
         incarnation: fleetring_control::Incarnation::LEGACY,
+        incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
     }
 }
 
