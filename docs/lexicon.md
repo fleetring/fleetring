@@ -315,7 +315,7 @@ Since 0.8.0 (ADR-0047). An [agent](#agent) another agent created by delegation; 
 
 Since 0.8.0 (ADR-0047). A parent agent asking the control plane for a [delegated agent](#delegated-agent)'s token: the control plane checks the parent's live token, narrows exactly with the strict grant step (needing the `grant` action), caps the lifetime at the parent's and at 24 hours, records the delegation and its [lineage](#lineage) in control state, and only then signs a JWT for the child with its [delegation issuer](#delegation-issuer) key. A *delegated token* is one such JWT; its `jti` is the *delegation ID*, which every copy of the delegation shares, since a retry re-signs the recorded claims, possibly with another control node's key. Revoking the delegation ID ends every copy and everything delegated below it. The *ancestor rule* lets an agent revoke, without the [fleet scope](#fleet-scope), the token it presented, itself as a principal, and the delegations recorded below it and their principals, and nothing else.
 
-*Deferred after 0.8* (ADR-0044's S1): offline delegation by appending a block to a biscuit token, signed by a holder key, and *attenuation*, appending a block that only narrows. FR-094's evidence decides whether they come back.
+*Deferred after 0.8* (ADR-0044's S1): offline delegation by appending a block to a biscuit token, signed by a holder key, and *attenuation*, appending a block that only narrows. FR-094's trial ([write-up](experiments/0.8-parent-child-workflow.md)) found no need for offline delegation in a single fleet, so it is dropped from the deferred list there, with the revocation IDs that depend on it, and returns only with a design in which data nodes serve without the control plane; attenuation stays deferred ([roadmap](roadmap.md#e3-security)).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Control.DelegateToken`, `Control.ListDelegations`, `Action::RecordDelegation`, `Delegation`, `DelegationId`, `TokenClaims`, `Feature::Delegation`; for the ancestor rule, `Action::RevokeAsAncestor`, `AncestorTarget`, and `Added::Ancestor`. **CLI:** `agent delegate`; the delegation ID in `agent show`; `agent list --fleet`; `token revoke --token-id` and `--principal` with `--agent`.
@@ -529,7 +529,7 @@ Who holds a lease: for a database lease, the primary; for a keyed lease, the nam
 
 ### Holder key
 
-*Deferred after 0.8* (ADR-0044, ADR-0047). The Ed25519 key a token is bound to: a root agent's is its certificate's key; a child generates its own on its machine, its parent's delegation block names the public key, and the child presents it as a self-signed client certificate, which a node accepts only with `[tls] accept_holder_keys` on and never reads a name from. A node accepts the token only on a connection that proves that key, or, for a bearer delegation, through a relay with `forward_tokens`. Delegating from a token needs a signature by its holder key.
+*Deferred after 0.8* (ADR-0044, ADR-0047), until children must run without their root's certificate, as in a sandbox the agent launcher can't serve otherwise (FR-094). The Ed25519 key a token is bound to: a root agent's is its certificate's key; a child generates its own on its machine, its parent's delegation block names the public key, and the child presents it as a self-signed client certificate, which a node accepts only with `[tls] accept_holder_keys` on and never reads a name from. A node accepts the token only on a connection that proves that key, or, for a bearer delegation, through a relay with `forward_tokens`. Delegating from a token needs a signature by its holder key.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet. **CLI:** none yet.
@@ -700,11 +700,11 @@ What a daemon runs: `data`, `control`, or `both` (ADR-0015).
 Since 0.8.0 (ADR-0046). The identifier of one *operation*: one fork request, from its first call until it is `ready`, `failed`, or `cancelled`, across every retry; and (ADR-0047) one `agent delegate` request, whose record control state keeps until its delegation expires, plus 1 hour (or for 1 hour after the delegation is revoked), so a retry returns the same [delegation](#delegation). It is 16 random bytes the client chooses, printed as 26 lowercase base32 characters, and the CLI prints it before it calls.
 
 - ***Caller intent*** is the request as given, a relative expiry included; the ***resolved state*** is what the first request settled: the source's incarnation, the fork's incarnation, the absolute expiry. Neither is decided twice.
-- ***Resuming*** reads the operation by its ID and follows it; nothing is sent or resolved again.
+- ***Resuming*** reads the operation by its ID and follows it; nothing is sent or resolved again. A fork carries on whether or not anyone waits for it: when `db fork`'s wait ends early, by Ctrl-C or `--timeout`, the CLI says `the fork carries on` and prints the command that resumes the wait.
 - ***Resubmitting*** sends the request again under a known ID, and compares the caller intent only: from the same principal and unchanged, it returns the existing operation; from another principal, it is refused without revealing the operation; changed, it is refused, naming the field.
 - **Retention.** Control state keeps the operation's record, and with it the ID, while the fork is pending and for 7 days after its terminal outcome; after that the ID is unknown, and the same request starts a new fork.
 - **Applies to:** daemon, CLI, UI.
-- **Code:** `OperationId`, `ForkIntent`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation` and `ForkOperationStatus`, `Rejection::OperationConflict`, `Rejection::OperationNotYours`. **CLI:** `--operation-id` on `db fork` and `agent delegate`, `operation_id` in their JSON and in `agent show`, and MCP `operation_id` (*planned:* `--operation-id` on `orphan remove` for a staged copy).
+- **Code:** `OperationId`, `ForkIntent`, `OperationRecord`, `State::fork_operations`, `Control.GetForkOperation` and `ForkOperationStatus`, `Rejection::OperationConflict`, `Rejection::OperationNotYours`. **CLI:** `--operation-id` on `db fork` and `agent delegate`, `operation_id` in their JSON and in `agent show`, and MCP `operation_id`, and `--operation-id` on `orphan remove` for a staged copy.
 - **Not:** [request ID](#request-id) (one call, for tracing), job ID, task ID, idempotency key, transaction ID.
 
 ### Organization
@@ -903,7 +903,7 @@ A restore also returns the [metadata](#metadata) the archive holds for the snaps
 
 ### Revocation ID
 
-*Deferred after 0.8* (ADR-0044, ADR-0047). The SHA-256 of one block's signature in a biscuit token, base64url. Putting it on the denylist refuses every token that contains the block, so revoking a parent's token, or the block that delegated to a child, revokes everything derived from it.
+*Deferred after 0.8* (ADR-0044, ADR-0047), and for a single fleet dropped with the offline delegation it depends on (FR-094). The SHA-256 of one block's signature in a biscuit token, base64url. Putting it on the denylist refuses every token that contains the block, so revoking a parent's token, or the block that delegated to a child, revokes everything derived from it.
 
 - **Applies to:** daemon, CLI.
 - **Code:** none yet (`Revoked::Block`). **CLI:** none yet.

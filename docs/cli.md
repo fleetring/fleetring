@@ -10,7 +10,7 @@ Names come from the [lexicon](lexicon.md). A command, flag, column or JSON field
 
 The CLI is one of three surfaces over one client crate (ADR-0033). The TUI and the desktop app follow the same names, the same confirmation rules and the same output fields.
 
-This guide describes the 0.8.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) lists what isn't built yet, and anything marked *planned* is designed here and not built yet. [§15](#15-forks) describes `db fork` (ADR-0046, FR-086), which reaches `ready` once the fleet's members report the `fork` feature, and [§16](#16-delegation) delegation (ADR-0047, FR-090 to FR-093), which works once they report `delegation`.
+This guide describes the 0.8.0 CLI (ADR-0043). It is updated before the code, as #103 asks. [Where `fleetring` stands](#where-fleetring-stands) records how the CLI came to follow it, and anything marked *planned* is designed here and not built yet. [§15](#15-forks) describes `db fork` (ADR-0046, FR-086), which reaches `ready` once the fleet's members report the `fork` feature, and [§16](#16-delegation) delegation (ADR-0047, FR-090 to FR-093), which works once they report `delegation`.
 
 ## 1. Structure: `fleetring <noun> <verb>`
 
@@ -410,10 +410,10 @@ It makes `<target>` a new database holding `<source>`'s current contents, at a p
   - **Resuming.** The command first asks the control plane for the operation (`GetForkOperation`). If it is known, the command follows it until it is ready, failed, or cancelled, and exits by that outcome. It resends nothing and resolves nothing again: the source's incarnation, the target's incarnation, and the absolute expiry are the ones the first request settled. The flags given are checked against the operation's recorded request, and a difference is refused, naming it: `operation 4k7mxq… was requested with --replication-factor 3, not 5`. `--description -` doesn't read stdin again on a resume, and matches the recorded description.
   - **Submitting.** If the operation is unknown, the command submits the request under that ID, as a first request does.
   - Another principal's ID is refused as if it didn't exist, revealing nothing about the operation.
-  - An ID is kept while its fork is pending and for 7 days after it is ready, failed, or cancelled. After that it is unknown, and the same command starts a new fork. `--help` says so, and so does every hint that names an ID: `resume with --operation-id 4k7mxq… (kept for 7 days after the fork finishes; after that, this command starts a new fork)`.
+  - An ID is kept while its fork is pending and for 7 days after it is ready, failed, or cancelled. After that it is unknown, and the same command starts a new fork. `--help` says so, and so does every hint that names an ID: ``resume with `fleetring db fork notes notes-exp --operation-id 4k7mxq…`. The operation ID is kept for 7 days after the fork finishes; after that, this command starts a new fork.``
 - **Resends.** When the first reply is lost, or the control plane answers `UNAVAILABLE`, the command submits the same request again under the same ID, up to 5 times within 60 s (ADR-0046, point 7). The control plane compares the request as given: from the same principal and unchanged, it answers with the existing operation, so a resend never starts a second fork, even if the source was dropped and recreated meanwhile. After 5 tries the command exits 4, with the ID and the command that resumes it in the hint.
 - **`--timeout <duration>`** limits how long the command waits, 1 h by default. It doesn't limit the fork: a seeding fork has its own deadline in the control plane, and a seeded fork waits for its replicas as long as it must. When the timeout passes, the command exits 4, with the ID and the command that resumes the wait in the hint, and the fork carries on.
-- **Ctrl-C** stops the wait, not the fork. The command prints the ID, the command that resumes the wait, and `fleetring db drop <target>`, which cancels the fork, and exits 130.
+- **Ctrl-C** stops the wait, not the fork. The command prints `operation 4k7mxq…: the fork carries on.`, the hint that resumes the wait, and `to cancel it: fleetring db drop notes-exp`, and exits 130.
 - **An older control plane** answers `UNIMPLEMENTED`, or refuses the call as one it doesn't serve (ADR-0041, amendment 4). The command exits 1 with `the control plane runs a release without forks; upgrade it first`.
 
 **Text result,** on stdout, as key and value lines:
@@ -619,7 +619,7 @@ Examples:
 
 ## Where `fleetring` stands
 
-As of 0.6.0, against this guide. "Plan" points into [`docs/plans/0.7.0-cli.md`](plans/0.7.0-cli.md); FR-056 is #59, FR-075 is #103, and FR-079 is #114.
+As of 0.8.0, every rule below is built. The table keeps where 0.6.0 stood, before 0.7.0's plan, and what changed it. "Plan" points into [`docs/plans/0.7.0-cli.md`](plans/0.7.0-cli.md); FR-056 is #59, FR-075 is #103, and FR-079 is #114.
 
 | Rule | 0.6.0 | Plan |
 |---|---|---|
