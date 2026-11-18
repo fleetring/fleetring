@@ -3852,7 +3852,9 @@ mod forks {
             .await?
             .placement
             .ok_or("no placement")?;
-        assert_eq!(later.incarnation, 0);
+        // A creation stores its random incarnation whether or not the fleet has forked
+        // (ADR-0046's FR-110 amendment).
+        assert_ne!(later.incarnation, 0);
 
         // `old` restarts on a release with `fork`, and rejoins saying so.
         node_client(address, &tls, "old")?
@@ -3888,14 +3890,14 @@ mod forks {
         }
         let control = secure_client(address, &tls)?;
 
-        // Before the fleet enables `fork`, a creation stores the legacy incarnation, and state
-        // is as it was.
+        // Before the fleet enables `fork`, a creation stores its random incarnation all the same
+        // (ADR-0046's FR-110 amendment), and nothing is enabled.
         let source = control
             .create_database(create_request("notes", 3))
             .await?
             .placement
             .ok_or("no placement")?;
-        assert_eq!(source.incarnation, 0);
+        assert_ne!(source.incarnation, 0);
         assert_eq!(source.fork, None);
         assert!(!handle.state().is_enabled(Feature::Fork));
 
@@ -3909,7 +3911,7 @@ mod forks {
         assert_ne!(status.incarnation, 0);
         assert_eq!(
             (status.source.as_str(), status.source_incarnation),
-            ("notes", 0)
+            ("notes", source.incarnation)
         );
         assert_eq!(status.attempt, 1);
         assert_eq!(status.requested_by.as_deref(), Some("tester"));
@@ -3926,7 +3928,7 @@ mod forks {
         assert_eq!(fork.operation_id, operation.to_bytes());
         assert_eq!(
             (fork.source.as_str(), fork.source_incarnation),
-            ("notes", 0)
+            ("notes", source.incarnation)
         );
         assert_eq!((fork.attempt, fork.max_attempts), (1, 5));
         assert_eq!(fork.holders_needed, 2);
@@ -3986,7 +3988,7 @@ mod forks {
                     attempt: 1,
                     position: vec![0, 0, 0, 9],
                     chain_hash: vec![7; 32],
-                    source_incarnation: 0,
+                    source_incarnation: source.incarnation,
                 }),
                 seed_progress: progress,
                 size_bytes: Some(4_096),
