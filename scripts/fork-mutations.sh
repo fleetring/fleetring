@@ -1,7 +1,8 @@
 #!/bin/sh
 # FR-087's mutation check: runs the fork simulation matrix, FR-102's hand-over scenarios
-# (`membership_lag::` and `handover::`), and FR-106's name created again (`recreated::`), once per
-# deliberate bug and reports which property and scenario failed for each (ADR-0046 point 12). A
+# (`membership_lag::` and `handover::`), and FR-106's and FR-110's name created again
+# (`recreated::`), once per deliberate bug and reports which property and scenario failed for
+# each (ADR-0046 point 12). A
 # mutation counts as caught only when the history checker reports a property violation
 # ("invariant violated (...)"); a
 # scenario that fails otherwise, by a timeout or an outcome it didn't expect, is listed but
@@ -21,7 +22,7 @@ all="pin_at_tip complete_on_one_holder non_holder_first_lease skip_source_incarn
 skip_target_identity_apply skip_target_identity_binding unconditional_reset serve_at_seeded \
 disk_without_reservations move_seeded_replica_set reset_committed_on_one \
 follower_reports_reset_early move_kept_replica_set count_placement_alone \
-count_first_ack_unproven"
+count_first_ack_unproven store_legacy_incarnation"
 mutations=${*:-$all}
 logs=target/fork-mutations
 mkdir -p "$logs"

@@ -13,7 +13,8 @@
 //! release accepts and says why. The node then upgrades again. `agent renew` then gives the agent
 //! this release's defaults, and the first `agent delegate` enables `delegation`, which alone ends
 //! rollback. The first `db fork` then enables `fork`, which rollback names from then on; a
-//! database created after it carries an incarnation, and those before keep 0. The previous
+//! database created after it carries an incarnation, as any this build's control node creates
+//! does, and those the previous release created keep 0. The previous
 //! release's token still works, `agent remove` revokes the child as its ancestor, and the fork is
 //! independent of its source.
 

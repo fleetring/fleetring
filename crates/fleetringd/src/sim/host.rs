@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use fleetring_control::{Liveness, Timestamp};
+use fleetring_control::{IncarnationRule, Liveness, Timestamp};
 use tokio::sync::watch;
 
 use crate::clock::{Clock, SimClock};
@@ -64,6 +64,9 @@ pub(super) struct Inner {
     /// The object stores every data host's archives write to, by archive name: outside the
     /// simulated network, shared by every host, and surviving every crash (ADR-0029, point 16).
     pub(super) object_stores: BTreeMap<String, Arc<dyn ObjectStore>>,
+    /// The rule the control node logs creations under, when the test stands it in for one of a
+    /// release before 0.8.1; `None` for this release's own.
+    pub(super) incarnation_rule: Option<IncarnationRule>,
 }
 
 /// What a running host exposes.
@@ -186,6 +189,9 @@ pub(super) async fn run_host(
     let mut environment = Environment::simulated(shared.clock())
         .with_network(Network::simulated().with_security(Security::Tls(identity)))
         .with_entropy(Arc::new(SimEntropy::new(seed ^ millis(elapsed))));
+    if let Some(rule) = shared.lock().incarnation_rule {
+        environment = environment.with_incarnation_rule(rule);
+    }
     let stores = shared.lock().object_stores.clone();
     for (archive, store) in stores {
         environment = environment.with_object_store(archive, store);

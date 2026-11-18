@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
 use fleetring_control::fork::{ForkIdentity, ForkState, OperationId};
-use fleetring_control::{DatabaseName, Feature, LeaseEpoch, State, Timestamp};
+use fleetring_control::{DatabaseName, Feature, IncarnationRule, LeaseEpoch, State, Timestamp};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -215,6 +215,8 @@ pub struct FleetBuilder {
     router: Option<String>,
     /// The name of the control host's delegation issuer, if it has one.
     control_issuer: Option<String>,
+    /// The rule the control node logs creations under, if not this release's own.
+    incarnation_rule: Option<IncarnationRule>,
 }
 
 impl fmt::Debug for FleetBuilder {
@@ -232,6 +234,17 @@ impl fmt::Debug for FleetBuilder {
 }
 
 impl FleetBuilder {
+    /// Has the control node log every database creation under `rule`.
+    /// [`IncarnationRule::OnceForked`] stands it in for a control node of a release before
+    /// 0.8.1, which stores the legacy incarnation, 0, until the fleet forks: one not upgraded
+    /// yet, or rolled back (ADR-0046's FR-110 amendment). The default is this release's own,
+    /// [`IncarnationRule::Always`].
+    #[must_use]
+    pub fn incarnation_rule(mut self, rule: IncarnationRule) -> Self {
+        self.incarnation_rule = Some(rule);
+        self
+    }
+
     /// Runs every host's replication with `settings`, through its `[replication]` table. The
     /// default is [`ReplicationSettings::new`].
     #[must_use]
@@ -471,6 +484,7 @@ impl FleetBuilder {
                     .object_stores
                     .insert(archive.clone(), Arc::clone(store));
             }
+            shared.incarnation_rule = self.incarnation_rule;
         }
         for name in data_hosts {
             fleet.add_lease_watcher(&name);
@@ -737,6 +751,7 @@ impl Fleet {
             archives: Vec::new(),
             router: None,
             control_issuer: None,
+            incarnation_rule: None,
         }
     }
 
@@ -1113,6 +1128,13 @@ impl Fleet {
         }
         std::fs::write(&files.cert, pair.certificate_pem())?;
         Ok(())
+    }
+
+    /// Has the control node log database creations under `rule` from its next start, or under
+    /// this release's own with `None`, as upgrading or rolling back its binary would
+    /// ([`FleetBuilder::incarnation_rule`]).
+    pub fn set_incarnation_rule(&mut self, rule: Option<IncarnationRule>) {
+        self.shared.lock().incarnation_rule = rule;
     }
 
     /// Lets data hosts refuse peer calls for their bindings in this run, as a fork scenario's
