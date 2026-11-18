@@ -92,6 +92,13 @@ fn scenario(seed: u64) -> TestResult {
         .map(|database| database.incarnation())
         .ok_or("no fork")?;
     assert_ne!(incarnation, Incarnation::LEGACY);
+    // The source has a random incarnation too, though it was created before the fleet forked
+    // (ADR-0046's FR-110 amendment), and each staged copy names it.
+    let source_incarnation = state
+        .database(&source)
+        .map(|database| database.incarnation())
+        .ok_or("no source")?;
+    assert_ne!(source_incarnation, Incarnation::LEGACY);
     let identity = ForkIdentity::new(target.clone(), incarnation, operation);
 
     let at = Position::new([0, 0, 0, 0x2A]);
@@ -103,7 +110,7 @@ fn scenario(seed: u64) -> TestResult {
                 1,
                 at.clone(),
                 chain_hash.clone(),
-                Incarnation::LEGACY,
+                source_incarnation,
             ),
         )
     };
