@@ -587,9 +587,6 @@ fn late_drop_notice_then_primary_lost(seed: u64, first_life: FirstLife) -> TestR
         fleet.stop(CONTROL)?;
         fleet.restart(CONTROL)?;
         fleet.await_ring(LIMIT)?;
-        // The data nodes reach the restarted control node again before the drop: a notice a node
-        // can't check against control state is refused, and its copy kept as an orphan.
-        fleet.run_for(Duration::from_secs(5))?;
         let kept = fleet
             .control_state()
             .and_then(|state| state.database(&database).map(|db| db.incarnation()));

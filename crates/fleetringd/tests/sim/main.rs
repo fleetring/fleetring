@@ -10,6 +10,7 @@ mod control;
 mod database;
 mod delegation;
 mod drain;
+mod dropped;
 mod durability;
 mod expiry;
 mod failover;
