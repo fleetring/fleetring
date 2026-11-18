@@ -26,6 +26,13 @@ const METADATA_AND_EXPIRY: &[Feature] = &[Feature::Metadata, Feature::Expiry];
 const FORK: &[Feature] = &[Feature::Fork];
 const HANDOVER: &[Feature] = &[Feature::Handover];
 
+/// What a creation under [`IncarnationRule::Always`] needs, with or without metadata and an
+/// expiry.
+const INCARNATIONS: &[Feature] = &[Feature::Incarnations];
+const METADATA_AND_INCARNATIONS: &[Feature] = &[Feature::Metadata, Feature::Incarnations];
+const METADATA_EXPIRY_AND_INCARNATIONS: &[Feature] =
+    &[Feature::Metadata, Feature::Expiry, Feature::Incarnations];
+
 /// The features of a fork request, which records metadata.
 const FORK_AND_METADATA: &[Feature] = &[Feature::Fork, Feature::Metadata];
 
@@ -177,10 +184,10 @@ pub enum Action {
         /// Creations logged before the field existed carry 0.
         #[serde(default, skip_serializing_if = "Incarnation::is_legacy")]
         incarnation: Incarnation,
-        /// When the incarnation is stored: [`IncarnationRule::Always`] from a control node of
-        /// 0.8.1 or later, and [`IncarnationRule::OnceForked`], which the log leaves out, from
-        /// earlier ones (ADR-0046's FR-110 amendment). A release before 0.8.1 ignores the field
-        /// and stores the creation as it always did.
+        /// When the incarnation is stored: [`IncarnationRule::Always`], which needs
+        /// [`Feature::Incarnations`], from a control node of 0.8.1 or later once every member
+        /// supports it, and otherwise [`IncarnationRule::OnceForked`], which the log leaves out,
+        /// as every creation before 0.8.1 (ADR-0046's FR-110 amendment).
         #[serde(default, skip_serializing_if = "IncarnationRule::is_once_forked")]
         incarnation_rule: IncarnationRule,
     },
@@ -613,6 +620,15 @@ pub enum Action {
     /// keeps a set depends on the log alone, never on which features the replaying binary knows.
     /// Needs [`Feature::Handover`].
     EnableHandover,
+
+    /// Enables [`Feature::Incarnations`] for good, so that creations under
+    /// [`IncarnationRule::Always`] store a random incarnation whether or not the fleet has forked
+    /// (ADR-0046's FR-110 amendment). It changes nothing else. The control node's writer logs it
+    /// just before the first such creation once every member supports the feature
+    /// ([`State::incarnations_due`](crate::State::incarnations_due)), so that a release without
+    /// the feature, which decodes the creation but not this command, refuses the log rather than
+    /// replay the creation to the legacy incarnation. Needs [`Feature::Incarnations`].
+    EnableIncarnations,
 }
 
 impl Action {
@@ -645,7 +661,11 @@ impl Action {
             Self::Join { .. }
             | Self::Leave { .. }
             | Self::Heartbeat { .. }
-            | Self::CreateDatabase { metadata: None, .. }
+            | Self::CreateDatabase {
+                metadata: None,
+                incarnation_rule: IncarnationRule::OnceForked,
+                ..
+            }
             | Self::ChangeDurability { .. }
             | Self::DropDatabase { .. }
             | Self::AcquireLease { .. }
@@ -664,15 +684,20 @@ impl Action {
             },
             Self::Undrain { .. } => &[Feature::Undrain],
             Self::CreateDatabase {
-                metadata: Some(spec),
+                metadata: None,
+                incarnation_rule: IncarnationRule::Always,
                 ..
-            } => {
-                if spec.expires_at.is_some() {
-                    METADATA_AND_EXPIRY
-                } else {
-                    METADATA
-                }
-            }
+            } => INCARNATIONS,
+            Self::CreateDatabase {
+                metadata: Some(spec),
+                incarnation_rule,
+                ..
+            } => match (spec.expires_at.is_some(), incarnation_rule) {
+                (true, IncarnationRule::OnceForked) => METADATA_AND_EXPIRY,
+                (false, IncarnationRule::OnceForked) => METADATA,
+                (true, IncarnationRule::Always) => METADATA_EXPIRY_AND_INCARNATIONS,
+                (false, IncarnationRule::Always) => METADATA_AND_INCARNATIONS,
+            },
             Self::UpdateDatabase { change, .. } => {
                 if change.touches_expiry() {
                     METADATA_AND_EXPIRY
@@ -699,6 +724,7 @@ impl Action {
             | Self::RevokePrincipal { .. }
             | Self::RevokeAsAncestor { .. } => DELEGATION,
             Self::ReleaseKeptReplicas { .. } | Self::EnableHandover => HANDOVER,
+            Self::EnableIncarnations => INCARNATIONS,
         }
     }
 

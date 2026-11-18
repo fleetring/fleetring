@@ -235,10 +235,10 @@ impl fmt::Debug for FleetBuilder {
 
 impl FleetBuilder {
     /// Has the control node log every database creation under `rule`.
-    /// [`IncarnationRule::OnceForked`] stands it in for a control node of a release before
-    /// 0.8.1, which stores the legacy incarnation, 0, until the fleet forks: one not upgraded
-    /// yet, or rolled back (ADR-0046's FR-110 amendment). The default is this release's own,
-    /// [`IncarnationRule::Always`].
+    /// [`IncarnationRule::OnceForked`] stands it in for a control node of 0.8.0, which stores the
+    /// legacy incarnation, 0, until the fleet forks, as a fleet's control node is until it is
+    /// upgraded, last (ADR-0046's FR-110 amendment). The default is this release's own:
+    /// [`IncarnationRule::Always`] once every member supports the `incarnations` feature.
     #[must_use]
     pub fn incarnation_rule(mut self, rule: IncarnationRule) -> Self {
         self.incarnation_rule = Some(rule);
@@ -1131,7 +1131,7 @@ impl Fleet {
     }
 
     /// Has the control node log database creations under `rule` from its next start, or under
-    /// this release's own with `None`, as upgrading or rolling back its binary would
+    /// this release's own with `None`, as upgrading its binary would
     /// ([`FleetBuilder::incarnation_rule`]).
     pub fn set_incarnation_rule(&mut self, rule: Option<IncarnationRule>) {
         self.shared.lock().incarnation_rule = rule;

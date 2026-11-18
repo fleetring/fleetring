@@ -18,10 +18,10 @@
 //! another incarnation than its copy records, and the drop notice deletes the copy, since the
 //! copy records the dropped incarnation and control state holds another.
 //!
-//! Since FR-110 every database a control node of 0.8.1 or later creates has a random
-//! incarnation, forked fleet or not (ADR-0046's FR-110 amendment). The scenarios of a fleet that
-//! never forked stand the control node in for one of 0.8.0 where only the chain hash can tell
-//! the copies apart, as while it isn't upgraded yet or after a rollback.
+//! Since FR-110 every database created once every member supports the `incarnations` fleet
+//! feature has a random incarnation, forked fleet or not (ADR-0046's FR-110 amendment). The
+//! scenarios of a fleet that never forked stand the control node in for one of 0.8.0 where only
+//! the chain hash can tell the copies apart, as while it isn't upgraded yet.
 
 use std::time::Duration;
 

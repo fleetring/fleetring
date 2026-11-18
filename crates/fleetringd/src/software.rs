@@ -47,13 +47,14 @@ pub fn running() -> Software {
 }
 
 /// The fleet features this build acts on in full.
-const SUPPORTED: [Feature; 6] = [
+const SUPPORTED: [Feature; 7] = [
     Feature::Undrain,
     Feature::Metadata,
     Feature::Expiry,
     Feature::Fork,
     Feature::Handover,
     Feature::Delegation,
+    Feature::Incarnations,
 ];
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
@@ -129,7 +130,14 @@ mod tests {
         assert_eq!(stored["features"], serde_json::json!(["undrain"]));
         assert_eq!(
             stored["newer_features"],
-            serde_json::json!(["delegation", "expiry", "fork", "handover", "metadata"])
+            serde_json::json!([
+                "delegation",
+                "expiry",
+                "fork",
+                "handover",
+                "incarnations",
+                "metadata"
+            ])
         );
         // `upgrade --software` lists `expiry` now that the control node sweeps expired
         // databases (ADR-0041, point 3).
@@ -143,7 +151,8 @@ mod tests {
                 "expiry",
                 "fork",
                 "delegation",
-                "handover"
+                "handover",
+                "incarnations"
             ])
         );
         // An upgrade runs this build's `serve --check` before it swaps it in (#95).

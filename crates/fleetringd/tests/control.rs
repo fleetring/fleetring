@@ -3852,9 +3852,10 @@ mod forks {
             .await?
             .placement
             .ok_or("no placement")?;
-        // A creation stores its random incarnation whether or not the fleet has forked
-        // (ADR-0046's FR-110 amendment).
-        assert_ne!(later.incarnation, 0);
+        // While a member lacks `incarnations`, a creation is logged as 0.8.0 logged it, at the
+        // legacy incarnation (ADR-0046's FR-110 amendment).
+        assert_eq!(later.incarnation, 0);
+        assert!(!handle.state().is_enabled(Feature::Incarnations));
 
         // `old` restarts on a release with `fork`, and rejoins saying so.
         node_client(address, &tls, "old")?
@@ -3864,6 +3865,15 @@ mod forks {
         let status = control.fork_database(fork_request(operation, 3)).await?;
         assert_eq!(status.state, i32::from(ForkState::Seeding));
         assert!(handle.state().is_enabled(Feature::Fork));
+        // Every member now supports `incarnations` too: the next creation enables it, and
+        // stores its random incarnation.
+        let fresh = control
+            .create_database(create_request("fresh", 3))
+            .await?
+            .placement
+            .ok_or("no placement")?;
+        assert_ne!(fresh.incarnation, 0);
+        assert!(handle.state().is_enabled(Feature::Incarnations));
         daemon.run_until(async {}).await;
         Ok(())
     }

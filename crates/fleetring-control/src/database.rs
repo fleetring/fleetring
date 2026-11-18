@@ -451,10 +451,10 @@ impl fmt::Display for LeaseEpoch {
 /// The control node that proposes a creation draws its incarnation as 64 random bits and carries
 /// it in the command, as it carries the time, so `apply` stays pure and a replay gives the same
 /// incarnations. No rule rests on incarnations growing or never repeating: fencing compares a
-/// fork's whole identity. Every database a control node of 0.8.1 or later creates has a nonzero
-/// incarnation, as every fork has ([`IncarnationRule::Always`]). A database created earlier has
-/// [`Incarnation::LEGACY`], 0, unless the `fork` fleet feature was enabled by then, and so does
-/// every record written before incarnations existed.
+/// fork's whole identity. Every database created once the `incarnations` fleet feature is
+/// enabled has a nonzero incarnation, as every fork has ([`IncarnationRule::Always`]). A database
+/// created earlier has [`Incarnation::LEGACY`], 0, unless the `fork` fleet feature was enabled by
+/// then, and so does every record written before incarnations existed.
 ///
 /// Text and JSON write an incarnation as 16 lowercase hex digits, since a 64-bit integer doesn't
 /// survive every JSON reader.
@@ -561,12 +561,13 @@ impl From<Incarnation> for String {
 #[serde(rename_all = "snake_case")]
 pub enum IncarnationRule {
     /// The incarnation is stored once the `fork` fleet feature is enabled, and 0 before: what
-    /// every creation logged before 0.8.1 follows.
+    /// every creation logged before the `incarnations` fleet feature passes the gate follows.
     #[default]
     OnceForked,
-    /// The incarnation is stored whether or not the fleet has forked, and 0 is refused: what a
-    /// control node of 0.8.1 or later logs, so that a name dropped and created again never has
-    /// the legacy incarnation twice.
+    /// The incarnation is stored whether or not the fleet has forked, and 0 is refused. Needs
+    /// the `incarnations` fleet feature, which a control node of 0.8.1 or later logs it under
+    /// once every member supports it, so that a name dropped and created again never has the
+    /// legacy incarnation twice.
     Always,
 }
 

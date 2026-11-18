@@ -366,8 +366,8 @@ pub(crate) struct ForkResultOut {
 pub(crate) struct PlacementOut {
     /// The engine it runs on.
     pub(crate) engine: String,
-    /// Its incarnation: 16 lowercase hex digits, all zero for a database created before 0.8.1
-    /// in a fleet that hadn't forked.
+    /// Its incarnation: 16 lowercase hex digits, all zero for a database created before the
+    /// fleet enabled `incarnations` or `fork`.
     pub(crate) incarnation: String,
     /// Its lease epoch, 0 before its first lease.
     pub(crate) lease_epoch: u64,
