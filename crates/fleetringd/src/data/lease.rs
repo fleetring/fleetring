@@ -74,6 +74,14 @@ use crate::replication::{DropNotice, Fenced, PromotionRequest, Replication};
 /// acknowledged before it deletes the copy (ADR-0041, point 4).
 pub(crate) const DROP_FLUSH_LIMIT: Duration = Duration::from_secs(30);
 
+/// How many times the lease keeper asks the control plane about a drop notice it can't confirm
+/// because the control plane can't be reached, as the control node tells an unreachable node
+/// of a drop (ADR-0042, point 2).
+const DROP_CHECK_ATTEMPTS: u32 = 5;
+
+/// How long the lease keeper waits before it asks the control plane about a drop notice again.
+const DROP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// How a data node paces its leases and promotions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaseSettings {
@@ -569,14 +577,48 @@ async fn keep_orphan(node: &DataNode, database: &DatabaseName, why: &'static str
 /// incarnation at any epoch, since a database created again under the name restarts its epochs
 /// and may have reached the copy's by the time the notice is judged. All of this is judged
 /// again here, under the name's lock, since a database of the name may have been created and
-/// leased since the notice arrived. A control plane that can't be reached leaves the copy,
-/// which becomes an orphan the usual way.
+/// leased since the notice arrived. A control plane that can't be reached is asked again, up
+/// to [`DROP_CHECK_ATTEMPTS`] times [`DROP_CHECK_INTERVAL`] apart and without the name's lock
+/// meanwhile, as a control node that just restarted may not answer at once; after that the
+/// copy stays, and becomes an orphan the usual way.
 async fn drop_seen(
     node: &DataNode,
     database: &DatabaseName,
     notice: &DropNotice,
     dropped: &mpsc::UnboundedSender<Dropped>,
 ) {
+    for attempt in 1..=DROP_CHECK_ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(DROP_CHECK_INTERVAL).await;
+        }
+        match judge_drop(node, database, notice, dropped).await {
+            Judged::Settled => return,
+            Judged::Unconfirmed(status) => {
+                tracing::debug!(database = %database, epoch = notice.epoch.get(), attempt, %status, "can't confirm a drop notice with the control plane yet");
+            }
+        }
+    }
+    tracing::info!(database = %database, epoch = notice.epoch.get(), "can't confirm a drop notice with the control plane; kept the copy");
+}
+
+/// How a drop notice was judged under the name's lock.
+#[derive(Debug)]
+enum Judged {
+    /// The copy was deleted, set to be deleted once flushed, or kept for a reason the notice
+    /// can't change.
+    Settled,
+    /// The control plane answered this status, not whether it holds the database.
+    Unconfirmed(Status),
+}
+
+/// Judges `notice` for `database` once under the name's lock, and acts on it: see
+/// [`drop_seen`].
+async fn judge_drop(
+    node: &DataNode,
+    database: &DatabaseName,
+    notice: &DropNotice,
+    dropped: &mpsc::UnboundedSender<Dropped>,
+) -> Judged {
     let epoch = notice.epoch;
     // No create, restore, or orphan removal of the name runs while the notice is judged and
     // acted on, so the copy judged is the copy deleted.
@@ -587,11 +629,11 @@ async fn drop_seen(
         .unwrap_or(LeaseEpoch::ZERO);
     match replication.drop_names_copy(database, epoch, notice.incarnation) {
         Some(true) => {}
-        None => return,
+        None => return Judged::Settled,
         Some(false) => {
             let recorded = replication.copy_incarnation(database);
             tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), named = ?notice.incarnation, ?recorded, "a drop notice names another incarnation than this node's copy; kept the copy");
-            return;
+            return Judged::Settled;
         }
     }
     let random = notice
@@ -605,26 +647,23 @@ async fn drop_seen(
     match node.locate(database).await {
         Ok(placement) if random.is_some_and(|named| named.get() == placement.incarnation) => {
             tracing::info!(database = %database, epoch = epoch.get(), "the control plane still holds the database the drop notice names; kept the copy");
-            return;
+            return Judged::Settled;
         }
         Ok(_) if names_recorded => {}
         Ok(placement) if placement.epoch < epoch.get() => {}
         Err(status) if missing_database(&status).is_some() => {}
         Ok(_) => {
             tracing::info!(database = %database, epoch = epoch.get(), "the control plane holds the name at the dropped epoch again; kept the copy");
-            return;
+            return Judged::Settled;
         }
-        Err(status) => {
-            tracing::info!(database = %database, epoch = epoch.get(), %status, "can't confirm a drop notice with the control plane; kept the copy");
-            return;
-        }
+        Err(status) => return Judged::Unconfirmed(status),
     }
     // The copy goes at its own highest epoch, the notice's or, for a copy that missed the
     // database's later epochs, a lower one: a newer database's copy here would have moved past it.
     let dropped_at = highest;
     if node.confirm_drop(database, dropped_at) {
         tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; its copy goes once its change streams are flushed");
-        return;
+        return Judged::Settled;
     }
     if let Some(lease) = node.held_leases().get(database).copied() {
         tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; stopped serving it");
@@ -636,10 +675,11 @@ async fn drop_seen(
             dropped,
         )
         .await;
-        return;
+        return Judged::Settled;
     }
     tracing::info!(database = %database, epoch = epoch.get(), "the database was dropped; deleting this node's copy");
     discard(node, database).await;
+    Judged::Settled
 }
 
 /// Acts on a drop notice that names a fork identity (ADR-0046, point 4.6): deletes this node's
