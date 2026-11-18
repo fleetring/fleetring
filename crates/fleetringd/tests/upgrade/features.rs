@@ -453,6 +453,17 @@ impl Features {
     /// The previous release's token reads the fleet as the test principal, and agent `42` writes
     /// and reads its database, with this build's command line.
     fn credentials_work(&self, when: &str) -> TestResult {
+        // A data node refuses every token while its denylist is older than the heartbeat timeout
+        // (ADR-0026, point 6; ADR-0047, invariant I5), as it can be just after the control node
+        // restarts. Wait that out; any other answer goes on to the checks below.
+        wait_for(
+            &format!("{when}: agent {AGENT}'s primary has a fresh denylist"),
+            || {
+                self.run(&["db", "query", MEMORY, "SELECT 1", "--agent", AGENT])
+                    .ok()
+                    .filter(|output| !stderr(output).contains("denylist is stale"))
+            },
+        )?;
         let listed = self.run(&["db", "list", "--token", &self.token])?;
         assert!(listed.status.success(), "{when}: {}", printed(&listed));
         assert!(
