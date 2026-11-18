@@ -66,8 +66,8 @@ pub enum Mutation {
     /// copy acknowledged under a name created again counts for the new database (FR-106).
     CountFirstAckUnproven,
     /// A creation stores the legacy incarnation, 0, until the fleet enables `fork`, as 0.8.0
-    /// did, whatever rule it carries: a name dropped and created again before then has
-    /// incarnation 0 twice (FR-110).
+    /// did, whatever rule it carries and whether or not `incarnations` is enabled: a name
+    /// dropped and created again before then has incarnation 0 twice (FR-110).
     StoreLegacyIncarnation,
 }
 

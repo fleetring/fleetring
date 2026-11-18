@@ -3009,7 +3009,8 @@ mod metadata {
                 engine: fleetring_control::Engine::Sqlite,
                 durability: None,
                 metadata: None,
-                incarnation: fleetring_control::Incarnation::LEGACY,
+                // The creation above enabled `incarnations`, so this one stores what it carries.
+                incarnation: fleetring_control::Incarnation::new(0x0bd),
                 incarnation_rule: fleetring_control::IncarnationRule::OnceForked,
             })
             .await?;

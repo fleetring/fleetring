@@ -576,3 +576,35 @@ fn after_the_upgrade_the_legacy_incarnation_names_only_the_databases_that_had_it
         "{created} {dropped} {refused}"
     );
 }
+
+/// The order lives in the log, not only in the writer: a creation under `always` is refused
+/// until `EnableIncarnations` has been applied, though every member supports the feature, so a
+/// proposer that skips the writer's check can't log one a release without the feature would
+/// replay to 0. Once the feature is enabled, a creation under `once_forked`, which a proposer
+/// chose while a member still lacked the feature, stores its random incarnation too, so it can't
+/// give a name the legacy incarnation a second time (ADR-0046's FR-110 amendment).
+#[test]
+fn incarnations_order_their_creations_in_the_log() {
+    let (mut state, _) = never_forked_on_0_8_0();
+    members_on_0_8_1(&mut state, 3);
+    let before = state.clone();
+    assert_eq!(
+        run(&mut state, 4, create_always("early", 3, 0x0e01)),
+        Err(Rejection::FeatureNotEnabled {
+            feature: Feature::Incarnations
+        })
+    );
+    assert_eq!(state, before, "a refused creation changes nothing");
+
+    enable_incarnations(&mut state, 5);
+    run(&mut state, 6, Action::DropDatabase { name: db("d0") }).expect("dropped");
+    run(&mut state, 7, create_at("d0", 3, 0x0e02)).expect("created as chosen before");
+    let stored = state.database(&db("d0")).map(|db| db.incarnation());
+    assert_eq!(stored, Some(Incarnation::new(0x0e02)));
+    assert_eq!(
+        run(&mut state, 8, create_at("late", 3, 0)),
+        Err(Rejection::IncarnationUnavailable {
+            incarnation: Incarnation::LEGACY
+        })
+    );
+}

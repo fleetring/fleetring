@@ -185,9 +185,11 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Incarnation::is_legacy")]
         incarnation: Incarnation,
         /// When the incarnation is stored: [`IncarnationRule::Always`], which needs
-        /// [`Feature::Incarnations`], from a control node of 0.8.1 or later once every member
-        /// supports it, and otherwise [`IncarnationRule::OnceForked`], which the log leaves out,
-        /// as every creation before 0.8.1 (ADR-0046's FR-110 amendment).
+        /// [`Feature::Incarnations`] enabled by [`Action::EnableIncarnations`] first, from a
+        /// control node of 0.8.1 or later once every member supports it, and otherwise
+        /// [`IncarnationRule::OnceForked`], which the log leaves out, as every creation before
+        /// 0.8.1, and which stores the incarnation too once `incarnations` is enabled
+        /// (ADR-0046's FR-110 amendment).
         #[serde(default, skip_serializing_if = "IncarnationRule::is_once_forked")]
         incarnation_rule: IncarnationRule,
     },
