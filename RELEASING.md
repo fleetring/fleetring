@@ -356,16 +356,16 @@ A draft for 0.8.1's notes (ADR-0046's FR-110 amendment; FR-110, #177). The 0.8.0
 ````markdown
 ## fleetringd 0.8.1
 
-A fix release for 0.8. Every new database now gets a random incarnation, whether or not the fleet has forked, which removes 0.8.0's first known limit: a name dropped and created again in quick succession could have a promotion serve the dropped rows under it. Upgrade as for any patch release, data nodes first and the control node last. 0.8.0 and 0.8.1 run side by side, and a node can roll back to 0.8.0, or to 0.7 while no 0.8 fleet feature has been used.
+A fix release for 0.8. Once every node runs 0.8.1, every new database gets a random incarnation, whether or not the fleet has forked, which removes 0.8.0's first known limit: a name dropped and created again in quick succession could have a promotion serve the dropped rows under it. Upgrade every data node first, then the control node. **The first `db create` after every node runs 0.8.1 enables a new fleet feature, `incarnations`, and from then on rolling back below 0.8.1 is refused**; read **Breaking changes** before you upgrade the last node.
 
 ### Breaking changes
 
 **Upgrading from 0.8.0 or 0.7:**
 
-- **The fix starts once the control node runs 0.8.1.** The control node gives each new database its incarnation, so until it is upgraded, which it is last (ADR-0038, point 9), a fleet that has never forked still creates databases at incarnation 0. **In a fleet that has never forked, don't drop a database and create its name again until the control node runs 0.8.1**, and, as for 0.8.0, while any node runs 0.7.
-- **Existing databases keep incarnation 0.** Only databases created from now on get a random one, which the `incarnation` field of `db show --json` and `db list --json` shows.
-- **Rolling back stays possible.** 0.8.0 reads 0.8.1's control log and snapshots, and so does 0.7 until a 0.8 fleet feature is first used, as before. Both store 0 for the databases they create. A database 0.8.1 created can read as incarnation 0 on a control node rolled back below 0.8.1; data nodes treat 0 as saying nothing, so it keeps working, with 0.8.0's protection, and the 0.8.0 limit returns until the control node runs 0.8.1 again.
-- **A copy of a dropped database can now be kept as an orphan in a fleet that has never forked.** A data node that missed the drop of a database created before the upgrade keeps that copy as an orphan if the name was created again: the new database's streams name its random incarnation, which the copy doesn't record. A forked fleet already worked this way. `fleetring orphan list` shows the copy, and `fleetring orphan remove` deletes it, after which the node follows the new database. Nothing is lost.
+- **A new fleet feature, `incarnations`, closes rollback below 0.8.1 the first time it is used.** It is used by the first database created once every member, live or down, runs 0.8.1, and creating databases is so common that, in practice, upgrading the last node is the last point to roll back from. After that, a 0.8.0 or 0.7 node can't join, and `fleetring upgrade --rollback` below 0.8.1 is refused, naming the feature. The control node logs the feature's enabling on its audit target.
+- **The fix starts once every node runs 0.8.1.** Until then creations store incarnation 0, as on 0.8.0, and 0.8.1 stays rollback-safe. **In a fleet that has never forked, don't drop a database and create its name again until every node runs 0.8.1 and a database has been created since**, and, as for 0.8.0, while any node runs 0.7.
+- **Existing databases keep incarnation 0.** Only databases created once the feature is enabled get a random one, which the `incarnation` field of `db show --json` and `db list --json` shows.
+- **A copy of a dropped database can now be kept as an orphan in a fleet that has never forked.** A data node that missed the drop of a database created before the feature was enabled keeps that copy as an orphan if the name was created again: the new database's streams name its random incarnation, which the copy doesn't record. A forked fleet already worked this way. `fleetring orphan list` shows the copy, and `fleetring orphan remove` deletes it, after which the node follows the new database. Nothing is lost.
 
 ### Fixes
 
@@ -375,7 +375,7 @@ A fix release for 0.8. Every new database now gets a random incarnation, whether
 
 - **An idle database's followers can wait for a write to count** (FR-111, #178), as in 0.8.0.
 - **A stale copy can stall a promotion** (FR-112, #180), as in 0.8.0.
-- **A database created before the upgrade, dropped, and created again before the control node ran 0.8.1** has the limit 0.8.0 published until it is dropped again.
+- **A database created before `incarnations` was enabled, dropped, and created again before then** has the limit 0.8.0 published until it is dropped again.
 
 ### Verify
 
