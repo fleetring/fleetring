@@ -264,7 +264,7 @@
               "type": "string"
             },
             "incarnation": {
-              "description": "Its incarnation: 16 lowercase hex digits, all zero before forks were enabled.",
+              "description": "Its incarnation: 16 lowercase hex digits, all zero for a database created before 0.8.1 in a fleet that hadn't forked.",
               "type": "string"
             },
             "lease_epoch": {
@@ -838,7 +838,7 @@
               "type": "string"
             },
             "incarnation": {
-              "description": "Its incarnation: 16 lowercase hex digits, all zero before forks were enabled.",
+              "description": "Its incarnation: 16 lowercase hex digits, all zero for a database created before 0.8.1 in a fleet that hadn't forked.",
               "type": "string"
             },
             "lease_epoch": {
@@ -1578,7 +1578,7 @@
               "type": "string"
             },
             "incarnation": {
-              "description": "Its incarnation: 16 lowercase hex digits, all zero before forks were enabled.",
+              "description": "Its incarnation: 16 lowercase hex digits, all zero for a database created before 0.8.1 in a fleet that hadn't forked.",
               "type": "string"
             },
             "lease_epoch": {
