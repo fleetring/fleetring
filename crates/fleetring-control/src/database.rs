@@ -560,8 +560,9 @@ impl From<Incarnation> for String {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum IncarnationRule {
-    /// The incarnation is stored once the `fork` fleet feature is enabled, and 0 before: what
-    /// every creation logged before the `incarnations` fleet feature passes the gate follows.
+    /// The incarnation is stored once the `fork` or the `incarnations` fleet feature is
+    /// enabled, and 0 before: what every creation logged before the `incarnations` fleet
+    /// feature passes the gate follows.
     #[default]
     OnceForked,
     /// The incarnation is stored whether or not the fleet has forked, and 0 is refused. Needs

@@ -854,6 +854,16 @@ pub enum Rejection {
         release: Release,
     },
 
+    /// The command needs a fleet feature that only a command of its own enables, and that
+    /// command hasn't been applied: a creation under
+    /// [`IncarnationRule::Always`] before [`Action::EnableIncarnations`]
+    /// (ADR-0046's FR-110 amendment).
+    #[error("the fleet hasn't enabled '{feature}': the command that enables it must come first")]
+    FeatureNotEnabled {
+        /// The feature the command needs.
+        feature: Feature,
+    },
+
     /// The command needs a fleet feature that isn't enabled, and no member has joined yet, so
     /// no member can be shown to support it. Enabling it then would refuse every later join of
     /// a release that doesn't report it.
@@ -1050,8 +1060,9 @@ pub enum Rejection {
     },
 
     /// A creation's incarnation is the legacy 0, which a creation may carry only under
-    /// [`IncarnationRule::OnceForked`] before forks are enabled, or a database or a fork
-    /// operation records it already. The control node draws another and asks again.
+    /// [`IncarnationRule::OnceForked`] before `fork` or `incarnations` is enabled, or a
+    /// database or a fork operation records it already. The control node draws another and asks
+    /// again.
     #[error("incarnation {incarnation} is unavailable")]
     IncarnationUnavailable {
         /// The incarnation.
@@ -1484,19 +1495,28 @@ fn create_database(state: &mut State, now: Timestamp, creation: Creation) -> Out
     if let Some(expires_at) = metadata.as_ref().and_then(|spec| spec.expires_at) {
         check_expiry(&name, now, expires_at)?;
     }
-    // A creation under `always`, which needs the `incarnations` feature, stores its incarnation
-    // whether or not the fleet has forked, so that a name dropped and created again never has
-    // the legacy incarnation twice. One under `once_forked`, as every creation before 0.8.1,
-    // stores it once the `fork` feature is enabled, and 0 before, so that it replays as it
-    // applied then (ADR-0046, point 1.2, as its FR-110 amendment changes it).
-    let incarnation_rule = if Mutation::StoreLegacyIncarnation.is_active() {
-        IncarnationRule::OnceForked
+    // A creation under `always` stores its incarnation whether or not the fleet has forked, so
+    // that a name dropped and created again never has the legacy incarnation twice. It is taken
+    // only once `incarnations` is enabled, by the command logged before it, so that a release
+    // without the feature can't load a log that holds one. A creation under `once_forked`, as
+    // every creation logged before the feature, stores it once `fork` or `incarnations` is
+    // enabled, and 0 before: it replays as it applied then, and one a proposer chose before the
+    // feature was enabled and logged after it still stores its random value (ADR-0046, point
+    // 1.2, as its FR-110 amendment changes it).
+    if incarnation_rule == IncarnationRule::Always && !state.is_enabled(Feature::Incarnations) {
+        return Err(Rejection::FeatureNotEnabled {
+            feature: Feature::Incarnations,
+        });
+    }
+    let stored = if Mutation::StoreLegacyIncarnation.is_active() {
+        state.is_enabled(Feature::Fork)
     } else {
-        incarnation_rule
-    };
-    let stored = match incarnation_rule {
-        IncarnationRule::Always => true,
-        IncarnationRule::OnceForked => state.is_enabled(Feature::Fork),
+        match incarnation_rule {
+            IncarnationRule::Always => true,
+            IncarnationRule::OnceForked => {
+                state.is_enabled(Feature::Fork) || state.is_enabled(Feature::Incarnations)
+            }
+        }
     };
     let incarnation = if stored {
         forks::check_incarnation(state, incarnation)?;

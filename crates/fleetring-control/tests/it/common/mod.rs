@@ -180,6 +180,18 @@ impl Generator {
         } else {
             action
         };
+        // Among current members, the first tick once every member supports `incarnations` is
+        // replaced by the command that enables it, as a control node's writer logs it before the
+        // first creation under `always` (ADR-0046's FR-110 amendment).
+        let enables = self.mix == SoftwareMix::Current
+            && matches!(action, Action::Tick)
+            && !state.is_enabled(Feature::Incarnations)
+            && state.check_feature(Feature::Incarnations).is_ok();
+        let action = if enables {
+            Action::EnableIncarnations
+        } else {
+            action
+        };
         Command::new(at(stamp), action)
     }
 }
@@ -290,11 +302,13 @@ fn action(state: &State, op: Op, mix: SoftwareMix) -> Action {
             {
                 *metadata = Some(metadata_spec(state, op));
             }
-            // Most creations among current members carry this release's rule, with an
-            // incarnation that is now and then 0, or a live database's, which `apply` refuses
-            // (ADR-0046's FR-110 amendment); the rest are logged as 0.8.0 logged them.
+            // Once `incarnations` is enabled, most creations among current members carry this
+            // release's rule, with an incarnation that is now and then 0, or a live database's,
+            // which `apply` refuses (ADR-0046's FR-110 amendment); the rest, and every one
+            // before, are logged as 0.8.0 logged them.
             if mix == SoftwareMix::Current
                 && !b.is_multiple_of(3)
+                && state.is_enabled(Feature::Incarnations)
                 && let Action::CreateDatabase {
                     incarnation,
                     incarnation_rule,
