@@ -275,6 +275,19 @@ impl State {
         Ok(())
     }
 
+    /// Whether the control node should log [`Action::EnableIncarnations`] before `action`: the
+    /// feature isn't enabled, every member, live or down, supports it, and `action` is a creation
+    /// under [`IncarnationRule::Always`](crate::IncarnationRule::Always), which needs it
+    /// (ADR-0046's FR-110 amendment). So the feature is enabled on its first use, as a command's
+    /// feature is (ADR-0038, point 4), by a command a release without the feature can't decode.
+    #[must_use]
+    pub fn incarnations_due(&self, action: &Action) -> bool {
+        action.features().contains(&Feature::Incarnations)
+            && !matches!(action, Action::EnableIncarnations)
+            && !self.is_enabled(Feature::Incarnations)
+            && self.check_feature(Feature::Incarnations).is_ok()
+    }
+
     /// Returns the timing rules the state runs under.
     #[must_use]
     pub fn config(&self) -> &ControlConfig {

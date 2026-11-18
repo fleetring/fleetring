@@ -35,10 +35,25 @@ fn v0_7_0() -> Software {
         )
 }
 
-/// What a 0.8.0 node reports: every feature this build knows.
+/// The features 0.8.0 knows: every one this build knows but `incarnations` (FR-110).
+fn features_of_0_8_0() -> impl Iterator<Item = Feature> {
+    Feature::ALL
+        .into_iter()
+        .filter(|feature| *feature != Feature::Incarnations)
+}
+
+/// What a 0.8.0 node reports: every feature 0.8.0 knows.
 fn v0_8_0() -> Software {
-    Feature::ALL.into_iter().fold(
+    features_of_0_8_0().fold(
         Software::new(Release::new(0, 8, 0), 1),
+        Software::with_feature,
+    )
+}
+
+/// What a 0.8.1 node reports: every feature this build knows.
+fn v0_8_1() -> Software {
+    Feature::ALL.into_iter().fold(
+        Software::new(Release::new(0, 8, 1), 1),
         Software::with_feature,
     )
 }
@@ -265,11 +280,12 @@ fn once_every_member_runs_0_8_each_feature_enables_on_its_first_command() {
     // n2 restarts on 0.8 and rejoins; its heartbeats report the same.
     fleet.run(join("n2", v0_8_0())).expect("rejoin");
     fleet.heartbeat("n2", v0_8_0());
-    assert!(fleet.state.members().all(|member| {
-        Feature::ALL
-            .into_iter()
-            .all(|f| member.running().supports(f))
-    }));
+    assert!(
+        fleet
+            .state
+            .members()
+            .all(|member| { features_of_0_8_0().all(|f| member.running().supports(f)) })
+    );
     // Commands that need no feature enable none: a fleet can still roll back.
     fleet.run(Action::Tick).expect("tick");
     fleet.run(create("plain", 3)).expect("create");
@@ -414,12 +430,39 @@ fn never_forked_on_0_8_0() -> (State, Vec<Command>) {
     (state, log)
 }
 
+/// Every member of `state` reports 0.8.1, as its heartbeats do once it restarts on it.
+fn members_on_0_8_1(state: &mut State, millis: u64) {
+    for node in ["n0", "n1", "n2"] {
+        let heartbeat = Action::Heartbeat {
+            id: id(node),
+            replicas: Vec::new(),
+            unknown_reports: UnknownReports::Skip,
+            software: Some(v0_8_1()),
+            disk_free_bytes: None,
+        };
+        run(state, millis, heartbeat).expect("heartbeat");
+    }
+}
+
+/// Enables `incarnations`, as the control node's writer does before the first creation under
+/// `always` once every member supports it.
+fn enable_incarnations(state: &mut State, millis: u64) {
+    assert!(state.incarnations_due(&create_always("probe", 3, 1)));
+    assert_eq!(
+        run(state, millis, Action::EnableIncarnations),
+        Ok(Applied::IncarnationsEnabled)
+    );
+    assert!(!state.incarnations_due(&create_always("probe", 3, 1)));
+}
+
 /// A control node upgraded from 0.8.0 replays 0.8.0's log to the same state, its databases at
-/// the legacy incarnation, though each creation carried a random one; a name it drops and
-/// creates again gets the random incarnation the creation carries, and never 0
+/// the legacy incarnation, though each creation carried a random one. While a member runs
+/// 0.8.0, a creation under `always` is refused for `incarnations`, so the control node logs
+/// creations as 0.8.0 did; once every member runs 0.8.1, the first one enables the feature, and
+/// a name dropped and created again gets the random incarnation the creation carries, never 0
 /// (ADR-0046's FR-110 amendment, items 14 and 15).
 #[test]
-fn an_upgraded_control_node_keeps_existing_databases_at_0_and_gives_a_name_created_again_another() {
+fn an_upgraded_fleet_keeps_existing_databases_at_0_and_gives_a_name_created_again_another() {
     let (mut state, log) = never_forked_on_0_8_0();
     for database in state.databases() {
         assert_eq!(database.incarnation(), Incarnation::LEGACY);
@@ -432,32 +475,65 @@ fn an_upgraded_control_node_keeps_existing_databases_at_0_and_gives_a_name_creat
     }
     assert_eq!(replayed, state);
 
+    // The members still run 0.8.0: `always` is refused, naming the first, and the hole stays
+    // open, as on 0.8.0.
+    let always = create_always("d0", 3, 0x5eed_0000_0000_0001);
+    assert!(!state.incarnations_due(&always));
+    assert!(matches!(
+        state.check_admission(&always),
+        Err(Rejection::FeatureUnsupported {
+            feature: Feature::Incarnations,
+            ..
+        })
+    ));
     run(&mut state, 3, Action::DropDatabase { name: db("d0") }).expect("dropped");
-    let refused = run(&mut state, 4, create_always("d0", 3, 0));
+    run(&mut state, 4, create_at("d0", 3, 0x5eed_0000_0000_0002)).expect("created as on 0.8.0");
+    let mixed = state.database(&db("d0")).map(|db| db.incarnation());
+    assert_eq!(mixed, Some(Incarnation::LEGACY));
+
+    // Every member runs 0.8.1: the first creation under `always` enables the feature.
+    members_on_0_8_1(&mut state, 5);
+    assert!(state.features().next().is_none(), "nothing is enabled yet");
+    enable_incarnations(&mut state, 6);
+    run(&mut state, 7, Action::DropDatabase { name: db("d0") }).expect("dropped");
+    let refused = run(&mut state, 8, create_always("d0", 3, 0));
     assert_eq!(
         refused,
         Err(Rejection::IncarnationUnavailable {
             incarnation: Incarnation::LEGACY
         })
     );
-    run(&mut state, 5, create_always("d0", 3, 0x5eed_0000_0000_0001)).expect("created again");
+    run(&mut state, 9, always).expect("created again");
     let again = state.database(&db("d0")).map(|db| db.incarnation());
     assert_eq!(again, Some(Incarnation::new(0x5eed_0000_0000_0001)));
-    assert!(state.features().next().is_none(), "nothing is enabled");
+    assert_eq!(
+        state.features().collect::<Vec<_>>(),
+        [Feature::Incarnations]
+    );
     for name in ["d1", "d2"] {
         let kept = state.database(&db(name)).map(|db| db.incarnation());
         assert_eq!(kept, Some(Incarnation::LEGACY), "{name}");
     }
+    // A 0.8.0 node can no longer join.
+    assert!(matches!(
+        run(&mut state, 10, join("old", v0_8_0())),
+        Err(Rejection::MissingFeature {
+            feature: Feature::Incarnations,
+            ..
+        })
+    ));
 }
 
-/// Once the control node runs this release, `(name, 0)` names at most one database for the
-/// rest of the fleet's life: the one that held it at the upgrade, until its drop. Generated
-/// drops and creations, some carrying 0 or an incarnation a live database has, never leave
-/// another database at the legacy incarnation (ADR-0046's FR-110 amendment, item 15).
+/// Once `incarnations` is enabled, `(name, 0)` names at most one database for the rest of the
+/// fleet's life: the one that held it then, until its drop. Generated drops and creations, some
+/// carrying 0 or an incarnation a live database has, never leave another database at the legacy
+/// incarnation (ADR-0046's FR-110 amendment, item 15).
 #[test]
 fn after_the_upgrade_the_legacy_incarnation_names_only_the_databases_that_had_it() {
     const NAMES: [&str; 3] = ["d0", "d1", "d2"];
     let (mut state, _) = never_forked_on_0_8_0();
+    members_on_0_8_1(&mut state, 3);
+    enable_incarnations(&mut state, 4);
     let mut legacy: std::collections::BTreeSet<_> = state
         .databases()
         .filter(|database| database.incarnation() == Incarnation::LEGACY)

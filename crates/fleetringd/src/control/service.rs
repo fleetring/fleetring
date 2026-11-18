@@ -134,8 +134,9 @@ pub struct ControlService {
     notices: Option<DropNotices>,
     /// Where incarnations come from (ADR-0020, ADR-0046 point 1.1).
     entropy: Arc<dyn Entropy>,
-    /// The rule every creation is logged under: [`IncarnationRule::Always`], unless a
-    /// simulation stands this control node in for one of an earlier release.
+    /// The rule creations are logged under once the `incarnations` feature passes the gate:
+    /// [`IncarnationRule::Always`], unless a simulation stands this control node in for one of
+    /// an earlier release.
     incarnation_rule: IncarnationRule,
     /// The limits each fork this service proposes records (ADR-0046, point 7).
     fork_limits: ForkLimits,
@@ -432,15 +433,32 @@ impl ControlService {
     /// Submits `action`, a command that brings a database name into existence, with an
     /// incarnation drawn from the injected generator, and draws again and resubmits while
     /// `apply` refuses the incarnation as unavailable (ADR-0046, point 1.1). A creation carries
-    /// [`IncarnationRule::Always`] too, so `apply` stores its incarnation whether or not the
-    /// fleet has forked, and a name dropped and created again never has the legacy incarnation
-    /// twice (ADR-0046's FR-110 amendment).
+    /// [`IncarnationRule::Always`] once every member supports the `incarnations` feature, so
+    /// that `apply` stores its incarnation whether or not the fleet has forked, and a name
+    /// dropped and created again never has the legacy incarnation twice; until then it carries
+    /// [`IncarnationRule::OnceForked`], as on 0.8.0 (ADR-0046's FR-110 amendment).
     ///
     /// # Errors
     ///
     /// As [`ControlService::submit`], and `UNAVAILABLE` if every draw was refused.
     async fn submit_drawing(&self, mut action: Action) -> Result<(Applied, Arc<State>), Status> {
-        for _ in 0..INCARNATION_DRAWS {
+        // `always` while the `incarnations` feature passes the gate: enabled, or supported by
+        // every member. Otherwise, and once the writer refuses it for a member that joined
+        // meanwhile, the creation is logged as 0.8.0 logged it.
+        let mut rule = match self.incarnation_rule {
+            IncarnationRule::Always
+                if self
+                    .node
+                    .state()
+                    .check_feature(Feature::Incarnations)
+                    .is_ok() =>
+            {
+                IncarnationRule::Always
+            }
+            _ => IncarnationRule::OnceForked,
+        };
+        let mut draws = 0;
+        while draws < INCARNATION_DRAWS {
             let drawn = self.draw_incarnation();
             match &mut action {
                 Action::CreateDatabase {
@@ -449,16 +467,22 @@ impl ControlService {
                     ..
                 } => {
                     *incarnation = drawn;
-                    *incarnation_rule = self.incarnation_rule;
+                    *incarnation_rule = rule;
                 }
                 Action::ForkDatabase { incarnation, .. } => *incarnation = drawn,
                 _ => {}
             }
-            let committed = self
-                .node
-                .submit(action.clone())
-                .await
-                .map_err(submit_status)?;
+            let committed = match self.node.submit(action.clone()).await {
+                Err(SubmitError::Refused(Rejection::FeatureUnsupported {
+                    feature: Feature::Incarnations,
+                    ..
+                })) if rule == IncarnationRule::Always => {
+                    rule = IncarnationRule::OnceForked;
+                    continue;
+                }
+                submitted => submitted.map_err(submit_status)?,
+            };
+            draws += 1;
             match committed.into_parts() {
                 (Ok(applied), state) => return Ok((applied, state)),
                 (Err(Rejection::IncarnationUnavailable { incarnation }), _) => {

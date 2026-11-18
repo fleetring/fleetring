@@ -285,6 +285,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             epoch,
         } => crate::handover::release_kept_replicas(state, database, incarnation, epoch),
         Action::EnableHandover => Ok(Applied::HandoverEnabled),
+        Action::EnableIncarnations => Ok(Applied::IncarnationsEnabled),
     }?;
     if let Some(before) = ring_before
         && state.membership_epoch != membership_epoch
@@ -593,6 +594,9 @@ pub enum Applied {
 
     /// [`Feature::Handover`] is enabled (ADR-0031, amendment 2).
     HandoverEnabled,
+    /// [`Feature::Incarnations`] was enabled: from now on a creation under
+    /// [`IncarnationRule::Always`] stores its random incarnation.
+    IncarnationsEnabled,
 }
 
 /// How a join changed the membership.
@@ -1480,10 +1484,11 @@ fn create_database(state: &mut State, now: Timestamp, creation: Creation) -> Out
     if let Some(expires_at) = metadata.as_ref().and_then(|spec| spec.expires_at) {
         check_expiry(&name, now, expires_at)?;
     }
-    // A creation logged by 0.8.1 or later stores its incarnation always, so that a name dropped
-    // and created again never has the legacy incarnation twice. One logged earlier stores it
-    // once the `fork` feature is enabled, and 0 before, so that it replays as it applied then
-    // (ADR-0046, point 1.2, as its FR-110 amendment changes it).
+    // A creation under `always`, which needs the `incarnations` feature, stores its incarnation
+    // whether or not the fleet has forked, so that a name dropped and created again never has
+    // the legacy incarnation twice. One under `once_forked`, as every creation before 0.8.1,
+    // stores it once the `fork` feature is enabled, and 0 before, so that it replays as it
+    // applied then (ADR-0046, point 1.2, as its FR-110 amendment changes it).
     let incarnation_rule = if Mutation::StoreLegacyIncarnation.is_active() {
         IncarnationRule::OnceForked
     } else {

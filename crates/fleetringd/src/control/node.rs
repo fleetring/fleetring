@@ -516,7 +516,8 @@ impl Writer {
     /// It is checked against the state the commands queued before it in the group leave, which is
     /// the state `apply` will see. A join or a leave that [`State::handover_due`] says would keep
     /// the first replica set is preceded by [`Action::EnableHandover`], logged by the writer
-    /// itself in the same group.
+    /// itself in the same group, and a creation that [`State::incarnations_due`] says would use
+    /// the `incarnations` feature first by [`Action::EnableIncarnations`].
     ///
     /// A command that needs the `delegation` fleet feature is answered with
     /// [`SubmitError::Refused`] and never logged when `apply` would refuse it on that state
@@ -535,7 +536,7 @@ impl Writer {
         let mut preview: Option<State> = None;
         for (action, reply) in submits {
             let membership = matches!(action, Action::Join { .. } | Action::Leave { .. });
-            let mut enable = false;
+            let mut enable = None;
             if needs_screening(&action)
                 || (membership && !self.state.is_enabled(fleetring_control::Feature::Handover))
             {
@@ -554,16 +555,23 @@ impl Writer {
                 }
                 // The first membership change that would keep a replica set, once every member
                 // supports `handover`, is preceded by the command that enables it, so that what
-                // a change does depends on the log alone (ADR-0031, amendment 2).
-                enable = preview.handover_due(&action);
+                // a change does depends on the log alone (ADR-0031, amendment 2). So is the first
+                // creation under `always`, so that a release without `incarnations` refuses the
+                // log rather than replay it to the legacy incarnation (ADR-0046's FR-110
+                // amendment).
+                if preview.handover_due(&action) {
+                    enable = Some(Action::EnableHandover);
+                } else if preview.incarnations_due(&action) {
+                    enable = Some(Action::EnableIncarnations);
+                }
             }
-            if enable {
+            if let Some(enabling) = enable {
                 let Some(index) = last.next() else {
                     exhausted = Some(reply);
                     break;
                 };
                 last = index;
-                let command = self.stamp(Action::EnableHandover);
+                let command = self.stamp(enabling);
                 if let Some(preview) = &mut preview {
                     let _outcome = apply(preview, command.clone());
                 }
@@ -901,6 +909,97 @@ mod tests {
             ),
             "{commands:?}"
         );
+    }
+
+    /// The writer logs `EnableIncarnations` just before the first creation under `always`, once
+    /// every member supports the feature, so a release without it refuses the log there rather
+    /// than replay the creation to the legacy incarnation; it refuses such a creation unlogged
+    /// while a member lacks the feature (ADR-0046's FR-110 amendment).
+    #[tokio::test(start_paused = true)]
+    async fn control_writer_enables_incarnations_before_the_first_creation_under_always() {
+        use fleetring::ReplicationFactor;
+        use fleetring_control::{
+            Engine, Feature, Incarnation, IncarnationRule, Member, Rejection, Release, Software,
+        };
+
+        let every = Feature::ALL.into_iter().fold(
+            Software::new(Release::new(0, 8, 1), 1),
+            Software::with_feature,
+        );
+        let without = Feature::ALL
+            .into_iter()
+            .filter(|feature| *feature != Feature::Incarnations)
+            .fold(
+                Software::new(Release::new(0, 8, 0), 1),
+                Software::with_feature,
+            );
+        let join = |name: &str, software: &Software| Action::Join {
+            member: Member::new(name.parse().expect("an id")).with_software(software.clone()),
+        };
+        let always = |name: &str, incarnation: u64| Action::CreateDatabase {
+            name: name.parse().expect("a name"),
+            replication_factor: ReplicationFactor::new(3).expect("nonzero"),
+            engine: Engine::Sqlite,
+            durability: None,
+            metadata: None,
+            incarnation: Incarnation::new(incarnation),
+            incarnation_rule: IncarnationRule::Always,
+        };
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("control.db");
+        let options = ControlOptions::default().with_storage_io(StorageIo::Inline);
+        let node = ControlNode::open(&path, options, SimClock::new(Timestamp::from_millis(1_000)))
+            .await
+            .expect("opens");
+        let handle = node.handle();
+        for action in [join("a", &every), join("b", &every), join("c", &without)] {
+            let committed = handle.submit(action).await.expect("commits");
+            assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        }
+        let refused = handle.submit(always("early", 0x11)).await;
+        assert!(
+            matches!(
+                refused,
+                Err(SubmitError::Refused(Rejection::FeatureUnsupported {
+                    feature: Feature::Incarnations,
+                    ..
+                }))
+            ),
+            "{refused:?}"
+        );
+        let committed = handle.submit(join("c", &every)).await.expect("commits");
+        assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        let committed = handle.submit(always("fresh", 0x22)).await.expect("commits");
+        assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        assert!(handle.state().is_enabled(Feature::Incarnations));
+        let committed = handle.submit(always("later", 0x33)).await.expect("commits");
+        assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        node.shutdown().await;
+
+        let log = CommandLog::open(&path, ControlConfig::new()).expect("the log opens");
+        let actions: Vec<Action> = log
+            .commands()
+            .expect("reads")
+            .into_iter()
+            .map(|(_, command)| command.action)
+            .collect();
+        let enabling: Vec<usize> = actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| matches!(action, Action::EnableIncarnations))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(enabling.len(), 1, "{actions:?}");
+        let created_next = matches!(
+            &actions[enabling[0] + 1],
+            Action::CreateDatabase { name, .. } if name.as_str() == "fresh"
+        );
+        assert!(created_next, "{actions:?}");
+        let logged_early = actions.iter().any(
+            |action| matches!(action, Action::CreateDatabase { name, .. } if name.as_str() == "early"),
+        );
+        assert!(!logged_early, "{actions:?}");
     }
 
     /// A delegation `apply` refuses is answered `Refused` and never logged, so a refusal costs

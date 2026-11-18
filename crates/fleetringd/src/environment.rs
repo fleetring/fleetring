@@ -354,9 +354,9 @@ impl Environment {
         self
     }
 
-    /// Logs every database creation under `rule`, as a control node of a release before 0.8.1
-    /// does with [`IncarnationRule::OnceForked`]: for simulations of a fleet whose control node
-    /// hasn't been upgraded, or was rolled back (ADR-0046's FR-110 amendment).
+    /// Logs every database creation under `rule`, as a control node of 0.8.0 does with
+    /// [`IncarnationRule::OnceForked`]: for simulations of a fleet whose control node hasn't been
+    /// upgraded yet (ADR-0046's FR-110 amendment).
     #[cfg(feature = "simulation")]
     #[must_use]
     pub fn with_incarnation_rule(mut self, rule: IncarnationRule) -> Self {

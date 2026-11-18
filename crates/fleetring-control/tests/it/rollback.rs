@@ -439,17 +439,90 @@ fn a_log_with_delegation_enabled_cant_load_without_it() {
     assert!(serde_json::from_str::<v0_7::Command>(&logged).is_err());
 }
 
-/// What a 0.8.0 control node decodes of a creation, as the `fleetringd-v0.8.0` tag defines
-/// `CreateDatabase`: every field this build logs but `incarnation_rule`, which it reads past, as
-/// serde reads past every field a type doesn't name.
-mod v0_8_0 {
+/// What a 0.8.0 control node decodes of this build's log and snapshots, as the
+/// `fleetringd-v0.8.0` tag defines it: the enabled features, decoded strictly, since "a release
+/// that doesn't know an enabled feature mustn't run the fleet, so its control node fails to load
+/// the state rather than drop the name" (0.8.0's `State::features`); every action by name, since
+/// serde refuses a variant an externally tagged enum lacks; and a creation, whose
+/// `incarnation_rule` it reads past.
+pub(crate) mod v0_8_0 {
+    use std::collections::BTreeSet;
+
     use fleetring::ReplicationFactor;
     use fleetring_control::{
-        Action, DatabaseName, Durability, Engine, Incarnation, IncarnationRule, MetadataSpec,
+        Action as Current, DatabaseName, Durability, Engine, Incarnation, IncarnationRule,
+        MetadataSpec,
     };
     use serde::Deserialize;
+    use serde::de::IgnoredAny;
 
-    /// 0.8.0's `CreateDatabase`.
+    /// 0.8.0's `Feature`: no `incarnations`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum Feature {
+        Undrain,
+        Metadata,
+        Expiry,
+        Fork,
+        Delegation,
+        Handover,
+    }
+
+    /// The part of 0.8.0's state that decodes strictly: the enabled features.
+    #[derive(Debug, Deserialize)]
+    #[expect(
+        dead_code,
+        reason = "decoding the features is the test; nothing reads them"
+    )]
+    pub(crate) struct State {
+        #[serde(default)]
+        pub(crate) features: BTreeSet<Feature>,
+    }
+
+    /// 0.8.0's command, of which the tests read the action.
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct Command {
+        pub(crate) action: Action,
+    }
+
+    /// 0.8.0's actions, every one of them, by name; a creation as 0.8.0 decodes it.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum Action {
+        Join(IgnoredAny),
+        Leave(IgnoredAny),
+        Heartbeat(IgnoredAny),
+        CreateDatabase(CreateDatabase),
+        UpdateDatabase(IgnoredAny),
+        ExpireDatabase(IgnoredAny),
+        ChangeDurability(IgnoredAny),
+        DropDatabase(IgnoredAny),
+        AcquireLease(IgnoredAny),
+        RenewLease(IgnoredAny),
+        StartPromotion(IgnoredAny),
+        RecordFenced(IgnoredAny),
+        CompletePromotion(IgnoredAny),
+        Tick,
+        Drain(IgnoredAny),
+        Undrain(IgnoredAny),
+        TransferLease(IgnoredAny),
+        RevokeToken(IgnoredAny),
+        ForkDatabase(IgnoredAny),
+        CompleteFork(IgnoredAny),
+        RetryForkSeed(IgnoredAny),
+        RecordForkDiskRefusal(IgnoredAny),
+        DropForkHolder(IgnoredAny),
+        FailFork(IgnoredAny),
+        MarkForkReady(IgnoredAny),
+        ReleaseForkHolders(IgnoredAny),
+        RecordDelegation(IgnoredAny),
+        RevokePrincipal(IgnoredAny),
+        RevokeAsAncestor(IgnoredAny),
+        ReleaseKeptReplicas(IgnoredAny),
+        EnableHandover,
+    }
+
+    /// 0.8.0's `CreateDatabase`: every field this build logs but `incarnation_rule`.
     #[derive(Debug, Deserialize)]
     pub(crate) struct CreateDatabase {
         pub(crate) name: DatabaseName,
@@ -463,25 +536,33 @@ mod v0_8_0 {
         pub(crate) incarnation: Incarnation,
     }
 
-    /// 0.8.0's `CreateDatabase` as it decodes `command`, a creation this build logged.
-    pub(crate) fn creation(command: &fleetring_control::Command) -> CreateDatabase {
-        let logged = serde_json::to_value(command).expect("serializes");
-        serde_json::from_value(logged["action"]["create_database"].clone())
-            .expect("0.8.0 decodes the creation")
+    impl CreateDatabase {
+        /// The creation 0.8.0's `apply` acts on: one under point 1.2's rule.
+        pub(crate) fn into_applied(self) -> Current {
+            Current::CreateDatabase {
+                name: self.name,
+                replication_factor: self.replication_factor,
+                engine: self.engine,
+                durability: self.durability,
+                metadata: self.metadata,
+                incarnation: self.incarnation,
+                incarnation_rule: IncarnationRule::OnceForked,
+            }
+        }
     }
 
-    /// The creation 0.8.0's `apply` acts on: one under point 1.2's rule, which 0.8.0 applied to
-    /// every creation.
-    pub(crate) fn as_applied(creation: CreateDatabase) -> Action {
-        Action::CreateDatabase {
-            name: creation.name,
-            replication_factor: creation.replication_factor,
-            engine: creation.engine,
-            durability: creation.durability,
-            metadata: creation.metadata,
-            incarnation: creation.incarnation,
-            incarnation_rule: IncarnationRule::OnceForked,
-        }
+    /// How a 0.8.0 control node decodes `command` from this build's log.
+    pub(crate) fn decode_command(
+        command: &fleetring_control::Command,
+    ) -> Result<Command, serde_json::Error> {
+        let logged = serde_json::to_string(command).expect("serializes");
+        serde_json::from_str(&logged)
+    }
+
+    /// Whether a 0.8.0 control node decodes `state` as a snapshot, or why not.
+    pub(crate) fn decodes_state(state: &fleetring_control::State) -> Result<(), serde_json::Error> {
+        let snapshot = serde_json::to_string(state).expect("serializes");
+        serde_json::from_str::<State>(&snapshot).map(drop)
     }
 }
 
@@ -492,69 +573,75 @@ fn incarnation_of(state: &State, name: &str) -> Option<fleetring_control::Incarn
         .map(fleetring_control::Database::incarnation)
 }
 
-/// A creation this build logs names its rule, which 0.8.0 and 0.7 read past: 0.8.0 decodes the
-/// incarnation and applies point 1.2's rule, storing 0 in a fleet that hasn't forked, and 0.7
-/// decodes the command, and the snapshot that stores the incarnation. A creation under 0.8.0's
-/// rule logs no rule, exactly as 0.8.0 logged it (ADR-0046's FR-110 amendment, item 16).
+/// Rollback below 0.8.1 is refused once the first creation under `always` has run: 0.8.0 and 0.7
+/// refuse the snapshot that records `incarnations`, and the `EnableIncarnations` the writer logs
+/// before that creation, so no release that would replay the creation to the legacy incarnation
+/// ever loads the log past it. Until then both load this build's log and snapshots, and a
+/// creation under `once_forked` is logged as 0.8.0 logged it (ADR-0046's FR-110 amendment,
+/// item 16).
 #[test]
-fn a_creation_under_the_new_rule_loads_on_0_8_0_and_0_7_which_store_0() {
+fn a_log_that_enabled_incarnations_cant_load_below_0_8_1() {
     use fleetring_control::Incarnation;
 
     use crate::common::{create_always, fork::create_at};
 
-    let joined = || {
-        let mut state = State::new(config());
-        for node in ["a", "b", "c"] {
-            run(
-                &mut state,
-                1,
-                Action::Join {
-                    member: Member::new(id(node)),
-                },
-            )
-            .expect("join");
-        }
-        state
-    };
+    let mut state = State::new(config());
+    for node in ["a", "b", "c"] {
+        run(
+            &mut state,
+            1,
+            Action::Join {
+                member: Member::new(id(node)).with_software(current_software()),
+            },
+        )
+        .expect("join");
+    }
     let drawn = Incarnation::new(0x3f9a_0c6e_21d4_b870);
-    let creation = Command::new(at(2), create_always("fresh", 3, drawn.get()));
-    let mut state = joined();
-    apply(&mut state, creation.clone()).expect("created");
-    assert_eq!(incarnation_of(&state, "fresh"), Some(drawn));
-    let logged = serde_json::to_value(&creation).expect("serializes");
-    assert_eq!(
-        logged["action"]["create_database"]["incarnation_rule"],
-        "always"
-    );
 
-    // 0.8.0 replays it as a creation that stores 0, since the fleet hasn't forked.
-    let decoded = v0_8_0::creation(&creation);
-    assert_eq!(decoded.incarnation, drawn);
-    let mut on_0_8_0 = joined();
-    apply(
-        &mut on_0_8_0,
-        Command::new(at(2), v0_8_0::as_applied(decoded)),
-    )
-    .expect("0.8.0 applies the creation");
-    assert_eq!(
-        incarnation_of(&on_0_8_0, "fresh"),
-        Some(Incarnation::LEGACY)
-    );
-
-    // 0.7 decodes the command and the snapshot, and an older database record reads past the
-    // stored incarnation.
-    v0_7::decodes_command(&creation).expect("0.7 decodes the creation");
-    v0_7::decodes_state(&state).expect("0.7 decodes the snapshot");
-    let snapshot = serde_json::to_string(&state).expect("serializes");
-    assert!(snapshot.contains(&drawn.to_string()), "{snapshot}");
-    let older: v0_5::State =
-        serde_json::from_str(&snapshot).expect("an older record reads past the incarnation");
-    assert!(older.databases.contains_key(&db("fresh")));
-
-    // A creation under 0.8.0's rule is logged as 0.8.0 logged it.
-    let legacy = Command::new(at(3), create_at("older", 3, drawn.get()));
+    // Before: a creation under 0.8.0's rule loads, and applies, on 0.8.0 as this build logs it.
+    let legacy = Command::new(at(2), create_at("older", 3, drawn.get()));
+    apply(&mut state, legacy.clone()).expect("created");
+    assert_eq!(incarnation_of(&state, "older"), Some(Incarnation::LEGACY));
     let logged = serde_json::to_string(&legacy).expect("serializes");
     assert!(!logged.contains("incarnation_rule"), "{logged}");
-    apply(&mut state, legacy).expect("created");
-    assert_eq!(incarnation_of(&state, "older"), Some(Incarnation::LEGACY));
+    let decoded = v0_8_0::decode_command(&legacy).expect("0.8.0 decodes the creation");
+    let v0_8_0::Action::CreateDatabase(creation) = decoded.action else {
+        panic!("a creation decodes as a creation: {decoded:?}");
+    };
+    assert_eq!(creation.incarnation, drawn);
+    let on_0_8_0 = state.clone();
+    v0_8_0::decodes_state(&state).expect("0.8.0 decodes the snapshot");
+    v0_7::decodes_state(&state).expect("0.7 decodes the snapshot");
+
+    // The writer logs `EnableIncarnations` before the first creation under `always`.
+    let always = Command::new(at(3), create_always("fresh", 3, drawn.get()));
+    assert!(state.incarnations_due(&always.action));
+    let enabling = Command::new(at(3), Action::EnableIncarnations);
+    apply(&mut state, enabling.clone()).expect("enabled");
+    apply(&mut state, always.clone()).expect("created");
+    assert_eq!(incarnation_of(&state, "fresh"), Some(drawn));
+
+    // After: neither 0.8.0 nor 0.7 loads the enabling command or the snapshot.
+    let refused = v0_8_0::decode_command(&enabling).expect_err("0.8.0 refuses the command");
+    assert!(
+        refused.to_string().contains("enable_incarnations"),
+        "{refused}"
+    );
+    let refused = v0_8_0::decodes_state(&state).expect_err("0.8.0 refuses the snapshot");
+    assert!(refused.to_string().contains("incarnations"), "{refused}");
+    assert!(v0_7::decodes_command(&enabling).is_err());
+    assert!(v0_7::decodes_state(&state).is_err());
+
+    // The creation itself decodes on 0.8.0, which would store 0 for it: hence the command
+    // before it, which stops a replay first.
+    let decoded = v0_8_0::decode_command(&always).expect("0.8.0 reads past the rule");
+    let v0_8_0::Action::CreateDatabase(creation) = decoded.action else {
+        panic!("a creation decodes as a creation: {decoded:?}");
+    };
+    let mut replayed = on_0_8_0;
+    apply(&mut replayed, Command::new(at(3), creation.into_applied())).expect("0.8.0 applies it");
+    assert_eq!(
+        incarnation_of(&replayed, "fresh"),
+        Some(Incarnation::LEGACY)
+    );
 }

@@ -247,17 +247,27 @@ pub enum Feature {
     /// leave the old set short of a write a promotion of it must find. Members' software alone
     /// never decides it, so a log replays the same whatever features the replaying binary knows.
     Handover,
+    /// A random incarnation for every database created, forked fleet or not (ADR-0046's FR-110
+    /// amendment): an [`Action::CreateDatabase`](crate::Action::CreateDatabase) under
+    /// [`IncarnationRule::Always`](crate::IncarnationRule::Always).
+    /// [`Action::EnableIncarnations`](crate::Action::EnableIncarnations) enables it, which the
+    /// control node's writer logs just before the first such creation once every member
+    /// supports it, so that a release without the feature can't load the log past it: one that
+    /// replayed such a creation would store the legacy incarnation, which the copies of the
+    /// database it created don't record.
+    Incarnations,
 }
 
 impl Feature {
     /// Every feature this release knows, in order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Undrain,
         Self::Metadata,
         Self::Expiry,
         Self::Fork,
         Self::Delegation,
         Self::Handover,
+        Self::Incarnations,
     ];
 
     /// Returns the feature's name, as members report it and errors print it.
@@ -270,6 +280,7 @@ impl Feature {
             Self::Fork => "fork",
             Self::Delegation => "delegation",
             Self::Handover => "handover",
+            Self::Incarnations => "incarnations",
         }
     }
 }
@@ -536,7 +547,7 @@ mod tests {
         let stored = serde_json::to_string(&software).expect("serializes");
         assert_eq!(
             stored,
-            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["delegation","expiry","fork","handover","metadata"]}"#
+            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["delegation","expiry","fork","handover","incarnations","metadata"]}"#
         );
         assert_eq!(
             serde_json::from_str::<Software>(&stored).expect("decodes"),
