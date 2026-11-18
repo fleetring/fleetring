@@ -370,6 +370,7 @@ A fix release for 0.8. Once every node runs 0.8.1, every new database gets a ran
 ### Fixes
 
 - **A database dropped and created again under the same name no longer risks serving the dropped rows** (FR-110, #177). In a fleet that had never forked, both lives of the name had incarnation 0. A follower whose drop notice arrived after the new database was leased could keep the dropped copy, and if the new primary failed before streaming to it, a promotion could serve the dropped rows as the new database's and lose writes it had acknowledged. Every database created now has a random incarnation, which its streams and its promotions' fences name, and a copy of another incarnation refuses both.
+- **A `db drop` right after the control node restarts no longer leaves orphans** (FR-121, #191). A data node that couldn't yet check the drop notice against the restarted control node refused it, and kept its copy as an orphan, so the drop needed `fleetring orphan remove` and `db create` of the name was refused until then. The node now answers that it can't check the notice yet, and the control node tells it again a few times, a second apart. A notice that control state contradicts still deletes nothing.
 
 ### Known limits
 
