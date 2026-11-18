@@ -286,6 +286,12 @@ async fn a_principal_cannot_make_node_to_node_calls() -> TestResult {
     Ok(())
 }
 
+/// `path` as the CLI prints it inside a TOML basic string: backslashes, Windows's separator,
+/// are escaped.
+fn toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
 /// Replaces `path` atomically, so a reload never reads half a file.
 /// Writes `contents` over `path` whole, private to its owner, as keys are written.
 fn replace_file(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
@@ -699,11 +705,11 @@ fn cert_issuer_writes_0600_key_and_refuses_over_90_days() -> TestResult {
     );
     assert!(stdout.contains("[control]"), "{stdout}");
     assert!(
-        stdout.contains(&format!("issuer_cert = \"{}\"", cert.display())),
+        stdout.contains(&format!("issuer_cert = \"{}\"", toml_path(&cert))),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&format!("issuer_key = \"{}\"", key.display())),
+        stdout.contains(&format!("issuer_key = \"{}\"", toml_path(&key))),
         "{stdout}"
     );
     assert!(!stdout.contains("PRIVATE KEY"), "the key is never printed");
