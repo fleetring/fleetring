@@ -395,6 +395,7 @@ fn write_issuer(tls: &Tls, name: &str, start: Timestamp, cert: &Path, key: &Path
         Validity::new(from, Duration::from_secs(60 * 24 * 3600)),
     )?;
     std::fs::write(key, pair.key_pem())?;
+    #[cfg(unix)]
     std::fs::set_permissions(key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     std::fs::write(cert, pair.certificate_pem())?;
     Ok(())
