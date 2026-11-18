@@ -9,7 +9,9 @@
 //!
 //! Notices are best effort and kept nowhere. A node that is down or unreachable for every
 //! attempt gets none, and keeps its copy as an orphan for an operator to remove; tombstones in
-//! control state (#105) will let it learn of the drop later.
+//! control state (#105) will let it learn of the drop later. A node that can't check a notice
+//! against control state yet, as just after a control node restarts, answers `UNAVAILABLE`,
+//! and is told again like a node that can't be reached.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +26,8 @@ use crate::data::unknown_call;
 use crate::environment::Network;
 use crate::transport::{Peers, replication_client};
 
-/// How many times a node is told of one drop while it can't be reached.
+/// How many times a node is told of one drop while it can't be reached, or can't check the
+/// notice against control state yet.
 const ATTEMPTS: u32 = 5;
 
 /// How long one notice may take.
@@ -118,7 +121,7 @@ impl DropNotices {
 }
 
 /// Tells `recipient` of the drop in `request`, up to [`ATTEMPTS`] times while it can't be
-/// reached.
+/// reached or can't check the notice yet.
 async fn tell(peers: &Peers, recipient: &Recipient, request: DropCopyRequest) {
     let Recipient { node, address } = recipient;
     for attempt in 1..=ATTEMPTS {
@@ -145,6 +148,7 @@ async fn tell(peers: &Peers, recipient: &Recipient, request: DropCopyRequest) {
             Ok(Err(status))
                 if matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded) =>
             {
+                tracing::debug!(%node, database = %request.database, attempt, %status, "a replica can't take a drop notice yet; telling it again");
                 peers.forget(address);
             }
             Ok(Err(status)) => {

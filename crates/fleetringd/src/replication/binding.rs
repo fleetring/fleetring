@@ -512,6 +512,8 @@ pub(super) async fn check_promote(
 /// - One that names neither gets `FAILED_PRECONDITION`, and changes nothing: a
 ///   replica that missed a promotion is told of the drop honestly, and keeps its copy as an
 ///   orphan. A node with no copy of the name accepts it, and has nothing to delete.
+/// - One this node can't check yet, because control state didn't answer whether it holds the
+///   database, gets `UNAVAILABLE`, and the control node tells it again.
 pub(super) async fn check_drop(
     inner: &Inner,
     database: &DatabaseName,
@@ -530,7 +532,7 @@ pub(super) async fn check_drop(
             }
         },
         Err(status) if status.code() == tonic::Code::NotFound => true,
-        Err(status) => return Err(status),
+        Err(status) => return Err(unchecked_drop(database, &status)),
     };
     if !dropped {
         let reason = Unbound::NotDropped {
@@ -566,6 +568,18 @@ pub(super) async fn check_drop(
             )))
         }
     }
+}
+
+/// The answer to a drop notice for `database` that this node couldn't check against control
+/// state, which answered `status` and not whether it holds the database: `UNAVAILABLE`, which
+/// the control node retries as for a node it can't reach (ADR-0042, amendment of 2026-11-18). A
+/// call cut short by a control node that restarted answers `CANCELLED`, for one, and a notice
+/// refused for it would leave the copy an orphan though the drop is real.
+fn unchecked_drop(database: &DatabaseName, status: &Status) -> Status {
+    Status::unavailable(format!(
+        "can't check the drop notice for {database} against control state yet: {}",
+        status.message()
+    ))
 }
 
 /// Checks a `Snapshot` that `caller` asks this node for, of `database` at `epoch`: this node
