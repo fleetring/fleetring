@@ -28,12 +28,17 @@
 //! # Determinism
 //!
 //! One seed drives turmoil's network and, through [`SimRng`], every workload. Daemon code reads
-//! time only from `tokio::time` and the injected clock. Built with
-//! `RUSTFLAGS="--cfg tokio_unstable"`, turmoil also seeds Tokio's scheduler, and a seed replays
-//! the same trace with the same simulated times ([`Replay::Exact`]). Without it, Tokio's
-//! `select!` picks among ready branches at random, so events can shift by a few simulated
-//! milliseconds; only the test's own faults and notes are compared, in order and without times
-//! ([`Replay::Order`]).
+//! time only from `tokio::time` and the injected clock, and a simulated node's data volume is
+//! simulated too. Built with `--cfg tokio_unstable`, which the workspace's `.cargo/config.toml`
+//! sets, turmoil also seeds Tokio's own randomness, and a seed replays the same trace with the
+//! same simulated times, the same history, and the same control log ([`Replay::Exact`]). A
+//! `RUSTFLAGS` variable replaces the configured flags; in a build without the cfg, Tokio's
+//! `select!` picks among ready branches, and a `watch` channel wakes its receivers, in an order
+//! that differs from run to run, so events shift by a few simulated milliseconds and a seed's
+//! outcome can change; only the test's own faults and notes are compared, in order and without
+//! times ([`Replay::Order`]). SQLite draws its log generations' salts from its own generator,
+//! which the process shares, so positions differ in those bytes between runs (ADR-0020's
+//! amendment).
 //!
 //! # Example
 //!

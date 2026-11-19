@@ -145,10 +145,11 @@ pub enum Replay {
 impl Replay {
     /// The strongest comparison this build supports.
     ///
-    /// turmoil seeds Tokio's scheduler, which picks among ready branches of a `select!`, only when
-    /// Tokio is built with `--cfg tokio_unstable`. With it, a seed replays exactly; without it,
-    /// events can shift by a few simulated milliseconds, so only the test's own events are
-    /// compared.
+    /// turmoil seeds Tokio's own randomness, which picks among ready branches of a `select!` and
+    /// orders a `watch` channel's wake-ups, only when Tokio is built with `--cfg tokio_unstable`,
+    /// as the workspace's `.cargo/config.toml` builds it unless a `RUSTFLAGS` variable replaces
+    /// its flags. With it, a seed replays exactly; without it, events can shift by a few
+    /// simulated milliseconds, so only the test's own events are compared.
     #[must_use]
     pub const fn supported() -> Self {
         if cfg!(tokio_unstable) {

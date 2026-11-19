@@ -215,7 +215,8 @@ jobs:
 
   # The simulation harness's fixed seeds (FR-024, ADR-0020). `--cfg tokio_unstable` lets turmoil
   # seed Tokio's scheduler, so each seed must replay its trace exactly, simulated times included.
-  # The test jobs above run the same tests without it, comparing event order only. The fork
+  # `.cargo/config.toml` sets it for the test jobs above too; a job that sets `RUSTFLAGS` replaces
+  # the configured flags, so it names the cfg itself (FR-122). The fork
   # matrix (FR-087) holds data nodes' fork work at each seeding step with the fault hooks, so
   # this job enables them; it runs every row at every step on one fixed seed.
   simulation:
