@@ -521,16 +521,19 @@ pub(super) struct Recovered {
 }
 
 /// Rebuilds a replica's chain from its recorded anchor, if any, and `read`, what it read from
-/// its log, which ends at `position`.
+/// its log, which ended at `position` when the replica looked, before it read.
 ///
-/// A record that fits the log anchors the chain, and the read continues it to the log's end.
-/// A log that began empty and has no record starts at [`ChainHash::GENESIS`], which the
-/// replica records so a restart continues from it. Otherwise the chain is derived from the
-/// position the log begins at.
+/// A record that fits the log, which a [`LogRead::Continues`] read says, anchors the chain, and
+/// the read continues it to `position`, or past it if the log grew in between. A log that began
+/// empty and has no record starts at [`ChainHash::GENESIS`], which the replica records so a
+/// restart continues from it. Otherwise the chain is derived from the position the log begins
+/// at.
 ///
 /// # Errors
 ///
-/// [`ChainError::Payload`] or [`ChainError::Malformed`] if the log read back can't be hashed.
+/// [`ChainError::Payload`] or [`ChainError::Malformed`] if the log read back can't be hashed,
+/// and [`ChainError::Unknown`] if a read that continues the record stops short of `position`,
+/// so that it doesn't describe the log.
 pub(super) fn recover(
     engine: &dyn FrameSourceEngine,
     recorded: Option<Anchor>,
@@ -540,18 +543,7 @@ pub(super) fn recover(
     let had_record = recorded.is_some();
     let batch = match (recorded, read) {
         (Some(anchor), LogRead::Continues(batch)) => {
-            let mut chain = Chain::new(anchor);
-            if let Some(batch) = &batch {
-                let from = chain.anchor_position.clone();
-                chain.extend(engine, from.as_ref(), batch)?;
-            }
-            if chain.tip().0 == position {
-                return Ok(Recovered {
-                    chain,
-                    record: None,
-                });
-            }
-            batch
+            return continued(engine, anchor, position, batch.as_ref());
         }
         (_, LogRead::Continues(batch) | LogRead::Restarted(batch)) => batch,
     };
@@ -571,6 +563,35 @@ pub(super) fn recover(
     };
     let mut chain = Chain::new(Anchor::derived(Some(&batch.start)));
     chain.extend(engine, Some(&batch.start), &batch)?;
+    Ok(Recovered {
+        chain,
+        record: None,
+    })
+}
+
+/// The chain from the recorded `anchor`, continued by `batch`, what the log holds after it, to
+/// `position`, where the log ended when the replica looked.
+///
+/// A write can commit between that look and the read, so the read may run past `position`. The
+/// record fits all the same: a chain derived instead would give positions this one holds, and
+/// may have answered for, other hashes, and from a read that carries a generation's header,
+/// hashes `verify` never gives (#197).
+fn continued(
+    engine: &dyn FrameSourceEngine,
+    anchor: Anchor,
+    position: Option<&Position>,
+    batch: Option<&FrameBatch>,
+) -> Result<Recovered, ChainError> {
+    let mut chain = Chain::new(anchor);
+    if let Some(batch) = batch {
+        let from = chain.anchor_position.clone();
+        chain.extend(engine, from.as_ref(), batch)?;
+    }
+    if chain.tip().0 < position {
+        return Err(ChainError::Unknown {
+            position: position.cloned(),
+        });
+    }
     Ok(Recovered {
         chain,
         record: None,
@@ -897,6 +918,55 @@ mod tests {
             empty.record,
             Some(Anchor::genesis()),
             "recorded from now on"
+        );
+    }
+
+    /// A write that commits between reading where the log ends and reading the log from the
+    /// record leaves a read that runs past that end. The record still fits: the chain continues
+    /// from it, so it holds the same hashes however many times it is built, and a fork seeded at
+    /// one of them is the hash `verify` gives later (#197).
+    #[test]
+    fn a_log_that_grew_while_it_was_read_still_continues_from_its_record() {
+        let mut lived = rooted();
+        lived
+            .extend(&Fixed, Some(&Position::new([0])), &batch(0, &[1, 2, 3]))
+            .expect("batch");
+        let record = rooted().anchor().clone();
+
+        let read_at_its_end = recover(
+            &Fixed,
+            Some(record.clone()),
+            Some(&Position::new([2])),
+            LogRead::Continues(Some(batch(0, &[1, 2]))),
+        )
+        .expect("recovered")
+        .chain;
+        let grew_meanwhile = recover(
+            &Fixed,
+            Some(record),
+            Some(&Position::new([2])),
+            LogRead::Continues(Some(batch(0, &[1, 2, 3]))),
+        )
+        .expect("recovered")
+        .chain;
+        assert!(!grew_meanwhile.is_derived(), "the record fits the log");
+        assert_eq!(grew_meanwhile.anchor(), read_at_its_end.anchor());
+        assert_eq!(grew_meanwhile.tip(), lived.tip());
+        assert_eq!(
+            grew_meanwhile.hash_at(Some(&Position::new([2]))),
+            read_at_its_end.hash_at(Some(&Position::new([2]))),
+            "the same hash at the same position, whichever build answers"
+        );
+
+        let short = recover(
+            &Fixed,
+            Some(rooted().anchor().clone()),
+            Some(&Position::new([3])),
+            LogRead::Continues(Some(batch(0, &[1, 2]))),
+        );
+        assert!(
+            matches!(short, Err(ChainError::Unknown { .. })),
+            "a read that stops short of the log's end describes no log: {short:?}"
         );
     }
 

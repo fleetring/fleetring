@@ -1420,6 +1420,12 @@ async fn load_chain(
         }
     };
     let position = read_end(inner, handle).await?;
+    // Writes go on while the build reads: the log read next can run past `position`.
+    inner
+        .forks
+        .faults()
+        .pass_any(FaultPoint::ChainEndRead)
+        .await;
     let anchored_at = recorded.as_ref().map(Anchor::position);
     let read = match anchored_at {
         Some(at) if at == position => LogRead::Continues(None),
