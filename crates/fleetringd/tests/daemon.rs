@@ -616,14 +616,20 @@ mod binary {
             .map_while(Result::ok)
             .take_while(|line| !line.contains("fleetringd started"))
             .collect();
-        let warnings: Vec<&String> = before.iter().filter(|line| line.contains("WARN")).collect();
-        assert_eq!(warnings.len(), 1, "{before:?}");
-        assert!(
-            warnings[0].contains(
-                "starting without `serve` is kept until 1.0; run `fleetring serve --config <file>`"
-            ),
-            "{before:?}"
-        );
+        // Only the deprecation counts: other warnings, such as the ring diagnostic membership
+        // logs when it publishes a ring smaller than the replication factor, may land before
+        // the started line too.
+        let deprecations = before
+            .iter()
+            .filter(|line| {
+                line.contains("WARN")
+                    && line.contains(
+                        "starting without `serve` is kept until 1.0; run `fleetring serve \
+                         --config <file>`",
+                    )
+            })
+            .count();
+        assert_eq!(deprecations, 1, "{before:?}");
 
         let second = crate::support::fleetring()
             .args(["serve", "--config"])
