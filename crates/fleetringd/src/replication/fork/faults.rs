@@ -68,6 +68,10 @@ pub enum FaultPoint {
     /// about to build it again: held, the chain stays loading. Held only for every database,
     /// with [`hold`](ForkFaults::hold).
     ChainRebuild,
+    /// A primary building its hash chain has read where its log ends and hasn't read the log
+    /// itself yet: held, writes land in between, so the log runs past the end it read. Held only
+    /// for every database, with [`hold`](ForkFaults::hold).
+    ChainEndRead,
     /// A node has written a fork's copy and its sidecar to temporary files and synced them, and
     /// hasn't renamed either into place: a crash here leaves only temporary files.
     StagingWritten,

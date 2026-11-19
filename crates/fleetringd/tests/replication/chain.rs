@@ -203,6 +203,80 @@ async fn a_chain_derived_from_where_the_log_begins_agrees_with_verify() -> TestR
     Ok(())
 }
 
+/// A primary that builds its chain from the record of a log that began empty, while a write
+/// lands between reading where the log ends and reading the log, continues from the record: the
+/// hash at a position is the one `verify` gave there before, and still gives. Deriving instead,
+/// from a read that carries the generation's header, gave every position a hash `verify` never
+/// gives, which a fork seeded meanwhile recorded as its source's (#197).
+#[cfg(feature = "fault-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_built_while_the_log_grows_keeps_its_hashes() -> TestResult {
+    use fleetringd::replication::{FaultPoint, ForkFaults};
+
+    let fleet = Fleet::start(&["a"], sqlite(), settings(), BTreeMap::new()).await?;
+    let db = name("grows");
+    let node = fleet.node("a");
+    guarded("creating the database", node.registry().create(&db)).await??;
+    node.replication.serve_primary(
+        db.clone(),
+        PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(1)),
+    )?;
+    // Built before the first write, over the empty log, the chain records its genesis.
+    eventually("the first chain", || {
+        node.replication.chain_history(&db).is_some()
+    })
+    .await?;
+    node.registry()
+        .execute(
+            &db,
+            fleetringd::engine::Transaction::from(fleetringd::engine::Statement::new(
+                "CREATE TABLE kv (k INTEGER PRIMARY KEY, v BLOB)",
+            )),
+        )
+        .await?;
+    for i in 0..3_i64 {
+        node.registry().execute(&db, put(i, 100)).await?;
+    }
+    let before = node.replication.verify(&db, None).await?;
+    let at = before.position.clone().ok_or("the log holds writes")?;
+
+    let faults = ForkFaults::new();
+    node.replication.set_fault_hooks(faults.clone());
+    faults.hold(FaultPoint::ChainEndRead);
+    node.replication.stop_primary(&db);
+    node.replication.serve_primary(
+        db.clone(),
+        PrimaryRole::new(ReplicationFactor::ONE, LeaseEpoch::new(2)),
+    )?;
+    assert!(
+        faults
+            .await_arrivals(
+                FaultPoint::ChainEndRead,
+                1,
+                std::time::Duration::from_secs(30)
+            )
+            .await,
+        "the build read where the log ends"
+    );
+    node.registry().execute(&db, put(3, 100)).await?;
+    faults.release(FaultPoint::ChainEndRead);
+    eventually("the chain rebuilt", || {
+        node.replication.chain_history(&db).is_some()
+    })
+    .await?;
+
+    let held = node
+        .replication
+        .chain_history(&db)
+        .ok_or("the chain is built")?
+        .get(&at)
+        .copied();
+    assert_eq!(held, Some(before.hash), "the chain holds what verify gave");
+    let after = node.replication.verify(&db, Some(at)).await?;
+    assert_eq!(after.hash, before.hash, "verify gives what it gave before");
+    Ok(())
+}
+
 /// Where `node` keeps `db`'s mirrored log.
 fn wal_path(fleet: &Fleet, node: &str, db: &str) -> PathBuf {
     fleet.node(node).database_dir(db).join("data.db-wal")
