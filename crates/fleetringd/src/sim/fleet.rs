@@ -79,10 +79,6 @@ fn host_seed(seed: u64, name: &str) -> u64 {
     seed ^ HOST_SALT ^ hashed
 }
 
-/// The free bytes every data host's fork admission believes it has, by default, so that a run
-/// never depends on the disk of the machine running it: the fork tests' hooks stand in for it.
-const ROOMY_DISK: u64 = 1 << 40;
-
 /// A second principal every host knows, with the same scopes as the workload's own: another
 /// requester for the same requests ([`Fleet::client_as`]).
 pub const OTHER_PRINCIPAL: &str = "other";
@@ -580,17 +576,16 @@ fn other_principal() -> crate::PrincipalConfig {
 }
 
 /// Fork hooks for a data host: with the `fault-hooks` feature, ones the test can hold and
-/// release, with room for any fork; without it, inert ones.
+/// release; without it, inert ones. Until a test sets a disk on them, the host's simulated
+/// volume has room for any fork, whatever its data directory grows by, so the free space a run
+/// reports never depends on the bytes its records happen to take.
 fn new_fork_faults() -> ForkFaults {
     #[cfg(feature = "fault-hooks")]
     {
-        let faults = ForkFaults::new();
-        faults.set_disk(ROOMY_DISK, 2 * ROOMY_DISK);
-        faults
+        ForkFaults::new()
     }
     #[cfg(not(feature = "fault-hooks"))]
     {
-        let _ = ROOMY_DISK;
         ForkFaults::default()
     }
 }
