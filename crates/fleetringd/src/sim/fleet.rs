@@ -2366,16 +2366,22 @@ impl Fleet {
     }
 }
 
-/// The size and modification time of each file of a SQLite copy, or `None` for one that is
-/// missing: what tells the fleet a copy changed since it last read it.
+/// A digest of each file of a SQLite copy, or `None` for one that is missing: what tells the
+/// fleet a copy changed since it last read it.
+///
+/// It digests the contents, not the files' modification times: those come from the wall clock,
+/// and on a file system with coarse timestamps a copy rewritten in place at the same size within
+/// one tick would keep its stamp, so when the fleet saw a fork marker would depend on how fast
+/// the machine ran (ADR-0020).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct CopyStamp([Option<(u64, std::time::SystemTime)>; 2]);
+struct CopyStamp([Option<blake3::Hash>; 2]);
 
 impl CopyStamp {
     fn of(dir: &Path) -> Self {
         let stamp = |file: &str| {
-            let meta = std::fs::metadata(dir.join(file)).ok()?;
-            Some((meta.len(), meta.modified().ok()?))
+            std::fs::read(dir.join(file))
+                .ok()
+                .map(|bytes| blake3::hash(&bytes))
         };
         Self([stamp("data.db"), stamp("data.db-wal")])
     }
