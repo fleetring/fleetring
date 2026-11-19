@@ -28,7 +28,7 @@ Decisions that shape the `fleetring` crate. Each record covers one decision: its
 | [0017](0017-control-state-machine.md) | A control plane built as a deterministic state machine: one node now, Raft later | Accepted |
 | [0018](0018-leases-epochs-quorums.md) | Leases, epochs, and quorums: one writer per database, no acknowledged write lost | Accepted (points 4, 5, 7 amended by 0022; quorums across membership changes by 0031 amendment 2) |
 | [0019](0019-grpc-transport.md) | Nodes talk gRPC over tonic | Accepted |
-| [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Accepted |
+| [0020](0020-simulation-testing.md) | Deterministic simulation testing with turmoil | Accepted (amendment of 2026-11-19 accepted, FR-122: seeds replay exactly in every workspace build) |
 | [0021](0021-engine-changing-migrations.md) | Migrations that change a database's engine | Accepted |
 | [0022](0022-failover-protocol.md) | Failover: the candidate drives the promotion, and logs are ranked by log epoch | Accepted (the set a promotion fences after a membership change amended by 0031 amendment 2) |
 | [0023](0023-configurable-durability.md) | Configurable durability: acknowledgement modes, a replica floor, and per-database settings | Accepted |
