@@ -9,6 +9,7 @@ mod changes;
 mod control;
 mod database;
 mod delegation;
+mod determinism;
 mod drain;
 mod dropped;
 mod durability;
