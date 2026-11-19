@@ -805,6 +805,9 @@ fn start_data(
     );
     statuses.set(replication.clone());
     replication.configure_forks(config.fork, environment.fork_faults());
+    if let Some((free, volume)) = environment.simulated_disk() {
+        replication.simulate_disk(free, volume);
+    }
     let mut sinks = config
         .changes
         .sink

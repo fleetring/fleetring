@@ -39,6 +39,10 @@ enum Link {
 /// the callee answers before the caller gives up.
 const REQUEST_MARGIN: Duration = Duration::from_secs(5);
 
+/// The free space of a simulated node's data volume, 1 TiB, half its size.
+#[cfg(feature = "simulation")]
+const SIMULATED_DISK_FREE: u64 = 1 << 40;
+
 impl Link {
     async fn connect(self, address: &str) -> io::Result<Raw> {
         match self {
@@ -245,6 +249,9 @@ pub struct Environment {
     /// The rule a control node logs creations under: [`IncarnationRule::Always`], unless a
     /// simulation stands it in for one of an earlier release.
     incarnation_rule: IncarnationRule,
+    /// The free space and size of the data volume a simulated node believes it has, in bytes;
+    /// `None` reads the real volume.
+    simulated_disk: Option<(u64, u64)>,
 }
 
 impl Environment {
@@ -260,12 +267,15 @@ impl Environment {
             drop_flush_limit: DROP_FLUSH_LIMIT,
             fork_faults: ForkFaults::default(),
             incarnation_rule: IncarnationRule::Always,
+            simulated_disk: None,
         }
     }
 
     /// turmoil's network, `clock`, and every storage call inline on the host's task. Its
     /// randomness is the operating system's until [`Environment::with_entropy`] replaces it, as
-    /// the simulation harness does with a seeded generator.
+    /// the simulation harness does with a seeded generator. Its data volume is simulated, 1 TiB
+    /// free of 2 TiB, so that the real volume's free space, which other programs change, never
+    /// reaches a heartbeat or a fork's admission (ADR-0020).
     ///
     /// Build it inside the turmoil host, so that a clock which follows `tokio::time` starts from
     /// the host's simulated time.
@@ -281,6 +291,7 @@ impl Environment {
             drop_flush_limit: DROP_FLUSH_LIMIT,
             fork_faults: ForkFaults::default(),
             incarnation_rule: IncarnationRule::Always,
+            simulated_disk: Some((SIMULATED_DISK_FREE, 2 * SIMULATED_DISK_FREE)),
         }
     }
 
@@ -362,6 +373,12 @@ impl Environment {
     pub fn with_incarnation_rule(mut self, rule: IncarnationRule) -> Self {
         self.incarnation_rule = rule;
         self
+    }
+
+    /// The free space and size of the data volume a simulated node believes it has, in bytes, or
+    /// `None` to read the real volume.
+    pub(crate) fn simulated_disk(&self) -> Option<(u64, u64)> {
+        self.simulated_disk
     }
 
     /// The rule a control node logs database creations under.
