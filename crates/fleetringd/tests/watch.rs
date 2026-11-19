@@ -466,8 +466,27 @@ async fn db_watch_follows_the_database_to_its_new_primary() -> TestResult {
     let mut seen = inserted_ids(&watch.json().await?);
 
     client.drain_node(&primary).await?;
-    // The write goes to whichever node serves the database once the lease has moved.
+    // The drain returns before the lease moves, and the old primary would take a write until it
+    // hands over, so the write waits until another node holds the lease (#199).
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    loop {
+        match client.locate(&notes).await {
+            Ok(located)
+                if located
+                    .primary
+                    .as_ref()
+                    .is_some_and(|node| *node != primary) =>
+            {
+                break;
+            }
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => return Err("the drain never moved the lease".into()),
+            Err(status) => return Err(status.into()),
+        }
+    }
+    // The write goes to whichever node serves the database now.
     loop {
         match client.execute(&notes, insert(2)).await {
             Ok(_) => break,
