@@ -1,0 +1,11 @@
+# Tokio's own randomness picks among the ready branches of a `select!` and the order a `watch`
+# channel wakes its receivers. turmoil seeds it from the simulation's seed only when Tokio is
+# built with `--cfg tokio_unstable`; without it the same seed gives a different run each time
+# (ADR-0020's amendment, FR-122). Setting it here makes every build of the workspace replay seeds
+# exactly, `cargo test` included.
+#
+# A `RUSTFLAGS` variable replaces these flags rather than adding to them, so a build that sets it
+# adds `--cfg tokio_unstable` itself, as CI's simulation jobs do; `sim::determinism` fails in a
+# build without it. Release builds set `RUSTFLAGS`, so release binaries are built without it.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
