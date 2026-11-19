@@ -328,6 +328,9 @@ pub(crate) struct Forks {
     /// streams to them and to placement and counts both write quorums, until control state
     /// releases them. A fork this node saw released never freezes again.
     frozen: Mutex<Frozen>,
+    /// The free space and size of the data volume a simulation gives the node, which test hooks
+    /// override; `None` reads the real volume.
+    simulated_disk: Mutex<Option<(u64, u64)>>,
     /// The free space and volume the test hooks last said, with the data directory's size
     /// then, which what it grows by since comes off the free space.
     disk_baseline: Mutex<Option<((u64, u64), u64)>>,
@@ -351,6 +354,7 @@ impl Forks {
             gated: Mutex::default(),
             opening: Mutex::default(),
             frozen: Mutex::default(),
+            simulated_disk: Mutex::default(),
             disk_baseline: Mutex::default(),
             metrics,
         }
@@ -372,6 +376,16 @@ impl Forks {
             .lock()
             .expect("fork faults lock poisoned")
             .clone()
+    }
+
+    /// Believes the data volume has `free` of `volume` bytes, instead of reading it: a simulated
+    /// node's, so that the real volume's free space never reaches a heartbeat or an admission
+    /// (ADR-0020).
+    pub(crate) fn simulate_disk(&self, free: u64, volume: u64) {
+        *self
+            .simulated_disk
+            .lock()
+            .expect("simulated disk lock poisoned") = Some((free, volume));
     }
 
     /// Runs with `config` and `faults` from now on.
@@ -397,7 +411,8 @@ impl Forks {
     }
 
     /// The node's data volume as a fork's admission sees it: as the test hooks say, if they say,
-    /// less what the data directory has grown by since they said it; else as the volume says.
+    /// less what the data directory has grown by since they said it; else as the simulation
+    /// says, if it does; else as the volume says.
     pub(crate) fn disk_space(&self) -> Option<DiskSpace> {
         if let Some(setting) = self.faults().disk() {
             let data_dir = self.store.root().parent().unwrap_or(self.store.root());
@@ -418,7 +433,14 @@ impl Forks {
                 volume: setting.1,
             });
         }
-        DiskSpace::of(self.store.root())
+        let simulated = *self
+            .simulated_disk
+            .lock()
+            .expect("simulated disk lock poisoned");
+        match simulated {
+            Some((free, volume)) => Some(DiskSpace { free, volume }),
+            None => DiskSpace::of(self.store.root()),
+        }
     }
 
     /// The free bytes on the node's data volume, for its heartbeats.
@@ -1054,6 +1076,11 @@ impl super::Replication {
     /// Runs the node's fork work with `config`'s limits, through `faults`.
     pub(crate) fn configure_forks(&self, config: ForkConfig, faults: ForkFaults) {
         self.inner.forks.configure(config, faults);
+    }
+
+    /// Believes the data volume has `free` of `volume` bytes, as a simulated node does.
+    pub(crate) fn simulate_disk(&self, free: u64, volume: u64) {
+        self.inner.forks.simulate_disk(free, volume);
     }
 
     /// The node's fork state.
