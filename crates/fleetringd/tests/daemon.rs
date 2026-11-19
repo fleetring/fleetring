@@ -10,6 +10,17 @@ mod support;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+/// Shared by the tests that run child processes, and taken whole by a test whose sockets no child
+/// may hold. A child inherits a socket that has no close-on-exec flag yet, and macOS sets that
+/// flag in a second call after creating the socket, so a child spawned in between keeps a copy
+/// open for as long as it runs (#194).
+static CHILDREN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Held by a test while it runs child processes.
+fn running_children() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    CHILDREN.blocking_read()
+}
+
 const MINIMAL: &str = r#"
 data_dir = "/tmp/fleetring-test"
 listen = "127.0.0.1:7400"
@@ -176,6 +187,9 @@ fn a_locked_data_directory_refuses_a_second_daemon() -> TestResult {
 /// it in the same process binds it at once, while a connection to the old one lingers.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stopped_daemon_frees_its_port_before_it_returns() -> TestResult {
+    // No other test's child may hold a copy of the daemon's listener, which would keep the port
+    // bound after the daemon closed it.
+    let _alone = CHILDREN.write().await;
     let dir = tempfile::tempdir()?;
     let tls = support::Tls::create(dir.path())?;
     let text = format!(
@@ -233,6 +247,7 @@ mod check {
 
     #[test]
     fn a_valid_configuration_passes_and_nothing_is_started_or_created() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         // The listen address is taken: a check binds nothing, so it doesn't notice.
         let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -268,6 +283,7 @@ mod check {
 
     #[test]
     fn an_invalid_configuration_fails_naming_the_file_and_the_field() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         // A rule across fields, which validation checks after parsing.
         let config = write(
@@ -326,6 +342,7 @@ mod check {
 
     #[test]
     fn a_missing_file_fails_naming_it() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         let missing = dir.path().join("missing.toml");
         let output = check(&missing, &[])?;
@@ -343,6 +360,7 @@ mod check {
 
     #[test]
     fn json_reports_the_result_and_its_problems() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         let config = write(dir.path(), &valid("127.0.0.1:7400"))?;
         let output = check(&config, &["--json"])?;
@@ -542,6 +560,7 @@ mod binary {
     /// nowhere to hand the lease to, so the drain reports it and the node leaves anyway.
     #[test]
     fn sigint_drains_a_primary_before_it_leaves() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path())?;
         let started = start(&config)?;
@@ -578,6 +597,7 @@ mod binary {
     /// With `on_shutdown = "stay"`, `Ctrl-C` neither drains nor leaves.
     #[test]
     fn sigint_on_a_node_that_stays_neither_drains_nor_leaves() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         let config = write_config_with(dir.path(), "on_shutdown = \"stay\"\n")?;
         let started = start(&config)?;
@@ -602,6 +622,7 @@ mod binary {
     /// 1.4).
     #[test]
     fn starts_logs_and_exits_cleanly_on_sigint_while_a_second_daemon_is_refused() -> TestResult {
+        let _children = crate::running_children();
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path())?;
         let mut daemon = crate::support::fleetring()
@@ -656,6 +677,7 @@ mod binary {
 
     #[test]
     fn a_dropped_lock_frees_the_directory_while_children_spawn() -> TestResult {
+        let _children = crate::running_children();
         const CHILDREN: usize = 50;
         let dir = tempfile::tempdir()?;
         let spawned = AtomicUsize::new(0);
