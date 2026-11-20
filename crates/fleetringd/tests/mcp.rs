@@ -46,6 +46,10 @@ struct Node {
     /// The data node a fork needs beside its source's, and the fault hooks of both nodes, for a
     /// [`Setup::Forking`] node.
     extra: Vec<Daemon>,
+    #[cfg_attr(
+        not(feature = "fault-hooks"),
+        expect(dead_code, reason = "only the fault-hook tests hold a fork")
+    )]
     faults: Vec<ForkFaults>,
     tls: Tls,
     control: String,
