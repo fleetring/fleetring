@@ -35,6 +35,7 @@ mod layout;
 pub mod mcp;
 mod membership;
 pub mod observe;
+mod per_ip;
 mod publisher;
 mod registry;
 pub mod replication;

@@ -11,9 +11,7 @@
 //! connections are pinged, and closed if the client stops answering. One client address holds at
 //! most `[http] max_connections_per_ip` connections.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +32,7 @@ use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use crate::clock::Clock as _;
+use crate::per_ip::PerIp;
 use crate::router::auth::{self, Refusal};
 use crate::router::hrana::{CursorRequest, Error, PipelineRequest, code};
 use crate::router::naming::{self, Endpoint, Upgrade};
@@ -118,60 +117,6 @@ pub(crate) async fn serve(
     }
     // Every connection goes with the server, and with it every request's work.
     connections.shutdown().await;
-}
-
-/// How many connections each client address holds.
-#[derive(Debug)]
-struct PerIp {
-    max: usize,
-    held: Mutex<BTreeMap<IpAddr, usize>>,
-}
-
-impl PerIp {
-    fn new(max: usize) -> Self {
-        Self {
-            max,
-            held: Mutex::default(),
-        }
-    }
-
-    /// A place for one more connection from `peer`, unless its address holds `max` already.
-    fn hold(this: &Arc<Self>, peer: SocketAddr) -> Option<Held> {
-        let ip = peer.ip();
-        let mut held = this.held.lock().expect("connection count lock poisoned");
-        let count = held.entry(ip).or_default();
-        if *count >= this.max {
-            return None;
-        }
-        *count += 1;
-        Some(Held {
-            per_ip: Arc::clone(this),
-            ip,
-        })
-    }
-}
-
-/// One connection's place in its address's count, given back as it drops.
-#[derive(Debug)]
-struct Held {
-    per_ip: Arc<PerIp>,
-    ip: IpAddr,
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        let mut held = self
-            .per_ip
-            .held
-            .lock()
-            .expect("connection count lock poisoned");
-        if let Some(count) = held.get_mut(&self.ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                held.remove(&self.ip);
-            }
-        }
-    }
 }
 
 /// Whether a connection has a request in flight, and since when it hasn't.

@@ -1941,6 +1941,8 @@ fn main() -> ExitCode {
     PROGRAM.get_or_init(|| name);
     // A shell's completion script runs the binary with `FLEETRING_COMPLETE` set: answer, and exit.
     completions::complete_if_asked(name);
+    #[cfg(unix)]
+    raise_descriptor_limit();
     let arg0 = raw.first().cloned();
     let (cli, invocation) = match parse(raw, name) {
         Ok(parsed) => parsed,
@@ -2154,6 +2156,41 @@ fn leave_the_session() {
     match rustix::process::setsid() {
         Ok(_) | Err(rustix::io::Errno::PERM) => {}
         Err(error) => eprintln!("{}: can't leave the terminal's session: {error}", program()),
+    }
+}
+
+/// Raises the soft limit on open file descriptors to the hard limit, as Go's runtime does. A
+/// node's sockets and database files share one limit, and the soft limit many systems start a
+/// process with (256 on macOS, 1,024 on Linux) is far below the hard one. On macOS it stops at
+/// `OPEN_MAX`, beyond which `setrlimit` refuses. A failure leaves the limit as it was.
+#[cfg(unix)]
+fn raise_descriptor_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    /// The highest soft limit macOS accepts, whatever the hard limit says.
+    #[cfg(target_os = "macos")]
+    const OPEN_MAX: u64 = 10_240;
+
+    let limit = getrlimit(Resource::Nofile);
+    #[cfg(target_os = "macos")]
+    let wanted = Some(
+        limit
+            .maximum
+            .map_or(OPEN_MAX, |maximum| maximum.min(OPEN_MAX)),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let wanted = limit.maximum;
+    // An unlimited hard limit on Linux still caps descriptors at `nr_open`, which an unlimited
+    // soft limit can't name, so the soft limit stays.
+    let (Some(current), Some(wanted)) = (limit.current, wanted) else {
+        return;
+    };
+    if current < wanted {
+        let raised = Rlimit {
+            current: Some(wanted),
+            maximum: limit.maximum,
+        };
+        let _unchanged = setrlimit(Resource::Nofile, raised);
     }
 }
 

@@ -75,8 +75,8 @@ pub struct HttpConfig {
     /// How long a connection may go without a request, in milliseconds, before the router closes
     /// it, a connection that never sends one included.
     pub idle_timeout_ms: NonZeroU64,
-    /// How many connections one client IP address may hold open at once; one more is closed as
-    /// it is accepted. Behind a load balancer that doesn't keep client addresses, every
+    /// How many connections one client IP address, or an IPv6 client's /64, may hold open at
+    /// once; one more is closed as it is accepted. Behind a load balancer that doesn't keep client addresses, every
     /// connection comes from the balancer's few: raise it there.
     pub max_connections_per_ip: NonZeroUsize,
 }
