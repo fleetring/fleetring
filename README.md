@@ -32,7 +32,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - `fleetring dev`: one command for a local node on a laptop, over the same TLS and scopes as a fleet
 - `fleetring mcp`: an MCP server over stdio, so an agent creates, finds, queries, follows, forks, and drops its own databases as one scoped principal, with text others wrote marked untrusted; `fleetring agent` gives each agent an identity of its own
 
-**New in 0.8.0**, being prepared:
+**New in 0.8.0** (2026-11-18), with two fix releases since: 0.8.1 gives every new database a random incarnation, and 0.8.2, a security release, caps the TLS handshakes in progress on a node:
 
 - `fleetring router`: a libSQL/Hrana front door, so existing libSQL and Turso clients reach each database's primary unchanged
 - `fleetring db watch`, which follows a database's row changes, and an MCP `changes` tool
@@ -143,7 +143,7 @@ The [`fleetring`](crates/fleetring) crate at the heart of FleetRing is general-p
 - [x] `fleetring dev`, a one-command local node, and webhook sinks over HTTPS (0.5.0)
 - [x] Agent kit: database descriptions, labels and expiry, `db show`, an MCP server, and an agent skill (0.6.0)
 - [x] The `fleetring` CLI: contexts, JSON output, exit codes, man pages, and an identity per agent (0.7.0)
-- [ ] Router (libSQL/Hrana protocol), `db watch`, database forks, online delegation between agents, and the joint-quorum hand-over (0.8.0, being prepared)
+- [x] Router (libSQL/Hrana protocol), `db watch`, database forks, online delegation between agents, and the joint-quorum hand-over (0.8.0)
 - [ ] Live migration
 - [ ] Raft control plane
 - [ ] Fault injection on real daemons
