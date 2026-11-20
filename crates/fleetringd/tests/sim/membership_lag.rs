@@ -221,6 +221,7 @@ pub(crate) fn scenario(seed: u64) -> TestResult {
 
 /// Runs `operations` on a client named `name` and returns every answer once each arrived, a
 /// timeout included. The client goes on sending an operation whose answer was uncertain.
+#[cfg(feature = "fault-hooks")]
 fn answers_of(
     fleet: &mut Fleet,
     name: &str,
