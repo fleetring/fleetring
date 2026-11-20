@@ -390,3 +390,34 @@ gh attestation verify fleetringd-0.8.1-<target>.tar.gz --repo fleetring/fleetrin
 gh attestation verify oci://ghcr.io/fleetring/fleetring:0.8.1 --repo fleetring/fleetring
 ```
 ````
+
+### 0.8.2: a cap on TLS handshakes
+
+A draft for 0.8.2's notes. Before the tag, check the advisory's ID, title, and severity against the draft advisory, and fill in the rest of the release.
+
+````markdown
+## fleetringd 0.8.2
+
+A security release: an unauthenticated client could exhaust a node's file descriptors. Upgrade every node.
+
+### Security
+
+- **GHSA-2xmc-pwvh-3fxq: fleetringd: an unauthenticated client can exhaust a node's file descriptors with handshakes that never finish.** High. Affects 0.2.0 through 0.8.1. Anyone who could reach a node's `listen` port could open connections that never finish the TLS handshake faster than the 10-second handshake timeout closed them, until the node ran out of file descriptors and could neither accept peers nor open its files. No certificate was needed, and nothing could be read or written. A node now runs at most 128 handshakes at once and 16 from one client address (an IPv6 client's /64): a connection beyond an address's share is closed at once, and one beyond the total closes the oldest handshake in progress. The daemon also raises its soft descriptor limit to the hard limit at start. Nothing to do after upgrading. See the [advisory](https://github.com/fleetring/fleetring/security/advisories/GHSA-2xmc-pwvh-3fxq).
+
+### Fixes
+
+- **A connection still in its TLS handshake when a node stops now closes with it** (FR-124, #202), rather than staying open for up to 10 seconds.
+- **A node out of file descriptors no longer retries accepting connections without pause**, which used a full core, and now logs the failure as a warning; it waits a tenth of a second between tries.
+- **The router counts an IPv6 client's /64 as one address** for `[http] max_connections_per_ip`, so one host can't take a share per address in its block.
+
+### Verify
+
+```sh
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/fleetring/fleetring/.github/workflows/release.yml@refs/tags/fleetringd-v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify fleetringd-0.8.2-<target>.tar.gz --repo fleetring/fleetring
+gh attestation verify oci://ghcr.io/fleetring/fleetring:0.8.2 --repo fleetring/fleetring
+```
+````
