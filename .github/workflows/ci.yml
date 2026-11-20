@@ -103,28 +103,20 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # macOS and Windows run the suite once each (ADR-0014). Linux runs it in four configurations, in
+  # `test-linux` below.
   test:
     name: test (${{ matrix.os }})
     needs: changes
     if: github.event_name != 'push' && !cancelled()
     runs-on: ${{ matrix.os }}
-    # Linux runs the suite three times; with 0.8.0's fork and delegation tests that takes over
-    # 40 minutes on ubuntu-latest.
-    timeout-minutes: 60
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The Linux job builds the workspace in three configurations, and the upgrade tests copy the
-      # daemon's binary, so it needs more than the runner's free disk: drop toolchains it never
-      # uses (#97).
-      - name: free disk space
-        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
       - if: needs.changes.outputs.code != 'false'
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -140,41 +132,92 @@ jobs:
         run: |
           echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
           echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: all features
-        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
-        run: cargo test --workspace --all-features --no-fail-fast
-      # The simulation tests are deterministic and OS-independent, and Linux already runs them in
-      # three jobs, so macOS and Windows run every feature except `simulation` (ADR-0014). macOS
-      # also enables the fork tests' fault hooks, so that `tests/fork.rs` runs there too.
+      # The simulation tests are deterministic and OS-independent, and Linux already runs them, so
+      # macOS and Windows run every feature except `simulation` (ADR-0014). macOS also enables the
+      # fork tests' fault hooks, so that `tests/fork.rs` runs there too.
       - name: all features except simulation
         if: needs.changes.outputs.code != 'false' && runner.os == 'macOS'
         run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/fault-hooks --no-fail-fast
       - name: all features except simulation and the fault hooks
         if: needs.changes.outputs.code != 'false' && runner.os == 'Windows'
         run: cargo test --workspace --features fleetring/serde,fleetring/test-util --no-fail-fast
-      # Feature combinations and the release profile don't depend on the OS, so only Linux runs
-      # them; macOS and Windows run the suite once (ADR-0014).
-      - name: default features
-        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
-        run: cargo test --workspace --no-fail-fast
-      # Only the placement crate has default features (`std`); every other crate builds the same
-      # with or without them, so running their suites again here would repeat the step above.
-      - name: no default features
-        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
-        run: cargo test -p fleetring --no-default-features --no-fail-fast
-      # Every feature but `fleetringd/fault-hooks`, which a build without debug assertions
-      # refuses: the fork tests it enables run in the debug steps above.
-      - name: all features but the fault hooks, release
-        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
-        run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-fail-fast
+
+  # Feature combinations and the release profile don't depend on the OS, so only Linux runs them
+  # (ADR-0014). Each configuration is its own job, so they run at once rather than one after
+  # another (FR-120), and each keeps its own cache key, which `cache` below refreshes on `main`.
+  test-linux:
+    name: test linux (${{ matrix.config.name }})
+    needs: changes
+    if: github.event_name != 'push' && !cancelled() && needs.changes.outputs.code != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { name: all features, key: test-linux-all }
+          - { name: default features, key: test-linux-default }
+          - { name: release, key: test-linux-release }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The upgrade tests copy the daemon's binary, and a full build needs more than the runner's
+      # free disk: drop toolchains the job never uses (#97).
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.config.key }}
+      - name: all features
+        if: matrix.config.key == 'test-linux-all'
+        run: cargo test --workspace --all-features --no-fail-fast
       # Runs every example, so a new one can't be left out. `cargo test` already builds them
       # on every OS, so running them on one is enough.
       - name: examples
-        if: needs.changes.outputs.code != 'false' && runner.os == 'Linux'
+        if: matrix.config.key == 'test-linux-all'
         run: |
           for example in crates/fleetring/examples/*.rs; do
             cargo run -p fleetring --all-features --example "$(basename "$example" .rs)"
           done
+      - name: default features
+        if: matrix.config.key == 'test-linux-default'
+        run: cargo test --workspace --no-fail-fast
+      # Only the placement crate has default features (`std`); every other crate builds the same
+      # with or without them, so running their suites again here would repeat the step above.
+      - name: no default features
+        if: matrix.config.key == 'test-linux-default'
+        run: cargo test -p fleetring --no-default-features --no-fail-fast
+      # Every feature but `fleetringd/fault-hooks`, which a build without debug assertions
+      # refuses: the fork tests it enables run in the debug configurations.
+      - name: all features but the fault hooks, release
+        if: matrix.config.key == 'test-linux-release'
+        run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-fail-fast
+
+  # The Linux check `main`'s ruleset requires, under the name the single Linux job had: it passes
+  # only if every configuration in `test-linux` passed, or if the pull request changes nothing
+  # they test.
+  test-ubuntu:
+    name: test (ubuntu-latest)
+    needs: [changes, test-linux]
+    if: github.event_name != 'push' && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: every Linux configuration passed
+        env:
+          RESULT: ${{ needs.test-linux.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          echo "test-linux: $RESULT (code changed: $CODE)"
+          case "$RESULT" in
+            success) ;;
+            skipped) [ "$CODE" = false ] ;;
+            *) exit 1 ;;
+          esac
 
   # Linux ARM64, natively, where most small self-hosted machines run (FR-034). macOS ARM64 is
   # covered above: `macos-latest` is an Apple Silicon runner.
@@ -409,17 +452,23 @@ jobs:
   #
   # rust-cache's key is `v0-rust`, then `shared-key` or else the job ID, then the runner's OS and
   # architecture, then a hash of `rustc -vV` and every CARGO*, RUST*, CC*, CFLAGS*, CXX*, and
-  # CMAKE* environment variable, then a hash of Cargo.lock and the manifests. With
-  # `shared-key: test`, this job's key is the one the `ubuntu-latest` leg of `test` uses, whose
-  # job ID is `test`; keep its toolchain and environment equal to that leg's, or the keys part.
-  # It builds the four feature and profile combinations that leg runs, without running them, so
-  # the cache holds the same dependencies. The other jobs' caches on `main` aren't refreshed by
-  # pushes; a manual run on `main` refreshes them.
+  # CMAKE* environment variable, then a hash of Cargo.lock and the manifests. Each leg here uses
+  # the `shared-key` of one `test-linux` configuration; keep its toolchain and environment equal
+  # to that configuration's, or the keys part. It builds what that configuration runs, without
+  # running it, so the cache holds the same dependencies. The other jobs' caches on `main` aren't
+  # refreshed by pushes; a manual run on `main` refreshes them.
   cache:
-    name: cache (main)
+    name: cache (main, ${{ matrix.config.name }})
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { name: all features, key: test-linux-all }
+          - { name: default features, key: test-linux-default }
+          - { name: release, key: test-linux-release }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -427,8 +476,12 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: test
-      - run: cargo test --workspace --all-features --no-run
-      - run: cargo test --workspace --no-run
-      - run: cargo test --workspace --no-default-features --no-run
-      - run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-run
+          shared-key: ${{ matrix.config.key }}
+      - if: matrix.config.key == 'test-linux-all'
+        run: cargo test --workspace --all-features --no-run
+      - if: matrix.config.key == 'test-linux-default'
+        run: |
+          cargo test --workspace --no-run
+          cargo test -p fleetring --no-default-features --no-run
+      - if: matrix.config.key == 'test-linux-release'
+        run: cargo test --workspace --features fleetring/serde,fleetring/test-util,fleetringd/simulation --release --no-run
