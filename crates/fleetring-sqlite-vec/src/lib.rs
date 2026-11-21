@@ -197,6 +197,37 @@ mod tests {
     }
 
     #[test]
+    fn the_lints_are_the_workspaces_but_for_unsafe_code() -> Result<(), Box<dyn Error>> {
+        let read = |path: &str| -> Result<toml::Table, Box<dyn Error>> {
+            let text = std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")))?;
+            Ok(toml::from_str(&text)?)
+        };
+        let workspace = read("../../Cargo.toml")?;
+        let mut expected = workspace
+            .get("workspace")
+            .and_then(|table| table.get("lints"))
+            .and_then(toml::Value::as_table)
+            .ok_or("the workspace has lints")?
+            .clone();
+        let rust = expected
+            .get_mut("rust")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or("the workspace has Rust lints")?;
+        assert_eq!(
+            rust.insert("unsafe_code".to_owned(), "deny".into()),
+            Some("forbid".into())
+        );
+        let clippy = expected
+            .get_mut("clippy")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or("the workspace has clippy lints")?;
+        clippy.insert("undocumented_unsafe_blocks".to_owned(), "warn".into());
+        let own = read("Cargo.toml")?;
+        assert_eq!(own.get("lints"), Some(&toml::Value::Table(expected)));
+        Ok(())
+    }
+
+    #[test]
     fn the_file_reading_functions_are_not_registered() -> rusqlite::Result<()> {
         let conn = registered()?;
         let called = conn.query_row("SELECT vec_npy_file('x.npy')", [], |row| {

@@ -45,12 +45,12 @@ pub(super) fn read_within(
 ) -> Result<Schema, EngineError> {
     let table_types = table_types(conn)?;
     let mut entries = entries(conn, &table_types)?;
-    let virtual_tables = virtual_tables(&table_types);
+    let vec0_tables = vectors::vec0_tables(conn)?;
     let hidden: BTreeSet<String> = match request.internal {
         Internal::Show => BTreeSet::new(),
         Internal::Hide => entries
             .iter()
-            .filter(|entry| is_internal(entry, &table_types, &virtual_tables))
+            .filter(|entry| is_internal(entry, &table_types, &vec0_tables))
             .map(|entry| entry.name.clone())
             .collect(),
     };
@@ -142,27 +142,18 @@ fn entries(
 }
 
 /// Whether `entry` is a table SQLite keeps for itself: one named `sqlite_...`, or a virtual
-/// table's shadow table, the vector chunk tables of one among `virtual_tables` included.
+/// table's shadow table, the vector chunk tables of one of `vec0_tables` included.
 fn is_internal(
     entry: &Entry,
     table_types: &BTreeMap<String, String>,
-    virtual_tables: &BTreeSet<String>,
+    vec0_tables: &BTreeSet<String>,
 ) -> bool {
     matches!(entry.kind, ObjectKind::Table | ObjectKind::VirtualTable)
         && (has_prefix(&entry.name, "sqlite_")
             || table_types
                 .get(&entry.name)
                 .is_some_and(|kind| kind == "shadow")
-            || vectors::is_chunk_table(&entry.name, virtual_tables))
-}
-
-/// The names of the virtual tables among `table_types`.
-fn virtual_tables(table_types: &BTreeMap<String, String>) -> BTreeSet<String> {
-    table_types
-        .iter()
-        .filter(|(_, kind)| *kind == "virtual")
-        .map(|(name, _)| name.clone())
-        .collect()
+            || vectors::is_chunk_table(&entry.name, vec0_tables))
 }
 
 /// Whether `entry`, or the table it belongs to, is reserved for fleetringd.

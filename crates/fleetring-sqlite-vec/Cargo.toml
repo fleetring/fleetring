@@ -20,9 +20,14 @@ sqlite-vec = "=0.1.9"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Reads this manifest and the workspace's, to hold their lints equal.
+toml = "1.1.8"
 
-# The workspace's lints (ADR-0009), but with `unsafe_code` denied rather than forbidden: this is
-# the FFI crate ADR-0015, point 7, provides for, and its one call into C opts out with `expect`.
+# The workspace's lints (ADR-0009), but with `unsafe_code` denied rather than forbidden, and
+# clippy's `undocumented_unsafe_blocks` added: this is the FFI crate ADR-0015, point 7, provides
+# for, and its one call into C opts out with `expect`. They are copied rather than inherited
+# because Cargo refuses `lints.workspace = true` beside lints of the crate's own, and a crate
+# attribute can't relax `forbid`. A unit test holds the copy equal to the workspace's.
 [lints.rust]
 missing_debug_implementations = "warn"
 missing_docs = "warn"
