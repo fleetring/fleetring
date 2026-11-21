@@ -276,15 +276,35 @@ SELECT state, count(*) AS tasks FROM tasks GROUP BY state ORDER BY state;
 
 `exec` returns no rows, so a `RETURNING` clause tells you nothing there; check `rows_affected`, then `query` for what you need.
 
-### Vectors (planned, FR-069)
+### Vectors
 
-Vector search waits for sqlite-vec to be compiled into `fleetring` (FR-069). Until then, `vec0` tables don't exist, and the adapter refuses to load extensions. Use full-text search instead.
+`fleetring` has sqlite-vec 0.1.9 compiled in, from the release after 0.8.2 (FR-069): a `vec0` table holds embeddings you compute, since FleetRing embeds nothing itself, and answers exact nearest-neighbour queries. Extensions still can't be loaded, so `vec0` is the only vector table there is. Keep one embedding per note in a `vec0` table keyed by the note's ID, and send each vector as JSON text. `float[4]` keeps the example short; declare your model's dimension, such as `float[1536]`. Delete before you insert, so a retried write replaces the vector instead of failing on the existing ID.
 
-```sql planned
--- Planned (FR-069): a vec0 virtual table beside notes, keyed by note ID, holding one
--- embedding per note, and a nearest-neighbour query ordered by distance. This page will
--- show the SQL once a release ships it.
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS note_vec USING vec0 (
+  embedding float[4] distance_metric=cosine
+);
+
+-- params: 1
+DELETE FROM note_vec WHERE rowid = ?;
+
+-- params: 1, '[0.1, 0.8, 0.3, 0.0]'
+INSERT INTO note_vec (rowid, embedding) VALUES (?, ?);
 ```
+
+Ask for the `k` nearest notes, nearest first. `distance` is the cosine distance: 0 for the same direction, up to 2.
+
+```sql
+-- params: '[0.1, 0.7, 0.4, 0.0]'
+WITH knn AS (
+  SELECT rowid, distance FROM note_vec WHERE embedding MATCH ? AND k = 5
+)
+SELECT n.id, n.title, knn.distance
+  FROM knn JOIN notes n ON n.id = knn.rowid
+  ORDER BY knn.distance;
+```
+
+`changes` doesn't return writes to a `vec0` table. If other agents follow your notes and need their vectors, store each embedding in the notes table as well, as `vec_f32(?)`, and fill `note_vec` from it with a trigger, as `notes_fts` is filled. The daemon README shows that pattern, and a hybrid search that combines `MATCH` on `notes_fts` with the vector distance.
 
 ## 8. Following changes
 

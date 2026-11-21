@@ -178,8 +178,17 @@ enum Recording {
 /// Runs every `sql` block of the skill, in order, on a fresh database: `query` for a `SELECT`
 /// or `WITH`, `execute` for the rest. Fails naming the block and statement that failed.
 fn run_the_skill(recording: Recording) -> Result<(), Box<dyn Error>> {
-    let blocks = sql_blocks(SKILL);
-    assert!(!blocks.is_empty(), "the skill has no sql blocks");
+    run_blocks(SKILL, recording).map(drop)
+}
+
+/// Runs every `sql` block of `markdown` as [`run_the_skill`] does, returning each query's rows
+/// in order.
+fn run_blocks(
+    markdown: &str,
+    recording: Recording,
+) -> Result<Vec<Vec<Vec<Value>>>, Box<dyn Error>> {
+    let blocks = sql_blocks(markdown);
+    assert!(!blocks.is_empty(), "the page has no sql blocks");
 
     let dir = tempfile::tempdir()?;
     let engine = SqliteEngine::new(4096)?;
@@ -190,11 +199,14 @@ fn run_the_skill(recording: Recording) -> Result<(), Box<dyn Error>> {
             .start_recording(CaptureMode::Full)?;
     }
     let mut ran = 0_usize;
+    let mut answers = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
         for statement in statements(block)? {
             let prepared = Statement::with_params(statement.sql.clone(), statement.params);
             let outcome = match first_keyword(&statement.sql).as_str() {
-                "SELECT" | "WITH" => db.query(&prepared, &Interrupt::new()).map(drop),
+                "SELECT" | "WITH" => db
+                    .query(&prepared, &Interrupt::new())
+                    .map(|rows| answers.push(rows.rows)),
                 _ => db
                     .execute(&Transaction::from(prepared), &Interrupt::new())
                     .map(drop),
@@ -209,12 +221,34 @@ fn run_the_skill(recording: Recording) -> Result<(), Box<dyn Error>> {
     }
     assert!(ran >= blocks.len(), "ran {ran} statements");
     db.close()?;
-    Ok(())
+    Ok(answers)
 }
 
 #[test]
 fn every_sql_block_in_the_skill_runs_through_the_sqlite_adapter() -> Result<(), Box<dyn Error>> {
     run_the_skill(Recording::Off)
+}
+
+/// The daemon README's search examples (FR-069): every `sql` block runs, with row changes
+/// recorded or not, and the queries answer as the text says.
+#[test]
+fn the_daemon_readmes_search_examples_run_and_rank_as_described() -> Result<(), Box<dyn Error>> {
+    const README: &str = include_str!("../README.md");
+    run_blocks(README, Recording::On)?;
+    let answers = run_blocks(README, Recording::Off)?;
+    let [nearest, hybrid] = answers.as_slice() else {
+        return Err(format!("expected two queries, got {answers:?}").into());
+    };
+    let ids = |rows: &[Vec<Value>]| rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+    // The k-nearest query: the two documents nearest the query vector, nearest first.
+    assert_eq!(ids(nearest), [Value::Integer(1), Value::Integer(2)]);
+    // The hybrid search: document 1 is first in both lists, 2 second in both, and 3 only in the
+    // vector list, last.
+    assert_eq!(
+        ids(hybrid),
+        [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+    );
+    Ok(())
 }
 
 #[test]
