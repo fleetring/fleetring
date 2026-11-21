@@ -65,7 +65,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
-use super::storage;
+use super::{storage, vectors};
 use crate::engine::{
     CaptureMode, Column, EngineError, Position, ReadLimit, RecordedTransaction, RowChange,
     RowOperation, Value,
@@ -464,21 +464,34 @@ fn start_bytes(start: Option<fleetring_wal::Position>) -> Vec<u8> {
 
 /// The tables the user owns: everything but SQLite's and the adapter's, and but virtual tables
 /// and their shadow tables. A virtual table can't carry triggers, and its shadow tables hold the
-/// module's own storage, such as an FTS5 index, whose rows aren't the user's.
+/// module's own storage, such as an FTS5 index or a `vec0` table's vectors, whose rows aren't the
+/// user's. SQLite doesn't report a `vec0` table's vector chunk tables as shadow tables, so they
+/// are left out by name (the `vectors` module).
 fn user_tables(conn: &Connection) -> Result<Vec<String>, EngineError> {
     let mut statement = conn
         .prepare(
-            "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'
+            "SELECT name, type FROM pragma_table_list WHERE schema = 'main'
+             AND type IN ('table', 'virtual')
              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE ?1 ESCAPE '\\'
              ORDER BY name",
         )
         .map_err(storage)?;
-    let names = statement
-        .query_map(params![reserved_pattern()], |row| row.get::<_, String>(0))
+    let listed = statement
+        .query_map(params![reserved_pattern()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(storage)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(storage)?;
-    Ok(names)
+    let (virtual_tables, tables): (Vec<_>, Vec<_>) =
+        listed.into_iter().partition(|(_, kind)| kind == "virtual");
+    let virtual_tables: BTreeSet<String> =
+        virtual_tables.into_iter().map(|(name, _)| name).collect();
+    Ok(tables
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !vectors::is_chunk_table(name, &virtual_tables))
+        .collect())
 }
 
 /// A `LIKE` pattern matching reserved names, with the prefix's underscores escaped.

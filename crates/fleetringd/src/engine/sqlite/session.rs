@@ -287,7 +287,7 @@ impl SqliteDatabase {
             }
             let next = {
                 let _user = UserStatement::enter(confinement);
-                batch.next()
+                confinement.preparing(|| batch.next())
             };
             let mut prepared = match next {
                 Ok(Some(prepared)) => prepared,
@@ -327,7 +327,7 @@ impl SqliteDatabase {
             SessionAccess::ReadWrite => (writer.conn, writer.confinement),
         };
         let _user = UserStatement::enter(confinement);
-        let prepared = match conn.prepare(sql) {
+        let prepared = match confinement.preparing(|| conn.prepare(sql)) {
             Ok(prepared) => prepared,
             Err(error) => return statement_error(error, confinement, &Interrupt::new()).map(Err),
         };
@@ -389,7 +389,7 @@ fn prepare_class<'c>(
     sql: &str,
 ) -> Result<(Statement<'c>, Class), Result<StatementError, EngineError>> {
     let _user = UserStatement::enter(confinement);
-    match conn.prepare(sql) {
+    match confinement.preparing(|| conn.prepare(sql)) {
         Ok(prepared) => {
             let class = confinement.class_of(&prepared);
             Ok((prepared, class))
@@ -408,7 +408,7 @@ fn sequence_intent(
     let _user = UserStatement::enter(confinement);
     let mut batch = Batch::new(conn, sql);
     loop {
-        match batch.next() {
+        match confinement.preparing(|| batch.next()) {
             Ok(Some(prepared)) => {
                 if !confinement.class_of(&prepared).reads_only() {
                     return Ok(WriteIntent::MayWrite);

@@ -25,6 +25,8 @@ fleetring = { path = "../fleetring", features = ["serde"] }
 fleetring-client = { version = "0.0.0", path = "../fleetring-client" }
 fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
 fleetring-proto = { version = "0.0.0", path = "../fleetring-proto" }
+# sqlite-vec, compiled in and registered on every connection the SQLite adapter opens (ADR-0049).
+fleetring-sqlite-vec = { version = "0.0.0", path = "../fleetring-sqlite-vec" }
 fleetring-wal = { version = "0.0.0", path = "../fleetring-wal" }
 # `fleetringd upgrade` reads the one binary out of a release's `.tar.gz` (ADR-0038).
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }

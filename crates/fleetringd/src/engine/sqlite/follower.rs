@@ -7,8 +7,8 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::{
     Checkpoint, DATABASE_FILE, checkpoint, cut_at, decode_position, defend, encode_position,
-    frame_batch, keep_wal_on_close, page_size, read_marker, read_wal_file, remove_if_present,
-    shm_path, storage, wal_path, write_marker,
+    frame_batch, keep_wal_on_close, page_size, read_marker, read_wal_file, register_vectors,
+    remove_if_present, shm_path, storage, wal_path, write_marker,
 };
 use crate::engine::{CheckpointMarker, EngineError, FrameBatch, FrameFollower, Position};
 
@@ -65,6 +65,7 @@ impl SqliteFollower {
         )
         .map_err(storage)?;
         defend(&conn)?;
+        register_vectors(&conn)?;
         if mode == Checkpoint::Passive {
             keep_wal_on_close(&conn)?;
         }

@@ -1,0 +1,41 @@
+[package]
+name = "fleetring-sqlite-vec"
+description = "Registers the statically linked sqlite-vec extension on a SQLite connection, for fleetringd's SQLite adapter."
+version = "0.0.0"
+publish = false
+edition.workspace = true
+# rusqlite needs 1.89, the daemon's toolchain (ADR-0015, point 7).
+rust-version = "1.89"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+# Pinned exactly: vec0's shadow tables are an on-disk format, so every upgrade is a deliberate
+# change (ADR-0049). 0.1.9 is the latest stable release; the 0.1.10 alphas, the only releases
+# with approximate indexes, are not used. The crate builds the release's C source with `cc`.
+sqlite-vec = "=0.1.9"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# The workspace's lints (ADR-0009), but with `unsafe_code` denied rather than forbidden: this is
+# the FFI crate ADR-0015, point 7, provides for, and its one call into C opts out with `expect`.
+[lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
