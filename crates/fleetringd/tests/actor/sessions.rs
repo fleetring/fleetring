@@ -328,6 +328,82 @@ fn temporary_objects_are_refused_in_sessions_and_execute() -> TestResult {
     Ok(())
 }
 
+/// The statement messages of a call that failed.
+fn message(result: &CallResult) -> &str {
+    match &result.outcome {
+        CallOutcome::Statement(Err(error)) => &error.message,
+        other => panic!("expected a statement that failed: {other:?}"),
+    }
+}
+
+#[test]
+fn schema_checks_still_run_after_a_savepoint_is_rolled_back() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = open(dir.path())?;
+    let rw = SessionAccess::ReadWrite;
+    for sql in [
+        "CREATE TABLE t (v)",
+        "CREATE TABLE plain (v)",
+        "CREATE VIRTUAL TABLE docs USING vec0(e float[2], kind TEXT)",
+        "INSERT INTO docs (rowid, e, kind) VALUES (1, '[1, 1]', 'a kind longer than sixteen bytes')",
+    ] {
+        ok(&run(db.as_mut(), &execute(sql), rw));
+    }
+    let names =
+        |db: &mut dyn Database| column(db, "SELECT name FROM main.sqlite_master ORDER BY name");
+    let before = names(db.as_mut());
+    // `ROLLBACK TO` takes the schema's version back to the savepoint's, so the next schema change
+    // brings it to a version the checks already read; they must still look.
+    for (change, reason) in [
+        ("ALTER TABLE docs RENAME TO moved", "can't be renamed"),
+        ("ALTER TABLE plain RENAME TO _fleetring_evil", "reserved"),
+    ] {
+        for sql in [
+            "BEGIN",
+            "INSERT INTO t VALUES (50)",
+            "SAVEPOINT s",
+            "CREATE TABLE junk (x)",
+            "ROLLBACK TO s",
+        ] {
+            ok(&run(db.as_mut(), &execute(sql), rw));
+        }
+        let refused = run(db.as_mut(), &execute(change), rw);
+        assert_eq!(failed(&refused), "SQLITE_AUTH", "{change}");
+        assert!(message(&refused).contains(reason), "{change}: {refused:?}");
+        assert_eq!(refused.autocommit, Autocommit::On, "{change}: rolled back");
+        // The same through `Execute`, which checks after every statement.
+        let error = db
+            .execute(
+                &Transaction::new([
+                    Statement::new("INSERT INTO t VALUES (51)"),
+                    Statement::new("SAVEPOINT s"),
+                    Statement::new("CREATE TABLE junk (x)"),
+                    Statement::new("ROLLBACK TO s"),
+                    Statement::new(change),
+                ]),
+                &Interrupt::new(),
+            )
+            .expect_err("the schema change is refused");
+        assert!(error.to_string().contains(reason), "{change}: {error}");
+    }
+    assert_eq!(names(db.as_mut()), before);
+    assert!(column(db.as_mut(), "SELECT v FROM t").is_empty());
+    // A savepoint's schema change that stays is checked as usual, and so is one after a
+    // `RELEASE`.
+    for sql in ["BEGIN", "SAVEPOINT s", "CREATE TABLE kept (x)", "RELEASE s"] {
+        ok(&run(db.as_mut(), &execute(sql), rw));
+    }
+    let refused = run(
+        db.as_mut(),
+        &execute("ALTER TABLE docs RENAME TO moved"),
+        rw,
+    );
+    assert_eq!(failed(&refused), "SQLITE_AUTH");
+    let kind = column(db.as_mut(), "SELECT kind FROM docs WHERE rowid = 1");
+    assert_eq!(kind, [Value::from("a kind longer than sixteen bytes")]);
+    Ok(())
+}
+
 #[test]
 fn a_session_records_row_changes_as_execute_does() -> TestResult {
     let sessions_dir = TempDir::new()?;
