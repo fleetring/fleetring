@@ -768,6 +768,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleetring-sqlite-vec"
+version = "0.0.0"
+dependencies = [
+ "rusqlite",
+ "sqlite-vec",
+ "tempfile",
+]
+
+[[package]]
 name = "fleetring-wal"
 version = "0.0.0"
 dependencies = [
@@ -802,6 +811,7 @@ dependencies = [
  "fleetring-client",
  "fleetring-control",
  "fleetring-proto",
+ "fleetring-sqlite-vec",
  "fleetring-wal",
  "http-body",
  "http-body-util",
@@ -2536,6 +2546,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -13,7 +13,10 @@ use fleetringd::durability::{
     RestoreError, RestoreTarget, Restored, StoreError, StoreFuture, checksum_hex, decode_segment,
     encode_descriptor, encode_segment, finish_offline, restore_into,
 };
-use fleetringd::engine::{EngineKind, Execution, Position, SqliteEngine};
+use fleetringd::engine::{
+    DatabaseEngine as _, EngineKind, Execution, Interrupt, OpenMode, Position, SqliteEngine,
+    Statement, Transaction, Value,
+};
 use tokio::sync::watch;
 
 use crate::common::{
@@ -99,6 +102,74 @@ async fn restoring_latest_reproduces_the_primary() -> TestResult {
     let refused = restore(&node, &ledger, &RestoreTarget::Latest, &staging).await;
     assert!(matches!(refused, Err(RestoreError::Io(_))), "{refused:?}");
     assert!(staging.join("data.db").exists());
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_copy_keeps_its_vec0_tables_working() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let node = Node::start(
+        &dir.path().join("node"),
+        Arc::new(MemoryStore::new()),
+        settings(),
+    );
+    let notes = name("notes");
+    node.create(
+        &notes,
+        "CREATE VIRTUAL TABLE notes USING vec0(embedding float[4], chunk_size = 8)",
+    )
+    .await?;
+    for batch in 0..3_i64 {
+        let inserts = (0..10_i64).map(|offset| {
+            let i = batch * 10 + offset;
+            Statement::with_params(
+                "INSERT INTO notes (rowid, embedding) VALUES (?1, ?2)",
+                [
+                    Value::Integer(i),
+                    Value::from(format!("[{i}, {}, {}, 1]", i % 5, 30 - i)),
+                ],
+            )
+        });
+        node.execute(&notes, Transaction::new(inserts)).await?;
+        node.await_archived().await?;
+    }
+    node.execute(
+        &notes,
+        Transaction::from(Statement::new("DELETE FROM notes WHERE rowid = 12")),
+    )
+    .await?;
+    node.await_archived().await?;
+    let nearest = Statement::new(
+        "SELECT rowid, distance FROM notes \
+         WHERE embedding MATCH '[12, 2, 18, 1]' AND k = 4 ORDER BY distance",
+    );
+    let expected = node.registry().query(&notes, nearest.clone()).await?;
+    assert_eq!(expected.rows.len(), 4);
+
+    let staging = dir.path().join("restored");
+    let restored = restore(&node, &notes, &RestoreTarget::Latest, &staging).await?;
+    assert_eq!(restored.position, node.position(&notes).await?);
+    // Opened through the adapter, as the database's new primary would open it.
+    let scratch = tempfile::tempdir()?;
+    for file in ["data.db", "data.db-wal"] {
+        if staging.join(file).exists() {
+            std::fs::copy(staging.join(file), scratch.path().join(file))?;
+        }
+    }
+    let mut opened = sqlite().open(scratch.path(), OpenMode::Existing)?;
+    let answer = opened.query(&nearest, &Interrupt::new())?;
+    assert_eq!(answer, expected);
+    // It still takes writes.
+    opened.execute(
+        &Transaction::from(Statement::new(
+            "INSERT INTO notes (rowid, embedding) VALUES (12, '[12, 2, 18, 1]')",
+        )),
+        &Interrupt::new(),
+    )?;
+    let answer = opened.query(&nearest, &Interrupt::new())?;
+    assert_eq!(answer.rows[0][0], Value::Integer(12));
+    opened.close()?;
     node.stop().await;
     Ok(())
 }

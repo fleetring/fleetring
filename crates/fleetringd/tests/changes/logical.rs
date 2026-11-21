@@ -394,6 +394,93 @@ async fn the_change_table_is_reserved_and_hidden_from_statements() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn vec0_writes_send_no_rows_and_the_table_they_index_carries_the_embedding() -> TestResult {
+    let harness = Harness::start().await?;
+    let sink = MemorySink::new("rows");
+    let node = harness
+        .node(vec![ConfiguredSink::new(
+            sink.clone(),
+            Format::Logical,
+            every_database(),
+        )])
+        .await?;
+    let db = name("memory");
+    node.create(
+        &db,
+        "CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT, embedding BLOB)",
+    )
+    .await?;
+    // The vector index is kept in step with `note` by a trigger, as an FTS5 index is.
+    node.execute(
+        &db,
+        Transaction::new([
+            Statement::new("CREATE VIRTUAL TABLE note_vec USING vec0(embedding float[2])"),
+            Statement::new(
+                "CREATE TRIGGER note_vec_ai AFTER INSERT ON note BEGIN \
+                 INSERT INTO note_vec (rowid, embedding) VALUES (new.id, new.embedding); END",
+            ),
+        ]),
+    )
+    .await?;
+    node.execute(
+        &db,
+        Transaction::from(Statement::with_params(
+            "INSERT INTO note (id, body, embedding) VALUES (?1, ?2, vec_f32(?3))",
+            [
+                Value::Integer(1),
+                Value::from("east"),
+                Value::from("[1, 2]"),
+            ],
+        )),
+    )
+    .await?;
+    // A write to the vector table alone records nothing.
+    node.execute(
+        &db,
+        Transaction::from(Statement::new(
+            "INSERT INTO note_vec (rowid, embedding) VALUES (2, '[5, 5]')",
+        )),
+    )
+    .await?;
+    node.await_caught_up().await?;
+
+    // Neither the virtual table nor its shadow tables: the note alone, whose embedding is the
+    // little-endian float32 blob `vec0` stores.
+    let embedding: Vec<u8> = [1.0_f32, 2.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    assert_eq!(
+        rows(&sink),
+        vec![
+            RowChange::new("note", RowOperation::Insert, [Column::new("id", 1_i64)]).with_after(
+                vec![
+                    Column::new("id", 1_i64),
+                    Column::new("body", "east"),
+                    Column::new("embedding", embedding),
+                ]
+            ),
+        ]
+    );
+    let nearest = node
+        .registry()
+        .query(
+            &db,
+            Statement::new(
+                "SELECT rowid FROM note_vec WHERE embedding MATCH '[1, 1]' AND k = 2 \
+                 ORDER BY distance",
+            ),
+        )
+        .await?;
+    assert_eq!(
+        nearest.rows,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    node.kill().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_change_record_round_trips_through_json() -> TestResult {
     use fleetringd::changes::{Change, ChangeRecord};
     use fleetringd::engine::Position;

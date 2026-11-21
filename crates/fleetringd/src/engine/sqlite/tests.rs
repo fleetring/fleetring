@@ -1726,3 +1726,279 @@ fn a_foreign_marker_table_stops_the_reset() -> TestResult {
     assert!(refusal(db.fork_marker())?.contains("_fleetring_fork"));
     Ok(())
 }
+
+/// Creates `docs`, a `vec0` table of three-dimensional vectors with a metadata column and an
+/// auxiliary column, and fills it with four rows, in one transaction.
+fn vector_table(db: &mut SqliteDatabase) -> Result<Executed, EngineError> {
+    db.execute(
+        &Transaction::new([
+            Statement::new(
+                "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3], kind TEXT, +title TEXT)",
+            ),
+            Statement::new(
+                "INSERT INTO docs (rowid, embedding, kind, title) VALUES \
+                 (1, '[1, 0, 0]', 'note', 'east'), \
+                 (2, '[0, 1, 0]', 'note', 'north'), \
+                 (3, '[0, 0, 2]', 'fact', 'up'), \
+                 (4, '[0.9, 0.1, 0]', 'fact', 'mostly east')",
+            ),
+        ]),
+        &Interrupt::new(),
+    )
+}
+
+/// The rowids of the three rows of `docs` nearest `[1, 0, 0]`, nearest first.
+const NEAREST: &str =
+    "SELECT rowid FROM docs WHERE embedding MATCH '[1, 0, 0]' AND k = 3 ORDER BY distance";
+
+fn rowids(rows: &Rows) -> Vec<Value> {
+    rows.rows.iter().map(|row| row[0].clone()).collect()
+}
+
+#[test]
+fn every_connection_has_sqlite_vec_registered() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    for conn in [&db.writer, &db.reader] {
+        let version: String = conn.query_row("SELECT vec_version()", [], |row| row.get(0))?;
+        assert_eq!(version, fleetring_sqlite_vec::VERSION);
+    }
+    // And under the confinement, which allows its functions like any other.
+    let version = query(&mut db, "SELECT vec_version()")?;
+    assert_eq!(version.rows, [[Value::from(fleetring_sqlite_vec::VERSION)]]);
+    Ok(())
+}
+
+#[test]
+fn vec0_tables_take_writes_and_answer_k_nearest_queries() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // `rows_affected` also counts the rows vec0 writes to its shadow tables, as it counts the
+    // rows triggers write.
+    let created = vector_table(&mut db)?;
+    assert!(created.rows_affected > 4, "{created:?}");
+    // A query runs on the read connection.
+    let nearest = query(&mut db, NEAREST)?;
+    assert_eq!(
+        rowids(&nearest),
+        [Value::Integer(1), Value::Integer(4), Value::Integer(2)]
+    );
+    // A metadata column filters inside the search, and an auxiliary column comes back with it.
+    let facts = query(
+        &mut db,
+        "SELECT rowid, title FROM docs \
+         WHERE embedding MATCH vec_f32('[1, 0, 0]') AND k = 2 AND kind = 'fact' ORDER BY distance",
+    )?;
+    assert_eq!(
+        facts.rows,
+        [
+            [Value::Integer(4), Value::from("mostly east")],
+            [Value::Integer(3), Value::from("up")]
+        ]
+    );
+    // Updates and deletes, in a later transaction, which reconnects to the table.
+    db.execute(
+        &Transaction::new([
+            Statement::new("UPDATE docs SET embedding = '[0.8, 0, 0.2]' WHERE rowid = 3"),
+            Statement::new("DELETE FROM docs WHERE rowid = 1"),
+        ]),
+        &Interrupt::new(),
+    )?;
+    let nearest = query(&mut db, NEAREST)?;
+    assert_eq!(
+        rowids(&nearest),
+        [Value::Integer(4), Value::Integer(3), Value::Integer(2)]
+    );
+    // The scalar functions, too.
+    let distance = query(
+        &mut db,
+        "SELECT vec_distance_l2(vec_f32('[0, 0]'), vec_f32('[3, 4]'))",
+    )?;
+    assert_eq!(distance.rows, [[Value::Real(5.0)]]);
+
+    // The table survives a checkpoint and a reopen.
+    db.checkpoint()?;
+    Box::new(db).close()?;
+    let mut reopened = SqliteDatabase::open(
+        dir.path().join(DATABASE_FILE),
+        OpenMode::Existing,
+        4096,
+        Arc::default(),
+    )?;
+    let nearest = query(&mut reopened, NEAREST)?;
+    assert_eq!(
+        rowids(&nearest),
+        [Value::Integer(4), Value::Integer(3), Value::Integer(2)]
+    );
+    Ok(())
+}
+
+#[test]
+fn vec0_shadow_tables_can_be_read_but_not_written_by_statements() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    vector_table(&mut db)?;
+    // No statement can change a shadow table, so none can corrupt the index the module keeps
+    // there: defensive mode refuses most, and the adapter the vector chunk tables, which SQLite
+    // doesn't know as shadow tables.
+    let chunks = [
+        "INSERT INTO docs_vector_chunks00 (rowid, vectors) VALUES (9, x'00')",
+        "UPDATE docs_vector_chunks00 SET vectors = x''",
+        "DELETE FROM DOCS_VECTOR_CHUNKS00",
+        "DROP TABLE docs_vector_chunks00",
+        "ALTER TABLE docs_vector_chunks00 ADD COLUMN extra",
+        "CREATE INDEX sneaky ON docs_vector_chunks00 (vectors)",
+        "CREATE TRIGGER sneaky AFTER DELETE ON docs_vector_chunks00 BEGIN SELECT 1; END",
+        // Nor can an ordinary table take such a name, so every table that has one is vec0's.
+        "CREATE TABLE notes_vector_chunks00 (v)",
+    ];
+    for sql in chunks {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, Refusal::VectorChunks.to_string(), "`{sql}`");
+    }
+    // Nor through a trigger, whose body SQLite prepares with the statement that fires it.
+    exec(
+        &mut db,
+        "CREATE TRIGGER wipe AFTER INSERT ON t BEGIN DELETE FROM docs_vector_chunks00; END",
+    )?;
+    let message = refusal(exec(&mut db, "INSERT INTO t VALUES (2)"))?;
+    assert_eq!(message, Refusal::VectorChunks.to_string());
+    exec(&mut db, "DROP TRIGGER wipe")?;
+    for sql in [
+        "INSERT INTO docs_rowids (rowid, id, chunk_id, chunk_offset) VALUES (9, NULL, 1, 9)",
+        "UPDATE docs_chunks SET size = 1",
+        "DELETE FROM docs_vector_chunks00",
+        "DELETE FROM docs_info",
+        "UPDATE docs_metadatachunks00 SET data = x''",
+        "DELETE FROM docs_auxiliary",
+        "DROP TABLE docs_chunks",
+        "ALTER TABLE docs_rowids ADD COLUMN extra",
+        "CREATE TRIGGER sneaky AFTER INSERT ON docs_rowids BEGIN SELECT 1; END",
+    ] {
+        let refused = exec(&mut db, sql);
+        assert!(
+            matches!(refused, Err(EngineError::Statement { .. })),
+            "`{sql}`: {refused:?}"
+        );
+    }
+    // Reading them is harmless: they hold only the user's own vectors.
+    let rows = query(&mut db, "SELECT count(*) FROM docs_rowids")?;
+    assert_eq!(rows.rows, [[Value::Integer(4)]]);
+    let chunks = query(&mut db, "SELECT count(*) FROM docs_vector_chunks00")?;
+    assert_eq!(chunks.rows, [[Value::Integer(1)]]);
+    // The module's own writes to them still work, from a fresh schema too, and so does dropping
+    // the table, which drops them.
+    Box::new(db).close()?;
+    let mut db = SqliteDatabase::open(
+        dir.path().join(DATABASE_FILE),
+        OpenMode::Existing,
+        4096,
+        Arc::default(),
+    )?;
+    let message = refusal(exec(&mut db, "DELETE FROM docs_vector_chunks00"))?;
+    assert_eq!(message, Refusal::VectorChunks.to_string());
+    exec(
+        &mut db,
+        "INSERT INTO docs (rowid, embedding, kind) VALUES (5, '[1, 0, 0.1]', 'note')",
+    )?;
+    let nearest = query(&mut db, NEAREST)?;
+    assert_eq!(
+        rowids(&nearest),
+        [Value::Integer(1), Value::Integer(5), Value::Integer(4)]
+    );
+    exec(&mut db, "DROP TABLE docs")?;
+    let left: i64 = db.writer.query_row(
+        "SELECT count(*) FROM main.sqlite_master WHERE name LIKE 'docs%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(left, 0, "dropping the table drops its shadow tables");
+    Ok(())
+}
+
+#[test]
+fn temporary_virtual_tables_are_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    for sql in [
+        "CREATE VIRTUAL TABLE temp.v USING vec0(embedding float[2])",
+        "CREATE VIRTUAL TABLE TEMP.f USING fts5(body)",
+        // No shadow tables, so only the virtual table's own refusal stops it shadowing `t`.
+        "CREATE VIRTUAL TABLE temp.t USING dbstat",
+    ] {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, Refusal::Temporary.to_string(), "`{sql}`");
+    }
+    let temporary: i64 =
+        db.writer
+            .query_row("SELECT count(*) FROM temp.sqlite_master", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(temporary, 0);
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
+    Ok(())
+}
+
+#[test]
+fn vec0_tables_in_the_reserved_namespace_are_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    // The table's own name, and a name whose shadow tables, `_fleetring_chunks` and the rest,
+    // would land in the namespace: vec0 creates them under the confinement.
+    for name in ["_fleetring_v", "_FLEETRING_v", "_fleetring"] {
+        let sql = format!("CREATE VIRTUAL TABLE {name} USING vec0(embedding float[2])");
+        let message = refusal(exec(&mut db, &sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, reserved_refusal(), "`{sql}`");
+    }
+    let left: i64 = db.writer.query_row(
+        "SELECT count(*) FROM main.sqlite_master WHERE name LIKE '\\_fleetring%' ESCAPE '\\'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(left, 0, "no table or shadow table was left behind");
+    // Nor can sqlite-vec be loaded at run time, compiled in or not.
+    let message = refusal(query(&mut db, "SELECT load_extension('vec0')"))?;
+    assert_eq!(message, "statements can't load extensions");
+    Ok(())
+}
+
+#[test]
+fn vec0_writes_record_no_row_changes_and_their_shadow_tables_get_no_triggers() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    db.start_recording(CaptureMode::Full)?;
+    vector_table(&mut db)?;
+    let start = db.position()?;
+    db.execute(
+        &Transaction::new([
+            Statement::new(
+                "INSERT INTO docs (rowid, embedding, kind) VALUES (5, '[1, 1, 1]', 'x')",
+            ),
+            Statement::new("INSERT INTO t VALUES (2)"),
+            Statement::new("DELETE FROM docs WHERE rowid = 2"),
+        ]),
+        &Interrupt::new(),
+    )?;
+    let end = db.position()?.ok_or("a position after a write")?;
+    // A virtual table carries no triggers, and its shadow tables hold the module's storage, not
+    // the user's rows: the ordinary table's row alone is recorded.
+    let changes = db.changes_between(start.as_ref(), &end)?;
+    let tables: Vec<&str> = changes.iter().map(|row| row.table.as_str()).collect();
+    assert_eq!(tables, ["t"], "{changes:?}");
+    let watched: Vec<String> = db
+        .writer
+        .prepare(
+            "SELECT DISTINCT tbl_name FROM temp.sqlite_master WHERE type = 'trigger' \
+             ORDER BY tbl_name",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(watched, ["t"]);
+    // The schema lists the virtual table and hides its shadow tables.
+    let schema = db.schema(&request(100, Internal::Hide), &Interrupt::new())?;
+    assert_eq!(
+        listed(&schema),
+        [(ObjectKind::VirtualTable, "docs"), (ObjectKind::Table, "t")]
+    );
+    Ok(())
+}

@@ -25,9 +25,17 @@
 //! User statements are confined to the database they name. One that attaches or detaches a
 //! database, loads an extension, or runs a pragma other than read-only introspection is refused
 //! as a statement error, so it can't reach another database's files or change how this one is
-//! journaled and checkpointed, nor create a temporary table, index, trigger, or view: temporary
-//! objects live on one connection, which every SQL session and `Execute` share, and outside the
-//! replicated log. The connections also run in SQLite's defensive mode.
+//! journaled and checkpointed, nor create a temporary table, index, trigger, view, or virtual
+//! table: temporary objects live on one connection, which every SQL session and `Execute` share,
+//! and outside the replicated log. The connections also run in SQLite's defensive mode.
+//!
+//! Every connection has sqlite-vec registered, compiled into the binary rather than loaded
+//! (ADR-0049): its `vec0` virtual table is SQLite storage like FTS5's, whose shadow tables are
+//! ordinary pages in the log, so it replicates, archives, and restores with no code of its own
+//! here. Like any virtual table, it records no row changes. User statements can't write its
+//! shadow tables: defensive mode refuses most, and the `vectors` module the vector chunk tables
+//! SQLite doesn't know as shadow tables. A temporary virtual table is refused like any temporary
+//! object.
 //!
 //! A user statement, and a schema read, stop once their call's [`Interrupt`] is raised (FR-078):
 //! while one runs, SQLite's progress handler checks the interrupt every
@@ -51,6 +59,7 @@ mod schema;
 mod session;
 #[cfg(test)]
 mod tests;
+mod vectors;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -287,6 +296,7 @@ impl SqliteDatabase {
         }
         let mut writer = Connection::open_with_flags(&path, flags).map_err(storage)?;
         defend(&writer)?;
+        register_vectors(&writer)?;
         keep_wal_on_close(&writer)?;
         if mode == OpenMode::Create {
             writer
@@ -320,6 +330,7 @@ impl SqliteDatabase {
         )
         .map_err(storage)?;
         defend(&reader)?;
+        register_vectors(&reader)?;
         keep_wal_on_close(&reader)?;
         reader
             .execute_batch("PRAGMA query_only = 1; PRAGMA wal_autocheckpoint = 0;")
@@ -563,7 +574,8 @@ impl Database for SqliteDatabase {
         let classify = |error: rusqlite::Error| {
             interrupted(&error, interrupt).unwrap_or_else(|| self.reading.classify(error))
         };
-        let mut prepared = prepare_user(&self.reader, statement.sql()).map_err(classify)?;
+        let mut prepared =
+            prepare_user(&self.reader, &self.reading, statement.sql()).map_err(classify)?;
         let columns: Vec<String> = prepared.column_names().map(str::to_owned).collect();
         let width = columns.len();
         let mut rows = prepared
@@ -924,6 +936,9 @@ struct Confinement {
     defines_program: AtomicBool,
     /// Why the user statement was refused, kept for its error.
     refused: Mutex<Option<Refusal>>,
+    /// Whether SQLite is preparing the user statement itself, rather than a statement of its own
+    /// or a virtual table's while the user statement steps.
+    preparing: AtomicBool,
     /// What the user statement being prepared does to a transaction, for a SQL session to read
     /// (ADR-0037, point 12). Never refused here: `Execute` refuses transaction control itself.
     control: Mutex<Option<Control>>,
@@ -932,6 +947,13 @@ struct Confinement {
 }
 
 impl Confinement {
+    /// Runs `prepare`, in which SQLite prepares a user statement, marked as such: a virtual
+    /// table's statements are prepared while the user statement steps, never inside `prepare`.
+    fn preparing<R>(&self, prepare: impl FnOnce() -> R) -> R {
+        let _preparing = Preparing::enter(self);
+        prepare()
+    }
+
     /// Records the first reason a user statement is refused.
     fn refuse(&self, refusal: Refusal) {
         self.refused
@@ -967,8 +989,11 @@ enum Refusal {
     Pragma(String),
     /// It asks for an action the adapter doesn't recognize, by SQLite's action code.
     Unrecognized(i32),
-    /// It creates a temporary table, index, trigger, or view.
+    /// It creates a temporary table, index, trigger, view, or virtual table.
     Temporary,
+    /// It creates, writes, alters, drops, indexes, or puts a trigger on a table named like a
+    /// `vec0` table's vector chunk table.
+    VectorChunks,
 }
 
 impl fmt::Display for Refusal {
@@ -990,9 +1015,13 @@ impl fmt::Display for Refusal {
                 write!(f, "statements can't perform SQLite action {code}")
             }
             Self::Temporary => f.write_str(
-                "statements can't create temporary tables, indexes, triggers, or views: they \
-                 would live on a connection the database's every caller shares, and outside its \
-                 replicated log",
+                "statements can't create temporary tables, indexes, triggers, views, or virtual \
+                 tables: they would live on a connection the database's every caller shares, and \
+                 outside its replicated log",
+            ),
+            Self::VectorChunks => f.write_str(
+                "names ending in `_vector_chunks` and two digits belong to vec0's shadow tables, \
+                 which statements can't create, change, or drop: write the vec0 table instead",
             ),
         }
     }
@@ -1051,7 +1080,12 @@ fn confine(conn: &mut Connection) -> Result<Arc<Confinement>, EngineError> {
         ) {
             seen.defines_program.store(true, Ordering::Relaxed);
         }
-        match refusal(&context.action) {
+        let refused = refusal(&context.action, context.database_name).or_else(|| {
+            (seen.preparing.load(Ordering::Relaxed)
+                && vectors::changes_chunk_table(&context.action))
+            .then_some(Refusal::VectorChunks)
+        });
+        match refused {
             Some(refusal) => {
                 seen.refuse(refusal);
                 Authorization::Deny
@@ -1081,8 +1115,9 @@ fn control_of(action: &AuthAction<'_>) -> Option<Control> {
     }
 }
 
-/// Why a user statement may not perform `action`, if it may not.
-fn refusal(action: &AuthAction<'_>) -> Option<Refusal> {
+/// Why a user statement may not perform `action`, in the schema named `database` if the action
+/// has one, if it may not.
+fn refusal(action: &AuthAction<'_>, database: Option<&str>) -> Option<Refusal> {
     match *action {
         // Another database's file, or any file at all, is outside the named database.
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Some(Refusal::OtherDatabase),
@@ -1112,6 +1147,14 @@ fn refusal(action: &AuthAction<'_>) -> Option<Refusal> {
         | AuthAction::CreateTempIndex { .. }
         | AuthAction::CreateTempTrigger { .. }
         | AuthAction::CreateTempView { .. } => Some(Refusal::Temporary),
+        // SQLite has no temporary form of this action: a virtual table in `temp` arrives with the
+        // schema's name. Its shadow tables, if its module has any, would be refused as temporary
+        // tables; one without, such as `dbstat`, would still shadow a main table's name.
+        AuthAction::CreateVtable { .. }
+            if database.is_some_and(|name| name.eq_ignore_ascii_case("temp")) =>
+        {
+            Some(Refusal::Temporary)
+        }
         _ => None,
     }
 }
@@ -1234,6 +1277,22 @@ fn names_reserved(action: &AuthAction<'_>) -> bool {
     }
 }
 
+/// Marks SQLite as preparing the user statement itself while it lives.
+struct Preparing<'c>(&'c Confinement);
+
+impl<'c> Preparing<'c> {
+    fn enter(confinement: &'c Confinement) -> Self {
+        confinement.preparing.store(true, Ordering::Relaxed);
+        Self(confinement)
+    }
+}
+
+impl Drop for Preparing<'_> {
+    fn drop(&mut self) {
+        self.0.preparing.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Marks a connection as preparing or running a user statement while it lives.
 struct UserStatement<'c>(&'c Confinement);
 
@@ -1260,6 +1319,16 @@ fn defend(conn: &Connection) -> Result<(), EngineError> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(storage)?;
     Ok(())
+}
+
+/// Registers sqlite-vec's `vec0` virtual table and its functions on `conn` (ADR-0049). It is
+/// compiled into the binary, so nothing is loaded: extension loading stays off and
+/// `load_extension` stays refused. Called on every connection the adapter opens, before its first
+/// statement, so that SQLite knows a `vec0` table's shadow tables as such when it reads the
+/// schema, and defensive mode keeps user statements from writing them; the `vectors` module
+/// covers the vector chunk tables, which SQLite doesn't know.
+fn register_vectors(conn: &Connection) -> Result<(), EngineError> {
+    fleetring_sqlite_vec::register(conn).map_err(storage)
 }
 
 /// Stops the last connection to close from checkpointing and deleting the WAL.
@@ -1325,7 +1394,7 @@ fn run(
     let classify = |error: rusqlite::Error| {
         interrupted(&error, interrupt).unwrap_or_else(|| confinement.classify(error))
     };
-    let mut prepared = prepare_user(conn, statement.sql()).map_err(classify)?;
+    let mut prepared = prepare_user(conn, confinement, statement.sql()).map_err(classify)?;
     let mut rows = prepared
         .query(rusqlite::params_from_iter(
             statement.params().iter().map(Param),
@@ -1374,13 +1443,16 @@ impl DerefMut for UserPrepared<'_> {
 /// share the cache.
 fn prepare_user<'conn>(
     conn: &'conn Connection,
+    confinement: &Confinement,
     sql: &str,
 ) -> rusqlite::Result<UserPrepared<'conn>> {
-    if mentions_reserved(sql) {
-        conn.prepare(sql).map(UserPrepared::Fresh)
-    } else {
-        conn.prepare_cached(sql).map(UserPrepared::Cached)
-    }
+    confinement.preparing(|| {
+        if mentions_reserved(sql) {
+            conn.prepare(sql).map(UserPrepared::Fresh)
+        } else {
+            conn.prepare_cached(sql).map(UserPrepared::Cached)
+        }
+    })
 }
 
 /// A parameter bound by reference.
