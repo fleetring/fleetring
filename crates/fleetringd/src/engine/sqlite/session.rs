@@ -786,6 +786,8 @@ impl WriterSide<'_> {
                 let sql = statement.map_or("", |statement| statement.sql.as_str());
                 recorder.after_statement(self.conn, sql)?;
             }
+        } else if now_in_transaction && class.control.is_some() {
+            self.after_savepoint_control()?;
         }
         match (in_transaction, now_in_transaction) {
             (false, true) => *self.transaction = Some(OpenTransaction::default()),
@@ -992,9 +994,28 @@ impl WriterSide<'_> {
         Ok(())
     }
 
+    /// After a `SAVEPOINT`, `RELEASE`, or `ROLLBACK TO` inside the transaction: reads the schema
+    /// the transaction now has afresh. A `ROLLBACK TO` takes the schema, and its version, back to
+    /// what it was at the savepoint, which a later statement's schema change can bring back to
+    /// a version already read; the checks after a statement compare with what was read last, and
+    /// skip while the version is the one they read, so they must start again from here.
+    fn after_savepoint_control(&mut self) -> Result<(), EngineError> {
+        self.reserved.forget();
+        self.conn.flush_prepared_statement_cache();
+        let wrote = self
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.wrote);
+        if wrote {
+            self.reserved.remember(self.conn)?;
+        }
+        Ok(())
+    }
+
     /// After the transaction ended without a commit: forgets what it began.
     fn ended(&mut self) {
         self.reserved.forget();
+        self.conn.flush_prepared_statement_cache();
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.rolled_back();
         }

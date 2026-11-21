@@ -286,7 +286,8 @@ struct Tokens<'s>(&'s str);
 impl<'s> Tokens<'s> {
     fn next_token(&mut self) -> Option<Token<'s>> {
         loop {
-            self.0 = self.0.trim_start();
+            // SQLite's whitespace only: other Unicode spaces are identifier characters to it.
+            self.0 = self.0.trim_start_matches([' ', '\t', '\n', '\x0c', '\r']);
             if let Some(after) = self.0.strip_prefix("--") {
                 self.0 = after.find('\n').map_or("", |end| &after[end..]);
             } else if let Some(after) = self.0.strip_prefix("/*") {
@@ -423,6 +424,15 @@ mod tests {
                 None,
             ),
             ("CREATE VIRTUAL TABLE \"unterminated", None),
+            // A no-break space is part of an identifier to SQLite, not a space.
+            (
+                "CREATE VIRTUAL TABLE t\u{a0}using\u{a0}fts5 USING vec0(e)",
+                Some("vec0"),
+            ),
+            (
+                "CREATE VIRTUAL TABLE \u{a0}using fts5 USING vec0(e)",
+                Some("vec0"),
+            ),
             ("", None),
         ];
         for (sql, module) in cases {

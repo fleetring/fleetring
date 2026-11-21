@@ -391,6 +391,7 @@ impl SqliteDatabase {
 
     fn roll_back(&mut self) {
         self.reserved.forget();
+        self.writer.flush_prepared_statement_cache();
         if let Some(recorder) = &mut self.recorder {
             recorder.rolled_back();
         }
