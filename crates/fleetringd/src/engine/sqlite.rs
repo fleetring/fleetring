@@ -33,8 +33,8 @@
 //! (ADR-0049): its `vec0` virtual table is SQLite storage like FTS5's, whose shadow tables are
 //! ordinary pages in the log, so it replicates, archives, and restores with no code of its own
 //! here. Like any virtual table, it records no row changes. User statements can't write its
-//! shadow tables: defensive mode refuses most, and the `vectors` module the vector chunk tables
-//! SQLite doesn't know as shadow tables. A temporary virtual table is refused like any temporary
+//! shadow tables, rename it, or take its shadow tables' names: defensive mode refuses most writes,
+//! and the `vectors` module the rest. A temporary virtual table is refused like any temporary
 //! object.
 //!
 //! A user statement, and a schema read, stop once their call's [`Interrupt`] is raised (FR-078):
@@ -370,10 +370,10 @@ impl SqliteDatabase {
                 run(&self.writer, statement, &self.writing, interrupt)?;
             }
             // The authorizer sees a renamed table's old name only, so a rename into the reserved
-            // namespace shows only in the schema it leaves behind.
-            if self.reserved.changed(&self.writer)? {
+            // namespace, or of a `vec0` table, shows only in the schema it leaves behind.
+            if let Some(refusal) = self.reserved.refusal_after(&self.writer)? {
                 return Err(EngineError::Statement {
-                    message: Refusal::Reserved.to_string(),
+                    message: refusal.to_string(),
                 });
             }
             if self.writing.defines_program.swap(false, Ordering::Relaxed) {
@@ -992,8 +992,12 @@ enum Refusal {
     /// It creates a temporary table, index, trigger, view, or virtual table.
     Temporary,
     /// It creates, writes, alters, drops, indexes, or puts a trigger on a table named like a
-    /// `vec0` table's vector chunk table.
+    /// `vec0` table's vector chunk table, or names a view or virtual table so.
     VectorChunks,
+    /// It renamed the `vec0` table so named.
+    RenamedVectorTable(String),
+    /// It gave the object so named a name that belongs to a `vec0` table's shadow tables.
+    VectorShadowName(String),
 }
 
 impl fmt::Display for Refusal {
@@ -1022,6 +1026,15 @@ impl fmt::Display for Refusal {
             Self::VectorChunks => f.write_str(
                 "names ending in `_vector_chunks` and two digits belong to vec0's shadow tables, \
                  which statements can't create, change, or drop: write the vec0 table instead",
+            ),
+            Self::RenamedVectorTable(table) => write!(
+                f,
+                "vec0 table `{table}` can't be renamed: sqlite-vec 0.1.9 would leave its shadow \
+                 tables behind under the old name; create a new table and copy the rows instead"
+            ),
+            Self::VectorShadowName(name) => write!(
+                f,
+                "`{name}` is named like a vec0 table's shadow table, and only vec0 creates those"
             ),
         }
     }
@@ -1080,10 +1093,12 @@ fn confine(conn: &mut Connection) -> Result<Arc<Confinement>, EngineError> {
         ) {
             seen.defines_program.store(true, Ordering::Relaxed);
         }
+        // vec0's own statements on its vector chunk tables are prepared at the top level while
+        // the user statement steps: never while it is prepared, and never inside a trigger.
+        let users_own = seen.preparing.load(Ordering::Relaxed) || context.accessor.is_some();
         let refused = refusal(&context.action, context.database_name).or_else(|| {
-            (seen.preparing.load(Ordering::Relaxed)
-                && vectors::changes_chunk_table(&context.action))
-            .then_some(Refusal::VectorChunks)
+            (users_own && vectors::changes_chunk_table(&context.action))
+                .then_some(Refusal::VectorChunks)
         });
         match refused {
             Some(refusal) => {

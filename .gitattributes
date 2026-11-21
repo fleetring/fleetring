@@ -6,3 +6,5 @@
 crates/fleetringd/tests/fixtures/** text eol=lf
 # The man pages are compared byte for byte with what the command tree renders.
 crates/fleetringd/man/** text eol=lf
+# A database file, compared by what SQLite reads from it.
+crates/fleetring-sqlite-vec/tests/fixtures/*.db binary

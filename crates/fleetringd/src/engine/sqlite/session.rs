@@ -32,8 +32,8 @@ use super::changes::Recorder;
 use super::marks::Marks;
 use super::reserved::Reserved;
 use super::{
-    Confinement, Interruptible, Param, Refusal, SqliteDatabase, UserStatement, classify,
-    encode_position, interrupted, read_wal_file, refuse_programs_on_reserved_names, value_from_sql,
+    Confinement, Interruptible, Param, SqliteDatabase, UserStatement, classify, encode_position,
+    interrupted, read_wal_file, refuse_programs_on_reserved_names, value_from_sql,
 };
 use crate::engine::{
     Autocommit, BatchStep, CANCELLED, CallOutcome, CallResult, DEADLINE_EXCEEDED, Description,
@@ -938,12 +938,13 @@ impl WriterSide<'_> {
     }
 
     /// Why a statement that wrote must be undone, if it must: it changed the reserved
-    /// namespace, or defined a trigger or view that names it.
+    /// namespace, renamed a `vec0` table or took a name its shadow tables own, or defined a
+    /// trigger or view that names the reserved namespace.
     fn refusal_after(&mut self, class: Class) -> Result<Option<StatementError>, EngineError> {
-        if self.reserved.changed(self.conn)? {
+        if let Some(refusal) = self.reserved.refusal_after(self.conn)? {
             return Ok(Some(StatementError::new(
                 "SQLITE_AUTH",
-                Refusal::Reserved.to_string(),
+                refusal.to_string(),
             )));
         }
         if class.defines_program {

@@ -2002,3 +2002,159 @@ fn vec0_writes_record_no_row_changes_and_their_shadow_tables_get_no_triggers() -
     );
     Ok(())
 }
+
+/// The refusal of a statement that renamed `vec0` table `table`.
+fn renamed_refusal(table: &str) -> String {
+    Refusal::RenamedVectorTable(table.to_owned()).to_string()
+}
+
+#[test]
+fn renaming_a_vec0_table_is_refused_and_keeps_its_shadow_tables_protected() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    vector_table(&mut db)?;
+    // 0.1.9 has no `xRename`: the rename would leave `docs_*` behind as ordinary tables.
+    for sql in [
+        "ALTER TABLE docs RENAME TO moved",
+        "ALTER TABLE main.DOCS RENAME TO \"Moved Too\"",
+    ] {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, renamed_refusal("docs"), "`{sql}`");
+    }
+    // Onto a name whose shadow tables were made ready beforehand, too.
+    db.execute(
+        &Transaction::new([
+            Statement::new("CREATE TABLE w_info (key TEXT PRIMARY KEY, value ANY)"),
+            Statement::new("CREATE TABLE w_chunks (chunk_id INTEGER PRIMARY KEY, size INTEGER)"),
+            Statement::new("CREATE TABLE w_rowids (rowid INTEGER PRIMARY KEY, id, chunk_id)"),
+        ]),
+        &Interrupt::new(),
+    )?;
+    let message = refusal(exec(&mut db, "ALTER TABLE docs RENAME TO w"))?;
+    assert_eq!(message, renamed_refusal("docs"));
+    // The refusal rolled the rename back: the table answers, and its shadow tables are still
+    // shadow tables, which no statement may change.
+    let nearest = query(&mut db, NEAREST)?;
+    assert_eq!(
+        rowids(&nearest),
+        [Value::Integer(1), Value::Integer(4), Value::Integer(2)]
+    );
+    for sql in [
+        "UPDATE docs_metadatachunks00 SET data = x'00'",
+        "DELETE FROM docs_rowids",
+        "UPDATE docs_chunks SET validity = x'00'",
+    ] {
+        refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+    }
+    let kind = query(&mut db, "SELECT kind FROM docs WHERE rowid = 3")?;
+    assert_eq!(kind.rows, [[Value::from("fact")]]);
+    // An ordinary table still renames.
+    exec(&mut db, "ALTER TABLE t RENAME TO t2")?;
+    Ok(())
+}
+
+#[test]
+fn names_that_belong_to_vec0_shadow_tables_are_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    vector_table(&mut db)?;
+    exec(&mut db, "CREATE VIRTUAL TABLE f USING fts5(a)")?;
+    // Defined with such a name: refused as SQLite prepares the statement.
+    for sql in [
+        "CREATE VIEW q_vector_chunks00 AS SELECT 1",
+        "CREATE VIRTUAL TABLE q2_vector_chunks00 USING fts5(a)",
+        "CREATE VIRTUAL TABLE q3_vector_chunks00 USING vec0(e float[2])",
+    ] {
+        let message = refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(message, Refusal::VectorChunks.to_string(), "`{sql}`");
+    }
+    // Renamed into one: refused once the schema shows it. The authorizer sees the old name only.
+    for (sql, name) in [
+        (
+            "ALTER TABLE t RENAME TO w_vector_chunks00",
+            "w_vector_chunks00",
+        ),
+        (
+            "ALTER TABLE t RENAME TO f_vector_chunks00",
+            "f_vector_chunks00",
+        ),
+        ("ALTER TABLE t RENAME TO DOCS_AUXILIARY2", ""),
+    ] {
+        let outcome = exec(&mut db, sql);
+        if name.is_empty() {
+            // Not a shadow table's name: `_auxiliary` has no number.
+            outcome.map_err(|error| format!("`{sql}`: {error}"))?;
+            exec(&mut db, "ALTER TABLE DOCS_AUXILIARY2 RENAME TO t")?;
+            continue;
+        }
+        let message = refusal(outcome).map_err(|error| format!("`{sql}`: {error}"))?;
+        assert_eq!(
+            message,
+            Refusal::VectorShadowName(name.to_owned()).to_string(),
+            "`{sql}`"
+        );
+    }
+    // Names in vec0's own list of shadow names SQLite refuses itself, in defensive mode.
+    for sql in [
+        "ALTER TABLE t RENAME TO docs_metadatachunks07",
+        "CREATE TABLE docs_metadatatext09 (data TEXT)",
+    ] {
+        refusal(exec(&mut db, sql)).map_err(|error| format!("`{sql}`: {error}"))?;
+    }
+    assert_eq!(values(&mut db)?, [[Value::Integer(1)]]);
+    // A new vec0 table's own shadow tables are vec0's to create.
+    exec(
+        &mut db,
+        "CREATE VIRTUAL TABLE more USING vec0(e float[2], m TEXT)",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn a_cached_statement_prepared_again_can_not_reach_vector_chunks_through_a_trigger() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut db = database(dir.path())?;
+    vector_table(&mut db)?;
+    let chunk_size = |db: &mut SqliteDatabase| -> Result<Vec<Vec<Value>>, Box<dyn Error>> {
+        Ok(query(db, "SELECT length(vectors) FROM docs_vector_chunks00")?.rows)
+    };
+    let before = chunk_size(&mut db)?;
+    // Cached on its first run.
+    exec(&mut db, "INSERT INTO t VALUES (7)")?;
+    exec(
+        &mut db,
+        "CREATE TRIGGER wipe AFTER INSERT ON t BEGIN \
+         UPDATE docs_vector_chunks00 SET vectors = x'00'; END",
+    )?;
+    // The same text again: whether SQLite prepares it afresh or again inside its step, the
+    // trigger's body is the user's.
+    let message = refusal(exec(&mut db, "INSERT INTO t VALUES (7)"))?;
+    assert_eq!(message, Refusal::VectorChunks.to_string());
+    assert_eq!(chunk_size(&mut db)?, before);
+
+    // The trigger rule alone, without the cache's flush: a statement prepared before the trigger
+    // existed is prepared again inside its step, outside `preparing`, and still refused.
+    exec(&mut db, "DROP TRIGGER wipe")?;
+    let mut stale = {
+        let _user = UserStatement::enter(&db.writing);
+        db.writer.prepare("INSERT INTO t VALUES (8)")?
+    };
+    // Created with the confinement clear, which only the borrow here asks for: a trigger's body
+    // is authorized when a statement that fires it is prepared, not when it is defined.
+    db.writer.execute_batch(
+        "CREATE TRIGGER wipe AFTER INSERT ON t BEGIN \
+         UPDATE docs_vector_chunks00 SET vectors = x'00'; END",
+    )?;
+    let stepped = {
+        let _user = UserStatement::enter(&db.writing);
+        stale.execute([])
+    };
+    stepped.expect_err("the trigger's write to a vector chunk table is refused");
+    drop(stale);
+    let refused = db.writing.refused.lock().expect("refusal lock").take();
+    assert_eq!(refused, Some(Refusal::VectorChunks));
+    assert_eq!(chunk_size(&mut db)?, before);
+    let nearest = query(&mut db, NEAREST)?;
+    assert_eq!(nearest.rows.len(), 3);
+    Ok(())
+}

@@ -7,10 +7,13 @@
 //!
 //! - **No user statement changes the namespace.** Before a write transaction's statements run,
 //!   [`Reserved::remember`] reads every schema object in `main` and `temp` whose name or table
-//!   is reserved; after each user statement, [`Reserved::changed`] reads them again, and any
-//!   difference refuses the statement and rolls its transaction back. The read is skipped while
-//!   neither schema's version has moved, so a statement that changes no schema costs two cookie
-//!   reads. The recorder's temporary triggers, which sit on user tables and are rebuilt whenever
+//!   is reserved; after each user statement, [`Reserved::refusal_after`] reads them again, and
+//!   any difference refuses the statement and rolls its transaction back. The read is skipped
+//!   while neither schema's version has moved, so a statement that changes no schema costs two
+//!   cookie reads. The same check refuses a statement that renamed a `vec0` table or took a name
+//!   that belongs to one's shadow tables (the `vectors` module), and a schema change also empties
+//!   the connection's statement cache, so that no cached statement is prepared again inside
+//!   SQLite's step against the new schema. The recorder's temporary triggers, which sit on user tables and are rebuilt whenever
 //!   the schema changes, are left out of the comparison; a user statement can't create one.
 //! - **The adapter adopts no foreign object.** Before it records changes, reads or writes sink
 //!   marks, or reads or writes a fork's marker, the adapter calls [`Reserved::foreign`], which
@@ -26,7 +29,8 @@ use std::fmt;
 use rusqlite::{Connection, params};
 
 use super::changes::{CHANGES_TABLE, RESERVED_PREFIX, TRIGGER_PREFIX};
-use super::{fork, marks, storage};
+use super::vectors::{self, Violation};
+use super::{Refusal, fork, marks, storage};
 use crate::engine::EngineError;
 
 /// Whether `name` is reserved for the adapter: whether it begins with [`RESERVED_PREFIX`],
@@ -155,9 +159,9 @@ impl fmt::Display for Foreign {
 /// The reserved part of one write connection's schema, as last read.
 #[derive(Debug, Default)]
 pub(super) struct Reserved {
-    /// The objects whose name or table is reserved, but the recorder's triggers, at the
-    /// versions they were read at.
-    remembered: Option<(Versions, Vec<Entry>)>,
+    /// The objects whose name or table is reserved, but the recorder's triggers, and what the
+    /// `vectors` module checks, at the versions they were read at.
+    remembered: Option<(Versions, Vec<Entry>, vectors::Snapshot)>,
     /// The versions at which [`foreign`](Self::foreign) last found nothing.
     clean_at: Option<Versions>,
 }
@@ -167,28 +171,41 @@ impl Reserved {
     /// the schema, unless it is already remembered at the current versions.
     pub(super) fn remember(&mut self, conn: &Connection) -> Result<(), EngineError> {
         let now = versions(conn)?;
-        if self.remembered.as_ref().is_some_and(|(at, _)| *at == now) {
+        if self.remembered.as_ref().is_some_and(|(at, ..)| *at == now) {
             return Ok(());
         }
-        self.remembered = Some((now, comparable(conn)?));
+        self.remembered = Some((now, comparable(conn)?, vectors::Snapshot::read(conn)?));
         Ok(())
     }
 
-    /// After a user statement: whether it changed the reserved part of the schema since
-    /// [`remember`](Self::remember). Nothing remembered counts as a change.
-    pub(super) fn changed(&mut self, conn: &Connection) -> Result<bool, EngineError> {
+    /// After a user statement: why it must be undone, if it must, because of what it did to the
+    /// schema since [`remember`](Self::remember): it changed the reserved part, renamed a `vec0`
+    /// table, or took a name that belongs to one's shadow tables. Nothing remembered counts as a
+    /// change to the reserved part.
+    pub(super) fn refusal_after(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<Option<Refusal>, EngineError> {
         let now = versions(conn)?;
-        let Some((at, entries)) = &mut self.remembered else {
-            return Ok(true);
+        let Some((at, entries, snapshot)) = &mut self.remembered else {
+            return Ok(Some(Refusal::Reserved));
         };
         if *at == now {
-            return Ok(false);
+            return Ok(None);
         }
+        conn.flush_prepared_statement_cache();
         if comparable(conn)? != *entries {
-            return Ok(true);
+            return Ok(Some(Refusal::Reserved));
+        }
+        let (after, violation) = snapshot.violation(conn)?;
+        match violation {
+            Some(Violation::Renamed(table)) => return Ok(Some(Refusal::RenamedVectorTable(table))),
+            Some(Violation::ShadowName(name)) => return Ok(Some(Refusal::VectorShadowName(name))),
+            None => {}
         }
         *at = now;
-        Ok(false)
+        *snapshot = after;
+        Ok(None)
     }
 
     /// Forgets what was read, after a transaction rolled back and took its schema changes with

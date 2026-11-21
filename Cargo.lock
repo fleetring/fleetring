@@ -774,6 +774,7 @@ dependencies = [
  "rusqlite",
  "sqlite-vec",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

@@ -118,7 +118,7 @@ fleetring db list --context home       # one command against another context
 
 **Statements.** `db exec` and `db query` run SQL against the one database they name, and statements are confined to it: a statement that attaches or detaches a database, loads an extension, or runs a pragma other than read-only introspection (`table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `integrity_check`, `quick_check`, `compile_options`, and the read forms of `user_version`, `application_id`, `schema_version`, `page_size`, `page_count`, `freelist_count`, and `data_version`, which FTS5 runs to search and update a full-text table) is refused with `INVALID_ARGUMENT`. `foreign_key_check` is refused too, because it would report which rows of a reserved table exist. Each call runs one statement: SQL with a second statement after the first is refused (`a call runs one statement; send each in a call of its own`), and nothing runs. The daemon owns journaling, syncing, and checkpoints.
 
-**Full-text and vector search.** Every database has SQLite's FTS5 and, compiled in, sqlite-vec 0.1.9 (ADR-0049): `SELECT vec_version()` returns `v0.1.9`, and nothing is loaded at run time, so `load_extension` stays refused. A `vec0` virtual table holds float32, int8, or bit vectors and answers exact k-nearest-neighbour queries: `MATCH` a query vector, as JSON text or a `vec_f32()` blob, bound the answer with `k = <n>`, and order by `distance` (L2, or cosine with `distance_metric=cosine` on the column). Both kinds of index replicate, archive, restore, and fail over like any table, but a change stream records neither: keep the source rows, embeddings included, in an ordinary table, and keep the indexes in step with triggers, as below, so a stream carries each embedding. Statements may read an index's shadow tables but never change them; for vec0 that covers its `<table>_vector_chunksNN` tables, and no other table may take such a name. A virtual table can't be temporary. `rows_affected` also counts the rows a vec0 write puts in its shadow tables, and vec0 0.1.9 can't rename a table. Each statement below is its own `db exec` or `db query`; the README's tests run them in order.
+**Full-text and vector search.** Every database has SQLite's FTS5 and, compiled in, sqlite-vec 0.1.9 (ADR-0049): `SELECT vec_version()` returns `v0.1.9`, and nothing is loaded at run time, so `load_extension` stays refused. A `vec0` virtual table holds float32, int8, or bit vectors and answers exact k-nearest-neighbour queries: `MATCH` a query vector, as JSON text or a `vec_f32()` blob, bound the answer with `k = <n>`, and order by `distance` (L2, or cosine with `distance_metric=cosine` on the column). Both kinds of index replicate, archive, restore, and fail over like any table, but a change stream records neither: keep the source rows, embeddings included, in an ordinary table, and keep the indexes in step with triggers, as below, so a stream carries each embedding. Statements may read an index's shadow tables but never change them, and only vec0 itself may give a table, view, or virtual table a name that belongs to a vec0 table's shadow tables (`<table>_info`, `_chunks`, `_rowids`, `_auxiliary`, `_metadatachunksNN`, `_metadatatextNN`, or `_vector_chunksNN`, the last for any table name). A vec0 table can't be renamed, because sqlite-vec 0.1.9 would leave its shadow tables behind: create a new one and copy the rows. A virtual table can't be temporary. `rows_affected` also counts the rows a vec0 write puts in its shadow tables. Each statement below is its own `db exec` or `db query`; the README's tests run them in order.
 
 ```sql
 CREATE TABLE docs (
@@ -139,6 +139,13 @@ END;
 CREATE TRIGGER docs_ad AFTER DELETE ON docs BEGIN
   INSERT INTO docs_fts (docs_fts, rowid, body) VALUES ('delete', old.id, old.body);
   DELETE FROM docs_vec WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER docs_au AFTER UPDATE ON docs BEGIN
+  INSERT INTO docs_fts (docs_fts, rowid, body) VALUES ('delete', old.id, old.body);
+  INSERT INTO docs_fts (rowid, body) VALUES (new.id, new.body);
+  DELETE FROM docs_vec WHERE rowid = old.id;
+  INSERT INTO docs_vec (rowid, embedding) VALUES (new.id, new.embedding);
 END;
 ```
 

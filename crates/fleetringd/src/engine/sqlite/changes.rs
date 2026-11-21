@@ -470,27 +470,20 @@ fn start_bytes(start: Option<fleetring_wal::Position>) -> Vec<u8> {
 fn user_tables(conn: &Connection) -> Result<Vec<String>, EngineError> {
     let mut statement = conn
         .prepare(
-            "SELECT name, type FROM pragma_table_list WHERE schema = 'main'
-             AND type IN ('table', 'virtual')
+            "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'
              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE ?1 ESCAPE '\\'
              ORDER BY name",
         )
         .map_err(storage)?;
-    let listed = statement
-        .query_map(params![reserved_pattern()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+    let names = statement
+        .query_map(params![reserved_pattern()], |row| row.get::<_, String>(0))
         .map_err(storage)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(storage)?;
-    let (virtual_tables, tables): (Vec<_>, Vec<_>) =
-        listed.into_iter().partition(|(_, kind)| kind == "virtual");
-    let virtual_tables: BTreeSet<String> =
-        virtual_tables.into_iter().map(|(name, _)| name).collect();
-    Ok(tables
+    let vec0_tables = vectors::vec0_tables(conn)?;
+    Ok(names
         .into_iter()
-        .map(|(name, _)| name)
-        .filter(|name| !vectors::is_chunk_table(name, &virtual_tables))
+        .filter(|name| !vectors::is_chunk_table(name, &vec0_tables))
         .collect())
 }
 
