@@ -2,10 +2,12 @@
 //! (ADR-0046, `docs/cli.md` section 15).
 //!
 //! The command makes the operation ID and prints it before it calls the control plane, so a lost
-//! reply never leaves the caller without it. The call is sent again under the same ID when its
+//! reply or a crash never leaves the caller without it, and says so if the control plane then
+//! refuses the request and nothing started. The call is sent again under the same ID when its
 //! reply is lost ([`fork_flow::submit`]), and the command then follows the operation to `ready`:
 //! a seeded fork isn't usable until its fork-reset write commits.
 
+use std::cell::Cell;
 use std::error::Error;
 use std::time::Duration;
 
@@ -16,7 +18,8 @@ use fleetring_control::{Acks, DatabaseName};
 use fleetring_proto::v1 as proto;
 use fleetringd::data::{Client, ForkSpec};
 use fleetringd::fork_flow::{
-    self, Followed, POLL_INTERVAL, ResendPolicy, SubmitError, difference, refusal_hint, resume_hint,
+    self, Followed, POLL_INTERVAL, ResendPolicy, SubmitError, difference, is_refusal,
+    name_is_taken, own_fork_hint, refusal_hint, resume_hint,
 };
 use fleetringd::fork_report::{fork_report, is_final, progress_line, ready_line, result_text};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -179,7 +182,7 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
     // The ID comes before the first call, so that nothing loses it (docs/cli.md, section 15).
     if operation_id.is_none() {
         note(format_args!(
-            "operation {id}: wait for it again with --operation-id {id}"
+            "operation {id}: if this command stops, run it again with --operation-id {id}"
         ));
     }
 
@@ -197,6 +200,7 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
                     return Err(Failed::new(&Status::already_exists(format!(
                         "operation {id} was requested with {found}"
                     )))
+                    .without_kind()
                     .with_hint(
                         "give the original arguments to resume it, or leave --operation-id out \
                          for a new fork",
@@ -215,23 +219,21 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
     let first = match known {
         Some(status) => status,
         None => {
+            let sends = Cell::new(0_u32);
             let sent = fork_flow::submit(ResendPolicy::default(), || {
+                sends.set(sends.get() + 1);
                 client.fork_database(&source, &target_name, &spec)
             })
             .await;
             match sent {
                 Ok(status) => status,
                 Err(SubmitError::Refused(status)) => {
-                    let mut failure = Failed::new(&status);
-                    // An agent's refusal keeps the hint that says to ask its parent.
-                    let agent_scope =
-                        exit::agent().is_some() && status.code() == Code::PermissionDenied;
-                    if !agent_scope
-                        && let Some(hint) =
-                            refusal_hint(&status, &shown(&source), &shown(&target_name), &id)
-                    {
-                        failure = failure.with_hint(hint);
-                    }
+                    // An ID made here, refused on its only send, can't name anything that
+                    // started. After a resend, an earlier send may have.
+                    let unstarted = operation_id.is_none() && sends.get() == 1;
+                    let unstarted = (unstarted && is_refusal(&status)).then_some(id.as_str());
+                    let failure =
+                        refusal(&client, &status, &source, &target_name, &id, unstarted).await;
                     return Err(failure.into());
                 }
                 Err(SubmitError::Unavailable { last, .. }) => {
@@ -277,6 +279,48 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
             Err(exit::Silent(exit::FAILURE).into())
         }
         _ => Ok(rendered),
+    }
+}
+
+/// The failure for a fork request the control plane refused with `status`. `unstarted` is the
+/// operation, when the refusal shows that it never started.
+async fn refusal(
+    client: &Client,
+    status: &Status,
+    source: &DatabaseName,
+    target: &DatabaseName,
+    id: &str,
+    unstarted: Option<&str>,
+) -> Failed {
+    let mut failure = Failed::new(status);
+    if is_refusal(status) {
+        failure = failure.without_kind();
+    }
+    if let Some(operation) = unstarted {
+        failure = failure.with_note(format!("operation {operation} was not started"));
+    }
+    // An agent's refusal keeps the hint that says to ask its parent.
+    if exit::agent().is_some() && status.code() == Code::PermissionDenied {
+        return failure;
+    }
+    let (source_text, target_text) = (shown(source), shown(target));
+    if name_is_taken(status) {
+        // Only what the caller may read: a failed lookup leaves the general hint.
+        let source_name = source.to_string();
+        let own = client
+            .locate(target)
+            .await
+            .ok()
+            .and_then(|location| location.fork)
+            .filter(|fork| fork.source == source_name)
+            .and_then(|fork| own_fork_hint(&fork, &source_text, &target_text));
+        if let Some(hint) = own {
+            return failure.with_hint(hint);
+        }
+    }
+    match refusal_hint(status, &source_text, &target_text, id) {
+        Some(hint) => failure.with_hint(hint),
+        None => failure,
     }
 }
 

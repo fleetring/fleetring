@@ -76,7 +76,11 @@ pub(crate) fn code_of(error: &(dyn Error + 'static)) -> u8 {
 #[derive(Debug)]
 pub(crate) struct Failed {
     code: Code,
+    /// gRPC's words for the kind of failure, unless the message says enough by itself.
+    kind: Option<&'static str>,
     message: String,
+    /// A line about what the failure means for the command, between the message and the hint.
+    note: Option<String>,
     hint: Option<String>,
 }
 
@@ -85,10 +89,24 @@ impl Failed {
     pub(crate) fn new(status: &Status) -> Self {
         Self {
             code: status.code(),
+            kind: Some(status.code().description()),
             // The message may name a database, whose name a principal chose.
             message: printable(status.message()),
+            note: None,
             hint: hint(status),
         }
+    }
+
+    /// This failure without gRPC's words for its kind, for a message that names the problem.
+    pub(crate) fn without_kind(mut self) -> Self {
+        self.kind = None;
+        self
+    }
+
+    /// This failure with `note` on a line of its own, after the message.
+    pub(crate) fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     /// This failure with `hint` in place of the usual one.
@@ -110,7 +128,13 @@ pub(crate) fn describe(status: &Status) -> String {
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code.description(), self.message)?;
+        if let Some(kind) = self.kind {
+            write!(f, "{kind}: ")?;
+        }
+        f.write_str(&self.message)?;
+        if let Some(note) = &self.note {
+            write!(f, "\n  {note}")?;
+        }
         match &self.hint {
             Some(hint) => write!(f, "\n  hint: {hint}"),
             None => Ok(()),
@@ -350,6 +374,22 @@ mod tests {
                 .to_string()
                 .ends_with("\n  hint: do this")
         );
+    }
+
+    #[test]
+    fn a_failure_that_names_its_problem_drops_the_kind_and_keeps_its_exit_code() {
+        let failed = Failed::new(&Status::already_exists("database 'bar' already exists"))
+            .without_kind()
+            .with_note("operation x was not started")
+            .with_hint("pick another name");
+        assert_eq!(
+            failed.to_string(),
+            "database 'bar' already exists\n  operation x was not started\n  hint: pick \
+             another name"
+        );
+        assert_eq!(code_of(&failed), FAILURE);
+        let refused = Failed::new(&Status::permission_denied("no")).without_kind();
+        assert_eq!(code_of(&refused), REFUSED);
     }
 
     #[test]

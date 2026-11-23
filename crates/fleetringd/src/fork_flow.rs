@@ -10,6 +10,7 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+use fleetring_client::output::ForkStatusReport;
 use fleetring_control::Acks;
 use fleetring_proto::v1 as proto;
 use tokio::time::{Instant, sleep};
@@ -342,7 +343,7 @@ pub fn refusal_hint(
              that has both (`--as`, `--token-file`, `--context`)"
                 .to_owned(),
         ),
-        Code::AlreadyExists if message.contains("operation") => Some(format!(
+        Code::AlreadyExists if !name_is_taken(status) => Some(format!(
             "operation {operation} was requested with other arguments; resume it with its \
              original arguments, or run the command again for a new fork"
         )),
@@ -363,6 +364,54 @@ pub fn refusal_hint(
         Code::Unimplemented => {
             Some("the control plane runs a release without forks; upgrade it first".to_owned())
         }
+        _ => None,
+    }
+}
+
+/// Whether `status` is the control plane's answer that it won't do what was asked, with a message
+/// that names why, rather than a failure whose outcome is unknown.
+#[must_use]
+pub fn is_refusal(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::InvalidArgument
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::PermissionDenied
+            | Code::Unauthenticated
+            | Code::FailedPrecondition
+            | Code::ResourceExhausted
+            | Code::OutOfRange
+            | Code::Unimplemented
+    )
+}
+
+/// Whether `status` refuses the request because a database holds the target's name, rather than
+/// because its operation ID was used for another request. That refusal always opens with the
+/// word `operation`, and a database's name, which this one quotes, may hold the word too.
+#[must_use]
+pub fn name_is_taken(status: &Status) -> bool {
+    status.code() == Code::AlreadyExists && !status.message().starts_with("operation ")
+}
+
+/// The next step when the target's name is held by `fork`, a fork of the same source, or `None`
+/// for a state that has none. `source` and `target` are the names as the command prints them.
+#[must_use]
+pub fn own_fork_hint(fork: &ForkStatusReport, source: &str, target: &str) -> Option<String> {
+    let operation = &fork.operation_id;
+    match fork.state {
+        "ready" => Some(format!(
+            "{target} is already a fork of {source}, and it is ready (operation {operation}); \
+             use it, or pick another name"
+        )),
+        state @ ("seeding" | "seeded") => Some(format!(
+            "{target} is already a fork of {source}, still {state} (operation {operation}); \
+             wait for it with `fleetring db fork {source} {target} --operation-id {operation}`"
+        )),
+        "failed" => Some(format!(
+            "{target} is a fork of {source} that failed (operation {operation}); `fleetring db \
+             drop {target}` removes it, then run this command again"
+        )),
         _ => None,
     }
 }
@@ -602,5 +651,87 @@ mod tests {
         );
         assert!(hint(Status::unimplemented("x")).is_some_and(|h| h.contains("upgrade it first")));
         assert!(hint(Status::internal("x")).is_none());
+    }
+
+    #[test]
+    fn a_database_named_like_an_operation_is_still_a_taken_name() {
+        let taken = Status::already_exists("database 'operation-log' already exists");
+        assert!(name_is_taken(&taken));
+        assert!(
+            refusal_hint(&taken, "notes", "operation-log", "abc")
+                .is_some_and(|hint| hint.contains("db show operation-log"))
+        );
+        let conflict = Status::already_exists("operation abc was requested with a different acks");
+        assert!(!name_is_taken(&conflict));
+    }
+
+    #[test]
+    fn only_a_definite_answer_is_a_refusal() {
+        for status in [
+            Status::invalid_argument("x"),
+            Status::already_exists("x"),
+            Status::permission_denied("x"),
+            Status::failed_precondition("x"),
+        ] {
+            assert!(is_refusal(&status), "{status:?}");
+        }
+        for status in [
+            Status::internal("x"),
+            Status::unknown("x"),
+            Status::aborted("x"),
+            Status::unavailable("x"),
+            Status::deadline_exceeded("x"),
+        ] {
+            assert!(!is_refusal(&status), "{status:?}");
+        }
+    }
+
+    fn fork_in(state: &'static str) -> ForkStatusReport {
+        ForkStatusReport {
+            state,
+            operation_id: "abc".to_owned(),
+            source: "foo".to_owned(),
+            source_incarnation: "0".repeat(16),
+            attempt: 1,
+            max_attempts: 5,
+            seeder: None,
+            seeder_excluded: Vec::new(),
+            disk_refused: Vec::new(),
+            holders: Vec::new(),
+            holders_needed: 1,
+            kept_holders: Vec::new(),
+            bytes: None,
+            total_bytes: None,
+            position: None,
+            chain_hash: None,
+            failure: None,
+            requested_by: None,
+            requested_at: String::new(),
+            deadline_at: None,
+            completed_at: None,
+            ready_at: None,
+            failed_at: None,
+        }
+    }
+
+    #[test]
+    fn a_name_held_by_the_same_sources_fork_says_what_to_do() {
+        let hint = |state| own_fork_hint(&fork_in(state), "foo", "bar");
+        assert_eq!(
+            hint("ready").as_deref(),
+            Some(
+                "bar is already a fork of foo, and it is ready (operation abc); use it, or pick another name"
+            )
+        );
+        assert_eq!(
+            hint("seeding").as_deref(),
+            Some(
+                "bar is already a fork of foo, still seeding (operation abc); wait for it with \
+                 `fleetring db fork foo bar --operation-id abc`"
+            )
+        );
+        assert!(hint("seeded").is_some_and(|text| text.contains("still seeded")));
+        assert!(hint("failed").is_some_and(|text| text.contains("`fleetring db drop bar`")));
+        assert_eq!(hint("cancelled"), None);
     }
 }
