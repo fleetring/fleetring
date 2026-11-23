@@ -836,6 +836,29 @@ fn renaming_and_altering_ordinary_tables_still_works() -> TestResult {
 }
 
 #[test]
+fn an_alter_table_is_never_taken_from_the_statement_cache() -> TestResult {
+    let mut conn = Connection::open_in_memory()?;
+    conn.execute_batch("CREATE TABLE t (a, b)")?;
+    let confinement = confine(&mut conn)?;
+    let sql = "ALTER TABLE t DROP COLUMN b";
+    for attempt in 0..2 {
+        let _user = UserStatement::enter(&confinement);
+        let prepared = prepare_user(&conn, &confinement, sql)?;
+        assert!(
+            matches!(prepared, UserPrepared::Fresh(_)),
+            "attempt {attempt}"
+        );
+        assert!(confinement.take_alters(&prepared), "attempt {attempt}");
+    }
+    // Any other statement still shares the cache.
+    let _user = UserStatement::enter(&confinement);
+    let prepared = prepare_user(&conn, &confinement, "SELECT a FROM t")?;
+    assert!(matches!(prepared, UserPrepared::Cached(_)));
+    assert!(!confinement.take_alters(&prepared));
+    Ok(())
+}
+
+#[test]
 fn a_table_with_triggers_has_no_route_into_the_reserved_namespace() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut db = database(dir.path())?;

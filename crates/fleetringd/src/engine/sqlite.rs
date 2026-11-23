@@ -364,11 +364,13 @@ impl SqliteDatabase {
     ) -> Result<(), EngineError> {
         self.reserved.remember(&self.writer)?;
         for statement in transaction.statements() {
-            {
-                let _user = UserStatement::enter(&self.writing);
-                let _interruptible = Interruptible::watch(&self.writing, interrupt);
-                run(&self.writer, statement, &self.writing, interrupt)?;
-            }
+            run(
+                &self.writer,
+                statement,
+                &self.writing,
+                interrupt,
+                self.recorder.as_mut(),
+            )?;
             // The authorizer sees a renamed table's old name only, so a rename into the reserved
             // namespace, or of a `vec0` table, shows only in the schema it leaves behind.
             if let Some(refusal) = self.reserved.refusal_after(&self.writer)? {
@@ -943,6 +945,9 @@ struct Confinement {
     /// What the user statement being prepared does to a transaction, for a SQL session to read
     /// (ADR-0037, point 12). Never refused here: `Execute` refuses transaction control itself.
     control: Mutex<Option<Control>>,
+    /// Whether the user statement being prepared is an `ALTER TABLE`, of any form, as the
+    /// authorizer reports it.
+    alters: AtomicBool,
     /// The interrupt the connection's statements stop on, while an [`Interruptible`] watches it.
     interrupt: Mutex<Option<Interrupt>>,
 }
@@ -953,6 +958,12 @@ impl Confinement {
     fn preparing<R>(&self, prepare: impl FnOnce() -> R) -> R {
         let _preparing = Preparing::enter(self);
         prepare()
+    }
+
+    /// Takes whether `prepared`, just prepared under this confinement, alters a table when it
+    /// runs: an `EXPLAIN` of an `ALTER TABLE` is authorized as one, and changes nothing.
+    fn take_alters(&self, prepared: &rusqlite::Statement<'_>) -> bool {
+        self.alters.swap(false, Ordering::Relaxed) && prepared.is_explain() == 0
     }
 
     /// Records the first reason a user statement is refused.
@@ -1084,6 +1095,9 @@ fn confine(conn: &mut Connection) -> Result<Arc<Confinement>, EngineError> {
         }
         if let Some(control) = control_of(&context.action) {
             *seen.control.lock().expect("control lock poisoned") = Some(control);
+        }
+        if matches!(context.action, AuthAction::AlterTable { .. }) {
+            seen.alters.store(true, Ordering::Relaxed);
         }
         if matches!(
             context.action,
@@ -1316,8 +1330,16 @@ impl<'c> UserStatement<'c> {
     fn enter(confinement: &'c Confinement) -> Self {
         confinement.user.store(true, Ordering::Relaxed);
         confinement.defines_program.store(false, Ordering::Relaxed);
+        confinement.alters.store(false, Ordering::Relaxed);
         *confinement.refused.lock().expect("refusal lock poisoned") = None;
         *confinement.control.lock().expect("control lock poisoned") = None;
+        Self(confinement)
+    }
+
+    /// Confines the connection again for a statement already prepared, keeping what its prepare
+    /// found.
+    fn resume(confinement: &'c Confinement) -> Self {
+        confinement.user.store(true, Ordering::Relaxed);
         Self(confinement)
     }
 }
@@ -1401,16 +1423,34 @@ fn stopped_by(interrupt: &Interrupt, error: EngineError) -> EngineError {
 }
 
 /// Runs a user statement on `conn`, which `confinement` confines, until `interrupt` stops it.
+///
+/// An `ALTER TABLE` runs with `recorder`'s triggers off, since SQLite refuses to change a column
+/// a trigger names. The caller's next [`Recorder::after_statement`] puts them back, and a failure
+/// rolls the whole transaction back, which restores them.
 fn run(
     conn: &Connection,
     statement: &Statement,
     confinement: &Confinement,
     interrupt: &Interrupt,
+    recorder: Option<&mut Recorder>,
 ) -> Result<(), EngineError> {
     let classify = |error: rusqlite::Error| {
         interrupted(&error, interrupt).unwrap_or_else(|| confinement.classify(error))
     };
-    let mut prepared = prepare_user(conn, confinement, statement.sql()).map_err(classify)?;
+    let mut prepared = {
+        let _user = UserStatement::enter(confinement);
+        let _interruptible = Interruptible::watch(confinement, interrupt);
+        prepare_user(conn, confinement, statement.sql()).map_err(classify)?
+    };
+    // The adapter's own statements, outside the confinement and the interrupt.
+    if confinement.take_alters(&prepared)
+        && let Some(recorder) = recorder
+    {
+        recorder.take_off_triggers(conn)?;
+    }
+    // Confined while it steps too: SQLite prepares a statement again after a schema change.
+    let _user = UserStatement::resume(confinement);
+    let _interruptible = Interruptible::watch(confinement, interrupt);
     let mut rows = prepared
         .query(rusqlite::params_from_iter(
             statement.params().iter().map(Param),
@@ -1457,6 +1497,9 @@ impl DerefMut for UserPrepared<'_> {
 /// or a query read the change record. So a user statement that mentions the reserved prefix anywhere,
 /// which every such statement of the adapter's does, is prepared afresh, and refused; the rest
 /// share the cache.
+///
+/// An `ALTER TABLE` never stays in the cache: the authorizer, which says what a statement is, runs
+/// only when SQLite prepares it, so one taken from the cache would run as if it weren't one.
 fn prepare_user<'conn>(
     conn: &'conn Connection,
     confinement: &Confinement,
@@ -1464,10 +1507,14 @@ fn prepare_user<'conn>(
 ) -> rusqlite::Result<UserPrepared<'conn>> {
     confinement.preparing(|| {
         if mentions_reserved(sql) {
-            conn.prepare(sql).map(UserPrepared::Fresh)
-        } else {
-            conn.prepare_cached(sql).map(UserPrepared::Cached)
+            return conn.prepare(sql).map(UserPrepared::Fresh);
         }
+        let cached = conn.prepare_cached(sql)?;
+        if confinement.alters.load(Ordering::Relaxed) {
+            cached.discard();
+            return conn.prepare(sql).map(UserPrepared::Fresh);
+        }
+        Ok(UserPrepared::Cached(cached))
     })
 }
 

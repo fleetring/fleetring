@@ -49,13 +49,37 @@
 //! earlier in the same transaction is covered too. The write connection runs with recursive
 //! triggers, so the rows an `INSERT OR REPLACE` replaces are recorded as deletes.
 //!
+//! # `ALTER TABLE`
+//!
+//! The triggers name every column, and SQLite refuses to drop a column a trigger names. So a user
+//! statement that the authorizer reports as an `ALTER TABLE`, of any form, runs with the triggers
+//! off, inside its transaction, and they are built again from the columns it leaves:
+//!
+//! - **It succeeds:** [`Recorder::after_statement`] rebuilds them, whatever the statement's text,
+//!   because taking them off forgets the schema version they were built for.
+//! - **It fails and the transaction goes on,** as a session's does: SQLite undoes the statement
+//!   but not the removal, so [`Recorder::rebuild_triggers`] builds them for the columns the table
+//!   still has, before any other statement runs.
+//! - **The transaction rolls back:** the rollback restores them, and the next transaction builds
+//!   them again.
+//! - **A `ROLLBACK TO` follows:** it restores the triggers of the savepoint's schema and takes the
+//!   schema's version back with it, so a later change could reach the version they were last built
+//!   for. A session rebuilds them at once; an `Execute` does in `after_statement`, which sees the
+//!   version differ.
+//!
+//! No row can change while they are off: only the `ALTER TABLE` runs, and `ALTER TABLE` fires no
+//! triggers of any kind. [`Recorder::commit`] refuses to commit a transaction whose triggers are
+//! off, so a path that missed them fails rather than losing rows silently.
+//!
 //! The per-transaction work is kept to a few cached statements: the change table is created
 //! once per connection, the transaction's position and id reach the triggers through two scalar
 //! functions on the connection rather than a table, the commit record is one insert, and
 //! released rows are pruned at most once every [`PRUNE_EVERY`] transactions.
 //!
 //! Not captured: schema changes (`CREATE`, `ALTER`, `DROP`), including a table rename, and
-//! SQLite's own tables.
+//! SQLite's own tables. A stream shows a schema change only through the rows after it, each of
+//! which names its own columns: a row written after a column is added, renamed, or dropped
+//! carries the new column list.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -119,7 +143,8 @@ pub(super) struct Recorder {
     mode: CaptureMode,
     /// The current transaction, shared with the connection's functions.
     txn: Arc<Txn>,
-    /// The schema version the triggers were built for.
+    /// The schema version the triggers were built for; `None` while they aren't built, or are
+    /// off for an `ALTER TABLE`.
     schema_version: Option<i64>,
     /// Whether the change table has been created on this connection.
     created: bool,
@@ -274,22 +299,52 @@ impl Recorder {
 
     /// Brings the triggers up to date after the statement `sql`, if it could have changed the
     /// schema: plain DML, by its first keyword, can't, and is the only kind that skips the
-    /// check.
+    /// check, unless the triggers are off for an `ALTER TABLE`.
     pub(super) fn after_statement(
         &mut self,
         writer: &Connection,
         sql: &str,
     ) -> Result<(), EngineError> {
-        if is_plain_dml(sql) {
+        if self.schema_version.is_some() && is_plain_dml(sql) {
             return Ok(());
         }
+        self.sync_triggers(writer)
+    }
+
+    /// Before a user's `ALTER TABLE`, inside its transaction: drops every trigger, since SQLite
+    /// refuses to change a column one names. [`after_statement`](Self::after_statement) or
+    /// [`rebuild_triggers`](Self::rebuild_triggers) builds them again.
+    pub(super) fn take_off_triggers(&mut self, writer: &Connection) -> Result<(), EngineError> {
+        // First, so that a failure below still leaves the triggers to be rebuilt.
+        self.schema_version = None;
+        self.undone_by_rollback.triggers = true;
+        let drops: String = existing_triggers(writer)?
+            .iter()
+            .map(|trigger| format!("DROP TRIGGER IF EXISTS temp.{};\n", quote(trigger)))
+            .collect();
+        writer.execute_batch(&drops).map_err(storage)
+    }
+
+    /// Builds the triggers for the schema as it is now, whatever they were built for: after an
+    /// `ALTER TABLE` failed, or a `ROLLBACK TO` took the schema and its version back.
+    pub(super) fn rebuild_triggers(&mut self, writer: &Connection) -> Result<(), EngineError> {
+        self.schema_version = None;
         self.sync_triggers(writer)
     }
 
     /// Ends the recording of the current transaction, before it commits: writes its commit
     /// record if the triggers recorded any row, and returns how many rows the change table
     /// gained, the commit record included.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the triggers are off, so that a transaction can't commit rows nothing recorded.
     pub(super) fn commit(&self, writer: &Connection) -> Result<u64, EngineError> {
+        if self.schema_version.is_none() {
+            return Err(storage(std::io::Error::other(
+                "the change recorder's triggers are not in place",
+            )));
+        }
         // The transaction's rows got the ids from its id on, so the highest id tells how many.
         let txn = self.txn.id.load(Ordering::Relaxed);
         let recorded = u64::try_from(highest_id(writer)? - txn + 1).unwrap_or(0);
@@ -951,6 +1006,27 @@ mod tests {
         recorder.rolled_back();
         assert!(recorder.created, "the change table stays known");
         assert!(recorder.schema_version.is_some(), "the triggers stay built");
+        Ok(())
+    }
+
+    #[test]
+    fn a_transaction_whose_triggers_are_off_does_not_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let writer = Connection::open_in_memory()?;
+        writer.execute_batch("CREATE TABLE t (v)")?;
+        let mut recorder = Recorder::install(&writer, CaptureMode::After)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        recorder.begin(&writer, None)?;
+        recorder.take_off_triggers(&writer)?;
+        assert!(existing_triggers(&writer)?.is_empty());
+        assert!(recorder.commit(&writer).is_err(), "nothing would record");
+        recorder.after_statement(&writer, "INSERT INTO t VALUES (1)")?;
+        assert_eq!(
+            existing_triggers(&writer)?.len(),
+            3,
+            "rebuilt, whatever the text"
+        );
+        recorder.commit(&writer)?;
         Ok(())
     }
 }
