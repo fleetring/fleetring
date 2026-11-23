@@ -836,6 +836,37 @@ fn renaming_and_altering_ordinary_tables_still_works() -> TestResult {
 }
 
 #[test]
+fn a_dropped_tables_name_reaches_no_other_prepare() -> TestResult {
+    let mut conn = Connection::open_in_memory()?;
+    conn.execute_batch(
+        "CREATE TABLE t (a);
+         CREATE TEMP TRIGGER _fleetring_trg_ins_t AFTER INSERT ON main.t BEGIN SELECT 1; END;",
+    )?;
+    let confinement = confine(&mut conn)?;
+    let drop_trigger = "DROP TRIGGER temp._fleetring_trg_ins_t";
+    let _user = UserStatement::enter(&confinement);
+    // Allowed for the `DROP TABLE` itself, under one confinement, as a sequence is checked.
+    drop(confinement.preparing(|| conn.prepare("DROP TABLE t"))?);
+    assert!(
+        confinement
+            .preparing(|| conn.prepare(drop_trigger))
+            .is_err(),
+        "the next prepare starts with no dropped table"
+    );
+    let mut batch = rusqlite::Batch::new(
+        &conn,
+        "DROP TABLE t; DROP TRIGGER temp._fleetring_trg_ins_t",
+    );
+    let first = confinement
+        .preparing(|| rusqlite::fallible_iterator::FallibleIterator::next(&mut batch))?;
+    drop(first);
+    let second =
+        confinement.preparing(|| rusqlite::fallible_iterator::FallibleIterator::next(&mut batch));
+    assert!(second.is_err(), "nor does the next statement of a batch");
+    Ok(())
+}
+
+#[test]
 fn an_alter_table_is_never_taken_from_the_statement_cache() -> TestResult {
     let mut conn = Connection::open_in_memory()?;
     conn.execute_batch("CREATE TABLE t (a, b)")?;
