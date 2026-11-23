@@ -280,6 +280,15 @@ pub(crate) async fn run(args: ForkArgs) -> Result<String, Box<dyn Error>> {
     }
 }
 
+/// What Ctrl-C prints: the fork goes on, and how to wait for it again or cancel it, each on a line
+/// of its own.
+fn interrupted_text(operation: &str, resume: &str, target: &str) -> String {
+    format!(
+        "operation {operation}: the fork carries on\n  {resume}\n  to cancel it: fleetring db \
+         drop {target}"
+    )
+}
+
 /// `status` as a command failure, with `hint`.
 fn exit_failure(status: &Status, hint: &str) -> Box<dyn Error> {
     Failed::new(status).with_hint(hint).into()
@@ -392,10 +401,7 @@ async fn follow_to_the_end(
     let followed = tokio::select! {
         _ = &mut interrupted => {
             following.finish();
-            eprintln!(
-                "operation {}: the fork carries on. {resume}\n  to cancel it: fleetring db drop {name}",
-                operation
-            );
+            eprintln!("{}", interrupted_text(&operation.to_string(), resume, &name));
             return Err(exit::Silent(exit::INTERRUPTED).into());
         }
         followed = fork_flow::follow(
@@ -435,5 +441,16 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.to_string().len(), 26);
         Ok(())
+    }
+
+    #[test]
+    fn ctrl_c_puts_each_next_step_on_a_line_of_its_own() {
+        let resume = resume_hint("abc", "foo", "bar");
+        assert_eq!(
+            interrupted_text("abc", &resume, "bar"),
+            "operation abc: the fork carries on\n  resume with `fleetring db fork foo bar \
+             --operation-id abc`. The operation ID is kept for 7 days after the fork finishes; \
+             after that, this command starts a new fork.\n  to cancel it: fleetring db drop bar"
+        );
     }
 }

@@ -35,6 +35,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server", "server-auto", "tokio"] }
 # Spinners on stderr for slow commands (ADR-0043, point 6).
+console = { version = "0.16.4", default-features = false, features = ["std"] }
 indicatif = { version = "0.18", default-features = false, features = ["unicode-width"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 prometheus-client = "0.25"
