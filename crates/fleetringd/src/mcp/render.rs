@@ -205,7 +205,8 @@ pub(crate) fn fork_result_out(report: &fleetring_client::output::ForkReport) -> 
         "failed" => "the fork failed: drop the new database with db_drop, then fork again",
         "cancelled" => "the fork was cancelled before it was ready: fork again for a new one",
         _ => {
-            "the fork is not ready and the database can't be used yet: check db_show later, or              call db_fork again with this operation_id and the same arguments to wait for it"
+            "the fork is not ready and the database can't be used yet: check db_show later, or \
+             call db_fork again with this operation_id and the same arguments to wait for it"
         }
     };
     ForkResultOut {
@@ -751,6 +752,32 @@ mod tests {
         };
         assert_eq!(list_out(&empty, Some(&me)).notice, NOTICE);
         Ok(())
+    }
+
+    #[test]
+    fn a_fork_not_ready_yet_gets_one_unbroken_hint() {
+        for state in ["seeding", "seeded"] {
+            let report = fleetring_client::output::ForkReport {
+                operation_id: "op".to_owned(),
+                database: "notes-try".to_owned(),
+                incarnation: "0".repeat(16),
+                state,
+                source: "notes".to_owned(),
+                source_incarnation: "0".repeat(16),
+                position: None,
+                chain_hash: None,
+                failure: None,
+                elapsed_ms: 0,
+                placement: None,
+            };
+            assert_eq!(
+                fork_result_out(&report).hint,
+                "the fork is not ready and the database can't be used yet: check db_show later, \
+                 or call db_fork again with this operation_id and the same arguments to wait \
+                 for it",
+                "{state}"
+            );
+        }
     }
 
     #[test]
