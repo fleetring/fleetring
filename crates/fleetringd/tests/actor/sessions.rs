@@ -873,6 +873,60 @@ fn an_alter_of_a_recorded_table_stays_confined() -> TestResult {
     Ok(())
 }
 
+/// Stages `position` as the mark of the sink `s`.
+fn stage(db: &mut dyn Database, position: &Position) {
+    db.sink_marks()
+        .expect("sqlite keeps marks")
+        .stage("s", position);
+}
+
+/// The mark recorded for the sink `s`.
+fn recorded_mark(db: &mut dyn Database) -> Option<Position> {
+    db.sink_marks()
+        .expect("sqlite keeps marks")
+        .marks()
+        .expect("readable marks")
+        .remove("s")
+}
+
+#[test]
+fn a_mark_staged_during_a_transaction_survives_its_commit() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let (first, second) = (Position::new([1]), Position::new([2]));
+    stage(db.as_mut(), &first);
+    session_ok(db.as_mut(), "BEGIN");
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (1)");
+    stage(db.as_mut(), &second);
+    session_ok(db.as_mut(), "COMMIT");
+    assert_eq!(recorded_mark(db.as_mut()), Some(first));
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+    assert_eq!(recorded_mark(db.as_mut()), Some(second));
+    Ok(())
+}
+
+#[test]
+fn a_rollback_keeps_the_marks_staged_through_a_later_commit_that_wrote_nothing() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let mark = Position::new([1]);
+    stage(db.as_mut(), &mark);
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t (id) VALUES (1)",
+        "ROLLBACK",
+        // Commits nothing, so it may not forget marks the rollback took back.
+        "BEGIN",
+        "COMMIT",
+    ] {
+        session_ok(db.as_mut(), sql);
+    }
+    assert_eq!(recorded_mark(db.as_mut()), None);
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+    assert_eq!(recorded_mark(db.as_mut()), Some(mark));
+    Ok(())
+}
+
 #[test]
 fn describe_reports_parameters_and_columns() -> TestResult {
     let dir = TempDir::new()?;
