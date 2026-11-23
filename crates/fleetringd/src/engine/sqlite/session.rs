@@ -1059,6 +1059,7 @@ impl WriterSide<'_> {
     fn ended(&mut self) {
         self.reserved.forget();
         self.conn.flush_prepared_statement_cache();
+        self.marks.rolled_back();
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.rolled_back();
         }

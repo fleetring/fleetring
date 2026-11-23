@@ -15,9 +15,10 @@
 //! A mark is staged in memory after its sink has taken a batch, and written by the next write
 //! transaction, at its start and before the transaction's own statements and before any prune of
 //! the change table, so that the marks, the user's write, and a prune commit or roll back
-//! together. A transaction that rolls back leaves the marks staged. No transaction is ever
-//! started just to write a mark: it would be a new batch, whose delivery would stage a new mark,
-//! and so on forever.
+//! together. A transaction that rolls back leaves the marks staged, and its commit forgets only
+//! the marks it wrote: one staged while a session's transaction is open waits for the next. No
+//! transaction is ever started just to write a mark: it would be a new batch, whose delivery
+//! would stage a new mark, and so on forever.
 
 use std::collections::BTreeMap;
 
@@ -48,9 +49,9 @@ pub(super) struct Marks {
     /// transaction that creates the table and rolls back takes the table with it, so this is
     /// set only once a commit succeeded.
     created: bool,
-    /// Whether the last [`flush`](Self::flush) wrote marks, which the transaction's commit then
-    /// makes permanent.
-    flushed: bool,
+    /// What the open transaction's [`flush`](Self::flush) wrote, which its commit makes
+    /// permanent.
+    flushed: BTreeMap<String, Vec<u8>>,
 }
 
 impl Marks {
@@ -75,7 +76,7 @@ impl Marks {
     /// Inside an open write transaction: creates the table if needed and upserts every staged
     /// mark. Returns how many rows it wrote.
     pub(super) fn flush(&mut self, writer: &Connection) -> Result<u64, EngineError> {
-        self.flushed = false;
+        self.flushed.clear();
         if self.staged.is_empty() {
             return Ok(0);
         }
@@ -86,22 +87,36 @@ impl Marks {
         for (sink, position) in &self.staged {
             upsert.execute(params![sink, position]).map_err(storage)?;
         }
-        self.flushed = true;
+        self.flushed.clone_from(&self.staged);
         Ok(u64::try_from(self.staged.len()).unwrap_or(u64::MAX))
     }
 
-    /// After `COMMIT` succeeded: forgets the marks the last [`flush`](Self::flush) wrote.
+    /// After `COMMIT` succeeded: forgets the marks the transaction's [`flush`](Self::flush) wrote,
+    /// and keeps any sink's newer mark, staged since.
     pub(super) fn committed(&mut self) {
-        if std::mem::take(&mut self.flushed) {
-            self.staged.clear();
-            self.created = true;
+        let flushed = std::mem::take(&mut self.flushed);
+        if flushed.is_empty() {
+            return;
         }
+        self.created = true;
+        for (sink, position) in flushed {
+            if self.staged.get(&sink) == Some(&position) {
+                self.staged.remove(&sink);
+            }
+        }
+    }
+
+    /// After a rollback took back what [`flush`](Self::flush) wrote: the marks stay staged, for
+    /// the next transaction that writes.
+    pub(super) fn rolled_back(&mut self) {
+        self.flushed.clear();
     }
 
     /// Forgets every staged mark, after a fork's reset cleared the recorded ones: they were
     /// staged for positions of the history the reset ends.
     pub(super) fn discard_staged(&mut self) {
         self.staged.clear();
+        self.flushed.clear();
     }
 
     /// Inside an open write transaction: deletes every recorded mark. A fork's reset does this,
