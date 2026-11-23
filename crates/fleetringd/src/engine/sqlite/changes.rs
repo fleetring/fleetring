@@ -112,6 +112,9 @@ const TXN_FUNCTION: &str = "_fleetring_txn";
 /// The prefix of every temporary trigger the recorder creates.
 pub(super) const TRIGGER_PREFIX: &str = "_fleetring_trg_";
 
+/// What follows [`TRIGGER_PREFIX`] in a trigger's name, before its table's: one per operation.
+const TRIGGER_TAGS: [&str; 3] = ["ins", "upd", "del"];
+
 /// The column the key of a row holds when its table declares no primary key.
 const ROWID: &str = "rowid";
 
@@ -617,6 +620,17 @@ fn existing_triggers(conn: &Connection) -> Result<BTreeSet<String>, EngineError>
     Ok(names)
 }
 
+/// Whether `trigger` is the name the recorder gives one of `table`'s triggers.
+pub(super) fn is_recorder_trigger_of(trigger: &str, table: &str) -> bool {
+    trigger.strip_prefix(TRIGGER_PREFIX).is_some_and(|rest| {
+        TRIGGER_TAGS.iter().any(|tag| {
+            rest.strip_prefix(tag)
+                .and_then(|rest| rest.strip_prefix('_'))
+                == Some(table)
+        })
+    })
+}
+
 /// A table's columns and primary key, from `PRAGMA table_info`.
 #[derive(Debug, Clone)]
 struct TableInfo {
@@ -651,9 +665,10 @@ fn triggers_for(table: &str, info: &TableInfo, mode: CaptureMode) -> String {
     let old = || json_columns("OLD", &info.columns);
     let new = || json_columns("NEW", &info.columns);
     let null = || "NULL".to_owned();
+    let [ins, upd, del] = TRIGGER_TAGS;
     let cases = [
         (
-            "ins",
+            ins,
             "INSERT",
             "NEW",
             INSERT,
@@ -662,7 +677,7 @@ fn triggers_for(table: &str, info: &TableInfo, mode: CaptureMode) -> String {
             null(),
         ),
         (
-            "upd",
+            upd,
             "UPDATE",
             "OLD",
             UPDATE,
@@ -671,7 +686,7 @@ fn triggers_for(table: &str, info: &TableInfo, mode: CaptureMode) -> String {
             on_full(mode, || updated_columns(&info.columns)),
         ),
         (
-            "del",
+            del,
             "DELETE",
             "OLD",
             DELETE,
@@ -1061,6 +1076,25 @@ mod tests {
         recorder.rolled_back();
         assert!(recorder.created, "the change table stays known");
         assert!(recorder.schema_version.is_some(), "the triggers stay built");
+        Ok(())
+    }
+
+    #[test]
+    fn the_recorders_triggers_are_known_by_their_table() -> Result<(), Box<dyn std::error::Error>> {
+        let writer = Connection::open_in_memory()?;
+        writer.execute_batch("CREATE TABLE \"odd name\" (v)")?;
+        let mut recorder = Recorder::install(&writer, CaptureMode::After)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        recorder.begin(&writer, None)?;
+        let triggers = existing_triggers(&writer)?;
+        assert_eq!(triggers.len(), 3);
+        for trigger in &triggers {
+            assert!(is_recorder_trigger_of(trigger, "odd name"), "{trigger}");
+            assert!(!is_recorder_trigger_of(trigger, "odd"), "{trigger}");
+        }
+        assert!(!is_recorder_trigger_of("_fleetring_trg_ins_t", "u"));
+        assert!(!is_recorder_trigger_of("_fleetring_trg_other_t", "t"));
+        assert!(!is_recorder_trigger_of("mine", "t"));
         Ok(())
     }
 

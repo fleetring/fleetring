@@ -1056,6 +1056,120 @@ fn a_rollback_to_an_inner_savepoint_keeps_the_transaction_whole() -> TestResult 
 }
 
 #[test]
+fn a_recorded_table_can_be_dropped_and_created_again_on_every_path() -> TestResult {
+    for path in StatementPath::ALL {
+        let dir = TempDir::new()?;
+        let mut db = recorded(dir.path())?;
+        // Twice, so that the same `DROP TABLE` text can come from the statement cache.
+        for (round, column) in [(1, "c"), (2, "d")] {
+            path.run(
+                db.as_mut(),
+                &format!("CREATE TABLE gone (id INTEGER PRIMARY KEY, {column})"),
+            );
+            path.run(db.as_mut(), "INSERT INTO gone (id) VALUES (1)");
+            path.run(db.as_mut(), "DROP TABLE gone");
+            path.run(
+                db.as_mut(),
+                &format!("CREATE TABLE gone (id INTEGER PRIMARY KEY, new_{column})"),
+            );
+            let before = log_end(db.as_mut());
+            path.run(db.as_mut(), "INSERT INTO gone (id) VALUES (2)");
+            path.run(db.as_mut(), &format!("INSERT INTO t (id) VALUES ({round})"));
+            assert_eq!(
+                recorded_rows(db.as_mut(), before.as_ref()),
+                [
+                    (2, names(&["id", &format!("new_{column}")])),
+                    (round, names(&["id", "a", "b"])),
+                ],
+                "{path:?}"
+            );
+            path.run(db.as_mut(), "DROP TABLE gone");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn dropping_a_table_opens_no_way_to_the_recorders_objects() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let rw = SessionAccess::ReadWrite;
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (1)");
+    session_ok(db.as_mut(), "CREATE TABLE gone (id INTEGER PRIMARY KEY)");
+    for sql in [
+        "DROP TRIGGER temp._fleetring_trg_ins_t",
+        "DROP TRIGGER _fleetring_trg_del_t",
+        "/* x */ dRoP tRiGgEr TEMP._FLEETRING_TRG_UPD_T",
+        "DROP TABLE _fleetring_cdc",
+        "DROP TABLE main._FLEETRING_CDC",
+    ] {
+        let refused = run(db.as_mut(), &execute(sql), rw);
+        assert_eq!(failed(&refused), "SQLITE_AUTH", "{sql}: {refused:?}");
+        let error = execute_all(db.as_mut(), &[sql]).expect_err("refused through Execute");
+        assert!(error.to_string().contains("reserved"), "{sql}: {error}");
+    }
+    // In one transaction with a `DROP TABLE`, the drop of another table's trigger is refused.
+    let drop_trigger = "DROP TRIGGER temp._fleetring_trg_ins_t";
+    let error = execute_all(db.as_mut(), &["DROP TABLE gone", drop_trigger])
+        .expect_err("refused through Execute");
+    assert!(error.to_string().contains("reserved"), "{error}");
+    let script = format!("BEGIN; DROP TABLE gone; {drop_trigger}; COMMIT;");
+    let result = run(db.as_mut(), &SessionCall::Sequence(script), rw);
+    let CallOutcome::Sequence(Err(error)) = &result.outcome else {
+        panic!("refused in a sequence: {result:?}");
+    };
+    assert_eq!(error.code, "SQLITE_AUTH");
+    session_ok(db.as_mut(), "ROLLBACK");
+    assert_eq!(
+        column(db.as_mut(), "SELECT count(*) FROM gone"),
+        [Value::Integer(0)],
+        "the table is still there"
+    );
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(2, names(&["id", "a", "b"]))]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rollback_of_a_drop_table_keeps_the_table_recorded() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    for script in [
+        [
+            "BEGIN",
+            "INSERT INTO t (id) VALUES (10)",
+            "DROP TABLE t",
+            "ROLLBACK",
+        ]
+        .as_slice(),
+        [
+            "BEGIN",
+            "INSERT INTO t (id) VALUES (20)",
+            "SAVEPOINT s",
+            "DROP TABLE t",
+            "ROLLBACK TO s",
+            "COMMIT",
+        ]
+        .as_slice(),
+    ] {
+        for sql in script {
+            session_ok(db.as_mut(), sql);
+        }
+    }
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (30)");
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(30, names(&["id", "a", "b"]))]
+    );
+    Ok(())
+}
+
+#[test]
 fn describe_reports_parameters_and_columns() -> TestResult {
     let dir = TempDir::new()?;
     let mut db = open(dir.path())?;

@@ -82,7 +82,7 @@ use rusqlite::{
 
 pub use follower::SqliteFollower;
 
-use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX, Watched};
+use self::changes::{RESERVED_PREFIX, Recorder, TRIGGER_PREFIX, Watched, is_recorder_trigger_of};
 use self::fork::Outcome;
 use self::marks::Marks;
 use self::pins::Pins;
@@ -949,6 +949,9 @@ struct Confinement {
     /// Whether the user statement being prepared is an `ALTER TABLE`, of any form, as the
     /// authorizer reports it.
     alters: AtomicBool,
+    /// The table the user statement being prepared drops. SQLite then authorizes dropping each of
+    /// the table's temporary triggers, and the recorder's are allowed for this table alone.
+    dropping: Mutex<Option<String>>,
     /// The interrupt the connection's statements stop on, while an [`Interruptible`] watches it.
     interrupt: Mutex<Option<Interrupt>>,
 }
@@ -965,6 +968,23 @@ impl Confinement {
     /// runs: an `EXPLAIN` of an `ALTER TABLE` is authorized as one, and changes nothing.
     fn take_alters(&self, prepared: &rusqlite::Statement<'_>) -> bool {
         self.alters.swap(false, Ordering::Relaxed) && prepared.is_explain() == 0
+    }
+
+    /// Forgets the table being dropped, so that no other statement's prepare sees it.
+    fn clear_dropping(&self) {
+        *self.dropping.lock().expect("dropping lock poisoned") = None;
+    }
+
+    /// Whether the statement being prepared drops `table`, which then takes `trigger` with it, and
+    /// `trigger` is one of the recorder's on `table`.
+    fn drops_with_table(&self, trigger: &str, table: &str) -> bool {
+        is_recorder_trigger_of(trigger, table)
+            && self
+                .dropping
+                .lock()
+                .expect("dropping lock poisoned")
+                .as_deref()
+                == Some(table)
     }
 
     /// Records the first reason a user statement is refused.
@@ -1057,7 +1077,7 @@ impl fmt::Display for Refusal {
 /// prepared or run, the authorizer refuses one that attaches or detaches a database, loads an
 /// extension, runs a pragma other than read-only introspection, or names a reserved table,
 /// index, trigger, view, or function, unless the access comes from one of the recorder's own
-/// triggers.
+/// triggers, or is a `DROP TABLE` taking that table's recorder triggers with it.
 ///
 /// SQLite authorizes a statement when it is prepared, so the confinement applies only around
 /// user statements; the adapter's own statements prepare with it clear.
@@ -1100,6 +1120,16 @@ fn confine(conn: &mut Connection) -> Result<Arc<Confinement>, EngineError> {
         if matches!(context.action, AuthAction::AlterTable { .. }) {
             seen.alters.store(true, Ordering::Relaxed);
         }
+        // SQLite asks about a table's triggers after the `DROP TABLE` itself, which the checks
+        // below have by then allowed.
+        if let AuthAction::DropTempTrigger {
+            trigger_name,
+            table_name,
+        } = context.action
+            && seen.drops_with_table(trigger_name, table_name)
+        {
+            return Authorization::Allow;
+        }
         if matches!(
             context.action,
             AuthAction::CreateTrigger { .. }
@@ -1121,7 +1151,13 @@ fn confine(conn: &mut Connection) -> Result<Arc<Confinement>, EngineError> {
                 seen.refuse(refusal);
                 Authorization::Deny
             }
-            None => Authorization::Allow,
+            None => {
+                if let AuthAction::DropTable { table_name } = context.action {
+                    *seen.dropping.lock().expect("dropping lock poisoned") =
+                        Some(table_name.to_owned());
+                }
+                Authorization::Allow
+            }
         }
     }))
     .map_err(storage)?;
@@ -1314,6 +1350,7 @@ struct Preparing<'c>(&'c Confinement);
 impl<'c> Preparing<'c> {
     fn enter(confinement: &'c Confinement) -> Self {
         confinement.preparing.store(true, Ordering::Relaxed);
+        confinement.clear_dropping();
         Self(confinement)
     }
 }
@@ -1321,6 +1358,7 @@ impl<'c> Preparing<'c> {
 impl Drop for Preparing<'_> {
     fn drop(&mut self) {
         self.0.preparing.store(false, Ordering::Relaxed);
+        self.0.clear_dropping();
     }
 }
 
@@ -1332,6 +1370,7 @@ impl<'c> UserStatement<'c> {
         confinement.user.store(true, Ordering::Relaxed);
         confinement.defines_program.store(false, Ordering::Relaxed);
         confinement.alters.store(false, Ordering::Relaxed);
+        confinement.clear_dropping();
         *confinement.refused.lock().expect("refusal lock poisoned") = None;
         *confinement.control.lock().expect("control lock poisoned") = None;
         Self(confinement)
@@ -1341,6 +1380,7 @@ impl<'c> UserStatement<'c> {
     /// found.
     fn resume(confinement: &'c Confinement) -> Self {
         confinement.user.store(true, Ordering::Relaxed);
+        confinement.clear_dropping();
         Self(confinement)
     }
 }
@@ -1348,6 +1388,7 @@ impl<'c> UserStatement<'c> {
 impl Drop for UserStatement<'_> {
     fn drop(&mut self) {
         self.0.user.store(false, Ordering::Relaxed);
+        self.0.clear_dropping();
     }
 }
 
