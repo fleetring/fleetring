@@ -287,9 +287,12 @@ impl Recorder {
         self.rebuild_triggers(writer)
     }
 
-    /// Before the next write after [`setup_may_be_undone`](Self::setup_may_be_undone): restores
-    /// the change table. The transaction keeps its position and its id, which is still the id its
-    /// first row has or will get: a rollback gives back only ids above the rows that remain.
+    /// Before the next write or the commit after
+    /// [`setup_may_be_undone`](Self::setup_may_be_undone): restores the change table. The
+    /// transaction keeps its position and its id, which is still the id its first row has or will
+    /// get: a rollback gives back only ids above the rows that remain. The commit needs it too: a
+    /// transaction that wrote commits frames even when a `ROLLBACK TO` undid every write, and a
+    /// log that moved past a position with no floor at or before it reads as released.
     pub(super) fn set_up_again(&mut self, writer: &Connection) -> Result<(), EngineError> {
         if !self.created {
             let start = self
@@ -392,15 +395,12 @@ impl Recorder {
     ///
     /// # Errors
     ///
-    /// Fails if the triggers are off, so that a transaction can't commit rows nothing recorded.
+    /// Fails if the change table or the triggers aren't in place, so that a transaction can't
+    /// commit rows nothing recorded.
     pub(super) fn commit(&self, writer: &Connection) -> Result<u64, EngineError> {
-        // A `ROLLBACK TO` took the table back, and with it everything this transaction recorded.
-        if !self.created && !table_exists(writer)? {
-            return Ok(0);
-        }
-        if self.schema_version.is_none() {
+        if !self.created || self.schema_version.is_none() {
             return Err(storage(std::io::Error::other(
-                "the change recorder's triggers are not in place",
+                "the change recorder's table or triggers are not in place",
             )));
         }
         // The transaction's rows got the ids from its id on, so the highest id tells how many.

@@ -1002,6 +1002,49 @@ fn a_write_undone_by_rollback_to_leaves_its_mark_staged() -> TestResult {
 }
 
 #[test]
+fn a_first_write_undone_under_a_savepoint_leaves_the_record_readable() -> TestResult {
+    for first in [
+        "INSERT INTO t (id) VALUES (9)",
+        "CREATE TABLE junk (id INTEGER PRIMARY KEY)",
+    ] {
+        let dir = TempDir::new()?;
+        let mut db = recorded(dir.path())?;
+        let before = log_end(db.as_mut());
+        for sql in ["BEGIN", "SAVEPOINT s", first, "ROLLBACK TO s", "COMMIT"] {
+            session_ok(db.as_mut(), sql);
+        }
+        let end = log_end(db.as_mut()).expect("a log");
+        assert_ne!(
+            Some(&end),
+            before.as_ref(),
+            "{first}: the commit wrote frames"
+        );
+        // A watcher at the old end reads nothing, and isn't told anything was released.
+        let limit = ReadLimit::new(NonZeroUsize::MAX, NonZeroUsize::MAX);
+        let read = db
+            .logical_changes()
+            .expect("sqlite records changes")
+            .transactions_after(before.as_ref(), &end, limit)?;
+        assert!(read.is_empty(), "{first}: {read:?}");
+        // A resume from the old end still works once the next write has committed.
+        session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+        let end = log_end(db.as_mut()).expect("a log");
+        let read = db
+            .logical_changes()
+            .expect("sqlite records changes")
+            .transactions_after(before.as_ref(), &end, limit)?;
+        assert_eq!(read.len(), 1, "{first}: {read:?}");
+        assert_eq!(read[0].changes.len(), 1, "{first}: {read:?}");
+        assert_eq!(
+            read[0].changes[0].key[0].value,
+            Value::Integer(2),
+            "{first}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn a_rollback_to_an_inner_savepoint_keeps_the_transaction_whole() -> TestResult {
     let dir = TempDir::new()?;
     let mut db = recorded(dir.path())?;
