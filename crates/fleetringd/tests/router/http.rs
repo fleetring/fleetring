@@ -8,6 +8,7 @@ use fleetring_control::Millis;
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
 use fleetringd::clock::{Clock as _, SystemClock};
+use fleetringd::data::ChangeUpdate;
 use fleetringd::engine::{Statement, Value as SqlValue};
 use fleetringd::transport::Credentials;
 use http_body_util::Full;
@@ -1033,6 +1034,74 @@ async fn one_address_holds_at_most_its_connections() -> TestResult {
         }
     })
     .await??;
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hrana_stream_alters_a_recorded_table_and_later_rows_stream_the_new_columns() -> TestResult
+{
+    let sink = tempfile::tempdir()?;
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        node_tables: format!(
+            "\n[[changes.sink]]\nname = \"log\"\nkind = \"file\"\ndatabases = [\"notes\"]\n\
+             path = {:?}\n",
+            sink.path()
+        ),
+        ..Options::default()
+    })
+    .await?;
+    fleet.create("notes", 1).await?;
+    let name = "notes".parse()?;
+    let mut updates = fleet.admin.watch_changes(&name, None).await?;
+    let opened = tokio::time::timeout(HANG_GUARD, updates.next()).await??;
+    assert!(
+        matches!(opened, Some(ChangeUpdate::Opened { .. })),
+        "{opened:?}"
+    );
+
+    let token = fleet.token("app", &["write:notes"], "t-app")?;
+    let answer = fleet
+        .post(
+            "/db/notes/v3/pipeline",
+            Some(&token),
+            &pipeline(
+                None,
+                json!([
+                    execute("BEGIN", json!([])),
+                    execute("ALTER TABLE t ADD COLUMN w", json!([])),
+                    execute("INSERT INTO t (id, v, w) VALUES (1, 'a', 'b')", json!([])),
+                    execute("/* drop */ alter table t drop column v", json!([])),
+                    execute("INSERT INTO t (id, w) VALUES (2, 'c')", json!([])),
+                    execute("COMMIT", json!([])),
+                    close(),
+                ]),
+            ),
+        )
+        .await?;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+    for index in 0..6 {
+        assert_eq!(answer.result(index)["type"], "ok", "{}", answer.text);
+    }
+
+    let update = tokio::time::timeout(HANG_GUARD, updates.next()).await??;
+    let Some(ChangeUpdate::Transaction(transaction)) = update else {
+        panic!("a transaction: {update:?}");
+    };
+    let columns: Vec<Vec<String>> = transaction
+        .changes
+        .iter()
+        .map(|change| {
+            change
+                .after
+                .iter()
+                .flatten()
+                .map(|column| column.name.clone())
+                .collect()
+        })
+        .collect();
+    assert_eq!(columns, [vec!["id", "v", "w"], vec!["id", "w"]]);
     fleet.stop().await;
     Ok(())
 }

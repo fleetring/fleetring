@@ -7,10 +7,10 @@ use std::time::Duration;
 use fleetring_control::DatabaseName;
 use fleetringd::engine::{
     Autocommit, BatchCondition, BatchStep, CallOutcome, CallResult, CaptureMode, Database,
-    DatabaseCapability, DatabaseEngine, EngineCapability, Execution, Interrupt, Interruption,
-    OpenMode, PERMISSION_DENIED, SAVEPOINT_OUTSIDE_TRANSACTION, SessionAccess, SessionCall,
-    SessionStatement, SqliteEngine, Statement, StatementOutcome, StepOutcome, Transaction, Value,
-    WantRows, WriteIntent,
+    DatabaseCapability, DatabaseEngine, EngineCapability, EngineError, Execution, Interrupt,
+    Interruption, OpenMode, PERMISSION_DENIED, Position, SAVEPOINT_OUTSIDE_TRANSACTION,
+    SessionAccess, SessionCall, SessionStatement, SqliteEngine, Statement, StatementOutcome,
+    StepOutcome, Transaction, Value, WantRows, WriteIntent,
 };
 use fleetringd::{
     Acknowledgement, BatchPublisher, CommittedBatch, DatabaseError, RecordingPublisher, Registry,
@@ -467,6 +467,409 @@ fn a_session_records_row_changes_as_execute_does() -> TestResult {
     }
     assert_eq!(recorded[0].len(), 3, "{:?}", recorded[0]);
     assert_eq!(recorded[0], recorded[1]);
+    Ok(())
+}
+
+/// A database with the table `t (id, a, b)`, whose row changes are recorded in full.
+fn recorded(dir: &Path) -> Result<Box<dyn Database>, Box<dyn std::error::Error>> {
+    let mut db = open(dir)?;
+    db.execute(
+        &Transaction::from(Statement::new(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a, b)",
+        )),
+        &Interrupt::new(),
+    )?;
+    db.logical_changes()
+        .expect("sqlite records changes")
+        .start_recording(CaptureMode::Full)?;
+    Ok(db)
+}
+
+/// Where the log ends.
+fn log_end(db: &mut dyn Database) -> Option<Position> {
+    let DatabaseCapability::FrameSource(frames) = db.capability() else {
+        panic!("sqlite is a frame source");
+    };
+    frames.position().expect("readable log")
+}
+
+/// The ID and the column names of every row recorded after `after`, in order. A delete records
+/// its old row, and anything else its new one.
+fn recorded_rows(db: &mut dyn Database, after: Option<&Position>) -> Vec<(i64, Vec<String>)> {
+    let end = log_end(db).expect("a log");
+    db.logical_changes()
+        .expect("sqlite records changes")
+        .changes_between(after, &end)
+        .expect("readable changes")
+        .into_iter()
+        .map(|change| {
+            let row = change.after.or(change.before).expect("full capture");
+            let id = row
+                .iter()
+                .find(|column| column.name == "id")
+                .map(|column| match column.value {
+                    Value::Integer(id) => id,
+                    _ => panic!("an integer id: {:?}", column.value),
+                })
+                .expect("a row has its id");
+            (id, row.into_iter().map(|column| column.name).collect())
+        })
+        .collect()
+}
+
+fn names(columns: &[&str]) -> Vec<String> {
+    columns.iter().map(|&column| column.to_owned()).collect()
+}
+
+/// Runs `sql` in a session on `db`, which must succeed.
+fn session_ok(db: &mut dyn Database, sql: &str) {
+    ok(&run(db, &execute(sql), SessionAccess::ReadWrite));
+}
+
+/// Runs `statements` through `Execute` as one transaction.
+fn execute_all(db: &mut dyn Database, statements: &[&str]) -> Result<(), EngineError> {
+    db.execute(
+        &Transaction::new(statements.iter().map(|&sql| Statement::new(sql))),
+        &Interrupt::new(),
+    )
+    .map(|_| ())
+}
+
+/// One way to run a statement on the writer.
+#[derive(Debug, Clone, Copy)]
+enum StatementPath {
+    Execute,
+    Session,
+    SessionTransaction,
+    Batch,
+    Sequence,
+}
+
+impl StatementPath {
+    const ALL: [Self; 5] = [
+        Self::Execute,
+        Self::Session,
+        Self::SessionTransaction,
+        Self::Batch,
+        Self::Sequence,
+    ];
+
+    fn run(self, db: &mut dyn Database, sql: &str) {
+        let rw = SessionAccess::ReadWrite;
+        match self {
+            Self::Execute => execute_all(db, &[sql]).expect("the statement runs"),
+            Self::Session => session_ok(db, sql),
+            Self::SessionTransaction => {
+                session_ok(db, "BEGIN");
+                session_ok(db, sql);
+                session_ok(db, "COMMIT");
+            }
+            Self::Batch => {
+                let batch = SessionCall::Batch(vec![BatchStep {
+                    condition: None,
+                    statement: SessionStatement::new(sql),
+                }]);
+                let result = run(db, &batch, rw);
+                let CallOutcome::Batch(steps) = &result.outcome else {
+                    panic!("a batch's outcome: {result:?}");
+                };
+                assert!(matches!(steps[0], StepOutcome::Ok(_)), "{sql}: {steps:?}");
+            }
+            Self::Sequence => {
+                let script = format!("BEGIN; {sql}; COMMIT;");
+                let result = run(db, &SessionCall::Sequence(script), rw);
+                assert_eq!(result.outcome, CallOutcome::Sequence(Ok(())), "{sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn every_alter_of_a_recorded_table_works_on_every_path() -> TestResult {
+    for path in StatementPath::ALL {
+        let dir = TempDir::new()?;
+        let mut db = recorded(dir.path())?;
+        // A comment, odd casing, and a schema name change nothing about what the statement is.
+        let steps: [(&str, &[&str]); 3] = [
+            ("ALTER TABLE t ADD COLUMN c", &["id", "a", "b", "c"]),
+            (
+                "/* first */ aLtEr /* x */ TaBlE t RENAME COLUMN c TO d",
+                &["id", "a", "b", "d"],
+            ),
+            (
+                "-- why\nALTER TABLE main.t DROP COLUMN a",
+                &["id", "b", "d"],
+            ),
+        ];
+        for (index, (alter, columns)) in (1_i64..).zip(steps) {
+            path.run(db.as_mut(), alter);
+            let before = log_end(db.as_mut());
+            path.run(db.as_mut(), &format!("INSERT INTO t (id) VALUES ({index})"));
+            path.run(
+                db.as_mut(),
+                &format!("UPDATE t SET b = 1 WHERE id = {index}"),
+            );
+            assert_eq!(
+                recorded_rows(db.as_mut(), before.as_ref()),
+                [(index, names(columns)), (index, names(columns))],
+                "{path:?}, after {alter}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_failed_alter_leaves_recording_as_it_was() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let rw = SessionAccess::ReadWrite;
+    // SQLite refuses this while it runs, after the statement was prepared.
+    let drop_b = "ALTER TABLE t DROP COLUMN b";
+    execute_all(db.as_mut(), &["CREATE VIEW v AS SELECT b FROM t"])?;
+    let full = names(&["id", "a", "b"]);
+
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "BEGIN");
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (1)");
+    let refused = run(db.as_mut(), &execute(drop_b), rw);
+    assert_eq!(failed(&refused), "SQLITE_ERROR", "{refused:?}");
+    assert_eq!(refused.autocommit, Autocommit::InTransaction);
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+    session_ok(db.as_mut(), "COMMIT");
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(1, full.clone()), (2, full.clone())]
+    );
+
+    // Alone in a session, and through `Execute`, twice, so the second may come from a cache.
+    for _ in 0..2 {
+        let refused = run(db.as_mut(), &execute(drop_b), rw);
+        assert_eq!(failed(&refused), "SQLITE_ERROR", "{refused:?}");
+        execute_all(db.as_mut(), &[drop_b]).expect_err("a view reads the column");
+    }
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (3)");
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(3, full.clone())]
+    );
+
+    // The same text, once it can succeed, still takes the triggers off.
+    execute_all(db.as_mut(), &["DROP VIEW v"])?;
+    execute_all(db.as_mut(), &[drop_b])?;
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (4)");
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(4, names(&["id", "a"]))]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rollback_of_an_alter_restores_recording() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    for sql in [
+        "BEGIN",
+        "ALTER TABLE t DROP COLUMN b",
+        "INSERT INTO t (id) VALUES (1)",
+        "ROLLBACK",
+    ] {
+        session_ok(db.as_mut(), sql);
+    }
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "INSERT INTO t (id, b) VALUES (2, 'kept')");
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(2, names(&["id", "a", "b"]))]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rollback_to_a_savepoint_keeps_recording_the_right_columns() -> TestResult {
+    let script = [
+        "INSERT INTO t (id) VALUES (1)",
+        "SAVEPOINT s",
+        "ALTER TABLE t DROP COLUMN b",
+        "INSERT INTO t (id) VALUES (50)",
+        "ROLLBACK TO s",
+        "INSERT INTO t (id) VALUES (2)",
+        // This change brings the schema's version back to the one the dropped column's had.
+        "ALTER TABLE t ADD COLUMN c",
+        "INSERT INTO t (id) VALUES (3)",
+    ];
+    let want = [
+        (1, names(&["id", "a", "b"])),
+        (2, names(&["id", "a", "b"])),
+        (3, names(&["id", "a", "b", "c"])),
+    ];
+
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "BEGIN");
+    for sql in script {
+        session_ok(db.as_mut(), sql);
+    }
+    session_ok(db.as_mut(), "COMMIT");
+    assert_eq!(recorded_rows(db.as_mut(), before.as_ref()), want);
+
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    let sequence = format!("BEGIN; {}; COMMIT;", script.join("; "));
+    let result = run(
+        db.as_mut(),
+        &SessionCall::Sequence(sequence),
+        SessionAccess::ReadWrite,
+    );
+    assert_eq!(result.outcome, CallOutcome::Sequence(Ok(())));
+    assert_eq!(recorded_rows(db.as_mut(), before.as_ref()), want);
+
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    execute_all(db.as_mut(), &script)?;
+    assert_eq!(recorded_rows(db.as_mut(), before.as_ref()), want);
+    Ok(())
+}
+
+#[test]
+fn a_table_created_after_a_rollback_to_is_recorded() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    // The second `CREATE TABLE` brings the schema's version back to the one the first reached, so
+    // the triggers look current unless the `ROLLBACK TO` made the recorder look again.
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT s",
+        "CREATE TABLE junk (id INTEGER PRIMARY KEY)",
+        "ROLLBACK TO s",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+        "INSERT INTO u VALUES (7)",
+        "COMMIT",
+    ] {
+        session_ok(db.as_mut(), sql);
+    }
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(7, names(&["id"]))]
+    );
+
+    // The same through `Execute`.
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    execute_all(
+        db.as_mut(),
+        &[
+            "SAVEPOINT s",
+            "CREATE TABLE junk (id INTEGER PRIMARY KEY)",
+            "ROLLBACK TO s",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+            "INSERT INTO u VALUES (7)",
+        ],
+    )?;
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(7, names(&["id"]))]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_savepoint_before_the_first_write_keeps_what_recording_set_up() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT s",
+        "INSERT INTO t (id) VALUES (1)",
+        "ROLLBACK TO s",
+        "INSERT INTO t (id) VALUES (2)",
+        "COMMIT",
+    ] {
+        session_ok(db.as_mut(), sql);
+    }
+    assert_eq!(
+        recorded_rows(db.as_mut(), before.as_ref()),
+        [(2, names(&["id", "a", "b"]))]
+    );
+    Ok(())
+}
+
+#[test]
+fn an_alter_of_a_recorded_table_stays_confined() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let rw = SessionAccess::ReadWrite;
+    execute_all(
+        db.as_mut(),
+        &[
+            "CREATE TABLE plain (v)",
+            "CREATE VIRTUAL TABLE docs USING vec0(e float[2])",
+        ],
+    )?;
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (1)");
+    let full = names(&["id", "a", "b"]);
+    for (alter, reason) in [
+        ("ALTER TABLE _fleetring_cdc DROP COLUMN updates", "reserved"),
+        (
+            "/* x */ aLtEr TaBlE _FLEETRING_cdc ADD COLUMN c",
+            "reserved",
+        ),
+        ("ALTER TABLE plain RENAME TO _fleetring_evil", "reserved"),
+        ("ALTER TABLE t RENAME TO _Fleetring_evil", "reserved"),
+        ("-- x\nALTER TABLE docs RENAME TO moved", "can't be renamed"),
+        ("ALTER TABLE plain RENAME TO docs_vector_chunks01", "shadow"),
+    ] {
+        let refused = run(db.as_mut(), &execute(alter), rw);
+        assert_eq!(failed(&refused), "SQLITE_AUTH", "{alter}: {refused:?}");
+        assert!(message(&refused).contains(reason), "{alter}: {refused:?}");
+
+        session_ok(db.as_mut(), "BEGIN");
+        session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (50)");
+        let refused = run(db.as_mut(), &execute(alter), rw);
+        assert_eq!(failed(&refused), "SQLITE_AUTH", "{alter}: {refused:?}");
+        if refused.autocommit == Autocommit::InTransaction {
+            // Refused as it was prepared, before anything ran: the transaction is still open.
+            session_ok(db.as_mut(), "ROLLBACK");
+        }
+
+        let error = execute_all(db.as_mut(), &[alter]).expect_err("refused through Execute");
+        assert!(error.to_string().contains(reason), "{alter}: {error}");
+
+        let script = format!("SELECT 1; {alter}; INSERT INTO t (id) VALUES (51);");
+        let result = run(db.as_mut(), &SessionCall::Sequence(script), rw);
+        let CallOutcome::Sequence(Err(error)) = &result.outcome else {
+            panic!("{alter}: refused in a sequence: {result:?}");
+        };
+        assert_eq!(error.code, "SQLITE_AUTH", "{alter}");
+
+        // Nothing of it stayed, and recording goes on over the same columns.
+        let before = log_end(db.as_mut());
+        session_ok(db.as_mut(), "INSERT OR REPLACE INTO t (id) VALUES (2)");
+        assert_eq!(
+            recorded_rows(db.as_mut(), before.as_ref()).last(),
+            Some(&(2, full.clone())),
+            "{alter}"
+        );
+    }
+    assert_eq!(
+        column(db.as_mut(), "SELECT id FROM t ORDER BY id"),
+        [Value::Integer(1), Value::Integer(2)]
+    );
+
+    // `EXPLAIN` of an `ALTER TABLE` changes nothing, and recording goes on.
+    session_ok(db.as_mut(), "EXPLAIN ALTER TABLE t DROP COLUMN b");
+    let before = log_end(db.as_mut());
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (3)");
+    assert_eq!(recorded_rows(db.as_mut(), before.as_ref()), [(3, full)]);
     Ok(())
 }
 

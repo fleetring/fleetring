@@ -12,10 +12,12 @@
 //!   commits it, and `ROLLBACK` rolls it back; a `SAVEPOINT` outside a transaction is refused;
 //! - inside a transaction, every statement runs on the writer.
 //!
-//! A transaction's first write records the staged sink marks and starts the change recorder's
-//! transaction, as an `Execute` does before its statements, and its commit records the
-//! recorder's commit row first. A statement that changes the reserved namespace, or defines a
-//! trigger or view that names it, rolls the whole transaction back.
+//! A transaction's first write or `SAVEPOINT` records the staged sink marks and starts the change
+//! recorder's transaction, as an `Execute` does before its statements, so that no `ROLLBACK TO`
+//! can undo them, and its commit records the recorder's commit row first. A statement that changes
+//! the reserved namespace, or defines a trigger or view that names it, rolls the whole transaction
+//! back. An `ALTER TABLE` runs with the recorder's triggers off, and they are rebuilt once it
+//! ends, however it ends (the `changes` module).
 //!
 //! A read-only session runs everything on the read connection, and refuses, without running it,
 //! any statement that isn't read-only or controls a transaction.
@@ -68,6 +70,8 @@ struct Class {
     control: Option<Control>,
     /// Whether it defines a trigger or a view, whose body is checked after it runs.
     defines_program: bool,
+    /// Whether it is an `ALTER TABLE`, which runs with the recorder's triggers off.
+    alters: bool,
 }
 
 impl Class {
@@ -85,8 +89,8 @@ impl Class {
 /// A transaction a session opened on the writer.
 #[derive(Debug, Default)]
 pub(super) struct OpenTransaction {
-    /// Whether it has written: the staged marks were recorded, the recorder's transaction
-    /// started, and the reserved schema remembered.
+    /// Whether it has written or set a savepoint: the staged marks were recorded, the recorder's
+    /// transaction started, and the reserved schema remembered.
     wrote: bool,
 }
 
@@ -377,6 +381,7 @@ impl Confinement {
             readonly: prepared.readonly(),
             control: self.take_control(),
             defines_program: self.defines_program.swap(false, Ordering::Relaxed),
+            alters: self.take_alters(prepared),
         }
     }
 }
@@ -743,7 +748,10 @@ impl WriterSide<'_> {
             (true, Some(Control::Commit)) => return self.commit(prepared, statement, budget),
             _ => {}
         }
-        if in_transaction && class.writes() {
+        // A savepoint counts as a write here: what `begin_writing` sets up must come before it,
+        // or a `ROLLBACK TO` would take the change table, the triggers, and the marks away while
+        // the transaction goes on believing they are there.
+        if in_transaction && (class.writes() || class.control == Some(Control::Savepoint)) {
             match self.begin_writing() {
                 Ok(()) => {}
                 Err(EngineError::Statement { message }) => {
@@ -756,6 +764,7 @@ impl WriterSide<'_> {
                 Err(storage) => return Err(storage),
             }
         }
+        self.before_alter(class)?;
         let no_arguments = SessionStatement::default();
         let arguments = statement.unwrap_or(&no_arguments);
         let stepped = step(
@@ -773,6 +782,8 @@ impl WriterSide<'_> {
                 if in_transaction && !now_in_transaction {
                     // SQLite rolled the whole transaction back, as it does after some errors.
                     self.ended();
+                } else if class.alters {
+                    self.after_failed_alter()?;
                 }
                 return Ok(Err(error));
             }
@@ -786,8 +797,8 @@ impl WriterSide<'_> {
                 let sql = statement.map_or("", |statement| statement.sql.as_str());
                 recorder.after_statement(self.conn, sql)?;
             }
-        } else if now_in_transaction && class.control.is_some() {
-            self.after_savepoint_control()?;
+        } else if now_in_transaction && let Some(control) = class.control {
+            self.after_savepoint_control(control)?;
         }
         match (in_transaction, now_in_transaction) {
             (false, true) => *self.transaction = Some(OpenTransaction::default()),
@@ -834,6 +845,7 @@ impl WriterSide<'_> {
             }
             Err(storage) => return Err(storage),
         }
+        self.before_alter(class)?;
         let no_arguments = SessionStatement::default();
         let arguments = statement.unwrap_or(&no_arguments);
         let outcome = match step(
@@ -994,12 +1006,43 @@ impl WriterSide<'_> {
         Ok(())
     }
 
-    /// After a `SAVEPOINT`, `RELEASE`, or `ROLLBACK TO` inside the transaction: reads the schema
-    /// the transaction now has afresh. A `ROLLBACK TO` takes the schema, and its version, back to
-    /// what it was at the savepoint, which a later statement's schema change can bring back to
-    /// a version already read; the checks after a statement compare with what was read last, and
-    /// skip while the version is the one they read, so they must start again from here.
-    fn after_savepoint_control(&mut self) -> Result<(), EngineError> {
+    /// Before a statement of `class` runs: an `ALTER TABLE` runs with the recorder's triggers
+    /// off, because SQLite refuses to change a column a trigger names. The statement's own end
+    /// puts them back, whether it succeeds or fails.
+    fn before_alter(&mut self, class: Class) -> Result<(), EngineError> {
+        match self.recorder.as_mut() {
+            Some(recorder) if class.alters => recorder.take_off_triggers(self.conn),
+            _ => Ok(()),
+        }
+    }
+
+    /// After an `ALTER TABLE` failed and SQLite undid it, with the transaction still open: puts
+    /// the recorder's triggers back on the columns the table still has.
+    fn after_failed_alter(&mut self) -> Result<(), EngineError> {
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.rebuild_triggers(self.conn)?;
+        }
+        self.read_schema_afresh()
+    }
+
+    /// After a `SAVEPOINT`, `RELEASE`, or `ROLLBACK TO` inside the transaction. A `ROLLBACK TO`
+    /// takes the schema, the recorder's triggers, and the schema's version back to what they were
+    /// at the savepoint, which a later statement's schema change can bring back to a version
+    /// already read. So the triggers are rebuilt for the schema it left, and the schema is read
+    /// afresh.
+    fn after_savepoint_control(&mut self, control: Control) -> Result<(), EngineError> {
+        if control == Control::RollbackTo
+            && let Some(recorder) = self.recorder.as_mut()
+        {
+            recorder.rebuild_triggers(self.conn)?;
+        }
+        self.read_schema_afresh()
+    }
+
+    /// Reads the schema the transaction now has afresh: the checks after a statement compare with
+    /// what was read last, and skip while the version is the one they read, so they must start
+    /// again from here.
+    fn read_schema_afresh(&mut self) -> Result<(), EngineError> {
         self.reserved.forget();
         self.conn.flush_prepared_statement_cache();
         let wrote = self
