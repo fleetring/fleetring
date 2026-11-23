@@ -16,7 +16,8 @@
 //! transaction, as an `Execute` does before its statements, and its commit records the recorder's
 //! commit row first. A transaction that only reads writes nothing, whatever savepoints it sets.
 //! When the first write ran under a savepoint, a `ROLLBACK TO` may undo what it set up, so the
-//! next write sets it up again. A statement that changes the reserved namespace, or defines a
+//! next write sets it up again, or the commit does, whose frames then hold the change table and
+//! its floor. A statement that changes the reserved namespace, or defines a
 //! trigger or view that names it, rolls the whole transaction back. An `ALTER TABLE` runs with the
 //! recorder's triggers off, and they are rebuilt once it ends, however it ends (the `changes`
 //! module).
@@ -98,7 +99,7 @@ enum Setup {
     /// In place.
     Done,
     /// It ran under a savepoint, and a `ROLLBACK TO` since may have undone any of it. The next
-    /// write sets it up again.
+    /// write sets it up again, or else the commit: only a transaction that wrote gets here.
     MayBeUndone,
 }
 
@@ -903,8 +904,7 @@ impl WriterSide<'_> {
         budget: &mut Budget,
     ) -> Ran<StatementOutcome> {
         if self.has_set_up()
-            && let Some(recorder) = self.recorder.as_ref()
-            && let Err(error) = recorder.commit(self.conn)
+            && let Err(error) = self.record_commit()
         {
             self.roll_back();
             return Err(error);
@@ -934,6 +934,23 @@ impl WriterSide<'_> {
                 Ok(Err(rolled_back(error)))
             }
         }
+    }
+
+    /// Before the `COMMIT` of a transaction that wrote: restores the change table if a
+    /// `ROLLBACK TO` may have taken it back, and records the commit row.
+    fn record_commit(&mut self) -> Result<(), EngineError> {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return Ok(());
+        };
+        let undone = self
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.setup == Setup::MayBeUndone);
+        if undone {
+            recorder.set_up_again(self.conn)?;
+        }
+        recorder.commit(self.conn)?;
+        Ok(())
     }
 
     /// Whether the open transaction has set up for writing, even if a `ROLLBACK TO` may have

@@ -4,11 +4,12 @@
 
 use std::time::Duration;
 
+use fleetring::ReplicationFactor;
 use fleetring_control::Millis;
 use fleetring_proto::v1::revocation::Revoked;
 use fleetring_proto::v1::{Revocation, RevokeTokenRequest};
 use fleetringd::clock::{Clock as _, SystemClock};
-use fleetringd::data::ChangeUpdate;
+use fleetringd::data::{ChangeUpdate, DatabaseSpec};
 use fleetringd::engine::{Statement, Value as SqlValue};
 use fleetringd::transport::Credentials;
 use http_body_util::Full;
@@ -1034,6 +1035,74 @@ async fn one_address_holds_at_most_its_connections() -> TestResult {
         }
     })
     .await??;
+    fleet.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_write_undone_under_a_savepoint_keeps_a_connected_watcher_open() -> TestResult {
+    let sink = tempfile::tempdir()?;
+    let fleet = Fleet::start(Options {
+        data_nodes: 1,
+        node_tables: format!(
+            "\n[[changes.sink]]\nname = \"log\"\nkind = \"file\"\ndatabases = [\"notes\"]\n\
+             path = {:?}\n",
+            sink.path()
+        ),
+        ..Options::default()
+    })
+    .await?;
+    // No statement has run, so the database has no change table yet.
+    let name = "notes".parse()?;
+    let factor = ReplicationFactor::new(1).ok_or("no replicas")?;
+    fleet
+        .admin
+        .create_database_with(&name, DatabaseSpec::new(factor))
+        .await?;
+    let mut updates = fleet.admin.watch_changes(&name, None).await?;
+    let opened = tokio::time::timeout(HANG_GUARD, updates.next()).await??;
+    assert!(
+        matches!(opened, Some(ChangeUpdate::Opened { .. })),
+        "{opened:?}"
+    );
+
+    let token = fleet.token("app", &["write:notes"], "t-app")?;
+    for requests in [
+        json!([
+            execute("BEGIN", json!([])),
+            execute("SAVEPOINT s", json!([])),
+            execute("CREATE TABLE junk (id INTEGER PRIMARY KEY)", json!([])),
+            execute("ROLLBACK TO s", json!([])),
+            execute("COMMIT", json!([])),
+            close(),
+        ]),
+        json!([
+            execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v)", json!([])),
+            execute("INSERT INTO t (id, v) VALUES (1, 'a')", json!([])),
+            close(),
+        ]),
+    ] {
+        let count = requests.as_array().map_or(0, Vec::len);
+        let answer = fleet
+            .post(
+                "/db/notes/v3/pipeline",
+                Some(&token),
+                &pipeline(None, requests),
+            )
+            .await?;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+        for index in 0..count {
+            assert_eq!(answer.result(index)["type"], "ok", "{}", answer.text);
+        }
+    }
+
+    // The same stream delivers the next recorded write.
+    let update = tokio::time::timeout(HANG_GUARD, updates.next()).await??;
+    let Some(ChangeUpdate::Transaction(transaction)) = update else {
+        panic!("a transaction: {update:?}");
+    };
+    assert_eq!(transaction.changes.len(), 1, "{transaction:?}");
+    assert_eq!(transaction.changes[0].table, "t");
     fleet.stop().await;
     Ok(())
 }
