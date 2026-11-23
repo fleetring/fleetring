@@ -36,10 +36,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// What `db fork --help` adds below the flags.
 pub(crate) const FORK_HELP: &str = "\
 Examples:
-  fleetring db fork notes notes-exp                         fork notes, and wait until the fork is ready
-  fleetring db fork notes notes-exp --detach                start the fork, and return
-  fleetring db fork notes notes-exp --operation-id 4k7mxq…  wait for the same fork again, or retry it
-  fleetring db drop notes-exp                               cancel the fork, or remove it
+  fleetring db fork notes notes-try                         fork notes into a new database, and wait until it is ready
+  fleetring db fork notes notes-try --detach                start the fork, and return
+  fleetring db fork notes notes-try --operation-id 4k7mxq…  wait for the same fork again, or retry it
+  fleetring db drop notes-try                               cancel the fork, or remove it
 
 To cancel a fork in progress, drop its target: fleetring db drop <target>. An operation ID is
 kept while its fork is pending and for 7 days after it is ready, failed, or cancelled; after
@@ -53,7 +53,7 @@ refused scope; 4 the control plane stayed unavailable or --timeout passed; 130 C
 pub(crate) struct ForkArgs {
     /// The database to copy.
     source: DatabaseName,
-    /// The new database's name.
+    /// The name of the new database the fork creates, which mustn't exist yet
     target_name: DatabaseName,
     /// How many replicas the fork has, the primary included
     ///

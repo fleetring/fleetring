@@ -389,7 +389,7 @@ fleetring db fork <source> <target>
 It makes `<target>` a new database holding `<source>`'s current contents, at a position the source's write quorum has acknowledged, and waits until the fork is **ready**. The fork is independent from then on: writes to either never reach the other. Until it is ready, its replicas are the nodes that hold its copy, whatever placement says; from then on it follows placement as any database does.
 
 - **Its place.** It belongs to the `db` noun, in the Databases group, after `db restore`. `fork` is a verb of its own (§1's table): it builds a new database and never writes over an existing one.
-- **Arguments.** Both are database names, the source first.
+- **Arguments.** Both are database names, the source first. The target is the name of the new database the fork creates, and mustn't exist yet.
 - **Settings are the target's own.** `--replication-factor`, `--acks` and `--min-replicas` default as `db create`'s do, never to the source's. `--description`, `--label`, `--expires-in` and `--expires-at` are `db create`'s flags. Nothing is copied from the source's metadata: its description is another principal's text (ADR-0041, point 9).
   - Whatever `--acks` says, the fork's copy and its fork-reset write need a majority of its replicas; `--acks` governs its writes from `ready` on (ADR-0046, point 3).
   - Before the fork is ready, `db edit` may change its description, labels, and expiry, but not `--acks` or `--min-replicas`. An expiry that passes before it is ready cancels it.

@@ -271,7 +271,7 @@ enum Command {
     /// A token is a signed, expiring credential that names a principal and carries its scopes.
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Creates, lists, writes, reads, watches, and drops databases
+    /// Creates, forks, writes, reads, watches, and drops databases
     #[command(subcommand)]
     Db(DbCommand),
     /// Lists, drains, undrains, and removes the fleet's members
