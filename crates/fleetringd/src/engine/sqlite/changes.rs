@@ -64,8 +64,9 @@
 //!   them again.
 //! - **A `ROLLBACK TO` follows:** it restores the triggers of the savepoint's schema and takes the
 //!   schema's version back with it, so a later change could reach the version they were last built
-//!   for. A session rebuilds them at once; an `Execute` does in `after_statement`, which sees the
-//!   version differ.
+//!   for. A session rebuilds them at once if the transaction has built or removed them, and
+//!   otherwise nothing changed that it could take back; an `Execute` does in `after_statement`,
+//!   which sees the version differ.
 //!
 //! No row can change while they are off: only the `ALTER TABLE` runs, and `ALTER TABLE` fires no
 //! triggers of any kind. [`Recorder::commit`] refuses to commit a transaction whose triggers are
@@ -161,7 +162,7 @@ pub(super) struct Recorder {
 struct Fresh {
     /// The transaction ran the change table's `CREATE`.
     table: bool,
-    /// The transaction rebuilt the triggers.
+    /// The transaction built or removed the triggers, as every schema change it makes does.
     triggers: bool,
 }
 
@@ -266,11 +267,16 @@ impl Recorder {
         }
     }
 
-    /// After a `ROLLBACK TO`: builds the triggers for the schema it left. If it took the change
-    /// table back, the triggers built after the table went with it, and stay off until the next
-    /// write restores both: SQLite compiles a table's triggers into every statement that writes
-    /// it, so a trigger whose change table is missing would refuse that statement as it prepares.
+    /// After a `ROLLBACK TO`: builds the triggers for the schema it left, if the transaction has
+    /// built or removed them; if it hasn't, it changed no schema, and they are still right. If the
+    /// `ROLLBACK TO` took the change table back, the triggers built after the table went with it,
+    /// and stay off until the next write restores both: SQLite compiles a table's triggers into
+    /// every statement that writes it, so a trigger whose change table is missing would refuse
+    /// that statement as it prepares.
     pub(super) fn after_rollback_to(&mut self, writer: &Connection) -> Result<(), EngineError> {
+        if !self.undone_by_rollback.triggers {
+            return Ok(());
+        }
         if !self.created && !table_exists(writer)? {
             self.schema_version = None;
             return Ok(());
@@ -1055,6 +1061,43 @@ mod tests {
         recorder.rolled_back();
         assert!(recorder.created, "the change table stays known");
         assert!(recorder.schema_version.is_some(), "the triggers stay built");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rollback_to_rebuilds_the_triggers_only_after_they_changed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_version = |conn: &Connection| -> rusqlite::Result<i64> {
+            conn.query_row("PRAGMA temp.schema_version", [], |row| row.get(0))
+        };
+        let writer = Connection::open_in_memory()?;
+        writer.execute_batch("CREATE TABLE t (v)")?;
+        let mut recorder = Recorder::install(&writer, CaptureMode::After)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        recorder.begin(&writer, None)?;
+        recorder.commit(&writer)?;
+        writer.execute_batch("COMMIT")?;
+        recorder.committed();
+
+        // Row changes alone leave the triggers as they are.
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        recorder.begin(&writer, None)?;
+        writer.execute_batch("SAVEPOINT s; INSERT INTO t VALUES (1); ROLLBACK TO s")?;
+        let before = temp_version(&writer)?;
+        recorder.after_rollback_to(&writer)?;
+        assert_eq!(temp_version(&writer)?, before, "no rebuild");
+
+        // A schema change since the transaction began means a rebuild.
+        writer.execute_batch("SAVEPOINT u; CREATE TABLE u (v)")?;
+        recorder.after_statement(&writer, "CREATE TABLE u (v)")?;
+        assert_eq!(existing_triggers(&writer)?.len(), 6);
+        writer.execute_batch("ROLLBACK TO u")?;
+        let before = temp_version(&writer)?;
+        recorder.after_rollback_to(&writer)?;
+        assert_ne!(temp_version(&writer)?, before, "rebuilt");
+        assert_eq!(existing_triggers(&writer)?.len(), 3, "t's alone");
+        let schema: i64 = writer.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        assert_eq!(recorder.schema_version, Some(schema));
         Ok(())
     }
 
