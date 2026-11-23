@@ -444,6 +444,104 @@ async fn an_operation_id_resumes_after_detach_and_a_changed_argument_is_a_confli
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_fork_says_it_never_started_and_names_the_problem() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (daemon, fleet) = fleet(dir.path()).await?;
+    let checks = tokio::task::spawn_blocking(move || -> Sendable {
+        with_notes(&fleet)?;
+        let refused = fleet.run(&[
+            "db",
+            "fork",
+            "notes",
+            "notes-exp",
+            "--replication-factor",
+            "1",
+            "--min-replicas",
+            "2",
+        ])?;
+        assert_eq!(code(&refused), Some(1), "{}", stderr(&refused));
+        let id = printed_operation(&refused)?;
+        let text = stderr(&refused);
+        assert!(
+            text.contains(&format!(
+                "operation {id}: if this command stops, run it again with --operation-id {id}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("min_replicas 2 is above the replication factor 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("operation {id} was not started")),
+            "{text}"
+        );
+        assert!(!text.contains("Client specified"), "{text}");
+        Ok(())
+    });
+    let checked = checks.await;
+    daemon.run_until(async {}).await;
+    checked?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_held_by_the_same_sources_fork_says_how_that_fork_stands() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (daemon, fleet) = fleet(dir.path()).await?;
+    let checks = tokio::task::spawn_blocking(move || -> Sendable {
+        with_notes(&fleet)?;
+        // Held before the seeder asks the source, so the fork stays in `seeding`.
+        fleet.faults.hold(FaultPoint::Fetch);
+        let detached = fleet.ok(&["db", "fork", "notes", "notes-exp", "--detach"])?;
+        let id = printed_operation(&detached)?;
+        let again = fleet.run(&["db", "fork", "notes", "notes-exp"])?;
+        assert_eq!(code(&again), Some(1), "{}", stderr(&again));
+        let text = stderr(&again);
+        assert!(
+            text.contains("database 'notes-exp' already exists"),
+            "{text}"
+        );
+        assert!(!text.contains("Some entity"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "notes-exp is already a fork of notes, still seeding (operation {id}); wait for \
+                 it with `fleetring db fork notes notes-exp --operation-id {id}`"
+            )),
+            "{text}"
+        );
+        fleet.faults.release(FaultPoint::Fetch);
+        fleet.ok(&[
+            "db",
+            "fork",
+            "notes",
+            "notes-exp",
+            "--operation-id",
+            &id.to_string(),
+        ])?;
+        let ready = stderr(&fleet.run(&["db", "fork", "notes", "notes-exp"])?);
+        assert!(
+            ready.contains(&format!(
+                "notes-exp is already a fork of notes, and it is ready (operation {id})"
+            )),
+            "{ready}"
+        );
+        // A fork of another source holds the name as any database does.
+        fleet.ok(&["db", "create", "other", "--replication-factor", "1"])?;
+        let other = stderr(&fleet.run(&["db", "fork", "other", "notes-exp"])?);
+        assert!(
+            other.contains("`fleetring db show notes-exp` shows what holds the name"),
+            "{other}"
+        );
+        Ok(())
+    });
+    let checked = checks.await;
+    daemon.run_until(async {}).await;
+    checked?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_target_during_seeding_cancels_the_fork() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (daemon, fleet) = fleet(dir.path()).await?;
