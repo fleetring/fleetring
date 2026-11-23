@@ -214,27 +214,7 @@ impl Recorder {
         self.undone_by_rollback = Fresh::default();
         let start = start_bytes(start);
         if !self.created {
-            writer
-                .execute_batch(&format!(
-                    "CREATE TABLE IF NOT EXISTS \"{CHANGES_TABLE}\" (
-                        change_id INTEGER PRIMARY KEY,
-                        change_txn_id INTEGER NOT NULL,
-                        change_type INTEGER NOT NULL,
-                        table_name TEXT,
-                        id TEXT,
-                        before TEXT,
-                        after TEXT,
-                        updates TEXT,
-                        start BLOB NOT NULL);"
-                ))
-                .map_err(storage)?;
-            // An empty table holds nothing from before: from this transaction on, everything is
-            // recorded and held.
-            if oldest_start(writer)?.is_none() {
-                insert_floor(writer, 1, &start)?;
-            }
-            self.created = true;
-            self.undone_by_rollback.table = true;
+            self.create_table(writer, &start)?;
         }
         self.since_prune = self.since_prune.saturating_add(1);
         if self.since_prune >= PRUNE_EVERY
@@ -246,6 +226,71 @@ impl Recorder {
         let next = highest_id(writer)?.saturating_add(1);
         self.txn.id.store(next, Ordering::Relaxed);
         *self.txn.start.lock().expect("transaction lock poisoned") = start;
+        if self.schema_version.is_none() {
+            self.sync_triggers(writer)?;
+        }
+        Ok(())
+    }
+
+    /// Creates the change table if it is missing, with a floor at `start` if it holds no row.
+    fn create_table(&mut self, writer: &Connection, start: &[u8]) -> Result<(), EngineError> {
+        writer
+            .execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS \"{CHANGES_TABLE}\" (
+                    change_id INTEGER PRIMARY KEY,
+                    change_txn_id INTEGER NOT NULL,
+                    change_type INTEGER NOT NULL,
+                    table_name TEXT,
+                    id TEXT,
+                    before TEXT,
+                    after TEXT,
+                    updates TEXT,
+                    start BLOB NOT NULL);"
+            ))
+            .map_err(storage)?;
+        // An empty table holds nothing from before: from this transaction on, everything is
+        // recorded and held.
+        if oldest_start(writer)?.is_none() {
+            insert_floor(writer, 1, start)?;
+        }
+        self.created = true;
+        self.undone_by_rollback.table = true;
+        Ok(())
+    }
+
+    /// After a `ROLLBACK TO` that may have undone this transaction's [`begin`](Self::begin): a
+    /// change table it created may be gone.
+    pub(super) fn setup_may_be_undone(&mut self) {
+        if self.undone_by_rollback.table {
+            self.created = false;
+        }
+    }
+
+    /// After a `ROLLBACK TO`: builds the triggers for the schema it left. If it took the change
+    /// table back, the triggers built after the table went with it, and stay off until the next
+    /// write restores both: SQLite compiles a table's triggers into every statement that writes
+    /// it, so a trigger whose change table is missing would refuse that statement as it prepares.
+    pub(super) fn after_rollback_to(&mut self, writer: &Connection) -> Result<(), EngineError> {
+        if !self.created && !table_exists(writer)? {
+            self.schema_version = None;
+            return Ok(());
+        }
+        self.rebuild_triggers(writer)
+    }
+
+    /// Before the next write after [`setup_may_be_undone`](Self::setup_may_be_undone): restores
+    /// the change table. The transaction keeps its position and its id, which is still the id its
+    /// first row has or will get: a rollback gives back only ids above the rows that remain.
+    pub(super) fn set_up_again(&mut self, writer: &Connection) -> Result<(), EngineError> {
+        if !self.created {
+            let start = self
+                .txn
+                .start
+                .lock()
+                .expect("transaction lock poisoned")
+                .clone();
+            self.create_table(writer, &start)?;
+        }
         if self.schema_version.is_none() {
             self.sync_triggers(writer)?;
         }
@@ -340,6 +385,10 @@ impl Recorder {
     ///
     /// Fails if the triggers are off, so that a transaction can't commit rows nothing recorded.
     pub(super) fn commit(&self, writer: &Connection) -> Result<u64, EngineError> {
+        // A `ROLLBACK TO` took the table back, and with it everything this transaction recorded.
+        if !self.created && !table_exists(writer)? {
+            return Ok(0);
+        }
         if self.schema_version.is_none() {
             return Err(storage(std::io::Error::other(
                 "the change recorder's triggers are not in place",

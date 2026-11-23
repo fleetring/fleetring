@@ -1,6 +1,7 @@
 //! SQL sessions (ADR-0037): SQLite's own transaction semantics in the engine, and the actor that
 //! lets one session's transaction hold a database's writer.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,7 +9,7 @@ use fleetring_control::DatabaseName;
 use fleetringd::engine::{
     Autocommit, BatchCondition, BatchStep, CallOutcome, CallResult, CaptureMode, Database,
     DatabaseCapability, DatabaseEngine, EngineCapability, EngineError, Execution, Interrupt,
-    Interruption, OpenMode, PERMISSION_DENIED, Position, SAVEPOINT_OUTSIDE_TRANSACTION,
+    Interruption, OpenMode, PERMISSION_DENIED, Position, ReadLimit, SAVEPOINT_OUTSIDE_TRANSACTION,
     SessionAccess, SessionCall, SessionStatement, SqliteEngine, Statement, StatementOutcome,
     StepOutcome, Transaction, Value, WantRows, WriteIntent,
 };
@@ -924,6 +925,133 @@ fn a_rollback_keeps_the_marks_staged_through_a_later_commit_that_wrote_nothing()
     assert_eq!(recorded_mark(db.as_mut()), None);
     session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
     assert_eq!(recorded_mark(db.as_mut()), Some(mark));
+    Ok(())
+}
+
+#[test]
+fn a_transaction_that_only_reads_under_a_savepoint_writes_nothing() -> TestResult {
+    let scripts = [
+        "BEGIN; SAVEPOINT s; SELECT count(*) FROM t; RELEASE s; COMMIT;",
+        "BEGIN; SAVEPOINT s; SELECT count(*) FROM t; ROLLBACK TO s; COMMIT;",
+    ];
+    // With no change table yet, and with one.
+    for writes_first in [false, true] {
+        let dir = TempDir::new()?;
+        let mut db = recorded(dir.path())?;
+        if writes_first {
+            session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (1)");
+        }
+        let mark = Position::new([7]);
+        stage(db.as_mut(), &mark);
+        let before = log_end(db.as_mut());
+        for _ in 0..3 {
+            for script in scripts {
+                let result = run(
+                    db.as_mut(),
+                    &SessionCall::Sequence(script.to_owned()),
+                    SessionAccess::ReadWrite,
+                );
+                assert_eq!(result.outcome, CallOutcome::Sequence(Ok(())), "{script}");
+            }
+            for sql in [
+                "BEGIN",
+                "SAVEPOINT s",
+                "SELECT count(*) FROM t",
+                "RELEASE s",
+                "COMMIT",
+            ] {
+                session_ok(db.as_mut(), sql);
+            }
+            assert_eq!(log_end(db.as_mut()), before, "first write {writes_first}");
+        }
+        assert_eq!(recorded_mark(db.as_mut()), None, "still staged");
+        // The next real write carries it, and records its row.
+        session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+        assert_eq!(recorded_mark(db.as_mut()), Some(mark));
+        assert_eq!(
+            recorded_rows(db.as_mut(), before.as_ref()),
+            [(2, names(&["id", "a", "b"]))]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_write_undone_by_rollback_to_leaves_its_mark_staged() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let mark = Position::new([7]);
+    stage(db.as_mut(), &mark);
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT s",
+        "INSERT INTO t (id) VALUES (1)",
+        "ROLLBACK TO s",
+        "COMMIT",
+    ] {
+        session_ok(db.as_mut(), sql);
+    }
+    assert_eq!(
+        recorded_mark(db.as_mut()),
+        None,
+        "the rollback took it back"
+    );
+    session_ok(db.as_mut(), "INSERT INTO t (id) VALUES (2)");
+    assert_eq!(recorded_mark(db.as_mut()), Some(mark));
+    Ok(())
+}
+
+#[test]
+fn a_rollback_to_an_inner_savepoint_keeps_the_transaction_whole() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut db = recorded(dir.path())?;
+    let before = log_end(db.as_mut());
+    let mark = Position::new([7]);
+    stage(db.as_mut(), &mark);
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT a",
+        "INSERT INTO t (id) VALUES (1)",
+        "SAVEPOINT b",
+        "INSERT INTO t (id) VALUES (50)",
+        "ROLLBACK TO b",
+        "INSERT INTO t (id) VALUES (2)",
+        "COMMIT",
+        "BEGIN",
+        "SAVEPOINT c",
+        "INSERT INTO t (id) VALUES (3)",
+        "SAVEPOINT d",
+        "ROLLBACK TO d",
+        "COMMIT",
+        "INSERT INTO t (id) VALUES (4)",
+    ] {
+        session_ok(db.as_mut(), sql);
+    }
+    assert_eq!(recorded_mark(db.as_mut()), Some(mark));
+    let end = log_end(db.as_mut()).expect("a log");
+    let limit = ReadLimit::new(NonZeroUsize::MAX, NonZeroUsize::MAX);
+    let transactions = db
+        .logical_changes()
+        .expect("sqlite records changes")
+        .transactions_after(before.as_ref(), &end, limit)?;
+    let ids: Vec<Vec<Value>> = transactions
+        .iter()
+        .map(|transaction| {
+            transaction
+                .changes
+                .iter()
+                .flat_map(|change| change.key.iter().map(|column| column.value.clone()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)],
+        ]
+    );
     Ok(())
 }
 

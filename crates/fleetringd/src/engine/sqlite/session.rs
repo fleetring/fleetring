@@ -12,12 +12,14 @@
 //!   commits it, and `ROLLBACK` rolls it back; a `SAVEPOINT` outside a transaction is refused;
 //! - inside a transaction, every statement runs on the writer.
 //!
-//! A transaction's first write or `SAVEPOINT` records the staged sink marks and starts the change
-//! recorder's transaction, as an `Execute` does before its statements, so that no `ROLLBACK TO`
-//! can undo them, and its commit records the recorder's commit row first. A statement that changes
-//! the reserved namespace, or defines a trigger or view that names it, rolls the whole transaction
-//! back. An `ALTER TABLE` runs with the recorder's triggers off, and they are rebuilt once it
-//! ends, however it ends (the `changes` module).
+//! A transaction's first write records the staged sink marks and starts the change recorder's
+//! transaction, as an `Execute` does before its statements, and its commit records the recorder's
+//! commit row first. A transaction that only reads writes nothing, whatever savepoints it sets.
+//! When the first write ran under a savepoint, a `ROLLBACK TO` may undo what it set up, so the
+//! next write sets it up again. A statement that changes the reserved namespace, or defines a
+//! trigger or view that names it, rolls the whole transaction back. An `ALTER TABLE` runs with the
+//! recorder's triggers off, and they are rebuilt once it ends, however it ends (the `changes`
+//! module).
 //!
 //! A read-only session runs everything on the read connection, and refuses, without running it,
 //! any statement that isn't read-only or controls a transaction.
@@ -86,12 +88,26 @@ impl Class {
     }
 }
 
+/// How far a session's transaction has set up what its writes need: the staged marks recorded,
+/// the recorder's transaction started, and the reserved schema remembered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Setup {
+    /// Not at all: it has only read, and writes nothing when it commits.
+    #[default]
+    NotYet,
+    /// In place.
+    Done,
+    /// It ran under a savepoint, and a `ROLLBACK TO` since may have undone any of it. The next
+    /// write sets it up again.
+    MayBeUndone,
+}
+
 /// A transaction a session opened on the writer.
 #[derive(Debug, Default)]
 pub(super) struct OpenTransaction {
-    /// Whether it has written or set a savepoint: the staged marks were recorded, the recorder's
-    /// transaction started, and the reserved schema remembered.
-    wrote: bool,
+    setup: Setup,
+    /// Whether a `SAVEPOINT` ran before the setup did, so that a `ROLLBACK TO` can undo it.
+    savepoint_before_setup: bool,
 }
 
 /// What is left of the most rows one call's results may hold.
@@ -748,10 +764,7 @@ impl WriterSide<'_> {
             (true, Some(Control::Commit)) => return self.commit(prepared, statement, budget),
             _ => {}
         }
-        // A savepoint counts as a write here: what `begin_writing` sets up must come before it,
-        // or a `ROLLBACK TO` would take the change table, the triggers, and the marks away while
-        // the transaction goes on believing they are there.
-        if in_transaction && (class.writes() || class.control == Some(Control::Savepoint)) {
+        if in_transaction && class.writes() {
             match self.begin_writing() {
                 Ok(()) => {}
                 Err(EngineError::Statement { message }) => {
@@ -889,11 +902,7 @@ impl WriterSide<'_> {
         statement: Option<&SessionStatement>,
         budget: &mut Budget,
     ) -> Ran<StatementOutcome> {
-        let wrote = self
-            .transaction
-            .as_ref()
-            .is_some_and(|transaction| transaction.wrote);
-        if wrote
+        if self.has_set_up()
             && let Some(recorder) = self.recorder.as_ref()
             && let Err(error) = recorder.commit(self.conn)
         {
@@ -927,26 +936,39 @@ impl WriterSide<'_> {
         }
     }
 
-    /// Before a transaction's first write: records the staged sink marks, starts the recorder's
-    /// transaction, and remembers the reserved schema, as an `Execute` does.
+    /// Whether the open transaction has set up for writing, even if a `ROLLBACK TO` may have
+    /// undone it since.
+    fn has_set_up(&self) -> bool {
+        self.transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.setup != Setup::NotYet)
+    }
+
+    /// Before a statement that writes, unless the transaction is set up for it: records the staged
+    /// sink marks, starts the recorder's transaction, or restores it after a `ROLLBACK TO`, and
+    /// remembers the reserved schema, as an `Execute` does.
     fn begin_writing(&mut self) -> Result<(), EngineError> {
-        if self
+        let setup = self
             .transaction
             .as_ref()
-            .is_some_and(|transaction| transaction.wrote)
-        {
+            .map_or(Setup::NotYet, |transaction| transaction.setup);
+        if setup == Setup::Done {
             return Ok(());
         }
         if self.marks.is_staged() || self.recorder.is_some() {
             self.refuse_foreign_objects()?;
         }
+        // Upserts, so writing a mark that a `ROLLBACK TO` didn't undo after all changes nothing.
         self.marks.flush(self.conn)?;
         if let Some(recorder) = self.recorder.as_mut() {
-            recorder.begin(self.conn, *self.end)?;
+            match setup {
+                Setup::MayBeUndone => recorder.set_up_again(self.conn)?,
+                Setup::NotYet | Setup::Done => recorder.begin(self.conn, *self.end)?,
+            }
         }
         self.reserved.remember(self.conn)?;
         if let Some(transaction) = self.transaction.as_mut() {
-            transaction.wrote = true;
+            transaction.setup = Setup::Done;
         }
         Ok(())
     }
@@ -1029,12 +1051,30 @@ impl WriterSide<'_> {
     /// takes the schema, the recorder's triggers, and the schema's version back to what they were
     /// at the savepoint, which a later statement's schema change can bring back to a version
     /// already read. So the triggers are rebuilt for the schema it left, and the schema is read
-    /// afresh.
+    /// afresh. If the transaction set up for writing under a savepoint, a `ROLLBACK TO` may have
+    /// undone that too, and the next write sets it up again.
     fn after_savepoint_control(&mut self, control: Control) -> Result<(), EngineError> {
+        if let Some(transaction) = self.transaction.as_mut() {
+            match control {
+                Control::Savepoint if transaction.setup == Setup::NotYet => {
+                    transaction.savepoint_before_setup = true;
+                }
+                Control::RollbackTo
+                    if transaction.setup == Setup::Done && transaction.savepoint_before_setup =>
+                {
+                    transaction.setup = Setup::MayBeUndone;
+                    self.marks.rolled_back();
+                    if let Some(recorder) = self.recorder.as_mut() {
+                        recorder.setup_may_be_undone();
+                    }
+                }
+                _ => {}
+            }
+        }
         if control == Control::RollbackTo
             && let Some(recorder) = self.recorder.as_mut()
         {
-            recorder.rebuild_triggers(self.conn)?;
+            recorder.after_rollback_to(self.conn)?;
         }
         self.read_schema_afresh()
     }
@@ -1045,11 +1085,7 @@ impl WriterSide<'_> {
     fn read_schema_afresh(&mut self) -> Result<(), EngineError> {
         self.reserved.forget();
         self.conn.flush_prepared_statement_cache();
-        let wrote = self
-            .transaction
-            .as_ref()
-            .is_some_and(|transaction| transaction.wrote);
-        if wrote {
+        if self.has_set_up() {
             self.reserved.remember(self.conn)?;
         }
         Ok(())
