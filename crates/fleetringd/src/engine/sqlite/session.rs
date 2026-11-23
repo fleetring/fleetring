@@ -1050,8 +1050,8 @@ impl WriterSide<'_> {
     /// After a `SAVEPOINT`, `RELEASE`, or `ROLLBACK TO` inside the transaction. A `ROLLBACK TO`
     /// takes the schema, the recorder's triggers, and the schema's version back to what they were
     /// at the savepoint, which a later statement's schema change can bring back to a version
-    /// already read. So the triggers are rebuilt for the schema it left, and the schema is read
-    /// afresh. If the transaction set up for writing under a savepoint, a `ROLLBACK TO` may have
+    /// already read. So the triggers are rebuilt for the schema it left, if the transaction
+    /// changed them, and the schema is read afresh. If the transaction set up for writing under a savepoint, a `ROLLBACK TO` may have
     /// undone that too, and the next write sets it up again.
     fn after_savepoint_control(&mut self, control: Control) -> Result<(), EngineError> {
         if let Some(transaction) = self.transaction.as_mut() {
