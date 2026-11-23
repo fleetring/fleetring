@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use console::Term;
 use fleetringd::upgrade::Steps;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
 use tokio::task::JoinHandle;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -21,6 +22,14 @@ const SHOW_AFTER: Duration = Duration::from_millis(150);
 
 /// How often the spinner turns once it shows.
 const TICK: Duration = Duration::from_millis(80);
+
+/// How often a spinner may redraw, as indicatif's own stderr target does.
+const REDRAWS_PER_SECOND: u8 = 20;
+
+/// The columns a spinner leaves free at the terminal's right edge, room for the `^C` the terminal
+/// echoes at the cursor. A line drawn to the edge would wrap the echo onto the next row, and the
+/// spinner, which clears the row the cursor is on, would then leave its own line behind.
+const RIGHT_MARGIN: u16 = 3;
 
 /// Whether the command's output is for programs: `-o json`, `jsonl` or `--json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +167,7 @@ impl Progress {
             return Self::hidden();
         };
         let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::hidden());
-        bar.set_style(ProgressStyle::default_spinner());
+        bar.set_style(spinner_style());
         bar.set_message(message);
         let phase = Arc::new(Mutex::new(Phase::Waiting));
         let reveal = runtime.spawn({
@@ -169,7 +178,10 @@ impl Progress {
                 let mut phase = locked(&phase);
                 if *phase == Phase::Waiting {
                     *phase = Phase::Shown;
-                    bar.set_draw_target(ProgressDrawTarget::stderr());
+                    bar.set_draw_target(ProgressDrawTarget::term_like_with_hz(
+                        Box::new(SpinnerTerm(Term::buffered_stderr())),
+                        REDRAWS_PER_SECOND,
+                    ));
                     bar.enable_steady_tick(TICK);
                 }
             }
@@ -272,6 +284,63 @@ impl Stepped {
         if let Some(progress) = locked(&self.progress).take() {
             progress.finish_ok(message);
         }
+    }
+}
+
+/// A spinner's line: its message is cut to one row, so that the row it clears is the row it drew.
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {wide_msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+/// The width a spinner draws to on a terminal `columns` wide.
+fn drawn_width(columns: u16) -> u16 {
+    columns.saturating_sub(RIGHT_MARGIN).max(1)
+}
+
+/// Stderr as a spinner draws on it: the terminal, less [`RIGHT_MARGIN`].
+#[derive(Debug)]
+struct SpinnerTerm(Term);
+
+impl TermLike for SpinnerTerm {
+    fn width(&self) -> u16 {
+        drawn_width(TermLike::width(&self.0))
+    }
+
+    fn height(&self) -> u16 {
+        TermLike::height(&self.0)
+    }
+
+    fn move_cursor_up(&self, n: usize) -> io::Result<()> {
+        TermLike::move_cursor_up(&self.0, n)
+    }
+
+    fn move_cursor_down(&self, n: usize) -> io::Result<()> {
+        TermLike::move_cursor_down(&self.0, n)
+    }
+
+    fn move_cursor_right(&self, n: usize) -> io::Result<()> {
+        TermLike::move_cursor_right(&self.0, n)
+    }
+
+    fn move_cursor_left(&self, n: usize) -> io::Result<()> {
+        TermLike::move_cursor_left(&self.0, n)
+    }
+
+    fn write_line(&self, s: &str) -> io::Result<()> {
+        TermLike::write_line(&self.0, s)
+    }
+
+    fn write_str(&self, s: &str) -> io::Result<()> {
+        TermLike::write_str(&self.0, s)
+    }
+
+    fn clear_line(&self) -> io::Result<()> {
+        TermLike::clear_line(&self.0)
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        TermLike::flush(&self.0)
     }
 }
 
@@ -457,6 +526,13 @@ mod tests {
         ] {
             assert!(surroundings.colour(ColorChoice::Auto));
         }
+    }
+
+    #[test]
+    fn a_spinner_leaves_room_at_the_edge_for_the_echoed_interrupt() {
+        assert_eq!(drawn_width(100), 97);
+        assert_eq!(drawn_width(3), 1, "never no width at all");
+        assert_eq!(drawn_width(0), 1);
     }
 
     #[test]

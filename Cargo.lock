@@ -805,6 +805,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "console",
  "dialoguer",
  "divan",
  "flate2",
