@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "fleetringd"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",

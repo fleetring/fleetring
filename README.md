@@ -31,14 +31,17 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Contexts: `fleetring context` names a fleet's addresses, certificates and principal once, and `fleetring switch` moves between fleets
 - `fleetring dev`: one command for a local node on a laptop, over the same TLS and scopes as a fleet
 - `fleetring mcp`: an MCP server over stdio, so an agent creates, finds, queries, follows, forks, and drops its own databases as one scoped principal, with text others wrote marked untrusted; `fleetring agent` gives each agent an identity of its own
-
-**New in 0.8.0** (2026-11-18), with two fix releases since: 0.8.1 gives every new database a random incarnation, and 0.8.2, a security release, caps the TLS handshakes in progress on a node:
-
 - `fleetring router`: a libSQL/Hrana front door, so existing libSQL and Turso clients reach each database's primary unchanged
 - `fleetring db watch`, which follows a database's row changes, and an MCP `changes` tool
 - Database forks: `fleetring db fork` copies a database's current contents into a new, independent one, at a position its write quorum acknowledged
 - Online delegation: `fleetring agent delegate` gives a child agent a narrower, shorter-lived credential from the control plane, recorded with its lineage, and revoking any ancestor ends every agent below it
 - Membership changes hand replica sets over on joint quorums, so a write acknowledged just before a node joins or leaves survives the next failover
+
+**New in 0.9.0** (2026-11-24):
+
+- Vector search: sqlite-vec 0.1.9 is compiled into the binary, so `vec0` tables hold embeddings you compute and answer exact nearest-neighbour queries, and they replicate, archive, restore, and fail over like any table
+- Safer drops: a node deletes its copy of a database only when a tombstone in control state names that copy, so a lost or replaced control plane deletes nothing, and a follower whose primary crashed before a drop still deletes its copy
+- `ALTER TABLE` and `DROP TABLE` work on tables whose row changes are recorded, which includes every table on a dev node
 
 **Planned**, each tracked as a [GitHub issue](https://github.com/fleetring/fleetring/issues):
 
@@ -48,7 +51,7 @@ SQLite is now a server-side building block, and a database per agent or tenant i
 - Keyed leases, Merkle anti-entropy, and cells in the daemon
 - A terminal UI and a desktop app
 - Archive follow-ups: acknowledging a write once it is archived, workload-identity credentials, and Vercel Blob
-- An agent launcher that sandboxes agents, vector search, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
+- An agent launcher that sandboxes agents, a Turso adapter, a Rust client, framework adapters, and a Ruby gem
 - apt, yum, AUR, and Homebrew packages
 
 ## Install
