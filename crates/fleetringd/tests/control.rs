@@ -3811,12 +3811,12 @@ mod forks {
         status
     }
 
-    /// FR-096: while a member runs 0.7.0, which reports `undrain`, `metadata` and `expiry` but
-    /// not `fork`, `db fork` is refused naming it, nothing is logged, and creations keep the
+    /// FR-096: while a member on the previous release line reports `undrain`, `metadata` and
+    /// `expiry` but not `fork`, `db fork` is refused naming it, nothing is logged, and creations keep the
     /// legacy incarnation. Once it rejoins on a release with `fork`, the first fork is accepted
     /// and enables the feature.
     #[tokio::test]
-    async fn a_fork_is_refused_naming_a_0_7_member_until_it_runs_0_8() -> TestResult {
+    async fn a_fork_is_refused_naming_a_member_without_fork_until_it_reports_it() -> TestResult {
         let dir = tempfile::tempdir()?;
         let tls = Tls::create(dir.path())?;
         let text = format!(
@@ -3828,13 +3828,14 @@ mod forks {
         let daemon = Daemon::start(Config::from_toml(&text)?).await?;
         let address = daemon.control_address().ok_or("no control address")?;
         let handle = daemon.control().ok_or("no control node")?;
-        let v0_7_0 = Software {
+        let previous = super::previous_line().to_string();
+        let without_fork = Software {
             features: ["undrain", "metadata", "expiry"]
                 .map(str::to_owned)
                 .to_vec(),
-            ..reporting("0.7.0")
+            ..reporting(&previous)
         };
-        for (id, software) in [("a", forking()), ("b", forking()), ("old", v0_7_0)] {
+        for (id, software) in [("a", forking()), ("b", forking()), ("old", without_fork)] {
             node_client(address, &tls, id)?
                 .join(join_with(id, Some(software)))
                 .await?;
@@ -3848,7 +3849,7 @@ mod forks {
             .await
             .expect_err("a member lacks fork");
         assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
-        for part in ["node 'old'", "0.7.0", "fork"] {
+        for part in ["node 'old'", previous.as_str(), "fork"] {
             assert!(refused.message().contains(part), "{part}: {refused}");
         }
         let state = handle.state();
