@@ -974,6 +974,7 @@ impl Default for ReplicationConfig {
 /// heartbeat_timeout_ms = 5000
 /// tick_interval_ms = 250      # how often the control node looks for expired leases
 /// snapshot_every = 1000       # commands between snapshots
+/// tombstone_window_ms = 604800000  # how long a dropped database's tombstone is kept: 7 days
 /// issuer_cert = "/etc/fleetring/tls/issuer.control-1.crt"  # the delegation issuer pair, from
 /// issuer_key = "/etc/fleetring/tls/issuer.control-1.key"   # `fleetring cert issuer`
 /// ```
@@ -1008,6 +1009,10 @@ pub struct ControlSettings {
     pub tick_interval_ms: NonZeroU64,
     /// How many commands the control node applies between snapshots.
     pub snapshot_every: NonZeroU64,
+    /// How long a dropped or expired database's tombstone is kept, in milliseconds (ADR-0050).
+    /// Unlike the timings above, it takes effect on an existing log, at the next drop. A node
+    /// down for longer keeps its copy as an orphan.
+    pub tombstone_window_ms: NonZeroU64,
     /// The PEM file with the delegation issuer certificate (ADR-0047, point 1.3). Set with
     /// `issuer_key`, on a node that runs the control role.
     pub issuer_cert: Option<PathBuf>,
@@ -1055,6 +1060,7 @@ impl Default for ControlSettings {
             heartbeat_timeout_ms: nonzero(config.heartbeat_timeout()),
             tick_interval_ms: nonzero(DEFAULT_TICK_INTERVAL),
             snapshot_every: crate::control::ControlOptions::default().snapshot_every(),
+            tombstone_window_ms: nonzero(fleetring_control::DEFAULT_TOMBSTONE_WINDOW),
             issuer_cert: None,
             issuer_key: None,
         }

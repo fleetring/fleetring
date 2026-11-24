@@ -330,6 +330,45 @@ pub(super) fn drop_rpc(
     });
 }
 
+/// Takes the tombstones a heartbeat's reply carried (ADR-0050, point 4): each that names this
+/// node's copy, or a staged copy of its fork, is queued as a drop for the lease keeper, which
+/// reads control state's tombstones again under the name's lock before it deletes anything. One
+/// that names neither changes nothing, so a tombstone of an earlier database of the name costs
+/// no work on every heartbeat.
+pub(super) fn learn_tombstones(inner: &Inner, tombstones: &[fleetring_proto::v1::Tombstone]) {
+    for tombstone in tombstones {
+        let Ok(name) = tombstone.database.parse::<DatabaseName>() else {
+            continue;
+        };
+        let incarnation = Incarnation::new(tombstone.incarnation);
+        let epoch = LeaseEpoch::new(tombstone.epoch);
+        let operation = tombstone
+            .operation
+            .as_deref()
+            .and_then(|bytes| crate::control::fork::operation_from_proto(bytes).ok());
+        let record = inner.epochs.record(&name);
+        let copy_named = fleetring_control::tombstone_names_copy(
+            incarnation,
+            epoch,
+            record.incarnation(),
+            LeaseEpoch::new(record.highest()),
+        );
+        let staged_named = operation.is_some_and(|operation| {
+            let fork =
+                fleetring_control::fork::ForkIdentity::new(name.clone(), incarnation, operation);
+            inner
+                .forks
+                .store()
+                .of_name(&name)
+                .iter()
+                .any(|staged| staged.sidecar.key.fork == fork)
+        });
+        if copy_named || staged_named {
+            drop_rpc(inner, name, epoch, Some(incarnation), operation);
+        }
+    }
+}
+
 /// Refuses a stream of `database` whose primary names `named` as the database's incarnation when
 /// this node's copy records another (ADR-0046's amendment, item 9): the copy is a dropped
 /// database's of the name, and is kept as an orphan, never followed as this one's. Checked
@@ -627,23 +666,6 @@ impl Replication {
     #[must_use]
     pub fn highest_epoch(&self, database: &DatabaseName) -> Option<LeaseEpoch> {
         self.inner.epochs.highest(database).map(LeaseEpoch::new)
-    }
-
-    /// Whether a drop of `database` at `epoch`, naming `incarnation` if it names one, names this
-    /// node's copy (ADR-0042, point 2): `None` if it has none. See
-    /// [`highest_epoch`](Self::highest_epoch) and [`copy_incarnation`](Self::copy_incarnation)
-    /// for what the copy records; a copy of the dropped incarnation at a lower epoch is named
-    /// too.
-    #[must_use]
-    pub fn drop_names_copy(
-        &self,
-        database: &DatabaseName,
-        epoch: LeaseEpoch,
-        incarnation: Option<Incarnation>,
-    ) -> Option<bool> {
-        self.inner
-            .epochs
-            .names_copy(database, epoch.get(), incarnation.map(Incarnation::get))
     }
 
     /// The highest epoch this node has seen for the database of `database` at `incarnation`:

@@ -90,10 +90,10 @@ service Control {
   rpc WatchMembership(WatchMembershipRequest) returns (stream MembershipUpdate);
   // Scope: admin on the database.
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
-  // Removes a database for good: its record, lease, and any promotion. The control node tells
-  // its replicas through `Replication.DropCopy`, and each closes and deletes its copy; one that
-  // misses the notice keeps its copy as an orphan (ADR-0042). `Locate` answers NOT_FOUND from
-  // then on.
+  // Removes a database for good: its record, lease, and any promotion, leaving a tombstone. The
+  // control node tells its replicas through `Replication.DropCopy`, and each closes and deletes
+  // its copy once it has read the tombstone; one that misses the notice learns of it from its
+  // heartbeats (ADR-0050). `Locate` answers NOT_FOUND from then on.
   // Scope: admin on the database.
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
   // Records new durability settings for a database, which take effect at its next lease
@@ -190,6 +190,34 @@ service Control {
   // Lists live delegation records, never tokens, for incident response (ADR-0047, point 6.4).
   // Scope: fleet.
   rpc ListDelegations(ListDelegationsRequest) returns (ListDelegationsResponse);
+  // The tombstones control state keeps of the named databases (ADR-0050): the positive record of
+  // a drop or expiry, the only thing a data node deletes a copy on. A control node that predates
+  // them answers UNIMPLEMENTED, and the node keeps its copy.
+  // Scope: fleet.
+  rpc ListTombstones(ListTombstonesRequest) returns (ListTombstonesResponse);
+}
+
+message ListTombstonesRequest {
+  repeated string databases = 1;
+}
+
+message ListTombstonesResponse {
+  repeated Tombstone tombstones = 1;
+}
+
+// What control state keeps of a database it dropped or expired, for a bounded window (ADR-0050).
+message Tombstone {
+  string database = 1;
+  // The dropped database's random incarnation.
+  fixed64 incarnation = 2;
+  // The epoch the database was at when it was dropped.
+  uint64 epoch = 3;
+  // The operation that made it, if it was a fork.
+  optional bytes operation = 4;
+  // When it was dropped, and when the tombstone may be forgotten, in milliseconds since the Unix
+  // epoch.
+  uint64 dropped_at_ms = 5;
+  uint64 kept_until_ms = 6;
 }
 
 message JoinRequest {
@@ -362,6 +390,10 @@ message HeartbeatRequest {
   // admission (ADR-0046, point 7.3). Unset by nodes that predate forks; recorded only once the
   // fleet has enabled `fork`.
   optional uint64 disk_free_bytes = 4;
+  // The names of the other copies the node holds, which `databases` leaves out: its orphans, and
+  // copies it follows that have no position yet. The reply carries their tombstones too
+  // (ADR-0050). Never logged.
+  repeated string unreported = 5;
 }
 
 message HeartbeatResponse {
@@ -375,6 +407,9 @@ message HeartbeatResponse {
   // The forks that aren't ready yet whose replica set names the node: it seeds them, or opens
   // them once seeded (ADR-0046, points 4 and 6). Empty from a control node that predates forks.
   repeated string forks = 4;
+  // The tombstones of the names in `databases` and `unreported` (ADR-0050): how a node that
+  // missed a drop learns of it. Empty from a control node that predates them.
+  repeated Tombstone tombstones = 5;
 }
 
 // A token, signing key, or principal on the denylist, and when the entry may be forgotten.

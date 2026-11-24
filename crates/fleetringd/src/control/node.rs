@@ -15,7 +15,8 @@ use std::{io, thread};
 use fleetring::NodeId;
 use fleetring_control::delegation::Resent;
 use fleetring_control::{
-    Action, Applied, Command, ControlConfig, Outcome, Rejection, State, apply,
+    Action, Applied, Command, ControlConfig, DEFAULT_TOMBSTONE_WINDOW, Millis, Outcome, Rejection,
+    State, apply,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -50,6 +51,7 @@ pub struct ControlOptions {
     mailbox: NonZeroUsize,
     storage_io: StorageIo,
     recorder: Option<NodeId>,
+    tombstone_window: Millis,
 }
 
 impl ControlOptions {
@@ -63,6 +65,7 @@ impl ControlOptions {
             mailbox: DEFAULT_MAILBOX,
             storage_io: StorageIo::DedicatedThread,
             recorder: None,
+            tombstone_window: DEFAULT_TOMBSTONE_WINDOW,
         }
     }
 
@@ -99,6 +102,14 @@ impl ControlOptions {
     #[must_use]
     pub const fn with_storage_io(mut self, storage_io: StorageIo) -> Self {
         self.storage_io = storage_io;
+        self
+    }
+
+    /// Keeps a new tombstone for `window` (ADR-0050). The writer logs it before the next drop
+    /// whenever control state's window differs, so a replay never reads the configuration.
+    #[must_use]
+    pub const fn with_tombstone_window(mut self, window: Millis) -> Self {
+        self.tombstone_window = window;
         self
     }
 
@@ -397,6 +408,7 @@ struct Writer {
     snapshot_every: NonZeroU64,
     clock: Box<dyn Clock>,
     recorder: Option<NodeId>,
+    tombstone_window: Millis,
     publish: watch::Sender<Arc<State>>,
     metrics: ControlMetrics,
 }
@@ -441,6 +453,7 @@ impl Writer {
             snapshot_every: options.snapshot_every,
             clock,
             recorder: options.recorder,
+            tombstone_window: options.tombstone_window,
             publish,
             metrics,
         };
@@ -537,7 +550,13 @@ impl Writer {
         for (action, reply) in submits {
             let membership = matches!(action, Action::Join { .. } | Action::Leave { .. });
             let mut enable = None;
+            // Before a drop, while the state's tombstone window isn't the configured one.
+            let dropping = matches!(
+                action,
+                Action::DropDatabase { .. } | Action::ExpireDatabase { .. }
+            ) && self.state.tombstones().window() != Some(self.tombstone_window);
             if needs_screening(&action)
+                || dropping
                 || (membership && !self.state.is_enabled(fleetring_control::Feature::Handover))
             {
                 let preview = preview.get_or_insert_with(|| {
@@ -563,6 +582,10 @@ impl Writer {
                     enable = Some(Action::EnableHandover);
                 } else if preview.incarnations_due(&action) {
                     enable = Some(Action::EnableIncarnations);
+                } else if preview.tombstones_due(&action, self.tombstone_window) {
+                    enable = Some(Action::SetTombstoneWindow {
+                        window: self.tombstone_window,
+                    });
                 }
             }
             if let Some(enabling) = enable {

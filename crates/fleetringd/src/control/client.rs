@@ -329,6 +329,22 @@ impl ControlClient {
         .await
     }
 
+    /// Reads the tombstones control state keeps of the named databases (ADR-0050). Retried.
+    ///
+    /// # Errors
+    ///
+    /// The status of the last attempt.
+    pub async fn list_tombstones(
+        &self,
+        request: fleetring_proto::v1::ListTombstonesRequest,
+    ) -> Result<fleetring_proto::v1::ListTombstonesResponse, Status> {
+        self.retrying(|mut client| {
+            let request = request.clone();
+            async move { client.list_tombstones(request).await }
+        })
+        .await
+    }
+
     /// Finds where a database lives. Retried.
     ///
     /// # Errors

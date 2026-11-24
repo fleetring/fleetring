@@ -34,7 +34,9 @@ pub fn release() -> Release {
 /// both write quorums while control state keeps a database's old replica set and report when
 /// placement's holds their log (ADR-0031, amendment 2), and [`Feature::Delegation`], since it
 /// enforces every rule of ADR-0047 points 3 and 11: the issuer path, the lineage checks,
-/// `Revoked::Principal` with its leeway by signer, and the unreadable-denylist rule (point 6.6).
+/// `Revoked::Principal` with its leeway by signer, and the unreadable-denylist rule (point 6.6),
+/// and [`Feature::Tombstones`], since its data nodes delete a copy only on a tombstone that names
+/// it (ADR-0050).
 ///
 /// Reporting a feature enables nothing: the fleet enables it at its first use (ADR-0038), so a
 /// fleet upgraded from 0.7 can still roll back until then.
@@ -47,7 +49,7 @@ pub fn running() -> Software {
 }
 
 /// The fleet features this build acts on in full.
-const SUPPORTED: [Feature; 7] = [
+const SUPPORTED: [Feature; 8] = [
     Feature::Undrain,
     Feature::Metadata,
     Feature::Expiry,
@@ -55,6 +57,7 @@ const SUPPORTED: [Feature; 7] = [
     Feature::Handover,
     Feature::Delegation,
     Feature::Incarnations,
+    Feature::Tombstones,
 ];
 
 /// What this build runs, as `fleetringd upgrade --software` prints it: one JSON object with the
@@ -136,7 +139,8 @@ mod tests {
                 "fork",
                 "handover",
                 "incarnations",
-                "metadata"
+                "metadata",
+                "tombstones"
             ])
         );
         // `upgrade --software` lists `expiry` now that the control node sweeps expired
@@ -152,7 +156,8 @@ mod tests {
                 "fork",
                 "delegation",
                 "handover",
-                "incarnations"
+                "incarnations",
+                "tombstones"
             ])
         );
         // An upgrade runs this build's `serve --check` before it swaps it in (#95).

@@ -102,6 +102,14 @@ pub enum Operation {
         /// The database.
         database: DatabaseName,
     },
+    /// Deletes `node`'s orphan copy of `database`, as `orphan remove` does: how a scenario clears
+    /// a copy of the legacy incarnation, which no tombstone can name (ADR-0050, point 3).
+    RemoveOrphan {
+        /// The node that keeps the orphan.
+        node: NodeId,
+        /// The database.
+        database: DatabaseName,
+    },
     /// Submits `action` to the control node in process, as its own fork driver would propose
     /// it: how a scenario delivers a delayed proposal, such as one for a fork identity that was
     /// dropped since (ADR-0046, point 12, row 18).
@@ -342,6 +350,9 @@ impl Operation {
             | Self::ImpostorSnapshot { database, .. } => Some(database),
             Self::Fork { target, .. }
             | Self::Drop { database: target }
+            | Self::RemoveOrphan {
+                database: target, ..
+            }
             | Self::Pad {
                 database: target, ..
             }
@@ -416,6 +427,9 @@ impl fmt::Display for Operation {
                 Ok(())
             }
             Self::Drop { database } => write!(f, "drop {database}"),
+            Self::RemoveOrphan { node, database } => {
+                write!(f, "remove {node}'s orphan of {database}")
+            }
             Self::Propose { action } => write!(f, "propose {action:?}"),
             Self::SeedingProbe {
                 to,
@@ -725,6 +739,8 @@ pub enum Ack {
     },
     /// The database was dropped.
     Dropped,
+    /// An orphan copy was deleted.
+    OrphanRemoved,
     /// The control node took a proposal: applied it, or refused it with a rejection that left
     /// its state as it was.
     Proposed {
@@ -811,6 +827,7 @@ impl fmt::Display for Ack {
             Self::Served => f.write_str("served"),
             Self::Forked { incarnation } => write!(f, "forked at incarnation {incarnation}"),
             Self::Dropped => f.write_str("dropped"),
+            Self::OrphanRemoved => f.write_str("orphan removed"),
             Self::Proposed { accepted: true } => f.write_str("proposal accepted"),
             Self::Proposed { accepted: false } => f.write_str("proposal refused"),
             Self::Padded => f.write_str("padded"),

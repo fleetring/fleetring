@@ -8,18 +8,20 @@
 //!   node can be granted a newer epoch meanwhile (point 6). Safety never depends on this timer:
 //!   followers fenced at a newer epoch refuse the old primary's batches, so it can't acknowledge
 //!   a write however long it takes to notice.
-//! - **Dropped databases.** A node deletes a copy only when it saw the database's drop itself
-//!   (ADR-0042): the control node that dropped or expired the database tells each replica
-//!   through `Replication.DropCopy`, and the replica deletes its copy once control state agrees
-//!   that it no longer holds the database at that epoch. Absence alone is never a drop: control
-//!   state that was lost, replaced, or rolled back, or a node pointed at another fleet, says
-//!   the same. So a renewal refused as an unknown database, a renewal refused because the name
-//!   now belongs to a database that has never been leased, a follower whose stream ends and
-//!   finds the database gone or at a lower epoch, and a recovery pass that finds the same, each
-//!   keep the copy as an **orphan**: closed, neither served nor replicated, logged at warn once,
-//!   listed in `status --node`, and counted in `fleetring_databases_orphaned`. A creation or
-//!   restore of the name on the node refuses it, naming it, and `fleetringd orphan remove`
-//!   deletes it.
+//! - **Dropped databases.** A node deletes a copy only on a **tombstone** in control state that
+//!   names it: the copy's own random incarnation, at an epoch at least as high as the copy's
+//!   highest (ADR-0050). The control node that dropped or expired the database tells each
+//!   replica through `Replication.DropCopy`, and every heartbeat's reply carries the tombstones
+//!   of the node's copies and orphans, so a node that was down or partitioned learns of the drop
+//!   too. Either way the node reads the tombstones again under the name's lock before it deletes
+//!   anything. Absence alone is never a drop: control state that was lost, replaced, or rolled
+//!   back, or a node pointed at another fleet, says the same. So a renewal refused as an unknown
+//!   database, a renewal refused because the name now belongs to a database that has never been
+//!   leased, a follower whose stream ends and finds the database gone or at a lower epoch, and a
+//!   recovery pass that finds the same, each keep the copy as an **orphan**: closed, neither
+//!   served nor replicated, logged at warn once, listed in `status --node`, and counted in
+//!   `fleetring_databases_orphaned`. A creation or restore of the name on the node refuses it,
+//!   naming it, and `fleetringd orphan remove` deletes it.
 //! - **Retiring.** A primary that stops serving because the control plane no longer knows its
 //!   database, by a notice or a refused renewal, admits no write after that. It flushes the
 //!   database's change streams, its archive included, for up to [`DROP_FLUSH_LIMIT`] (ADR-0041,
@@ -32,7 +34,8 @@
 //!   same moment as the notice. Until then, the node refuses to create or restore
 //!   a database of the same name with `UNAVAILABLE`, which clients retry, and the deletion
 //!   leaves the copy alone if the node serves the name at another epoch by then. A node that
-//!   was down when the drop happened gets no notice, and keeps its copy as an orphan.
+//!   was down when the drop happened keeps its copy as an orphan until a heartbeat brings the
+//!   tombstone, and for good if the tombstone's window passed first.
 //! - **After a restart**, the node asks the control plane about every database it has an epoch
 //!   record for, and leads each one whose lease it holds at once, rather than when the first
 //!   request arrives. The same pass reads its copies' positions, so its heartbeats report them.
@@ -56,7 +59,8 @@ use std::time::Duration;
 use fleetring::NodeId;
 use fleetring_control::{DatabaseName, LeaseEpoch};
 use fleetring_proto::v1::{
-    CompletePromotionRequest, Placement, RecordFencedRequest, RenewLeaseRequest,
+    CompletePromotionRequest, ListTombstonesRequest, Placement, RecordFencedRequest,
+    RenewLeaseRequest,
 };
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -559,28 +563,20 @@ async fn keep_orphan(node: &DataNode, database: &DatabaseName, why: &'static str
     }
 }
 
-/// Acts on a drop a control node told this node of (ADR-0042): deletes this node's copy of
-/// `database`, after flushing its change streams if this node serves it.
+/// Acts on a drop this node was told of, by a control node's notice or a heartbeat's tombstone
+/// (ADR-0050): deletes this node's copy of `database`, after flushing its change streams if this
+/// node serves it, if control state keeps a tombstone that names the copy.
 ///
-/// The copy is deleted only if the notice names this copy's incarnation: when both the notice
-/// and the copy name an incarnation, the same one, at the copy's highest epoch or a later one,
-/// since a copy that missed the database's later epochs is the dropped database's all the same;
-/// otherwise, the copy's highest epoch is exactly the notice's, the one the database was dropped
-/// at. A database created again under the name restarts its epochs, so the epoch alone doesn't
-/// tell a late notice for the dropped database from one for the copy's. A notice or a copy
-/// without an incarnation, from a release before them, is judged by the epoch alone, and such a
-/// replica that missed a promotion keeps its copy as an orphan.
-/// The copy is deleted only while control state still agrees, too: it never holds the database
-/// a notice's random incarnation names, whatever the epoch (a notice naming the live database
-/// at a later epoch is forged or wrong); and it holds no database of the name, or one at a
-/// lower epoch, or, when the copy records the notice's random incarnation, one of another
-/// incarnation at any epoch, since a database created again under the name restarts its epochs
-/// and may have reached the copy's by the time the notice is judged. All of this is judged
-/// again here, under the name's lock, since a database of the name may have been created and
-/// leased since the notice arrived. A control plane that can't be reached is asked again, up
-/// to [`DROP_CHECK_ATTEMPTS`] times [`DROP_CHECK_INTERVAL`] apart and without the name's lock
-/// meanwhile, as a control node that just restarted may not answer at once; after that the
-/// copy stays, and becomes an orphan the usual way.
+/// The notice only says when to look. What decides is a tombstone read from control state under
+/// the name's lock, so that no create, restore, or orphan removal of the name runs meanwhile: one that
+/// names the random incarnation the copy records, at the copy's highest epoch or a later one,
+/// since a copy that missed the database's later epochs is the dropped database's all the same.
+/// A database created again under the name has another incarnation, so an old tombstone never
+/// names its copy, and a forged notice deletes nothing, since it can't make a tombstone. A copy
+/// that records no incarnation is never named. A control plane that can't be reached is asked
+/// again, up to [`DROP_CHECK_ATTEMPTS`] times [`DROP_CHECK_INTERVAL`] apart and without the name's
+/// lock meanwhile, as a control node that just restarted may not answer at once; after that the
+/// copy stays, and the next heartbeat's tombstone tries again.
 async fn drop_seen(
     node: &DataNode,
     database: &DatabaseName,
@@ -620,43 +616,32 @@ async fn judge_drop(
     dropped: &mpsc::UnboundedSender<Dropped>,
 ) -> Judged {
     let epoch = notice.epoch;
-    // No create, restore, or orphan removal of the name runs while the notice is judged and
-    // acted on, so the copy judged is the copy deleted.
+    // No create, restore, or orphan removal of the name runs while the notice is judged and acted
+    // on, so the copy judged is the copy deleted.
     let _name = node.lock_name(database).await;
     let replication = node.replication();
+    if replication.copy_epoch(database).is_none() {
+        return Judged::Settled;
+    }
     let highest = replication
         .highest_epoch(database)
         .unwrap_or(LeaseEpoch::ZERO);
-    match replication.drop_names_copy(database, epoch, notice.incarnation) {
-        Some(true) => {}
-        None => return Judged::Settled,
-        Some(false) => {
-            let recorded = replication.copy_incarnation(database);
-            tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), named = ?notice.incarnation, ?recorded, "a drop notice names another incarnation than this node's copy; kept the copy");
-            return Judged::Settled;
-        }
-    }
-    let random = notice
-        .incarnation
-        .filter(|named| *named != fleetring_control::Incarnation::LEGACY);
-    // The copy records the random incarnation the notice names, so it is the dropped database's:
-    // a database of another incarnation in control state is one created again under the name,
-    // whatever epoch it has reached.
-    let names_recorded =
-        random.is_some_and(|named| replication.copy_incarnation(database) == Some(named));
-    match node.locate(database).await {
-        Ok(placement) if random.is_some_and(|named| named.get() == placement.incarnation) => {
-            tracing::info!(database = %database, epoch = epoch.get(), "the control plane still holds the database the drop notice names; kept the copy");
-            return Judged::Settled;
-        }
-        Ok(_) if names_recorded => {}
-        Ok(placement) if placement.epoch < epoch.get() => {}
-        Err(status) if missing_database(&status).is_some() => {}
-        Ok(_) => {
-            tracing::info!(database = %database, epoch = epoch.get(), "the control plane holds the name at the dropped epoch again; kept the copy");
-            return Judged::Settled;
-        }
+    let recorded = replication.copy_incarnation(database);
+    let tombstones = match tombstones_of(node, database).await {
+        Ok(tombstones) => tombstones,
         Err(status) => return Judged::Unconfirmed(status),
+    };
+    let named = tombstones.iter().any(|tombstone| {
+        fleetring_control::tombstone_names_copy(
+            fleetring_control::Incarnation::new(tombstone.incarnation),
+            LeaseEpoch::new(tombstone.epoch),
+            recorded,
+            highest,
+        )
+    });
+    if !named {
+        tracing::info!(database = %database, epoch = epoch.get(), highest = highest.get(), named = ?notice.incarnation, ?recorded, "no tombstone names this node's copy; kept the copy");
+        return Judged::Settled;
     }
     // The copy goes at its own highest epoch, the notice's or, for a copy that missed the
     // database's later epochs, a lower one: a newer database's copy here would have moved past it.
@@ -682,10 +667,25 @@ async fn judge_drop(
     Judged::Settled
 }
 
+/// The tombstones control state keeps of `database`.
+async fn tombstones_of(
+    node: &DataNode,
+    database: &DatabaseName,
+) -> Result<Vec<fleetring_proto::v1::Tombstone>, Status> {
+    let response = node
+        .inner
+        .control
+        .list_tombstones(ListTombstonesRequest {
+            databases: vec![database.to_string()],
+        })
+        .await?;
+    Ok(response.tombstones)
+}
+
 /// Acts on a drop notice that names a fork identity (ADR-0046, point 4.6): deletes this node's
 /// staged copies of `database` at `incarnation` made by `operation`, of every attempt, if control
-/// state agrees, judged again under the name's lock, that it no longer holds that fork: it holds
-/// no database of the name, or one of another incarnation. Its fetches stop too.
+/// state keeps a tombstone of exactly that fork, read under the name's lock (ADR-0050). Its
+/// fetches stop too.
 async fn drop_staged(
     node: &DataNode,
     database: &DatabaseName,
@@ -694,16 +694,19 @@ async fn drop_staged(
 ) {
     let _name = node.lock_name(database).await;
     let fork = fleetring_control::fork::ForkIdentity::new(database.clone(), incarnation, operation);
-    let gone = match node.locate(database).await {
-        Ok(placement) => placement.incarnation != incarnation.get(),
-        Err(status) if missing_database(&status).is_some() => true,
+    let operation_bytes = operation.to_bytes();
+    let gone = match tombstones_of(node, database).await {
+        Ok(tombstones) => tombstones.iter().any(|tombstone| {
+            tombstone.incarnation == incarnation.get()
+                && tombstone.operation.as_deref() == Some(operation_bytes.as_slice())
+        }),
         Err(status) => {
-            tracing::info!(%fork, %status, "can't confirm a fork's drop notice with the control plane; kept its staged copies");
+            tracing::info!(%fork, %status, "can't read the fork's tombstone from the control plane; kept its staged copies");
             return;
         }
     };
     if !gone {
-        tracing::info!(%fork, "the control plane still holds the fork a drop notice names; kept its staged copies");
+        tracing::info!(%fork, "no tombstone names the fork a drop notice names; kept its staged copies");
         return;
     }
     node.replication()

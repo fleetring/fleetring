@@ -22,8 +22,9 @@ use crate::{
     Timestamp,
 };
 
-/// Checks that a new database may take `incarnation`: it isn't the legacy 0, and no database or
-/// fork operation records it (ADR-0046, point 1).
+/// Checks that a new database may take `incarnation`: it isn't the legacy 0, and no database,
+/// fork operation, or tombstone records it (ADR-0046, point 1; ADR-0050), so that a tombstone
+/// can never name a later database.
 ///
 /// # Errors
 ///
@@ -36,7 +37,8 @@ pub(crate) fn check_incarnation(state: &State, incarnation: Incarnation) -> Resu
         || state
             .fork_operations
             .values()
-            .any(|record| record.target_incarnation() == incarnation);
+            .any(|record| record.target_incarnation() == incarnation)
+        || state.tombstones.holds_incarnation(incarnation);
     if used {
         return Err(Rejection::IncarnationUnavailable { incarnation });
     }

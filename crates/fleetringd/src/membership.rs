@@ -373,6 +373,17 @@ pub trait DatabaseStatuses: fmt::Debug + Send + Sync + 'static {
     fn disk_free_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// The names of the other copies this node holds, which `statuses` leaves out: its orphans,
+    /// and copies it follows that have no position yet. A heartbeat's reply carries their
+    /// tombstones too (ADR-0050).
+    fn unreported_copies(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Takes the tombstones a heartbeat's reply carried: how a node that missed a drop learns of
+    /// it (ADR-0050, point 4).
+    fn learn_tombstones(&self, _tombstones: &[fleetring_proto::v1::Tombstone]) {}
 }
 
 impl<T: DatabaseStatuses + ?Sized> DatabaseStatuses for Arc<T> {
@@ -382,6 +393,14 @@ impl<T: DatabaseStatuses + ?Sized> DatabaseStatuses for Arc<T> {
 
     fn disk_free_bytes(&self) -> Option<u64> {
         (**self).disk_free_bytes()
+    }
+
+    fn unreported_copies(&self) -> Vec<String> {
+        (**self).unreported_copies()
+    }
+
+    fn learn_tombstones(&self, tombstones: &[fleetring_proto::v1::Tombstone]) {
+        (**self).learn_tombstones(tombstones);
     }
 }
 
@@ -742,6 +761,7 @@ impl Heartbeats {
             databases: self.databases.statuses(),
             software: Some(self.software.clone()),
             disk_free_bytes: self.databases.disk_free_bytes(),
+            unreported: self.databases.unreported_copies(),
         };
         let sent = tokio::time::Instant::now();
         let result = timeout(self.limit, self.client.heartbeat(request)).await;
@@ -758,6 +778,7 @@ impl Heartbeats {
             self.unknown = unknown;
             self.denylist
                 .receive(revocations_from_proto(response.revocations.clone()));
+            self.databases.learn_tombstones(&response.tombstones);
             let forks: std::collections::BTreeSet<fleetring_control::DatabaseName> = response
                 .forks
                 .iter()

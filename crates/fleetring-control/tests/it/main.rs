@@ -19,4 +19,5 @@ mod rollback;
 mod scenarios;
 mod software;
 mod tokens_vectors;
+mod tombstones;
 mod upgrade;

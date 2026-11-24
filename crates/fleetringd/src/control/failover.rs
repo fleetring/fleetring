@@ -265,7 +265,7 @@ async fn run(
         let now = clock.now();
         let current = handle.state();
         let idle = now.as_millis().saturating_sub(current.now().as_millis()) >= tick.get();
-        if (idle || delegation::tick_due(&current, now))
+        if (idle || delegation::tick_due(&current, now) || current.tombstones().purge_due(now))
             && handle.submit(Action::Tick).await.is_err()
         {
             return;

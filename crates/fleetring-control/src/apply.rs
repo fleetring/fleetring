@@ -23,10 +23,11 @@ use crate::mutation::Mutation;
 use crate::scope::GrantStepError;
 use crate::state::{MemberEntry, build_ring, quorums_for};
 use crate::{
-    Action, Command, Database, DatabaseName, DescriptionChange, Durability, DurabilityError,
-    Engine, ExpiryChange, Feature, HostedReplica, Incarnation, IncarnationRule, Lease, LeaseEpoch,
-    MAX_LABELS, Member, Metadata, MetadataChange, MetadataSpec, Position, PrincipalName, Promotion,
-    Quorums, Release, Revoked, Software, State, Timestamp, TokenId,
+    Action, Command, DEFAULT_TOMBSTONE_WINDOW, Database, DatabaseName, DescriptionChange,
+    Durability, DurabilityError, Engine, ExpiryChange, Feature, HostedReplica, Incarnation,
+    IncarnationRule, Lease, LeaseEpoch, MAX_LABELS, Member, Metadata, MetadataChange, MetadataSpec,
+    Millis, Position, PrincipalName, Promotion, Quorums, Release, Revoked, Software, State,
+    Timestamp, TokenId, Tombstone, TombstoneCause,
 };
 
 /// The result of applying a command: what changed, or why nothing did.
@@ -189,6 +190,7 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
             state.revocations.forget_through(now);
             forks::tick(state, now);
             delegation_state::forget_through(state, now);
+            state.tombstones.purge_through(now);
             Ok(Applied::Ticked { at: now })
         }
         Action::Drain { id } => drain(state, id),
@@ -286,6 +288,10 @@ pub fn apply(state: &mut State, command: Command) -> Outcome {
         } => crate::handover::release_kept_replicas(state, database, incarnation, epoch),
         Action::EnableHandover => Ok(Applied::HandoverEnabled),
         Action::EnableIncarnations => Ok(Applied::IncarnationsEnabled),
+        Action::SetTombstoneWindow { window } => {
+            state.tombstones.set_window(window);
+            Ok(Applied::TombstoneWindowSet { window })
+        }
     }?;
     if let Some(before) = ring_before
         && state.membership_epoch != membership_epoch
@@ -481,6 +487,12 @@ pub enum Applied {
         epoch: LeaseEpoch,
         /// The expiry that had passed.
         expires_at: Timestamp,
+    },
+
+    /// The window new tombstones are kept for was set, and the `tombstones` feature enabled.
+    TombstoneWindowSet {
+        /// How long a new tombstone is kept.
+        window: Millis,
     },
 
     /// A fork was created and started seeding at attempt 1.
@@ -1680,7 +1692,35 @@ fn remove_database(
         entry.reports.remove(name);
     }
     forks::dropped(state, &database, now, cause);
+    record_tombstone(state, now, &database, cause);
     Some(database)
+}
+
+/// Leaves a tombstone of `database`, just dropped for `cause`, once the fleet has enabled the
+/// feature. A database of the legacy incarnation leaves none: that incarnation names every
+/// database of the name made before incarnations, so no tombstone could tell their copies apart,
+/// and its replicas keep their copies as orphans (ADR-0050, point 3).
+fn record_tombstone(state: &mut State, now: Timestamp, database: &Database, cause: CancelCause) {
+    if !state.is_enabled(Feature::Tombstones) || database.incarnation().is_legacy() {
+        return;
+    }
+    let window = state
+        .tombstones
+        .window()
+        .unwrap_or(DEFAULT_TOMBSTONE_WINDOW);
+    let cause = match cause {
+        CancelCause::Expired => TombstoneCause::Expired,
+        CancelCause::Dropped => TombstoneCause::Dropped,
+    };
+    let tombstone = Tombstone::new(
+        database.incarnation(),
+        database.epoch(),
+        database.fork().map(crate::fork::Fork::operation),
+        cause,
+        now,
+        now.saturating_add(window),
+    );
+    state.tombstones.record(database.name(), tombstone);
 }
 
 fn acquire_lease(

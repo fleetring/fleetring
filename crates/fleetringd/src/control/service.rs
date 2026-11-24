@@ -1,5 +1,6 @@
 //! The gRPC `Control` service over the control node (ADR-0017, ADR-0019).
 
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -26,10 +27,11 @@ use fleetring_proto::v1::{
     ForkDatabaseRequest, ForkOperationStatus, GetForkOperationRequest, HeartbeatRequest,
     HeartbeatResponse, JoinRequest, JoinResponse, LeaseResponse, LeaveRequest, LeaveResponse,
     ListDatabasesRequest, ListDatabasesResponse, ListDelegationsRequest, ListDelegationsResponse,
-    LocateRequest, LocateResponse, MembershipUpdate, Placement, PromotionResponse,
-    RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest, RevokeTokenRequest,
-    RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest, UndrainRequest,
-    UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse, WatchMembershipRequest,
+    ListTombstonesRequest, ListTombstonesResponse, LocateRequest, LocateResponse, MembershipUpdate,
+    Placement, PromotionResponse, RecordFencedRequest, RecordFencedResponse, RenewLeaseRequest,
+    RevokeTokenRequest, RevokeTokenResponse, StartPromotionRequest, TransferLeaseRequest,
+    UndrainRequest, UndrainResponse, UpdateDatabaseRequest, UpdateDatabaseResponse,
+    WatchMembershipRequest,
 };
 use fleetring_proto::{PROTOCOL_VERSION, check_protocol};
 use tokio_stream::wrappers::WatchStream;
@@ -1059,6 +1061,39 @@ pub fn rejection_status(rejection: &Rejection) -> Status {
     }
 }
 
+/// The most names one `ListTombstones` may ask about.
+const MAX_TOMBSTONE_NAMES: usize = 1_024;
+
+/// The tombstones `state` keeps of `names`, in the order asked; a name that isn't valid has none.
+fn tombstones_to_proto<'n>(
+    state: &State,
+    names: impl Iterator<Item = &'n str>,
+) -> Vec<fleetring_proto::v1::Tombstone> {
+    let tombstones = state.tombstones();
+    if tombstones.is_empty() {
+        return Vec::new();
+    }
+    names
+        .filter_map(|name| name.parse::<DatabaseName>().ok())
+        .flat_map(|name| {
+            tombstones
+                .of(&name)
+                .iter()
+                .map(|tombstone| fleetring_proto::v1::Tombstone {
+                    database: name.to_string(),
+                    incarnation: tombstone.incarnation().get(),
+                    epoch: tombstone.epoch().get(),
+                    operation: tombstone
+                        .operation()
+                        .map(|operation| operation.to_bytes().to_vec()),
+                    dropped_at_ms: tombstone.dropped_at().as_millis(),
+                    kept_until_ms: tombstone.kept_until().as_millis(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// The metadata key of a `NOT_FOUND` status about an unknown database; its value names the
 /// database.
 pub const MISSING_DATABASE_KEY: &str = "fleetring-missing-database";
@@ -1529,6 +1564,14 @@ impl Control for ControlService {
         let request = request.into_inner();
         let id: NodeId = parse("node id", &request.node_id)?;
         peer.check_node(&id, "Heartbeat")?;
+        // The names whose tombstones the reply carries (ADR-0050). The unreported ones go no
+        // further: a heartbeat's log entry holds only what the node reports it hosts.
+        let reported: BTreeSet<String> = request
+            .databases
+            .iter()
+            .map(|status| status.database.clone())
+            .chain(request.unreported.iter().cloned())
+            .collect();
         let mut replicas = Vec::with_capacity(request.databases.len());
         let mut progress = Vec::new();
         for status in request.databases {
@@ -1567,6 +1610,26 @@ impl Control for ControlService {
             unknown_databases,
             revocations: revocations_to_proto(state.revocations()),
             forks: pending_forks(&state, &id),
+            tombstones: tombstones_to_proto(&state, reported.iter().map(String::as_str)),
+        }))
+    }
+
+    /// The tombstones control state keeps of the names asked for (ADR-0050). A data node reads
+    /// them under a name's lock before it deletes a copy.
+    async fn list_tombstones(
+        &self,
+        request: Request<ListTombstonesRequest>,
+    ) -> Result<Response<ListTombstonesResponse>, Status> {
+        let databases = request.into_inner().databases;
+        if databases.len() > MAX_TOMBSTONE_NAMES {
+            return Err(Status::invalid_argument(format!(
+                "asked for the tombstones of {} names; the most is {MAX_TOMBSTONE_NAMES}",
+                databases.len()
+            )));
+        }
+        let state = self.node.state();
+        Ok(Response::new(ListTombstonesResponse {
+            tombstones: tombstones_to_proto(&state, databases.iter().map(String::as_str)),
         }))
     }
 

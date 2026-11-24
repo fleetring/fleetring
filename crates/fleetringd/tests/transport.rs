@@ -59,6 +59,7 @@ impl Control for StubControl {
             unknown_databases: Vec::new(),
             revocations: Vec::new(),
             forks: Vec::new(),
+            tombstones: Vec::new(),
         }))
     }
 
@@ -122,6 +123,13 @@ impl Control for StubControl {
         &self,
         _request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn list_tombstones(
+        &self,
+        _: Request<fleetring_proto::v1::ListTombstonesRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListTombstonesResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 

@@ -149,6 +149,30 @@ fn make_a_fork(fleet: &mut Fleet) -> Result<()> {
     Ok(())
 }
 
+/// Waits until each of `hosts` keeps its copy of `database` as an orphan, then removes them, as
+/// an operator would: a database of the legacy incarnation leaves no tombstone, so a drop deletes
+/// none of its copies (ADR-0050, point 3).
+fn remove_legacy_orphans(fleet: &mut Fleet, hosts: &[&str], database: &DatabaseName) -> Result<()> {
+    let (watched, waiting) = (database.clone(), hosts.to_vec());
+    fleet.run_until(LIMIT, "the legacy copies kept as orphans", |fleet| {
+        waiting.iter().all(|host| {
+            fleet
+                .replication(host)
+                .is_some_and(|replication| replication.is_orphan(&watched))
+        })
+    })?;
+    let removals = hosts
+        .iter()
+        .map(|host| {
+            Ok(Operation::RemoveOrphan {
+                node: host.parse()?,
+                database: database.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    run_script(fleet, "operator", removals)
+}
+
 /// The second life's acknowledged writes alone: the history checker leaves a dropped name out.
 fn second_life(history: &History) -> History {
     let mut life = History::default();
@@ -236,6 +260,9 @@ fn scenario(seed: u64, forks: Forks) -> TestResult {
             .data_dir(host)
             .is_some_and(|dir| dir.join("databases").join("reused").exists())
     };
+    if let Forks::Never = forks {
+        remove_legacy_orphans(&mut fleet, &[primary.as_str(), cut.as_str()], &database)?;
+    }
     let deleting = cut.clone();
     fleet.run_until(LIMIT, "T deleting its copy", |fleet| {
         !copy_on(fleet, &deleting)
@@ -621,6 +648,9 @@ fn late_drop_notice_then_primary_lost(seed: u64, first_life: FirstLife) -> TestR
             .data_dir(host)
             .is_some_and(|dir| dir.join("databases").join("reused").exists())
     };
+    if let FirstLife::BeforeTheUpgrade = first_life {
+        remove_legacy_orphans(&mut fleet, &[primary.as_str(), prompt.as_str()], &database)?;
+    }
     let (p, t) = (primary.clone(), prompt.clone());
     fleet.run_until(LIMIT, "P and T deleting their copies", |fleet| {
         !copy_on(fleet, &p) && !copy_on(fleet, &t)

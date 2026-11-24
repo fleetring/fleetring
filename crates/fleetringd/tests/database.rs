@@ -4703,12 +4703,11 @@ mod orphans {
         Ok(())
     }
 
-    /// FR-077: a late notice for an earlier database of the name, at the epoch this node's copy
-    /// is at, deletes nothing once control state no longer knows the name: the copy recorded its
-    /// own incarnation when this node led it, and the notice names another. A notice naming the
-    /// copy's own incarnation still deletes it.
+    /// FR-077: a notice deletes nothing on a control plane that holds no tombstone of the copy
+    /// (ADR-0050, point 2), whichever incarnation it names: an earlier database's, or the copy's
+    /// own, as a stolen node key would send to a fleet whose control state was lost.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_late_drop_notice_for_another_incarnation_keeps_the_copy() -> TestResult {
+    async fn a_drop_notice_without_a_tombstone_keeps_the_copy() -> TestResult {
         let dir = tempfile::tempdir()?;
         let (fleet, switch) = proxied_fleet(dir.path()).await?;
         let client = fleet.client()?;
@@ -4723,7 +4722,7 @@ mod orphans {
             .copy_incarnation(&solo)
             .ok_or("the primary's copy records no incarnation")?;
 
-        // Control state forgets the name, so it confirms a drop of it at any incarnation.
+        // Control state forgets the name, and holds no tombstone of it.
         let fleet = replace_control_plane(fleet, &switch, dir.path(), &[]).await?;
         wait_until("the primary keeping its copy as an orphan", async || {
             orphans_of(&fleet, primary.as_str())
@@ -4757,16 +4756,155 @@ mod orphans {
         replication_client(sender.channel(&address)?)
             .drop_copy(notice(recorded))
             .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(copies(dir.path(), "solo"), before, "the copy is kept");
+        assert_eq!(
+            orphans_of(&fleet, primary.as_str()).await?,
+            [("solo".to_owned(), 1)]
+        );
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// FR-077: a replica that was down when its database was dropped deletes its copy when it
+    /// comes back, on the tombstone its first heartbeats bring, with no notice and no restart of
+    /// anything else (ADR-0050, point 4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replica_down_during_the_drop_deletes_its_copy_on_the_tombstone() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = Fleet::start(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "doomed", three()?).await?;
+        let doomed = name("doomed")?;
+        let location = client.locate(&doomed).await?;
+        let follower = location
+            .followers()
+            .next()
+            .ok_or("no follower")?
+            .node
+            .to_string();
+
+        let Fleet { control, data, tls } = fleet;
+        let mut kept = Vec::new();
+        let mut stopped = None;
+        for daemon in data {
+            if daemon.config().node.id.as_str() == follower {
+                let config = daemon.config().clone();
+                daemon.run_until(async {}).await;
+                stopped = Some(config);
+            } else {
+                kept.push(daemon);
+            }
+        }
+        let config = stopped.ok_or("the follower isn't a data daemon")?;
+        let running = Fleet {
+            control,
+            data: kept,
+            tls,
+        };
+        running.client()?.drop_database(&doomed).await?;
+        wait_until("only the stopped replica's copy left", async || {
+            let left = copies(dir.path(), "doomed");
+            left.len() == 1 && left.iter().all(|(id, _)| *id == follower)
+        })
+        .await?;
+        // Long enough that every notice to the stopped node has been given up on.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        let Fleet {
+            control,
+            mut data,
+            tls,
+        } = running;
+        data.push(fleetringd::Daemon::start(config).await?);
+        let fleet = Fleet { control, data, tls };
         // The node deletes the copy's files before it stops listing the orphan, so it may list
         // one of no size for a moment: the deletion is done once neither is left.
-        wait_until("the copy deleted", async || {
-            copies(dir.path(), "solo").is_empty()
-                && node_status(&fleet, primary.as_str())
+        wait_until("the returning replica deleting its copy", async || {
+            copies(dir.path(), "doomed").is_empty()
+                && node_status(&fleet, &follower)
                     .await
                     .is_ok_and(|status| status.orphans.is_empty())
         })
         .await?;
-        assert!(orphans_of(&fleet, primary.as_str()).await?.is_empty());
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// FR-077: a database dropped and created again under its name, with a replica that was down
+    /// throughout, is never deleted by the old tombstone: the returning replica deletes the old
+    /// copy, and the new database's copies, at the same epoch as the tombstone, all stay
+    /// (ADR-0050, point 1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tombstone_never_deletes_the_database_created_again() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = Fleet::start(dir.path()).await?;
+        let client = fleet.client()?;
+        let reused = name("reused")?;
+        create_noted(dir.path(), &client, "reused", three()?).await?;
+        assert_eq!(client.drop_database(&reused).await?.get(), 1);
+        wait_until("every old copy deleted", async || {
+            copies(dir.path(), "reused").is_empty()
+        })
+        .await?;
+        create_noted(dir.path(), &client, "reused", three()?).await?;
+        let location = client.locate(&reused).await?;
+        assert_eq!(location.epoch.get(), 1, "the tombstone's epoch too");
+        let before = copies(dir.path(), "reused");
+
+        // Several heartbeats carry the old tombstone to every replica.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(copies(dir.path(), "reused"), before, "nothing was deleted");
+        insert_note(&client, &reused, 4).await?;
+        for id in DATA {
+            assert!(orphans_of(&fleet, id).await?.is_empty(), "{id}");
+        }
+        fleet.stop().await;
+        Ok(())
+    }
+
+    /// A forged notice deletes nothing on an emptied control plane, whichever certificate sends
+    /// it and whichever incarnation and epoch it names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forged_notice_deletes_nothing_on_an_emptied_control_plane() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let (fleet, switch) = proxied_fleet(dir.path()).await?;
+        let client = fleet.client()?;
+        create_noted(dir.path(), &client, "trio", three()?).await?;
+        let expected = every_copy(dir.path(), &["trio"]);
+        let recorded = fleet
+            .data_daemon("data-1")?
+            .replication()
+            .ok_or("no replication")?
+            .copy_incarnation(&name("trio")?)
+            .map(fleetring_control::Incarnation::get);
+        let fleet = replace_control_plane(fleet, &switch, dir.path(), &[]).await?;
+        wait_until("every node reporting its orphan", async || {
+            reports(&fleet, &expected).await
+        })
+        .await?;
+        for incarnation in [None, recorded] {
+            for sender_id in ["intruder-9", "data-1"] {
+                let sender = fleet.tls.node_network(sender_id)?;
+                for id in DATA {
+                    let address = fleet.data_daemon(id)?.listen_address().to_string();
+                    for epoch in [7, 1] {
+                        // Refused or accepted, it must delete nothing.
+                        let _answer = replication_client(sender.channel(&address)?)
+                            .drop_copy(DropCopyRequest {
+                                database: "trio".to_owned(),
+                                epoch,
+                                incarnation,
+                                operation: None,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(copies(dir.path(), "trio").len(), DATA.len());
+        assert!(reports(&fleet, &expected).await, "every copy is an orphan");
         fleet.stop().await;
         Ok(())
     }
