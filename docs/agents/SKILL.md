@@ -278,7 +278,7 @@ SELECT state, count(*) AS tasks FROM tasks GROUP BY state ORDER BY state;
 
 ### Vectors
 
-`fleetring` has sqlite-vec 0.1.9 compiled in, from the release after 0.8.2 (FR-069): a `vec0` table holds embeddings you compute, since FleetRing embeds nothing itself, and answers exact nearest-neighbour queries. Extensions still can't be loaded, so `vec0` is the only vector table there is. Keep one embedding per note in a `vec0` table keyed by the note's ID, and send each vector as JSON text. `float[4]` keeps the example short; declare your model's dimension, such as `float[1536]`. Delete before you insert, so a retried write replaces the vector instead of failing on the existing ID.
+`fleetring` has sqlite-vec 0.1.9 compiled in, from 0.9.0 (FR-069): a `vec0` table holds embeddings you compute, since FleetRing embeds nothing itself, and answers exact nearest-neighbour queries. Extensions still can't be loaded, so `vec0` is the only vector table there is. Keep one embedding per note in a `vec0` table keyed by the note's ID, and send each vector as JSON text. `float[4]` keeps the example short; declare your model's dimension, such as `float[1536]`. Delete before you insert, so a retried write replaces the vector instead of failing on the existing ID.
 
 ```sql
 CREATE VIRTUAL TABLE IF NOT EXISTS note_vec USING vec0 (
