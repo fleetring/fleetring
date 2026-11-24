@@ -28,6 +28,7 @@ mod recreated;
 mod replication;
 mod router;
 mod snapshot_chain;
+mod tombstones;
 
 use std::error::Error;
 

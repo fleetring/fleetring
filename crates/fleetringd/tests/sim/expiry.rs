@@ -5,9 +5,9 @@
 //! The control node crashes and restarts before the first expiry passes, and the primary of one
 //! expiring database crashes before its expiry and comes back after it. By the end:
 //!
-//! - every database whose expiry passed is gone from control state (a follower whose primary
-//!   crashed before it noticed the drop may keep its copy until it restarts: ADR-0041,
-//!   amendment 7);
+//! - every database whose expiry passed is gone from control state (a follower that missed the
+//!   notice deletes its copy on the tombstone its next heartbeat brings: ADR-0050, and
+//!   `tests/sim/tombstones.rs`);
 //! - none was dropped before its expiry by the simulated clock: every `ExpireDatabase` in the
 //!   log is stamped at or after the expiry its database was created with, and nothing else
 //!   dropped one;
@@ -129,8 +129,9 @@ fn expiries(seed: u64) -> TestResult {
     fleet.run_for(Duration::from_secs(1))?;
     fleet.restart(&primary)?;
 
-    // Followers of a database whose primary crashed before it noticed the drop keep their
-    // copies until they restart (ADR-0041, amendment 7), so only control state is checked here.
+    // Followers that missed a notice delete their copies on the tombstone a later heartbeat
+    // brings (ADR-0050), which `tests/sim/tombstones.rs` checks; only control state is checked
+    // here.
     fleet.run_until(
         Duration::from_secs(90),
         "every expired database gone from control state",

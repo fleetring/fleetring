@@ -681,6 +681,9 @@ async fn open_control(
     // layer's leader ID (ADR-0047, point 6.1).
     let options = ControlOptions::new(config.control.control_config())
         .with_snapshot_every(config.control.snapshot_every)
+        .with_tombstone_window(fleetring_control::Millis::new(
+            config.control.tombstone_window_ms.get(),
+        ))
         .with_storage_io(environment.control_storage_io())
         .with_recorder(config.node.id.clone());
     let path = data_dir.path().join(CONTROL_DB);
@@ -910,6 +913,19 @@ impl DatabaseStatuses for ReplicationStatuses {
 
     fn disk_free_bytes(&self) -> Option<u64> {
         self.0.get().and_then(DatabaseStatuses::disk_free_bytes)
+    }
+
+    fn unreported_copies(&self) -> Vec<String> {
+        self.0
+            .get()
+            .map(DatabaseStatuses::unreported_copies)
+            .unwrap_or_default()
+    }
+
+    fn learn_tombstones(&self, tombstones: &[fleetring_proto::v1::Tombstone]) {
+        if let Some(replication) = self.0.get() {
+            replication.learn_tombstones(tombstones);
+        }
     }
 }
 

@@ -256,11 +256,19 @@ pub enum Feature {
     /// replayed such a creation would store the legacy incarnation, which the copies of the
     /// database it created don't record.
     Incarnations,
+    /// Tombstones (ADR-0050): control state remembers each database it drops or expires, by
+    /// incarnation and epoch, for a bounded window, and a data node deletes a copy only on a
+    /// tombstone that names it.
+    /// [`Action::SetTombstoneWindow`](crate::Action::SetTombstoneWindow) enables it, which the
+    /// control node's writer logs just before the first drop or expiry once every member
+    /// supports it. Until then a drop records nothing and every replica keeps its copy as an
+    /// orphan: a mixed fleet fails closed.
+    Tombstones,
 }
 
 impl Feature {
     /// Every feature this release knows, in order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Undrain,
         Self::Metadata,
         Self::Expiry,
@@ -268,6 +276,7 @@ impl Feature {
         Self::Delegation,
         Self::Handover,
         Self::Incarnations,
+        Self::Tombstones,
     ];
 
     /// Returns the feature's name, as members report it and errors print it.
@@ -281,6 +290,7 @@ impl Feature {
             Self::Delegation => "delegation",
             Self::Handover => "handover",
             Self::Incarnations => "incarnations",
+            Self::Tombstones => "tombstones",
         }
     }
 }
@@ -547,7 +557,7 @@ mod tests {
         let stored = serde_json::to_string(&software).expect("serializes");
         assert_eq!(
             stored,
-            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["delegation","expiry","fork","handover","incarnations","metadata"]}"#
+            r#"{"release":"0.6.0","control_format":1,"features":["undrain"],"newer_features":["delegation","expiry","fork","handover","incarnations","metadata","tombstones"]}"#
         );
         assert_eq!(
             serde_json::from_str::<Software>(&stored).expect("decodes"),

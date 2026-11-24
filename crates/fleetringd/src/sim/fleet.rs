@@ -621,6 +621,7 @@ fn host_config(
             heartbeat_timeout_ms: nonzero("the heartbeat timeout", timings.heartbeat_timeout)?,
             tick_interval_ms: nonzero("the tick interval", timings.tick_interval)?,
             snapshot_every: timings.snapshot_every,
+            tombstone_window_ms: crate::config::ControlSettings::default().tombstone_window_ms,
             issuer_cert: None,
             issuer_key: None,
         },

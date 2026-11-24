@@ -1230,6 +1230,31 @@ impl DatabaseStatuses for Replication {
     fn disk_free_bytes(&self) -> Option<u64> {
         self.inner.forks.disk_free_bytes()
     }
+
+    fn unreported_copies(&self) -> Vec<String> {
+        let mut names: BTreeSet<String> = self
+            .inner
+            .lock_orphans()
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        // A follower of a database with an empty log has no position to report, and no ended
+        // stream asks about it again once the control node can be reached.
+        names.extend(self.inner.lock_followers().keys().map(ToString::to_string));
+        names.extend(
+            self.inner
+                .forks
+                .store()
+                .orphans()
+                .into_iter()
+                .map(|(key, _)| key.fork.name.to_string()),
+        );
+        names.into_iter().collect()
+    }
+
+    fn learn_tombstones(&self, tombstones: &[fleetring_proto::v1::Tombstone]) {
+        failover::learn_tombstones(&self.inner, tombstones);
+    }
 }
 
 /// Whether a lease event says a lease was gained or lost.

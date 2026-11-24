@@ -203,6 +203,13 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Listing(&[Action::Read]),
         Binding::None,
     ),
+    // A data node reads the tombstones of the names it holds copies of (ADR-0050). A read that
+    // changes nothing, so there is nothing to bind it to.
+    node_too(
+        "/fleetring.v1.Control/ListTombstones",
+        Requirement::Fleet,
+        Binding::None,
+    ),
     rpc(
         "/fleetring.v1.Control/AcquireLease",
         Requirement::Node,
@@ -832,6 +839,7 @@ mod tests {
         let reads: BTreeSet<&str> = [
             "/fleetring.v1.Control/WatchMembership",
             "/fleetring.v1.Control/Locate",
+            "/fleetring.v1.Control/ListTombstones",
         ]
         .into_iter()
         .collect();
@@ -1221,6 +1229,7 @@ mod tests {
         let daemon_calls = [
             "/fleetring.v1.Control/WatchMembership",
             "/fleetring.v1.Control/Locate",
+            "/fleetring.v1.Control/ListTombstones",
             "/fleetring.v1.Control/Leave",
             "/fleetring.v1.Control/Drain",
             "/fleetring.v1.Control/TransferLease",

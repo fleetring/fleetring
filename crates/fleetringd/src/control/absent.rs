@@ -118,6 +118,13 @@ impl Control for NoControl {
         self.refuse()
     }
 
+    async fn list_tombstones(
+        &self,
+        _: Request<fleetring_proto::v1::ListTombstonesRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListTombstonesResponse>, Status> {
+        self.refuse()
+    }
+
     async fn list_databases(
         &self,
         _: Request<ListDatabasesRequest>,

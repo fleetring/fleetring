@@ -3,15 +3,13 @@
 //! deletes its copy.
 //!
 //! A data node never deletes a copy because control state doesn't know its database: an empty,
-//! older, or foreign control state says the same. The notice is the positive signal instead:
-//! only a control node that applied the drop sends one. The receiving node still checks with
-//! control state before it deletes anything.
+//! older, or foreign control state says the same. It deletes one only on a tombstone in control
+//! state that names the copy (ADR-0050), and the notice is what tells it to look now.
 //!
 //! Notices are best effort and kept nowhere. A node that is down or unreachable for every
-//! attempt gets none, and keeps its copy as an orphan for an operator to remove; tombstones in
-//! control state (#105) will let it learn of the drop later. A node that can't check a notice
-//! against control state yet, as just after a control node restarts, answers `UNAVAILABLE`,
-//! and is told again like a node that can't be reached.
+//! attempt gets none, and learns of the drop from the tombstones its next heartbeats bring. A
+//! node that can't check a notice against control state yet, as just after a control node
+//! restarts, answers `UNAVAILABLE`, and is told again like a node that can't be reached.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -158,5 +156,5 @@ async fn tell(peers: &Peers, recipient: &Recipient, request: DropCopyRequest) {
             Err(_) => peers.forget(address),
         }
     }
-    tracing::info!(%node, database = %request.database, epoch = request.epoch, "can't tell a replica of a drop; it keeps its copy as an orphan");
+    tracing::info!(%node, database = %request.database, epoch = request.epoch, "can't tell a replica of a drop; it learns of it from the tombstone");
 }

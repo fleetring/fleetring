@@ -660,6 +660,13 @@ impl Control for Redirecting {
         self.redirect()
     }
 
+    async fn list_tombstones(
+        &self,
+        _: Request<fleetring_proto::v1::ListTombstonesRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListTombstonesResponse>, Status> {
+        self.redirect()
+    }
+
     async fn list_databases(
         &self,
         _: Request<ListDatabasesRequest>,
@@ -4119,6 +4126,7 @@ impl Control for Publishing {
             unknown_databases: Vec::new(),
             revocations: self.published(),
             forks: Vec::new(),
+            tombstones: Vec::new(),
         }))
     }
 
@@ -4179,6 +4187,13 @@ impl Control for Publishing {
     }
 
     async fn locate(&self, _: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
+        unimplemented_stub()
+    }
+
+    async fn list_tombstones(
+        &self,
+        _: Request<fleetring_proto::v1::ListTombstonesRequest>,
+    ) -> Result<Response<fleetring_proto::v1::ListTombstonesResponse>, Status> {
         unimplemented_stub()
     }
 

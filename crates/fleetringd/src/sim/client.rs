@@ -341,6 +341,7 @@ async fn execute(
                     .collect(),
                 software: Some(software_to_proto(&running())),
                 disk_free_bytes: *disk_free_bytes,
+                unreported: Vec::new(),
             })
             .await
             .map(|_| Ack::HeartbeatRecorded),
@@ -368,6 +369,7 @@ async fn execute(
                 databases: Vec::new(),
                 software: Some(software_to_proto(&running())),
                 disk_free_bytes: None,
+                unreported: Vec::new(),
             })
             .await
             .map(|_| Ack::HeartbeatRecorded),
@@ -375,6 +377,10 @@ async fn execute(
             return submit(shared, Action::Leave { id: node.clone() }, Ack::Left).await;
         }
         Operation::Drop { database } => data.drop_database(database).await.map(|_| Ack::Dropped),
+        Operation::RemoveOrphan { node, database } => data
+            .remove_orphan(&format!("{node}:{PORT}"), database)
+            .await
+            .map(|_| Ack::OrphanRemoved),
         Operation::Propose { action } => return propose(shared, (**action).clone()).await,
         Operation::SeedingProbe {
             to,

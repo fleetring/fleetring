@@ -147,6 +147,7 @@ pub mod scope;
 mod software;
 mod state;
 mod time;
+mod tombstone;
 
 pub use apply::{Applied, JoinKind, Outcome, Rejection, apply};
 pub use command::{Action, Command, UnknownReports};
@@ -171,6 +172,10 @@ pub use revocation::{
 pub use software::{Feature, ParseFeatureError, ParseReleaseError, Release, Software};
 pub use state::{State, membership_ring};
 pub use time::{Millis, Timestamp};
+pub use tombstone::{
+    DEFAULT_TOMBSTONE_WINDOW, MAX_TOMBSTONES, MAX_TOMBSTONES_PER_NAME, Tombstone, TombstoneCause,
+    Tombstones, tombstone_names_copy,
+};
 
 // Public types must stay shareable across threads; a refactor that breaks this fails to compile.
 const _: () = {
@@ -178,6 +183,9 @@ const _: () = {
     assert_debug_send_sync::<Acks>();
     assert_debug_send_sync::<Added>();
     assert_debug_send_sync::<Action>();
+    assert_debug_send_sync::<Tombstone>();
+    assert_debug_send_sync::<TombstoneCause>();
+    assert_debug_send_sync::<Tombstones>();
     assert_debug_send_sync::<Applied>();
     assert_debug_send_sync::<Command>();
     assert_debug_send_sync::<ControlConfig>();

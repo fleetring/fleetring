@@ -12,8 +12,8 @@ use crate::fork::{
 use crate::scope::Scopes;
 use crate::{
     DatabaseName, Durability, Engine, Feature, HostedReplica, Incarnation, IncarnationRule,
-    LeaseEpoch, Member, MetadataChange, MetadataSpec, Position, PrincipalName, Revoked, Software,
-    Timestamp,
+    LeaseEpoch, Member, MetadataChange, MetadataSpec, Millis, Position, PrincipalName, Revoked,
+    Software, Timestamp,
 };
 
 /// The features of a command that needs database metadata.
@@ -29,6 +29,7 @@ const HANDOVER: &[Feature] = &[Feature::Handover];
 /// What a creation under [`IncarnationRule::Always`] needs, with or without metadata and an
 /// expiry.
 const INCARNATIONS: &[Feature] = &[Feature::Incarnations];
+const TOMBSTONES: &[Feature] = &[Feature::Tombstones];
 const METADATA_AND_INCARNATIONS: &[Feature] = &[Feature::Metadata, Feature::Incarnations];
 const METADATA_EXPIRY_AND_INCARNATIONS: &[Feature] =
     &[Feature::Metadata, Feature::Expiry, Feature::Incarnations];
@@ -240,11 +241,9 @@ pub enum Action {
     },
 
     /// Removes a database for good: its record, its lease, any promotion in progress, and every
-    /// member's report of it.
-    ///
-    /// The lease holder learns of the drop when its next renewal is refused as an unknown
-    /// database, and followers when their streams end and the control plane no longer knows the
-    /// database. Logs written before this action existed never contain it.
+    /// member's report of it. Once [`Feature::Tombstones`] is enabled, a database with a random
+    /// incarnation leaves a [`Tombstone`](crate::Tombstone), the only thing a data node deletes
+    /// its copy on (ADR-0050). Logs written before this action existed never contain it.
     DropDatabase {
         /// The database's name.
         name: DatabaseName,
@@ -297,7 +296,8 @@ pub enum Action {
     },
 
     /// Changes nothing but the time, and forgets what the time has passed: revocations, fork
-    /// operations, and delegation records, operations, tombstones, and rate-window times.
+    /// operations, database tombstones past their window, and delegation records, operations,
+    /// tombstones, and rate-window times.
     ///
     /// The control node submits one when no other command has arrived for a while, so that
     /// liveness and lease expiry, which are judged at the time of the last command, move on
@@ -631,6 +631,17 @@ pub enum Action {
     /// the feature, which decodes the creation but not this command, refuses the log rather than
     /// replay the creation to the legacy incarnation. Needs [`Feature::Incarnations`].
     EnableIncarnations,
+
+    /// Enables [`Feature::Tombstones`] for good and sets how long a new tombstone is kept
+    /// (ADR-0050). Tombstones already kept keep their own time. The control node's writer logs
+    /// it just before a drop or an expiry, when every member supports the feature and the window
+    /// isn't the one it is configured with
+    /// ([`State::tombstones_due`](crate::State::tombstones_due)), so that whether a drop leaves
+    /// a tombstone, and for how long, depends on the log alone. Needs [`Feature::Tombstones`].
+    SetTombstoneWindow {
+        /// How long a new tombstone is kept.
+        window: Millis,
+    },
 }
 
 impl Action {
@@ -727,6 +738,7 @@ impl Action {
             | Self::RevokeAsAncestor { .. } => DELEGATION,
             Self::ReleaseKeptReplicas { .. } | Self::EnableHandover => HANDOVER,
             Self::EnableIncarnations => INCARNATIONS,
+            Self::SetTombstoneWindow { .. } => TOMBSTONES,
         }
     }
 

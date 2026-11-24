@@ -11,8 +11,8 @@ use crate::delegation::{Delegation, DelegationId, DelegationOperation, RateKey};
 use crate::fork::apply::{live_operation, resend};
 use crate::fork::{ForkState, OperationId, OperationRecord};
 use crate::{
-    Acks, Action, ControlConfig, Database, DatabaseName, Feature, Liveness, Member, Quorums,
-    Rejection, Report, Revocations, Timestamp,
+    Acks, Action, ControlConfig, Database, DatabaseName, Feature, Liveness, Member, Millis,
+    Quorums, Rejection, Report, Revocations, Timestamp, Tombstones,
 };
 
 /// Everything the control plane knows: members, their liveness, and databases with their leases.
@@ -71,6 +71,10 @@ pub struct State {
         with = "rate_windows_as_pairs"
     )]
     pub(crate) rate_windows: BTreeMap<RateKey, VecDeque<Timestamp>>,
+    /// What control state remembers of the databases it dropped or expired, and for how long
+    /// (ADR-0050). Absent until the feature is enabled.
+    #[serde(default, skip_serializing_if = "Tombstones::is_unset")]
+    pub(crate) tombstones: Tombstones,
 }
 
 /// The rate windows as `[key, times]` pairs in key order: JSON map keys must be strings, and a
@@ -130,6 +134,7 @@ impl State {
             delegations: BTreeMap::new(),
             delegation_operations: BTreeMap::new(),
             rate_windows: BTreeMap::new(),
+            tombstones: Tombstones::default(),
         }
     }
 
@@ -286,6 +291,26 @@ impl State {
             && !matches!(action, Action::EnableIncarnations)
             && !self.is_enabled(Feature::Incarnations)
             && self.check_feature(Feature::Incarnations).is_ok()
+    }
+
+    /// Whether the control node should log [`Action::SetTombstoneWindow`] before `action`: a
+    /// drop or an expiry, while every member, live or down, supports
+    /// [`Feature::Tombstones`] and the state's window isn't `window`, the one this control node
+    /// is configured with (ADR-0050). The window is logged, so a replay never depends on a
+    /// configuration file.
+    #[must_use]
+    pub fn tombstones_due(&self, action: &Action, window: Millis) -> bool {
+        matches!(
+            action,
+            Action::DropDatabase { .. } | Action::ExpireDatabase { .. }
+        ) && self.tombstones.window() != Some(window)
+            && self.check_feature(Feature::Tombstones).is_ok()
+    }
+
+    /// Returns the tombstones of the databases control state dropped or expired (ADR-0050).
+    #[must_use]
+    pub fn tombstones(&self) -> &Tombstones {
+        &self.tombstones
     }
 
     /// Returns the timing rules the state runs under.
