@@ -717,7 +717,7 @@ Since 0.8.0 (ADR-0046). The identifier of one *operation*: one fork request, fro
 
 ### Orphan
 
-A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and the node saw no drop (ADR-0042). A node deletes a copy only after a control node tells it of the drop; an orphan stays until an operator removes it. It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused. A [staged copy](#staged-copy) whose fork the node can't confirm is kept as an orphan too, including when a placement shows the name with another [incarnation](#incarnation); it is listed and removed by its name, incarnation, operation ID, and attempt (ADR-0046).
+A copy of a database that a data node keeps on disk, closed, because the control plane doesn't know the database, or holds the name only at a lower epoch, and no [tombstone](#tombstone) names the copy (ADR-0042, ADR-0050). An orphan stays until a tombstone names it or an operator removes it; bringing one back into the fleet is planned (FR-125). It is neither served nor replicated, is listed in `status --node`, and counts in `fleetring_databases_orphaned`; a creation or restore of its name on that node is refused. A [staged copy](#staged-copy) whose fork the node can't confirm is kept as an orphan too, including when a placement shows the name with another [incarnation](#incarnation); it is listed and removed by its name, incarnation, operation ID, and attempt (ADR-0046).
 
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `Replication::orphan`, `data::Orphan`, `data::StagedOrphan`, `Client::remove_staged_orphan`, protocol `OrphanStatus`, `StagedOrphan`, and `Database.RemoveOrphan`. **CLI:** `fleetring orphan list`, `fleetring orphan remove <database> --node <id>`.
@@ -1068,6 +1068,14 @@ A bearer credential: an Ed25519-signed JWT from the authority that names a princ
 - **Applies to:** daemon, CLI, UI.
 - **Code:** `auth::BearerToken`, `TokenSpec` (what a token says: principal, scopes, ID, lifetime), `TokenId`, `KeyId`. **CLI:** `fleetring token issue|revoke`, `--token`, `FLEETRING_TOKEN`, `--token-id`, `--key-id`.
 - **Not:** API key, password, secret, session, JWT (fine where the format matters).
+
+### Tombstone
+
+The record control state keeps of a database it dropped or expired: its name, random [incarnation](#incarnation), last [epoch](#epoch), fork operation if any, cause, and times (ADR-0050). A data node deletes a copy only on a tombstone naming the incarnation the copy records, at an epoch at least as high as the copy's. It is kept for the **tombstone window** (`[control] tombstone_window_ms`, 7 days by default), then forgotten by a stamped `Tick`; a node that returns later keeps its copy as an [orphan](#orphan). A database of the legacy incarnation leaves none.
+
+- **Applies to:** daemon, CLI, UI.
+- **Code:** `Tombstone`, `Tombstones`, `State::tombstones`, `Action::SetTombstoneWindow`, `Feature::Tombstones`, protocol `Tombstone` and `Control.ListTombstones`. **CLI:** none.
+- **Not:** drop marker, deletion record, soft delete (a tombstoned database can't be brought back).
 
 ### Transfer
 
