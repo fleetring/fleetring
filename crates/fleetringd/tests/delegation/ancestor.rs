@@ -771,12 +771,19 @@ async fn same_second_redelegation_answers_unavailable() -> TestResult {
     Err("every attempt crossed a second boundary".into())
 }
 
+/// The first release of the line before this build's, which may run beside it (ADR-0038).
+fn previous_line() -> String {
+    let (major, minor) = fleetringd::software::release().line();
+    format!("{major}.{}.0", minor.saturating_sub(1))
+}
+
 /// The feature gate: while a member lacks `delegation`, principals and the ancestor rule are
 /// refused naming it, and nothing is logged.
 #[tokio::test]
 async fn member_without_delegation_refuses_ancestor_revocations_naming_it() -> TestResult {
     let dev = Dev::start().await?;
-    // A member that runs 0.7, which doesn't report `delegation`, joins on its own certificate.
+    // A member on the previous release line that doesn't report `delegation` joins on its own
+    // certificate.
     dev.tls
         .node_network("data-1")?
         .control_client(dev.address.clone())
@@ -790,7 +797,7 @@ async fn member_without_delegation_refuses_ancestor_revocations_naming_it() -> T
                 address: None,
             }),
             software: Some(Software {
-                version: "0.7.2".to_owned(),
+                version: previous_line(),
                 protocol: Some(PROTOCOL_VERSION),
                 control_format: 1,
                 features: vec!["undrain".to_owned(), "metadata".to_owned()],
