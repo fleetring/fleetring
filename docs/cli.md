@@ -52,7 +52,7 @@ Groups are the headings `fleetring -h` prints them under (§9).
 | | `db fork <source> <target> [--operation-id <id>] [--detach]` | Makes a new database from another's current contents, and waits until it is ready (ADR-0046, §15) |
 | Fleet | `status [--node <id> \| --address <host:port>]` | Gives the fleet overview, or one data node's view |
 | | `node list \| drain \| undrain \| remove` | Members, with liveness, release, and drain state |
-| | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042) |
+| | `orphan list \| remove` | Copies a data node keeps that the control plane doesn't know (ADR-0042, ADR-0050) |
 | | `upgrade [--check \| --rollback \| --version <v>]` | Installs another release in place, once the release's `serve --check` accepts the node's configuration (ADR-0038) |
 | | `lease watch` | Follows the leases a data node holds |
 | Security | `cert init \| node \| client` | Creates the authority and issues certificates |

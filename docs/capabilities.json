@@ -616,7 +616,7 @@
       "component": "fleetringd",
       "area": "operations",
       "title": "No deletion by absence",
-      "description": "A data node deletes a copy only when told of its database’s drop, and keeps any copy the control plane doesn’t know as an orphan, listed and counted, until orphan remove deletes it.",
+      "description": "A data node deletes a copy only on a tombstone in control state naming its incarnation, and keeps any other copy the control plane doesn’t know as an orphan, listed and counted, until orphan remove deletes it.",
       "status": "built",
       "since": "0.6.0",
       "ticket": "FR-077",
