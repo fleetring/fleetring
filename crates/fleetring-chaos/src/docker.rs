@@ -7,8 +7,9 @@
 use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::pin::Pin;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use crate::node::{FLEET, GATEWAY, NETWORK, Node, PRINCIPAL, SUBNET};
 
@@ -246,18 +247,32 @@ impl Docker {
     /// [`DockerError::Spawn`] if `docker` can't run, and [`DockerError::Failed`] with its stderr
     /// if it exits non-zero.
     pub fn run(&self, args: &[String]) -> Result<String, DockerError> {
-        let output = Command::new("docker")
-            .args(args)
-            .output()
-            .map_err(|source| DockerError::Spawn { source })?;
-        if !output.status.success() {
-            return Err(DockerError::Failed {
-                command: args.join(" "),
-                status: output.status.to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
+        let output = output(Command::new("docker").args(args), args)?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Runs `docker` with `args` in the directory `dir`, as [`run`](Self::run) does: for a
+    /// build, whose context is the directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub fn run_in(&self, dir: &Path, args: &[String]) -> Result<String, DockerError> {
+        let output = output(Command::new("docker").current_dir(dir).args(args), args)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Runs `docker` with `args` and returns what it wrote to stdout, then what it wrote to
+    /// stderr: for `docker logs`, which replays a container's two streams on its own two.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub fn run_combined(&self, args: &[String]) -> Result<String, DockerError> {
+        let output = output(Command::new("docker").args(args), args)?;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(text)
     }
 
     /// Runs `docker` with `args` on Tokio's blocking pool, and returns its stdout, trimmed.
@@ -279,6 +294,22 @@ impl Docker {
     pub fn run_ignoring_errors(&self, args: &[String]) {
         let _ = self.run(args);
     }
+}
+
+/// Runs `command`, whose arguments after `docker` are `args`, and returns its output if it
+/// exits zero.
+fn output(command: &mut Command, args: &[String]) -> Result<Output, DockerError> {
+    let output = command
+        .output()
+        .map_err(|source| DockerError::Spawn { source })?;
+    if !output.status.success() {
+        return Err(DockerError::Failed {
+            command: args.join(" "),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(output)
 }
 
 /// Runs docker commands for the fault injector: [`Docker`] in a run, a recorder in tests.
