@@ -145,6 +145,8 @@ pub(crate) struct Reported {
     pub(crate) features: BTreeSet<String>,
     /// Whether it has `serve --check`, which a release before 0.8 hasn't.
     pub(crate) config_check: bool,
+    /// The highest control-log format it reads; 1 for a binary that doesn't say.
+    pub(crate) control_format: u32,
 }
 
 impl Reported {
@@ -158,13 +160,15 @@ impl Reported {
                 .map(|feature| feature.as_str().to_owned())
                 .collect(),
             config_check: true,
+            control_format: software.control_format(),
         }
     }
 }
 
 /// What the binary at `path` runs, from `--version` and `upgrade --software`. A binary without
 /// `upgrade --software`, such as 0.3.0, supports no fleet features, and one whose answer has no
-/// `config_check`, a release before 0.8, can't check a configuration.
+/// `config_check`, a release before 0.8, can't check a configuration. One that reports no
+/// `control_format` reads format 1, which every release before format 2 reads.
 ///
 /// # Errors
 ///
@@ -178,6 +182,11 @@ pub(crate) fn software_of(path: &Path) -> Result<Reported, UpgradeError> {
         features: Vec<String>,
         #[serde(default)]
         config_check: bool,
+        #[serde(default = "format_one")]
+        control_format: u32,
+    }
+    const fn format_one() -> u32 {
+        1
     }
     let release = version_of(path)?;
     let printed = Command::new(path)
@@ -192,11 +201,13 @@ pub(crate) fn software_of(path: &Path) -> Result<Reported, UpgradeError> {
             release,
             features: printed.features.into_iter().collect(),
             config_check: printed.config_check,
+            control_format: printed.control_format,
         },
         None => Reported {
             release,
             features: BTreeSet::new(),
             config_check: false,
+            control_format: 1,
         },
     })
 }
