@@ -40,6 +40,7 @@ mod publisher;
 mod registry;
 pub mod replication;
 pub mod report;
+pub mod rng;
 pub mod router;
 #[cfg(feature = "simulation")]
 pub mod sim;
@@ -194,6 +195,7 @@ const _: () = {
     assert_debug_send_sync::<observe::TraceLayer>();
     assert_debug_send_sync::<OnShutdown>();
     assert_debug_send_sync::<ReplicationConfig>();
+    assert_debug_send_sync::<rng::SplitMix64>();
     assert_debug_send_sync::<Plaintext>();
     assert_debug_send_sync::<StartError>();
     assert_debug_send_sync::<Stop>();

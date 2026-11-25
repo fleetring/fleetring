@@ -39,6 +39,15 @@ console = { version = "0.16.4", default-features = false, features = ["std"] }
 indicatif = { version = "0.18", default-features = false, features = ["unicode-width"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 prometheus-client = "0.25"
+# The control group's Raft (ADR-0035, ADR-0040 point 1). Pinned exactly: openraft's storage and
+# network traits change between patch releases, and FleetRing owns the byte formats they carry, so
+# every upgrade is a deliberate change with its golden vectors re-checked. Without default
+# features, so without clap and without `serde`.
+openraft = { version = "=0.10.1", default-features = false }
+# Tokio's channels, mutex and timers for openraft, which `ControlRuntime` wraps (ADR-0040 point 1).
+openraft-rt-tokio = { version = "=0.10.1", default-features = false }
+# The trait `ControlRng` implements for openraft's election-timeout draw; the version openraft uses.
+rand = { version = "0.10", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ring = "0.17"
 # Kept behind `fleetringd::mcp` alone (ADR-0041 point 9).
