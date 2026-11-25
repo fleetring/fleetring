@@ -22,6 +22,8 @@ pub mod inject;
 pub mod node;
 #[cfg(feature = "harness")]
 pub mod schedule;
+#[cfg(feature = "harness")]
+pub mod workload;
 
 /// Whether a run checks the fleet or checks the harness (ADR-0036, point 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -75,5 +77,7 @@ const _: () = {
         assert_debug_send_sync::<schedule::PlannedFault>();
         assert_debug_send_sync::<schedule::Scenario>();
         assert_debug_send_sync::<schedule::Schedule>();
+        assert_debug_send_sync::<workload::Recorder>();
+        assert_debug_send_sync::<workload::WorkloadError>();
     }
 };
