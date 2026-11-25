@@ -130,6 +130,36 @@ pub enum LogError {
     /// The log has no room for another command.
     #[error("control log index is exhausted")]
     Exhausted,
+    /// A format-1 log can't migrate to format 2; the node stays down until an operator acts.
+    #[error("control log can't migrate from format 1: {reason}")]
+    Migration {
+        /// Why.
+        reason: String,
+    },
+    /// A format-2 log entry can't be decoded.
+    #[error("control log entry {index} is corrupt")]
+    CorruptEntry {
+        /// The entry's index.
+        index: LogIndex,
+        /// The decoder's error.
+        source: crate::control::raft::codec::CodecError,
+    },
+    /// A value in format 2's `meta` table can't be decoded.
+    #[error("control log's {key} is corrupt")]
+    CorruptMeta {
+        /// The value's key.
+        key: &'static str,
+        /// The decoder's error.
+        source: crate::control::raft::codec::CodecError,
+    },
+    /// A format-2 log holds a non-empty format-1 `commands` table.
+    #[error("format-2 control log {path} has a format-1 `commands` table with {rows} rows")]
+    StrayTable {
+        /// The log's database file.
+        path: PathBuf,
+        /// How many rows the table holds.
+        rows: u64,
+    },
 }
 
 /// A state rebuilt from the log at startup.
@@ -483,7 +513,7 @@ fn to_sql(index: LogIndex) -> Result<i64, LogError> {
 
 /// Checks the invariants that every state produced by `apply` keeps, so that a damaged snapshot
 /// is refused instead of corrupting the control plane.
-fn check_state(state: &State, genesis: &ControlConfig) -> Result<(), String> {
+pub(crate) fn check_state(state: &State, genesis: &ControlConfig) -> Result<(), String> {
     if state.config() != genesis {
         return Err("its configuration differs from the log's genesis configuration".into());
     }

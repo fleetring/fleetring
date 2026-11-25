@@ -36,6 +36,8 @@ use crate::support::Tls;
 
 #[path = "control/fixtures.rs"]
 mod fixtures;
+#[path = "control/store.rs"]
+mod store;
 mod support;
 use tonic::{Code, Request, Response, Status};
 
