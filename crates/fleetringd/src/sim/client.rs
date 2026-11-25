@@ -17,7 +17,7 @@ use fleetring_proto::v1::{
 use crate::auth::refused_binding;
 use crate::control::ControlClient;
 use crate::control::fork::replica_to_proto;
-use crate::control::rejection_status;
+use crate::control::{SubmitError, rejection_status};
 use crate::data::{Client, DatabaseSpec, Expiry, ForkSpec, LeaseUpdate, NewMetadata};
 use crate::engine::{Statement, Value};
 use crate::environment::Network;
@@ -755,9 +755,11 @@ async fn submit(shared: &Shared, action: Action, ack: Ack) -> Outcome {
             Ok(_) => Outcome::Acknowledged(ack),
             Err(rejection) => Outcome::from_status(&rejection_status(&rejection)),
         },
-        Err(_) => Outcome::Indeterminate {
-            code: Some(tonic::Code::Unavailable),
-        },
+        Err(SubmitError::Stopped | SubmitError::Storage(_) | SubmitError::Refused(_)) => {
+            Outcome::Indeterminate {
+                code: Some(tonic::Code::Unavailable),
+            }
+        }
     }
 }
 
@@ -949,9 +951,11 @@ async fn propose(shared: &Shared, action: Action) -> Outcome {
         Ok(committed) => Outcome::Acknowledged(Ack::Proposed {
             accepted: committed.into_outcome().is_ok(),
         }),
-        Err(_) => Outcome::Indeterminate {
-            code: Some(tonic::Code::Unavailable),
-        },
+        Err(SubmitError::Stopped | SubmitError::Storage(_) | SubmitError::Refused(_)) => {
+            Outcome::Indeterminate {
+                code: Some(tonic::Code::Unavailable),
+            }
+        }
     }
 }
 

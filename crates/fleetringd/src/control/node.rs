@@ -13,15 +13,15 @@ use std::sync::Arc;
 use std::{io, thread};
 
 use fleetring::NodeId;
-use fleetring_control::delegation::Resent;
 use fleetring_control::{
-    Action, Applied, Command, ControlConfig, DEFAULT_TOMBSTONE_WINDOW, Millis, Outcome, Rejection,
-    State, apply,
+    Action, Command, ControlConfig, DEFAULT_TOMBSTONE_WINDOW, Millis, Outcome, Rejection, State,
+    apply,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
 use crate::control::log::{CommandLog, LogError, LogIndex, Recovered};
+use crate::control::screen::{Screen, Screened, Settings, Verdict};
 use crate::observe::ControlMetrics;
 use crate::observe::codes::action_label;
 
@@ -407,8 +407,7 @@ struct Writer {
     last_index: LogIndex,
     snapshot_every: NonZeroU64,
     clock: Box<dyn Clock>,
-    recorder: Option<NodeId>,
-    tombstone_window: Millis,
+    settings: Settings,
     publish: watch::Sender<Arc<State>>,
     metrics: ControlMetrics,
 }
@@ -452,8 +451,7 @@ impl Writer {
             last_index,
             snapshot_every: options.snapshot_every,
             clock,
-            recorder: options.recorder,
-            tombstone_window: options.tombstone_window,
+            settings: Settings::new(options.recorder, options.tombstone_window),
             publish,
             metrics,
         };
@@ -512,134 +510,62 @@ impl Writer {
         }
     }
 
-    /// Returns `action` stamped with the time and, if this node has one, its recorder, as every
-    /// command it logs is, its own commands included (ADR-0047, point 6.1).
-    fn stamp(&self, action: Action) -> Command {
-        match &self.recorder {
-            Some(by) => Command::stamped(self.clock.now(), by.clone(), action),
-            None => Command::new(self.clock.now(), action),
-        }
-    }
-
-    /// Stamps and numbers `submits` in order, each with the time and the recorder, logs them in
-    /// one transaction, then applies, publishes, and answers each. Nothing is answered before the whole group is durable.
+    /// Screens `submits` in order ([`Screen`]), numbers what the screen accepts, logs it in one
+    /// transaction, then applies, publishes, and answers each. Nothing is answered before the
+    /// whole group is durable, except a refusal, which logs nothing.
     ///
-    /// A command `apply` would refuse for software, a join or a command that needs a fleet
-    /// feature some member lacks, is refused at once and never logged ([`State::check_admission`]).
-    /// It is checked against the state the commands queued before it in the group leave, which is
-    /// the state `apply` will see. A join or a leave that [`State::handover_due`] says would keep
-    /// the first replica set is preceded by [`Action::EnableHandover`], logged by the writer
-    /// itself in the same group, and a creation that [`State::incarnations_due`] says would use
-    /// the `incarnations` feature first by [`Action::EnableIncarnations`].
-    ///
-    /// A command that needs the `delegation` fleet feature is answered with
-    /// [`SubmitError::Refused`] and never logged when `apply` would refuse it on that state
-    /// ([`refused_unlogged`]). A `RecordDelegation` that resends an operation the state records,
-    /// as racing identical calls do, is answered with the recorded delegation and never logged:
-    /// its answer waits for the group to be durable, since the record may be one of the group's.
+    /// Each command is stamped with the time and the recorder, and screened against the state the
+    /// commands accepted before it in the group leave, which is the state `apply` will see. The
+    /// screen refuses, unlogged, a command `apply` would refuse for software
+    /// ([`State::check_admission`]), and a command that needs the `delegation` fleet feature that
+    /// `apply` would reject. It precedes a command with the one that enables a fleet feature on
+    /// its first use, or sets the tombstone window, which the writer logs in the same group. And
+    /// it answers a `RecordDelegation` that resends an operation the state records, as racing
+    /// identical calls do, with the recorded delegation: the writer sends that answer once the
+    /// group is durable, since the record may be one of the group's.
     fn commit_group(&mut self, submits: Vec<(Action, Reply)>) -> Flow {
-        let mut commands: Vec<(LogIndex, Command)> = Vec::with_capacity(submits.len());
+        let mut indices: Vec<LogIndex> = Vec::with_capacity(submits.len());
+        let mut commands: Vec<Command> = Vec::with_capacity(submits.len());
         let mut replies = Vec::with_capacity(submits.len());
         // Resends answered from the state, sent once the group is durable.
         let mut resent: Vec<(Reply, Command, Outcome)> = Vec::new();
         let mut last = self.last_index;
         let mut exhausted = None;
-        // The state after the group's commands so far, built only once a command needs screening,
-        // or, until `handover` is enabled, once a membership change comes.
-        let mut preview: Option<State> = None;
+        let mut screen = Screen::new(&self.state, &self.settings);
         for (action, reply) in submits {
-            let membership = matches!(action, Action::Join { .. } | Action::Leave { .. });
-            let mut enable = None;
-            // Before a drop, while the state's tombstone window isn't the configured one.
-            let dropping = matches!(
-                action,
-                Action::DropDatabase { .. } | Action::ExpireDatabase { .. }
-            ) && self.state.tombstones().window() != Some(self.tombstone_window);
-            if needs_screening(&action)
-                || dropping
-                || (membership && !self.state.is_enabled(fleetring_control::Feature::Handover))
-            {
-                let preview = preview.get_or_insert_with(|| {
-                    let mut state = self.state.clone();
-                    for (_, command) in &commands {
-                        let _outcome = apply(&mut state, command.clone());
-                    }
-                    state
-                });
-                if needs_screening(&action)
-                    && let Err(rejection) = preview.check_admission(&action)
-                {
-                    let _unheard = reply.send(Err(SubmitError::Refused(rejection)));
-                    continue;
-                }
-                // The first membership change that would keep a replica set, once every member
-                // supports `handover`, is preceded by the command that enables it, so that what
-                // a change does depends on the log alone (ADR-0031, amendment 2). So is the first
-                // creation under `always`, so that a release without `incarnations` refuses the
-                // log rather than replay it to the legacy incarnation (ADR-0046's FR-110
-                // amendment).
-                if preview.handover_due(&action) {
-                    enable = Some(Action::EnableHandover);
-                } else if preview.incarnations_due(&action) {
-                    enable = Some(Action::EnableIncarnations);
-                } else if preview.tombstones_due(&action, self.tombstone_window) {
-                    enable = Some(Action::SetTombstoneWindow {
-                        window: self.tombstone_window,
-                    });
-                }
-            }
-            if let Some(enabling) = enable {
+            let Screened { enabling, verdict } = screen.screen(action, self.clock.now(), &commands);
+            if let Some(enabling) = enabling {
                 let Some(index) = last.next() else {
                     exhausted = Some(reply);
                     break;
                 };
                 last = index;
-                let command = self.stamp(enabling);
-                if let Some(preview) = &mut preview {
-                    let _outcome = apply(preview, command.clone());
-                }
-                commands.push((index, command));
+                indices.push(index);
+                commands.push(enabling);
                 replies.push(None);
             }
-            let unlogged_if_refused = refused_unlogged(&action);
-            let command = self.stamp(action);
-            if let Some(preview) = &mut preview {
-                // A resend changes nothing, so it costs the log nothing either: N racing
-                // identical calls log one command, not N with full claims each.
-                if let Some(Ok((id, record))) =
-                    preview.delegation_resend(&command.action, command.at)
-                {
-                    let outcome = Ok(Applied::DelegationRecorded {
-                        id: id.clone(),
-                        claims: record.claims.clone(),
-                        resent: Resent::Yes,
-                    });
-                    resent.push((reply, command, outcome));
-                    continue;
+            match verdict {
+                Verdict::Append(command) => {
+                    let Some(index) = last.next() else {
+                        exhausted = Some(reply);
+                        break;
+                    };
+                    last = index;
+                    indices.push(index);
+                    commands.push(command);
+                    replies.push(Some(reply));
                 }
-                let outcome = apply(preview, command.clone());
-                // The preview applied exactly the command `apply_logged` would, to exactly the
-                // state it would see, so its refusal is the one the log would hold; a refusal
-                // changes nothing, `State::now` included, so leaving it out replays the same.
-                if unlogged_if_refused && let Err(rejection) = outcome {
+                Verdict::Refused(rejection) => {
                     let _unheard = reply.send(Err(SubmitError::Refused(rejection)));
-                    continue;
                 }
+                Verdict::Resent { command, outcome } => resent.push((reply, command, outcome)),
             }
-            let Some(index) = last.next() else {
-                exhausted = Some(reply);
-                break;
-            };
-            last = index;
-            commands.push((index, command));
-            replies.push(Some(reply));
         }
         let started = tokio::time::Instant::now();
         let written = if commands.is_empty() {
             Ok(())
         } else {
-            self.log
-                .append_all(commands.iter().map(|(index, command)| (*index, command)))
+            self.log.append_all(indices.iter().copied().zip(&commands))
         };
         if !commands.is_empty() && written.is_ok() {
             self.metrics.log_written(started.elapsed());
@@ -652,7 +578,7 @@ impl Writer {
             }
             return Flow::Stop(None);
         }
-        for ((index, command), reply) in commands.into_iter().zip(replies) {
+        for ((index, command), reply) in indices.into_iter().zip(commands).zip(replies) {
             let committed = self.apply_logged(index, command);
             // A caller that gave up still had its command applied, as logged. The writer's own
             // commands have no caller.
@@ -773,25 +699,6 @@ fn log_enabled_features(state: &State, before: &[fleetring_control::Feature], in
     for feature in state.features().filter(|feature| !before.contains(feature)) {
         tracing::info!(target: "fleetringd::audit", feature = feature.as_str(), index = index.get(), "fleet feature enabled for good: members without it can no longer join, and rolling back to a release without it is refused");
     }
-}
-
-/// Whether `action` may be refused for software, so the writer screens it before it logs it: a
-/// join, or a command that needs any fleet feature.
-fn needs_screening(action: &Action) -> bool {
-    !action.features().is_empty() || matches!(action, Action::Join { .. })
-}
-
-/// Whether the writer answers `apply`'s refusal of `action` without logging it: a command that
-/// needs the `delegation` fleet feature (ADR-0047, points 5.10 and 6.2).
-///
-/// An agent's token drives these, so a refusal, a rate limit's above all, must cost the log
-/// nothing; and a refused command doesn't enable its feature, so logging one would leave a
-/// command the previous release line can't decode in a log it may still roll back to
-/// (ADR-0038, point 4). Every such command [`needs_screening`], so the preview exists.
-fn refused_unlogged(action: &Action) -> bool {
-    action
-        .features()
-        .contains(&fleetring_control::Feature::Delegation)
 }
 
 #[cfg(test)]
@@ -1123,6 +1030,7 @@ mod tests {
     /// or a later one.
     #[tokio::test(start_paused = true)]
     async fn racing_identical_delegations_log_once() {
+        use fleetring_control::Applied;
         use fleetring_control::delegation::Resent;
 
         use crate::control::test_support::{member_with_every_feature, root_delegation};

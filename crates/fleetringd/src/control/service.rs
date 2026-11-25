@@ -482,7 +482,12 @@ impl ControlService {
                     rule = IncarnationRule::OnceForked;
                     continue;
                 }
-                submitted => submitted.map_err(submit_status)?,
+                Ok(committed) => committed,
+                Err(
+                    error @ (SubmitError::Stopped
+                    | SubmitError::Storage(_)
+                    | SubmitError::Refused(_)),
+                ) => return Err(submit_status(error)),
             };
             draws += 1;
             match committed.into_parts() {
@@ -592,7 +597,9 @@ impl ControlService {
             let outcome = match self.node.submit(action.clone()).await {
                 Ok(committed) => committed.into_outcome(),
                 Err(SubmitError::Refused(rejection)) => Err(rejection),
-                Err(error) => return Err(submit_status(error)),
+                Err(error @ (SubmitError::Stopped | SubmitError::Storage(_))) => {
+                    return Err(submit_status(error));
+                }
             };
             match outcome {
                 Ok(Applied::DelegationRecorded { id, claims, resent }) => {
