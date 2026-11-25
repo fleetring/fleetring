@@ -46,6 +46,10 @@ For workflow changes, run [`actionlint`](https://github.com/rhysd/actionlint) to
 - **Re-run only the failed jobs, and only for a known flake** that has an issue. Otherwise, find the cause: a failure you don't understand is a bug until shown otherwise.
 - **A flaky test gets an issue, never just a re-run.** Record the job, the seed or the log, and how often it fails, as [FR-051](https://github.com/fleetring/fleetring/issues/54) does. Label it `flaky-test`. Statistical and simulation tests run on fixed corpora and seeds so they can't flake; one that does has a real cause.
 
+## Fault injection
+
+The nightly `Chaos` workflow (`.github/workflows/chaos.yml`) runs FR-065's fault-injection harness on `main`: five real daemons in containers with partitions, kills, pauses, and clock skew, each scenario for ten minutes, plus a self-test that must find a lost write. It never runs on pull requests. To run a scenario locally, on Linux with Docker, see [`crates/fleetring-chaos/README.md`](crates/fleetring-chaos/README.md). A failing nightly run gets an issue by hand, with its seed and its uploaded run directory attached, as a flaky test does; a real timing can't be replayed, so the fix comes with a simulation test that reproduces it.
+
 ## Dependabot
 
 Dependabot opens one grouped pull request a week for GitHub Actions updates (`.github/dependabot.yml`).

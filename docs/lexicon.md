@@ -421,6 +421,14 @@ A promotion after a primary's lease expires: the control plane starts it, and a 
 - **Code:** `replication::failover`. **CLI:** "fails over" in messages.
 - **Not:** failback, switchover (for an unplanned move), election.
 
+### Fault
+
+A failure caused on purpose by the simulation harness or the fault-injection harness: a network partition, a crash or kill, a paused process, added latency or loss, or a skewed clock. A *fault schedule* is the seeded list of faults one run injects, each with when it starts and ends (ADR-0020, ADR-0036).
+
+- **Applies to:** daemon (tests and harnesses).
+- **Code:** `sim::Fault`, `fleetring_chaos::schedule::Fault`, `Schedule`. **CLI:** `fleetring-chaos run --scenario <name>`; `schedule.txt` in a run directory.
+- **Not:** nemesis, disruption, failure (for one caused on purpose), chaos (except in the harness's name).
+
 ### Fencing
 
 Making a replica record a newer lease epoch, so it refuses anything an older primary sends. Epochs fence; no clock decides safety (ADR-0018).
@@ -518,6 +526,14 @@ A data node's periodic call to the control plane. It reports the replicas the no
 - **Applies to:** daemon.
 - **Code:** `Control.Heartbeat`, `[control] heartbeat_interval_ms`. **CLI:** none.
 - **Not:** ping, keepalive, health check, gossip.
+
+### History
+
+Every operation clients sent during a run, each with when it was sent, when it ended, and how: `ok` (acknowledged), `fail` (refused, so it had no effect), or `info` (unknown, so it may or may not have taken effect). The history checker (FR-036) judges a history against what each database promises.
+
+- **Applies to:** daemon (tests and harnesses).
+- **Code:** `sim::History`, `sim::history::check`, `OutcomeClass`. **CLI:** `history.txt` in a fault-injection run's directory.
+- **Not:** log (a control log and a database's log are other things), trace (the simulation's `Trace` is its event order), journal, record (one operation in a history is a record).
 
 ### Holder
 
