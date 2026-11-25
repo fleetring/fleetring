@@ -1,0 +1,22 @@
+{
+  "configs": [
+    [
+      "0000000000000002",
+      "d733a26dd4b49b94"
+    ]
+  ],
+  "nodes": {
+    "0000000000000002": {
+      "node_id": "c2",
+      "address": "10.0.0.2:7400"
+    },
+    "7ffffffffffffffe": {
+      "node_id": "c3",
+      "address": "[fd00::3]:7400"
+    },
+    "d733a26dd4b49b94": {
+      "node_id": "c1",
+      "address": "c1.fleet.internal:7400"
+    }
+  }
+}

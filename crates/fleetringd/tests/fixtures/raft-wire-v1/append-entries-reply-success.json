@@ -1,0 +1,8 @@
+{
+  "result": "success",
+  "acknowledged": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 43
+  }
+}

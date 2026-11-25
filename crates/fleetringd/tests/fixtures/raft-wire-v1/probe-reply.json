@@ -1,0 +1,12 @@
+{
+  "node_id": "c3",
+  "software": {
+    "release": "0.10.0",
+    "control_format": 2,
+    "newer_features": [
+      "delegation",
+      "handover"
+    ]
+  },
+  "has_raft_state": false
+}
