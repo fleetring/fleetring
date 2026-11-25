@@ -17,6 +17,8 @@
 pub mod config;
 pub mod docker;
 pub mod duration;
+#[cfg(feature = "harness")]
+pub mod inject;
 pub mod node;
 #[cfg(feature = "harness")]
 pub mod schedule;
@@ -65,6 +67,9 @@ const _: () = {
     assert_debug_send_sync::<node::Node>();
     #[cfg(feature = "harness")]
     {
+        assert_debug_send_sync::<inject::AppliedFault>();
+        assert_debug_send_sync::<inject::InjectError>();
+        assert_debug_send_sync::<inject::Injector>();
         assert_debug_send_sync::<schedule::Fault>();
         assert_debug_send_sync::<schedule::FaultKind>();
         assert_debug_send_sync::<schedule::PlannedFault>();
