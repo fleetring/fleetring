@@ -340,8 +340,16 @@ fn samples() -> Vec<Action> {
 #[test]
 #[ignore = "writes fields-0.9.0.txt; scripts/write-control-fixtures.sh runs it at the tag"]
 fn write() {
-    let commands = std::env::var("FIXTURE_COMMANDS").expect("FIXTURE_COMMANDS names a file");
-    let out = std::env::var("FIXTURE_OUT").expect("FIXTURE_OUT names a directory");
+    // `--ignored` runs, such as CI's release statistics, reach this too; only the script sets these.
+    let (Ok(commands), Ok(out)) = (
+        std::env::var("FIXTURE_COMMANDS"),
+        std::env::var("FIXTURE_OUT"),
+    ) else {
+        eprintln!(
+            "FIXTURE_COMMANDS and FIXTURE_OUT are unset; scripts/write-control-fixtures.sh sets them"
+        );
+        return;
+    };
     let text = std::fs::read_to_string(commands).expect("the commands can be read");
     let commands: Vec<Command> = serde_json::from_str(&text).expect("the commands decode");
     let mut lines = String::new();
