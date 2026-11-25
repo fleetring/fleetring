@@ -1,7 +1,7 @@
 ---
 id: FR-065
 title: "Fault injection on real daemons: partitions, kills, pauses, and clock skew, judged by the history checker"
-status: in-progress
+status: done
 priority: P1
 size: L
 milestone: M7 Durability and operations
@@ -849,3 +849,4 @@ The open questions this plan raised were decided as recommended:
     - `schedule.txt` prints each applied fault with its actual start and end, and a first line saying where the fault phase starts in `history.txt`'s time: the history counts from the setup, the schedule from the fault phase. A planned fault the deadline cut off is marked `(not run)`.
     - `chaos.yml` passes `matrix.run` to the run step through an environment variable rather than inline in the script.
     - Ctrl-C undoes every fault, removes the fleet unless `--keep`, and exits 130.
+- 2026-11-25: Done. #213 merged, and the first dispatch of `chaos.yml` on GitHub's Linux runners (run 45655993531, 600 s per scenario) gave `valid` on `mixed`, `partitions`, `kills`, `pauses`, and `clock`, with no failed operation, and the self-test reported its lost write. The seeds are in #68's closing comment. Step 11 stays open under FR-064.
