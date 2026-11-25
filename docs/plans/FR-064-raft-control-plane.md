@@ -835,4 +835,37 @@ The down-conversion (the old question 2) was dropped (D3). Leader transfer befor
 - 2026-11-04: ADR-0040 proposed, amending ADR-0035 for versions, rollback, dev mode, and the leader's screen. This plan was rewritten into phases A1–F around it. openraft 0.9.25's runtime hook was verified in a scratch crate: the same seed gave the same election timeouts across a spawned task. No Raft code is written yet.
 - 2026-11-04: after an independent review, ADR-0040 gained the staleness, announcement, and fail-stop rules, the stray-table rule, the rule on fields an older line drops, and the time assumptions. A2 was split into A2a (store and migration as library code) and A2b (openraft wiring). The build was then paused until the MVP work landed.
 - 2026-11-25: the plan was reviewed against `main` at 0.9.0. The single writer had grown injected enabling commands, unlogged delegation refusals, resend answers, and `recorded_by`; the protocol was at 1.3, and `HeartbeatResponse` field 4 was taken; openraft 0.10.1 was final. The owner accepted every recommendation (D1–D9), and FR-127 (#216) and FR-128 (#217) were filed.
-- 2026-11-25: PR 0 (docs). ADR-0040 was revised and accepted, with dated notes on ADR-0031, 0034, 0035, 0038, 0046, 0047, and 0050, and this plan was rewritten into PRs 0–7 and un-paused. Next: PR 1, the screen extraction.
+- 2026-11-25: PR 0 (docs). ADR-0040 was revised and accepted, with dated notes on ADR-0031, 0034, 0035, 0038, 0046, 0047, and 0050, and this plan was rewritten into PRs 0–7 and un-paused. Next: PR 1, the screen extraction. **Done.**
+- 2026-11-25: PR 1 merged: `control/screen.rs` holds the single writer's screening, and every `match` on `SubmitError` names each variant. **Done.**
+- 2026-11-25: PR 2 written, in review: openraft and `ControlRuntime`, the codec and its golden vectors, Raft IDs, `ControlStore` over format 2, the migration, the 0.9.0 fixture with its writers and `scripts/write-control-fixtures.sh`, `fields-0.9.0.txt` and the field register, and the `ControlFormat` refusal. The daemon is unchanged.
+  - **openraft 0.10.1, checked against its source.** Every claim the design relies on holds:
+    - `AsyncRuntime` is in `openraft-rt` (re-exported as `openraft::rt`), with `Mpsc`, `Watch`, `Oneshot`, and `Mutex<T>`.
+    - `spawn_blocking` defaults to one OS thread per call and is overridable; openraft itself never calls it.
+    - The RNG hook is `AsyncRuntime::thread_rng() -> Self::ThreadLocalRng: rand::Rng` (rand 0.10), called for every election-timeout draw.
+    - `RaftNetworkV2::full_snapshot` hands the network the whole snapshot.
+    - `WriteOption::expect_leader`, `ReadPolicy::ReadIndex`, and `trigger().transfer_leader` exist.
+    - `default-features = false` drops `clap` and `tokio-rt`.
+    - openraft's `rust-version` is 1.88, and `cargo +1.89 check` passes.
+    - openraft has no direct `tokio` dependency, calls no RNG but the hook, spawns no thread outside its tests, and its `select2`–`select4` are biased. It reads `SystemTime` only to format instants for logs.
+    - `cargo deny check` passes. openraft adds duplicate-version warnings only: `quorum-set` pulls `sha2 0.10` (with `digest`, `block-buffer`, `crypto-common`, `cpufeatures`) beside `0.11`, and `itertools 0.15`. `chrono` still reaches the graph only through rmcp and schemars.
+  - **API shapes that differ from the plan,** adapted:
+    - `SnapshotData` left `RaftTypeConfig` in 0.10: it is an associated type of `RaftStateMachine`, `RaftSnapshotBuilder`, and `RaftNetworkV2`, so `declare_raft_types!` doesn't name it.
+    - `Raft` takes the state machine as a second type parameter, `Raft<C, SM>`. PR 3's `Proposer` holds `Raft<ControlTypes, ControlStateMachine>`.
+    - The fire-and-forget write with a leader condition is `raft.write(request).with_leader(leader_id).responder(responder)`; `client_write_ff` takes no option.
+    - Without `tokio-rt`, openraft has no Tokio runtime. `ControlRuntime` reuses `openraft-rt-tokio`'s channels and mutex (a direct `=0.10.1` dependency), and defines `ControlInstant`, since `TokioInstant`'s inner instant is private.
+    - `AsyncRuntime` also requires `new` and `block_on`, which openraft never calls. `ControlRuntime` stays a unit struct, and `block_on` builds a current-thread Tokio runtime.
+    - `TryFrom<EntryWire>` for openraft's `Entry` is refused by coherence (it is an associated type), so it is `EntryWire::into_entry`.
+  - **Choices the plan left open:**
+    - A snapshot's `membership` column also stores the membership's own `log_id`, which `StoredMembership` needs. Migration sets it to the snapshot's log ID (term 0, node `0000000000000000`, index N).
+    - The snapshot data `RaftNetworkV2` sends is the `state` column's bytes, format 1's `State` JSON, base64 in each chunk.
+    - `CodecError` also has `Membership { voter }` and `Chunk { offset, received }`, and `LogError` also has `CorruptMeta { key, source }`.
+    - `save_control_snapshot` takes how many snapshots to retain.
+    - `control::raft`, `control::raft::codec`, and `rng` are public modules, for the integration tests and PR 4.
+    - `ControlRequest` keeps the proposer's decoded command beside the raw JSON (`command()`, `command_json()`, `decode()`). A request read from the log or the wire holds only the JSON.
+    - Migration recovers and checks the replay before its `BEGIN IMMEDIATE`, since format 1's code reads on its own connection. The transaction re-checks that the format is still 1 and the newest index unchanged before it renames anything. The data directory's lock already keeps other writers out.
+  - **The fixture.** `writer_0_9_0.rs` ran at `fleetringd-v0.9.0` and wrote the same `commands.json` as this tree does: 62 commands, a snapshot at 50. It differs from the plan's list in three places:
+    - a third database, `tenant:acme/scratch`, is the one `ExpireDatabase` expires;
+    - `n4` hosts no replica of the fixture's databases, so its drain keeps no set, and `EnableHandover` comes before the `Leave` of `n3`, whose kept set for the billing database is released and whose set for the notes stays;
+    - a second child delegation, which nothing revokes, keeps a delegation record in the state.
+  - **The field register.** `fields.rs` includes `fields_0_9_0.rs` as a module, so the 0.9.0 list and this build's come from one function. The paths are those of every action and every state in the fixture's replay, plus hand-built actions for the variants and optional fields the log lacks. The register is empty, and the test passes.
+  - **Tests.** The runtime-hook tests pass, and the `spawn_blocking` test fails against openraft's default. The `ControlFormat` tests are in `tests/upgrade/control_format.rs`. Next: PR 3.
