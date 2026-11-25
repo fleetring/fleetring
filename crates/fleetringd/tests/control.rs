@@ -34,6 +34,8 @@ use tokio_stream::Stream;
 
 use crate::support::Tls;
 
+#[path = "control/fixtures.rs"]
+mod fixtures;
 mod support;
 use tonic::{Code, Request, Response, Status};
 
