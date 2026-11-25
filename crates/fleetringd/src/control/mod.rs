@@ -6,6 +6,8 @@
 //! - [`ControlNode`] runs the single writer: it stamps each command with a
 //!   [`Clock`](crate::clock::Clock), logs it, applies it with `fleetring_control::apply`, and
 //!   publishes the new state. [`ControlHandle`] submits commands and reads the published state.
+//!   Before it logs a command, the writer screens it in `screen`, which adds the commands that
+//!   enable a fleet feature on its first use and refuses, unlogged, what must never be logged.
 //! - [`ControlService`] serves the `Control` gRPC service over a handle, forks included
 //!   (ADR-0046): what replicas report about forks, a fork's status in a placement, and a fork
 //!   operation's status cross the protocol in `fork`. It also delegates agents' tokens
@@ -29,6 +31,7 @@ pub(crate) mod fork;
 mod log;
 mod node;
 mod notices;
+mod screen;
 mod service;
 #[cfg(test)]
 mod test_support;

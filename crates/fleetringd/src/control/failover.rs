@@ -265,10 +265,13 @@ async fn run(
         let now = clock.now();
         let current = handle.state();
         let idle = now.as_millis().saturating_sub(current.now().as_millis()) >= tick.get();
-        if (idle || delegation::tick_due(&current, now) || current.tombstones().purge_due(now))
-            && handle.submit(Action::Tick).await.is_err()
-        {
-            return;
+        if idle || delegation::tick_due(&current, now) || current.tombstones().purge_due(now) {
+            match handle.submit(Action::Tick).await {
+                Ok(_) => {}
+                Err(SubmitError::Stopped | SubmitError::Storage(_) | SubmitError::Refused(_)) => {
+                    return;
+                }
+            }
         }
         let state = handle.state();
         let config = state.config();
@@ -293,7 +296,9 @@ async fn run(
                             tracing::info!(database = %database, epoch = epoch.get(), %candidate, "lease expired; promotion started");
                         }
                     }
-                    Err(_) => return,
+                    Err(
+                        SubmitError::Stopped | SubmitError::Storage(_) | SubmitError::Refused(_),
+                    ) => return,
                 }
             }
             if drive_forks(&handle, now).await == Sweep::Stop {
@@ -326,7 +331,7 @@ async fn drive_forks(handle: &ControlHandle, now: Timestamp) -> Sweep {
                 Err(rejection) => tracing::debug!(%rejection, "a fork proposal was refused"),
             },
             Err(SubmitError::Stopped) => return Sweep::Stop,
-            Err(error) => {
+            Err(error @ (SubmitError::Storage(_) | SubmitError::Refused(_))) => {
                 tracing::warn!(%error, "can't log a fork proposal; the next tick proposes again");
             }
         }
@@ -367,7 +372,7 @@ async fn release_kept_replicas(handle: &ControlHandle) -> Sweep {
                 }
             },
             Ok(Err(SubmitError::Stopped)) => sweep = Sweep::Stop,
-            Ok(Err(error)) => {
+            Ok(Err(error @ (SubmitError::Storage(_) | SubmitError::Refused(_)))) => {
                 tracing::warn!(%error, "can't log a release; the next tick proposes again");
             }
             Err(error) => {
