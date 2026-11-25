@@ -8,6 +8,10 @@ use crate::node::{Node, PORT, PRINCIPAL};
 /// Every setting it doesn't name keeps the daemon's default (leases, failover margin, heartbeat
 /// interval and timeout), so a run tests the defaults operators get. Members stay members across
 /// restarts (`on_shutdown = "stay"`), so a kill tests failover rather than a leave.
+///
+/// The control node names its own address as `[control] address` too: without it, its data
+/// role would dial its own listener on loopback, which its certificate, issued for its bridge
+/// address only, doesn't name.
 #[must_use]
 pub fn render_config(node: Node) -> String {
     let name = node.name();
@@ -16,11 +20,7 @@ pub fn render_config(node: Node) -> String {
     } else {
         "data"
     };
-    let control = if node == Node::CONTROL {
-        String::new()
-    } else {
-        format!("[control]\naddress = \"{}\"\n\n", Node::CONTROL.address())
-    };
+    let control = Node::CONTROL.address();
     let advertise = node.address();
     format!(
         "data_dir = \"/data\"
@@ -31,7 +31,10 @@ role = \"{role}\"
 id = \"{name}\"
 advertise = \"{advertise}\"
 
-{control}[membership]
+[control]
+address = \"{control}\"
+
+[membership]
 on_shutdown = \"stay\"
 
 [tls]
@@ -93,11 +96,26 @@ mod tests {
     fn only_the_control_node_runs_control() {
         let control = render_config(Node::N1);
         assert!(control.contains("role = \"both\""), "{control}");
-        assert!(!control.contains("[control]"), "{control}");
         for node in &Node::ALL[1..] {
             let text = render_config(*node);
             assert!(text.contains("role = \"data\""), "{text}");
-            assert!(text.contains("address = \"10.77.0.11:7400\""), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_node_dials_the_control_node_at_its_bridge_address() {
+        // Including the control node itself, whose certificate names only that address.
+        for node in Node::ALL {
+            let text = render_config(node);
+            assert!(
+                text.contains("[control]\naddress = \"10.77.0.11:7400\""),
+                "{text}"
+            );
+            let config = Config::from_toml(&text).expect("config");
+            assert_eq!(
+                config.control.address.map(|address| address.to_string()),
+                Some(Node::CONTROL.address())
+            );
         }
     }
 
