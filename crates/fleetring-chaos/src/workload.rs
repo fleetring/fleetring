@@ -121,6 +121,12 @@ impl Recorder {
         outcome
     }
 
+    /// Returns how long it has been since the instant the history's times count from.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.t0.elapsed()
+    }
+
     /// Returns a copy of the history so far.
     #[must_use]
     pub fn history(&self) -> History {

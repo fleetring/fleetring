@@ -1,13 +1,15 @@
 //! `fleetring-chaos`: fault injection on real daemons (ADR-0036).
 
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use fleetring_chaos::docker::{Docker, network_rm_args, rm_args};
+use fleetring_chaos::docker::Docker;
 use fleetring_chaos::duration::parse_duration;
-use fleetring_chaos::node::{DEFAULT_IMAGE, Node};
+use fleetring_chaos::node::DEFAULT_IMAGE;
+use fleetring_chaos::run::{RunOptions, remove_fleet, run};
 use fleetring_chaos::schedule::{Scenario, Schedule};
 use fleetring_chaos::{Build, Mode, Teardown};
 
@@ -79,12 +81,16 @@ fn mode(self_test: bool) -> Mode {
     }
 }
 
+/// A seed from the kernel: 8 bytes of `/dev/urandom`, little-endian.
+fn random_seed() -> std::io::Result<u64> {
+    let mut bytes = [0; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 /// Removes the five containers and the network, whichever exist.
 fn clean() {
-    let docker = Docker;
-    let containers: Vec<String> = Node::ALL.into_iter().map(Node::container).collect();
-    docker.run_ignoring_errors(&rm_args(&containers));
-    docker.run_ignoring_errors(&network_rm_args());
+    remove_fleet(&Docker);
     println!("removed the fleetring-chaos containers and network, if there were any");
 }
 
@@ -101,18 +107,50 @@ fn main() -> ExitCode {
             out,
             keep,
         } => {
-            let _ = (scenario, seed, time_limit, mode(self_test), image, out);
-            let _ = if skip_build {
-                Build::Skip
-            } else {
-                Build::Image
+            if std::env::consts::OS != "linux" {
+                eprintln!(
+                    "fleetring-chaos: fleetring-chaos run needs Linux with Docker; this host runs {}",
+                    std::env::consts::OS
+                );
+                return ExitCode::from(2);
+            }
+            let seed = match seed.map_or_else(random_seed, Ok) {
+                Ok(seed) => seed,
+                Err(error) => {
+                    eprintln!("fleetring-chaos: can't read a seed from /dev/urandom: {error}");
+                    return ExitCode::from(2);
+                }
             };
-            let _ = if keep {
-                Teardown::Keep
-            } else {
-                Teardown::Remove
+            eprintln!("fleetring-chaos: {scenario} seed {seed}");
+            let options = RunOptions {
+                scenario,
+                seed,
+                time_limit,
+                mode: mode(self_test),
+                image,
+                build: if skip_build {
+                    Build::Skip
+                } else {
+                    Build::Image
+                },
+                out,
+                teardown: if keep {
+                    Teardown::Keep
+                } else {
+                    Teardown::Remove
+                },
             };
-            todo!("FR-065 step 8")
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("fleetring-chaos: can't start the async runtime: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            ExitCode::from(runtime.block_on(run(options)))
         }
         Command::Schedule {
             scenario,

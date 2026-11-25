@@ -21,6 +21,8 @@ pub mod duration;
 pub mod inject;
 pub mod node;
 #[cfg(feature = "harness")]
+pub mod run;
+#[cfg(feature = "harness")]
 pub mod schedule;
 #[cfg(feature = "harness")]
 pub mod workload;
@@ -72,6 +74,12 @@ const _: () = {
         assert_debug_send_sync::<inject::AppliedFault>();
         assert_debug_send_sync::<inject::InjectError>();
         assert_debug_send_sync::<inject::Injector>();
+        assert_debug_send_sync::<run::Counts>();
+        assert_debug_send_sync::<run::Judgement>();
+        assert_debug_send_sync::<run::RunError>();
+        assert_debug_send_sync::<run::RunOptions>();
+        assert_debug_send_sync::<run::Verdict>();
+        assert_debug_send_sync::<run::VerdictKind>();
         assert_debug_send_sync::<schedule::Fault>();
         assert_debug_send_sync::<schedule::FaultKind>();
         assert_debug_send_sync::<schedule::PlannedFault>();
