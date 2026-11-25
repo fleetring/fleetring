@@ -58,6 +58,7 @@
 //!   `Raft::trigger().transfer_leader(to)` hands leadership over. `Raft` takes the state machine
 //!   as a second type parameter: `Raft<C, SM>`.
 
+pub mod codec;
 mod id;
 mod runtime;
 mod types;

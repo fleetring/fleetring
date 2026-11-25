@@ -1,0 +1,20 @@
+{
+  "result": "conflict",
+  "log_id": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 40
+  },
+  "hint": [
+    {
+      "term": 1,
+      "node": "0000000000000002",
+      "index": 12
+    },
+    {
+      "term": 2,
+      "node": "0000000000000002",
+      "index": 30
+    }
+  ]
+}

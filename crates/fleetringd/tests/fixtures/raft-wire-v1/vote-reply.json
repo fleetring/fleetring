@@ -1,0 +1,13 @@
+{
+  "vote": {
+    "term": 4,
+    "node": "0000000000000002",
+    "committed": false
+  },
+  "vote_granted": true,
+  "last_log_id": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 43
+  }
+}

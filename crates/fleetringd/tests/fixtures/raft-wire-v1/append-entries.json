@@ -1,0 +1,72 @@
+{
+  "vote": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "committed": true
+  },
+  "prev_log_id": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 40
+  },
+  "entries": [
+    {
+      "index": 41,
+      "term": 3,
+      "leader_node": "d733a26dd4b49b94",
+      "kind": "blank",
+      "payload": {}
+    },
+    {
+      "index": 42,
+      "term": 3,
+      "leader_node": "d733a26dd4b49b94",
+      "kind": "command",
+      "payload": {
+        "screened": {
+          "term": 3,
+          "node": "d733a26dd4b49b94"
+        },
+        "command": {"at":1764000000000,"recorded_by":"c1","action":{"leave":{"id":"n3"}}}
+      }
+    },
+    {
+      "index": 43,
+      "term": 3,
+      "leader_node": "d733a26dd4b49b94",
+      "kind": "membership",
+      "payload": {
+        "configs": [
+          [
+            "0000000000000002",
+            "d733a26dd4b49b94"
+          ],
+          [
+            "0000000000000002",
+            "7ffffffffffffffe",
+            "d733a26dd4b49b94"
+          ]
+        ],
+        "nodes": {
+          "0000000000000002": {
+            "node_id": "c2",
+            "address": "10.0.0.2:7400"
+          },
+          "7ffffffffffffffe": {
+            "node_id": "c3",
+            "address": "[fd00::3]:7400"
+          },
+          "d733a26dd4b49b94": {
+            "node_id": "c1",
+            "address": "c1.fleet.internal:7400"
+          }
+        }
+      }
+    }
+  ],
+  "leader_commit": {
+    "term": 3,
+    "node": "d733a26dd4b49b94",
+    "index": 40
+  }
+}

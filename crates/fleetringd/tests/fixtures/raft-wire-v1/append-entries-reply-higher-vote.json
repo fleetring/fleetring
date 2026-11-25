@@ -1,0 +1,8 @@
+{
+  "result": "higher_vote",
+  "vote": {
+    "term": 5,
+    "node": "0000000000000002",
+    "committed": false
+  }
+}
