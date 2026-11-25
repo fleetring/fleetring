@@ -14,6 +14,7 @@
 //! tested; the parts that run a workload need `fleetringd`'s simulation types, behind the
 //! `harness` feature.
 
+pub mod config;
 pub mod duration;
 pub mod node;
 #[cfg(feature = "harness")]
