@@ -3,6 +3,9 @@
 //!
 //! - [`CommandLog`] stores each stamped command in SQLite and makes it durable before it is
 //!   applied, snapshots the state periodically, and replays the log at startup.
+//! - [`ControlStore`] is `control.db` format 2, the control group's Raft log and control
+//!   snapshots, which migrates a format-1 log on open. `raft` holds openraft's types for the
+//!   group and their encodings (ADR-0035, ADR-0040). Nothing runs them yet.
 //! - [`ControlNode`] runs the single writer: it stamps each command with a
 //!   [`Clock`](crate::clock::Clock), logs it, applies it with `fleetring_control::apply`, and
 //!   publishes the new state. [`ControlHandle`] submits commands and reads the published state.
@@ -34,6 +37,7 @@ mod notices;
 pub mod raft;
 mod screen;
 mod service;
+mod store;
 #[cfg(test)]
 mod test_support;
 
@@ -52,3 +56,4 @@ pub use service::{
     missing_database, rejection_status,
 };
 pub(crate) use service::{member_from, node_to_proto};
+pub use store::{ControlSnapshot, ControlStore};

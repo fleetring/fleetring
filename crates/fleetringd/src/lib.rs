@@ -125,6 +125,25 @@ const _: () = {
     assert_debug_send_sync::<control::ControlHandle>();
     assert_debug_send_sync::<control::ControlNode>();
     assert_debug_send_sync::<control::ControlOptions>();
+    assert_debug_send_sync::<control::ControlSnapshot>();
+    assert_debug_send_sync::<control::raft::ControlInstant>();
+    assert_debug_send_sync::<control::raft::ControlPeer>();
+    assert_debug_send_sync::<control::raft::ControlRequest>();
+    assert_debug_send_sync::<control::raft::ControlResponse>();
+    assert_debug_send_sync::<control::raft::ControlRng>();
+    assert_debug_send_sync::<control::raft::ControlRuntime>();
+    assert_debug_send_sync::<control::raft::ControlTypes>();
+    assert_debug_send_sync::<control::raft::LeaderRef>();
+    assert_debug_send_sync::<control::raft::ParseRaftIdError>();
+    assert_debug_send_sync::<control::raft::RaftIdError>();
+    assert_debug_send_sync::<control::raft::RaftSeed>();
+    assert_debug_send_sync::<control::raft::codec::CodecError>();
+    assert_debug_send_sync::<control::raft::codec::AppendEntries>();
+    assert_debug_send_sync::<control::raft::codec::AppendEntriesReply>();
+    assert_debug_send_sync::<control::raft::codec::EntryWire>();
+    assert_debug_send_sync::<control::raft::codec::InstallSnapshotChunk>();
+    assert_debug_send_sync::<control::raft::codec::ProbeReply>();
+    assert_debug_send_sync::<control::raft::codec::SnapshotAssembly>();
     assert_debug_send_sync::<control::ControlService>();
     assert_debug_send_sync::<control::LogError>();
     assert_debug_send_sync::<control::NoControl>();
@@ -249,4 +268,5 @@ const _: () = {
     // The log owns a SQLite connection, which moves between threads but isn't shared.
     const fn assert_debug_send<T: std::fmt::Debug + Send>() {}
     assert_debug_send::<control::CommandLog>();
+    assert_debug_send::<control::ControlStore>();
 };
