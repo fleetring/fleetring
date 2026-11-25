@@ -1,0 +1,40 @@
+[package]
+name = "fleetring-chaos"
+description = "Fault injection on real fleetringd processes, judged by the history checker (ADR-0036)."
+version = "0.0.0"
+publish = false
+edition.workspace = true
+# Needs fleetringd, which needs 1.89 (ADR-0015, point 7).
+rust-version = "1.89"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[features]
+# The harness itself. Off by default: it turns on fleetringd's `simulation` feature, which
+# Cargo would otherwise unify into every workspace build (ADR-0036, Consequences).
+harness = ["fleetringd/simulation"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+fleetring = { path = "../fleetring", features = ["serde"] }
+fleetring-control = { version = "0.0.0", path = "../fleetring-control" }
+fleetringd = { version = "0.9.0", path = "../fleetringd" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tonic = "0.14"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "test-util"] }
+
+[[bin]]
+name = "fleetring-chaos"
+path = "src/main.rs"
+required-features = ["harness"]
+
+[lints]
+workspace = true
