@@ -7,7 +7,6 @@
 //! `fleetringd-v0.9.0` tag by the same computation this test runs (`writer`).
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use fleetring_control::{Command, Feature};
 
@@ -31,23 +30,15 @@ enum Why {
 /// Every field path of this build that the previous line (0.9) lacks, with why it is safe.
 const NEW_FIELDS: &[(&str, Why)] = &[];
 
-fn manifest() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
 #[test]
 fn every_field_the_previous_line_lacks_is_gated_or_derived() {
-    let previous: BTreeSet<String> =
-        std::fs::read_to_string(manifest().join("tests/it/fixtures/fields-0.9.0.txt"))
-            .expect("fields-0.9.0.txt can be read")
-            .lines()
-            .map(str::to_owned)
-            .collect();
-    let commands = std::fs::read_to_string(
-        manifest().join("../fleetringd/tests/fixtures/control-0.9.0/commands.json"),
-    )
-    .expect("the 0.9.0 fixture's commands can be read");
-    let commands: Vec<Command> = serde_json::from_str(&commands).expect("the commands decode");
+    // Embedded at compile time, so the test runs where it has no file system (wasm32-wasip1).
+    let previous: BTreeSet<String> = include_str!("fixtures/fields-0.9.0.txt")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let commands = include_str!("../../../fleetringd/tests/fixtures/control-0.9.0/commands.json");
+    let commands: Vec<Command> = serde_json::from_str(commands).expect("the commands decode");
     let current = writer::field_paths(&commands);
     assert!(
         current.len() > 100,
