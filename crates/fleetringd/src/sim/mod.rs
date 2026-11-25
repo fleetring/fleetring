@@ -81,6 +81,7 @@ mod trace;
 mod workload;
 
 pub use check::{ControlLog, Invariant, ReplicaChains, ReplicaRows, Violation};
+pub use client::data_operation;
 pub use fault::{Fault, LossRate};
 pub use fleet::{
     Fleet, FleetBuilder, OTHER_PRINCIPAL, PORT, ROUTER_PORT, Report, SimError, TRACE_VAR, Timings,

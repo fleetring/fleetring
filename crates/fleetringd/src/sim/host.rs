@@ -201,7 +201,7 @@ pub(super) async fn run_host(
         environment = environment.with_fork_faults(faults);
     }
     #[cfg(not(feature = "fault-hooks"))]
-    drop(faults);
+    let _ = faults;
     let daemon = Daemon::start_with(config, environment).await?;
     let membership = daemon.membership();
     shared.lock().running.insert(

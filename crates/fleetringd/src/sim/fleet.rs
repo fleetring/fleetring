@@ -1756,11 +1756,7 @@ impl Fleet {
     pub fn replica_rows(&self, database: &DatabaseName) -> Result<ReplicaRows, SimError> {
         let mut rows = ReplicaRows::new();
         for host in self.hosts.iter().filter(|host| host.role.hosts_data()) {
-            let dir = host
-                .data_dir
-                .join(DATABASES_DIR)
-                .join(layout::database_dir(database));
-            let held = read_rows(&dir).map_err(|error| {
+            let held = check::read_replica_rows(&host.data_dir, database).map_err(|error| {
                 SimError::Simulation(format!(
                     "can't read {}'s copy of {database}: {error}",
                     host.name
@@ -2509,34 +2505,6 @@ pub fn written_values(dir: &Path) -> Result<Vec<i64>, SimError> {
     read().map_err(|error| {
         SimError::Simulation(format!("can't read the copy at {}: {error}", dir.display()))
     })
-}
-
-fn read_rows(dir: &Path) -> Result<BTreeSet<i64>, Box<dyn std::error::Error>> {
-    let database = dir.join("data.db");
-    if !database.try_exists()? {
-        return Ok(BTreeSet::new());
-    }
-    let scratch = tempfile::tempdir()?;
-    let copy = scratch.path().join("data.db");
-    std::fs::copy(&database, &copy)?;
-    let wal = dir.join("data.db-wal");
-    if wal.try_exists()? {
-        std::fs::copy(&wal, scratch.path().join("data.db-wal"))?;
-    }
-    let connection = rusqlite::Connection::open(&copy)?;
-    let tables: i64 = connection.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [WRITES_TABLE],
-        |row| row.get(0),
-    )?;
-    if tables == 0 {
-        return Ok(BTreeSet::new());
-    }
-    let mut statement = connection.prepare(&format!("SELECT value FROM {WRITES_TABLE}"))?;
-    let keys = statement
-        .query_map([], |row| row.get::<_, i64>(0))?
-        .collect::<Result<BTreeSet<i64>, _>>()?;
-    Ok(keys)
 }
 
 /// A link as an ordered pair of host names, so both directions name it the same way.
