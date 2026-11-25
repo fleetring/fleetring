@@ -132,7 +132,8 @@ pub enum Unbound {
 /// (ADR-0046, points 4.1 and 4.4).
 ///
 /// Most variants are reasons for a `seeding` binding refusal. [`NotSeeding`](Self::NotSeeding),
-/// [`Attempt`](Self::Attempt), and [`NotSourcePrimary`](Self::NotSourcePrimary) aren't: they
+/// [`Attempt`](Self::Attempt), [`SourceGone`](Self::SourceGone), and
+/// [`NotSourcePrimary`](Self::NotSourcePrimary) aren't: they
 /// describe a request whose identity and caller match, made from a view a moment older or newer
 /// than the receiver's, which is answered `UNAVAILABLE` with a retry-after and not counted as a
 /// refusal (ADR-0046, points 4.1 and 4.4, as amended).
@@ -158,8 +159,13 @@ pub enum SeedingMismatch {
     },
     /// The request names a source other than the fork's.
     Source,
-    /// The source's incarnation isn't the one the request, or the fork, names.
+    /// The request names another source incarnation than the fork does.
     SourceIncarnation,
+    /// Control state no longer holds the source incarnation the fork, and the request, name:
+    /// the source was dropped, or created again, after the fork began, and the fork hasn't
+    /// failed yet. Answered with a retry-after, not refused: the seeder asks control state again
+    /// before it retries, and stops once the fork has failed.
+    SourceGone,
     /// The receiving node doesn't hold the source's lease now. Answered with a retry-after, not
     /// refused: the seeder asks control state where the source's primary is before it retries.
     NotSourcePrimary,
@@ -182,7 +188,10 @@ impl fmt::Display for SeedingMismatch {
                 write!(f, "the fork seeds attempt {current}, not {requested}")
             }
             Self::Source => f.write_str("the request names another source than the fork's"),
-            Self::SourceIncarnation => f.write_str("the source has another incarnation"),
+            Self::SourceIncarnation => {
+                f.write_str("the request names another source incarnation than the fork's")
+            }
+            Self::SourceGone => f.write_str("the fork's source incarnation was dropped"),
             Self::NotSourcePrimary => f.write_str("this node doesn't hold the source's lease"),
             Self::NotSeeder => f.write_str("the caller isn't the attempt's seeder"),
             Self::NotTheSeeder => f.write_str("this node isn't the attempt's seeder"),

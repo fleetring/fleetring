@@ -877,7 +877,8 @@ fn answer_later(request: &SeedingRequest, why: SeedingMismatch) -> Status {
 /// matches but whose attempt isn't the one seeding now is answered, not refused: the caller's
 /// role is checked only against the attempt it names, once that attempt is seeding. So is the
 /// seeder's request to a node that doesn't lead the source now: the source's lease moved after
-/// the seeder looked.
+/// the seeder looked, or control state no longer holds the source incarnation the fork names,
+/// which it fails the fork for next.
 ///
 /// The control-state views the check takes answer within [`CONTROL_CALL_LIMIT`], all told.
 ///
@@ -932,15 +933,20 @@ pub(super) async fn check_seeding(
     {
         return refused(SeedingMismatch::NotSeeder);
     }
+    // The request names the fork's source incarnation, and comes from the attempt's seeder. If
+    // control state no longer holds that incarnation, the source was dropped or created again
+    // after the fork began, and the driver hasn't failed the fork yet: the seeder asked as its
+    // view said, and this node doesn't lead the source the fork names (ADR-0046's amendment,
+    // item 5).
     let source = match view_by(inner, &request.database, deadline).await {
         Ok(source) => source,
         Err(status) if status.code() == tonic::Code::NotFound => {
-            return refused(SeedingMismatch::SourceIncarnation);
+            return Err(answer_later(request, SeedingMismatch::SourceGone));
         }
         Err(status) => return Err(status),
     };
     if !unchecked && source.incarnation != request.source_incarnation {
-        return refused(SeedingMismatch::SourceIncarnation);
+        return Err(answer_later(request, SeedingMismatch::SourceGone));
     }
     let epoch = source.holders.epoch;
     let leads = source.holders.holder.as_ref() == Some(&inner.node)
