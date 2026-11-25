@@ -168,6 +168,17 @@ row!(
     source_recreated
 );
 
+/// Row 5 on seeds where the new source's primary refused the attempt's seeder for its binding:
+/// control state still showed the fork seeding from the dropped incarnation, which the driver
+/// hadn't failed yet, so the seeder asked the source's primary for it as control state said. A
+/// request made at another moment, answered with a retry-after (ADR-0046, points 4.1 and 4.4,
+/// as amended).
+#[test]
+fn row_05_source_recreated_a_seeding_request_for_the_dropped_source_is_answered_not_refused() {
+    super::matrix::pinned(&[607_073_808], Point::BeforePin, source_recreated);
+    super::matrix::pinned(&[607_073_935], Point::DuringStream, source_recreated);
+}
+
 /// Row 6: the seeder crashes at each step and restarts.
 fn seeder_restart(seed: u64, point: Point) -> Result<()> {
     let mut run = Run::start(seed, &Setup::default())?;
