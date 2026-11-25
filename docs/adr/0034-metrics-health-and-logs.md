@@ -4,6 +4,8 @@
 - **Date:** 2026-11-03
 - **Related:** ADR-0013 (async boundaries), ADR-0015 (daemon layout), ADR-0020 (simulation), ADR-0025 and ADR-0026 (principals, scopes, enforcement), ADR-0033 (surfaces); tickets FR-063
 
+*Note (2026-11-25):* [ADR-0040](0040-raft-control-group-versions-and-dev-mode.md) point 10, accepted today, gives FR-064's control group its readiness checks and metrics: `control_log` means the proposer and storage run, `leader` that this node knows a leader, a new check `control_group` that it is a voter or learner, and the control family gains the group's gauges and counters. Where point 4 below names the control writer, read the group's proposer once FR-064 lands. The text below is unchanged.
+
 ## Context
 
 The roadmap's "Operable" criterion asks for metrics, health checks, and logs an operator can collect. A running `fleetringd` offers `tracing` text on stderr and the `status` commands. Neither can be scraped, a load balancer or an orchestrator has nothing to probe, and the log lines one request causes, on the node it reached and on the nodes that node called, share nothing that ties them together.
