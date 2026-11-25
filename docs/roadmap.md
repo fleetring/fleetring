@@ -16,7 +16,7 @@ The placement crate `fleetring` is released (0.1.0) and its placement is frozen 
 ### E1. Correctness, verified
 Every simulation run checked against the guarantees each database promises, and the same checks on real processes.
 - FR-036 history checker (done); nightly sweep of 500 seeds, with failing seeds filed as bugs.
-- [FR-065](https://github.com/fleetring/fleetring/issues/68): a Jepsen-style run on real daemons before the first "safe" release. An in-repo harness, `fleetring-chaos`, runs five daemons in containers with partitions, kills, pauses, and clock skew, and judges each run with FR-036's checker, nightly (ADR-0036, accepted; [plan](plans/FR-065-fault-injection-harness.md)).
+- [FR-065](https://github.com/fleetring/fleetring/issues/68): a Jepsen-style run on real daemons before the first "safe" release. An in-repo harness, `fleetring-chaos` (ADR-0036), runs five daemons in containers with partitions, kills, pauses, and clock skew, and judges each run with FR-036's checker, nightly in the `Chaos` workflow ([README](../crates/fleetring-chaos/README.md); [plan](plans/FR-065-fault-injection-harness.md)). Control-group faults follow FR-064.
 - Fuzzing of the daemon's protocol inputs (batches, database snapshots, control RPCs), next to the existing spec fuzzing.
 
 ### E2. Durability and operations
@@ -77,7 +77,7 @@ Today's design is sound for about a hundred nodes and tens of thousands of datab
 ### E9. Release engineering
 - Nightly simulation sweeps kept green for a sustained period before a release is called safe.
 - Compatibility tests between the previous and current release: mixed-version fleets, old control logs and control snapshots.
-- Chaos on a real fleet in CI: FR-065's nightly job (kill, pause, partition with `iptables`, clock skew), never on pull requests.
+- Chaos on a real fleet in CI: [FR-065](https://github.com/fleetring/fleetring/issues/68)'s nightly job (kill, pause, partition with `iptables`, clock skew), never on pull requests.
 
 ## Order
 
