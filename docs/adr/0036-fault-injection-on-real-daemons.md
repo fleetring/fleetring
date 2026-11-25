@@ -52,6 +52,22 @@ Constraints:
 
 10. **Control-group faults follow the control group.** When FR-064 lands three control nodes, the harness gains faults that isolate the control leader, kill two of three control nodes, and skew clocks between control nodes. Until then the control node is one process, and its faults are those above.
 
+## Owner decisions
+
+Made on 2026-11-03, when this record was accepted, as FR-065's plan recommended:
+
+1. **Failing nightly runs don't file issues automatically.** The job summary and the uploaded run directory are enough; an issue is filed by hand, with the seed and the run directory, as for a flaky test.
+2. **Clock skew is injected on the control node only** (point 4). Skew on data nodes and between control nodes comes with FR-064's control group (point 10).
+3. **If `libfaketime` doesn't move Rust's clock in the containers, the fallback is the container's clock namespace** (`unshare --time`), recorded as an amendment to this record, never a clock hook in the daemon. The first runs (2026-11-25) showed it isn't needed: with the library preloaded, a `-7200s` offset moved the binary's `SystemTime` by two hours (a certificate it issued started two hours and 30 seconds early), and the harness's clock faults use it as point 4 describes.
+
+## Implementation notes
+
+FR-065 built this decision as written, with three details the record didn't fix:
+
+- **The control node names its own bridge address as `[control] address`.** A node of role `both` otherwise dials its own control role on loopback, which the certificate the harness issues it (point 3, for its bridge address only) doesn't name.
+- **The self-test passes on any invariant a lost acknowledged write breaks:** acknowledged writes on a write quorum, in every later read, read-your-writes, or monotonic reads, since which one the checker reports first depends on the history.
+- **A run with fewer than 100 acknowledged writes is a harness failure only when the checks find no violation:** a violation in a short run is still a violation (point 6).
+
 ## Alternatives considered
 
 - **Jepsen itself.** The reference tool, with Knossos and Elle as checkers, and the most credible result to point to. It needs a Clojure project, five SSH-reachable LXC or Docker nodes plus a control node, and a FleetRing client on the JVM: either a gRPC client generated for Java, or a CLI process per operation, which is too slow for a meaningful rate. Its checkers would judge a history FleetRing already checks with FR-036, under a second definition of the guarantees that could drift from the first. The harness's history format is close to Jepsen's (invocations and completions with `ok`, `fail`, `info`), so a Jepsen run can be added later for an external review; this decision doesn't rule it out.
