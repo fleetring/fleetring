@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use fleetring_chaos::docker::{Docker, network_rm_args, rm_args};
 use fleetring_chaos::duration::parse_duration;
 use fleetring_chaos::node::{DEFAULT_IMAGE, Node};
-use fleetring_chaos::schedule::Scenario;
+use fleetring_chaos::schedule::{Scenario, Schedule};
 use fleetring_chaos::{Build, Mode, Teardown};
 
 /// Runs five real fleetringd processes in Docker, injects faults, and judges the history
@@ -120,8 +120,11 @@ fn main() -> ExitCode {
             time_limit,
             self_test,
         } => {
-            let _ = (scenario, seed, time_limit, mode(self_test));
-            todo!("FR-065 step 5")
+            let schedule = Schedule::generate(scenario, seed, time_limit, mode(self_test));
+            for planned in &schedule.faults {
+                println!("{planned}");
+            }
+            ExitCode::SUCCESS
         }
         Command::Clean => {
             clean();

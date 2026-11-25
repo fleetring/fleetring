@@ -63,4 +63,12 @@ const _: () = {
     assert_debug_send_sync::<docker::Signal>();
     assert_debug_send_sync::<duration::ParseDurationError>();
     assert_debug_send_sync::<node::Node>();
+    #[cfg(feature = "harness")]
+    {
+        assert_debug_send_sync::<schedule::Fault>();
+        assert_debug_send_sync::<schedule::FaultKind>();
+        assert_debug_send_sync::<schedule::PlannedFault>();
+        assert_debug_send_sync::<schedule::Scenario>();
+        assert_debug_send_sync::<schedule::Schedule>();
+    }
 };
