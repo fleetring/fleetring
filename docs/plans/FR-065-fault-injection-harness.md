@@ -1,7 +1,7 @@
 ---
 id: FR-065
 title: "Fault injection on real daemons: partitions, kills, pauses, and clock skew, judged by the history checker"
-status: todo
+status: in-progress
 priority: P1
 size: L
 milestone: M7 Durability and operations
@@ -26,15 +26,15 @@ The roadmap's first "safe to use" criterion asks for no known way to lose an ack
 
 ## Acceptance criteria
 
-- [ ] ADR-0036 is accepted and listed in `docs/adr/README.md`.
+- [x] ADR-0036 is accepted and listed in `docs/adr/README.md`.
 - [ ] `cargo run -p fleetring-chaos -- run --scenario mixed --time-limit 600s` on a Linux host with Docker starts five real daemons, runs the workload and the faults, heals, and exits 0 with the checker's verdict `valid`.
-- [ ] Every fault kind runs in at least one scenario, and each appears in the run's `schedule.txt` with its start and end times and targets.
-- [ ] The verdict comes from FR-036's checker over the recorded history and the rows read from every node's data directory after the run, plus the control log replay check; exit code 1 means a violation, 2 a harness failure.
-- [ ] `--self-test` creates `acks = local` databases but checks them as `quorum`, and reports a lost acknowledged write within the default time limit on the `partitions` scenario.
-- [ ] A failing run prints its seed and a command that reruns its fault schedule, and its run directory holds the history, schedule, verdict, and node logs.
-- [ ] `.github/workflows/chaos.yml` runs the five scenarios nightly and on manual dispatch, uploads run directories on failure, and doesn't run on pull requests.
-- [ ] The harness's schedule generation and command building have unit tests that run in normal CI without Docker.
-- [ ] The harness README, `docs/roadmap.md` (E1, E9), and the lexicon are updated.
+- [x] Every fault kind runs in at least one scenario, and each appears in the run's `schedule.txt` with its start and end times and targets.
+- [x] The verdict comes from FR-036's checker over the recorded history and the rows read from every node's data directory after the run, plus the control log replay check; exit code 1 means a violation, 2 a harness failure.
+- [x] `--self-test` creates `acks = local` databases but checks them as `quorum`, and reports a lost acknowledged write within the default time limit on the `partitions` scenario.
+- [x] A failing run prints its seed and a command that reruns its fault schedule, and its run directory holds the history, schedule, verdict, and node logs.
+- [x] `.github/workflows/chaos.yml` runs the five scenarios nightly and on manual dispatch, uploads run directories on failure, and doesn't run on pull requests.
+- [x] The harness's schedule generation and command building have unit tests that run in normal CI without Docker.
+- [x] The harness README, `docs/roadmap.md` (E1, E9), and the lexicon are updated.
 
 Note on the second criterion: the binary needs the crate's `harness` feature (ADR-0036, Consequences), so the command that runs is `cargo run -p fleetring-chaos --features harness -- run --scenario mixed --time-limit 600s`. The issue's text is to be updated to that form when ADR-0036 is accepted.
 
@@ -832,4 +832,20 @@ The open questions this plan raised were decided as recommended:
 
 ## Progress
 
-- Not started.
+- 2026-11-25: Steps 1 to 10 implemented on branch `worktree-agent-ab3f8fa3bf2f38e57`, one commit per step plus one fix; step 11 waits on FR-064. The status stays in-progress until CI is green and a 600 s run on a Linux host (the second acceptance criterion) has passed; the nightly workflow's manual dispatch is the way to run it.
+  - **Runs (Docker Desktop on macOS, arm64).** `run` refuses macOS itself (exit 2, as step 8 says), and the host can't reach bridge addresses there, so the Linux build of the harness ran in a container on the Docker Desktop VM's host network, with the Docker socket and the workspace mounted (the README shows the command). `mixed`, seed 7, 120 s: five faults (a kill, a clock strobe of ±55 s, a bridge, the control node isolated, a skew of -41 s), failovers in the node logs, 17,432 `ok`, 0 `fail`, 1,235 `info`, verdict `valid`, exit 0. `partitions --self-test`, seed 11, 180 s: six primary isolations, verdict `invalid` on "acknowledged writes are on a write quorum" (a write to `chaos/db-6` held by no replica), `self-test passed`, exit 0. Both removed their containers and network.
+  - **libfaketime.** The open risk didn't happen: preloaded with a `-7200s` offset file, the image's `fleetring cert init` wrote a certificate starting two hours and 30 seconds before the host's time, so Rust's `SystemTime` reads go through the library, and no `unshare --time` fallback or ADR amendment is needed. Recorded in ADR-0036's owner decisions.
+  - **Deviations from the plan, adapted to the code as it stands after 0.9.0:**
+    - The daemon's binary is `fleetring` now (ADR-0043), with `fleetringd` a link to it, so the image installs `fleetring`, links `fleetringd`, and runs `fleetring serve --config …`.
+    - The 1.88 MSRV line already excluded `fleetring-sqlite-vec`; it now excludes `fleetring-chaos` too, and the 1.89 line names both.
+    - Step 1 also replaces `drop(faults)` in `sim/host.rs` with `let _ = faults;`: clippy's `drop_non_drop` fails any lint of the `simulation` feature without `fault-hooks`, which is what linting the harness alone builds.
+    - **The control node names its own address as `[control] address`** (the `fix(chaos)` commit, found by the first run): without it, its data role dials its own listener on loopback, which its certificate doesn't name, and the fleet never had five live members. The test `only_the_control_node_runs_control` no longer asserts that `n1` has no `[control]` table; `every_node_dials_the_control_node_at_its_bridge_address` replaces it.
+    - `Fault::Partition` carries its `sides` as well as its `cut`, so `schedule.txt` prints the sides; `schedule::workload_rng` gives the workload the root generator after the schedule's fork; `schedule::DATABASES` and `database_label` live in `schedule.rs`, which `workload.rs` re-exports and builds on.
+    - The `Runner` trait arrived with `docker.rs` in step 4 rather than step 6. `Docker` gained `run_in` (the build runs in the workspace root) and `run_combined` (a container's log is its stdout then its stderr).
+    - `judge` returns a `Judgement` (verdict kind, invariant, detail, counts, exit code) rather than `(Verdict, u8)`, since it doesn't know the scenario, seed, and fault count `verdict.json` carries; `run` builds the `Verdict`.
+    - The 100-acknowledged-write floor applies only when the checks find no violation, so `a_lost_acknowledged_write_is_invalid` (one write) stays invalid as the plan's test requires; a short run that looks valid is still a harness failure.
+    - The self-test passes on any invariant a lost acknowledged write breaks: acknowledged writes on a write quorum, in every later read, read-your-writes, and monotonic reads, because which one the checker reports first depends on the history.
+    - `checked_guarantee` takes no mode, as the plan's signature has it, so `chaos/db-6` and `chaos/db-7` are checked as `all` in the self-test too, not `quorum`; a lost write breaks either.
+    - `schedule.txt` prints each applied fault with its actual start and end, and a first line saying where the fault phase starts in `history.txt`'s time: the history counts from the setup, the schedule from the fault phase. A planned fault the deadline cut off is marked `(not run)`.
+    - `chaos.yml` passes `matrix.run` to the run step through an environment variable rather than inline in the script.
+    - Ctrl-C undoes every fault, removes the fleet unless `--keep`, and exits 130.
