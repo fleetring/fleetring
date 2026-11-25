@@ -511,6 +511,54 @@ fn to_sql(index: LogIndex) -> Result<i64, LogError> {
     i64::try_from(index.0).map_err(|_| LogError::Exhausted)
 }
 
+/// Returns the format of the control log at `path`, read without changing the file: `None` when
+/// there is no file, or the file holds no format yet.
+///
+/// # Errors
+///
+/// [`LogError::Sqlite`] if the file can't be read, and [`LogError::UnsupportedFormat`] if its
+/// format isn't a number.
+pub(crate) fn file_format(path: &Path) -> Result<Option<u32>, LogError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let sqlite = |source| LogError::Sqlite {
+        path: path.to_owned(),
+        source,
+    };
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(sqlite)?;
+    let has_meta = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sqlite)?
+        .is_some();
+    if !has_meta {
+        return Ok(None);
+    }
+    let found: Option<String> = connection
+        .query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(sqlite)?;
+    found
+        .map(|text| {
+            text.parse().map_err(|_| LogError::UnsupportedFormat {
+                found: text,
+                supported: FORMAT_VERSION,
+            })
+        })
+        .transpose()
+}
+
 /// Checks the invariants that every state produced by `apply` keeps, so that a damaged snapshot
 /// is refused instead of corrupting the control plane.
 pub(crate) fn check_state(state: &State, genesis: &ControlConfig) -> Result<(), String> {

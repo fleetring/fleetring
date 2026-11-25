@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 mod common;
+mod control_format;
 mod features;
 mod rolling;
 #[path = "../support/mod.rs"]

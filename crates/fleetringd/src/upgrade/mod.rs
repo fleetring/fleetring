@@ -7,13 +7,16 @@
 //! 3. **Download and verify:** the archive, `SHA256SUMS`, and its Sigstore bundle; the signature
 //!    with cosign against the release workflow's identity, then the archive's checksum, then the
 //!    extracted binary's `--version`. Any failure is a refusal; nothing unverified is installed.
-//! 4. **Check the node's configuration:** with `--config`, the release's own binary runs `serve
+//! 4. **Check the node's control log:** with `--config`, refuse a release whose binary reads
+//!    a lower control-log format than the node's `control.db` holds, before anything is swapped
+//!    (ADR-0040 point 5).
+//! 5. **Check the node's configuration:** with `--config`, the release's own binary runs `serve
 //!    --check` on the node's command line, and a configuration it refuses refuses the swap, unless
 //!    `--no-restart`. A release before 0.8 can't check, and the report says so.
-//! 5. **Swap:** the new binary replaces the installed one atomically, which is kept as
+//! 6. **Swap:** the new binary replaces the installed one atomically, which is kept as
 //!    `<name>.previous` for `--rollback`. A release before 0.7 can't run `serve`, so installing
 //!    one first checks how the node was started (ADR-0043, point 3.5).
-//! 6. **Restart:** with `--config` naming a running node, drain it, send it `SIGHUP` so it
+//! 7. **Restart:** with `--config` naming a running node, drain it, send it `SIGHUP` so it
 //!    restarts in place, and wait until it has rejoined on the new release and caught up.
 
 mod config_check;
@@ -149,6 +152,23 @@ pub enum UpgradeError {
         release: Release,
         /// The enabled feature it lacks.
         feature: String,
+    },
+    /// The release reads a lower control-log format than the node's `control.db` holds, so a
+    /// control node on it couldn't start.
+    #[error(
+        "fleetring {release} reads control log format {reads}, and {} is format {found}: \
+         rolling this control node back would leave it unable to start\n  hint: roll forward",
+        path.display()
+    )]
+    ControlFormat {
+        /// The node's control log.
+        path: PathBuf,
+        /// The format the file holds.
+        found: u32,
+        /// The release asked for.
+        release: Release,
+        /// The highest format it reads.
+        reads: u32,
     },
     /// The binary's directory can't be written.
     #[error(
@@ -509,6 +529,47 @@ fn check_features(view: &MembershipView, software: &Reported) -> Result<(), Upgr
     }
 }
 
+/// Returns the format of the node's control log, if `--config` named a node whose data
+/// directory holds one. A data-only node has none.
+///
+/// # Errors
+///
+/// [`UpgradeError::Io`] if the file can't be read.
+fn node_control_format(options: &Options) -> Result<Option<(PathBuf, u32)>, UpgradeError> {
+    let Some(node) = &options.node else {
+        return Ok(None);
+    };
+    let path = node.data_dir.join(crate::daemon::CONTROL_DB);
+    let found = crate::control::file_format(&path).map_err(|error| UpgradeError::Io {
+        path: path.clone(),
+        source: std::io::Error::other(error),
+    })?;
+    Ok(found.map(|found| (path, found)))
+}
+
+/// Refuses `software` if it reads a lower control-log format than `control`, the node's
+/// control log and its format, holds (ADR-0040 point 5).
+///
+/// # Errors
+///
+/// [`UpgradeError::ControlFormat`] naming both formats.
+fn check_control_format(
+    control: Option<&(PathBuf, u32)>,
+    software: &Reported,
+) -> Result<(), UpgradeError> {
+    match control {
+        Some((path, found)) if software.control_format < *found => {
+            Err(UpgradeError::ControlFormat {
+                path: path.clone(),
+                found: *found,
+                release: software.release.clone(),
+                reads: software.control_format,
+            })
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
 async fn check(options: &Options) -> Result<Outcome, UpgradeError> {
     let source = source(options)?;
     let installed = this_release();
@@ -517,6 +578,26 @@ async fn check(options: &Options) -> Result<Outcome, UpgradeError> {
     if available <= installed && options.version.is_none() {
         report.push_str("fleetring is up to date\n");
         return Ok(Outcome::done(report));
+    }
+    let control = node_control_format(options)?;
+    if let Some((path, found)) = &control {
+        // What a release reads is known only to its binary, as its features are.
+        let software = if available == installed {
+            Reported::this_binary()
+        } else {
+            let scratch = scratch()?;
+            software_of(&fetch(&source, &available, scratch.path(), &options.steps).await?)?
+        };
+        if check_control_format(control.as_ref(), &software).is_err() {
+            let _ = writeln!(
+                report,
+                "control log: {available} can't read {}: it reads format {}, and the file is \
+                 format {found}",
+                path.display(),
+                software.control_format
+            );
+            return Ok(Outcome::blocked(report));
+        }
     }
     let Some(view) = fleet_view(options).await? else {
         report.push_str("fleet: not checked; pass --config or --control to check it\n");
@@ -613,6 +694,7 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
     }
     let running = running_daemon(options, installed)?;
     check_start_command(options, running.as_ref(), &release)?;
+    let control = node_control_format(options)?;
     let view = fleet_view(options).await?;
     if let Some(view) = &view {
         check_window(view, options.node.as_ref().map(|node| &node.id), &release)?;
@@ -621,6 +703,7 @@ async fn install(options: &Options, installed: &Installed) -> Result<Outcome, Up
     let scratch = scratch()?;
     let binary = fetch(&source, &release, scratch.path(), &options.steps).await?;
     let software = software_of(&binary)?;
+    check_control_format(control.as_ref(), &software)?;
     if let Some(view) = &view {
         check_features(view, &software)?;
     }
@@ -651,6 +734,7 @@ async fn roll_back(options: &Options, installed: &Installed) -> Result<Outcome, 
     }
     let software = software_of(&previous)?;
     let release = software.release.clone();
+    check_control_format(node_control_format(options)?.as_ref(), &software)?;
     let running = running_daemon(options, installed)?;
     check_start_command(options, running.as_ref(), &release)?;
     if let Some(view) = fleet_view(options).await? {
