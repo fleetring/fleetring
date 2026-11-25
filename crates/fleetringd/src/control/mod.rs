@@ -31,6 +31,7 @@ pub(crate) mod fork;
 mod log;
 mod node;
 mod notices;
+pub mod raft;
 mod screen;
 mod service;
 #[cfg(test)]
