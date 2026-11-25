@@ -5,8 +5,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use fleetring_chaos::docker::{Docker, network_rm_args, rm_args};
 use fleetring_chaos::duration::parse_duration;
-use fleetring_chaos::node::DEFAULT_IMAGE;
+use fleetring_chaos::node::{DEFAULT_IMAGE, Node};
 use fleetring_chaos::schedule::Scenario;
 use fleetring_chaos::{Build, Mode, Teardown};
 
@@ -78,6 +79,15 @@ fn mode(self_test: bool) -> Mode {
     }
 }
 
+/// Removes the five containers and the network, whichever exist.
+fn clean() {
+    let docker = Docker;
+    let containers: Vec<String> = Node::ALL.into_iter().map(Node::container).collect();
+    docker.run_ignoring_errors(&rm_args(&containers));
+    docker.run_ignoring_errors(&network_rm_args());
+    println!("removed the fleetring-chaos containers and network, if there were any");
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -113,6 +123,9 @@ fn main() -> ExitCode {
             let _ = (scenario, seed, time_limit, mode(self_test));
             todo!("FR-065 step 5")
         }
-        Command::Clean => todo!("FR-065 step 4"),
+        Command::Clean => {
+            clean();
+            ExitCode::SUCCESS
+        }
     }
 }

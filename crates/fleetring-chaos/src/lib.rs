@@ -15,6 +15,7 @@
 //! `harness` feature.
 
 pub mod config;
+pub mod docker;
 pub mod duration;
 pub mod node;
 #[cfg(feature = "harness")]
@@ -57,6 +58,9 @@ const _: () = {
     assert_debug_send_sync::<Build>();
     assert_debug_send_sync::<Mode>();
     assert_debug_send_sync::<Teardown>();
+    assert_debug_send_sync::<docker::Docker>();
+    assert_debug_send_sync::<docker::DockerError>();
+    assert_debug_send_sync::<docker::Signal>();
     assert_debug_send_sync::<duration::ParseDurationError>();
     assert_debug_send_sync::<node::Node>();
 };
