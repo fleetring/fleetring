@@ -1,8 +1,22 @@
 # ADR-0035: The control log is replicated by a Raft control group on openraft, with one code path from one voter to five
 
-- **Status:** Accepted (2026-11-03); amendments proposed in ADR-0040
+- **Status:** Accepted (2026-11-03); points 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, and 15 amended by [ADR-0040](0040-raft-control-group-versions-and-dev-mode.md) (accepted 2026-11-25)
 - **Date:** 2026-11-03
 - **Related:** ADR-0017 (resolves its "Adding Raft later"), ADR-0018, ADR-0019, ADR-0020, ADR-0022 (extends point 6), ADR-0025, ADR-0026, ADR-0031; tickets FR-064
+
+*Note (2026-11-25):* [ADR-0040](0040-raft-control-group-versions-and-dev-mode.md), accepted today, amends this record wherever the two differ, and FR-064 builds to it. The points it changes most:
+
+- **Point 1:** openraft is pinned to `=0.10.1`, with default features off and without `serde`, not "the newest 0.9.x with its `serde` feature" (ADR-0040 point 1, decision D1). The type configuration's `AsyncRuntime` is one runtime in every build, seeded per host.
+- **Point 3:** the leader's proposer screens each command through the single writer's screen, `control/screen.rs`, stamps `recorded_by`, which the state machine checks against the entry's leader, and proposes with `expect_leader` (ADR-0040 point 2, decisions D5 and D6).
+- **Points 4, 8, and 9:** the disk and wire formats are FleetRing's, not openraft's serde forms (ADR-0040 point 3).
+- **Point 5:** format-1 files from 0.9.x migrate with a replay check from genesis; there is no down-conversion, and `upgrade` refuses a rollback below the format (ADR-0040 points 5 and 8, decisions D2 and D3).
+- **Point 6:** linearizable reads use `ReadPolicy::ReadIndex` only, and also cover `DescribeControlGroup`, `GetForkOperation`, and `ListDelegations` (ADR-0040 point 2).
+- **Point 7:** the settle window is measured on `tokio::time::Instant` and gates fork actions and kept-set releases as well as promotions (ADR-0040 point 6).
+- **Point 12:** the router takes `[control] addresses` too (ADR-0040 point 12).
+- **Point 14:** the protocol moves to 1.4, and `HeartbeatResponse.control_nodes` is field 6, not 4, which `forks` holds (ADR-0040 point 11).
+- **Point 15:** each control host draws from its own injected generator (ADR-0040 point 1).
+
+The text below is unchanged.
 
 ## Context
 
