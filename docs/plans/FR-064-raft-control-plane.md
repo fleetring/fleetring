@@ -104,7 +104,7 @@ Raft ships in 0.10, the release this plan calls R. Nobody runs a release before 
   - "Fleet", never "cluster", except where openraft's own API names a field `cluster_name`.
   - The CLI is `fleetring` (ADR-0043). The process file keeps its name, `fleetringd.process`, and the git tags keep theirs (`fleetringd-v0.9.0`).
 - **Paths** are under `crates/fleetringd/` unless a step says otherwise. Each commit has the trailer `Refs: FR-064`, and each pull request's body says `Refs #67`; only the last says `Fixes #67`.
-- **Before pushing,** every pull request runs every gate in `CLAUDE.md`'s Commands once, locally: fmt, clippy, tests, docs, both MSRV checks, and the fixed-seed simulation with `--cfg tokio_unstable`. Docs-only pull requests skip the Rust gates. One pull request is in review at a time, so each costs one CI run.
+- **Before pushing,** every pull request runs every gate in [`CONTRIBUTING.md`](../../CONTRIBUTING.md#before-you-push) once, locally: fmt, clippy, tests, docs, both MSRV checks, and the fixed-seed simulation with `--cfg tokio_unstable`. Docs-only pull requests skip the Rust gates. One pull request is in review at a time, so each costs one CI run.
 
 ## Pull requests and order
 
