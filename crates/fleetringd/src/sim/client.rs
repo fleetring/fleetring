@@ -273,6 +273,9 @@ async fn execute(
             _ => {}
         }
     }
+    if let Some(outcome) = data_operation(data, operation).await {
+        return outcome;
+    }
     let client = node.unwrap_or_else(|| data.control());
     let result = match operation {
         Operation::Join { node } => client
@@ -518,11 +521,6 @@ async fn execute(
             })
             .await
             .map(lease_ack),
-        Operation::Create {
-            database,
-            replication_factor,
-            durability,
-        } => create(data, database, *replication_factor, *durability).await,
         Operation::CreateEmpty {
             database,
             replication_factor,
@@ -532,6 +530,34 @@ async fn execute(
             replication_factor,
             expires_in,
         } => create_expiring(data, database, *replication_factor, *expires_in).await,
+        Operation::ImpostorReplicate { .. }
+        | Operation::ImpostorFence { .. }
+        | Operation::ImpostorSnapshot { .. } => {
+            return Outcome::Acknowledged(impostor(network, operation).await);
+        }
+        Operation::Create { .. } | Operation::Write { .. } | Operation::Read { .. } => {
+            unreachable!("data_operation answers creates, writes, and reads")
+        }
+    };
+    result.map_or_else(
+        |status| Outcome::from_status(&status),
+        Outcome::Acknowledged,
+    )
+}
+
+/// Sends a data-plane `operation` (create, write, or read) through `data` and returns its
+/// outcome, exactly as a simulated client does. Any other operation returns `None`.
+///
+/// A create makes the database if it doesn't exist yet, then its [`WRITES_TABLE`]; a write
+/// inserts its value into that table; a read reads it, whole or for one value. The call makes
+/// whatever attempts `data`'s backoff allows, and the outcome classifies the last one.
+pub async fn data_operation(data: &Client, operation: &Operation) -> Option<Outcome> {
+    let result = match operation {
+        Operation::Create {
+            database,
+            replication_factor,
+            durability,
+        } => create(data, database, *replication_factor, *durability).await,
         Operation::Write { database, value } => data
             .execute(
                 database,
@@ -549,16 +575,12 @@ async fn execute(
                 epoch: written.epoch,
             }),
         Operation::Read { database, value } => read(data, database, *value).await,
-        Operation::ImpostorReplicate { .. }
-        | Operation::ImpostorFence { .. }
-        | Operation::ImpostorSnapshot { .. } => {
-            return Outcome::Acknowledged(impostor(network, operation).await);
-        }
+        _ => return None,
     };
-    result.map_or_else(
+    Some(result.map_or_else(
         |status| Outcome::from_status(&status),
         Outcome::Acknowledged,
-    )
+    ))
 }
 
 /// Creates `database` in `durability` if it doesn't exist yet, then its writes table.

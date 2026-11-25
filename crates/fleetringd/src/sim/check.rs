@@ -749,6 +749,49 @@ pub fn lease_events_match_control(
 /// The rows each replica of a database holds, by host.
 pub type ReplicaRows = BTreeMap<String, BTreeSet<i64>>;
 
+/// Reads the values in the [`WRITES_TABLE`] of `database`'s copy under the data directory
+/// `data_dir`, from a scratch copy of its files, so a follower's mirrored log is replayed as a
+/// promotion would replay it. A node with no copy holds no rows.
+///
+/// Call it only while no daemon has the data directory open.
+///
+/// # Errors
+///
+/// If the copy exists but can't be copied or read.
+pub fn read_replica_rows(
+    data_dir: &Path,
+    database: &DatabaseName,
+) -> Result<BTreeSet<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = data_dir
+        .join(crate::daemon::DATABASES_DIR)
+        .join(crate::layout::database_dir(database));
+    let database = dir.join("data.db");
+    if !database.try_exists()? {
+        return Ok(BTreeSet::new());
+    }
+    let scratch = tempfile::tempdir()?;
+    let copy = scratch.path().join("data.db");
+    std::fs::copy(&database, &copy)?;
+    let wal = dir.join("data.db-wal");
+    if wal.try_exists()? {
+        std::fs::copy(&wal, scratch.path().join("data.db-wal"))?;
+    }
+    let connection = rusqlite::Connection::open(&copy)?;
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [WRITES_TABLE],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let mut statement = connection.prepare(&format!("SELECT value FROM {WRITES_TABLE}"))?;
+    let values = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<BTreeSet<i64>, _>>()?;
+    Ok(values)
+}
+
 /// The hash chain each replica of a database holds, by host: the hash at every position the
 /// replica still keeps one for.
 pub type ReplicaChains = BTreeMap<String, BTreeMap<Position, ChainHash>>;
@@ -1868,5 +1911,31 @@ mod tests {
             violated(check(&[1, 2], &committed, Some(Duration::ZERO))),
             "acknowledged writes missing from the latest point"
         );
+    }
+
+    #[test]
+    fn a_node_without_a_copy_holds_no_rows() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let database: DatabaseName = "chaos/db-0".parse().expect("database name");
+        let rows = read_replica_rows(dir.path(), &database).expect("rows");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn rows_are_read_from_the_encoded_database_directory() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let copy = dir.path().join("databases").join("chaos%2fdb-0");
+        std::fs::create_dir_all(&copy).expect("database directory");
+        let connection = rusqlite::Connection::open(copy.join("data.db")).expect("open");
+        connection
+            .execute_batch(
+                "CREATE TABLE writes (value INTEGER NOT NULL); \
+                 INSERT INTO writes (value) VALUES (1), (2);",
+            )
+            .expect("write rows");
+        drop(connection);
+        let database: DatabaseName = "chaos/db-0".parse().expect("database name");
+        let rows = read_replica_rows(dir.path(), &database).expect("rows");
+        assert_eq!(rows, BTreeSet::from([1, 2]));
     }
 }
