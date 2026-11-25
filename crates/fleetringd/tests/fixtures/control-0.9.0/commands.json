@@ -1,0 +1,1333 @@
+[
+  {
+    "at": 1764000000010,
+    "recorded_by": "c1",
+    "action": {
+      "join": {
+        "member": {
+          "id": "n1",
+          "zone": "a",
+          "host": null,
+          "weight": 1,
+          "software": {
+            "release": "0.9.0",
+            "control_format": 1,
+            "features": [
+              "undrain"
+            ],
+            "newer_features": [
+              "delegation",
+              "expiry",
+              "fork",
+              "handover",
+              "incarnations",
+              "metadata",
+              "tombstones"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "at": 1764000000020,
+    "recorded_by": "c1",
+    "action": {
+      "join": {
+        "member": {
+          "id": "n2",
+          "zone": "b",
+          "host": null,
+          "weight": 1,
+          "software": {
+            "release": "0.9.0",
+            "control_format": 1,
+            "features": [
+              "undrain"
+            ],
+            "newer_features": [
+              "delegation",
+              "expiry",
+              "fork",
+              "handover",
+              "incarnations",
+              "metadata",
+              "tombstones"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "at": 1764000000030,
+    "recorded_by": "c1",
+    "action": {
+      "join": {
+        "member": {
+          "id": "n3",
+          "zone": "c",
+          "host": null,
+          "weight": 1,
+          "software": {
+            "release": "0.9.0",
+            "control_format": 1,
+            "features": [
+              "undrain"
+            ],
+            "newer_features": [
+              "delegation",
+              "expiry",
+              "fork",
+              "handover",
+              "incarnations",
+              "metadata",
+              "tombstones"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "at": 1764000000040,
+    "recorded_by": "c1",
+    "action": {
+      "join": {
+        "member": {
+          "id": "n4",
+          "zone": "a",
+          "host": null,
+          "weight": 1,
+          "software": {
+            "release": "0.9.0",
+            "control_format": 1,
+            "features": [
+              "undrain"
+            ],
+            "newer_features": [
+              "delegation",
+              "expiry",
+              "fork",
+              "handover",
+              "incarnations",
+              "metadata",
+              "tombstones"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "at": 1764000000050,
+    "recorded_by": "c1",
+    "action": {
+      "join": {
+        "member": {
+          "id": "n5",
+          "zone": "b",
+          "host": null,
+          "weight": 1,
+          "software": {
+            "release": "0.9.0",
+            "control_format": 1,
+            "features": [
+              "undrain"
+            ],
+            "newer_features": [
+              "delegation",
+              "expiry",
+              "fork",
+              "handover",
+              "incarnations",
+              "metadata",
+              "tombstones"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "at": 1764000000060,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000070,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n2",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000080,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n3",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000090,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n4",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000100,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n5",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000110,
+    "recorded_by": "c1",
+    "action": "enable_incarnations"
+  },
+  {
+    "at": 1764000000110,
+    "recorded_by": "c1",
+    "action": {
+      "create_database": {
+        "name": "tenant:acme/notes",
+        "replication_factor": 3,
+        "engine": "sqlite",
+        "durability": null,
+        "metadata": {
+          "description": "Meeting notes",
+          "created_by": "sam"
+        },
+        "incarnation": "0000000000000101",
+        "incarnation_rule": "always"
+      }
+    }
+  },
+  {
+    "at": 1764000000120,
+    "recorded_by": "c1",
+    "action": {
+      "create_database": {
+        "name": "tenant:acme/billing",
+        "replication_factor": 3,
+        "engine": "sqlite",
+        "durability": {
+          "acks": "all",
+          "min_replicas": 3
+        },
+        "incarnation": "0000000000000102",
+        "incarnation_rule": "always"
+      }
+    }
+  },
+  {
+    "at": 1764000000130,
+    "recorded_by": "c1",
+    "action": {
+      "create_database": {
+        "name": "tenant:acme/scratch",
+        "replication_factor": 1,
+        "engine": "sqlite",
+        "durability": null,
+        "metadata": {
+          "expires_at": 1764000003000
+        },
+        "incarnation": "0000000000000103",
+        "incarnation_rule": "always"
+      }
+    }
+  },
+  {
+    "at": 1764000000140,
+    "recorded_by": "c1",
+    "action": {
+      "acquire_lease": {
+        "database": "tenant:acme/notes",
+        "node": "n5"
+      }
+    }
+  },
+  {
+    "at": 1764000000150,
+    "recorded_by": "c1",
+    "action": {
+      "renew_lease": {
+        "database": "tenant:acme/notes",
+        "node": "n5",
+        "epoch": 1
+      }
+    }
+  },
+  {
+    "at": 1764000000160,
+    "recorded_by": "c1",
+    "action": {
+      "acquire_lease": {
+        "database": "tenant:acme/billing",
+        "node": "n1"
+      }
+    }
+  },
+  {
+    "at": 1764000000170,
+    "recorded_by": "c1",
+    "action": {
+      "renew_lease": {
+        "database": "tenant:acme/billing",
+        "node": "n1",
+        "epoch": 1
+      }
+    }
+  },
+  {
+    "at": 1764000000180,
+    "recorded_by": "c1",
+    "action": {
+      "acquire_lease": {
+        "database": "tenant:acme/scratch",
+        "node": "n3"
+      }
+    }
+  },
+  {
+    "at": 1764000000190,
+    "recorded_by": "c1",
+    "action": {
+      "renew_lease": {
+        "database": "tenant:acme/scratch",
+        "node": "n3",
+        "epoch": 1
+      }
+    }
+  },
+  {
+    "at": 1764000000200,
+    "recorded_by": "c1",
+    "action": {
+      "update_database": {
+        "name": "tenant:acme/notes",
+        "change": {
+          "description": {
+            "set": "Meeting notes, reviewed"
+          },
+          "set_labels": {
+            "team": "platform"
+          }
+        },
+        "by": "sam"
+      }
+    }
+  },
+  {
+    "at": 1764000000210,
+    "recorded_by": "c1",
+    "action": "tick"
+  },
+  {
+    "at": 1764000000220,
+    "recorded_by": "c1",
+    "action": {
+      "drain": {
+        "id": "n4"
+      }
+    }
+  },
+  {
+    "at": 1764000000230,
+    "recorded_by": "c1",
+    "action": {
+      "undrain": {
+        "id": "n4"
+      }
+    }
+  },
+  {
+    "at": 1764000000240,
+    "recorded_by": "c1",
+    "action": {
+      "fork_database": {
+        "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf",
+        "intent": {
+          "name": "tenant:acme/notes-review",
+          "source": "tenant:acme/notes",
+          "replication_factor": 3,
+          "requested_by": "sam"
+        },
+        "incarnation": "0000000000000201",
+        "limits": {
+          "max_attempts": 3,
+          "deadline": 3600000,
+          "attempt_timeout": 600000,
+          "seeder_timeout": 60000,
+          "operation_retention": 86400000
+        }
+      }
+    }
+  },
+  {
+    "at": 1764000000250,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n3",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "follower",
+            "position": [],
+            "staged": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "attempt": 1,
+              "position": [
+                1,
+                0
+              ],
+              "chain_hash": [
+                7,
+                7
+              ],
+              "source_incarnation": "0000000000000101"
+            }
+          }
+        ],
+        "unknown_reports": "skip",
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000260,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "follower",
+            "position": [],
+            "staged": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "attempt": 1,
+              "position": [
+                1,
+                0
+              ],
+              "chain_hash": [
+                7,
+                7
+              ],
+              "source_incarnation": "0000000000000101"
+            }
+          }
+        ],
+        "unknown_reports": "skip",
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000270,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n2",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "follower",
+            "position": [],
+            "staged": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "attempt": 1,
+              "position": [
+                1,
+                0
+              ],
+              "chain_hash": [
+                7,
+                7
+              ],
+              "source_incarnation": "0000000000000101"
+            }
+          }
+        ],
+        "unknown_reports": "skip",
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000270,
+    "recorded_by": "c1",
+    "action": {
+      "complete_fork": {
+        "fork": {
+          "name": "tenant:acme/notes-review",
+          "incarnation": "0000000000000201",
+          "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+        },
+        "attempt": 1,
+        "at": [
+          1,
+          0
+        ],
+        "chain_hash": [
+          7,
+          7
+        ],
+        "holders": [
+          "n1",
+          "n2",
+          "n3"
+        ]
+      }
+    }
+  },
+  {
+    "at": 1764000000280,
+    "recorded_by": "c1",
+    "action": {
+      "acquire_lease": {
+        "database": "tenant:acme/notes-review",
+        "node": "n3"
+      }
+    }
+  },
+  {
+    "at": 1764000000290,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n3",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "primary",
+            "position": [
+              9
+            ],
+            "reset": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "epoch": 1,
+              "position": [
+                3
+              ],
+              "progress": "committed"
+            }
+          }
+        ],
+        "unknown_reports": "skip"
+      }
+    }
+  },
+  {
+    "at": 1764000000300,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "primary",
+            "position": [
+              9
+            ],
+            "reset": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "epoch": 1,
+              "position": [
+                3
+              ],
+              "progress": "committed"
+            }
+          }
+        ],
+        "unknown_reports": "skip"
+      }
+    }
+  },
+  {
+    "at": 1764000000310,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n2",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "primary",
+            "position": [
+              9
+            ],
+            "reset": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "epoch": 1,
+              "position": [
+                3
+              ],
+              "progress": "committed"
+            }
+          }
+        ],
+        "unknown_reports": "skip"
+      }
+    }
+  },
+  {
+    "at": 1764000000310,
+    "recorded_by": "c1",
+    "action": {
+      "mark_fork_ready": {
+        "fork": {
+          "name": "tenant:acme/notes-review",
+          "incarnation": "0000000000000201",
+          "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+        },
+        "epoch": 1,
+        "reset_position": [
+          3
+        ]
+      }
+    }
+  },
+  {
+    "at": 1764000000320,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n3",
+        "replicas": [
+          {
+            "database": "tenant:acme/notes-review",
+            "role": "primary",
+            "position": [
+              4
+            ],
+            "log_epoch": 1,
+            "placement_caught_up": {
+              "fork": {
+                "name": "tenant:acme/notes-review",
+                "incarnation": "0000000000000201",
+                "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+              },
+              "epoch": 1,
+              "membership_epoch": 5
+            }
+          }
+        ],
+        "unknown_reports": "skip"
+      }
+    }
+  },
+  {
+    "at": 1764000000320,
+    "recorded_by": "c1",
+    "action": {
+      "release_fork_holders": {
+        "fork": {
+          "name": "tenant:acme/notes-review",
+          "incarnation": "0000000000000201",
+          "operation": "0f1w7gy3rf1w7gy3rf1w7gy3rf"
+        },
+        "epoch": 1
+      }
+    }
+  },
+  {
+    "at": 1764000000330,
+    "recorded_by": "c1",
+    "action": "tick"
+  },
+  {
+    "at": 1764000000340,
+    "recorded_by": "c1",
+    "action": {
+      "record_delegation": {
+        "operation": "6ht78x3meht78x3meht78x3meh",
+        "requested_by": "agent-42",
+        "request": {
+          "segment": "c7",
+          "scopes": [
+            "admin:agent-42.c7-*",
+            "stream:agent-42.c7-*"
+          ],
+          "caller_token": "root-42"
+        },
+        "caller": {
+          "claims": {
+            "fleet": "acme",
+            "principal": "agent-42",
+            "id": "root-42",
+            "issued_at": 1763996400000,
+            "not_before": 1763996400000,
+            "expires_at": 1766592000000,
+            "scopes": [
+              "admin:agent-42-*",
+              "admin:agent-42.*",
+              "grant:agent-42.*",
+              "stream:agent-42-*",
+              "stream:agent-42.*"
+            ],
+            "kind": "agent",
+            "owner": "sam"
+          },
+          "kid": "authority"
+        },
+        "id": "Xl5eXl5eXl5eXl5eXl5eXg",
+        "scopes": [
+          "admin:agent-42.c7-*",
+          "stream:agent-42.c7-*"
+        ],
+        "not_before": 1764000000000,
+        "expires_at": 1764007200000
+      }
+    }
+  },
+  {
+    "at": 1764000000360,
+    "recorded_by": "c1",
+    "action": {
+      "revoke_token": {
+        "revoked": {
+          "token": "Xl5eXl5eXl5eXl5eXl5eXg"
+        },
+        "until": 1764007200000
+      }
+    }
+  },
+  {
+    "at": 1764000000370,
+    "recorded_by": "c1",
+    "action": {
+      "revoke_principal": {
+        "principal": "agent-42.c7"
+      }
+    }
+  },
+  {
+    "at": 1764000000380,
+    "recorded_by": "c1",
+    "action": {
+      "record_delegation": {
+        "operation": "6jtb9d5mpjtb9d5mpjtb9d5mpj",
+        "requested_by": "agent-42",
+        "request": {
+          "segment": "c8",
+          "scopes": [
+            "admin:agent-42.c8-*",
+            "stream:agent-42.c8-*"
+          ],
+          "caller_token": "root-42"
+        },
+        "caller": {
+          "claims": {
+            "fleet": "acme",
+            "principal": "agent-42",
+            "id": "root-42",
+            "issued_at": 1763996400000,
+            "not_before": 1763996400000,
+            "expires_at": 1766592000000,
+            "scopes": [
+              "admin:agent-42-*",
+              "admin:agent-42.*",
+              "grant:agent-42.*",
+              "stream:agent-42-*",
+              "stream:agent-42.*"
+            ],
+            "kind": "agent",
+            "owner": "sam"
+          },
+          "kid": "authority"
+        },
+        "id": "XV1dXV1dXV1dXV1dXV1dXQ",
+        "scopes": [
+          "admin:agent-42.c8-*",
+          "stream:agent-42.c8-*"
+        ],
+        "not_before": 1764000000000,
+        "expires_at": 1764007200000
+      }
+    }
+  },
+  {
+    "at": 1764000000390,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000400,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n2",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000410,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n3",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000420,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n4",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000430,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n5",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000440,
+    "recorded_by": "c1",
+    "action": "enable_handover"
+  },
+  {
+    "at": 1764000000440,
+    "recorded_by": "c1",
+    "action": {
+      "leave": {
+        "id": "n3"
+      }
+    }
+  },
+  {
+    "at": 1764000000450,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [
+          {
+            "database": "tenant:acme/billing",
+            "role": "primary",
+            "position": [
+              9
+            ],
+            "log_epoch": 1,
+            "replicas_caught_up": {
+              "incarnation": "0000000000000102",
+              "epoch": 1,
+              "membership_epoch": 6
+            }
+          }
+        ],
+        "unknown_reports": "skip"
+      }
+    }
+  },
+  {
+    "at": 1764000000460,
+    "recorded_by": "c1",
+    "action": {
+      "release_kept_replicas": {
+        "database": "tenant:acme/billing",
+        "incarnation": "0000000000000102",
+        "epoch": 1
+      }
+    }
+  },
+  {
+    "at": 1764000000470,
+    "recorded_by": "c1",
+    "action": {
+      "set_tombstone_window": {
+        "window": 604800000
+      }
+    }
+  },
+  {
+    "at": 1764000000470,
+    "recorded_by": "c1",
+    "action": {
+      "drop_database": {
+        "name": "tenant:acme/billing"
+      }
+    }
+  },
+  {
+    "at": 1764000000480,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000490,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n2",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000500,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n4",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000000510,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n5",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000003050,
+    "recorded_by": "c1",
+    "action": {
+      "expire_database": {
+        "name": "tenant:acme/scratch"
+      }
+    }
+  },
+  {
+    "at": 1764000003060,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n1",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000003070,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n2",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000003080,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n4",
+        "replicas": [],
+        "unknown_reports": "skip",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000003090,
+    "recorded_by": "c1",
+    "action": {
+      "heartbeat": {
+        "id": "n5",
+        "replicas": [],
+        "unknown_reports": "reject",
+        "software": {
+          "release": "0.9.0",
+          "control_format": 1,
+          "features": [
+            "undrain"
+          ],
+          "newer_features": [
+            "delegation",
+            "expiry",
+            "fork",
+            "handover",
+            "incarnations",
+            "metadata",
+            "tombstones"
+          ]
+        },
+        "disk_free_bytes": 42949672960
+      }
+    }
+  },
+  {
+    "at": 1764000003100,
+    "recorded_by": "c1",
+    "action": "tick"
+  }
+]

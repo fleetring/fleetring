@@ -5,6 +5,7 @@ mod common;
 mod delegation;
 mod delegation_replay;
 mod durability;
+mod fields;
 mod fork;
 mod fork_lifecycle;
 mod fork_replay;
