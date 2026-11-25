@@ -732,6 +732,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleetring-chaos"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "fleetring",
+ "fleetring-control",
+ "fleetringd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "fleetring-client"
 version = "0.0.0"
 dependencies = [
