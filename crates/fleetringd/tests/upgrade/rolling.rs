@@ -16,6 +16,13 @@
 //! by the upgrade alone, a node rolls back and returns while nothing is, each feature is enabled
 //! by its first command, and rollback is refused after.
 //!
+//! Once the control node runs this build, its format-1 `control.db` has migrated to a control
+//! group of one voter (FR-064, ADR-0040 points 5 and 8): the group's only voter is the control
+//! node, every database is still listed at its epoch or a later one, `upgrade --rollback` to the
+//! previous release is refused for the control log's format, the previous release run on the
+//! data directory anyway refuses the format and leaves an empty `commands` table behind, and
+//! this build, started again, drops that table and serves.
+//!
 //! The previous release comes from one of:
 //!
 //! - `FLEETRINGD_BASELINE_VERSION`, such as `0.6.0`: this build's own `fleetring upgrade
@@ -34,6 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fleetring::NodeId;
+use fleetring_control::{DatabaseName, LeaseEpoch};
 
 use crate::common::{
     ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, check_history,
@@ -79,6 +87,75 @@ fn has_upgrade(bin: &Path) -> TestResult<bool> {
             .status
             .success(),
     )
+}
+
+/// The control group's voters in `control_db`'s newest control snapshot, as Raft IDs in hex.
+fn voters(control_db: &Path) -> TestResult<Vec<Vec<String>>> {
+    let connection = rusqlite::Connection::open_with_flags(
+        control_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let format: String =
+        connection.query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(format, "2", "the control log migrated to format 2");
+    let membership: String = connection.query_row(
+        "SELECT membership FROM snapshots ORDER BY log_index DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let membership: serde_json::Value = serde_json::from_str(&membership)?;
+    let configs = membership
+        .pointer("/membership/configs")
+        .or_else(|| membership.get("configs"))
+        .ok_or("a membership without configs")?;
+    Ok(serde_json::from_value(configs.clone())?)
+}
+
+/// Every database the fleet lists, with its epoch and primary.
+async fn epochs(
+    client: &fleetringd::data::Client,
+) -> TestResult<Vec<(DatabaseName, LeaseEpoch, Option<NodeId>)>> {
+    Ok(client
+        .list_databases()
+        .await?
+        .into_iter()
+        .map(|location| (location.database, location.epoch, location.primary))
+        .collect())
+}
+
+/// Runs `bin` on `config` until it exits, for at most a minute, and returns what it logged.
+fn run_to_exit(bin: &Path, config: &Path) -> TestResult<(std::process::ExitStatus, String)> {
+    let mut command = Command::new(bin);
+    crate::support::isolate(&mut command);
+    let mut child = crate::support::spawn_copied(
+        command
+            .arg("--config")
+            .arg(config)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )?;
+    // A minute, in tenths of a second.
+    let mut waits = 600_u32;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if waits == 0 {
+            child.kill()?;
+            return Err("the previous release kept running on a format-2 control log".into());
+        }
+        waits -= 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let output = child.wait_with_output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok((status, text))
 }
 
 /// Replaces the binary at `bin` with this build, atomically, as `install.sh` does.
@@ -144,11 +221,15 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
     }
 
     // The data nodes first, then the control node.
+    let mut before_the_control_node = Vec::new();
     for index in [2, 1, 0] {
         let id: NodeId = fleet.nodes[index].id.parse()?;
         progress(&format!("upgrading {id}"));
         let bin = fleet.nodes[index].bin.clone();
         let mut restarted = false;
+        if index == 0 {
+            before_the_control_node = runtime.block_on(epochs(&client))?;
+        }
         // This build's own settings, such as its admin listener, apply from its first start.
         fleet.enable_admin(index)?;
         if has_upgrade(&bin)? {
@@ -204,6 +285,67 @@ fn a_fleet_rolls_from_the_previous_release_to_this_build_under_writes() -> TestR
             format!("fleetringd {}", current())
         );
         progress(&format!("{id} runs {}", current()));
+
+        if index == 0 {
+            // The format-1 log migrated to a control group whose only voter is the control node.
+            let control_db = fleet.nodes[0].data_dir.join("control.db");
+            let own = fleetringd::control::raft::raft_id_text(fleetringd::control::raft::raft_id(
+                id.as_str(),
+            ));
+            assert_eq!(voters(&control_db)?, vec![vec![own]]);
+            // Every database the fleet created is still listed at its epoch. The control node
+            // also hosts data, so its upgrade drains it: a database it was primary for moves its
+            // lease to another replica, at a later epoch. Every other keeps its epoch, since the
+            // migration itself changes no lease.
+            let after = runtime.block_on(epochs(&client))?;
+            for (database, epoch, primary) in &before_the_control_node {
+                let listed = after
+                    .iter()
+                    .find(|(name, _, _)| name == database)
+                    .ok_or_else(|| format!("{database} is no longer listed"))?;
+                if primary.as_ref() == Some(&id) {
+                    assert!(listed.1 > *epoch, "{database}: {} <= {epoch}", listed.1);
+                } else {
+                    assert_eq!(listed.1, *epoch, "{database} changed epoch");
+                }
+            }
+            // A rollback to the previous release is refused before anything is swapped.
+            if has_upgrade(&baseline)? {
+                let running = fs::read(&bin)?;
+                let refused = fleet
+                    .command(&bin, &path)
+                    .args(["upgrade", "--rollback", "--yes", "--no-restart", "--config"])
+                    .arg(&fleet.nodes[0].config)
+                    .output()?;
+                assert_eq!(refused.status.code(), Some(1), "{}", printed(&refused));
+                let stderr = String::from_utf8_lossy(&refused.stderr);
+                assert!(
+                    stderr.contains("reads control log format 1, and")
+                        && stderr.contains("is format 2"),
+                    "{}",
+                    printed(&refused)
+                );
+                assert_eq!(fs::read(&bin)?, running, "the rollback swapped the binary");
+            }
+            // The previous release, run on the data directory as a rollback that bypassed the
+            // check would run it, refuses the format, and this build tolerates what it leaves.
+            fleet.stop(0)?;
+            let (status, logged) = run_to_exit(&baseline, &fleet.nodes[0].config)?;
+            assert!(!status.success(), "{logged}");
+            assert!(
+                logged.contains("control log format 2 is not supported"),
+                "{logged}"
+            );
+            fleet.spawn(0)?;
+            runtime.block_on(wait_for_members(&client, &[id.as_str()], Some(&current())))?;
+            assert!(
+                fs::read_to_string(&fleet.nodes[0].log)?
+                    .contains("dropped the empty commands table an older release created"),
+                "{}",
+                fleet.logs()
+            );
+            progress("the control node runs a one-voter control group, and refuses a rollback");
+        }
 
         if index != 0
             && let Some(features) = &features
