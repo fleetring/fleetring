@@ -34,7 +34,8 @@ const DATA: [&str; 3] = ["data-1", "data-2", "data-3"];
 
 /// Timings short enough for a failover to finish quickly over loopback.
 const FAST_LEASES: &str = "lease_duration_ms = 800\nfailover_margin_ms = 100\n\
-                           heartbeat_timeout_ms = 500\ntick_interval_ms = 20\n";
+                           heartbeat_timeout_ms = 500\ntick_interval_ms = 20\n\
+                           election_timeout_ms = 100\nraft_heartbeat_ms = 25\n";
 
 /// The free space every data daemon believes its volume has, unless a test says otherwise.
 const ROOMY: u64 = 1 << 40;

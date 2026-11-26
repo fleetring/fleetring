@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::config::{AdminListener, AdminTls, Config, ConfigError, NodeRole, Plaintext};
+use crate::control::Bootstrap;
 use crate::tls::{
     Authority, AuthorityError, DEFAULT_AUTHORITY_LIFETIME, DEV_ISSUER_FILES, DevIssuerOutcome,
     IssuerFiles, IssuerFilesError, Validity, ensure_dev_pair,
@@ -175,6 +176,12 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid {
             field: "insecure_plaintext",
             reason: "dev mode always runs over TLS, with its own authority".to_owned(),
+        });
+    }
+    if config.control.bootstrap == Bootstrap::Join {
+        return Err(ConfigError::Invalid {
+            field: "control.bootstrap",
+            reason: "dev mode runs one control node, which starts its own group".to_owned(),
         });
     }
     Ok(())
@@ -2026,6 +2033,21 @@ mod tests {
         assert!(Config::from_toml(&real).is_ok());
         let ipv6 = base.replace("127.0.0.1:7400", "[::1]:7400");
         assert!(Config::from_toml(&ipv6).is_ok());
+    }
+
+    /// A dev node is a control group of one voter that starts its own group; `bootstrap =
+    /// "join"` would wait for a second node dev mode never runs (ADR-0040 point 9).
+    #[test]
+    fn dev_mode_refuses_bootstrap_join() {
+        let text = generated().replace("[control]\n", "[control]\nbootstrap = \"join\"\n");
+        let error = Config::from_toml(&text).expect_err("join");
+        let ConfigError::Invalid { field, reason } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(*field, "control.bootstrap");
+        assert!(reason.contains("starts its own group"), "{reason}");
+        let new = generated().replace("[control]\n", "[control]\nbootstrap = \"new\"\n");
+        assert!(Config::from_toml(&new).is_ok(), "{new}");
     }
 
     #[test]

@@ -140,14 +140,21 @@ pub struct Timings {
     pub failover_margin: Duration,
     /// How often the control node looks for expired leases.
     pub tick_interval: Duration,
-    /// How many commands the control node applies between snapshots.
+    /// How many log entries the control group takes between control snapshots.
     pub snapshot_every: NonZeroU64,
+    /// The control group's shortest election timeout.
+    pub election_timeout: Duration,
+    /// How often the control group's leader sends Raft heartbeats.
+    pub raft_heartbeat: Duration,
+    /// How many log entries a control node keeps behind its newest control snapshot.
+    pub log_keep: NonZeroU64,
 }
 
 impl Default for Timings {
     /// A 200 ms heartbeat, a 1 s heartbeat timeout, 2 s leases renewed every 400 ms, a 400 ms
-    /// failover margin, a 100 ms tick, and a snapshot every 50 commands, so a short run crosses
-    /// several snapshots.
+    /// failover margin, a 100 ms tick, a snapshot every 50 entries, so a short run crosses
+    /// several snapshots, a 250 ms election timeout with a 50 ms Raft heartbeat, and a log that
+    /// is never purged, so every check that replays from genesis keeps running.
     fn default() -> Self {
         Self {
             heartbeat_interval: Duration::from_millis(200),
@@ -157,6 +164,9 @@ impl Default for Timings {
             failover_margin: Duration::from_millis(400),
             tick_interval: Duration::from_millis(100),
             snapshot_every: NonZeroU64::new(50).unwrap_or(NonZeroU64::MIN),
+            election_timeout: Duration::from_millis(250),
+            raft_heartbeat: Duration::from_millis(50),
+            log_keep: NonZeroU64::MAX,
         }
     }
 }
@@ -176,6 +186,9 @@ impl Timings {
             failover_margin: Duration::from_millis(control.failover_margin_ms),
             tick_interval: control.tick_interval(),
             snapshot_every: control.snapshot_every,
+            election_timeout: Duration::from_millis(control.election_timeout_ms.get()),
+            raft_heartbeat: Duration::from_millis(control.raft_heartbeat_ms.get()),
+            log_keep: NonZeroU64::new(control.log_keep).unwrap_or(NonZeroU64::MIN),
         }
     }
 }
@@ -624,6 +637,10 @@ fn host_config(
             tombstone_window_ms: crate::config::ControlSettings::default().tombstone_window_ms,
             issuer_cert: None,
             issuer_key: None,
+            election_timeout_ms: nonzero("the election timeout", timings.election_timeout)?,
+            raft_heartbeat_ms: nonzero("the Raft heartbeat", timings.raft_heartbeat)?,
+            log_keep: timings.log_keep.get(),
+            ..ControlSettings::default()
         },
         role,
         engine: EngineConfig {

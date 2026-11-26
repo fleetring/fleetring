@@ -48,7 +48,7 @@ pub use fork::SeedProgress;
 pub use log::{CommandLog, LogError, LogIndex, Recovered};
 pub(crate) use log::{FORMAT_VERSION, file_format};
 pub use node::{
-    Committed, ControlHandle, ControlNode, ControlOptions, OpenError, RecoverySummary, StorageIo,
+    Bootstrap, Committed, ControlHandle, ControlNode, ControlOptions, OpenError, RecoverySummary, StorageIo,
     SubmitError,
 };
 pub use service::{
