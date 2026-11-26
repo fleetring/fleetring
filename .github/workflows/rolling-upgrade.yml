@@ -64,6 +64,11 @@ jobs:
         if: steps.baseline.outputs.version != ''
         env:
           FLEETRINGD_BASELINE_VERSION: ${{ steps.baseline.outputs.version }}
+          # The test publishes this debug build as a release, and the baseline's `upgrade`
+          # refuses a binary over 512 MiB. With full debug info the build passes that on Linux,
+          # so keep only line tables, which backtraces still use.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_TEST_DEBUG: line-tables-only
         run: |
           cargo test -p fleetringd --test upgrade -- --ignored --nocapture \
             rolling::a_fleet_rolls_from_the_previous_release_to_this_build_under_writes
