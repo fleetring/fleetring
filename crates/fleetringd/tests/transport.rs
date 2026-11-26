@@ -47,6 +47,7 @@ impl Control for StubControl {
             revocations: Vec::new(),
             protocol: Some(PROTOCOL_VERSION),
             membership_epoch: MEMBERSHIP_EPOCH,
+            control_nodes: Vec::new(),
         }))
     }
 
@@ -60,6 +61,7 @@ impl Control for StubControl {
             revocations: Vec::new(),
             forks: Vec::new(),
             tombstones: Vec::new(),
+            control_nodes: Vec::new(),
         }))
     }
 

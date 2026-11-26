@@ -50,6 +50,9 @@ pub enum Binding {
     /// `Snapshot`'s binding: [`Binding::Follower`] for a request that names no fork, and
     /// [`Binding::Seeding`] for one that does.
     FollowerOrSeeding,
+    /// The caller is a voter or learner of the receiving node's control group, or, while the
+    /// receiver belongs to no group yet, any node of the fleet (ADR-0035 point 13, ADR-0040).
+    ControlPeer,
 }
 
 impl Binding {
@@ -68,6 +71,7 @@ impl Binding {
             Self::Dropped => "dropped",
             Self::Seeding => "seeding",
             Self::FollowerOrSeeding => "follower or seeding",
+            Self::ControlPeer => "control peer",
         }
     }
 }
@@ -126,6 +130,8 @@ pub enum Unbound {
         /// What doesn't match.
         mismatch: SeedingMismatch,
     },
+    /// The caller isn't a voter or learner of the receiving node's control group.
+    NotControlPeer,
 }
 
 /// What in a seeding request doesn't match the fork, its source, or the receiving node
@@ -212,6 +218,7 @@ impl Unbound {
             Self::NotFollower { .. } => Binding::Follower,
             Self::NotDropped { .. } => Binding::Dropped,
             Self::NotSeeding { .. } => Binding::Seeding,
+            Self::NotControlPeer => Binding::ControlPeer,
         }
     }
 
@@ -219,7 +226,7 @@ impl Unbound {
     #[must_use]
     pub fn database(&self) -> Option<&DatabaseName> {
         match self {
-            Self::OtherNode { .. } => None,
+            Self::OtherNode { .. } | Self::NotControlPeer => None,
             Self::NotReplica { database }
             | Self::NotHolder { database, .. }
             | Self::NotCandidate { database, .. }
@@ -239,7 +246,8 @@ impl Unbound {
             Self::OtherNode { .. }
             | Self::NotReplica { .. }
             | Self::NotFollower { .. }
-            | Self::NotSeeding { .. } => None,
+            | Self::NotSeeding { .. }
+            | Self::NotControlPeer => None,
         }
     }
 }
@@ -273,6 +281,7 @@ impl fmt::Display for Unbound {
             Self::NotSeeding { fork, mismatch } => {
                 write!(f, "not seeding fork '{fork}': {mismatch}")
             }
+            Self::NotControlPeer => f.write_str("not a member of the control group"),
         }
     }
 }
@@ -418,6 +427,11 @@ mod tests {
                  attempt 2, not 1",
                 "seeding",
             ),
+            (
+                Unbound::NotControlPeer,
+                "Fence refused for node 'a': not a member of the control group",
+                "control peer",
+            ),
         ];
         for (reason, message, binding) in cases {
             let denied = BindingDenied::new("Fence", node("a"), reason);
@@ -460,6 +474,7 @@ mod tests {
             Binding::Dropped,
             Binding::Seeding,
             Binding::FollowerOrSeeding,
+            Binding::ControlPeer,
         ]
         .iter()
         .map(ToString::to_string)
@@ -476,7 +491,8 @@ mod tests {
                 "follower",
                 "dropped",
                 "seeding",
-                "follower or seeding"
+                "follower or seeding",
+                "control peer"
             ]
         );
     }

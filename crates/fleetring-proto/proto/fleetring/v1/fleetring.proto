@@ -74,7 +74,11 @@ enum ReplicaRole {
 // be for the database or node the request names (ADR-0031): `self` (the request names the
 // caller), `replica` (in the database's replica set), `holder` (it holds the database's lease),
 // `candidate` (the candidate of the promotion to the request's epoch), `holder or candidate`
-// (either, at the stream's epoch), or `follower` (one the primary streams the database to). A
+// (either, at the stream's epoch), `follower` (one the primary streams the database to),
+// `seeding` (the attempt's seeder, or a replica of the fork asking it; ADR-0046), `dropped`
+// (control state no longer holds the database at the request's epoch; ADR-0042), or
+// `control peer` (a voter or learner of the receiver's control group, or any node of the fleet
+// while the receiver has none; ADR-0040). A
 // call that fails its binding is refused with PERMISSION_DENIED and `fleetring-binding`
 // metadata naming the binding. `fleetringd::auth::RPCS` holds the same table, and tests keep
 // the two equal; a request for an RPC the table doesn't list is refused.
@@ -236,6 +240,10 @@ message JoinResponse {
   // a node that starts has a denylist before its first heartbeat. Empty from a control node that
   // predates the field.
   repeated Revocation revocations = 3;
+  // The control group's voters and learners, with its leader marked (ADR-0040 point 12), so a
+  // node can reach the group at any of its addresses. Empty from a control node that predates
+  // the field.
+  repeated ControlNode control_nodes = 4;
 }
 
 message DatabaseStatus {
@@ -410,6 +418,9 @@ message HeartbeatResponse {
   // The tombstones of the names in `databases` and `unreported` (ADR-0050): how a node that
   // missed a drop learns of it. Empty from a control node that predates them.
   repeated Tombstone tombstones = 5;
+  // The control group's voters and learners, with its leader marked (ADR-0040 point 12). Empty
+  // from a control node that predates the field.
+  repeated ControlNode control_nodes = 6;
 }
 
 // A token, signing key, or principal on the denylist, and when the entry may be forgotten.
@@ -1058,6 +1069,50 @@ service Replication {
   // Scope: node.
   // Binding: dropped.
   rpc DropCopy(DropCopyRequest) returns (DropCopyResponse);
+}
+
+// ---- Raft -------------------------------------------------------------------------------------
+
+// The control group's Raft messages (ADR-0035, ADR-0040). Payloads are FleetRing's JSON forms
+// of openraft's requests and replies: internal to the control group, fixed by golden vectors,
+// and opaque to everything else.
+service Raft {
+  // Scope: node.
+  // Binding: control peer.
+  rpc AppendEntries(RaftPayload) returns (RaftPayload);
+  // Scope: node.
+  // Binding: control peer.
+  rpc Vote(RaftPayload) returns (RaftPayload);
+  // Scope: node.
+  // Binding: control peer.
+  rpc InstallSnapshot(RaftPayload) returns (RaftPayload);
+  // What a node would bring to a control group: its node ID, its software, and whether it
+  // already holds Raft state. The leader calls it before adding the node.
+  // Scope: node.
+  // Binding: control peer.
+  rpc Probe(RaftPayload) returns (RaftPayload);
+}
+
+message RaftPayload {
+  bytes json = 1;
+  // The sender's software (ADR-0040 point 4).
+  Software sender = 2;
+  // The sender's clock when it sent the message, in milliseconds since the Unix epoch. Watched,
+  // never used to decide anything (ADR-0040 point 6).
+  uint64 sent_at_ms = 3;
+}
+
+// A voter or learner of the control group, as a control node knows it.
+message ControlNode {
+  string node_id = 1;
+  // The address its peers and data nodes dial, `host:port`.
+  string address = 2;
+  bool voter = 3;
+  bool leader = 4;
+  // On the leader, the last log index the node is known to hold; 0 elsewhere.
+  uint64 matched_index = 5;
+  // The software the leader last heard from the node; unset when it has heard none.
+  Software software = 6;
 }
 
 message ReplicateMessage {

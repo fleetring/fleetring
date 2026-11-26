@@ -1594,6 +1594,7 @@ impl Control for ControlService {
                 protocol: Some(PROTOCOL_VERSION),
                 membership_epoch: membership_epoch.get(),
                 revocations: revocations_to_proto(state.revocations()),
+                control_nodes: Vec::new(),
             })),
             (other, _) => Err(unexpected(&other)),
         }
@@ -1654,6 +1655,7 @@ impl Control for ControlService {
             revocations: revocations_to_proto(state.revocations()),
             forks: pending_forks(&state, &id),
             tombstones: tombstones_to_proto(&state, reported.iter().map(String::as_str)),
+            control_nodes: Vec::new(),
         }))
     }
 

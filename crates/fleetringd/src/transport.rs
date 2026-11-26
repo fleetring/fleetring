@@ -17,6 +17,8 @@ use fleetring_proto::v1::control_client::ControlClient;
 use fleetring_proto::v1::control_server::{Control, ControlServer};
 use fleetring_proto::v1::database_client::DatabaseClient;
 use fleetring_proto::v1::database_server::{Database, DatabaseServer};
+use fleetring_proto::v1::raft_client::RaftClient;
+use fleetring_proto::v1::raft_server::{Raft, RaftServer};
 use fleetring_proto::v1::replication_client::ReplicationClient;
 use fleetring_proto::v1::replication_server::{Replication, ReplicationServer};
 use tokio_stream::Stream;
@@ -170,6 +172,15 @@ pub fn replication_client(channel: Channel) -> ReplicationClient<Channel> {
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }
 
+/// A `Raft` client over `channel`, with FleetRing's message limits: a control node's client
+/// to another member of its control group (ADR-0040).
+#[must_use]
+pub fn raft_client(channel: Channel) -> RaftClient<Channel> {
+    RaftClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+}
+
 /// A `Database` client over `channel`, with FleetRing's message limits.
 #[must_use]
 pub fn database_client(channel: Channel) -> DatabaseClient<Channel> {
@@ -283,6 +294,13 @@ pub fn control_server<S: Control>(service: S) -> ControlServer<S> {
 /// A `Replication` server for `service`, with FleetRing's message limits.
 pub fn replication_server<S: Replication>(service: S) -> ReplicationServer<S> {
     ReplicationServer::new(service)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+}
+
+/// A `Raft` server for `service`, with FleetRing's message limits (ADR-0040).
+pub fn raft_server<S: Raft>(service: S) -> RaftServer<S> {
+    RaftServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }

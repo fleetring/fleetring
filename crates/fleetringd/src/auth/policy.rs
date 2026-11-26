@@ -332,6 +332,28 @@ pub const RPCS: &[Rpc] = &[
         Requirement::Node,
         Binding::Dropped,
     ),
+    // Raft (ADR-0035, ADR-0040): the control group's members only, or any node of the fleet
+    // while the receiver belongs to no group yet.
+    rpc(
+        "/fleetring.v1.Raft/AppendEntries",
+        Requirement::Node,
+        Binding::ControlPeer,
+    ),
+    rpc(
+        "/fleetring.v1.Raft/Vote",
+        Requirement::Node,
+        Binding::ControlPeer,
+    ),
+    rpc(
+        "/fleetring.v1.Raft/InstallSnapshot",
+        Requirement::Node,
+        Binding::ControlPeer,
+    ),
+    rpc(
+        "/fleetring.v1.Raft/Probe",
+        Requirement::Node,
+        Binding::ControlPeer,
+    ),
     // Database.
     rpc(
         "/fleetring.v1.Database/Execute",
@@ -723,7 +745,7 @@ impl Denied {
 mod tests {
     use std::collections::BTreeSet;
 
-    use fleetring_proto::v1::{control_server, database_server, replication_server};
+    use fleetring_proto::v1::{control_server, database_server, raft_server, replication_server};
 
     use super::*;
 
@@ -889,7 +911,8 @@ mod tests {
                 | Binding::Follower
                 | Binding::Dropped
                 | Binding::Seeding
-                | Binding::FollowerOrSeeding) => binding.as_str(),
+                | Binding::FollowerOrSeeding
+                | Binding::ControlPeer) => binding.as_str(),
             };
             let row = format!(
                 "| `{service}.{}` | {} | {binding} |",
@@ -910,6 +933,7 @@ mod tests {
             control_server::SERVICE_NAME,
             replication_server::SERVICE_NAME,
             database_server::SERVICE_NAME,
+            raft_server::SERVICE_NAME,
         ]
         .into_iter()
         .collect();
@@ -922,11 +946,11 @@ mod tests {
     }
 
     #[test]
-    fn replication_is_for_nodes_only() {
-        for rpc in RPCS
-            .iter()
-            .filter(|rpc| rpc.service() == replication_server::SERVICE_NAME)
-        {
+    fn replication_and_raft_are_for_nodes_only() {
+        for rpc in RPCS.iter().filter(|rpc| {
+            rpc.service() == replication_server::SERVICE_NAME
+                || rpc.service() == raft_server::SERVICE_NAME
+        }) {
             assert_eq!(rpc.requirement, Requirement::Node, "{}", rpc.path);
         }
     }
