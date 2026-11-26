@@ -4145,6 +4145,7 @@ impl Control for Publishing {
             revocations: self.published(),
             protocol: Some(PROTOCOL_VERSION),
             membership_epoch: 1,
+            control_nodes: Vec::new(),
         }))
     }
 
@@ -4158,6 +4159,7 @@ impl Control for Publishing {
             revocations: self.published(),
             forks: Vec::new(),
             tombstones: Vec::new(),
+            control_nodes: Vec::new(),
         }))
     }
 

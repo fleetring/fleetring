@@ -1,6 +1,7 @@
 //! gRPC services and messages between FleetRing nodes (ADR-0019).
 //!
-//! Package `fleetring.v1` defines the `Control`, `Replication`, and `Database` services. Log
+//! Package `fleetring.v1` defines the `Control`, `Replication`, `Raft`, and `Database` services:
+//! `Raft` carries the control group's messages between control nodes (ADR-0040). Log
 //! positions and batch payloads are opaque bytes that only engine adapters interpret, and
 //! positions compare lexicographically in log order (ADR-0016).
 
@@ -30,8 +31,10 @@ use v1::ProtocolVersion;
 /// plane writes, and the principal fields of `RevokeToken`; `Placement.placed_replicas`, and
 /// `replicas_caught_up` in heartbeats, for membership changes that hand replica sets over on
 /// joint quorums (ADR-0031, amendment 2); and `ReplicateOpen.epoch_start_chain` (FR-044).
+/// Minor 4 adds the control group (ADR-0040 point 11): the `Raft` service with `Probe`,
+/// `RaftPayload`, `ControlNode`, and `control_nodes` in `JoinResponse` and `HeartbeatResponse`.
 /// Peers need only share the major version (`check_protocol`), so these changed no version.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 
 /// The largest message a node sends or accepts: a replication batch or a snapshot chunk.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
