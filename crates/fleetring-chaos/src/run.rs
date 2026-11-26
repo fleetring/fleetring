@@ -173,7 +173,9 @@ const LOST_WRITE: [Invariant; 4] = [
 
 /// Judges a run: FR-036's history checker over `history` and the rows each database's copies
 /// hold, the convergence of each database's final replica set (`final_sets`, by node name),
-/// and the control log's replay. The first violation decides. A run without a violation and
+/// and the replay of the control node's `control.db`, a one-voter control group's format-2 log,
+/// from its oldest retained control snapshot or from genesis (`check::control_log_replays`). The
+/// first violation decides. A run without a violation and
 /// with fewer than [`MIN_ACKNOWLEDGED_WRITES`] acknowledged writes tested too little and is a
 /// harness failure.
 ///
