@@ -470,7 +470,8 @@ async fn the_control_node_starts_a_promotion_for_an_expired_lease_and_a_node_lea
     let tls = Tls::create(dir.path())?;
     let text = format!(
         "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \"control-1\"\n\n\
-         [control]\nlease_duration_ms = 2000\nfailover_margin_ms = 0\ntick_interval_ms = 20\n{}",
+         [control]\nlease_duration_ms = 2000\nfailover_margin_ms = 0\ntick_interval_ms = 20\n\
+         election_timeout_ms = 200\nraft_heartbeat_ms = 50\n{}",
         dir.path().join("data"),
         tls.node_table("control-1")?
     );
@@ -3899,7 +3900,7 @@ mod forks {
         let text = format!(
             "data_dir = {:?}\nlisten = \"127.0.0.1:0\"\nrole = \"control\"\n\n[node]\nid = \
              \"control-1\"\n\n[control]\nlease_duration_ms = 500\nfailover_margin_ms = 0\n\
-             tick_interval_ms = 50\n{}",
+             tick_interval_ms = 50\nelection_timeout_ms = 100\nraft_heartbeat_ms = 25\n{}",
             dir.path().join("data"),
             tls.node_table("control-1")?
         );

@@ -55,9 +55,10 @@ pub use actor::{
 };
 pub use config::{
     AdminConfig, AdminListener, AdminPlaintext, AdminTls, Config, ConfigError, ControlSettings,
-    ForkConfig, HEARTBEATS_PER_TIMEOUT, LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig,
-    LogFormat, MembershipSettings, NodeConfig, NodeRole, OnShutdown, ParseLogFormatError,
-    Plaintext, PrincipalConfig, ReplicationConfig, SessionsConfig, TlsConfig, TokenForwarding,
+    ELECTION_TIMEOUT_SPREAD, ELECTIONS_PER_LEASE, ForkConfig, HEARTBEATS_PER_TIMEOUT,
+    LEASE_RENEWALS_PER_DURATION, LimitsConfig, LogConfig, LogFormat, MembershipSettings,
+    NodeConfig, NodeRole, OnShutdown, ParseLogFormatError, Plaintext, PrincipalConfig,
+    RAFT_HEARTBEATS_PER_ELECTION, ReplicationConfig, SessionsConfig, TlsConfig, TokenForwarding,
 };
 pub use daemon::{Daemon, StartError, Stop};
 pub use data_dir::{DataDir, DataDirError};

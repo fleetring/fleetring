@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::actor::SessionLimits;
 use crate::auth::{Action, Scopes};
 use crate::changes::ChangesConfig;
-use crate::control::DurabilityDefaults;
+use crate::control::{Bootstrap, DurabilityDefaults};
 use crate::dev::{self, DevMode};
 use crate::durability::ArchiveConfig;
 use crate::engine::EngineConfig;
@@ -799,6 +799,30 @@ const DEFAULT_RENEWALS_PER_DURATION: u64 = 5;
 /// How often the control node looks for expired leases, by default.
 const DEFAULT_TICK_INTERVAL: Millis = Millis::new(250);
 
+/// How many Raft heartbeats must fit in the control group's shortest election timeout, so that
+/// a follower survives two lost heartbeats without starting an election (ADR-0040 point 4).
+pub const RAFT_HEARTBEATS_PER_ELECTION: u64 = 3;
+
+/// How many of the control group's longest election timeouts must fit in a lease duration, so
+/// that a new leader is elected well before a lease nobody could renew meanwhile looks expired.
+pub const ELECTIONS_PER_LEASE: u64 = 2;
+
+/// The control group's longest election timeout, as a multiple of its shortest
+/// (`[control] election_timeout_ms`): each election timeout is drawn between the two.
+pub const ELECTION_TIMEOUT_SPREAD: u64 = 2;
+
+/// The control group's shortest election timeout, by default.
+const DEFAULT_ELECTION_TIMEOUT: Millis = Millis::new(1_000);
+
+/// How often the control group's leader sends Raft heartbeats, by default.
+const DEFAULT_RAFT_HEARTBEAT: Millis = Millis::new(250);
+
+/// How many log entries a control node keeps behind its newest control snapshot, by default.
+const DEFAULT_LOG_KEEP: u64 = 1_000;
+
+/// How many control snapshots a control node keeps, by default.
+const DEFAULT_SNAPSHOTS_RETAINED: NonZeroU64 = NonZeroU64::new(2).expect("2 is nonzero");
+
 /// The `[membership]` table: how a data node reports to the control plane.
 ///
 /// ```toml
@@ -975,9 +999,21 @@ impl Default for ReplicationConfig {
 /// tick_interval_ms = 250      # how often the control node looks for expired leases
 /// snapshot_every = 1000       # commands between snapshots
 /// tombstone_window_ms = 604800000  # how long a dropped database's tombstone is kept: 7 days
+/// bootstrap = "new"           # "new" starts a control group; "join" waits to be added to one
+/// election_timeout_ms = 1000  # the control group's shortest election timeout
+/// raft_heartbeat_ms = 250     # how often the control group's leader sends Raft heartbeats
+/// log_keep = 1000             # log entries kept behind the newest control snapshot
+/// snapshots_retained = 2      # control snapshots kept on disk
 /// issuer_cert = "/etc/fleetring/tls/issuer.control-1.crt"  # the delegation issuer pair, from
 /// issuer_key = "/etc/fleetring/tls/issuer.control-1.key"   # `fleetring cert issuer`
 /// ```
+///
+/// `bootstrap`, the election timeout, the Raft heartbeat, `log_keep` and `snapshots_retained`
+/// configure the control group (ADR-0035, ADR-0040). A single control node is a group of one
+/// voter, which elects itself at once and needs none of them set. The election timeout must fit
+/// [`RAFT_HEARTBEATS_PER_ELECTION`] Raft heartbeats, and the lease duration
+/// [`ELECTIONS_PER_LEASE`] of the longest election timeouts, which are
+/// [`ELECTION_TIMEOUT_SPREAD`] times `election_timeout_ms`.
 ///
 /// The defaults suit a local network: a primary that dies is replaced about
 /// `lease_duration_ms + failover_margin_ms` after its last renewal. A data node checks that
@@ -1018,6 +1054,17 @@ pub struct ControlSettings {
     pub issuer_cert: Option<PathBuf>,
     /// The PEM file with the delegation issuer's private key. Set with `issuer_cert`.
     pub issuer_key: Option<PathBuf>,
+    /// Whether an empty control log starts a control group or waits to be added to one.
+    pub bootstrap: Bootstrap,
+    /// The control group's shortest election timeout, in milliseconds. Each election timeout is
+    /// drawn up to [`ELECTION_TIMEOUT_SPREAD`] times as long.
+    pub election_timeout_ms: NonZeroU64,
+    /// How often the control group's leader sends Raft heartbeats, in milliseconds.
+    pub raft_heartbeat_ms: NonZeroU64,
+    /// How many log entries the control node keeps behind its newest control snapshot.
+    pub log_keep: u64,
+    /// How many control snapshots the control node keeps on disk.
+    pub snapshots_retained: NonZeroU64,
 }
 
 impl ControlSettings {
@@ -1046,6 +1093,43 @@ impl ControlSettings {
     pub fn tick_interval(&self) -> Duration {
         Duration::from_millis(self.tick_interval_ms.get())
     }
+
+    /// Returns the control group's longest election timeout, in milliseconds:
+    /// [`ELECTION_TIMEOUT_SPREAD`] times `election_timeout_ms`.
+    #[must_use]
+    pub fn longest_election_timeout_ms(&self) -> u64 {
+        self.election_timeout_ms
+            .get()
+            .saturating_mul(ELECTION_TIMEOUT_SPREAD)
+    }
+
+    /// Checks the control group's timings against each other and against the lease duration.
+    fn validate_group(&self) -> Result<(), ConfigError> {
+        let election = self.election_timeout_ms.get();
+        let heartbeat = self.raft_heartbeat_ms.get();
+        if heartbeat.saturating_mul(RAFT_HEARTBEATS_PER_ELECTION) > election {
+            return Err(ConfigError::Invalid {
+                field: "control.election_timeout_ms",
+                reason: format!(
+                    "{election} ms leaves room for fewer than {RAFT_HEARTBEATS_PER_ELECTION} Raft \
+                     heartbeats of control.raft_heartbeat_ms ({heartbeat} ms)"
+                ),
+            });
+        }
+        let longest = self.longest_election_timeout_ms();
+        let lease = self.lease_duration_ms.get();
+        if longest.saturating_mul(ELECTIONS_PER_LEASE) > lease {
+            return Err(ConfigError::Invalid {
+                field: "control.lease_duration_ms",
+                reason: format!(
+                    "{lease} ms is shorter than {ELECTIONS_PER_LEASE} of the control group's \
+                     longest election timeouts ({longest} ms, {ELECTION_TIMEOUT_SPREAD} times \
+                     control.election_timeout_ms)"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for ControlSettings {
@@ -1063,6 +1147,11 @@ impl Default for ControlSettings {
             tombstone_window_ms: nonzero(fleetring_control::DEFAULT_TOMBSTONE_WINDOW),
             issuer_cert: None,
             issuer_key: None,
+            bootstrap: Bootstrap::New,
+            election_timeout_ms: nonzero(DEFAULT_ELECTION_TIMEOUT),
+            raft_heartbeat_ms: nonzero(DEFAULT_RAFT_HEARTBEAT),
+            log_keep: DEFAULT_LOG_KEEP,
+            snapshots_retained: DEFAULT_SNAPSHOTS_RETAINED,
         }
     }
 }
@@ -1211,6 +1300,9 @@ impl Config {
             });
         }
         self.validate_issuer()?;
+        if self.role.runs_control() {
+            self.control.validate_group()?;
+        }
         let interval = self.membership.heartbeat_interval_ms.get();
         let timeout = self.control.heartbeat_timeout_ms.get();
         if self.role.hosts_data() && interval.saturating_mul(HEARTBEATS_PER_TIMEOUT) > timeout {
@@ -1389,6 +1481,51 @@ mod tests {
 
     fn with(tables: &str) -> Result<Config, ConfigError> {
         Config::from_toml(&format!("{MINIMAL}{tables}"))
+    }
+
+    /// A new node needs no control group settings: the defaults validate, and start a group.
+    #[test]
+    fn the_defaults_validate() {
+        let config = with("").expect("a minimal config");
+        let control = &config.control;
+        assert_eq!(control.bootstrap, Bootstrap::New);
+        assert_eq!(control.election_timeout_ms.get(), 1_000);
+        assert_eq!(control.raft_heartbeat_ms.get(), 250);
+        assert_eq!(control.log_keep, 1_000);
+        assert_eq!(control.snapshots_retained.get(), 2);
+        assert_eq!(control.longest_election_timeout_ms(), 2_000);
+        let join = with("\n[control]\nbootstrap = \"join\"\n").expect("join");
+        assert_eq!(join.control.bootstrap, Bootstrap::Join);
+    }
+
+    #[test]
+    fn the_election_timeout_must_fit_three_raft_heartbeats() {
+        let refused = with("\n[control]\nelection_timeout_ms = 700\nraft_heartbeat_ms = 250\n")
+            .expect_err("two heartbeats");
+        let ConfigError::Invalid { field, reason } = &refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(*field, "control.election_timeout_ms");
+        assert!(reason.contains("control.raft_heartbeat_ms"), "{reason}");
+        with("\n[control]\nelection_timeout_ms = 750\nraft_heartbeat_ms = 250\n")
+            .expect("three heartbeats fit");
+    }
+
+    #[test]
+    fn the_lease_must_outlast_two_of_the_longest_election_timeouts() {
+        let refused = with("\n[control]\nlease_duration_ms = 3999\n").expect_err("short lease");
+        let ConfigError::Invalid { field, reason } = &refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(*field, "control.lease_duration_ms");
+        assert!(reason.contains("2000 ms"), "{reason}");
+        with("\n[control]\nlease_duration_ms = 4000\n").expect("two longest timeouts fit");
+        // A data-only node runs no control group, so its election timeout means nothing.
+        let data = format!(
+            "role = \"data\"\n{MINIMAL}\n[control]\naddress = \"127.0.0.1:7400\"\n\
+             lease_duration_ms = 3000\n"
+        );
+        Config::from_toml(&data).expect("a data-only node isn't held to the election timeout");
     }
 
     #[test]

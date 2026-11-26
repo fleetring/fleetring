@@ -43,6 +43,18 @@ pub enum StorageIo {
     Inline,
 }
 
+/// What a control node with an empty control log does (`[control] bootstrap`, ADR-0040 point 8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Bootstrap {
+    /// It starts a control group with itself as the only voter. The default.
+    #[default]
+    New,
+    /// It waits to be added to an existing control group.
+    Join,
+}
+
 /// How to run a control node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlOptions {

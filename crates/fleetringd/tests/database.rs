@@ -975,7 +975,8 @@ async fn a_restarted_primary_serves_its_database_again() -> TestResult {
 
 /// Timings short enough for a failover to finish quickly over loopback.
 const FAST_LEASES: &str = "lease_duration_ms = 800\nfailover_margin_ms = 100\n\
-                           heartbeat_timeout_ms = 500\ntick_interval_ms = 20\n";
+                           heartbeat_timeout_ms = 500\ntick_interval_ms = 20\n\
+                           election_timeout_ms = 100\nraft_heartbeat_ms = 25\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn db_exec_keeps_working_through_a_primary_failover_after_a_retry() -> TestResult {
