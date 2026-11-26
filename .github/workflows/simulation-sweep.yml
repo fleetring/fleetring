@@ -23,50 +23,62 @@ env:
   RUSTFLAGS: --cfg tokio_unstable
 
 jobs:
+  # Each shard runs its share of the seeds, one test-suite run per seed. It runs optimized with
+  # debug assertions kept: one debug run of 500 seeds took longer than the job's limit, so it
+  # was cancelled every night without reporting (FR-130).
   sweep:
-    name: sweep
+    name: sweep (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
       SEEDS: ${{ github.event.inputs.seeds || '500' }}
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo test -p fleetringd --features simulation --test sim --no-run
-      - name: run random seeds
+      - run: cargo test --release -p fleetringd --features simulation --test sim --no-run
+      - name: run this shard's random seeds
         run: |
+          per_shard=$(( (SEEDS + 7) / 8 ))
           failed=""
-          for _ in $(seq "$SEEDS"); do
+          for i in $(seq "$per_shard"); do
             seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
-            if ! FLEETRING_SIM_SEED="$seed" cargo test -q -p fleetringd --features simulation \
-                --test sim > "seed-$seed.log" 2>&1; then
+            started=$SECONDS
+            if ! FLEETRING_SIM_SEED="$seed" cargo test -q --release -p fleetringd \
+                --features simulation --test sim > "seed-$seed.log" 2>&1; then
               echo "::error::simulation seed $seed failed"
               cat "seed-$seed.log"
               failed="$failed $seed"
             else
               rm "seed-$seed.log"
             fi
+            echo "seed $i of $per_shard: $seed in $(( SECONDS - started )) s"
           done
           if [ -n "$failed" ]; then
             {
               echo "## Failing simulation seeds"
               echo
               for seed in $failed; do
-                echo "- \`RUSTFLAGS=\"--cfg tokio_unstable\" FLEETRING_SIM_SEED=$seed cargo test -p fleetringd --features simulation --test sim\`"
+                echo "- \`RUSTFLAGS=\"--cfg tokio_unstable\" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true FLEETRING_SIM_SEED=$seed cargo test --release -p fleetringd --features simulation --test sim\`"
               done
             } >> "$GITHUB_STEP_SUMMARY"
             echo "failing seeds:$failed"
             exit 1
           fi
-          echo "all $SEEDS seeds passed"
+          echo "all $per_shard seeds passed"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
+        if: failure() || cancelled()
         with:
-          name: simulation-sweep-logs
+          name: simulation-sweep-logs-${{ matrix.shard }}
           path: seed-*.log
+          if-no-files-found: ignore
 
   # FR-087's fork matrix: every row over the same number of seeds as `seeds`, each seed at the
   # seeding step it picks (the ignored `sweep_row_*` tests), and FR-102's hand-over sweep
