@@ -1,6 +1,6 @@
 # ADR-0040: The Raft control group screens commands on its leader against the log it will commit, owns its storage and wire formats, and draws openraft's randomness from an injected generator (amends ADR-0035)
 
-- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25))
+- **Status:** Accepted (2026-11-25, by the owner, with decisions D1 to D9 as recommended; see [Owner decisions](#owner-decisions-2026-11-25)); points 2 and 6 amended by [amendment 1](#amendment-1-2026-11-26-one-batch-in-flight-and-a-discarded-entrys-outcome-is-unknown) (accepted 2026-11-26)
 - **Date:** 2026-11-04 (revised on 2026-11-25 against `main` at 0.9.0, before acceptance)
 - **Related:** ADR-0035 (amends points 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, and 15), ADR-0017, ADR-0018, ADR-0020, ADR-0022, ADR-0026, ADR-0031 (amendment 2), ADR-0034, ADR-0038, ADR-0039, ADR-0043, ADR-0046 (FR-110 amendment), ADR-0047, ADR-0050; tickets FR-064 (#67), FR-065 (#68), FR-127 (#216), FR-128 (#217)
 
@@ -188,6 +188,27 @@ The owner accepted this record on 2026-11-25, with every recommendation of the r
 9. **D9, per-node settings that leak into commands: documented, with a leader warning on a mismatch** (point 13). It is cheap, and flapping is harmless. FR-128 (#217) is the follow-up that moves fleet-wide settings into control state.
 
 The review's other corrections are folded into the points above: protocol 1.4 and the field numbers (point 11), the 0.9.0 fixture and field register (points 5 and 8), the `ControlFormat` refusal (point 5), the group gate's fallback for each injected enabling command (point 4), `ReadIndex` only (point 2), and resends answered only after commit (point 2). FR-127 (#216), explicit feature finalization in place of injected enabling commands, was filed with them.
+
+## Amendment 1 (2026-11-26): one batch in flight, and a discarded entry's outcome is unknown
+
+- **Status:** Accepted (2026-11-26, by the owner, after an independent review of FR-064's PR 3).
+- **Amends:** point 2 (the screening state's steps 6 and 7, and "S is dropped"), and point 6's list of errors that pause the leader's timers.
+
+The review checked point 2 against openraft 0.10.1's source and found two places where the point's reasoning doesn't hold for that release.
+
+1. **The proposer keeps one batch in flight (owner's answer to Q1).** Point 2 says the screen is exact because, in term T, the leader's log is its log at takeover followed by its own term-T proposals in order, which is exactly what S applied. openraft 0.10.1 breaks the "exactly": it refuses a write on a leader whose leader lease has expired (`ForwardToLeader::empty()` with reason `LeaseExpired`, `core/raft_core.rs` lines 692–700 and `proposer/leader.rs` lines 319–327) while that node stays leader in the same term. A refused proposal never reaches the log, but S already applied it, and a proposal screened after it, before the refusal arrives, is screened against a state holding a command that never took effect. So:
+   - the proposer screens and proposes the next batch only after openraft has answered every proposal of the previous one. Submissions keep queuing in the mailbox meanwhile and form the next batch, so group commit stays: a burst still becomes one append;
+   - any answer other than `Applied` marks S as poisoned, as PR 3 built it. The next batch is screened against S cloned again from the applied state, which then holds exactly what took effect, since nothing else is in flight;
+   - a node that isn't a ready leader screens nothing, so it answers submissions at once while its old proposals wait, and a shutdown stops the proposer even while a batch waits.
+
+   This replaces step 7's "proposals pipeline": the cost is one replication round between batches, not between commands, which the alternative "proposing one command at a time" would cost.
+2. **A discarded entry's outcome is unknown (owner's answer to Q2).** Point 2 says openraft answers a truncated entry's submitter `ForwardToLeader`, "which means it never took effect". In openraft 0.10.1 a truncated or purged entry is answered `ClientWriteError::LogEntryDiscarded` (`core/raft_core.rs` lines 2643–2675), and its own comment says another node may still commit it: a later leader that holds the entry can commit it after this node truncated its copy. So:
+   - `LogEntryDiscarded` is answered `SubmitError::Unknown`, "the control leader changed before the command was known to be logged; retry", and the `Control` service answers it `UNAVAILABLE` *without* a leader redirect;
+   - the leader's timers pause on it as on `Superseded` (point 6), and never end on it;
+   - a retry is safe, because the next leader screens a resent command against the state its own log reaches: a command that did commit meets itself as already done (a join of a member already joined, a delegation answered as a resend), and one that didn't is screened afresh. This is the same at-least-once outcome as a lost deadline (Consequences).
+   - `ForwardToLeader`, which openraft gives a proposal it never appended (no longer leader, or the lease refusal above), keeps its meaning: nothing happened, `NotLeader`.
+
+   The proposals metric counts `Unknown` as `not_leader`, so the closed set of point 10 doesn't change.
 
 ## Alternatives considered
 

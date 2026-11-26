@@ -492,7 +492,8 @@ impl ControlService {
                     | SubmitError::Refused(_)
                     | SubmitError::NotLeader { .. }
                     | SubmitError::CatchingUp { .. }
-                    | SubmitError::Superseded),
+                    | SubmitError::Superseded
+                    | SubmitError::Unknown),
                 ) => return Err(submit_status(error)),
             };
             draws += 1;
@@ -608,7 +609,8 @@ impl ControlService {
                     | SubmitError::Storage(_)
                     | SubmitError::NotLeader { .. }
                     | SubmitError::CatchingUp { .. }
-                    | SubmitError::Superseded),
+                    | SubmitError::Superseded
+                    | SubmitError::Unknown),
                 ) => {
                     return Err(submit_status(error));
                 }
@@ -1129,10 +1131,13 @@ pub fn missing_database(status: &Status) -> Option<&str> {
 
 /// The status a submission's error is answered with: a redirect to the leader when this node
 /// knows it, `UNAVAILABLE` while the control group has no ready leader here or the leader
-/// changed, with the leader as a hint when known.
+/// changed, with the leader as a hint when known. A command whose outcome is unknown is
+/// `UNAVAILABLE` without a redirect: retrying it is safe, since the next leader screens it.
 fn submit_status(error: SubmitError) -> Status {
     match error {
-        SubmitError::Stopped | SubmitError::Superseded => Status::unavailable(error.to_string()),
+        SubmitError::Stopped | SubmitError::Superseded | SubmitError::Unknown => {
+            Status::unavailable(error.to_string())
+        }
         SubmitError::Storage(_) => Status::internal(error.to_string()),
         SubmitError::Refused(rejection) => rejection_status(&rejection),
         SubmitError::NotLeader {
@@ -2365,6 +2370,20 @@ impl Control for ControlService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command whose outcome is unknown after a leader change is answered `UNAVAILABLE`, retry,
+    /// and never redirected: the node that answers no longer leads, and may not know who does
+    /// (ADR-0040, amendment 1).
+    #[test]
+    fn an_unknown_outcome_is_unavailable_without_a_redirect() {
+        let status = submit_status(SubmitError::Unknown);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("retry"), "{status:?}");
+        assert!(
+            status.metadata().get(LEADER_METADATA_KEY).is_none(),
+            "{status:?}"
+        );
+    }
 
     #[test]
     fn a_new_name_under_the_reserved_prefix_is_refused() {

@@ -761,7 +761,8 @@ async fn submit(shared: &Shared, action: Action, ack: Ack) -> Outcome {
             | SubmitError::Refused(_)
             | SubmitError::NotLeader { .. }
             | SubmitError::CatchingUp { .. }
-            | SubmitError::Superseded,
+            | SubmitError::Superseded
+            | SubmitError::Unknown,
         ) => Outcome::Indeterminate {
             code: Some(tonic::Code::Unavailable),
         },
@@ -962,7 +963,8 @@ async fn propose(shared: &Shared, action: Action) -> Outcome {
             | SubmitError::Refused(_)
             | SubmitError::NotLeader { .. }
             | SubmitError::CatchingUp { .. }
-            | SubmitError::Superseded,
+            | SubmitError::Superseded
+            | SubmitError::Unknown,
         ) => Outcome::Indeterminate {
             code: Some(tonic::Code::Unavailable),
         },
