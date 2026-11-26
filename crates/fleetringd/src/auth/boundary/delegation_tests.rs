@@ -669,7 +669,7 @@ async fn a_relay_carried_stream_ends_on_an_ancestors_revocation_within_a_recheck
 async fn control_node(dir: &std::path::Path) -> crate::control::ControlNode {
     let options = crate::control::ControlOptions::default()
         .with_storage_io(crate::control::StorageIo::Inline);
-    crate::control::ControlNode::open(
+    crate::control::test_support::open_node(
         dir.join("control.db"),
         options,
         SimClock::new(Timestamp::ZERO),

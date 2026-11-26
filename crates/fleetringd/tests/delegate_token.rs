@@ -24,7 +24,7 @@ use fleetring_proto::v1::{
 };
 use fleetringd::auth::{BearerToken, Scopes, TokenSigner, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
-use fleetringd::control::{CommandLog, ControlClient};
+use fleetringd::control::{ControlClient, ControlStore};
 use fleetringd::data::{Client, DatabaseSpec};
 use fleetringd::tls::{IssuerFiles, IssuerPair, Validity};
 use fleetringd::transport::Credentials;
@@ -837,7 +837,11 @@ async fn rate_limited_requests_log_nothing() -> TestResult {
         );
     }
     let dir = dev.stop_keeping_files().await;
-    let log = CommandLog::open(dir.path().join("data/control.db"), ControlConfig::new())?;
+    let log = ControlStore::open(
+        dir.path().join("data/control.db"),
+        ControlConfig::new(),
+        None,
+    )?;
     let recorded = log
         .commands()?
         .into_iter()

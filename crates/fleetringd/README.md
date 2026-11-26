@@ -540,8 +540,9 @@ The node certificate must name the address Prometheus dials (`cert node --addres
 | `ring` | data | it has published a ring | `no ring published yet` |
 | `denylist` | data | its token denylist is no older than the stale bound, so it accepts tokens | `no denylist yet`, `denylist is <n> ms old; tokens are refused`, or `denylist entry <i> is unreadable (<reason>); tokens are refused` |
 | `draining` | data | the node isn't draining | `the node is draining` |
-| `control_log` | control | the control log recovered and its writer runs | `the control writer stopped; restart the node` |
-| `leader` | control | a control leader is known; always, until the Raft control group (FR-064) | — |
+| `control_log` | control | the control log recovered, the control group runs, and it applies every entry it meets | `the control node stopped; restart the node`, or `entry <i> can't be read by fleetring <version> (<error>); upgrade this node` |
+| `leader` | control | a control group leader is known, this node or another | `no control leader known` |
+| `control_group` | control | the node is a voter or learner of a control group | `this node is no voter or learner of a control group: it waits to be added, or was removed` |
 
 A draining node answers `503`, so a load balancer stops sending it work while its leases move. In Kubernetes:
 
@@ -593,15 +594,24 @@ Every family carries the `fleetring_` prefix, lexicon words, and base units in i
 | `fleetring_lease_transfers_total` | counter | `outcome` | Leases this node handed over while draining, by outcome. |
 | `fleetring_promotions_total` | counter | `outcome` | Promotions this node carried out as candidate, by outcome. |
 | `fleetring_promotion_duration_seconds` | histogram | — | Time from a promotion notice to serving as primary. |
-| `fleetring_control_commands_total` | counter | `action`, `outcome` | Control commands logged, by action and whether `apply` accepted them. |
-| `fleetring_control_log_index` | gauge | — | The index of the last logged control command. |
-| `fleetring_control_log_write_duration_seconds` | histogram | — | Time to log one group of control commands, its sync included. |
-| `fleetring_control_mailbox_depth` | gauge | — | Control commands waiting for the writer. |
-| `fleetring_control_snapshot_index` | gauge | — | The log index of the last control snapshot saved; 0 before the first. |
+| `fleetring_control_commands_total` | counter | `action`, `outcome` | Control commands this node applied, by action and whether `apply` accepted them. |
+| `fleetring_control_log_index` | gauge | — | The index of the last entry in this node's control log. |
+| `fleetring_control_log_write_duration_seconds` | histogram | — | Time to append one batch of control log entries, its sync included. |
+| `fleetring_control_mailbox_depth` | gauge | — | Control commands waiting for the proposer or for their entries to be applied. |
+| `fleetring_control_snapshot_index` | gauge | — | The log index of the newest control snapshot; 0 before the first. |
 | `fleetring_control_promotions_in_progress` | gauge | — | Databases with a promotion in progress. |
 | `fleetring_control_kept_replica_sets` | gauge | — | Databases whose replica set a membership change kept, until their primary reports that placement's write quorum holds the log and the control plane releases it (ADR-0031, amendment 2). One that stays above zero for more than a few heartbeats is a hand-over that can't finish. |
 | `fleetring_control_databases` | gauge | — | Databases control state records. |
-| `fleetring_control_leader` | gauge | — | 1 if this node is the control plane's leader. |
+| `fleetring_control_leader` | gauge | — | 1 if this node is the control group's leader. |
+| `fleetring_control_committed_index` | gauge | — | The index of the last control log entry this node knows is committed. |
+| `fleetring_control_applied_index` | gauge | — | The index of the last control log entry this node applied. |
+| `fleetring_control_term` | gauge | — | The control group's term as this node knows it. |
+| `fleetring_control_voters` | gauge | — | Voters in the control group's membership as this node knows it. |
+| `fleetring_control_learners` | gauge | — | Learners in the control group's membership as this node knows it. |
+| `fleetring_control_replication_lag_max` | gauge | — | On the control group's leader, the most entries any member is behind; 0 elsewhere. |
+| `fleetring_control_clock_offset_max_seconds` | gauge | — | The largest clock offset this node saw in the control group's messages. |
+| `fleetring_control_elections_total` | counter | — | Terms of the control group this node saw begin. |
+| `fleetring_control_proposals_total` | counter | `outcome` | Control commands this node screened as leader, by what became of them: `committed`, `refused`, `superseded`, or `not_leader`. |
 | `fleetring_change_deliveries_total` | counter | `sink`, `outcome` | Change stream deliveries, by sink and outcome. |
 | `fleetring_change_resets_total` | counter | `sink` | Times a sink's stream skipped ahead because the log moved past it. |
 | `fleetring_change_backlog_batches` | gauge | `sink` | Batches published but not yet delivered, summed over databases. |

@@ -66,7 +66,7 @@ pub(crate) struct Readiness {
 pub(crate) enum Health {
     /// The process can serve.
     Serving,
-    /// The control writer stopped after a storage failure; only a restart recovers.
+    /// The control node stopped after a storage failure; only a restart recovers.
     ControlWriterStopped,
 }
 
@@ -128,13 +128,28 @@ impl Probes {
             ));
         }
         if let Some(control) = &self.control {
-            checks.push(Check::judged(
-                "control_log",
+            // ADR-0040 point 10: the control log applies and its storage runs; a leader is known,
+            // this node or another; and this node is a voter or learner of a control group.
+            let stopped = control.halted().or_else(|| {
                 (!control.is_running())
-                    .then(|| "the control writer stopped; restart the node".to_owned()),
+                    .then(|| "the control node stopped; restart the node".to_owned())
+            });
+            checks.push(Check::judged("control_log", stopped));
+            checks.push(Check::judged(
+                "leader",
+                control
+                    .leader()
+                    .is_none()
+                    .then(|| "no control leader known".to_owned()),
             ));
-            // One control node is its own leader; FR-064's Raft group gives this a meaning.
-            checks.push(Check::passed("leader"));
+            checks.push(Check::judged(
+                "control_group",
+                (!control.group().contains(&control.own().node_id)).then(|| {
+                    "this node is no voter or learner of a control group: it waits to be added, \
+                     or was removed"
+                        .to_owned()
+                }),
+            ));
         }
         Readiness {
             ready: checks.iter().all(|check| check.ok),
@@ -179,7 +194,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let options = crate::control::ControlOptions::default()
             .with_storage_io(crate::control::StorageIo::Inline);
-        let node = crate::control::ControlNode::open(
+        let node = crate::control::test_support::open_node(
             dir.path().join("control.db"),
             options,
             crate::clock::SimClock::new(fleetring_control::Timestamp::ZERO),
@@ -249,6 +264,55 @@ mod tests {
             .find(|check| check.name == "denylist")
             .expect("a denylist check");
         assert!(denylist.ok, "{denylist:?}");
+    }
+
+    /// A one-voter control group is ready: its node knows a leader, itself, and is a voter. A
+    /// node that waits to join a group knows no leader and is no member (ADR-0040 point 10).
+    #[tokio::test(start_paused = true)]
+    async fn readiness_reports_leader_and_control_group() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let options = crate::control::ControlOptions::default()
+            .with_storage_io(crate::control::StorageIo::Inline);
+        let node = crate::control::test_support::open_node(
+            dir.path().join("control.db"),
+            options.clone(),
+            crate::clock::SimClock::new(fleetring_control::Timestamp::ZERO),
+        )
+        .await
+        .expect("a control node");
+        let probes = Probes {
+            node: "control-1".parse().expect("a node id"),
+            membership: None,
+            denylist_max_age: Duration::from_secs(5),
+            control: Some(node.handle()),
+        };
+        let readiness = probes.readiness();
+        assert!(readiness.ready, "{readiness:?}");
+        let names: Vec<&str> = readiness.checks.iter().map(|check| check.name).collect();
+        assert_eq!(names, ["control_log", "leader", "control_group"]);
+        node.shutdown().await;
+
+        let joining = crate::control::test_support::open_node(
+            dir.path().join("joining.db"),
+            options.with_bootstrap(crate::control::Bootstrap::Join),
+            crate::clock::SimClock::new(fleetring_control::Timestamp::ZERO),
+        )
+        .await
+        .expect("a joining control node");
+        let probes = Probes {
+            control: Some(joining.handle()),
+            ..probes
+        };
+        let readiness = probes.readiness();
+        assert!(!readiness.ready);
+        let failing: Vec<&str> = readiness
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| check.name)
+            .collect();
+        assert_eq!(failing, ["leader", "control_group"]);
+        joining.shutdown().await;
     }
 
     #[test]

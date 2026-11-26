@@ -21,7 +21,7 @@ use fleetring_proto::v1::{
 };
 use fleetringd::auth::{BearerToken, STREAM_RECHECK, Scopes, TokenSigner, TokenSpec};
 use fleetringd::clock::{Clock as _, SystemClock};
-use fleetringd::control::{CommandLog, ControlClient};
+use fleetringd::control::{ControlClient, ControlStore};
 use fleetringd::data::Client;
 use fleetringd::transport::{Credentials, control_client_with};
 use fleetringd::{Config, Daemon, Network};
@@ -269,7 +269,11 @@ async fn assert_revoked(client: &Client, who: &str) {
 
 /// How many commands the log holds that revoke under the ancestor rule or a principal.
 fn logged_revocations(dir: &tempfile::TempDir) -> Result<usize, Box<dyn Error>> {
-    let log = CommandLog::open(dir.path().join("data/control.db"), ControlConfig::new())?;
+    let log = ControlStore::open(
+        dir.path().join("data/control.db"),
+        ControlConfig::new(),
+        None,
+    )?;
     Ok(log
         .commands()?
         .into_iter()

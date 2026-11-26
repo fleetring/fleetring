@@ -105,6 +105,9 @@ pub(crate) const OUTCOMES_PROMOTION: &[&str] = &["completed", "superseded", "fai
 /// The `outcome` label's values on `fleetring_control_commands_total`.
 pub(crate) const OUTCOMES_CONTROL: &[&str] = &["applied", "rejected"];
 
+/// The `outcome` label's values on `fleetring_control_proposals_total` (ADR-0040 point 10).
+pub(crate) const OUTCOMES_PROPOSAL: &[&str] = &["committed", "refused", "superseded", "not_leader"];
+
 /// The `outcome` label's values on `fleetring_change_deliveries_total`.
 pub(crate) const OUTCOMES_DELIVERY: &[&str] = &["delivered", "failed"];
 
@@ -356,31 +359,31 @@ pub const FAMILIES: &[FamilySpec] = &[
         "fleetring_control_commands",
         Counter,
         &["action", "outcome"],
-        "Control commands logged, by action and whether apply accepted them",
+        "Control commands this node applied, by action and whether apply accepted them",
     ),
     family(
         "fleetring_control_log_index",
         Gauge,
         &[],
-        "The index of the last logged control command",
+        "The index of the last entry in this node's control log",
     ),
     family(
         "fleetring_control_log_write_duration_seconds",
         Histogram,
         &[],
-        "Time to log one group of control commands, its sync included",
+        "Time to append one batch of control log entries, its sync included",
     ),
     family(
         "fleetring_control_mailbox_depth",
         Gauge,
         &[],
-        "Control commands waiting for the writer",
+        "Control commands waiting for the proposer or for their entries to be applied",
     ),
     family(
         "fleetring_control_snapshot_index",
         Gauge,
         &[],
-        "The log index of the last control snapshot saved; 0 before the first",
+        "The log index of the newest control snapshot; 0 before the first",
     ),
     family(
         "fleetring_control_promotions_in_progress",
@@ -404,7 +407,61 @@ pub const FAMILIES: &[FamilySpec] = &[
         "fleetring_control_leader",
         Gauge,
         &[],
-        "1 if this node is the control plane's leader",
+        "1 if this node is the control group's leader",
+    ),
+    family(
+        "fleetring_control_committed_index",
+        Gauge,
+        &[],
+        "The index of the last control log entry this node knows is committed",
+    ),
+    family(
+        "fleetring_control_applied_index",
+        Gauge,
+        &[],
+        "The index of the last control log entry this node applied",
+    ),
+    family(
+        "fleetring_control_term",
+        Gauge,
+        &[],
+        "The control group's term as this node knows it",
+    ),
+    family(
+        "fleetring_control_voters",
+        Gauge,
+        &[],
+        "Voters in the control group's membership as this node knows it",
+    ),
+    family(
+        "fleetring_control_learners",
+        Gauge,
+        &[],
+        "Learners in the control group's membership as this node knows it",
+    ),
+    family(
+        "fleetring_control_replication_lag_max",
+        Gauge,
+        &[],
+        "On the control group's leader, the most entries any member is behind; 0 elsewhere",
+    ),
+    family(
+        "fleetring_control_clock_offset_max_seconds",
+        Gauge,
+        &[],
+        "The largest clock offset this node saw in the control group's messages",
+    ),
+    family(
+        "fleetring_control_elections",
+        Counter,
+        &[],
+        "Terms of the control group this node saw begin",
+    ),
+    family(
+        "fleetring_control_proposals",
+        Counter,
+        &["outcome"],
+        "Control commands this node screened as leader, by what became of them",
     ),
     family(
         "fleetring_change_deliveries",
@@ -500,6 +557,7 @@ pub fn closed_values(family: &str, label: &str) -> Option<&'static [&'static str
         ("fleetring_lease_transfers", "outcome") => OUTCOMES_TRANSFER,
         ("fleetring_promotions", "outcome") => OUTCOMES_PROMOTION,
         ("fleetring_control_commands", "outcome") => OUTCOMES_CONTROL,
+        ("fleetring_control_proposals", "outcome") => OUTCOMES_PROPOSAL,
         ("fleetring_change_deliveries", "outcome") => OUTCOMES_DELIVERY,
         ("fleetring_forks", "outcome") => OUTCOMES_FORK,
         ("fleetring_fork_attempts", "outcome") => OUTCOMES_FORK_ATTEMPT,

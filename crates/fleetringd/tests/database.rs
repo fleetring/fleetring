@@ -3478,7 +3478,7 @@ mod expiry {
 
     use fleetring_control::{Action, ControlConfig, DatabaseName, ExpiryChange, Millis, Timestamp};
     use fleetringd::clock::{Clock, SystemClock};
-    use fleetringd::control::CommandLog;
+    use fleetringd::control::ControlStore;
     use fleetringd::data::{Client, DatabaseSpec, Expiry, NewMetadata, RestoredExpiry};
     use fleetringd::durability::RestoreTarget;
     use fleetringd::engine::{Statement, Value};
@@ -3548,7 +3548,11 @@ mod expiry {
         dir: &Path,
         database: &DatabaseName,
     ) -> Result<Vec<Action>, Box<dyn std::error::Error>> {
-        let log = CommandLog::open(dir.join("control").join("control.db"), ControlConfig::new())?;
+        let log = ControlStore::open(
+            dir.join("control").join("control.db"),
+            ControlConfig::new(),
+            None,
+        )?;
         Ok(log
             .commands()?
             .into_iter()
@@ -3974,14 +3978,20 @@ mod expiry {
     ) -> Result<Fleet, Box<dyn std::error::Error>> {
         let Fleet { control, data, tls } = fleet;
         let config = control.config().clone();
+        // The control daemon opens the new log again as itself, its group's only voter.
+        let peer = fleetringd::control::raft::ControlPeer::new(
+            config.node.id.as_str(),
+            control.listen_address().to_string(),
+        );
         control.run_until(async {}).await;
         let data_dir = dir.join("control");
         std::fs::remove_dir_all(&data_dir)?;
         std::fs::create_dir_all(&data_dir)?;
-        let node = fleetringd::control::ControlNode::open(
+        let node = crate::support::open_control_as(
             data_dir.join("control.db"),
             fleetringd::control::ControlOptions::new(config.control.control_config()),
             SystemClock,
+            peer,
         )
         .await?;
         let handle = node.handle();

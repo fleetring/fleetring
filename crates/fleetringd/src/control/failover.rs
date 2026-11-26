@@ -32,10 +32,20 @@
 //!    kept whose primary reports that placement's write quorum holds its log
 //!    ([`State::releases_due`]; ADR-0031, amendment 2).
 //!
-//! A control node that has just started gives primaries one lease duration plus the failover
-//! margin to renew before it starts any promotion: leases look expired after an outage only
-//! because nobody could renew them, and the primaries kept serving meanwhile (ADR-0018,
-//! point 6). None of this affects safety, which comes from epochs and quorums.
+//! All of it runs only on the control group's ready leader (ADR-0040 point 6): the timer and the
+//! sweep start when this node becomes ready, and pause for a tick, without ending, when a command
+//! is refused for leadership (`NotLeader`, `CatchingUp`, or `Superseded`): they then resume if the
+//! node is still ready under the same leader, keeping the settle window, or start again under a
+//! new one. Every command they submit names the leader they run under, and the proposer refuses
+//! it under any other. Only a stopped control node or a storage failure ends them.
+//!
+//! A leader that has just become ready gives primaries one lease duration plus the failover
+//! margin to renew before it starts a promotion, a fork action, or a kept set's release: leases
+//! look expired after an election or an outage only because nobody could renew them, and the
+//! primaries kept serving meanwhile (ADR-0018, point 6). The window is measured on
+//! `tokio::time::Instant`, which is monotonic, so a step of the leader's wall clock can't shorten
+//! it. Notices for promotions already in progress go out at once. None of this affects safety,
+//! which comes from epochs and quorums.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,6 +61,7 @@ use tokio::time::MissedTickBehavior;
 use crate::clock::Clock;
 use crate::control::node::{Committed, ControlHandle, SubmitError};
 use crate::control::notices::DropNotices;
+use crate::control::raft::{LeaderRef, Readiness};
 use crate::environment::Network;
 use crate::transport::{Peers, replication_client};
 
@@ -101,12 +112,12 @@ impl Default for FailoverSettings {
 #[derive(Debug)]
 pub struct Failover {
     task: JoinHandle<()>,
-    sweep: JoinHandle<()>,
 }
 
 impl Failover {
     /// Starts the timer and the expiry sweep for the control node behind `handle`, reading time
-    /// from `clock` and reaching candidates over `network`.
+    /// from `clock` and reaching candidates over `network`. Both run whenever this node is the
+    /// control group's ready leader.
     ///
     /// # Panics
     ///
@@ -119,33 +130,29 @@ impl Failover {
         settings: FailoverSettings,
     ) -> Self {
         let notices = DropNotices::new(network.clone());
-        let sweep = spawn_expiry_sweep(handle.clone(), Arc::clone(&clock), Some(notices));
-        let task = tokio::spawn(run(handle, clock, network, settings));
-        Self { task, sweep }
+        let task = tokio::spawn(run(handle, clock, network, settings, notices));
+        Self { task }
     }
 
     /// Stops the timer and the sweep, and waits for them to end.
     pub async fn stop(mut self) {
         self.task.abort();
-        self.sweep.abort();
-        // Aborted, so each can only end cancelled.
+        // Aborted, so it can only end cancelled; the sweep ends with it.
         let _stopped = (&mut self.task).await;
-        let _swept = (&mut self.sweep).await;
     }
 }
 
 impl Drop for Failover {
     fn drop(&mut self) {
         self.task.abort();
-        self.sweep.abort();
     }
 }
 
 /// Starts the expiry sweep for the control node behind `handle`, reading time from `clock`:
 /// every [`EXPIRY_SWEEP`], it expires the databases whose expiry has passed, as
 /// [`sweep`] does, and tells their replicas through `notices`. The task ends once the control
-/// node stops.
-pub(crate) fn spawn_expiry_sweep(
+/// node stops or stops leading; the timer starts it again at the next readiness.
+fn spawn_expiry_sweep(
     handle: ControlHandle,
     clock: Arc<dyn Clock>,
     notices: Option<DropNotices>,
@@ -156,20 +163,47 @@ pub(crate) fn spawn_expiry_sweep(
         loop {
             sweeps.tick().await;
             let due = handle.state().expired_databases(clock.now());
-            if sweep(&handle, due, notices.as_ref()).await == Sweep::Stop {
-                return;
+            match sweep(&handle, due, notices.as_ref()).await {
+                Sweep::Continue => {}
+                Sweep::Pause | Sweep::Stop => return,
             }
         }
     })
 }
 
-/// Whether the expiry sweep goes on.
+/// Whether the timer, or the expiry sweep, goes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sweep {
-    /// It sweeps again at its next interval.
+    /// It goes on at its next interval.
     Continue,
-    /// The control node has stopped, so it ends.
+    /// This node no longer leads, so it pauses until the next readiness.
+    Pause,
+    /// The control node has stopped, or can't log, so it ends.
     Stop,
+}
+
+impl Sweep {
+    /// What a submission's `error` means for the timer: only a stopped node or a storage
+    /// failure ends it, a lost leadership pauses it, and a refusal skips one command (ADR-0040
+    /// point 6).
+    fn after(error: &SubmitError) -> Self {
+        match error {
+            SubmitError::Stopped | SubmitError::Storage(_) => Self::Stop,
+            SubmitError::NotLeader { .. }
+            | SubmitError::CatchingUp { .. }
+            | SubmitError::Superseded => Self::Pause,
+            SubmitError::Refused(_) => Self::Continue,
+        }
+    }
+
+    /// The more final of `self` and `other`.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Stop, _) | (_, Self::Stop) => Self::Stop,
+            (Self::Pause, _) | (_, Self::Pause) => Self::Pause,
+            (Self::Continue, Self::Continue) => Self::Continue,
+        }
+    }
 }
 
 /// Submits [`Action::ExpireDatabase`] for each of the first [`MAX_EXPIRIES_PER_SWEEP`] databases
@@ -209,16 +243,15 @@ pub(crate) async fn sweep(
         {
             notices.send(recipients, database, *epoch);
         }
-        if expired(&name, result) == Sweep::Stop {
-            next = Sweep::Stop;
-        }
+        next = next.and(expired(&name, result));
     }
     next
 }
 
 /// Logs what became of the expiry of `database`, and says whether the sweep goes on: it stops
-/// only with the control node. A command refused before it was logged, or rejected by `apply`,
-/// is skipped, and a storage failure is retried at the next sweep.
+/// with the control node, and pauses when this node no longer leads. A command refused before it
+/// was logged, or rejected by `apply`, is skipped, and a storage failure is retried at the next
+/// sweep.
 pub(crate) fn expired(database: &DatabaseName, result: Result<Committed, SubmitError>) -> Sweep {
     match result {
         Ok(committed) => match committed.outcome() {
@@ -244,48 +277,132 @@ pub(crate) fn expired(database: &DatabaseName, result: Result<Committed, SubmitE
             tracing::warn!(database = %database, %error, "can't log an expiry; the next sweep tries again");
         }
         Err(SubmitError::Stopped) => return Sweep::Stop,
+        Err(
+            error @ (SubmitError::NotLeader { .. }
+            | SubmitError::CatchingUp { .. }
+            | SubmitError::Superseded),
+        ) => {
+            tracing::debug!(database = %database, %error, "the expiry wasn't logged; the next leader sweeps again");
+            return Sweep::Pause;
+        }
     }
     Sweep::Continue
 }
 
+/// Runs the timer and the sweep through every term this node leads, until the control node
+/// stops.
 async fn run(
     handle: ControlHandle,
     clock: Arc<dyn Clock>,
     network: Network,
     settings: FailoverSettings,
+    notices: DropNotices,
 ) {
     let peers = Arc::new(Peers::with_network(network));
-    let started = clock.now();
+    let mut leadership = handle.watch_leadership();
+    // The leader the timers last ran under, and when its settle window started.
+    let mut term: Option<(LeaderRef, tokio::time::Instant)> = None;
+    loop {
+        let leader = loop {
+            let current = leadership.borrow_and_update().clone();
+            if let Readiness::Ready { leader } = current {
+                break leader;
+            }
+            if leadership.changed().await.is_err() {
+                return;
+            }
+        };
+        // The settle window starts at readiness, on the monotonic clock, and again only under a
+        // new leader: resuming after a pause in the same term keeps it (ADR-0040 point 6).
+        let started = match term {
+            Some((under, started)) if under == leader => started,
+            Some(_) | None => tokio::time::Instant::now(),
+        };
+        term = Some((leader, started));
+        let sweep = spawn_expiry_sweep(handle.clone(), Arc::clone(&clock), Some(notices.clone()));
+        let ended = lead(
+            &handle,
+            &*clock,
+            &peers,
+            settings,
+            (leader, started),
+            &mut leadership,
+        )
+        .await;
+        sweep.abort();
+        match ended {
+            Sweep::Continue => {}
+            Sweep::Pause => {
+                // A refusal pauses the timers for a tick; then they resume if this node is still
+                // ready under the same leader, or start again under a new one.
+                tracing::info!(leader = %leader, "control leader's timers paused for a tick");
+                tokio::time::sleep(settings.tick_interval).await;
+            }
+            Sweep::Stop => return,
+        }
+    }
+}
+
+/// Runs the timer while this node is ready under `leader`, whose settle window started at
+/// `started`, and says why it ended: `Continue` when readiness changed, `Pause` when a command
+/// was refused for leadership, and `Stop` when the control node stopped. Every command it
+/// submits is submitted under `leader`, so none reaches another term's log.
+async fn lead(
+    handle: &ControlHandle,
+    clock: &dyn Clock,
+    peers: &Arc<Peers>,
+    settings: FailoverSettings,
+    (leader, started): (LeaderRef, tokio::time::Instant),
+    leadership: &mut tokio::sync::watch::Receiver<Readiness>,
+) -> Sweep {
     let tick = millis(settings.tick_interval);
     let mut notified: BTreeMap<DatabaseName, (LeaseEpoch, Timestamp)> = BTreeMap::new();
     let mut ticks = tokio::time::interval(settings.tick_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        ticks.tick().await;
+        tokio::select! {
+            biased;
+            changed = leadership.changed() => {
+                if changed.is_err() {
+                    return Sweep::Stop;
+                }
+                if *leadership.borrow_and_update() != (Readiness::Ready { leader }) {
+                    return Sweep::Continue;
+                }
+                continue;
+            }
+            _ = ticks.tick() => {}
+        }
         let now = clock.now();
         let current = handle.state();
         let idle = now.as_millis().saturating_sub(current.now().as_millis()) >= tick.get();
-        if idle || delegation::tick_due(&current, now) || current.tombstones().purge_due(now) {
-            match handle.submit(Action::Tick).await {
-                Ok(_) => {}
-                Err(SubmitError::Stopped | SubmitError::Storage(_) | SubmitError::Refused(_)) => {
-                    return;
+        if (idle || delegation::tick_due(&current, now) || current.tombstones().purge_due(now))
+            && let Err(error) = handle.submit_under(leader, Action::Tick).await
+        {
+            match Sweep::after(&error) {
+                Sweep::Continue => {
+                    tracing::debug!(%error, "a tick was refused");
                 }
+                next @ (Sweep::Pause | Sweep::Stop) => return next,
             }
         }
         let state = handle.state();
         let config = state.config();
-        let settled = started.saturating_add(
+        let window = Duration::from_millis(
             config
                 .lease_duration()
-                .saturating_add(config.failover_margin()),
+                .saturating_add(config.failover_margin())
+                .get(),
         );
-        if now > settled {
+        if started.elapsed() > window {
             for database in state.promotions_due(now) {
                 match handle
-                    .submit(Action::StartPromotion {
-                        database: database.clone(),
-                    })
+                    .submit_under(
+                        leader,
+                        Action::StartPromotion {
+                            database: database.clone(),
+                        },
+                    )
                     .await
                 {
                     Ok(committed) => {
@@ -296,22 +413,27 @@ async fn run(
                             tracing::info!(database = %database, epoch = epoch.get(), %candidate, "lease expired; promotion started");
                         }
                     }
-                    Err(
-                        SubmitError::Stopped | SubmitError::Storage(_) | SubmitError::Refused(_),
-                    ) => return,
+                    Err(error) => match Sweep::after(&error) {
+                        Sweep::Continue => {
+                            tracing::debug!(database = %database, %error, "a promotion was refused");
+                        }
+                        next @ (Sweep::Pause | Sweep::Stop) => return next,
+                    },
                 }
             }
-            if drive_forks(&handle, now).await == Sweep::Stop {
-                return;
+            match drive_forks(handle, leader, now).await {
+                Sweep::Continue => {}
+                next @ (Sweep::Pause | Sweep::Stop) => return next,
             }
-            if release_kept_replicas(&handle).await == Sweep::Stop {
-                return;
+            match release_kept_replicas(handle, leader).await {
+                Sweep::Continue => {}
+                next @ (Sweep::Pause | Sweep::Stop) => return next,
             }
         }
         notify_candidates(
             &handle.state(),
             now,
-            &peers,
+            peers,
             settings.notify_interval,
             &mut notified,
         );
@@ -322,10 +444,10 @@ async fn run(
 /// and logs what became of each (ADR-0046, point 3.11). The driver reads only the state, so a
 /// restarted control node proposes the same commands; `apply` checks each one again, so a
 /// proposal made stale by an earlier one is refused and changes nothing. Says whether the timer
-/// goes on: it stops only with the control node.
-async fn drive_forks(handle: &ControlHandle, now: Timestamp) -> Sweep {
+/// goes on: it stops with the control node, and pauses when this node no longer leads.
+async fn drive_forks(handle: &ControlHandle, leader: LeaderRef, now: Timestamp) -> Sweep {
     for action in fork::actions(&handle.state(), now) {
-        match handle.submit(action).await {
+        match handle.submit_under(leader, action).await {
             Ok(committed) => match committed.outcome() {
                 Ok(applied) => tracing::info!(?applied, "a fork moved on"),
                 Err(rejection) => tracing::debug!(%rejection, "a fork proposal was refused"),
@@ -334,6 +456,11 @@ async fn drive_forks(handle: &ControlHandle, now: Timestamp) -> Sweep {
             Err(error @ (SubmitError::Storage(_) | SubmitError::Refused(_))) => {
                 tracing::warn!(%error, "can't log a fork proposal; the next tick proposes again");
             }
+            Err(
+                SubmitError::NotLeader { .. }
+                | SubmitError::CatchingUp { .. }
+                | SubmitError::Superseded,
+            ) => return Sweep::Pause,
         }
     }
     Sweep::Continue
@@ -349,7 +476,7 @@ const RELEASES_PER_TICK: usize = 64;
 /// together, and logs what became of each. `apply` checks each one again, so one made stale
 /// meanwhile is refused and changes nothing; the rest wait for the next tick. Says whether the
 /// timer goes on.
-async fn release_kept_replicas(handle: &ControlHandle) -> Sweep {
+async fn release_kept_replicas(handle: &ControlHandle, leader: LeaderRef) -> Sweep {
     let mut releases = JoinSet::new();
     for action in handle
         .state()
@@ -358,7 +485,7 @@ async fn release_kept_replicas(handle: &ControlHandle) -> Sweep {
         .take(RELEASES_PER_TICK)
     {
         let handle = handle.clone();
-        releases.spawn(async move { handle.submit(action).await });
+        releases.spawn(async move { handle.submit_under(leader, action).await });
     }
     let mut sweep = Sweep::Continue;
     while let Some(joined) = releases.join_next().await {
@@ -371,10 +498,15 @@ async fn release_kept_replicas(handle: &ControlHandle) -> Sweep {
                     tracing::debug!(%rejection, "a kept replica set's release was refused");
                 }
             },
-            Ok(Err(SubmitError::Stopped)) => sweep = Sweep::Stop,
+            Ok(Err(SubmitError::Stopped)) => sweep = sweep.and(Sweep::Stop),
             Ok(Err(error @ (SubmitError::Storage(_) | SubmitError::Refused(_)))) => {
                 tracing::warn!(%error, "can't log a release; the next tick proposes again");
             }
+            Ok(Err(
+                SubmitError::NotLeader { .. }
+                | SubmitError::CatchingUp { .. }
+                | SubmitError::Superseded,
+            )) => sweep = sweep.and(Sweep::Pause),
             Err(error) => {
                 tracing::warn!(%error, "a release's submission ended early; the next tick proposes again");
             }
@@ -469,9 +601,13 @@ mod tests {
 
     async fn node(dir: &std::path::Path) -> ControlNode {
         let options = ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
-        let node = ControlNode::open(dir.join("control.db"), options, SimClock::new(BASE))
-            .await
-            .expect("a new log opens");
+        let node = crate::control::test_support::open_node(
+            dir.join("control.db"),
+            options,
+            SimClock::new(BASE),
+        )
+        .await
+        .expect("a new log opens");
         let member =
             Member::new("data-1".parse().expect("an id")).with_software(crate::software::running());
         node.handle()
@@ -613,13 +749,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn timer_ticks_when_a_kept_until_passes_on_a_busy_control_plane() {
         let dir = tempfile::tempdir().expect("a directory");
-        let options = ControlOptions::new(ControlConfig::new())
-            .with_storage_io(StorageIo::Inline)
-            .with_recorder("control-1".parse().expect("an id"));
+        let options = ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
         let clock = SimClock::new(BASE);
-        let node = ControlNode::open(dir.path().join("control.db"), options, clock)
-            .await
-            .expect("a new log opens");
+        let node =
+            crate::control::test_support::open_node(dir.path().join("control.db"), options, clock)
+                .await
+                .expect("a new log opens");
         let handle = node.handle();
         let software = Feature::ALL.into_iter().fold(
             fleetring_control::Software::new(Release::new(0, 8, 0), 1),
@@ -668,5 +803,376 @@ mod tests {
         assert_eq!(handle.state().delegations().len(), 0);
         timer.stop().await;
         node.shutdown().await;
+    }
+
+    /// The 0.9.0 fixture's commands, as 0.9.0's single writer logged them.
+    fn fixture() -> Vec<fleetring_control::Command> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/control-0.9.0/commands.json");
+        let text = std::fs::read_to_string(path).expect("readable");
+        serde_json::from_str(&text).expect("decodes")
+    }
+
+    /// A clock that follows `tokio::time` from the fixture's first stamp, and that a test can
+    /// step forward, as an operator's or NTP's correction steps a wall clock.
+    #[derive(Debug, Clone)]
+    struct SteppedClock {
+        clock: SimClock,
+        step: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SteppedClock {
+        fn new(base: Timestamp) -> Self {
+            Self {
+                clock: SimClock::new(base),
+                step: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+
+        fn step(&self, by: Duration) {
+            self.step
+                .fetch_add(millis(by).get(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for SteppedClock {
+        fn now(&self) -> Timestamp {
+            self.clock.now().saturating_add(Millis::new(
+                self.step.load(std::sync::atomic::Ordering::SeqCst),
+            ))
+        }
+    }
+
+    /// A control node that has logged the fixture's actions through `upto` (enabling commands
+    /// left out, the proposer adds them), each at its own time on `clock`, and the heartbeats
+    /// among them, which keep the members live and their reports current.
+    async fn fixture_node(
+        dir: &std::path::Path,
+        clock: SteppedClock,
+        upto: usize,
+    ) -> (ControlNode, Vec<Action>) {
+        let commands = fixture();
+        let base = commands[0].at;
+        let started = tokio::time::Instant::now();
+        let options = ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
+        let node = crate::control::test_support::open_node(dir.join("control.db"), options, clock)
+            .await
+            .expect("opens");
+        let mut heartbeats = Vec::new();
+        for command in &commands[..=upto] {
+            if matches!(
+                command.action,
+                Action::EnableHandover
+                    | Action::EnableIncarnations
+                    | Action::SetTombstoneWindow { .. }
+            ) {
+                continue;
+            }
+            let offset = command.at.as_millis().saturating_sub(base.as_millis());
+            tokio::time::sleep_until(started + Duration::from_millis(offset)).await;
+            node.handle()
+                .submit(command.action.clone())
+                .await
+                .expect("logged as the writer logged it");
+            if let Action::Heartbeat { id, .. } = &command.action {
+                heartbeats.retain(
+                    |beat| !matches!(beat, Action::Heartbeat { id: known, .. } if known == id),
+                );
+                heartbeats.push(command.action.clone());
+            }
+        }
+        (node, heartbeats)
+    }
+
+    /// `heartbeats`, and one from each member that reports it follows, at a position, every
+    /// leased database whose replica set holds it: candidates for a promotion.
+    fn following(state: &State, mut heartbeats: Vec<Action>) -> Vec<Action> {
+        for member in state.members() {
+            let replicas: Vec<serde_json::Value> = state
+                .databases()
+                .filter(|database| {
+                    database
+                        .lease()
+                        .is_some_and(|lease| lease.holder() != member.id())
+                        && state
+                            .replica_set(database.name())
+                            .is_ok_and(|set| set.contains(member.id()))
+                })
+                .map(|database| {
+                    serde_json::json!({
+                        "database": database.name().as_str(),
+                        "role": "follower",
+                        "position": [0, 0, 0, 1],
+                    })
+                })
+                .collect();
+            if replicas.is_empty() {
+                continue;
+            }
+            let heartbeat = serde_json::json!({
+                "heartbeat": {
+                    "id": member.id().as_str(),
+                    "replicas": replicas,
+                    "unknown_reports": "skip",
+                }
+            });
+            heartbeats.push(serde_json::from_value(heartbeat).expect("a heartbeat"));
+        }
+        heartbeats
+    }
+
+    /// Keeps the members live for `span`: their last heartbeats again every second.
+    async fn heartbeat_for(handle: &ControlHandle, heartbeats: &[Action], span: Duration) {
+        let until = tokio::time::Instant::now() + span;
+        while tokio::time::Instant::now() < until {
+            for heartbeat in heartbeats {
+                handle
+                    .submit(heartbeat.clone())
+                    .await
+                    .expect("the heartbeat commits");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    fn promotions(handle: &ControlHandle) -> usize {
+        handle
+            .state()
+            .databases()
+            .filter(|database| database.promotion().is_some())
+            .count()
+    }
+
+    /// The settle window of the default control configuration: a lease duration plus the
+    /// failover margin.
+    const WINDOW: Duration = Duration::from_secs(12);
+
+    /// A leader that has just become ready starts no promotion for a settle window, however
+    /// long its leases have looked expired, and starts them once the window has passed (ADR-0040
+    /// point 6).
+    #[tokio::test(start_paused = true)]
+    async fn a_new_leader_waits_a_lease_duration_before_promoting() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let clock = SteppedClock::new(fixture()[0].at);
+        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 27).await;
+        let handle = node.handle();
+        // Every lease expires, unrenewed, while nothing runs the timers.
+        let heartbeats = following(&handle.state(), heartbeats);
+        heartbeat_for(&handle, &heartbeats, WINDOW + Duration::from_secs(2)).await;
+        assert!(!handle.state().promotions_due(clock.now()).is_empty());
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock.clone()),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        heartbeat_for(&handle, &heartbeats, WINDOW - Duration::from_secs(1)).await;
+        assert_eq!(promotions(&handle), 0, "no promotion inside the window");
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(3)).await;
+        assert!(promotions(&handle) > 0, "promotions after the window");
+        timer.stop().await;
+        node.shutdown().await;
+    }
+
+    /// A leader that has just become ready moves no fork and releases no kept replica set for a
+    /// settle window, and does once it has passed (ADR-0040 point 6).
+    #[tokio::test(start_paused = true)]
+    async fn a_new_leader_waits_a_lease_duration_before_fork_actions_and_releases() {
+        // The fork is seeded on every replica: the driver would complete it.
+        let dir = tempfile::tempdir().expect("a directory");
+        let clock = SteppedClock::new(fixture()[0].at);
+        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 27).await;
+        let handle = node.handle();
+        let seeding = |handle: &ControlHandle| {
+            handle.state().databases().any(|database| {
+                database.fork().is_some_and(|fork| {
+                    matches!(
+                        fork.state(),
+                        fleetring_control::fork::ForkState::Seeding { .. }
+                    )
+                })
+            })
+        };
+        assert!(seeding(&handle));
+        assert!(!fork::actions(&handle.state(), clock.now()).is_empty());
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock.clone()),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        heartbeat_for(&handle, &heartbeats, WINDOW - Duration::from_secs(1)).await;
+        assert!(seeding(&handle), "no fork action inside the window");
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(3)).await;
+        assert!(!seeding(&handle), "the fork moved on after the window");
+        timer.stop().await;
+        node.shutdown().await;
+
+        // A kept replica set whose primary reports the new placement's quorum holds its log.
+        let dir = tempfile::tempdir().expect("a directory");
+        let clock = SteppedClock::new(fixture()[0].at);
+        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 48).await;
+        let handle = node.handle();
+        assert!(!handle.state().releases_due().is_empty());
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock.clone()),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        heartbeat_for(&handle, &heartbeats, WINDOW - Duration::from_secs(1)).await;
+        assert!(
+            !handle.state().releases_due().is_empty(),
+            "no release inside the window"
+        );
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(3)).await;
+        assert!(
+            handle.state().releases_due().is_empty(),
+            "the kept set was released after the window"
+        );
+        timer.stop().await;
+        node.shutdown().await;
+    }
+
+    /// The settle window is measured on the monotonic clock: a wall clock that steps an hour
+    /// forward as the leader becomes ready makes every lease look expired at once, and still no
+    /// promotion starts before the window has passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_wall_clock_step_does_not_shorten_the_settle_window() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let clock = SteppedClock::new(fixture()[0].at);
+        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 27).await;
+        let handle = node.handle();
+        let heartbeats = following(&handle.state(), heartbeats);
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock.clone()),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        clock.step(Duration::from_secs(3_600));
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(1)).await;
+        assert!(!handle.state().promotions_due(clock.now()).is_empty());
+        heartbeat_for(&handle, &heartbeats, WINDOW - Duration::from_secs(2)).await;
+        assert_eq!(promotions(&handle), 0, "no promotion inside the window");
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(3)).await;
+        assert!(promotions(&handle) > 0, "promotions after the window");
+        timer.stop().await;
+        node.shutdown().await;
+    }
+
+    /// The timers run only on a ready leader: a node that leads nothing, as one waiting to join
+    /// a group, ticks nothing however long it waits, and once it becomes ready they run. (A
+    /// one-voter group can't lose leadership to a peer; how each answer pauses or ends them is
+    /// `only_stopped_and_storage_end_the_timers`.)
+    #[tokio::test(start_paused = true)]
+    async fn the_timers_pause_on_not_leader_and_resume_at_readiness() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let options = ControlOptions::new(ControlConfig::new())
+            .with_storage_io(StorageIo::Inline)
+            .with_bootstrap(crate::control::Bootstrap::Join);
+        let clock = SimClock::new(BASE);
+        let joining =
+            crate::control::test_support::open_node(dir.path().join("joining.db"), options, clock)
+                .await
+                .expect("opens");
+        let handle = joining.handle();
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(handle.applied().get(), 0, "no tick while not leading");
+        let peer = crate::control::test_support::own();
+        let id = crate::control::raft::raft_id(&peer.node_id);
+        let membership = crate::control::raft::Membership::new(
+            vec![std::collections::BTreeSet::from([id])],
+            std::collections::BTreeMap::from([(id, peer)]),
+        )
+        .expect("a membership");
+        handle
+            .raft()
+            .initialize(membership)
+            .await
+            .expect("initialized");
+        handle.raft().trigger().elect(false).await.expect("elects");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(handle.state().now() > BASE, "the timers tick once it leads");
+        timer.stop().await;
+        joining.shutdown().await;
+    }
+
+    /// A timer command refused for leadership while the node stays ready under the same leader
+    /// pauses the timers for a tick only: they resume, and keep the settle window, so promotions
+    /// start when the window that began at readiness ends, not a window later.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_timer_command_pauses_the_timers_for_a_tick_and_keeps_the_window() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let clock = SteppedClock::new(fixture()[0].at);
+        let (node, heartbeats) = fixture_node(dir.path(), clock.clone(), 27).await;
+        let handle = node.handle();
+        let heartbeats = following(&handle.state(), heartbeats);
+        heartbeat_for(&handle, &heartbeats, WINDOW + Duration::from_secs(2)).await;
+        let before = handle.leadership();
+        let timer = Failover::start(
+            handle.clone(),
+            Arc::new(clock.clone()),
+            Network::tcp(crate::transport::TransportConfig::default()),
+            FailoverSettings::new(),
+        );
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(6)).await;
+        handle
+            .faults()
+            .refuse
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let ticked = handle.state().now();
+        heartbeat_for(&handle, &heartbeats, Duration::from_secs(2)).await;
+        assert_eq!(
+            handle
+                .faults()
+                .refuse
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a timer command was refused"
+        );
+        assert_eq!(handle.leadership(), before, "the same leader throughout");
+        assert!(handle.state().now() > ticked);
+        assert_eq!(promotions(&handle), 0, "no promotion inside the window");
+        heartbeat_for(
+            &handle,
+            &heartbeats,
+            WINDOW - Duration::from_secs(8) + Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            promotions(&handle) > 0,
+            "promotions once the window that began at readiness ended"
+        );
+        timer.stop().await;
+        node.shutdown().await;
+    }
+
+    /// Only a stopped node or a storage failure ends the timers; a lost leadership pauses them,
+    /// and a refused command is skipped (ADR-0040 point 6).
+    #[test]
+    fn only_stopped_and_storage_end_the_timers() {
+        assert_eq!(Sweep::after(&SubmitError::Stopped), Sweep::Stop);
+        assert_eq!(
+            Sweep::after(&SubmitError::Storage(crate::control::LogError::Exhausted)),
+            Sweep::Stop
+        );
+        for paused in [
+            SubmitError::NotLeader { leader: None },
+            SubmitError::CatchingUp { leader: None },
+            SubmitError::Superseded,
+        ] {
+            assert_eq!(Sweep::after(&paused), Sweep::Pause, "{paused:?}");
+        }
+        let refused = SubmitError::Refused(Rejection::UnknownMember {
+            id: "x".parse().expect("an id"),
+        });
+        assert_eq!(Sweep::after(&refused), Sweep::Continue);
     }
 }

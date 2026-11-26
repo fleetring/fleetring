@@ -123,6 +123,7 @@ const _: () = {
     assert_debug_send_sync::<clock::SystemClock>();
     assert_debug_send_sync::<control::Committed>();
     assert_debug_send_sync::<control::ControlClient>();
+    assert_debug_send_sync::<control::ControlGroup>();
     assert_debug_send_sync::<control::ControlHandle>();
     assert_debug_send_sync::<control::ControlNode>();
     assert_debug_send_sync::<control::ControlOptions>();
@@ -134,6 +135,7 @@ const _: () = {
     assert_debug_send_sync::<control::raft::ControlRng>();
     assert_debug_send_sync::<control::raft::ControlRuntime>();
     assert_debug_send_sync::<control::raft::ControlTypes>();
+    assert_debug_send_sync::<control::raft::GroupGate>();
     assert_debug_send_sync::<control::raft::LeaderRef>();
     assert_debug_send_sync::<control::raft::ParseRaftIdError>();
     assert_debug_send_sync::<control::raft::RaftIdError>();
@@ -149,6 +151,9 @@ const _: () = {
     assert_debug_send_sync::<control::LogError>();
     assert_debug_send_sync::<control::NoControl>();
     assert_debug_send_sync::<control::OpenError>();
+    assert_debug_send_sync::<control::Readiness>();
+    assert_debug_send_sync::<control::Bootstrap>();
+    assert_debug_send_sync::<control::RecoverySummary>();
     assert_debug_send_sync::<control::SeedProgress>();
     assert_debug_send_sync::<control::SubmitError>();
     assert_debug_send_sync::<ControlSettings>();
@@ -268,6 +273,5 @@ const _: () = {
 
     // The log owns a SQLite connection, which moves between threads but isn't shared.
     const fn assert_debug_send<T: std::fmt::Debug + Send>() {}
-    assert_debug_send::<control::CommandLog>();
     assert_debug_send::<control::ControlStore>();
 };

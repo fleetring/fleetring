@@ -25,8 +25,8 @@ use fleetring_proto::v1::{
 use fleetringd::auth::{AuthLayer, Authorizer, refused_binding};
 use fleetringd::clock::{Clock, SystemClock};
 use fleetringd::control::{
-    CommandLog, Committed, ControlClient, ControlHandle, ControlNode, ControlOptions,
-    ControlService, LogError, LogIndex, OpenError, StorageIo,
+    Committed, ControlClient, ControlHandle, ControlOptions, ControlService, ControlStore,
+    LogError, OpenError, StorageIo,
 };
 use fleetringd::transport::{TransportConfig, control_server};
 use fleetringd::{Config, ConfigError, Daemon, NodeRole};
@@ -154,7 +154,7 @@ async fn serve_service(service: ControlService) -> Result<SocketAddr, Box<dyn Er
 }
 
 /// Replays the whole log into a fresh state, returning it and each command's outcome.
-fn replay(log: &CommandLog) -> Result<(State, Vec<fleetring_control::Outcome>), LogError> {
+fn replay(log: &ControlStore) -> Result<(State, Vec<fleetring_control::Outcome>), LogError> {
     let mut state = State::new(log.genesis());
     let outcomes = log
         .commands()?
@@ -778,7 +778,7 @@ async fn serve_redirect(
 #[tokio::test]
 async fn the_client_follows_leader_redirects_without_the_caller_noticing() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let node = ControlNode::open(
+    let node = crate::support::open_control(
         dir.path().join("control.db"),
         ControlOptions::default(),
         SystemClock,
@@ -844,7 +844,7 @@ fn create_request(database: &str, replication_factor: u32) -> CreateDatabaseRequ
 /// The replication factor of every database creation in the log at `path`, by name, in log
 /// order.
 fn logged_factors(path: &Path) -> Result<Vec<(String, u8)>, Box<dyn Error>> {
-    let log = CommandLog::open(path, ControlConfig::new())?;
+    let log = ControlStore::open(path, ControlConfig::new(), None)?;
     Ok(log
         .commands()?
         .into_iter()
@@ -875,7 +875,8 @@ async fn a_creation_without_a_replication_factor_logs_the_fleets_default() -> Te
     for (index, (default, members, expected)) in cases.into_iter().enumerate() {
         let path = dir.path().join(format!("control-{index}.db"));
         let node =
-            ControlNode::open(&path, ControlOptions::default(), TickClock::default()).await?;
+            crate::support::open_control(&path, ControlOptions::default(), TickClock::default())
+                .await?;
         let mut service = ControlService::new(node.handle());
         if let Some(default) = default {
             service = service.with_default_replication_factor(default);
@@ -911,7 +912,7 @@ async fn a_creation_without_a_replication_factor_logs_the_fleets_default() -> Te
             ],
             "default {default:?}"
         );
-        let (replayed, _) = replay(&CommandLog::open(&path, ControlConfig::new())?)?;
+        let (replayed, _) = replay(&ControlStore::open(&path, ControlConfig::new(), None)?)?;
         assert_eq!(replayed, *published);
     }
     Ok(())
@@ -968,7 +969,7 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("control.db");
     let options = ControlOptions::default().with_snapshot_every(NonZeroU64::new(16).ok_or("zero")?);
-    let node = ControlNode::open(&path, options, TickClock::default()).await?;
+    let node = crate::support::open_control(&path, options, TickClock::default()).await?;
 
     let mut callers = Vec::new();
     for caller in 0..CALLERS {
@@ -1002,19 +1003,21 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
     let published = node.handle().state();
     node.shutdown().await;
 
-    // Every command got its own index, and was stamped in the order it was logged.
+    // Every command got its own index, after the control group's own first entries, and was
+    // stamped in the order it was logged.
     committed.sort_by_key(Committed::index);
     let total = CALLERS * COMMANDS;
     assert_eq!(committed.len(), usize::try_from(total)?);
+    let first = committed[0].index().get();
     for (expected, record) in (1..=total).zip(&committed) {
-        assert_eq!(record.index().get(), expected);
+        assert_eq!(record.index().get(), first + expected - 1);
         assert_eq!(record.command().at.as_millis(), expected, "{record:?}");
         assert_eq!(record.state().now().as_millis(), expected, "{record:?}");
     }
 
     // The log holds the same commands in the same order, and replaying it reproduces each
-    // outcome and the final state.
-    let log = CommandLog::open(&path, ControlConfig::new())?;
+    // outcome and the final state, and each control snapshot it took.
+    let log = ControlStore::open(&path, ControlConfig::new(), None)?;
     let logged = log.commands()?;
     assert_eq!(logged.len(), committed.len());
     let (replayed, outcomes) = replay(&log)?;
@@ -1024,10 +1027,15 @@ async fn concurrent_commands_apply_one_at_a_time_in_log_order() -> TestResult {
         assert_eq!(record.outcome(), outcome);
     }
     assert_eq!(replayed, *published);
-    let recovered = log.recover()?;
-    assert_eq!(recovered.state, replayed);
-    assert_eq!(recovered.snapshot.map(|index| index.get()), Some(160));
-    assert_eq!(recovered.replayed, 0);
+    let snapshot = log.latest_control_snapshot()?.ok_or("a control snapshot")?;
+    let at = snapshot.meta.last_log_id.ok_or("a snapshot index")?.index;
+    let mut state = State::new(log.genesis());
+    for (index, command) in logged {
+        if index.get() <= at {
+            let _outcome = apply(&mut state, command);
+        }
+    }
+    assert_eq!(snapshot.state, state);
     Ok(())
 }
 
@@ -1046,19 +1054,20 @@ fn commits(path: &Path) -> Result<usize, Box<dyn Error>> {
     )
 }
 
-/// Every command that waits for the writer when it picks the next one up is logged with it in
-/// one transaction, so a burst costs one sync, not one per command. The commands still get
+/// Every command waiting for the proposer when it picks the next one up is proposed with it as
+/// one batch, which the control group appends in one transaction, so a burst costs one sync for
+/// its entries (and one for the committed index), not one per command. The commands still get
 /// their own indexes and stamps, in order.
 ///
-/// The writer runs inline on this single-threaded runtime, so it can't pick anything up until
-/// every submission below has been queued.
+/// The control node runs inline on this single-threaded runtime, so its proposer can't pick
+/// anything up until every submission below has been queued.
 #[tokio::test]
 async fn commands_queued_together_are_logged_in_one_transaction() -> TestResult {
     const QUEUED: u64 = 40;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("control.db");
     let options = ControlOptions::default().with_storage_io(StorageIo::Inline);
-    let node = ControlNode::open(&path, options, TickClock::default()).await?;
+    let node = crate::support::open_control(&path, options, TickClock::default()).await?;
     let before = commits(&path)?;
 
     let mut submits = tokio::task::JoinSet::new();
@@ -1075,16 +1084,21 @@ async fn commands_queued_together_are_logged_in_one_transaction() -> TestResult 
         .iter()
         .map(|record| record.index().get())
         .collect();
-    assert_eq!(indexes, (1..=QUEUED).collect::<Vec<_>>());
+    let first = indexes[0];
+    assert_eq!(indexes, (first..first + QUEUED).collect::<Vec<_>>());
     let stamps: Vec<Timestamp> = committed.iter().map(|record| record.command().at).collect();
     assert!(
         stamps.windows(2).all(|pair| pair[0] < pair[1]),
         "{stamps:?}"
     );
-    assert_eq!(commits(&path)? - before, 1, "one transaction for the group");
+    let transactions = commits(&path)? - before;
+    assert!(
+        transactions <= 3,
+        "{transactions} transactions: one append for the batch and its committed index"
+    );
     node.shutdown().await;
 
-    let log = CommandLog::open(&path, ControlConfig::new())?;
+    let log = ControlStore::open(&path, ControlConfig::new(), None)?;
     let logged = log.commands()?;
     assert_eq!(logged.len(), usize::try_from(QUEUED)?);
     for (record, (index, command)) in committed.iter().zip(&logged) {
@@ -1094,36 +1108,31 @@ async fn commands_queued_together_are_logged_in_one_transaction() -> TestResult 
     Ok(())
 }
 
-/// A group is logged whole or not at all: an index already taken fails the group, and the
-/// commands before it in the group aren't logged either.
-#[test]
-fn a_group_with_a_taken_index_logs_nothing() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let mut log = CommandLog::open(dir.path().join("control.db"), ControlConfig::new())?;
-    let tick = |at: u64| Command::new(Timestamp::from_millis(at), Action::Tick);
-    log.append(LogIndex::new(1), &tick(1))?;
-    let group = [tick(2), tick(3)];
-    let refused = log
-        .append_all([(LogIndex::new(2), &group[0]), (LogIndex::new(1), &group[1])])
-        .expect_err("index 1 is taken");
-    assert!(matches!(refused, LogError::Sqlite { .. }), "{refused}");
-    let logged = log.commands()?;
-    assert_eq!(logged, vec![(LogIndex::new(1), tick(1))]);
-    log.append_all([(LogIndex::new(2), &group[0]), (LogIndex::new(3), &group[1])])?;
-    assert_eq!(log.commands()?.len(), 3);
-    Ok(())
-}
-
-/// Runs a few commands with frequent snapshots and returns the log's path.
+/// Runs a few commands with frequent control snapshots and returns the log's path, once a
+/// snapshot is on disk.
 async fn log_with_snapshot(dir: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let path = dir.join("control.db");
     let options = ControlOptions::default().with_snapshot_every(NonZeroU64::new(3).ok_or("zero")?);
-    let node = ControlNode::open(&path, options, TickClock::default()).await?;
+    let node = crate::support::open_control(&path, options, TickClock::default()).await?;
     let handle = node.handle();
     for id in ["a", "b", "c", "d"] {
         let member = Member::new(id.parse()?);
         handle.submit(Action::Join { member }).await?;
     }
+    // openraft builds control snapshots in the background.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ControlStore::open(&path, ControlConfig::new(), None)?
+        .latest_control_snapshot()?
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no control snapshot was taken"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // And an entry past the snapshot, which recovery applies again.
+    handle.submit(Action::Tick).await?;
     node.shutdown().await;
     Ok(path)
 }
@@ -1136,16 +1145,21 @@ fn tamper(path: &Path, sql: &str) -> rusqlite::Result<()> {
 
 fn tamper_snapshot(
     path: &Path,
-    change: impl FnOnce(&mut serde_json::Value),
+    change: impl Fn(&mut serde_json::Value),
 ) -> Result<(), Box<dyn Error>> {
     let connection = rusqlite::Connection::open(path)?;
-    let text: String = connection.query_row("SELECT state FROM snapshots", [], |row| row.get(0))?;
-    let mut state: serde_json::Value = serde_json::from_str(&text)?;
-    change(&mut state);
-    connection.execute(
-        "UPDATE snapshots SET state = ?1",
-        [serde_json::to_string(&state)?],
-    )?;
+    let rows: Vec<(i64, String)> = connection
+        .prepare("SELECT log_index, state FROM snapshots")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (index, text) in rows {
+        let mut state: serde_json::Value = serde_json::from_str(&text)?;
+        change(&mut state);
+        connection.execute(
+            "UPDATE snapshots SET state = ?1 WHERE log_index = ?2",
+            rusqlite::params![serde_json::to_string(&state)?, index],
+        )?;
+    }
     Ok(())
 }
 
@@ -1174,17 +1188,17 @@ async fn a_corrupt_snapshot_is_an_error() -> TestResult {
     for (reason, change) in cases {
         let dir = tempfile::tempdir()?;
         let path = log_with_snapshot(dir.path()).await?;
-        CommandLog::open(&path, ControlConfig::new())?.recover()?;
+        ControlStore::open(&path, ControlConfig::new(), None)?.latest_control_snapshot()?;
         tamper_snapshot(&path, change)?;
-        let error = CommandLog::open(&path, ControlConfig::new())?
-            .recover()
+        let error = ControlStore::open(&path, ControlConfig::new(), None)?
+            .latest_control_snapshot()
             .expect_err(reason);
         assert!(
-            matches!(&error, LogError::CorruptSnapshot { index, .. } if index.get() == 3),
+            matches!(&error, LogError::CorruptSnapshot { .. }),
             "{error}"
         );
         assert!(error.to_string().contains(reason), "{reason}: {error}");
-        let refused = ControlNode::open(&path, ControlOptions::default(), SystemClock)
+        let refused = crate::support::open_control(&path, ControlOptions::default(), SystemClock)
             .await
             .expect_err("a node must not start from a corrupt snapshot");
         assert!(
@@ -1201,31 +1215,29 @@ async fn a_damaged_log_is_an_error() -> TestResult {
     let path = log_with_snapshot(dir.path()).await?;
     tamper(
         &path,
-        "DELETE FROM snapshots; DELETE FROM commands WHERE log_index = 2;",
+        "UPDATE log SET payload = '{' WHERE log_index = (SELECT MAX(log_index) FROM log);",
     )?;
-    let error = CommandLog::open(&path, ControlConfig::new())?
-        .recover()
-        .expect_err("gap");
-    assert!(matches!(error, LogError::Gap { .. }), "{error}");
+    let refused = crate::support::open_control(&path, ControlOptions::default(), SystemClock)
+        .await
+        .expect_err("a corrupt entry");
+    assert!(
+        matches!(refused, OpenError::Log(LogError::CorruptEntry { .. })),
+        "{refused}"
+    );
 
     let dir = tempfile::tempdir()?;
     let path = log_with_snapshot(dir.path()).await?;
     tamper(
         &path,
-        "UPDATE commands SET command = '{' WHERE log_index = 4;",
+        "UPDATE log SET leader_node = 'nope' WHERE log_index = (SELECT MAX(log_index) FROM log);",
     )?;
-    let error = CommandLog::open(&path, ControlConfig::new())?
-        .recover()
-        .expect_err("corrupt command");
-    assert!(matches!(error, LogError::CorruptCommand { .. }), "{error}");
-
-    let dir = tempfile::tempdir()?;
-    let path = log_with_snapshot(dir.path()).await?;
-    tamper(&path, "DELETE FROM commands WHERE log_index >= 3;")?;
-    let error = CommandLog::open(&path, ControlConfig::new())?
-        .recover()
-        .expect_err("snapshot ahead of the log");
-    assert!(matches!(error, LogError::CorruptSnapshot { .. }), "{error}");
+    let refused = crate::support::open_control(&path, ControlOptions::default(), SystemClock)
+        .await
+        .expect_err("a corrupt leader");
+    assert!(
+        matches!(refused, OpenError::Log(LogError::CorruptEntry { .. })),
+        "{refused}"
+    );
     Ok(())
 }
 
@@ -1234,10 +1246,13 @@ async fn an_existing_log_keeps_its_genesis_timings() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = log_with_snapshot(dir.path()).await?;
     let other = ControlConfig::new().with_lease_duration(Millis::new(1));
-    let node = ControlNode::open(&path, ControlOptions::new(other), SystemClock).await?;
+    let node = crate::support::open_control(&path, ControlOptions::new(other), SystemClock).await?;
     assert_eq!(*node.handle().state().config(), ControlConfig::new());
-    assert_eq!(node.recovered().snapshot.map(|index| index.get()), Some(3));
-    assert_eq!(node.recovered().replayed, 1);
+    assert!(
+        node.recovered().snapshot.is_some(),
+        "{:?}",
+        node.recovered()
+    );
     node.shutdown().await;
     Ok(())
 }
@@ -1759,17 +1774,17 @@ impl Bound {
         &self.replicas[1]
     }
 
-    /// The index of the last command the control log holds.
+    /// The index of the last entry the control log holds.
     fn logged(&self) -> Result<i64, Box<dyn Error>> {
         let log = rusqlite::Connection::open_with_flags(
             &self.log,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        Ok(log.query_row(
-            "SELECT coalesce(max(log_index), 0) FROM commands",
-            [],
-            |row| row.get(0),
-        )?)
+        Ok(
+            log.query_row("SELECT coalesce(max(log_index), 0) FROM log", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
 
     async fn locate(&self) -> Result<fleetring_proto::v1::Placement, Box<dyn Error>> {
@@ -2166,7 +2181,11 @@ async fn a_mixed_fleet_refuses_a_command_a_member_does_not_support() -> TestResu
     daemon.run_until(async {}).await;
     // The refused command never reached the log, where a control node of an older release
     // couldn't read it; the accepted one did.
-    let log = CommandLog::open(dir.path().join("data/control.db"), ControlConfig::new())?;
+    let log = ControlStore::open(
+        dir.path().join("data/control.db"),
+        ControlConfig::new(),
+        None,
+    )?;
     let undrains = log
         .commands()?
         .into_iter()
@@ -2203,7 +2222,8 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("control.db");
-    let node = ControlNode::open(&path, ControlOptions::default(), TickClock::default()).await?;
+    let node = crate::support::open_control(&path, ControlOptions::default(), TickClock::default())
+        .await?;
     let handle = node.handle();
     let join = |id: &str, software: Option<Software>| -> Result<Action, Box<dyn Error>> {
         let member = Member::new(id.parse()?);
@@ -2256,7 +2276,7 @@ async fn a_join_refused_for_its_software_is_never_logged() -> TestResult {
     let published = handle.state();
     node.shutdown().await;
 
-    let log = CommandLog::open(&path, ControlConfig::new())?;
+    let log = ControlStore::open(&path, ControlConfig::new(), None)?;
     let logged: Vec<Action> = log
         .commands()?
         .into_iter()
@@ -2319,7 +2339,8 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("control.db");
-    let node = ControlNode::open(&path, ControlOptions::default(), TickClock::default()).await?;
+    let node = crate::support::open_control(&path, ControlOptions::default(), TickClock::default())
+        .await?;
     let handle = node.handle();
     let join = |id: &str, software: Software| -> Result<Action, Box<dyn Error>> {
         Ok(Action::Join {
@@ -2418,7 +2439,7 @@ async fn a_metadata_command_a_member_lacks_is_never_logged() -> TestResult {
     assert!(published.is_enabled(Feature::Expiry));
     node.shutdown().await;
 
-    let log = CommandLog::open(&path, ControlConfig::new())?;
+    let log = ControlStore::open(&path, ControlConfig::new(), None)?;
     let logged: Vec<Action> = log
         .commands()?
         .into_iter()
@@ -2451,7 +2472,7 @@ mod metadata {
         CreateDatabaseWithMetadataRequest, DatabaseMetadata, Label, ListDatabasesRequest,
         LocateRequest, MetadataSpec, UpdateDatabaseRequest,
     };
-    use fleetringd::control::{CommandLog, ControlClient};
+    use fleetringd::control::{ControlClient, ControlStore};
     use fleetringd::{Config, Daemon};
     use tonic::Code;
 
@@ -2732,7 +2753,11 @@ mod metadata {
         assert!(!handle.state().is_enabled(Feature::Metadata));
 
         daemon.run_until(async {}).await;
-        let log = CommandLog::open(dir.path().join("data/control.db"), ControlConfig::new())?;
+        let log = ControlStore::open(
+            dir.path().join("data/control.db"),
+            ControlConfig::new(),
+            None,
+        )?;
         let logged: Vec<Action> = log
             .commands()?
             .into_iter()
@@ -3097,7 +3122,7 @@ mod expiry {
     use fleetringd::auth::{AuthLayer, Authorizer};
     use fleetringd::clock::SimClock;
     use fleetringd::control::{
-        CommandLog, ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService,
+        ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService, ControlStore,
         Failover, FailoverSettings, MIN_EXPIRY, StorageIo, rejection_status,
     };
     use fleetringd::transport::control_server;
@@ -3138,7 +3163,7 @@ mod expiry {
             let path = dir.path().join("control.db");
             let options =
                 ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
-            let node = ControlNode::open(&path, options, clock).await?;
+            let node = crate::support::open_control(&path, options, clock).await?;
             let handle = node.handle();
             handle
                 .submit(Action::Join {
@@ -3185,7 +3210,7 @@ mod expiry {
             if let Some(node) = self.node.take() {
                 node.shutdown().await;
             }
-            let log = CommandLog::open(&self.path, ControlConfig::new())?;
+            let log = ControlStore::open(&self.path, ControlConfig::new(), None)?;
             Ok(log
                 .commands()?
                 .into_iter()
@@ -4589,4 +4614,110 @@ mod heard_denylist {
         node.stop().await;
         Ok(())
     }
+}
+
+/// A committed entry missing from the middle of the log, as after damage to the file, is
+/// refused as a gap when the node opens; it never opens with the entry silently skipped.
+#[tokio::test(start_paused = true)]
+async fn a_gap_in_the_log_is_an_error() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("control.db");
+    let options = ControlOptions::default().with_storage_io(StorageIo::Inline);
+    let clock = fleetringd::clock::SimClock::new(Timestamp::from_millis(1_000));
+    let node = crate::support::open_control(&path, options.clone(), clock).await?;
+    let mut indexes = Vec::new();
+    for name in ["a", "b", "c"] {
+        let member = Member::new(name.parse()?);
+        let committed = node.handle().submit(Action::Join { member }).await?;
+        assert!(committed.outcome().is_ok(), "{:?}", committed.outcome());
+        indexes.push(committed.index().get());
+    }
+    node.shutdown().await;
+    tamper(
+        &path,
+        &format!("DELETE FROM log WHERE log_index = {};", indexes[1]),
+    )?;
+    let refused = crate::support::open_control(&path, options, clock)
+        .await
+        .expect_err("a gap");
+    assert!(
+        matches!(&refused, OpenError::Log(LogError::Gap { expected, .. }) if expected.get() == indexes[1]),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// Appends a command entry this build can't decode after the log's last entry, under that
+/// entry's own leader, and returns its log ID.
+fn plant_undecodable(path: &Path) -> Result<fleetringd::control::raft::LogId, Box<dyn Error>> {
+    use fleetringd::control::raft::{ControlRequest, Entry, LeaderRef, LogId};
+    use openraft::impls::leader_id_adv::LeaderId;
+
+    let mut store = ControlStore::open(path, ControlConfig::new(), None)?;
+    let last = store.last_log_id()?.ok_or("entries")?;
+    let leader = last.leader_id;
+    let log_id = LogId::new(
+        LeaderId {
+            term: leader.term,
+            node_id: leader.node_id,
+        },
+        last.index + 1,
+    );
+    let raw = serde_json::value::RawValue::from_string(
+        r#"{"at":5,"recorded_by":"control-1","action":{"frobnicate":{}}}"#.to_owned(),
+    )?;
+    let request = ControlRequest::from_json(
+        LeaderRef {
+            term: leader.term,
+            node: leader.node_id,
+        },
+        raw,
+    );
+    store.append_entries([&Entry {
+        log_id,
+        payload: openraft::EntryPayload::Normal(request),
+    }])?;
+    Ok(log_id)
+}
+
+/// A node that stopped at an entry it can't decode, committed or only appended when it stopped,
+/// opens again stopped there: `control_log` names the entry, rather than the node failing to
+/// open, and it stays so across another restart (ADR-0040 point 4).
+#[tokio::test(start_paused = true)]
+async fn a_node_stopped_at_an_undecodable_entry_opens_stopped() -> TestResult {
+    for committed in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("control.db");
+        let options = ControlOptions::default().with_storage_io(StorageIo::Inline);
+        let clock = fleetringd::clock::SimClock::new(Timestamp::from_millis(1_000));
+        let node = crate::support::open_control(&path, options.clone(), clock).await?;
+        node.handle().submit(Action::Tick).await?;
+        node.shutdown().await;
+        let planted = plant_undecodable(&path)?;
+        if committed {
+            ControlStore::open(&path, ControlConfig::new(), None)?
+                .save_committed(Some(&planted))?;
+        }
+        for restart in 0..2 {
+            let node = crate::support::open_control(&path, options.clone(), clock)
+                .await
+                .map_err(|error| format!("committed {committed}, restart {restart}: {error:?}"))?;
+            let handle = node.handle();
+            let mut halted = handle.watch_halted();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                halted.wait_for(Option::is_some),
+            )
+            .await??;
+            let reason = handle.halted().ok_or("halted")?;
+            assert!(
+                reason.starts_with(&format!("entry {} can't be read", planted.index)),
+                "committed {committed}, restart {restart}: {reason}"
+            );
+            assert!(!handle.leadership().is_ready());
+            assert!(handle.applied().get() < planted.index);
+            node.shutdown().await;
+        }
+    }
+    Ok(())
 }

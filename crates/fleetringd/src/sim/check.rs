@@ -36,7 +36,8 @@ use fleetring_control::{
 
 use crate::MembershipView;
 use crate::changes::{ChangeRecord, RecordContent, unhex};
-use crate::control::CommandLog;
+use crate::control::raft::state_machine::{Decision, decide};
+use crate::control::{ControlSnapshot, ControlStore};
 use crate::engine::{Position, Value};
 use crate::replication::ChainHash;
 use crate::sim::history::excerpt;
@@ -355,27 +356,48 @@ pub fn copies_kept_until_dropped(
 pub struct ControlLog {
     state: State,
     genesis: State,
+    replayed_from: State,
+    entries: Vec<(u64, Command)>,
     commands: Vec<Command>,
     holders: LeaseHolders,
 }
 
 impl ControlLog {
-    /// Returns the state recovery builds.
+    /// Returns the state recovery builds: the state after every committed entry.
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
     }
 
-    /// Returns the state the log starts from.
+    /// Returns the state the log's genesis configuration starts from.
     #[must_use]
     pub fn genesis(&self) -> &State {
         &self.genesis
     }
 
-    /// Returns every logged command, in log order.
+    /// Returns the state the replay started from: the oldest retained control snapshot at or past
+    /// the purged index, or the genesis state while nothing is purged. [`ControlLog::commands`]
+    /// follow it.
+    #[must_use]
+    pub fn replayed_from(&self) -> &State {
+        &self.replayed_from
+    }
+
+    /// Returns every command the replay applied, in log order: superseded entries are left out.
     #[must_use]
     pub fn commands(&self) -> &[Command] {
         &self.commands
+    }
+
+    /// Returns the state after the entries up to and including `index`, replayed from
+    /// [`ControlLog::replayed_from`].
+    #[must_use]
+    pub fn state_at(&self, index: u64) -> State {
+        let mut state = self.replayed_from.clone();
+        for (_, command) in self.entries.iter().take_while(|(at, _)| *at <= index) {
+            let _outcome = apply(&mut state, command.clone());
+        }
+        state
     }
 
     /// Returns the holder of each database's lease at each epoch the log ever granted one at.
@@ -391,47 +413,108 @@ impl ControlLog {
     }
 }
 
-/// Opens the control log at `path` and checks that recovery (snapshot plus tail) equals a replay
-/// of every logged command from genesis.
+/// Opens the control log at `path`, a format-2 store, and replays it (ADR-0040 point 7): from the
+/// oldest retained control snapshot at or past the purged index, or from genesis while nothing
+/// has been purged, through the last committed entry. Each newer snapshot must be reproduced at its index. Superseded command
+/// entries are skipped by the state machine's own rules, the leader they were screened under
+/// and then `recorded_by`, and a command this build can't decode is a violation.
 ///
-/// Call it only while no control node has the log open.
+/// Call it only while no control node has the log open. [`ControlLog::state_at`] gives the state
+/// at a published index, to compare with what a control node published.
 ///
 /// # Errors
 ///
-/// [`Invariant::ControlLogReplays`] if the log can't be read or the two states differ.
+/// [`Invariant::ControlLogReplays`] if the log can't be read, has nothing to replay from, or the
+/// replay misses a snapshot.
 pub fn control_log_replays(path: &Path) -> Result<ControlLog, Violation> {
     let violation = |detail: String| Violation::new(Invariant::ControlLogReplays, detail);
     if !path.exists() {
         return Err(violation(format!("no control log at {}", path.display())));
     }
-    let log = CommandLog::open(path, ControlConfig::new())
+    let store = ControlStore::open(path, ControlConfig::new(), None)
         .map_err(|error| violation(format!("can't open the log: {error}")))?;
-    let recovered = log
-        .recover()
-        .map_err(|error| violation(format!("can't recover the log: {error}")))?;
-    let commands: Vec<Command> = log
-        .commands()
-        .map_err(|error| violation(format!("can't read the log: {error}")))?
-        .into_iter()
-        .map(|(_, command)| command)
+    let read = |error: crate::control::LogError| violation(format!("can't read the log: {error}"));
+    let genesis = State::new(store.genesis());
+    let snapshots = store.control_snapshots().map_err(read)?;
+    let purged = store.purged().map_err(read)?;
+    let committed = store.committed().map_err(read)?;
+    let snapshot_index =
+        |snapshot: &ControlSnapshot| snapshot.meta.last_log_id.map_or(0, |log_id| log_id.index);
+    // From genesis while nothing is purged, so every check that needs the whole log runs.
+    let (replayed_from, from_index) = match purged {
+        None => (genesis.clone(), None),
+        Some(purged) => {
+            // The oldest snapshot the log still follows: an older one, kept while the log was purged
+            // past it, has no entries left to replay from.
+            let oldest = snapshots
+                .iter()
+                .find(|snapshot| snapshot_index(snapshot) >= purged.index)
+                .ok_or_else(|| {
+                    violation(format!(
+                        "the log is purged through {} and no snapshot covers it",
+                        purged.index
+                    ))
+                })?;
+            (oldest.state.clone(), Some(snapshot_index(oldest)))
+        }
+    };
+    let mut pending: Vec<&ControlSnapshot> = snapshots
+        .iter()
+        .filter(|snapshot| from_index.is_none_or(|from| snapshot_index(snapshot) > from))
         .collect();
-    let genesis = State::new(log.genesis());
-    let mut replayed = genesis.clone();
+    pending.reverse();
+    let mut state = replayed_from.clone();
     let mut holders = LeaseHolders::new();
-    for command in &commands {
-        // A rejected command changes nothing, in recovery as in the replay.
-        let _outcome = apply(&mut replayed, command.clone());
-        record_holders(&replayed, &mut holders);
+    record_holders(&state, &mut holders);
+    let mut entries = Vec::new();
+    let mut commands = Vec::new();
+    let last = committed.map(|log_id| log_id.index);
+    let start = from_index.map_or(0, |from| from.saturating_add(1));
+    let logged = match last {
+        Some(last) if last >= start => store.entries(start..=last).map_err(read)?,
+        Some(_) | None => Vec::new(),
+    };
+    for entry in logged {
+        let index = entry.log_id.index;
+        if let openraft::EntryPayload::Normal(request) = &entry.payload {
+            match decide(&entry.log_id, request) {
+                Decision::Apply(command) => {
+                    // A rejected command changes nothing, in the state machine as in the replay.
+                    let _outcome = apply(&mut state, Command::clone(&command));
+                    record_holders(&state, &mut holders);
+                    entries.push((index, Command::clone(&command)));
+                    commands.push(*command);
+                }
+                Decision::Superseded => {}
+                Decision::Undecodable(error) => {
+                    return Err(violation(format!(
+                        "entry {index} can't be decoded: {error}"
+                    )));
+                }
+            }
+        }
+        while let Some(snapshot) = pending.last()
+            && snapshot_index(snapshot) <= index
+        {
+            if snapshot_index(snapshot) == index && snapshot.state != state {
+                return Err(violation(format!(
+                    "the replay differs from the control snapshot at {index}"
+                )));
+            }
+            pending.pop();
+        }
     }
-    if recovered.state != replayed {
+    if let Some(snapshot) = pending.last() {
         return Err(violation(format!(
-            "recovery after {} commands differs from a replay from genesis",
-            recovered.last_index.get()
+            "the control snapshot at {} is past the last committed entry",
+            snapshot_index(snapshot)
         )));
     }
     Ok(ControlLog {
-        state: recovered.state,
+        state,
         genesis,
+        replayed_from,
+        entries,
         commands,
         holders,
     })
@@ -1937,5 +2020,157 @@ mod tests {
         let database: DatabaseName = "chaos/db-0".parse().expect("database name");
         let rows = read_replica_rows(dir.path(), &database).expect("rows");
         assert_eq!(rows, BTreeSet::from([1, 2]));
+    }
+
+    /// A one-voter control node with frequent control snapshots and `log_keep` entries kept,
+    /// run until it has compacted its log, then stopped: the log's path.
+    async fn compacted(dir: &Path, log_keep: u64, rounds: u32, burst: u32) -> std::path::PathBuf {
+        use std::num::{NonZeroU64, NonZeroUsize};
+
+        use crate::clock::SimClock;
+        use crate::control::test_support::open_node;
+        use crate::control::{ControlOptions, StorageIo};
+
+        let path = dir.join("control.db");
+        let options = ControlOptions::default()
+            .with_storage_io(StorageIo::Inline)
+            .with_snapshot_every(NonZeroU64::new(10).expect("nonzero"))
+            .with_log_keep(log_keep)
+            .with_snapshots_retained(NonZeroUsize::new(2).expect("nonzero"));
+        let node = open_node(&path, options, SimClock::new(Timestamp::from_millis(1_000)))
+            .await
+            .expect("opens");
+        for _ in 0..rounds {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let submits: Vec<_> = (0..burst)
+                .map(|_| {
+                    let handle = node.handle();
+                    tokio::spawn(async move { handle.submit(Action::Tick).await })
+                })
+                .collect();
+            for submit in submits {
+                submit.await.expect("joins").expect("commits");
+            }
+        }
+        // openraft builds snapshots and purges in the background.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        node.shutdown().await;
+        let store = ControlStore::open(&path, ControlConfig::new(), None).expect("opens");
+        assert!(
+            store.purged().expect("readable").is_some(),
+            "the log was compacted"
+        );
+        path
+    }
+
+    /// The replay check reads a compacted log from the oldest snapshot the log still follows,
+    /// with the plan's settings (`snapshot_every = 10`, `log_keep = 5`), where an older retained
+    /// snapshot lies behind the purged index.
+    #[tokio::test(start_paused = true)]
+    async fn a_compacted_log_replays() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = compacted(dir.path(), 5, 100, 1).await;
+        let log = control_log_replays(&path).expect("the compacted log replays");
+        assert!(!log.commands().is_empty());
+    }
+
+    /// The same with `log_keep` equal to `snapshot_every`, as the defaults are, and bursts of
+    /// commands, so applies batch and snapshots fall between multiples of `snapshot_every`.
+    #[tokio::test(start_paused = true)]
+    async fn a_compacted_log_replays_after_bursts() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = compacted(dir.path(), 10, 30, 7).await;
+        control_log_replays(&path).expect("the compacted log replays");
+    }
+
+    /// Crashes a one-voter control node, its runtime dropped mid-flight, at many points, with
+    /// frequent snapshots: after each restart every acknowledged join is in the state, and at
+    /// the end the state is the replay of the log from genesis, and the replay check passes.
+    #[test]
+    fn crashes_lose_nothing_acknowledged() {
+        use std::num::NonZeroU64;
+        use std::sync::{Arc, Mutex};
+
+        use crate::clock::SimClock;
+        use crate::control::test_support::open_node;
+        use crate::control::{ControlOptions, StorageIo};
+
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("a runtime")
+        };
+        for log_keep in [u64::MAX, 5] {
+            let dir = tempfile::tempdir().expect("a directory");
+            let path = dir.path().join("control.db");
+            let options = ControlOptions::default()
+                .with_storage_io(StorageIo::Inline)
+                .with_snapshot_every(NonZeroU64::new(10).expect("nonzero"))
+                .with_log_keep(log_keep);
+            let acked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            for round in 0..40_u32 {
+                let acked_here = Arc::clone(&acked);
+                let (path_here, options_here) = (path.clone(), options.clone());
+                let missing = runtime().block_on(async move {
+                    let clock = SimClock::new(Timestamp::from_millis(1_000));
+                    let node = open_node(&path_here, options_here, clock)
+                        .await
+                        .expect("reopens");
+                    let handle = node.handle();
+                    let state = handle.state();
+                    let missing: Vec<String> = acked_here
+                        .lock()
+                        .expect("lock")
+                        .iter()
+                        .filter(|name| state.member(&name.parse().expect("an id")).is_none())
+                        .cloned()
+                        .collect();
+                    for n in 0..7_u32 {
+                        let handle = handle.clone();
+                        let acked = Arc::clone(&acked_here);
+                        let name = format!("m{round}x{n}");
+                        tokio::spawn(async move {
+                            let member = Member::new(name.parse().expect("an id"));
+                            if let Ok(committed) = handle.submit(Action::Join { member }).await
+                                && committed.outcome().is_ok()
+                            {
+                                acked.lock().expect("lock").push(name);
+                            }
+                        });
+                    }
+                    for _ in 0..(round % 23) {
+                        tokio::task::yield_now().await;
+                    }
+                    // The crash: nothing is shut down.
+                    std::mem::forget(node);
+                    missing
+                });
+                assert!(
+                    missing.is_empty(),
+                    "log_keep {log_keep}, round {round}: acknowledged members lost: {missing:?}"
+                );
+            }
+            if log_keep == u64::MAX {
+                let state = runtime().block_on(async {
+                    let clock = SimClock::new(Timestamp::from_millis(1_000));
+                    let node = open_node(&path, options.clone(), clock)
+                        .await
+                        .expect("reopens");
+                    let state = node.handle().state();
+                    node.shutdown().await;
+                    state
+                });
+                let store = ControlStore::open(&path, ControlConfig::new(), None).expect("opens");
+                let mut replayed = State::new(store.genesis());
+                for (_, command) in store.commands().expect("readable") {
+                    let _outcome = apply(&mut replayed, command);
+                }
+                assert_eq!(*state, replayed, "the state is the replay of the log");
+                drop(store);
+                control_log_replays(&path).expect("the replay check passes");
+            }
+        }
     }
 }

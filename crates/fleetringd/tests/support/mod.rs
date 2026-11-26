@@ -75,6 +75,65 @@ pub(crate) fn isolate(command: &mut std::process::Command) -> &mut std::process:
     command
 }
 
+/// The peer every test's in-process control node runs as: a control group of one voter.
+pub(crate) fn control_peer() -> fleetringd::control::raft::ControlPeer {
+    fleetringd::control::raft::ControlPeer::new("control-1", "127.0.0.1:7400")
+}
+
+/// Opens an in-process control node at `path` as [`control_peer`], with `options` and `clock`,
+/// over a TCP network it never dials and the operating system's entropy.
+///
+/// # Errors
+///
+/// As [`ControlNode::open`](fleetringd::control::ControlNode::open).
+pub(crate) async fn open_control(
+    path: impl Into<PathBuf>,
+    options: fleetringd::control::ControlOptions,
+    clock: impl fleetringd::clock::Clock + 'static,
+) -> Result<fleetringd::control::ControlNode, fleetringd::control::OpenError> {
+    open_control_as(path, options, clock, control_peer()).await
+}
+
+/// Opens an in-process control node at `path` as `peer`: the node whose group a daemon of that
+/// node ID then opens again.
+///
+/// # Errors
+///
+/// As [`ControlNode::open`](fleetringd::control::ControlNode::open).
+pub(crate) async fn open_control_as(
+    path: impl Into<PathBuf>,
+    options: fleetringd::control::ControlOptions,
+    clock: impl fleetringd::clock::Clock + 'static,
+    peer: fleetringd::control::raft::ControlPeer,
+) -> Result<fleetringd::control::ControlNode, fleetringd::control::OpenError> {
+    fleetringd::control::ControlNode::open(
+        path,
+        options,
+        clock,
+        peer,
+        Network::tcp(TransportConfig::default()),
+        &fleetringd::router::SystemEntropy::new(),
+    )
+    .await
+}
+
+/// Every command the control log at `path` holds that its state machine applies, in log order,
+/// with its index.
+///
+/// # Errors
+///
+/// The store's error if the log can't be opened or read.
+pub(crate) fn control_commands(
+    path: &Path,
+) -> Result<Vec<(fleetringd::control::LogIndex, fleetring_control::Command)>, Box<dyn Error>> {
+    let store = fleetringd::control::ControlStore::open(
+        path,
+        fleetring_control::ControlConfig::new(),
+        None,
+    )?;
+    Ok(store.commands()?)
+}
+
 /// The binary, isolated by [`isolate`]. Every integration test runs it through this (or through
 /// [`isolate`]); `tests/contexts.rs` fails if one doesn't.
 pub(crate) fn fleetring() -> std::process::Command {

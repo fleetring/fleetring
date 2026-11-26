@@ -7,6 +7,40 @@ use fleetring_control::fork::OperationId;
 use fleetring_control::scope::Scopes;
 use fleetring_control::{Action, Feature, Member, Release, Software, Timestamp};
 
+/// The peer every unit test's control node runs as.
+pub(crate) fn own() -> crate::control::raft::ControlPeer {
+    crate::control::raft::ControlPeer::new("control-1", "127.0.0.1:7400")
+}
+
+/// Opens a control node at `path` as [`own`], with `options` and `clock`, over a TCP network it
+/// never dials and the operating system's entropy.
+pub(crate) async fn open_node(
+    path: impl Into<std::path::PathBuf>,
+    options: crate::control::ControlOptions,
+    clock: impl crate::clock::Clock + 'static,
+) -> Result<crate::control::ControlNode, crate::control::OpenError> {
+    crate::control::ControlNode::open(
+        path,
+        options,
+        clock,
+        own(),
+        crate::Network::tcp(crate::transport::TransportConfig::default()),
+        &crate::router::SystemEntropy::new(),
+    )
+    .await
+}
+
+/// Every command the control log at `path` holds that the state machine applies, in log order.
+pub(crate) fn logged_commands(path: &std::path::Path) -> Vec<fleetring_control::Command> {
+    crate::control::ControlStore::open(path, fleetring_control::ControlConfig::new(), None)
+        .expect("the log opens")
+        .commands()
+        .expect("the log reads")
+        .into_iter()
+        .map(|(_, command)| command)
+        .collect()
+}
+
 /// A member that reports every fleet feature, `delegation` included.
 pub(crate) fn member_with_every_feature(id: &str) -> Member {
     let software = Feature::ALL.into_iter().fold(

@@ -28,6 +28,14 @@ tokio::task_local! {
     static GENERATOR: Arc<Mutex<SplitMix64>>;
 }
 
+/// The longest sleep the runtime ends at the timer's next turn rather than after its duration.
+/// Tokio rounds every deadline up to the next millisecond, so a sleep of a microsecond, which
+/// openraft 0.10.1 takes to batch the notices of finished storage IO (and of a nanosecond, to
+/// yield), lasts a millisecond. Under paused time and turmoil that would cost every append a
+/// millisecond of virtual time. Only these token sleeps are cut short; any longer one is
+/// openraft's to time.
+const TOKEN_SLEEP: Duration = Duration::from_micros(1);
+
 /// The Raft ID that seeds the generator a draw outside any scope falls back to.
 static FALLBACK_SEED: AtomicU64 = AtomicU64::new(0);
 
@@ -142,13 +150,6 @@ impl RaftSeed {
 ///
 /// `fallback` seeds the generator that a draw outside any scope uses, which would be a bug: the
 /// draw is counted and logged at error level once.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the control node opens its group inside it from PR 3"
-    )
-)]
 pub(crate) async fn with_generator<F: Future>(
     seed: RaftSeed,
     fallback: RaftId,
@@ -227,12 +228,25 @@ impl AsyncRuntime for ControlRuntime {
         }
     }
 
+    /// Sleeps for `duration`, or only until the timer's next turn for a token sleep of a
+    /// microsecond or less, which Tokio would otherwise round up to a millisecond.
     fn sleep(duration: Duration) -> Self::Sleep {
-        tokio::time::sleep(duration)
+        if duration <= TOKEN_SLEEP {
+            tokio::time::sleep(Duration::ZERO)
+        } else {
+            tokio::time::sleep(duration)
+        }
     }
 
+    /// Sleeps until `deadline`, or only until the timer's next turn when `deadline` is a
+    /// microsecond away or less, which Tokio would otherwise round up to a millisecond.
     fn sleep_until(deadline: Self::Instant) -> Self::Sleep {
-        tokio::time::sleep_until(deadline.0)
+        let now = tokio::time::Instant::now();
+        if deadline.0.saturating_duration_since(now) <= TOKEN_SLEEP {
+            tokio::time::sleep_until(now)
+        } else {
+            tokio::time::sleep_until(deadline.0)
+        }
     }
 
     fn timeout<R, F: Future<Output = R> + OptionalSend>(

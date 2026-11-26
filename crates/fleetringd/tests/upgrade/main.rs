@@ -26,9 +26,10 @@ use fleetringd::upgrade::ProcessFile;
 
 use crate::common::{
     ArchiveLayout, Defect, ProcessFleet, ReleaseServer, TestResult, before_the_rename,
-    check_history, create_history_database, current, fake_binary, fake_cosign, line_behind,
-    lines_ahead, node_command, path_with, printed, refusing_release, release_of, wait_for,
-    wait_for_members, write_release, write_releases_list, write_until,
+    check_history, create_history_database, current, fake_binary,
+    fake_binary_reading_this_control_log, fake_cosign, line_behind, lines_ahead, node_command,
+    path_with, printed, refusing_release, release_of, wait_for, wait_for_members, write_release,
+    write_releases_list, write_until,
 };
 
 /// A scratch install of this build, a release server, and a stand-in cosign.
@@ -593,7 +594,11 @@ fn a_release_without_the_check_is_installed_with_a_note() -> TestResult {
         ProcessFile::read(&node.data_dir).ok().flatten()
     })?;
     let older = line_behind();
-    let url = bench.publish(&older, &fake_binary(&older), Defect::None)?;
+    let url = bench.publish(
+        &older,
+        &fake_binary_reading_this_control_log(&older),
+        Defect::None,
+    )?;
     let installed = fleet
         .command(&node.bin, &bench.path())
         .args([
@@ -616,7 +621,10 @@ fn a_release_without_the_check_is_installed_with_a_note() -> TestResult {
         "{}",
         printed(&installed)
     );
-    assert_eq!(fs::read(&node.bin)?, fake_binary(&older));
+    assert_eq!(
+        fs::read(&node.bin)?,
+        fake_binary_reading_this_control_log(&older)
+    );
     Ok(())
 }
 
@@ -650,7 +658,11 @@ fn a_release_without_an_enabled_feature_is_refused_before_it_is_installed() -> T
     runtime.block_on(wait_for_feature(&client, "undrain"))?;
 
     let older = line_behind();
-    let url = bench.publish(&older, &fake_binary(&older), Defect::None)?;
+    let url = bench.publish(
+        &older,
+        &fake_binary_reading_this_control_log(&older),
+        Defect::None,
+    )?;
     let version = older.to_string();
     let lacks = "lacks the fleet feature 'undrain' this fleet uses";
     for node in &fleet.nodes {
@@ -700,7 +712,7 @@ fn a_release_without_an_enabled_feature_is_refused_before_it_is_installed() -> T
         assert_eq!(fs::read(&node.bin)?, installed, "{} was replaced", node.id);
 
         let previous = node.bin.with_file_name("fleetringd.previous");
-        fs::write(&previous, fake_binary(&older))?;
+        fs::write(&previous, fake_binary_reading_this_control_log(&older))?;
         fs::set_permissions(&previous, fs::Permissions::from_mode(0o755))?;
         let rollback = upgrade(&["--rollback"])?;
         assert_eq!(
@@ -722,7 +734,10 @@ fn a_release_without_an_enabled_feature_is_refused_before_it_is_installed() -> T
             "{} was rolled back",
             node.id
         );
-        assert_eq!(fs::read(&previous)?, fake_binary(&older));
+        assert_eq!(
+            fs::read(&previous)?,
+            fake_binary_reading_this_control_log(&older)
+        );
         fs::remove_file(&previous)?;
     }
 
@@ -919,7 +934,7 @@ fn a_rollback_past_the_rename_is_refused_for_a_running_node_started_with_serve()
     })?;
     let older = before_the_rename();
     let previous = node.bin.with_file_name("fleetring.previous");
-    fs::write(&previous, fake_binary(&older))?;
+    fs::write(&previous, fake_binary_reading_this_control_log(&older))?;
     fs::set_permissions(&previous, fs::Permissions::from_mode(0o755))?;
     let installed = fs::read(&node.bin)?;
     for restart in [&[][..], &["--no-restart"]] {
@@ -941,7 +956,10 @@ fn a_rollback_past_the_rename_is_refused_for_a_running_node_started_with_serve()
             printed(&refused)
         );
         assert_eq!(fs::read(&node.bin)?, installed, "{restart:?}: rolled back");
-        assert_eq!(fs::read(&previous)?, fake_binary(&older));
+        assert_eq!(
+            fs::read(&previous)?,
+            fake_binary_reading_this_control_log(&older)
+        );
     }
     Ok(())
 }

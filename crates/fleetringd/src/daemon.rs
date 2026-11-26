@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use tonic::transport::Server;
 use crate::auth::{AuthLayer, Authorizer};
 use crate::changes::{BuildSinkError, ChangeParts, ChangeSettings, ChangeStreams, build_sink};
 use crate::config::{HEARTBEATS_PER_TIMEOUT, reachable};
+use crate::control::raft::ControlPeer;
 use crate::control::{
     ControlClient, ControlHandle, ControlNode, ControlOptions, ControlService, Failover,
     FailoverSettings, NoControl, OpenError,
@@ -249,8 +251,17 @@ impl Daemon {
         let metrics = Metrics::new(&NodeInfo::new(config.node.id.clone(), config.role, fleet));
         let issuer = load_issuer(&config, &environment)?;
         let data_dir = DataDir::lock(&config.data_dir)?;
+        // The listener is bound before the control node opens: a format-1 log's migration makes
+        // this node its group's only voter, at the address it advertises (ADR-0040 point 8).
+        let network = environment.network();
+        let (listener, address) = bind(&config, network).await?;
+        let admin_listener = bind_admin(&config, network).await?;
         let control = if config.role.runs_control() {
-            let node = open_control(&config, &data_dir, &environment, &metrics).await?;
+            let own = ControlPeer::new(
+                config.node.id.as_str(),
+                advertised(&config, address).to_string(),
+            );
+            let node = open_control(&config, &data_dir, &environment, &metrics, own).await?;
             let failover = Failover::start(
                 node.handle(),
                 environment.clock(),
@@ -269,9 +280,6 @@ impl Daemon {
         } else {
             None
         };
-        let network = environment.network();
-        let (listener, address) = bind(&config, network).await?;
-        let admin_listener = bind_admin(&config, network).await?;
         let data = if config.role.hosts_data() {
             Some(start_data(
                 &config,
@@ -671,26 +679,41 @@ fn load_issuer(
     Ok(Some(pair))
 }
 
+/// Opens the control node in `data_dir` as `own`, a group of one voter unless `[control]
+/// bootstrap = "join"`. Its leader stamps its own node ID on every command it logs, beside the
+/// time (ADR-0047, point 6.1; ADR-0040 point 2).
 async fn open_control(
     config: &Config,
     data_dir: &DataDir,
     environment: &Environment,
     metrics: &Metrics,
+    own: ControlPeer,
 ) -> Result<ControlNode, StartError> {
-    // The writer stamps its own node ID on every command it logs, beside the time, as the log
-    // layer's leader ID (ADR-0047, point 6.1).
-    let options = ControlOptions::new(config.control.control_config())
-        .with_snapshot_every(config.control.snapshot_every)
+    let control = &config.control;
+    let snapshots_retained = usize::try_from(control.snapshots_retained.get())
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .unwrap_or(NonZeroUsize::MIN);
+    let options = ControlOptions::new(control.control_config())
+        .with_snapshot_every(control.snapshot_every)
         .with_tombstone_window(fleetring_control::Millis::new(
-            config.control.tombstone_window_ms.get(),
+            control.tombstone_window_ms.get(),
         ))
         .with_storage_io(environment.control_storage_io())
-        .with_recorder(config.node.id.clone());
+        .with_bootstrap(control.bootstrap)
+        .with_election_timeout(Duration::from_millis(control.election_timeout_ms.get()))
+        .with_raft_heartbeat(Duration::from_millis(control.raft_heartbeat_ms.get()))
+        .with_log_keep(control.log_keep)
+        .with_snapshots_retained(snapshots_retained)
+        .with_fork_limits(config.fork.limits());
     let path = data_dir.path().join(CONTROL_DB);
     Ok(ControlNode::open_with_metrics(
         path,
         options,
         environment.clock(),
+        own,
+        environment.network().clone(),
+        environment.entropy().as_ref(),
         metrics.control().clone(),
     )
     .await?)

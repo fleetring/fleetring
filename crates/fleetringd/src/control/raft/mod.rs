@@ -18,9 +18,14 @@
 //!   proposal carries the leader it was screened under ([`ControlRequest::screened`], ADR-0040
 //!   point 2).
 //!
+//! - **The pieces.** `log_storage` and `state_machine` implement openraft's storage traits over
+//!   [`ControlStore`](crate::control::ControlStore); `proposer` screens, stamps, and proposes on
+//!   the leader; `gate` is the group gate ([`GroupGate`]); `network` is the group's network,
+//!   which carries no Raft message yet, so a group has one voter.
+//!
 //! # openraft 0.10.1's interfaces
 //!
-//! As checked against the crate's source; later pull requests implement them.
+//! As checked against the crate's source.
 //!
 //! - `RaftLogReader<C>`: `try_get_log_entries(&mut self, range: impl RangeBounds<u64>) ->
 //!   Result<Vec<C::Entry>, io::Error>` and `read_vote(&mut self) -> Result<Option<Vote>,
@@ -59,12 +64,20 @@
 //!   as a second type parameter: `Raft<C, SM>`.
 
 pub mod codec;
+pub(crate) mod gate;
 mod id;
-mod runtime;
+pub(crate) mod log_storage;
+pub(crate) mod network;
+pub(crate) mod proposer;
+pub(crate) mod runtime;
+pub(crate) mod state_machine;
 mod types;
 
+pub use gate::GroupGate;
 pub use id::{ParseRaftIdError, RaftIdError, check_raft_id, parse_raft_id, raft_id, raft_id_text};
+pub use proposer::Readiness;
 pub use runtime::{ControlInstant, ControlRng, ControlRuntime, RaftSeed};
+pub use state_machine::SnapshotData;
 pub use types::{ControlPeer, ControlRequest, ControlResponse, LeaderRef};
 
 /// A control node's Raft ID: the XXH3-64 hash of its fleet node ID (ADR-0035 point 2).

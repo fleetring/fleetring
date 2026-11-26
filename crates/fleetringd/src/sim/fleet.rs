@@ -2281,11 +2281,12 @@ impl Fleet {
         let _records = self.check_change_streams()?;
         let log = self.check_control_log()?;
         if let Some(control) = control
-            && *control.state() != *log.state()
+            && *control.state() != log.state_at(control.applied().get())
         {
             return Err(Violation::new(
                 check::Invariant::ControlLogReplays,
-                "the recovered state differs from the state the control node last published",
+                "the replayed state differs from the state the control node last published, at \
+                 its index",
             )
             .into());
         }
@@ -2301,7 +2302,7 @@ impl Fleet {
         check::lease_events_match_control(&history, log.lease_holders())?;
         let disk = self.fork_disk(&log);
         crate::sim::forks::check(
-            log.genesis(),
+            log.replayed_from(),
             log.commands(),
             &history,
             &disk,

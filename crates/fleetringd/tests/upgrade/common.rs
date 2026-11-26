@@ -200,6 +200,20 @@ pub(crate) fn fake_binary(release: &Release) -> Vec<u8> {
     format!("#!/bin/sh\necho \"fleetringd {release}\"\n").into_bytes()
 }
 
+/// A stand-in for an older release, as [`fake_binary`], that reads this build's control log:
+/// its `upgrade --software` reports `release`, no feature, no `serve --check`, and control log
+/// format 2. A real release before the control group reads only format 1, which `upgrade`
+/// refuses on a control node (ADR-0040 point 5); the tests of the other refusals use this one so
+/// that the control log's format doesn't refuse first.
+pub(crate) fn fake_binary_reading_this_control_log(release: &Release) -> Vec<u8> {
+    format!(
+        "#!/bin/sh\ncase \"$1 $2\" in\n\"--version \"*) echo \"fleetringd {release}\" ;;\n\
+         \"upgrade --software\") echo '{{\"version\":\"{release}\",\"features\":[],\
+         \"config_check\":false,\"control_format\":2}}' ;;\nesac\n"
+    )
+    .into_bytes()
+}
+
 /// A stand-in for a next release that refuses a configuration this build accepts, as a release
 /// that tightens a rule does: a script that runs this build for everything, except that its
 /// `serve --check` refuses a heartbeat interval of 200 ms, which every [`ProcessFleet`] node's

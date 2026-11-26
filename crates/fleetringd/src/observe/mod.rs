@@ -29,10 +29,10 @@ pub(crate) mod sampler;
 mod trace;
 
 pub use logs::{LogColour, log_subscriber};
-pub(crate) use metrics::DataMetrics;
 pub use metrics::{
     ChangeMetrics, ControlMetrics, MembershipMetrics, Metrics, NodeInfo, ReplicationMetrics,
 };
+pub(crate) use metrics::{DataMetrics, RaftSample};
 pub use names::{ALLOWED_LABELS, FAMILIES, FamilySpec, INFO_LABELS, Kind, closed_values};
 pub use request_id::{REQUEST_ID_KEY, RequestId};
 pub use trace::{TraceLayer, TraceService};
