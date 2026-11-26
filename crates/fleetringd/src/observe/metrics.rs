@@ -445,7 +445,8 @@ impl ReplicationMetrics {
     }
 }
 
-/// The control plane's families, which the control writer updates.
+/// The control plane's families, which the control group's state machine, log storage,
+/// proposer, and metrics task update (ADR-0040 point 10).
 ///
 /// A `Default` handle counts without being registered anywhere.
 #[derive(Debug, Clone)]
@@ -454,6 +455,15 @@ pub struct ControlMetrics {
     log_index: Gauge,
     log_write_duration: Histogram,
     snapshot_index: Gauge,
+    committed_index: Gauge,
+    applied_index: Gauge,
+    term: Gauge,
+    voters: Gauge,
+    learners: Gauge,
+    replication_lag_max: Gauge,
+    clock_offset_max: Gauge<f64, AtomicU64>,
+    elections: Counter,
+    proposals: Outcomes,
     forks: Outcomes,
     fork_ready_duration: Histogram,
 }
@@ -465,10 +475,40 @@ impl Default for ControlMetrics {
             log_index: Gauge::default(),
             log_write_duration: duration_histogram(),
             snapshot_index: Gauge::default(),
+            committed_index: Gauge::default(),
+            applied_index: Gauge::default(),
+            term: Gauge::default(),
+            voters: Gauge::default(),
+            learners: Gauge::default(),
+            replication_lag_max: Gauge::default(),
+            clock_offset_max: Gauge::default(),
+            elections: Counter::default(),
+            proposals: Outcomes::with(names::OUTCOMES_PROPOSAL),
             forks: Outcomes::with(names::OUTCOMES_FORK),
             fork_ready_duration: long_duration_histogram(),
         }
     }
+}
+
+/// What the control group's metrics task reads from openraft's metrics, for the gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RaftSample {
+    /// The index of the last entry in the log.
+    pub(crate) last_log_index: u64,
+    /// The index of the last entry known committed.
+    pub(crate) committed_index: u64,
+    /// The index of the last entry applied.
+    pub(crate) applied_index: u64,
+    /// The index of the newest control snapshot.
+    pub(crate) snapshot_index: u64,
+    /// The control group's term.
+    pub(crate) term: u64,
+    /// Voters in the membership.
+    pub(crate) voters: usize,
+    /// Learners in the membership.
+    pub(crate) learners: usize,
+    /// On the leader, the most entries any member is behind; 0 elsewhere.
+    pub(crate) replication_lag_max: u64,
 }
 
 impl ControlMetrics {
@@ -484,22 +524,60 @@ impl ControlMetrics {
         metrics
     }
 
-    /// A command logged at `index`, with its action and outcome.
+    /// A command applied at `index`, with its action and outcome.
     pub(crate) fn command(&self, index: u64, action: &'static str, outcome: &'static str) {
         self.commands
             .get_or_create(&CommandLabels { action, outcome })
             .inc();
-        self.log_index.set(gauge_value_u64(index));
+        self.applied_index.set(gauge_value_u64(index));
+    }
+
+    /// The control group's state, as openraft's metrics last showed it.
+    pub(crate) fn raft(&self, sample: &RaftSample) {
+        self.log_index.set(gauge_value_u64(sample.last_log_index));
+        self.committed_index
+            .set(gauge_value_u64(sample.committed_index));
+        self.applied_index
+            .set(gauge_value_u64(sample.applied_index));
+        self.snapshot_index
+            .set(gauge_value_u64(sample.snapshot_index));
+        self.term.set(gauge_value_u64(sample.term));
+        self.voters.set(gauge_value(sample.voters));
+        self.learners.set(gauge_value(sample.learners));
+        self.replication_lag_max
+            .set(gauge_value_u64(sample.replication_lag_max));
+    }
+
+    /// A term of the control group this node saw begin.
+    pub(crate) fn election(&self) {
+        self.elections.inc();
+    }
+
+    /// A command this node screened as leader, and what became of it: one of
+    /// [`OUTCOMES_PROPOSAL`](names::OUTCOMES_PROPOSAL).
+    pub(crate) fn proposal(&self, outcome: &'static str) {
+        self.proposals.inc(outcome);
+    }
+
+    /// The largest clock offset seen in the control group's messages, in seconds.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Raft network measures offsets from PR 4")
+    )]
+    pub(crate) fn clock_offset(&self, seconds: f64) {
+        self.clock_offset_max.set(seconds);
     }
 
     pub(crate) fn log_written(&self, duration: Duration) {
         self.log_write_duration.observe(duration.as_secs_f64());
     }
 
-    /// The log index and snapshot index recovery found.
-    pub(crate) fn recovered(&self, index: u64, snapshot: u64) {
-        self.log_index.set(gauge_value_u64(index));
-        self.snapshot_index.set(gauge_value_u64(snapshot));
+    /// How many commands with `action` and `outcome` this node counted.
+    #[cfg(test)]
+    pub(crate) fn commands(&self, action: &'static str, outcome: &'static str) -> u64 {
+        self.commands
+            .get_or_create(&CommandLabels { action, outcome })
+            .get()
     }
 
     pub(crate) fn snapshot_saved(&self, index: u64) {
@@ -877,6 +955,27 @@ impl Metrics {
             sampled.control_databases.clone(),
         );
         r.add("fleetring_control_leader", sampled.control_leader.clone());
+        r.add(
+            "fleetring_control_committed_index",
+            control.committed_index.clone(),
+        );
+        r.add(
+            "fleetring_control_applied_index",
+            control.applied_index.clone(),
+        );
+        r.add("fleetring_control_term", control.term.clone());
+        r.add("fleetring_control_voters", control.voters.clone());
+        r.add("fleetring_control_learners", control.learners.clone());
+        r.add(
+            "fleetring_control_replication_lag_max",
+            control.replication_lag_max.clone(),
+        );
+        r.add(
+            "fleetring_control_clock_offset_max_seconds",
+            control.clock_offset_max.clone(),
+        );
+        r.add("fleetring_control_elections", control.elections.clone());
+        r.add("fleetring_control_proposals", control.proposals.0.clone());
         r.add("fleetring_change_deliveries", changes.deliveries.clone());
         r.add("fleetring_change_resets", changes.resets.clone());
         r.add(
@@ -1024,6 +1123,38 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("# EOF\n"), "{text}");
+    }
+
+    /// The control group's families of ADR-0040 point 10 are on the first scrape, before any
+    /// command, each proposal outcome at zero.
+    #[test]
+    fn the_control_group_families_are_listed_from_the_first_scrape() {
+        let metrics = Metrics::new(&info());
+        metrics.control().clock_offset(0.0);
+        let text = metrics.encode();
+        for family in [
+            "fleetring_control_committed_index",
+            "fleetring_control_applied_index",
+            "fleetring_control_term",
+            "fleetring_control_voters",
+            "fleetring_control_learners",
+            "fleetring_control_replication_lag_max",
+            "fleetring_control_clock_offset_max_seconds",
+        ] {
+            assert!(text.contains(&format!("\n{family} 0")), "{family}:\n{text}");
+        }
+        assert!(
+            text.contains("\nfleetring_control_elections_total 0\n"),
+            "{text}"
+        );
+        for outcome in names::OUTCOMES_PROPOSAL {
+            assert!(
+                text.contains(&format!(
+                    "fleetring_control_proposals_total{{outcome=\"{outcome}\"}} 0\n"
+                )),
+                "{outcome}:\n{text}"
+            );
+        }
     }
 
     #[test]

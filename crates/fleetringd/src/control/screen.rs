@@ -1,9 +1,9 @@
 //! The screen every control command passes before it is logged.
 //!
-//! The control node's writer runs each submitted action through a [`Screen`] before it logs
-//! anything, and a proposer that logs through another log must run the same screen, or the
-//! guarantees below break. Given the state the log has reached, the commands already accepted
-//! for logging after it, the action, and the time to stamp, the screen decides, purely:
+//! The control group's leader runs each submitted action through a [`Screen`] before it proposes
+//! anything (ADR-0040 point 2). Given the state its log will have reached, the commands already
+//! accepted for proposing after it, the action, and the time to stamp, the screen decides,
+//! purely:
 //!
 //! - which command to log first, if any: [`Action::EnableHandover`] before the first
 //!   membership change that would keep a replica set (ADR-0031, amendment 2),
@@ -11,8 +11,12 @@
 //!   amendment), and [`Action::SetTombstoneWindow`] before a drop while the state's tombstone
 //!   window isn't this node's (ADR-0050);
 //! - whether the action is refused before it is logged: a join, or a command that needs a fleet
-//!   feature, that [`State::check_admission`] refuses (ADR-0038, point 4); and a command that
-//!   needs the `delegation` fleet feature that `apply` would reject (ADR-0047, point 6.2);
+//!   feature, that [`State::check_admission`] or the group's [`Gate`] refuses (ADR-0038, point 4;
+//!   ADR-0040 point 4); and a command that needs the `delegation` fleet feature that `apply`
+//!   would reject (ADR-0047, point 6.2);
+//! - what happens when the gate refuses an enabling command (ADR-0040 point 4): a creation under
+//!   `always` is refused for want of `EnableIncarnations`, and a membership change or a drop goes
+//!   on without its `EnableHandover` or `SetTombstoneWindow`;
 //! - whether the action resends a delegation the state already records, which is answered from
 //!   the state and never logged (ADR-0047, point 5.7);
 //! - and the command itself, stamped with the time and this node's recorder (ADR-0047,
@@ -21,10 +25,7 @@
 //! The screen reads no clock, no randomness, and no storage: the time arrives with each action.
 
 use fleetring::NodeId;
-use fleetring_control::delegation::Resent;
-use fleetring_control::{
-    Action, Applied, Command, Feature, Millis, Outcome, Rejection, State, Timestamp, apply,
-};
+use fleetring_control::{Action, Command, Feature, Millis, Rejection, State, Timestamp, apply};
 
 /// What this node writes into the commands it logs, beside the action: its recorder and its
 /// tombstone window.
@@ -54,16 +55,39 @@ impl Settings {
     }
 }
 
+/// The group gate's check of a command before it is logged (ADR-0040 point 4): whether every
+/// member of the control group supports the fleet features it needs.
+pub(crate) trait Gate {
+    /// Refuses `action` if a member of the group doesn't support a feature it needs.
+    ///
+    /// # Errors
+    ///
+    /// The [`Rejection`] to answer.
+    fn check(&self, action: &Action) -> Result<(), Rejection>;
+}
+
+/// A gate that admits everything: a log with no control group beyond the fleet's members.
+#[derive(Debug, Clone, Copy)]
+#[cfg(test)]
+pub(crate) struct Open;
+
+#[cfg(test)]
+impl Gate for Open {
+    fn check(&self, _action: &Action) -> Result<(), Rejection> {
+        Ok(())
+    }
+}
+
 /// The screen of one run of submissions against the state a log has reached.
 ///
 /// Each call to [`Screen::screen`] sees the state after `committed` and every command the screen
 /// accepted for logging before it, in order: the caller logs those commands in that order, after
 /// `committed`, so the state each command is screened against is the one `apply` will see. The
 /// screen builds that state, its preview, only once an action needs it.
-#[derive(Debug)]
 pub(crate) struct Screen<'s> {
     committed: &'s State,
     settings: &'s Settings,
+    gate: &'s dyn Gate,
     /// `committed` with the accepted commands applied, once an action needed it.
     preview: Option<State>,
     /// How many of the accepted commands the preview has applied.
@@ -102,27 +126,49 @@ pub(crate) enum Verdict {
     /// Refused before it was logged, so nothing changed for it: answer the rejection and log
     /// nothing for the action.
     Refused(Rejection),
-    /// A resend of a delegation the state records: log nothing for it, and answer `outcome`,
-    /// [`Resent::Yes`], once every command accepted before it is durable, since the record may be
-    /// one of them.
+    /// A resend of a delegation the screening state records: log nothing for it, and answer it
+    /// with the record, `Resent::Yes`, read from the applied state once every command accepted
+    /// before it is committed and applied, since the record may be one of them (ADR-0040
+    /// point 2).
     Resent {
         /// The stamped command, as it would have been logged.
         command: Command,
-        /// The recorded delegation.
-        outcome: Outcome,
     },
+}
+
+impl std::fmt::Debug for Screen<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Screen")
+            .field("settings", &self.settings)
+            .field("previewed", &self.previewed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'s> Screen<'s> {
     /// Returns a screen against `committed`, the state the log has reached, for a node with
-    /// `settings`.
+    /// `settings`, that no gate beyond the fleet's own holds back.
+    #[cfg(test)]
     pub(crate) fn new(committed: &'s State, settings: &'s Settings) -> Self {
+        Self::gated(committed, settings, &Open)
+    }
+
+    /// Returns a screen against `committed` for a node with `settings`, whose commands also pass
+    /// `gate`.
+    pub(crate) fn gated(committed: &'s State, settings: &'s Settings, gate: &'s dyn Gate) -> Self {
         Self {
             committed,
             settings,
+            gate,
             preview: None,
             previewed: 0,
         }
+    }
+
+    /// Returns the preview, if an action needed it: `committed` with every accepted command
+    /// applied.
+    pub(crate) fn into_preview(self) -> Option<State> {
+        self.preview
     }
 
     /// Screens `action`, stamped `at`, against the state after `committed` and `accepted`.
@@ -137,6 +183,7 @@ impl<'s> Screen<'s> {
         accepted: &[Command],
     ) -> Screened {
         let settings = self.settings;
+        let gate = self.gate;
         let membership = matches!(action, Action::Join { .. } | Action::Leave { .. });
         // Before a drop, while the state's tombstone window isn't the configured one.
         let dropping = matches!(
@@ -150,7 +197,9 @@ impl<'s> Screen<'s> {
         {
             let preview = self.preview(accepted);
             if needs_screening(&action)
-                && let Err(rejection) = preview.check_admission(&action)
+                && let Err(rejection) = preview
+                    .check_admission(&action)
+                    .and_then(|()| gate.check(&action))
             {
                 return Screened {
                     enabling: None,
@@ -176,10 +225,29 @@ impl<'s> Screen<'s> {
                 None
             };
             if let Some(enable) = enable {
-                let command = settings.stamp(at, enable);
-                let _outcome = apply(preview, command.clone());
-                self.previewed += 1;
-                enabling = Some(command);
+                match gate.check(&enable) {
+                    Ok(()) => {
+                        let command = settings.stamp(at, enable);
+                        let _outcome = apply(preview, command.clone());
+                        self.previewed += 1;
+                        enabling = Some(command);
+                    }
+                    // Without `incarnations` enabled, a creation under `always` would replay to
+                    // the legacy incarnation on a release without it: the service submits it
+                    // again under `once_forked` (ADR-0040 point 4).
+                    Err(rejection) if matches!(enable, Action::EnableIncarnations) => {
+                        return Screened {
+                            enabling: None,
+                            verdict: Verdict::Refused(rejection),
+                        };
+                    }
+                    // A membership change keeps no replica set without `handover`, and a drop
+                    // keeps no tombstone without the window: each fails closed, every replica
+                    // keeping its copy (ADR-0031 amendment 2, ADR-0050 point 7).
+                    Err(rejection) => {
+                        tracing::info!(%rejection, enabling = ?enable, "the control group isn't ready for a fleet feature yet; the command goes on without it");
+                    }
+                }
             }
         }
         let unlogged_if_refused = refused_unlogged(&action);
@@ -187,15 +255,10 @@ impl<'s> Screen<'s> {
         if let Some(preview) = &mut self.preview {
             // A resend changes nothing, so it costs the log nothing either: N racing identical
             // calls log one command, not N with full claims each.
-            if let Some(Ok((id, record))) = preview.delegation_resend(&command.action, command.at) {
-                let outcome = Ok(Applied::DelegationRecorded {
-                    id: id.clone(),
-                    claims: record.claims.clone(),
-                    resent: Resent::Yes,
-                });
+            if let Some(Ok(_)) = preview.delegation_resend(&command.action, command.at) {
                 return Screened {
                     enabling,
-                    verdict: Verdict::Resent { command, outcome },
+                    verdict: Verdict::Resent { command },
                 };
             }
             let outcome = apply(preview, command.clone());
@@ -495,6 +558,88 @@ mod tests {
         let _drop = appended(screened);
     }
 
+    /// A group gate that refuses every command needing `feature`, as for a control node that
+    /// lacks it.
+    struct Lacking(Feature);
+
+    impl Gate for Lacking {
+        fn check(&self, action: &Action) -> Result<(), Rejection> {
+            if action.features().contains(&self.0) {
+                Err(Rejection::FeatureUnsupported {
+                    feature: self.0,
+                    id: "control-2".parse().expect("an id"),
+                    release: Release::new(0, 9, 0),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The group gate's fallbacks for the enabling commands (ADR-0040 point 4): without
+    /// `EnableIncarnations` a creation under `always` is refused for `incarnations`, and without
+    /// `SetTombstoneWindow` a drop goes on alone.
+    #[test]
+    fn a_gate_refusing_an_enabling_command_falls_back() {
+        let state = state_after([
+            join(member_with_every_feature("a")),
+            create("one", IncarnationRule::OnceForked),
+        ]);
+        let settings = Settings::new(Some(recorder()), Millis::new(60_000));
+        let lacking = Lacking(Feature::Incarnations);
+        let screened = Screen::gated(&state, &settings, &lacking).screen(
+            create("fresh", IncarnationRule::Always),
+            AT,
+            &[],
+        );
+        assert!(screened.enabling.is_none(), "{screened:?}");
+        assert!(
+            matches!(
+                screened.verdict,
+                Verdict::Refused(Rejection::FeatureUnsupported {
+                    feature: Feature::Incarnations,
+                    ..
+                })
+            ),
+            "{screened:?}"
+        );
+
+        let lacking = Lacking(Feature::Tombstones);
+        let drop_one = Action::DropDatabase {
+            name: "one".parse().expect("a name"),
+        };
+        let screened = Screen::gated(&state, &settings, &lacking).screen(drop_one, AT, &[]);
+        assert!(screened.enabling.is_none(), "{screened:?}");
+        assert!(
+            matches!(&appended(screened).action, Action::DropDatabase { .. }),
+            "the drop goes on without a tombstone window"
+        );
+    }
+
+    /// A command the group gate refuses for a feature is refused unlogged, like one the fleet's
+    /// own gate refuses.
+    #[test]
+    fn a_command_the_group_gate_refuses_is_refused() {
+        let state = state_after([join(member_with_every_feature("a"))]);
+        let settings = settings();
+        let lacking = Lacking(Feature::Delegation);
+        let screened = Screen::gated(&state, &settings, &lacking).screen(
+            root_delegation(AT, 1, 60_000),
+            AT,
+            &[],
+        );
+        assert!(
+            matches!(
+                screened.verdict,
+                Verdict::Refused(Rejection::FeatureUnsupported {
+                    feature: Feature::Delegation,
+                    ..
+                })
+            ),
+            "{screened:?}"
+        );
+    }
+
     /// A join `check_admission` refuses is refused, and the screen goes on from the state
     /// before it.
     #[test]
@@ -555,14 +700,7 @@ mod tests {
         let first = appended(screen.screen(action.clone(), AT, &[]));
         let accepted = [first];
         let resent = |screened: Screened| match screened.verdict {
-            Verdict::Resent {
-                command,
-                outcome:
-                    Ok(Applied::DelegationRecorded {
-                        resent: Resent::Yes,
-                        ..
-                    }),
-            } => command,
+            Verdict::Resent { command } => command,
             other => panic!("expected a resend: {other:?}"),
         };
         // Behind the accepted record, in the same run.

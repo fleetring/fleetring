@@ -1,4 +1,6 @@
-//! The control node's durable command log and snapshots, in one SQLite database (ADR-0017).
+//! `control.db` format 1: the single writer's command log and snapshots, which 0.9.x and every
+//! release before it wrote (ADR-0017). This build reads it only to migrate it to format 2, the
+//! control group's store (ADR-0040 point 8), and writes it only in tests.
 //!
 //! # Format
 //!
@@ -24,8 +26,8 @@ use std::ptr;
 use fleetring_control::{Command, ControlConfig, State, apply};
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// The log format this build writes and reads.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// The format this module reads.
+const FORMAT_VERSION: u32 = 1;
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -180,7 +182,7 @@ pub struct Recovered {
 /// The log is blocking. In async code, call it from a dedicated thread, or inline under
 /// simulation (ADR-0020).
 #[derive(Debug)]
-pub struct CommandLog {
+pub(crate) struct CommandLog {
     path: PathBuf,
     connection: Connection,
     genesis: ControlConfig,
@@ -197,7 +199,7 @@ impl CommandLog {
     ///
     /// [`LogError`] if the file can't be opened, was written by an incompatible build, or its
     /// genesis configuration is corrupt.
-    pub fn open(path: impl Into<PathBuf>, config: ControlConfig) -> Result<Self, LogError> {
+    pub(crate) fn open(path: impl Into<PathBuf>, config: ControlConfig) -> Result<Self, LogError> {
         let path = path.into();
         let sqlite = |source| LogError::Sqlite {
             path: path.clone(),
@@ -222,94 +224,10 @@ impl CommandLog {
         })
     }
 
-    /// Returns the log's database file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Returns the configuration the log's first state was created with.
     #[must_use]
-    pub fn genesis(&self) -> ControlConfig {
+    pub(crate) fn genesis(&self) -> ControlConfig {
         self.genesis
-    }
-
-    /// Appends `command` at `index` and waits until it is on stable storage.
-    ///
-    /// # Errors
-    ///
-    /// [`LogError`] if the command can't be encoded or written, including when `index` is
-    /// already taken. After an error the command may or may not be durable.
-    pub fn append(&mut self, index: LogIndex, command: &Command) -> Result<(), LogError> {
-        self.append_all([(index, command)])
-    }
-
-    /// Appends `commands`, each at its index, in one transaction, and waits until all of them
-    /// are on stable storage.
-    ///
-    /// The group costs one sync however many commands it holds, so a writer that logs everything
-    /// queued behind a command as one group keeps up with a burst of commands on a disk whose
-    /// syncs are slow, where logging them one at a time would fall ever further behind. Either
-    /// every command in the group is logged or none is.
-    ///
-    /// # Errors
-    ///
-    /// [`LogError`] if a command can't be encoded or written, including when an index is already
-    /// taken. Nothing from the group is logged then.
-    pub fn append_all<'c>(
-        &mut self,
-        commands: impl IntoIterator<Item = (LogIndex, &'c Command)>,
-    ) -> Result<(), LogError> {
-        let path = self.path.clone();
-        let sqlite = |source| LogError::Sqlite {
-            path: path.clone(),
-            source,
-        };
-        let transaction = self.connection.transaction().map_err(sqlite)?;
-        {
-            let mut insert = transaction
-                .prepare_cached("INSERT INTO commands (log_index, command) VALUES (?1, ?2)")
-                .map_err(sqlite)?;
-            for (index, command) in commands {
-                let text = serde_json::to_string(command).map_err(|source| LogError::Encode {
-                    what: "a command",
-                    source,
-                })?;
-                insert
-                    .execute(params![to_sql(index)?, text])
-                    .map_err(sqlite)?;
-            }
-        }
-        transaction.commit().map_err(sqlite)
-    }
-
-    /// Stores `state` as the snapshot after the command at `index`, replacing older snapshots.
-    ///
-    /// # Errors
-    ///
-    /// [`LogError`] if the state can't be encoded or written.
-    pub fn save_snapshot(&mut self, index: LogIndex, state: &State) -> Result<(), LogError> {
-        let text = serde_json::to_string(state).map_err(|source| LogError::Encode {
-            what: "a snapshot",
-            source,
-        })?;
-        let index = to_sql(index)?;
-        let path = self.path.clone();
-        let sqlite = |source| LogError::Sqlite {
-            path: path.clone(),
-            source,
-        };
-        let transaction = self.connection.transaction().map_err(sqlite)?;
-        transaction
-            .execute(
-                "INSERT OR REPLACE INTO snapshots (log_index, state) VALUES (?1, ?2)",
-                params![index, text],
-            )
-            .map_err(sqlite)?;
-        transaction
-            .execute("DELETE FROM snapshots WHERE log_index < ?1", params![index])
-            .map_err(sqlite)?;
-        transaction.commit().map_err(sqlite)
     }
 
     /// Returns every logged command in log order, checking that no index is missing.
@@ -317,7 +235,7 @@ impl CommandLog {
     /// # Errors
     ///
     /// [`LogError`] if the log can't be read, a command is corrupt, or an index is missing.
-    pub fn commands(&self) -> Result<Vec<(LogIndex, Command)>, LogError> {
+    pub(crate) fn commands(&self) -> Result<Vec<(LogIndex, Command)>, LogError> {
         let mut commands = Vec::new();
         self.for_each_command_after(LogIndex::ZERO, |index, command| {
             commands.push((index, command));
@@ -331,7 +249,7 @@ impl CommandLog {
     ///
     /// [`LogError`] if the log can't be read, the snapshot or a command is corrupt, or an index
     /// is missing.
-    pub fn recover(&self) -> Result<Recovered, LogError> {
+    pub(crate) fn recover(&self) -> Result<Recovered, LogError> {
         let snapshot = self.latest_snapshot()?;
         let (mut state, start) = match &snapshot {
             Some((index, state)) => (state.clone(), *index),
@@ -553,7 +471,7 @@ pub(crate) fn file_format(path: &Path) -> Result<Option<u32>, LogError> {
         .map(|text| {
             text.parse().map_err(|_| LogError::UnsupportedFormat {
                 found: text,
-                supported: FORMAT_VERSION,
+                supported: crate::control::store::STORE_FORMAT,
             })
         })
         .transpose()

@@ -29,11 +29,12 @@ use std::path::{Path, PathBuf};
 use fleetring_control::{Command, ControlConfig, State, apply};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::control::log::{CommandLog, LogError, LogIndex, check_state};
+use crate::control::format1::{CommandLog, LogError, LogIndex, check_state};
 use crate::control::raft::codec::{
     CodecError, EntryKind, EntryWire, HexId, LogIdWire, PayloadWire, StoredMembershipWire,
     VoteWire, decode_raft_id,
 };
+use crate::control::raft::state_machine::{Decision, decide};
 use crate::control::raft::{
     ControlPeer, ControlRequest, Entry, LogId, Membership, RaftId, SnapshotMeta, StoredMembership,
     Vote, raft_id_text,
@@ -335,10 +336,24 @@ impl ControlStore {
                 ))
             })
             .map_err(|source| self.sqlite(source))?;
+        // The log holds every index after the purged one, with no gap: a missing row is damage,
+        // and openraft must never be handed a log that skips an entry.
+        let first = self
+            .purged()?
+            .map_or(0, |purged| purged.index.saturating_add(1));
+        let mut expected = low.max(first);
         let mut entries = Vec::new();
         for row in rows {
             let (index, term, leader, kind, payload) = row.map_err(|source| self.sqlite(source))?;
-            entries.push(decode_entry(index, term, &leader, &kind, &payload)?);
+            let entry = decode_entry(index, term, &leader, &kind, &payload)?;
+            if entry.log_id.index != expected {
+                return Err(LogError::Gap {
+                    expected: LogIndex::new(expected),
+                    found: LogIndex::new(entry.log_id.index),
+                });
+            }
+            expected = expected.saturating_add(1);
+            entries.push(entry);
         }
         Ok(entries)
     }
@@ -418,6 +433,64 @@ impl ControlStore {
                 openraft::EntryPayload::Blank | openraft::EntryPayload::Membership(_) => None,
             })
             .collect())
+    }
+
+    /// Returns the commands the log still holds that the state machine applies, in log order,
+    /// each with its index: Raft's own blank and membership entries, and the command entries the
+    /// skip rules supersede, are left out (ADR-0040 point 2). Uncommitted entries are included.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError`] if they can't be read, or one is corrupt or can't be decoded.
+    pub fn commands(&self) -> Result<Vec<(LogIndex, Command)>, LogError> {
+        let mut commands = Vec::new();
+        for entry in self.entries(..)? {
+            let openraft::EntryPayload::Normal(request) = &entry.payload else {
+                continue;
+            };
+            let index = LogIndex::new(entry.log_id.index);
+            match decide(&entry.log_id, request) {
+                Decision::Apply(command) => commands.push((index, *command)),
+                Decision::Superseded => {}
+                Decision::Undecodable(source) => {
+                    return Err(LogError::CorruptEntry {
+                        index,
+                        source: CodecError::Json {
+                            what: "a command",
+                            source,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(commands)
+    }
+
+    /// Whether the store holds no log yet: no entry, nothing purged, and no snapshot, as on a
+    /// node waiting to be added to a control group. A saved vote doesn't count: openraft saves
+    /// the leader's vote before it installs the group's first snapshot on a joiner.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError`] if the store can't be read.
+    pub fn is_fresh(&self) -> Result<bool, LogError> {
+        let snapshots: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .map_err(|source| self.sqlite(source))?;
+        Ok(snapshots == 0 && self.last_log_id()?.is_none())
+    }
+
+    /// Records `config` as the store's genesis configuration: on a fresh joiner, the one the
+    /// group's first control snapshot carries, in place of its own configuration's.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError`] if it can't be written.
+    pub fn set_genesis(&mut self, config: ControlConfig) -> Result<(), LogError> {
+        self.write_meta("genesis", Some(&config))?;
+        self.genesis = config;
+        Ok(())
     }
 
     fn read_snapshots(&self, order: &str) -> Result<Vec<ControlSnapshot>, LogError> {

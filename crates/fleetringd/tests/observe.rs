@@ -469,7 +469,8 @@ async fn readiness_lists_every_check_of_both_roles() -> TestResult {
             "denylist",
             "draining",
             "control_log",
-            "leader"
+            "leader",
+            "control_group"
         ]
     );
     assert!(failing(&body).is_empty(), "{body}");

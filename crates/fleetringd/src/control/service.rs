@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use fleetring::{NodeId, ReplicationFactor, Weight};
+use fleetring_client::redirect::{LEADER_METADATA_KEY, not_leader};
 use fleetring_control::delegation::{
     AgentName, CallerToken, CanonicalRequest, ClaimField, Delegation, DelegationId, Forgery,
     Resent, TokenClaims, TokenKind,
@@ -444,16 +445,18 @@ impl ControlService {
     ///
     /// As [`ControlService::submit`], and `UNAVAILABLE` if every draw was refused.
     async fn submit_drawing(&self, mut action: Action) -> Result<(Applied, Arc<State>), Status> {
-        // `always` while the `incarnations` feature passes the gate: enabled, or supported by
-        // every member. Otherwise, and once the writer refuses it for a member that joined
-        // meanwhile, the creation is logged as 0.8.0 logged it.
+        // `always` while the `incarnations` feature passes both gates: enabled, or supported by
+        // every member of the fleet and of the control group (ADR-0040 point 4). Otherwise, and
+        // once the leader refuses it for a member that joined meanwhile, the creation is logged
+        // as 0.8.0 logged it.
         let mut rule = match self.incarnation_rule {
             IncarnationRule::Always
                 if self
                     .node
                     .state()
                     .check_feature(Feature::Incarnations)
-                    .is_ok() =>
+                    .is_ok()
+                    && self.node.gate().supports(Feature::Incarnations) =>
             {
                 IncarnationRule::Always
             }
@@ -486,7 +489,10 @@ impl ControlService {
                 Err(
                     error @ (SubmitError::Stopped
                     | SubmitError::Storage(_)
-                    | SubmitError::Refused(_)),
+                    | SubmitError::Refused(_)
+                    | SubmitError::NotLeader { .. }
+                    | SubmitError::CatchingUp { .. }
+                    | SubmitError::Superseded),
                 ) => return Err(submit_status(error)),
             };
             draws += 1;
@@ -597,7 +603,13 @@ impl ControlService {
             let outcome = match self.node.submit(action.clone()).await {
                 Ok(committed) => committed.into_outcome(),
                 Err(SubmitError::Refused(rejection)) => Err(rejection),
-                Err(error @ (SubmitError::Stopped | SubmitError::Storage(_))) => {
+                Err(
+                    error @ (SubmitError::Stopped
+                    | SubmitError::Storage(_)
+                    | SubmitError::NotLeader { .. }
+                    | SubmitError::CatchingUp { .. }
+                    | SubmitError::Superseded),
+                ) => {
                     return Err(submit_status(error));
                 }
             };
@@ -1115,11 +1127,30 @@ pub fn missing_database(status: &Status) -> Option<&str> {
     status.metadata().get(MISSING_DATABASE_KEY)?.to_str().ok()
 }
 
+/// The status a submission's error is answered with: a redirect to the leader when this node
+/// knows it, `UNAVAILABLE` while the control group has no ready leader here or the leader
+/// changed, with the leader as a hint when known.
 fn submit_status(error: SubmitError) -> Status {
     match error {
-        SubmitError::Stopped => Status::unavailable(error.to_string()),
+        SubmitError::Stopped | SubmitError::Superseded => Status::unavailable(error.to_string()),
         SubmitError::Storage(_) => Status::internal(error.to_string()),
         SubmitError::Refused(rejection) => rejection_status(&rejection),
+        SubmitError::NotLeader {
+            leader: Some(ref leader),
+        } => not_leader(leader),
+        SubmitError::NotLeader { leader: None } => {
+            Status::unavailable("no control leader is known yet; retry")
+        }
+        SubmitError::CatchingUp { ref leader } => match leader {
+            Some(leader) => {
+                let mut status = Status::unavailable(error.to_string());
+                if let Ok(value) = leader.parse() {
+                    status.metadata_mut().insert(LEADER_METADATA_KEY, value);
+                }
+                status
+            }
+            None => Status::unavailable(error.to_string()),
+        },
     }
 }
 
@@ -2377,12 +2408,14 @@ mod tests {
         async fn new() -> Self {
             let dir = tempfile::tempdir().expect("a directory");
             let clock = SimClock::new(Timestamp::from_millis(1_000_000));
-            let options = ControlOptions::default()
-                .with_storage_io(StorageIo::Inline)
-                .with_recorder("control".parse().expect("an id"));
-            let node = ControlNode::open(dir.path().join("control.db"), options, clock)
-                .await
-                .expect("opens");
+            let options = ControlOptions::default().with_storage_io(StorageIo::Inline);
+            let node = crate::control::test_support::open_node(
+                dir.path().join("control.db"),
+                options,
+                clock,
+            )
+            .await
+            .expect("opens");
             let handle = node.handle();
             handle
                 .submit(Action::Join {

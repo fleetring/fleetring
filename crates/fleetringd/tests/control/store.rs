@@ -11,7 +11,7 @@ use fleetringd::control::raft::{
     ControlPeer, ControlRequest, Entry, LeaderRef, LogId, Membership, RaftId, SnapshotMeta,
     StoredMembership, Vote, raft_id,
 };
-use fleetringd::control::{CommandLog, ControlStore, LogError};
+use fleetringd::control::{ControlStore, LogError, format1_create};
 use openraft::EntryPayload;
 use openraft::impls::leader_id_adv::LeaderId;
 
@@ -104,24 +104,25 @@ fn has_table(path: &Path, table: &str) -> bool {
 fn appended_entries_survive_reopening() {
     let (_dir, path, mut store) = new_store();
     assert_eq!(store.last_log_id().expect("readable"), None);
+    // A group's log starts at index 0, with openraft's first membership entry.
     let entries = vec![
         Entry {
-            log_id: log_id(1, 1),
+            log_id: log_id(1, 0),
             payload: EntryPayload::Membership(membership()),
         },
-        blank(1, 2),
-        command_entry(1, 3),
+        blank(1, 1),
+        command_entry(1, 2),
     ];
     store.append_entries(&entries).expect("the entries append");
     drop(store);
     let store = open(&path);
-    assert_eq!(store.last_log_id().expect("readable"), Some(log_id(1, 3)));
+    assert_eq!(store.last_log_id().expect("readable"), Some(log_id(1, 2)));
     assert_eq!(
         encoded(&store.entries(..).expect("readable")),
         encoded(&entries)
     );
     assert_eq!(
-        encoded(&store.entries(2..3).expect("readable")),
+        encoded(&store.entries(1..2).expect("readable")),
         encoded(&entries[1..2])
     );
     // The stored kinds are readable in the sqlite3 shell.
@@ -130,8 +131,48 @@ fn appended_entries_survive_reopening() {
         "membership,blank,command"
     );
     assert_eq!(
-        query::<String>(&path, "SELECT leader_node FROM log WHERE log_index = 3"),
+        query::<String>(&path, "SELECT leader_node FROM log WHERE log_index = 2"),
         format!("{:016x}", raft_id(OWN))
+    );
+}
+
+/// A batch is appended whole or not at all: an index already taken fails the batch, and the
+/// entries before it in the batch aren't appended either.
+#[test]
+fn a_batch_with_a_taken_index_appends_nothing() {
+    let (_dir, _path, mut store) = new_store();
+    store
+        .append_entries(&[command_entry(1, 0)])
+        .expect("the first entry appends");
+    let refused = store
+        .append_entries(&[command_entry(1, 1), command_entry(1, 0)])
+        .expect_err("index 0 is taken");
+    assert!(matches!(refused, LogError::Sqlite { .. }), "{refused}");
+    assert_eq!(store.entries(..).expect("readable").len(), 1);
+    store
+        .append_entries(&[command_entry(1, 1), command_entry(1, 2)])
+        .expect("the batch appends");
+    assert_eq!(store.commands().expect("readable").len(), 3);
+}
+
+/// A row missing from the log, after the purged index, is refused as a gap, never skipped.
+#[test]
+fn a_missing_entry_is_a_gap() {
+    let (_dir, path, mut store) = new_store();
+    let entries: Vec<Entry> = (0..5).map(|index| command_entry(1, index)).collect();
+    store.append_entries(&entries).expect("the entries append");
+    execute(&path, "DELETE FROM log WHERE log_index = 2");
+    let refused = store.entries(..).expect_err("a gap");
+    assert!(
+        matches!(&refused, LogError::Gap { expected, found } if expected.get() == 2 && found.get() == 3),
+        "{refused}"
+    );
+    assert_eq!(store.entries(3..).expect("readable").len(), 2);
+    execute(&path, "DELETE FROM log WHERE log_index = 0");
+    let refused = store.entries(..).expect_err("a missing head");
+    assert!(
+        matches!(&refused, LogError::Gap { expected, .. } if expected.get() == 0),
+        "{refused}"
     );
 }
 
@@ -341,7 +382,7 @@ fn a_snapshot_that_disagrees_with_the_replay_refuses_migration() {
 fn an_empty_format_one_log_migrates_to_an_empty_store() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let path = dir.path().join("control.db");
-    drop(CommandLog::open(&path, ControlConfig::new()).expect("an empty format-1 log"));
+    format1_create(&path).expect("an empty format-1 log");
     let store = open(&path);
     assert_eq!(store.last_log_id().expect("readable"), None);
     assert_eq!(store.committed().expect("readable"), None);

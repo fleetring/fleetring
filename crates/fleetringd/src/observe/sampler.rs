@@ -157,8 +157,11 @@ fn control_sample(control: &ControlHandle) -> ControlSample {
             .databases()
             .filter(|database| database.kept_replicas().is_some())
             .count(),
-        // One control node is the control plane's leader until FR-064's Raft group.
-        leader: control.is_running(),
+        // 1 on the control group's leader, ready or catching up (ADR-0040 point 10).
+        leader: !matches!(
+            control.leadership(),
+            crate::control::Readiness::Follower { .. }
+        ),
         ..ControlSample::default()
     };
     for member in state.members() {

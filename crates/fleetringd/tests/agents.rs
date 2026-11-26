@@ -1565,7 +1565,9 @@ impl StubFleet {
     async fn start(software: Software) -> TestResult<Self> {
         let dir = tempfile::tempdir()?;
         let options = ControlOptions::new(ControlConfig::new()).with_storage_io(StorageIo::Inline);
-        let node = ControlNode::open(dir.path().join("control.db"), options, SystemClock).await?;
+        let node =
+            crate::support::open_control(dir.path().join("control.db"), options, SystemClock)
+                .await?;
         node.handle()
             .submit(Action::Join {
                 member: Member::new("data-1".parse()?).with_software(software),
